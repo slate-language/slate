@@ -17,20 +17,25 @@ slate/
     ast.sysl        the tree
     parse.sysl      statements, by recursive descent
     expr.sysl       expressions, by binding power
+    pattern.sysl    patterns, and the arms of a `match`
     value.sysl      what a program computes with, and the scope chain
     eval.sysl       the walk
     builtin.sysl    the functions a program has without writing them
     show.sysl       the tree as `(+ 1 (* 2 3))`, for the tests
     tests.sysl      what all of it claims, run by `sysl test .`
 main.sysl           the driver: a path in, a report out
-examples/tour.slate the language in one file
+examples/tour.sl    the language in one file
+examples/match.sl   the patterns, in another
 ```
+
+A slate program is a **`.sl`** file. A literate one — prose with the program in it, as sysl has for
+`.lsysl` — will be **`.lsl`**, and is not built yet.
 
 ## Running it
 
 ```
 sysl test .
-sysl run . -- examples/tour.slate
+sysl run . -- examples/tour.sl
 ```
 
 ## The language
@@ -78,6 +83,25 @@ print([x -> x * 2, 21])
 print({ name: "ada", born: 1815 }.name)
 ```
 
+`match` is postfix, as in Scala and sysl — a transformation of the thing to its left. Patterns test
+literals, shapes and alternatives, and a guard runs after the pattern has bound:
+
+```
+classify(v)
+    v match
+        { kind: "point", at: [0, 0] } -> "origin"
+        { kind: "point", at: [x, y] } if x == y -> "diagonal"
+        [first, ...rest] -> "a list starting " + str(first)
+        "sat" | "sun" -> "a weekend"
+        _ -> "something else"
+```
+
+An object pattern matches an object with *at least* those fields, because a record grows fields over
+its life. `{ name }` is shorthand for `{ name: name }`. No alternative of a `|` may bind a name, since
+it would be bound down one path and not the other. **There is no exhaustiveness check and there
+cannot be one** — slate is dynamically typed, so the set of values a name may hold is not known; a
+subject matching no arm is a runtime fault, as Scala's `MatchError` is.
+
 It is dynamically typed. Values are `nil`, booleans, integers, reals, strings, arrays, objects and
 functions. Arrays and objects are reference types and compare by their contents. Only `false` and
 `nil` are false — zero and the empty string are not, which is the rule Ruby and Lua take and the one
@@ -93,6 +117,11 @@ renderer, the binding-power loop, and the layout pass. Slate is that package's f
 **`layout`**: `json` has no line structure and `ogol` has no indentation, so the column stack had
 been written and never run by anything.
 
+**slate is also where `layout`'s 0.3.0 came from.** A bracket used to suspend the off-side rule
+outright, so `push(xs, n match ...)` had its arms inside a bracket pair where a newline means nothing
+and the block never opened. The package now lets a grammar nominate the tokens that open a block —
+slate's is `match`, and it has exactly one where sysl has two.
+
 Two of its own notes turn out to matter here and are worth repeating:
 
 - **The `TokenStream` the Pratt loop runs on is the parser, not the token cursor.** A `led` callback
@@ -103,9 +132,13 @@ Two of its own notes turn out to matter here and are worth repeating:
 
 ## What is not here yet
 
-`match`, string interpolation, a module system, and anything resembling a standard library beyond
-five builtins. The tour is the current surface, and it is meant to grow in whatever direction puts
-the most pressure on sysl.
+String interpolation, a module system, a literate `.lsl` form, and anything resembling a standard
+library beyond five builtins. **Values are reference-counted, so a cycle leaks** — and every named
+function is one, its closure being bound into the scope it captured. `sysl-lang/gc` is the answer and
+is the next piece of work.
+
+The two examples are the current surface, and it is meant to grow in whatever direction puts the most
+pressure on sysl.
 
 ## Licence
 

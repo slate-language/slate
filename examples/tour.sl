@@ -75,3 +75,27 @@ loop
         break
 
 print("ended at", n)
+
+// `match` is postfix, as in Scala and sysl: a transformation of the thing to its left.
+describe(v)
+    v match
+        0 -> "zero"
+        [a, b] -> "a pair summing " + str(a + b)
+        { name } -> "someone called " + name
+        "sat" | "sun" -> "a weekend"
+        _ -> "something else"
+
+print(describe(0))
+print(describe([3, 4]))
+print(describe({ name: "ada" }))
+print(describe("sun"))
+print(describe(9))
+
+// A guard runs after the pattern has bound, and can refuse the arm so a later one gets its turn.
+sign(n)
+    n match
+        0 -> "zero"
+        n if n < 0 -> "negative"
+        _ -> "positive"
+
+print(sign(0), sign(-3), sign(3))

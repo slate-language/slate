@@ -299,6 +299,7 @@ eval(e: Expr, env: &Env) -> Step
                 else_branch match
                     Some(b) -> eval(b, child_env(env))
                     None -> Ok(Nil)
+        MatchExpr(subject, arms) -> run_match(subject, arms, env, e.span)
         Block(stmts) -> exec_block(stmts, child_env(env))
         Bad -> fault(e.span, "this part of the program did not parse")
 end eval
@@ -562,3 +563,108 @@ apply(f: Value, vals: Buf[Value], at: Span, env: &Env) -> Step
                 Err(other) -> Err(other)
         other -> fault(at, s"${other.type_name()} is not something that can be called")
 end apply
+
+// -- matching -----------------------------------------------------------------------------------
+
+// `subject match` with its arms.
+//
+// **Each arm is tried in a scope of its own, and the scope is thrown away where the arm does not
+// take.** A pattern binds as it goes -- there is no way to know whether `[a, b]` matches without
+// binding `a` first -- so a failed arm has already written names, and the only way to keep those
+// from leaking into the next arm is to give each one somewhere separate to write.
+private run_match(subject: Expr, arms: Buf[Arm], env: &Env, at: Span) -> Step
+    val v = eval(subject, env)?
+
+    for i in 0..<arms.len()
+        val arm = arms.at(i)
+        val scope = child_env(env)
+
+        if match_pattern(arm.pattern, v, scope)
+            // **The guard is evaluated in the arm's scope, after the pattern bound.** That is what
+            // it is for: a guard that could not read what the pattern just bound would say nothing
+            // an `if` in the body could not.
+            val ok = arm.guard match
+                Some(g) -> eval(g, scope)?.truthy()
+                None -> true
+
+            if ok then return eval(arm.body, scope)
+    end for
+
+    fault(at, s"no arm of this match applies to ${value_text(v)}")
+end run_match
+
+// Whether a pattern matches a value, binding its names into `scope` as it goes.
+//
+// **It answers a bare `bool` rather than a `Step`, and that is deliberate**: nothing a pattern does
+// can fail at runtime. There is no arithmetic in one, no call, and no index that could be out of
+// range -- a pattern that does not fit simply does not fit, which is an answer and not a fault.
+match_pattern(pat: Pattern, v: Value, scope: &Env) -> bool
+    *pat.kind match
+        Wild -> true
+        Bind(name) ->
+            // Bound as a `val`: a name a pattern introduced is not a place to write to.
+            scope.declare(name, v, false)
+            true
+        IntPat(want) -> same(v, Int(want))
+        RealPat(want) -> same(v, Real(want))
+        StrPat(want) -> same(v, Str(want))
+        BoolPat(want) -> same(v, Bool(want))
+        NilPat -> v match
+            Nil -> true
+            _ -> false
+        ArrayPat(items, open, rest) -> match_array(items, open, rest, v, scope)
+        ObjectPat(keys, values) -> match_object(keys, values, v, scope)
+        OrPat(alts) ->
+            for i in 0..<alts.len()
+                if match_pattern(alts.at(i), v, scope) then return true
+
+            false
+end match_pattern
+
+// `[a, b]` and `[first, ...rest]`.
+private match_array(items: Buf[Pattern], open: bool, rest: Option[string], v: Value, scope: &Env) -> bool
+    v match
+        Array(xs) ->
+            // A closed pattern must agree on length exactly; an open one treats the fixed patterns
+            // as a floor.
+            val fixed = items.len()
+
+            if open
+                if xs.len() < fixed then return false
+            else
+                if xs.len() != fixed then return false
+
+            for i in 0..<fixed
+                if !match_pattern(items.at(i), xs.at(i), scope) then return false
+
+            // The tail is only gathered where it is named. `[a, ...]` allocates nothing.
+            rest match
+                Some(name) ->
+                    var tail: &Buf[Value] = buf()
+
+                    for i in fixed..<xs.len()
+                        tail.push(xs.at(i))
+
+                    scope.declare(name, Array(tail), false)
+                None -> ()
+
+            true
+        _ -> false
+end match_array
+
+// `{ name: n }`.
+//
+// **An object pattern matches an object with *at least* these fields.** A record grows fields over
+// its life, so a pattern that broke whenever one was added would be a pattern nobody could keep
+// working -- and a program that wants exactness can ask `len(o)`.
+private match_object(keys: Buf[string], values: Buf[Pattern], v: Value, scope: &Env) -> bool
+    v match
+        Object(fields) ->
+            for i in 0..<keys.len()
+                fields.get(keys.at(i)) match
+                    None -> return false
+                    Some(field) -> if !match_pattern(values.at(i), field, scope) then return false
+
+            true
+        _ -> false
+end match_object
