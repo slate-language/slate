@@ -93,8 +93,22 @@ classify(v)
         { kind: "point", at: [x, y] } if x == y -> "diagonal"
         [first, ...rest] -> "a list starting " + str(first)
         "sat" | "sun" -> "a weekend"
+        n @ num if n < 0 -> "a negative number"
         _ -> "something else"
 ```
+
+**A bare name in a pattern tests for a kind where it names one, and binds otherwise** — `nil`,
+`bool`, `int`, `real`, `num`, `str`, `array`, `object`, `fn`. That is sysl's own bare-name rule (a
+bare identifier is a nullary-variant pattern when it names one of the scrutinee's variants), applied
+to a scrutinee that is always a value: those words *are* the variants. So a type test needs no syntax
+of its own, and `n @ pat` — again sysl's spelling — is how a program tests and names at once. None of
+them is a keyword: `val int = 3` still works.
+
+`num` is the one that is not a variant, being the union of `int` and `real`. It earns its place
+because the two are separate values, so a pattern guarding arithmetic would otherwise be written
+twice. It is also what makes a broad guard safe: `n if n < 0` binds *anything*, so the guard
+evaluates `[3, 4] < 0` and faults, where `n @ num if n < 0` cannot reach the guard with the wrong
+kind.
 
 An object pattern matches an object with *at least* those fields, because a record grows fields over
 its life. `{ name }` is shorthand for `{ name: name }`. No alternative of a `|` may bind a name, since

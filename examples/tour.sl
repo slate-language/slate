@@ -77,25 +77,26 @@ loop
 print("ended at", n)
 
 // `match` is postfix, as in Scala and sysl: a transformation of the thing to its left.
+//
+// A bare name in a pattern tests for a kind where it names one -- `int`, `str`, `array` and the
+// rest -- and binds otherwise. That is sysl's bare-name rule, whose scrutinee here is always a
+// value, and `n @ pat` is sysl's spelling for testing and naming at once.
 describe(v)
     v match
         0 -> "zero"
+        n @ num if n < 0 -> "negative"
+        n @ num -> "the number " + str(n)
         [a, b] -> "a pair summing " + str(a + b)
         { name } -> "someone called " + name
         "sat" | "sun" -> "a weekend"
+        s @ str -> "the text " + s
         _ -> "something else"
 
 print(describe(0))
+print(describe(-3))
+print(describe(1.5))
 print(describe([3, 4]))
 print(describe({ name: "ada" }))
 print(describe("sun"))
-print(describe(9))
-
-// A guard runs after the pattern has bound, and can refuse the arm so a later one gets its turn.
-sign(n)
-    n match
-        0 -> "zero"
-        n if n < 0 -> "negative"
-        _ -> "positive"
-
-print(sign(0), sign(-3), sign(3))
+print(describe("hi"))
+print(describe(true))
