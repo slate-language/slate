@@ -72,21 +72,30 @@ end Ran
 // **A program with a single mistake in it is not run at all.** The parser reports everything it
 // found in one pass, and running a tree that has `Bad` nodes in it would produce a second, worse
 // account of the same file.
+// **Every run starts by emptying the heap**, which finalizes whatever the last one left reachable
+// and clears the shadow stack. Without it a program's strings and buffers would survive its own end,
+// and the interpreter's state is module storage -- see `obj.sysl` for why the collector forces that.
 run(src: Source) -> Ran
+    reset_heap()
+    output.clear()
+
     val parsed = parse(src)
-    var env = root_env()
 
-    if !parsed.ok() then return Ran(Nil, parsed.report, env.world.output)
+    if !parsed.ok() then return Ran(Nil, parsed.report, output)
 
+    // The root scope is held for the whole run: everything a program can still reach hangs off it.
+    var env = new_env(null)
+
+    hold_env(env)
     install_builtins(env)
 
     var rep = parsed.report
 
     exec_block(parsed.program.stmts, env) match
-        Ok(v) -> Ran(v, rep, env.world.output)
+        Ok(v) -> Ran(v, rep, output)
         Err(s) ->
             rep.add(error(signal_span(s), signal_message(s)))
-            Ran(Nil, rep, env.world.output)
+            Ran(Nil, rep, output)
 end run
 
 // Where to point at a signal that escaped to the top.
@@ -106,19 +115,35 @@ private signal_message(s: Signal) -> string = s match
 //
 // **A block's value is its trailing expression**, which is sysl's rule and slate's. A block ending
 // in something that is not an expression is `nil`, exactly as one ending in a `while` would be.
-exec_block(stmts: Buf[Stmt], env: &Env) -> Step
+exec_block(stmts: Buf[Stmt], env: *EnvObj) -> Step
+    val mark = root_mark()
     var last: Value = Nil
 
     for i in 0..<stmts.len()
+        // **The one point a collection may happen.** Everything live is either in the scope chain or
+        // on the shadow stack by now, which is what makes it safe here and nowhere else.
+        maybe_collect()
+
+        // A full heap is reported where there is a line to point at. The allocator has no idea which
+        // statement it was serving, so it raises a flag and this is what reads it.
+        if heap_exhausted
+            release(mark)
+            return fault(stmts.at(i).span, "this program has run out of memory")
+
         last = exec_stmt(stmts.at(i), env)?
 
+        // The block's value has to survive the next statement's collection, and nothing else does.
+        release(mark)
+        hold(last)
+
+    release(mark)
     Ok(last)
 end exec_block
 
-private exec_stmt(s: Stmt, env: &Env) -> Step
+private exec_stmt(s: Stmt, env: *EnvObj) -> Step
     *s.kind match
-        Val(name, init) -> declare(env, name, init, false)
-        Var(name, init) -> declare(env, name, init, true)
+        Val(name, init) -> declare_binding(env, name, init, false)
+        Var(name, init) -> declare_binding(env, name, init, true)
         Eval(e) -> eval(e, env)
         Return(value) ->
             // The annotation says which `Nil` this is: `Tok` has one too, and a bare `return`
@@ -138,38 +163,38 @@ private exec_stmt(s: Stmt, env: &Env) -> Step
 end exec_stmt
 
 // `val x = e` and `var x = e`.
-private declare(env: &Env, name: string, init: Expr, assignable: bool) -> Step
+private declare_binding(env: *EnvObj, name: string, init: Expr, assignable: bool) -> Step
     val v = eval(init, env)?
 
-    env.declare(name, v, assignable)
+    declare(env, name, v, assignable)
     Ok(Nil)
-end declare
+end declare_binding
 
 // A named function.
 //
 // **The name is bound before the closure is built, so the body can see it.** That is the whole of
 // what makes a named function recursive and a lambda not: the closure captures the scope, and the
 // scope already holds the name by the time anything calls it.
-private define(env: &Env, name: string, params: Buf[string], body: Expr) -> Step
-    env.declare(name, Nil, false)
-    env.declare(name, Fn(Closure(params, body, env)), false)
+private define(env: *EnvObj, name: string, params: Buf[string], body: usize) -> Step
+    declare(env, name, Nil, false)
+    declare(env, name, Fn(new_closure(params, body, env)), false)
     Ok(Nil)
 end define
 
 // `x = e`, `o.f = e`, `xs[i] = e`.
-private assign_to(target: Expr, value: Expr, env: &Env, at: Span) -> Step
+private assign_to(target: Expr, value: Expr, env: *EnvObj, at: Span) -> Step
     val v = eval(value, env)?
 
     *target.kind match
         Name(n) ->
-            env.assign(n, v) match
+            assign_name(env, n, v) match
                 Written -> Ok(Nil)
                 Immutable -> fault(target.span, s"`${n}` is a `val`, so it is written once")
                 Unknown -> fault(target.span, s"`${n}` is not defined")
         Field(obj, name) ->
             eval(obj, env)? match
                 Object(fields) ->
-                    fields.put(name, v)
+                    fields.fields.put(name, v)
                     Ok(Nil)
                 other -> fault(target.span, s"a field belongs to an object, and this is ${other.type_name()}")
         Index(target_expr, key) ->
@@ -186,16 +211,16 @@ private store_at(container: Value, k: Value, v: Value, at: Span) -> Step
         Array(items) ->
             k match
                 Int(i) ->
-                    if i < 0 || usize(i) >= items.len()
-                        return fault(at, s"the index ${i} is outside an array of ${items.len()}")
+                    if i < 0 || usize(i) >= items.items.len()
+                        return fault(at, s"the index ${i} is outside an array of ${items.items.len()}")
 
-                    items.set(usize(i), v)
+                    items.items.set(usize(i), v)
                     Ok(Nil)
                 other -> fault(at, s"an array is indexed by an integer, and this is ${other.type_name()}")
         Object(fields) ->
             k match
                 Str(name) ->
-                    fields.put(name, v)
+                    fields.fields.put(name.s, v)
                     Ok(Nil)
                 other -> fault(at, s"an object is indexed by a string, and this is ${other.type_name()}")
         other -> fault(at, s"${other.type_name()} cannot be indexed")
@@ -206,7 +231,7 @@ end store_at
 // **A loop is where two of the four signals stop travelling.** `Brk` ends it and `Cont` starts the
 // next turn; `Ret` and `Fail` are none of a loop's business and keep going up, which is what makes
 // `return` from inside two nested loops work with nothing written for it.
-private run_while(cond: Expr, body: Expr, env: &Env) -> Step
+private run_while(cond: Expr, body: Expr, env: *EnvObj) -> Step
     loop
         if !eval(cond, env)?.truthy() then break
 
@@ -217,7 +242,7 @@ private run_while(cond: Expr, body: Expr, env: &Env) -> Step
     Ok(Nil)
 end run_while
 
-private run_loop(body: Expr, env: &Env) -> Step
+private run_loop(body: Expr, env: *EnvObj) -> Step
     loop
         turn(body, env)? match
             Brk -> break
@@ -226,15 +251,18 @@ private run_loop(body: Expr, env: &Env) -> Step
     Ok(Nil)
 end run_loop
 
-private run_for(name: string, iter: Expr, body: Expr, env: &Env, at: Span) -> Step
+private run_for(name: string, iter: Expr, body: Expr, env: *EnvObj, at: Span) -> Step
+    val mark = root_mark()
     val subject = eval(iter, env)?
+
+    hold(subject)
 
     subject match
         Array(items) ->
-            for i in 0..<items.len()
-                val scope = child_env(env)
+            for i in 0..<items.items.len()
+                val scope = new_env(env)
 
-                scope.declare(name, items.at(i), false)
+                declare(scope, name, items.items.at(i), false)
 
                 turn_in(body, scope)? match
                     Brk -> break
@@ -249,27 +277,38 @@ end run_for
 // **`Brk` and `Cont` are caught here and everything else is re-raised**, which is why the loops
 // above are three lines each. The `Ok(Cont)` and `Ok(Brk)` it answers with are not values a program
 // can see -- they are this file talking to itself.
-private turn(body: Expr, env: &Env) -> Result[Signal, Signal] = turn_in(body, child_env(env))
+private turn(body: Expr, env: *EnvObj) -> Result[Signal, Signal] = turn_in(body, new_env(env))
 
-private turn_in(body: Expr, scope: &Env) -> Result[Signal, Signal]
+private turn_in(body: Expr, scope: *EnvObj) -> Result[Signal, Signal]
+    val emark = env_mark()
+
+    hold_env(scope)
+
+    val answer = turn_body(body, scope)
+
+    release_env(emark)
+    answer
+end turn_in
+
+private turn_body(body: Expr, scope: *EnvObj) -> Result[Signal, Signal]
     eval(body, scope) match
         Ok(_) -> Ok(Cont)
         Err(Brk) -> Ok(Brk)
         Err(Cont) -> Ok(Cont)
         Err(other) -> Err(other)
-end turn_in
+end turn_body
 
 // -- expressions --------------------------------------------------------------------------------
 
-eval(e: Expr, env: &Env) -> Step
+eval(e: Expr, env: *EnvObj) -> Step
     *e.kind match
         IntLit(v) -> Ok(Int(v))
         RealLit(v) -> Ok(Real(v))
-        StrLit(v) -> Ok(Str(v))
+        StrLit(v) -> Ok(str_value(v))
         BoolLit(v) -> Ok(Bool(v))
         NilLit -> Ok(Nil)
         Name(n) ->
-            env.lookup(n) match
+            lookup(env, n) match
                 Some(v) -> Ok(v)
                 None -> fault(e.span, s"`${n}` is not defined")
         Unary(op, rhs) -> unary(op, eval(rhs, env)?, e.span)
@@ -278,29 +317,29 @@ eval(e: Expr, env: &Env) -> Step
         Index(target, key) -> read_at(eval(target, env)?, eval(key, env)?, e.span)
         Field(target, name) -> read_field(eval(target, env)?, name, e.span)
         ArrayLit(items) ->
-            var out: &Buf[Value] = buf()
+            var out: Buf[Value] = buf()
 
             for i in 0..<items.len()
                 out.push(eval(items.at(i), env)?)
 
-            Ok(Array(out))
+            Ok(Array(new_array(out)))
         ObjectLit(keys, values) ->
-            var fields: &Map[string, Value] = map()
+            var fields: Map[string, Value] = map()
 
             for i in 0..<keys.len()
                 fields.put(keys.at(i), eval(values.at(i), env)?)
 
-            Ok(Object(fields))
-        Lambda(params, body) -> Ok(Fn(Closure(params, body, env)))
+            Ok(Object(new_object(fields)))
+        Lambda(params, body) -> Ok(Fn(new_closure(params, body, env)))
         IfExpr(cond, then_branch, else_branch) ->
             if eval(cond, env)?.truthy()
-                eval(then_branch, child_env(env))
+                eval(then_branch, new_env(env))
             else
                 else_branch match
-                    Some(b) -> eval(b, child_env(env))
+                    Some(b) -> eval(b, new_env(env))
                     None -> Ok(Nil)
         MatchExpr(subject, arms) -> run_match(subject, arms, env, e.span)
-        Block(stmts) -> exec_block(stmts, child_env(env))
+        Block(stmts) -> run_block_scope(stmts, env)
         Bad -> fault(e.span, "this part of the program did not parse")
 end eval
 
@@ -323,7 +362,7 @@ end unary
 // otherwise. That is what nearly every dynamically typed language does, and it is the one place
 // slate's rule is not sysl's: sysl's operands are `bool` and there is nothing else for it to give
 // back.
-private binary(op: Tok, lhs: Expr, rhs: Expr, env: &Env, at: Span) -> Step
+private binary(op: Tok, lhs: Expr, rhs: Expr, env: *EnvObj, at: Span) -> Step
     if op == AndAnd
         val a = eval(lhs, env)?
 
@@ -354,7 +393,7 @@ private arith(op: Tok, a: Value, b: Value, at: Span) -> Step
         a match
             Str(x) ->
                 b match
-                    Str(y) -> return Ok(Str(x + y))
+                    Str(y) -> return Ok(str_value(x.s + y.s))
                     _ -> ()
             _ -> ()
     end if
@@ -369,7 +408,7 @@ private arith(op: Tok, a: Value, b: Value, at: Span) -> Step
     a match
         Str(x) ->
             b match
-                Str(y) -> return compare_str(op, x, y, at)
+                Str(y) -> return compare_str(op, x.s, y.s, at)
                 _ -> ()
         _ -> ()
 
@@ -447,7 +486,11 @@ same(a: Value, b: Value) -> bool
             Bool(y) -> x == y
             _ -> false
         Str(x) -> b match
-            Str(y) -> x == y
+            // **`x == y` here would compare the two `*StrObj` POINTERS**, which is identity and not
+            // equality -- and it compiles, because pointers do compare. Moving a string from a value
+            // into the collected heap turned a structural comparison into an identity one silently,
+            // and fourteen tests caught it. Go has the same distinction and answers it the same way.
+            Str(y) -> x.s == y.s
             _ -> false
         Int(x) -> b match
             Int(y) -> x == y
@@ -458,10 +501,10 @@ same(a: Value, b: Value) -> bool
             Real(y) -> x == y
             _ -> false
         Array(xs) -> b match
-            Array(ys) -> same_array(xs, ys)
+            Array(ys) -> same_array(xs.items, ys.items)
             _ -> false
         Object(xs) -> b match
-            Object(ys) -> same_object(xs, ys)
+            Object(ys) -> same_object(xs.fields, ys.fields)
             _ -> false
         Fn(_) -> false
         Native(x) -> b match
@@ -501,14 +544,14 @@ private read_at(container: Value, k: Value, at: Span) -> Step
         Array(items) ->
             k match
                 Int(i) ->
-                    if i < 0 || usize(i) >= items.len()
-                        return fault(at, s"the index ${i} is outside an array of ${items.len()}")
+                    if i < 0 || usize(i) >= items.items.len()
+                        return fault(at, s"the index ${i} is outside an array of ${items.items.len()}")
 
-                    Ok(items.at(usize(i)))
+                    Ok(items.items.at(usize(i)))
                 other -> fault(at, s"an array is indexed by an integer, and this is ${other.type_name()}")
         Object(fields) ->
             k match
-                Str(name) -> Ok(fields.get(name).unwrap_or(Nil))
+                Str(name) -> Ok(fields.fields.get(name.s).unwrap_or(Nil))
                 other -> fault(at, s"an object is indexed by a string, and this is ${other.type_name()}")
         Str(sv) ->
             k match
@@ -522,7 +565,7 @@ end read_at
 // is how a program asks whether this one has.
 private read_field(target: Value, name: string, at: Span) -> Step
     target match
-        Object(fields) -> Ok(fields.get(name).unwrap_or(Nil))
+        Object(fields) -> Ok(fields.fields.get(name).unwrap_or(Nil))
         other -> fault(at, s"a field belongs to an object, and this is ${other.type_name()}")
 
 // -- calls --------------------------------------------------------------------------------------
@@ -530,14 +573,26 @@ private read_field(target: Value, name: string, at: Span) -> Step
 // **A call is where `Ret` stops travelling.** Every other signal passes through untouched, so a
 // `break` written inside a function body and outside any loop reaches the top and is reported
 // there rather than quietly ending the call.
-private do_call(callee: Expr, args: Buf[Expr], env: &Env, at: Span) -> Step
+private do_call(callee: Expr, args: Buf[Expr], env: *EnvObj, at: Span) -> Step
+    val mark = root_mark()
     val f = eval(callee, env)?
+
+    hold(f)
+
     var vals: Buf[Value] = buf()
 
     for i in 0..<args.len()
-        vals.push(eval(args.at(i), env)?)
+        val v = eval(args.at(i), env)?
 
-    apply(f, vals, at, env)
+        // A `Buf` of the interpreter's own is not a root, so each argument is held as it arrives --
+        // a later argument's own body may collect.
+        hold(v)
+        vals.push(v)
+
+    val answer = apply(f, vals, at, env)
+
+    release(mark)
+    answer
 end do_call
 
 // Call a value with arguments already evaluated.
@@ -545,22 +600,30 @@ end do_call
 // The calling scope is passed for the run's world, not for its names: a closure's body is evaluated
 // in a child of the scope the closure *captured*, which is what makes it a closure rather than a
 // function with dynamic scoping.
-apply(f: Value, vals: Buf[Value], at: Span, env: &Env) -> Step
+apply(f: Value, vals: Buf[Value], at: Span, env: *EnvObj) -> Step
     f match
-        Native(name) -> call_native(name, vals, at, env)
+        Native(f) -> call_native(f, vals, at)
         Fn(c) ->
-            if vals.len() != c.arity()
-                return fault(at, s"this function takes ${c.arity()} arguments and was given ${vals.len()}")
+            if vals.len() != c.params.len()
+                return fault(at, s"this function takes ${c.params.len()} arguments and was given ${vals.len()}")
 
-            val scope = child_env(c.scope)
+            val emark = env_mark()
+            val scope = new_env(c.scope)
+
+            hold_env(scope)
 
             for i in 0..<c.params.len()
-                scope.declare(c.params.at(i), vals.at(i), true)
+                declare(scope, c.params.at(i), vals.at(i), true)
 
-            eval(c.body, scope) match
+            // The annotation is the one the compiler asks for: a bare `Ok`/`Err` pair in a `match`
+            // used as a value has nothing on the line to say what the other half is.
+            val answer: Step = eval(body_at(c.body), scope) match
                 Ok(v) -> Ok(v)
                 Err(Ret(v)) -> Ok(v)
                 Err(other) -> Err(other)
+
+            release_env(emark)
+            answer
         other -> fault(at, s"${other.type_name()} is not something that can be called")
 end apply
 
@@ -572,12 +635,22 @@ end apply
 // take.** A pattern binds as it goes -- there is no way to know whether `[a, b]` matches without
 // binding `a` first -- so a failed arm has already written names, and the only way to keep those
 // from leaking into the next arm is to give each one somewhere separate to write.
-private run_match(subject: Expr, arms: Buf[Arm], env: &Env, at: Span) -> Step
+private run_match(subject: Expr, arms: Buf[Arm], env: *EnvObj, at: Span) -> Step
+    val mark = root_mark()
+    val emark = env_mark()
     val v = eval(subject, env)?
+
+    // The subject is in no scope -- `[1, 2] match ...` is a temporary -- and every arm's body may
+    // collect.
+    hold(v)
 
     for i in 0..<arms.len()
         val arm = arms.at(i)
-        val scope = child_env(env)
+        val scope = new_env(env)
+
+        // The arm's scope reaches `env` through its parent, but nothing reaches the arm's scope, so
+        // it is held for as long as the arm is being tried.
+        hold_env(scope)
 
         if match_pattern(arm.pattern, v, scope)
             // **The guard is evaluated in the arm's scope, after the pattern bound.** That is what
@@ -587,8 +660,17 @@ private run_match(subject: Expr, arms: Buf[Arm], env: &Env, at: Span) -> Step
                 Some(g) -> eval(g, scope)?.truthy()
                 None -> true
 
-            if ok then return eval(arm.body, scope)
+            if ok
+                val answer = eval(arm.body, scope)
+
+                release(mark)
+                release_env(emark)
+                return answer
+            end if
     end for
+
+    release(mark)
+    release_env(emark)
 
     fault(at, s"no arm of this match applies to ${value_text(v)}")
 end run_match
@@ -598,12 +680,12 @@ end run_match
 // **It answers a bare `bool` rather than a `Step`, and that is deliberate**: nothing a pattern does
 // can fail at runtime. There is no arithmetic in one, no call, and no index that could be out of
 // range -- a pattern that does not fit simply does not fit, which is an answer and not a fault.
-match_pattern(pat: Pattern, v: Value, scope: &Env) -> bool
+match_pattern(pat: Pattern, v: Value, scope: *EnvObj) -> bool
     *pat.kind match
         Wild -> true
         Bind(name) ->
             // Bound as a `val`: a name a pattern introduced is not a place to write to.
-            scope.declare(name, v, false)
+            declare(scope, name, v, false)
             true
         TypePat(test) -> is_kind(v, test)
         At(name, inner) ->
@@ -612,11 +694,11 @@ match_pattern(pat: Pattern, v: Value, scope: &Env) -> bool
             // scope would throw away anyway, but only by accident rather than by rule.
             if !match_pattern(inner, v, scope) then return false
 
-            scope.declare(name, v, false)
+            declare(scope, name, v, false)
             true
         IntPat(want) -> same(v, Int(want))
         RealPat(want) -> same(v, Real(want))
-        StrPat(want) -> same(v, Str(want))
+        StrPat(want) -> same(v, str_value(want))
         BoolPat(want) -> same(v, Bool(want))
         NilPat -> v match
             Nil -> true
@@ -631,7 +713,7 @@ match_pattern(pat: Pattern, v: Value, scope: &Env) -> bool
 end match_pattern
 
 // `[a, b]` and `[first, ...rest]`.
-private match_array(items: Buf[Pattern], open: bool, rest: Option[string], v: Value, scope: &Env) -> bool
+private match_array(items: Buf[Pattern], open: bool, rest: Option[string], v: Value, scope: *EnvObj) -> bool
     v match
         Array(xs) ->
             // A closed pattern must agree on length exactly; an open one treats the fixed patterns
@@ -639,22 +721,22 @@ private match_array(items: Buf[Pattern], open: bool, rest: Option[string], v: Va
             val fixed = items.len()
 
             if open
-                if xs.len() < fixed then return false
+                if xs.items.len() < fixed then return false
             else
-                if xs.len() != fixed then return false
+                if xs.items.len() != fixed then return false
 
             for i in 0..<fixed
-                if !match_pattern(items.at(i), xs.at(i), scope) then return false
+                if !match_pattern(items.at(i), xs.items.at(i), scope) then return false
 
             // The tail is only gathered where it is named. `[a, ...]` allocates nothing.
             rest match
                 Some(name) ->
-                    var tail: &Buf[Value] = buf()
+                    var tail: Buf[Value] = buf()
 
-                    for i in fixed..<xs.len()
-                        tail.push(xs.at(i))
+                    for i in fixed..<xs.items.len()
+                        tail.push(xs.items.at(i))
 
-                    scope.declare(name, Array(tail), false)
+                    declare(scope, name, Array(new_array(tail)), false)
                 None -> ()
 
             true
@@ -666,11 +748,11 @@ end match_array
 // **An object pattern matches an object with *at least* these fields.** A record grows fields over
 // its life, so a pattern that broke whenever one was added would be a pattern nobody could keep
 // working -- and a program that wants exactness can ask `len(o)`.
-private match_object(keys: Buf[string], values: Buf[Pattern], v: Value, scope: &Env) -> bool
+private match_object(keys: Buf[string], values: Buf[Pattern], v: Value, scope: *EnvObj) -> bool
     v match
         Object(fields) ->
             for i in 0..<keys.len()
-                fields.get(keys.at(i)) match
+                fields.fields.get(keys.at(i)) match
                     None -> return false
                     Some(field) -> if !match_pattern(values.at(i), field, scope) then return false
 
@@ -714,3 +796,16 @@ private is_kind(v: Value, test: TypeTest) -> bool
             Native(_) -> true
             _ -> false
 end is_kind
+
+// A block with a scope of its own, held for as long as it runs.
+private run_block_scope(stmts: Buf[Stmt], env: *EnvObj) -> Step
+    val emark = env_mark()
+    val scope = new_env(env)
+
+    hold_env(scope)
+
+    val answer = exec_block(stmts, scope)
+
+    release_env(emark)
+    answer
+end run_block_scope

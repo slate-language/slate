@@ -1,0 +1,308 @@
+module slate
+
+import sh.sysl.gc
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+
+// The collected heap, and the objects in it.
+//
+// **Reference counting cannot free a cycle, and slate makes one on every named function.** `define`
+// binds a closure into the very scope that closure captured, so the scope holds the closure and the
+// closure holds the scope. Nothing declared that back-edge, so `weak` cannot help: it is a cycle in
+// somebody else's program, which is the case `sh.sysl.gc` exists for.
+//
+// ## What is collected and what is not
+//
+// **The collector manages exactly what refcounting cannot.** A string, an array, an object, a
+// closure and a scope are collected, because a value graph made of them can cycle. The *tree* is
+// not: an `Expr` is immutable and acyclic, so ARC frees it correctly and it stays where it is.
+//
+// A slate string is a GC object holding a sysl `string`, which its finalizer releases -- so a string
+// takes part in the collector's lifetime the way Go's does, without this file reimplementing every
+// string operation over raw bytes. The same bargain gives an array its `Buf` and an object its
+// `Map`.
+//
+// **`Value` therefore holds no reference-counted member at all**: scalars and raw pointers, nothing
+// else. That is what lets one be stored into GC memory, copied into a `Buf`, and passed around with
+// no ARC traffic on the interpreter's hot path.
+
+// How many bytes the collected heap gets.
+//
+// One block, fixed at startup -- there is no growing, and `alloc` answers null when it is full. Four
+// megabytes is far more than any slate program written so far, and is a static rather than a
+// `malloc` so that nothing here needs an allocator to start.
+private const HeapBytes: usize = 4194304
+
+private var storage: [HeapBytes]u8 = [0u8; HeapBytes]
+
+// The one heap. **Module storage, and the collector's design is what forces it**: a root function
+// must be a top-level function to have an address, and it has to reach the interpreter's state, so
+// that state cannot be a local of anything. One interpreter to a process is the consequence.
+var slate_heap: gc.Heap = gc.heap(&storage[0], HeapBytes)
+
+// -- the objects --------------------------------------------------------------------------------
+
+// A slate string. Immutable, as Go's is, so nothing ever writes through one.
+//
+// **The GC object is the sysl string's ONLY owner, and that is the point of the arrangement.**
+// `new_str` takes the string by value and stores it; the caller's copy dies with the caller's frame,
+// which drops the count to one -- the one inside this object. From then on nothing but the
+// collector decides when those bytes go, and `finalize_str` is what takes the count to zero. A
+// caller that squirrels a second copy away somewhere would break exactly that, which is why nothing
+// in slate holds a sysl `string` for a slate string value: a `Value` holds a `*StrObj` and nothing
+// else.
+struct StrObj
+    s: string
+
+// A slate array. Its elements are `Value`s, which is what `trace` walks.
+struct ArrayObj
+    items: Buf[Value]
+
+// A slate object: a record whose fields are named.
+struct ObjectObj
+    fields: Map[string, Value]
+
+// A function and the scope it was written in.
+//
+// **The scope is the whole of what makes it a closure**, and the reason this file exists: a function
+// that outlives the call that made it keeps that scope alive, and a named function's scope holds the
+// function.
+struct ClosureObj
+    params: Buf[string]
+
+    // An index into `bodies`, not an `Expr`: a counted box may not live in raw GC memory.
+    body: usize
+
+    scope: *EnvObj
+
+// A scope: the names written in one block, and the scope it sits inside.
+struct EnvObj
+    names: Map[string, Value]
+
+    // Which names may be written to. A `val` is absent and a `var` is present.
+    mutable: Map[string, bool]
+
+    // Null at the top level, where there is nothing outside.
+    parent: *EnvObj
+
+// -- tracing ------------------------------------------------------------------------------------
+
+// Grey whatever a value points at. Scalars point at nothing and cost one comparison.
+mark_value(h: *gc.Heap, v: Value)
+    v match
+        Str(p) -> gc.mark(h, ptr_cast(p))
+        Array(p) -> gc.mark(h, ptr_cast(p))
+        Object(p) -> gc.mark(h, ptr_cast(p))
+        Fn(p) -> gc.mark(h, ptr_cast(p))
+        _ -> ()
+end mark_value
+
+// Grey every value in a map. Used by both the object kind and the scope kind.
+private mark_map(h: *gc.Heap, m: Map[string, Value])
+    var walk = m.walk()
+
+    loop
+        walk.next() match
+            None -> break
+            Some(pair) -> mark_value(h, pair.1)
+end mark_map
+
+// A string owns its sysl `string` and points at nothing, so it needs a finalizer and no tracer.
+trace_str(p: *u8, h: *gc.Heap)
+    ()
+
+finalize_str(p: *u8)
+    val o: *StrObj = ptr_cast(p)
+
+    // Writing an empty string here releases the one that was there, which is the whole of what a
+    // finalizer owes: give back what the object held outside the collected heap.
+    o.s = ""
+
+trace_array(p: *u8, h: *gc.Heap)
+    val o: *ArrayObj = ptr_cast(p)
+
+    for i in 0..<o.items.len()
+        mark_value(h, o.items.at(i))
+
+finalize_array(p: *u8)
+    val o: *ArrayObj = ptr_cast(p)
+
+    o.items = buf()
+
+trace_object(p: *u8, h: *gc.Heap)
+    val o: *ObjectObj = ptr_cast(p)
+
+    mark_map(h, o.fields)
+
+finalize_object(p: *u8)
+    val o: *ObjectObj = ptr_cast(p)
+
+    o.fields = map()
+
+trace_closure(p: *u8, h: *gc.Heap)
+    val o: *ClosureObj = ptr_cast(p)
+
+    gc.mark(h, ptr_cast(o.scope))
+
+finalize_closure(p: *u8)
+    val o: *ClosureObj = ptr_cast(p)
+
+    o.params = buf()
+
+trace_env(p: *u8, h: *gc.Heap)
+    val o: *EnvObj = ptr_cast(p)
+
+    gc.mark(h, ptr_cast(o.parent))
+    mark_map(h, o.names)
+
+finalize_env(p: *u8)
+    val o: *EnvObj = ptr_cast(p)
+
+    o.names = map()
+    o.mutable = map()
+
+// A `Kind` must outlive every object naming it and its address must not move, so these are module
+// storage. Module storage states its type, which is why each is written out.
+var str_kind: gc.Kind = gc.Kind(&trace_str, &finalize_str, null, null)
+var array_kind: gc.Kind = gc.Kind(&trace_array, &finalize_array, null, null)
+var object_kind: gc.Kind = gc.Kind(&trace_object, &finalize_object, null, null)
+var closure_kind: gc.Kind = gc.Kind(&trace_closure, &finalize_closure, null, null)
+var env_kind: gc.Kind = gc.Kind(&trace_env, &finalize_env, null, null)
+
+// -- the roots ----------------------------------------------------------------------------------
+
+// **`alloc` never collects, so a value held only in a sysl local is invisible to the mark phase.**
+// A tree-walker has those everywhere -- the subject of a `match`, a half-built array literal, the
+// evaluated arguments of a call -- and none of them is in any scope. So the interpreter pushes what
+// it is holding onto these, and pops on the way out.
+//
+// This is the shadow stack every precise collector's client has to keep, and it is the real cost of
+// tracing over refcounting. The alternative -- scanning the machine stack -- is what makes a
+// conservative collector a porting project rather than a dependency.
+private var root_values: Buf[Value] = buf()
+private var root_envs: Buf[*EnvObj] = buf()
+
+// Where the stacks stand now, to be given back to `release` on the way out.
+root_mark() -> usize = root_values.len()
+
+env_mark() -> usize = root_envs.len()
+
+// Hold a value across a point that may collect.
+hold(v: Value)
+    root_values.push(v)
+
+// Let go of everything pushed since a mark.
+release(mark: usize)
+    root_values.truncate(mark)
+
+// Hold a scope across a point that may collect.
+hold_env(e: *EnvObj)
+    root_envs.push(e)
+
+release_env(mark: usize)
+    root_envs.truncate(mark)
+
+// Everything the program can still reach.
+//
+// **A top-level function, because a hook is reached by address** and a nested one has no address to
+// take. That is also why the state above is module storage.
+roots(h: *gc.Heap)
+    for i in 0..<root_values.len()
+        mark_value(h, root_values.at(i))
+
+    for i in 0..<root_envs.len()
+        gc.mark(h, ptr_cast(root_envs.at(i)))
+end roots
+
+// How much of the heap is spoken for.
+heap_used() -> usize = gc.used(&slate_heap)
+
+// Collect, at a point the interpreter has chosen because it knows what is live.
+collect_now()
+    gc.collect(&slate_heap, &roots)
+
+// How much may be allocated before a collection is worth doing.
+private const CollectAbove: usize = 262144
+
+// Collect if enough has been allocated to be worth it.
+//
+// **Called only at a statement boundary, and that is the whole of the safety argument.** `alloc`
+// never collects, so the one moment a collection can happen is one the interpreter chose -- and it
+// chose the top of a statement, where what is live is the scope chain plus whatever the frames above
+// have pushed onto the shadow stack. A collection anywhere else would sweep a value some sysl local
+// was halfway through building.
+maybe_collect()
+    if gc.used(&slate_heap) > CollectAbove then collect_now()
+
+// Give the heap back, and run every finalizer still outstanding.
+//
+// **Without it a finalizer never runs for anything still reachable when the program stops**, so
+// every sysl string and `Buf` a live object holds would leak. It is also what lets two programs run
+// in one process, which every test in this repo does.
+reset_heap()
+    gc.dispose(&slate_heap)
+    root_values.clear()
+    root_envs.clear()
+    heap_exhausted = false
+
+// -- allocation ---------------------------------------------------------------------------------
+
+// **A full heap answers null, and writing through that is a wild write.** The heap does not grow, so
+// a program that outruns it has to be told rather than crashed: each of these collects first if the
+// heap is nearly full, and `out_of_memory` reports the one case where that did not help.
+//
+// The collection here is safe for the same reason the one in `exec_block` is: these are only reached
+// while the interpreter is between sub-expressions, with everything live either in a scope or on the
+// shadow stack.
+
+// Whether the last allocation failed. Read at the statement boundary, where there is a span to point
+// at -- an allocator has no idea which line of the program it is serving.
+var heap_exhausted: bool = false
+
+// Try once, collect, try again. Null after that means the live set genuinely does not fit.
+private alloc_or_collect(size: usize, kind: *gc.Kind) -> *u8
+    var p = gc.alloc(&slate_heap, size, kind)
+
+    if p != null then return p
+
+    collect_now()
+
+    p = gc.alloc(&slate_heap, size, kind)
+
+    if p == null then heap_exhausted = true
+
+    p
+end alloc_or_collect
+new_str(s: string) -> *StrObj
+    var o: *StrObj = ptr_cast(alloc_or_collect(sizeof(StrObj), &str_kind))
+
+    o.s = s
+    o
+
+new_array(items: Buf[Value]) -> *ArrayObj
+    var o: *ArrayObj = ptr_cast(alloc_or_collect(sizeof(ArrayObj), &array_kind))
+
+    o.items = items
+    o
+
+new_object(fields: Map[string, Value]) -> *ObjectObj
+    var o: *ObjectObj = ptr_cast(alloc_or_collect(sizeof(ObjectObj), &object_kind))
+
+    o.fields = fields
+    o
+
+new_closure(params: Buf[string], body: usize, scope: *EnvObj) -> *ClosureObj
+    var o: *ClosureObj = ptr_cast(alloc_or_collect(sizeof(ClosureObj), &closure_kind))
+
+    o.params = params
+    o.body = body
+    o.scope = scope
+    o
+
+new_env(parent: *EnvObj) -> *EnvObj
+    var o: *EnvObj = ptr_cast(alloc_or_collect(sizeof(EnvObj), &env_kind))
+
+    o.names = map()
+    o.mutable = map()
+    o.parent = parent
+    o

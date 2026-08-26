@@ -1,5 +1,6 @@
 module slate
 
+import sh.sysl.gc
 import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map}
 
@@ -8,26 +9,29 @@ import sysl.container.{Map, map}
 // slate is dynamically typed, so this is the tagged union every such language has, and the whole of
 // its type system lives in the arms that read it.
 //
-// **An array and an object are counted boxes, and that is what makes them reference types.** Two
-// names for one `&Buf[Value]` see each other's writes, so `val a = [1]` followed by `val b = a` and
-// `b[0] = 2` changes what `a` holds -- which is what JavaScript, Python and Ruby all do, and is not
-// something slate has to implement. A number, a string and a boolean are values and are copied.
+// **Not one member of it is reference counted**, and that is what makes it cheap: scalars, and raw
+// pointers into the collected heap. A `Value` copies with no ARC traffic, stores into GC memory
+// without a write barrier, and needs no finalizer of its own -- the objects it points at have those.
+//
+// **An array and an object are reference types because the pointer is the value.** Two names for one
+// array see each other's writes, which is what JavaScript, Python and Ruby all do and is not
+// something slate implements. A number and a boolean are copied.
 enum Value
     Nil
     Bool(v: bool)
     Int(v: long)
     Real(v: real)
-    Str(v: string)
-    Array(items: &Buf[Value])
-    Object(fields: &Map[string, Value])
-    Fn(f: &Closure)
+    Str(p: *StrObj)
+    Array(p: *ArrayObj)
+    Object(p: *ObjectObj)
+    Fn(p: *ClosureObj)
 
-    // A function the interpreter supplies, named rather than boxed.
+    // A function the interpreter supplies.
     //
-    // **It is a `Value` so that a builtin is an ordinary first-class function**: `val p = print`
-    // binds it, and `apply(print, 1)` calls it. Dispatching on the name at the call site instead
-    // would have made the builtins the one kind of function a slate program cannot pass around.
-    Native(name: string)
+    // **A closed enum rather than a name, so that a `Value` stays free of reference counting.** A
+    // `string` here would be the one ARC member in the union and would put a finalizer on every
+    // object that can hold a value.
+    Native(f: NativeFn)
 
     // The name a program uses for this kind of value, which is what a runtime complaint says.
     type_name(self) -> string = self match
@@ -44,107 +48,73 @@ enum Value
     // Whether this counts as true in a condition.
     //
     // **Only `false` and `nil` are false, and nothing else is.** The alternative -- zero and the
-    // empty string being false as well -- is the rule JavaScript and Python took and is the one
-    // most often written about as a mistake: it makes `if xs.len` and `if xs.len != 0` differ from
-    // each other in a way nobody predicts. slate takes Ruby's and Lua's side of that argument.
+    // empty string being false as well -- is the rule JavaScript and Python took and is the one most
+    // often written about as a mistake: it makes `if xs.len` and `if xs.len != 0` differ from each
+    // other in a way nobody predicts. slate takes Ruby's and Lua's side of that argument.
     truthy(self) -> bool = self match
         Nil -> false
         Bool(v) -> v
         _ -> true
 end Value
 
-// A function and the scope it was written in.
+// The functions a program has without writing them.
+enum NativeFn deriving Display
+    NPrint
+    NLen
+    NPush
+    NStr
+    NKeys
+end NativeFn
+
+// The text of a slate string, for the interpreter's own use.
+text_of(p: *StrObj) -> string = p.s
+
+// A slate string value over a sysl string. The GC object becomes that string's only owner.
+str_value(s: string) -> Value = Str(new_str(s))
+
+// -- scopes -------------------------------------------------------------------------------------
+
+// What a name holds, looked up outward through the chain.
+lookup(e: *EnvObj, name: string) -> Option[Value]
+    var scope = e
+
+    // A loop rather than the recursion this reads as, because a scope chain is as deep as a
+    // program's nesting and a walk up it is a walk up a linked list.
+    loop
+        if scope == null then return None
+
+        scope.names.get(name) match
+            Some(v) -> return Some(v)
+            None -> scope = scope.parent
+end lookup
+
+// Whether a name is bound anywhere in the chain.
+knows(e: *EnvObj, name: string) -> bool = lookup(e, name).is_some()
+
+// Bind a name in this scope, shadowing whatever an outer one had.
+declare(e: *EnvObj, name: string, v: Value, assignable: bool)
+    e.names.put(name, v)
+    e.mutable.put(name, assignable)
+
+// Write to an existing binding, wherever in the chain it lives.
 //
-// **The scope is the whole of what makes it a closure**, and it is a counted box, so a function that
-// outlives the call that made it keeps that scope alive and keeps seeing writes to it. A counter
-// whose `bump` increments a `var` in its parent works for that reason and for no other.
-struct Closure
-    params: Buf[string]
-    body: Expr
-    scope: &Env
+// Three answers rather than two: the name may be unknown, or known and not writable, and the two are
+// different complaints.
+assign_name(e: *EnvObj, name: string, v: Value) -> Assigned
+    var scope = e
 
-    arity(self) -> usize = self.params.len()
-end Closure
+    loop
+        if scope == null then return Unknown
 
-// What one run of a program has that is not a scope.
-//
-// **It exists so that the interpreter has no module-level `var`.** A gathered output buffer is the
-// obvious thing to make a global, and a global would make the interpreter non-reentrant -- two
-// programs could not run in one process, which is what every test in this repo does. It also makes
-// the buffer *module storage*, which an initializer fills before a program's statements run, and
-// that is what shuts a package out of a freestanding target. Neither cost is worth a saved
-// parameter.
-//
-// It hangs off `Env` rather than being threaded separately because every scope of a run already
-// carries the chain, and one more shared box on it costs nothing at any call site.
-struct World
-    // What the program printed. Gathered rather than written, so that a test can read it back and
-    // two runs cannot interleave.
-    output: &Buf[string]
-end World
+        if scope.names.has(name)
+            if !scope.mutable.get_or(name, false) then return Immutable
 
-// A scope: the names written in one block, and the scope it sits inside.
-//
-// **A chain rather than a flattened map**, because a block's bindings go out of scope with it and a
-// closure made inside one has to keep exactly that block alive and nothing more.
-struct Env
-    names: Map[string, Value]
-
-    // `None` at the top level, where there is nothing outside.
-    parent: Option[&Env]
-
-    // The same box in every scope of one run.
-    world: &World
-
-    // Which names may be written to. A `val` is absent from this and a `var` is in it, which is how
-    // an assignment to a `val` is refused at the moment it is attempted.
-    mutable: Map[string, bool]
-
-    // What a name holds, looked up outward through the chain.
-    lookup(self, name: string) -> Option[Value]
-        self.names.get(name) match
-            Some(v) -> Some(v)
-            None ->
-                self.parent match
-                    Some(p) -> p.lookup(name)
-                    None -> None
-    end lookup
-
-    // Whether a name is bound anywhere in the chain.
-    knows(self, name: string) -> bool = self.lookup(name).is_some()
-
-    // Bind a name in this scope, shadowing whatever an outer one had.
-    declare(*self, name: string, v: Value, assignable: bool)
-        self.names.put(name, v)
-        self.mutable.put(name, assignable)
-
-    // Write to an existing binding, wherever in the chain it lives.
-    //
-    // Three answers rather than two: the name may be unknown, or known and not writable, and the
-    // two are different complaints.
-    assign(*self, name: string, v: Value) -> Assigned
-        if self.names.has(name)
-            if !self.mutable.get_or(name, false) then return Immutable
-
-            self.names.put(name, v)
+            scope.names.put(name, v)
             return Written
         end if
 
-        self.parent match
-            Some(p) -> p.assign(name, v)
-            None -> Unknown
-    end assign
-end Env
-
-// A new scope inside this one.
-//
-// **The constructors are free functions because a member cannot be one**: sysl has no inherent
-// `impl` block, so every member is written in its type's body and a name that makes a value of the
-// type has nowhere in there to go.
-child_env(parent: &Env) -> &Env = Env(map(), Some(parent), parent.world, map())
-
-// The scope a program starts in, with a world of its own.
-root_env() -> &Env = Env(map(), None, World(buf()), map())
+        scope = scope.parent
+end assign_name
 
 // What happened when a name was written to.
 enum Assigned

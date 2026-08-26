@@ -18,6 +18,7 @@ slate/
     parse.sysl      statements, by recursive descent
     expr.sysl       expressions, by binding power
     pattern.sysl    patterns, and the arms of a `match`
+    obj.sysl        the collected heap: the objects, their tracers, and the roots
     value.sysl      what a program computes with, and the scope chain
     eval.sysl       the walk
     builtin.sysl    the functions a program has without writing them
@@ -144,12 +145,33 @@ Two of its own notes turn out to matter here and are worth repeating:
 - **A parse error is a node, not a `Result`.** It keeps the tree shaped and lets one pass report
   every mistake in a file.
 
+## Memory
+
+**Values are traced, not reference counted, because slate makes a cycle on every named function** —
+`define` binds a closure into the very scope that closure captured. Nothing declared that back-edge,
+so `weak` cannot help: it is a cycle in somebody else's program, which is what `sysl-lang/gc` is for.
+
+The collector manages exactly what refcounting cannot. Strings, arrays, objects, closures and scopes
+are collected; the syntax tree is not, being immutable and acyclic. A slate string is a GC object
+holding a sysl `string` and is that string's only owner, so finalising takes its count to zero — the
+same bargain gives an array its `Buf` and an object its `Map`. A `Value` therefore holds no
+reference-counted member at all: scalars and raw pointers, which is what lets one be copied with no
+ARC traffic on the hot path.
+
+Two consequences worth knowing:
+
+- **`alloc` never collects, so a value held only in a sysl local is invisible to the mark phase.** A
+  tree-walker has those everywhere — a match subject, a half-built literal, a call's arguments — so
+  the interpreter keeps a shadow stack and collects only at a statement boundary. That is the real
+  cost of tracing over refcounting, and it is why `obj.sysl` has `hold` and `release`.
+- **The interpreter's state is module storage**, because a root function must be a top-level function
+  to have an address and must reach that state. One interpreter to a process; `run` empties the heap
+  on the way in, which is what lets two programs run one after another.
+
 ## What is not here yet
 
 String interpolation, a module system, a literate `.lsl` form, and anything resembling a standard
-library beyond five builtins. **Values are reference-counted, so a cycle leaks** — and every named
-function is one, its closure being bound into the scope it captured. `sysl-lang/gc` is the answer and
-is the next piece of work.
+library beyond five builtins.
 
 The two examples are the current surface, and it is meant to grow in whatever direction puts the most
 pressure on sysl.
