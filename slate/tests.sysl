@@ -1,0 +1,160 @@
+module slate
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{str_builder, Search}
+
+// What slate claims, run by `sysl test .`.
+
+// -- helpers ----------------------------------------------------------------------------------
+
+// The token kinds a snippet lexes to, as one space-separated line.
+//
+// **Spans are dropped here and asserted separately.** A test that pins both says nothing clearly
+// when it fails: the whole list is printed and the reader has to find which half moved. The shape
+// of the token stream is what nearly every one of these is about, so that is what they compare.
+//
+// **A string rather than the `Buf[Tok]` this naturally wants to be**, because neither `Buf[T]` nor
+// `[]T` is `Eq` where `T` is -- `sysl.slices.equal` is the only comparison, and it answers a bare
+// `bool`, so a failure would print which assertion broke and not what the two sides were. Rendering
+// first costs an allocation no test cares about and buys a failure that reads like a diff.
+private kinds(text: string) -> string
+    val r = lex(source_of("t", text))
+    var out = str_builder()
+    var t = r.tokens
+    var first = true
+
+    loop
+        t.advance() match
+            None -> break
+            Some(x) ->
+                if !first then out.push_char(' ')
+
+                out.push(s"${x.value}")
+                first = false
+
+    out.finish()
+end kinds
+
+// Whether a snippet lexes with nothing to complain about.
+private clean(text: string) -> bool = lex(source_of("t", text)).ok()
+
+// The first complaint a snippet draws, rendered as the sentence a person would read.
+private first_fault(text: string) -> string
+    val src = source_of("t", text)
+    val r = lex(src)
+
+    if r.report.is_empty() then "" else r.report.render(src)
+end first_fault
+
+// -- words and operators ----------------------------------------------------------------------
+
+@test
+a_word_the_grammar_took_is_not_an_identifier()
+    assert_eq(kinds("val"), "Val Newline Eof")
+    assert_eq(kinds("var"), "Var Newline Eof")
+    assert_eq(kinds("nil"), "Nil Newline Eof")
+
+@test
+a_word_the_grammar_did_not_take_is_an_identifier()
+    assert_eq(kinds("value"), "Ident Newline Eof")
+    assert_eq(kinds("iffy"), "Ident Newline Eof")
+    assert_eq(kinds("_x1"), "Ident Newline Eof")
+
+@test
+end_is_a_soft_word_and_stays_an_identifier()
+    // Taking `end` as a keyword would take the name away from every program that wanted it. The
+    // parser decides what it means by what follows.
+    assert_eq(kinds("end"), "Ident Newline Eof")
+
+@test
+a_two_byte_operator_is_read_before_its_first_byte()
+    assert_eq(kinds("=="), "EqEq Newline Eof")
+    assert_eq(kinds("="), "Assign Newline Eof")
+    assert_eq(kinds("->"), "Arrow Newline Eof")
+    assert_eq(kinds("-"), "Minus Newline Eof")
+    assert_eq(kinds("<="), "LtEq Newline Eof")
+    assert_eq(kinds("<"), "Lt Newline Eof")
+    assert_eq(kinds("!="), "BangEq Newline Eof")
+    assert_eq(kinds("!"), "Bang Newline Eof")
+end a_two_byte_operator_is_read_before_its_first_byte
+
+// -- literals ---------------------------------------------------------------------------------
+
+@test
+an_integer_and_a_real_are_told_apart()
+    assert_eq(kinds("42"), "IntLit Newline Eof")
+    assert_eq(kinds("4.2"), "RealLit Newline Eof")
+    assert_eq(kinds("0x2a"), "IntLit Newline Eof")
+
+@test
+a_string_keeps_its_quotes_in_its_span()
+    val r = lex(source_of("t", "\"hi\""))
+
+    assert_eq(r.tokens.peek().unwrap().span, Span(0, 4))
+
+@test
+a_malformed_literal_is_reported_and_does_not_stop_the_line()
+    assert(!clean("\"unclosed"))
+    assert(!clean("\"\\q\""))
+
+// -- layout -----------------------------------------------------------------------------------
+
+@test
+an_indented_run_opens_and_closes_one_block()
+    assert_eq(kinds("a\n    b\n"), "Ident Indent Ident Newline Dedent Eof")
+
+@test
+two_lines_at_one_depth_are_separated_by_a_newline()
+    assert_eq(kinds("a\nb\n"), "Ident Newline Ident Newline Eof")
+
+@test
+one_line_closes_as_many_blocks_as_it_dedents_past()
+    assert_eq(kinds("a\n    b\n        c\nd\n"), "Ident Indent Ident Indent Ident Newline Dedent Dedent Ident Newline Eof")
+end one_line_closes_as_many_blocks_as_it_dedents_past
+
+@test
+everything_still_open_closes_at_the_end_of_the_file()
+    assert_eq(kinds("a\n    b\n        c\n"), "Ident Indent Ident Indent Ident Newline Dedent Dedent Eof")
+
+@test
+a_blank_line_is_not_a_line()
+    // Neither a statement separator nor a block: there is nothing on it to separate.
+    assert_eq(kinds("a\n\n\nb\n"), "Ident Newline Ident Newline Eof")
+
+@test
+a_comment_only_line_is_not_a_line_whatever_its_indentation()
+    // A person who indents a comment to line up with the code below it did not mean to open a block.
+    assert_eq(kinds("a\n        // note\nb\n"), "Ident Newline Ident Newline Eof")
+
+@test
+a_trailing_comment_ends_the_line_and_nothing_else()
+    assert_eq(kinds("a // note\nb\n"), "Ident Newline Ident Newline Eof")
+
+@test
+a_newline_inside_brackets_is_not_a_line_ending()
+    // The rule every language with both features implements the same way: count the brackets in the
+    // lexer, and ignore line structure while the count is above zero.
+    assert_eq(kinds("f(a,\n    b)\n"), "Ident LParen Ident Comma Ident RParen Newline Eof")
+end a_newline_inside_brackets_is_not_a_line_ending
+
+@test
+a_line_lining_up_with_nothing_is_reported_rather_than_quietly_closed()
+    // The one indentation mistake a person actually makes: a body pulled back to a column between
+    // two open ones. Closing the nearest level quietly would turn it into a parse error elsewhere.
+    val text = "a\n        b\n    c\n"
+
+    assert(!clean(text))
+    assert(first_fault(text).contains("lines up with no block"))
+end a_line_lining_up_with_nothing_is_reported_rather_than_quietly_closed
+
+@test
+mixing_tabs_and_spaces_on_one_line_is_reported()
+    assert(!clean("a\n \tb\n"))
+
+@test
+an_empty_file_has_no_structure_to_report()
+    assert_eq(kinds(""), "Eof")
+    assert_eq(kinds("\n\n"), "Eof")
+    assert(clean(""))

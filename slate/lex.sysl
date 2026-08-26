@@ -1,0 +1,304 @@
+module slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.slices.equal
+
+// Bytes to tokens, with indentation turned into structure on the way.
+//
+// The pass is `sh.sysl.parsing`'s `layout` doing the bookkeeping and this file deciding what the
+// bookkeeping *means*: the column stack, the bracket depth and the arithmetic of closing several
+// blocks at once are all there, and what a `NEWLINE` is called and whether a blank line counts as a
+// line at all are here, because those are the grammar's and not the toolkit's.
+//
+// **Three tokens carry the shape of the file and none of them is a character in it.** `Indent` opens
+// a block, `Dedent` closes one, and `Newline` separates two statements at the same depth. Above this
+// line the parser never looks at a column.
+
+// A tab advances to the next multiple of this. Eight is what a terminal does, and therefore what the
+// person looking at the file sees.
+private const TabWidth: usize = 8
+
+// The result of reading a whole file: the tokens, and everything that was wrong with it.
+//
+// **Both, rather than one or the other.** A lexer that stops at the first bad byte reports one
+// mistake per run, and a file with two typos in it takes two runs to fix. So a malformed literal is
+// recorded and skipped, and the caller decides whether a non-empty report means the parse should go
+// ahead -- which for slate it does not, but that is the caller's rule to state.
+struct Lexed
+    tokens: Tokens[Tok]
+    report: Report
+
+    ok(self) -> bool = !self.report.has_errors()
+end Lexed
+
+// Read a whole source into tokens.
+lex(src: Source) -> Lexed
+    var s = scan(src)
+    var lay = layout()
+    // The annotation is the one the compiler asks for: `Tokens[T]` takes its parameter from the
+    // element type of the buffer handed in, and an empty `buf()` has nothing to say about it.
+    var out: Tokens[Tok] = Tokens(buf(), 0)
+    var rep = report()
+
+    // Whether the cursor is at the head of a line whose indentation has not been measured yet. It is
+    // only ever set where the layout is significant, so a line continued inside brackets never
+    // reaches the measuring branch at all.
+    var at_line_head = true
+
+    // Whether anything has been emitted. The first line of a file opens no block and ends no
+    // statement, so it gets neither an `Indent` nor a `Newline`, and this is what tells it apart
+    // from an identical line halfway down.
+    var started = false
+
+    loop
+        if at_line_head
+            val ind = measure_indent(&s, TabWidth)
+
+            if s.at_end()
+                break
+
+            // A line with nothing on it but spaces, or nothing but a comment, is not a line: it has
+            // no statement to separate and no block to open, and a person who indents a comment to
+            // line up with the code below it did not mean to open one.
+            if s.at_line_end() || s.starts_with("//".bytes)
+                s.skip_line()
+                continue
+            end if
+
+            if ind.is_mixed()
+                rep.add(error(s.here(), "this line is indented with both tabs and spaces")
+                    .with_note("a file may use either, but a file using both nests differently in different editors"))
+
+            emit_dent(&out, &rep, lay.line(ind.columns), s.here(), started)
+
+            started = true
+            at_line_head = false
+        end if
+
+        s.skip_blanks()
+
+        if s.starts_with("//".bytes)
+            s.skip_to_line_end()
+
+        if s.at_end()
+            break
+
+        if s.at_line_end()
+            s.accept_newline()
+
+            if lay.significant()
+                at_line_head = true
+
+            continue
+        end if
+
+        scan_token(&s, &lay, &out, &rep)
+    end loop
+
+    // Whatever is still open at the end of the file closes there, and the statement on the last line
+    // ends there too. The empty span at the end is where a complaint about an unterminated construct
+    // points.
+    val eof = point(s.at)
+
+    if started
+        out.push(Newline, eof)
+
+    for _ in 0..<lay.finish()
+        out.push(Dedent, eof)
+
+    out.push(Eof, eof)
+
+    Lexed(out, rep)
+end lex
+
+// Turn one line's indentation into the tokens that stand for it.
+//
+// **A `Dedent` ends the statement above it as well as closing the block**, so no `Newline` is
+// emitted beside one. The parser therefore accepts either as a statement terminator, which is the
+// same rule Python's grammar states and is what keeps the last statement of a block from needing a
+// blank line under it.
+private emit_dent(out: *Tokens[Tok], rep: *Report, d: Dent, at: Span, started: bool)
+    d match
+        Same ->
+            if started then out.push(Newline, at)
+        Deeper ->
+            out.push(Indent, at)
+        Shallower(levels) ->
+            if started then out.push(Newline, at)
+
+            for _ in 0..<levels
+                out.push(Dedent, at)
+        Ragged(levels) ->
+            rep.add(error(at, "this line lines up with no block that is open")
+                .with_note("it is less indented than the line above and matches none of the levels still open"))
+
+            if started then out.push(Newline, at)
+
+            for _ in 0..<levels
+                out.push(Dedent, at)
+end emit_dent
+
+// One token, from wherever the cursor is standing.
+//
+// The cursor is known not to be at a newline, at the end, or on a space: the loop above has dealt
+// with all three, so what is here begins something.
+private scan_token(s: *Scanner, lay: *Layout, out: *Tokens[Tok], rep: *Report)
+    val m = s.mark()
+
+    s.peek() match
+        None -> return
+        Some(c) ->
+            if is_ident_start(c) then
+                scan_word(s, out, m)
+            elif is_digit(c) then
+                scan_number(s, out, rep, m)
+            elif c == u8('"') then
+                scan_string(s, out, rep, m)
+            else
+                scan_punct(s, lay, out, rep, m)
+end scan_token
+
+// A word: an identifier, or one of the words the grammar has taken.
+private scan_word(s: *Scanner, out: *Tokens[Tok], m: usize)
+    s.read_ident(is_ident_start, is_ident_cont)
+
+    out.push(word_kind(s.text_from(m)), s.span_from(m))
+
+// Which token a run of identifier bytes is.
+//
+// **A chain of comparisons rather than a table, and it is the right shape here.** A table would be
+// module storage -- an initializer that runs before the program does -- and slate's word list is
+// eighteen entries, which a chain settles in a handful of byte compares because the lengths differ.
+// Every hand-written lexer this file was modelled on does exactly this.
+//
+// `end` is deliberately absent: it is a soft word, so it arrives as an `Ident` and the parser
+// decides by what follows. See the note in `tok.sysl`.
+private word_kind(w: []const u8) -> Tok
+    if equal(w, "val".bytes) then Val
+    elif equal(w, "var".bytes) then Var
+    elif equal(w, "if".bytes) then If
+    elif equal(w, "then".bytes) then Then
+    elif equal(w, "elif".bytes) then Elif
+    elif equal(w, "else".bytes) then Else
+    elif equal(w, "while".bytes) then While
+    elif equal(w, "for".bytes) then For
+    elif equal(w, "in".bytes) then In
+    elif equal(w, "loop".bytes) then Loop
+    elif equal(w, "do".bytes) then Do
+    elif equal(w, "break".bytes) then Break
+    elif equal(w, "continue".bytes) then Continue
+    elif equal(w, "return".bytes) then Return
+    elif equal(w, "true".bytes) then True
+    elif equal(w, "false".bytes) then False
+    elif equal(w, "nil".bytes) then Nil
+    else Ident
+end word_kind
+
+// A number, which slate keeps as an integer or a real exactly as it was written.
+//
+// **The value is thrown away here and read again in the parser.** What this call is for is the
+// *diagnosis*: `read_number` knows about radix prefixes, underscores and overflow, so a malformed
+// literal is caught at the byte that caused it rather than surviving into a tree.
+private scan_number(s: *Scanner, out: *Tokens[Tok], rep: *Report, m: usize)
+    read_number(s) match
+        Ok(n) ->
+            val kind = n match
+                Int(_) -> IntLit
+                Real(_) -> RealLit
+
+            out.push(kind, s.span_from(m))
+        Err(e) ->
+            rep.add(error(where(e), lit_message(e)))
+
+            // Step past whatever the reader stopped on, so that the loop above cannot spin on it.
+            if s.offset == m then s.bump()
+
+// A quoted string. The span kept is the whole lexeme, both quotes included, because that is what a
+// caret should underline when the complaint is about the literal rather than about one escape in it.
+private scan_string(s: *Scanner, out: *Tokens[Tok], rep: *Report, m: usize)
+    read_quoted(s, u8('"')) match
+        Ok(_) -> out.push(StrLit, s.span_from(m))
+        Err(e) ->
+            rep.add(error(where(e), lit_message(e)))
+
+            if s.offset == m then s.bump()
+
+// Everything that is neither a word, a number nor a string.
+private scan_punct(s: *Scanner, lay: *Layout, out: *Tokens[Tok], rep: *Report, m: usize)
+    punct_kind(s, lay) match
+        Some(k) -> out.push(k, s.span_from(m))
+        None ->
+            s.next_char()
+
+            rep.add(error(s.span_from(m), s"`${escape_text(s.text_from(m))}` is not a slate character"))
+
+// The operator or separator at the cursor, consumed.
+//
+// **Two bytes are tried before one, and the order is the whole of the rule**: `=` would swallow the
+// first half of `==` and `-` the first half of `->`. A bracket adjusts the layout's depth on the way
+// past, which is what makes a newline inside one insignificant.
+private punct_kind(s: *Scanner, lay: *Layout) -> Option[Tok]
+    if s.accept_seq("==".bytes) then return Some(EqEq)
+    if s.accept_seq("!=".bytes) then return Some(BangEq)
+    if s.accept_seq("<=".bytes) then return Some(LtEq)
+    if s.accept_seq(">=".bytes) then return Some(GtEq)
+    if s.accept_seq("&&".bytes) then return Some(AndAnd)
+    if s.accept_seq("||".bytes) then return Some(OrOr)
+    if s.accept_seq("->".bytes) then return Some(Arrow)
+
+    if s.accept(u8('('))
+        lay.open_bracket()
+        return Some(LParen)
+
+    if s.accept(u8(')'))
+        lay.close_bracket()
+        return Some(RParen)
+
+    if s.accept(u8('['))
+        lay.open_bracket()
+        return Some(LBracket)
+
+    if s.accept(u8(']'))
+        lay.close_bracket()
+        return Some(RBracket)
+
+    if s.accept(u8('{'))
+        lay.open_bracket()
+        return Some(LBrace)
+
+    if s.accept(u8('}'))
+        lay.close_bracket()
+        return Some(RBrace)
+
+    if s.accept(u8(',')) then return Some(Comma)
+    if s.accept(u8(':')) then return Some(Colon)
+    if s.accept(u8('.')) then return Some(Dot)
+    if s.accept(u8('=')) then return Some(Assign)
+    if s.accept(u8('+')) then return Some(Plus)
+    if s.accept(u8('-')) then return Some(Minus)
+    if s.accept(u8('*')) then return Some(Star)
+    if s.accept(u8('/')) then return Some(Slash)
+    if s.accept(u8('%')) then return Some(Percent)
+    if s.accept(u8('<')) then return Some(Lt)
+    if s.accept(u8('>')) then return Some(Gt)
+    if s.accept(u8('!')) then return Some(Bang)
+
+    None
+end punct_kind
+
+// What to say about a literal that would not read.
+//
+// The toolkit's `LitError` says which rule was broken and where; the sentence a person reads is the
+// grammar's, because only the grammar knows what it was trying to read at the time.
+private lit_message(e: LitError) -> string
+    e match
+        NoDigits(_) -> "this number has no digits"
+        BadDigit(_) -> "this digit is not one this base allows"
+        Overflow(_) -> "this number is too large to hold"
+        Unterminated(_) -> "this string reaches the end of the file without closing"
+        NoQuote(_) -> "a string starts with a quote"
+        BadEscape(_) -> "this is not an escape slate knows"
+        BadCodepoint(_) -> "this escape is not a character"
+        BadReal(_) -> "this is not a number that can be read"
+end lit_message
