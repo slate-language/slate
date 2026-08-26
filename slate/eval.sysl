@@ -1,0 +1,564 @@
+module slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+import sysl.text.{str_builder, StrBuilder}
+
+// Walking the tree.
+//
+// **Everything that is not ordinary completion travels in the error channel, and that is the one
+// design decision this file turns on.** A tree-walking interpreter has to carry four things upward
+// out of a nested expression -- a `return`, a `break`, a `continue`, and a runtime fault -- and the
+// usual shape for it is a five-armed `Outcome` enum matched at every one of the fifty places a
+// sub-expression is evaluated.
+//
+// Modelling them as `Result[Value, Signal]` instead makes `?` do all of it. Every propagation site
+// is `eval(x, env)?`, the four unwinding cases are indistinguishable to the code they pass through --
+// which is exactly right, since none of them is that code's business -- and the two places that
+// *do* care catch them: a loop stops at `Brk`, a call stops at `Ret`.
+
+// Why a walk stopped early.
+//
+// The names avoid `Break`, `Continue` and `Return`, which `StmtKind` and `Tok` already have. Two
+// enums may share a variant name and the expected type picks between them, but a reader should not
+// have to work out which `Break` is meant.
+enum Signal
+    // A `return` on its way out of a call.
+    Ret(v: Value)
+
+    Brk
+    Cont
+
+    // Something the program did that it may not.
+    Fail(at: Span, message: string)
+end Signal
+
+// What every step of the walk answers with.
+type Step = Result[Value, Signal]
+
+// A fault at a place, as the error channel wants it.
+//
+// Not `private`: `private` in sysl is private to the *file*, and `builtin.sysl` complains too.
+fault(at: Span, message: string) -> Step = Err(Fail(at, message))
+
+// -- entry point --------------------------------------------------------------------------------
+
+// What running a program answers with.
+struct Ran
+    value: Value
+    report: Report
+
+    // The lines the program printed, in order.
+    output: &Buf[string]
+
+    ok(self) -> bool = !self.report.has_errors()
+
+    // Everything printed, joined by newlines -- which is what a test compares against.
+    printed(self) -> string
+        var out = str_builder()
+
+        for i in 0..<self.output.len()
+            if i > 0 then out.push_char('\n')
+
+            out.push(self.output.at(i))
+
+        out.finish()
+    end printed
+end Ran
+
+// Read a source and run it.
+//
+// **A program with a single mistake in it is not run at all.** The parser reports everything it
+// found in one pass, and running a tree that has `Bad` nodes in it would produce a second, worse
+// account of the same file.
+run(src: Source) -> Ran
+    val parsed = parse(src)
+    var env = root_env()
+
+    if !parsed.ok() then return Ran(Nil, parsed.report, env.world.output)
+
+    install_builtins(env)
+
+    var rep = parsed.report
+
+    exec_block(parsed.program.stmts, env) match
+        Ok(v) -> Ran(v, rep, env.world.output)
+        Err(s) ->
+            rep.add(error(signal_span(s), signal_message(s)))
+            Ran(Nil, rep, env.world.output)
+end run
+
+// Where to point at a signal that escaped to the top.
+private signal_span(s: Signal) -> Span = s match
+    Fail(at, _) -> at
+    _ -> point(0)
+
+private signal_message(s: Signal) -> string = s match
+    Fail(_, m) -> m
+    Ret(_) -> "`return` outside a function"
+    Brk -> "`break` outside a loop"
+    Cont -> "`continue` outside a loop"
+
+// -- statements ---------------------------------------------------------------------------------
+
+// A run of statements, whose value is the last one's.
+//
+// **A block's value is its trailing expression**, which is sysl's rule and slate's. A block ending
+// in something that is not an expression is `nil`, exactly as one ending in a `while` would be.
+exec_block(stmts: Buf[Stmt], env: &Env) -> Step
+    var last: Value = Nil
+
+    for i in 0..<stmts.len()
+        last = exec_stmt(stmts.at(i), env)?
+
+    Ok(last)
+end exec_block
+
+private exec_stmt(s: Stmt, env: &Env) -> Step
+    *s.kind match
+        Val(name, init) -> declare(env, name, init, false)
+        Var(name, init) -> declare(env, name, init, true)
+        Eval(e) -> eval(e, env)
+        Return(value) ->
+            // The annotation says which `Nil` this is: `Tok` has one too, and a bare `return`
+            // supplies nothing else on this line to pick from.
+            val v: Value = value match
+                Some(e) -> eval(e, env)?
+                None -> Nil
+
+            Err(Ret(v))
+        Break -> Err(Brk)
+        Continue -> Err(Cont)
+        Assign(target, value) -> assign_to(target, value, env, s.span)
+        Def(name, params, body) -> define(env, name, params, body)
+        While(cond, body) -> run_while(cond, body, env)
+        For(name, iter, body) -> run_for(name, iter, body, env, s.span)
+        Loop(body) -> run_loop(body, env)
+end exec_stmt
+
+// `val x = e` and `var x = e`.
+private declare(env: &Env, name: string, init: Expr, assignable: bool) -> Step
+    val v = eval(init, env)?
+
+    env.declare(name, v, assignable)
+    Ok(Nil)
+end declare
+
+// A named function.
+//
+// **The name is bound before the closure is built, so the body can see it.** That is the whole of
+// what makes a named function recursive and a lambda not: the closure captures the scope, and the
+// scope already holds the name by the time anything calls it.
+private define(env: &Env, name: string, params: Buf[string], body: Expr) -> Step
+    env.declare(name, Nil, false)
+    env.declare(name, Fn(Closure(params, body, env)), false)
+    Ok(Nil)
+end define
+
+// `x = e`, `o.f = e`, `xs[i] = e`.
+private assign_to(target: Expr, value: Expr, env: &Env, at: Span) -> Step
+    val v = eval(value, env)?
+
+    *target.kind match
+        Name(n) ->
+            env.assign(n, v) match
+                Written -> Ok(Nil)
+                Immutable -> fault(target.span, s"`${n}` is a `val`, so it is written once")
+                Unknown -> fault(target.span, s"`${n}` is not defined")
+        Field(obj, name) ->
+            eval(obj, env)? match
+                Object(fields) ->
+                    fields.put(name, v)
+                    Ok(Nil)
+                other -> fault(target.span, s"a field belongs to an object, and this is ${other.type_name()}")
+        Index(target_expr, key) ->
+            val container = eval(target_expr, env)?
+            val k = eval(key, env)?
+
+            store_at(container, k, v, target.span)
+        _ -> fault(at, "this cannot be assigned to")
+end assign_to
+
+// Writing through `xs[i]` and `o[k]`.
+private store_at(container: Value, k: Value, v: Value, at: Span) -> Step
+    container match
+        Array(items) ->
+            k match
+                Int(i) ->
+                    if i < 0 || usize(i) >= items.len()
+                        return fault(at, s"the index ${i} is outside an array of ${items.len()}")
+
+                    items.set(usize(i), v)
+                    Ok(Nil)
+                other -> fault(at, s"an array is indexed by an integer, and this is ${other.type_name()}")
+        Object(fields) ->
+            k match
+                Str(name) ->
+                    fields.put(name, v)
+                    Ok(Nil)
+                other -> fault(at, s"an object is indexed by a string, and this is ${other.type_name()}")
+        other -> fault(at, s"${other.type_name()} cannot be indexed")
+end store_at
+
+// -- loops --------------------------------------------------------------------------------------
+
+// **A loop is where two of the four signals stop travelling.** `Brk` ends it and `Cont` starts the
+// next turn; `Ret` and `Fail` are none of a loop's business and keep going up, which is what makes
+// `return` from inside two nested loops work with nothing written for it.
+private run_while(cond: Expr, body: Expr, env: &Env) -> Step
+    loop
+        if !eval(cond, env)?.truthy() then break
+
+        turn(body, env)? match
+            Brk -> break
+            _ -> ()
+
+    Ok(Nil)
+end run_while
+
+private run_loop(body: Expr, env: &Env) -> Step
+    loop
+        turn(body, env)? match
+            Brk -> break
+            _ -> ()
+
+    Ok(Nil)
+end run_loop
+
+private run_for(name: string, iter: Expr, body: Expr, env: &Env, at: Span) -> Step
+    val subject = eval(iter, env)?
+
+    subject match
+        Array(items) ->
+            for i in 0..<items.len()
+                val scope = child_env(env)
+
+                scope.declare(name, items.at(i), false)
+
+                turn_in(body, scope)? match
+                    Brk -> break
+                    _ -> ()
+
+            Ok(Nil)
+        other -> fault(at, s"`for` walks an array, and this is ${other.type_name()}")
+end run_for
+
+// One turn of a loop, in a scope of its own, answering which of `break` and `continue` it ended on.
+//
+// **`Brk` and `Cont` are caught here and everything else is re-raised**, which is why the loops
+// above are three lines each. The `Ok(Cont)` and `Ok(Brk)` it answers with are not values a program
+// can see -- they are this file talking to itself.
+private turn(body: Expr, env: &Env) -> Result[Signal, Signal] = turn_in(body, child_env(env))
+
+private turn_in(body: Expr, scope: &Env) -> Result[Signal, Signal]
+    eval(body, scope) match
+        Ok(_) -> Ok(Cont)
+        Err(Brk) -> Ok(Brk)
+        Err(Cont) -> Ok(Cont)
+        Err(other) -> Err(other)
+end turn_in
+
+// -- expressions --------------------------------------------------------------------------------
+
+eval(e: Expr, env: &Env) -> Step
+    *e.kind match
+        IntLit(v) -> Ok(Int(v))
+        RealLit(v) -> Ok(Real(v))
+        StrLit(v) -> Ok(Str(v))
+        BoolLit(v) -> Ok(Bool(v))
+        NilLit -> Ok(Nil)
+        Name(n) ->
+            env.lookup(n) match
+                Some(v) -> Ok(v)
+                None -> fault(e.span, s"`${n}` is not defined")
+        Unary(op, rhs) -> unary(op, eval(rhs, env)?, e.span)
+        Binary(op, lhs, rhs) -> binary(op, lhs, rhs, env, e.span)
+        Call(callee, args) -> do_call(callee, args, env, e.span)
+        Index(target, key) -> read_at(eval(target, env)?, eval(key, env)?, e.span)
+        Field(target, name) -> read_field(eval(target, env)?, name, e.span)
+        ArrayLit(items) ->
+            var out: &Buf[Value] = buf()
+
+            for i in 0..<items.len()
+                out.push(eval(items.at(i), env)?)
+
+            Ok(Array(out))
+        ObjectLit(keys, values) ->
+            var fields: &Map[string, Value] = map()
+
+            for i in 0..<keys.len()
+                fields.put(keys.at(i), eval(values.at(i), env)?)
+
+            Ok(Object(fields))
+        Lambda(params, body) -> Ok(Fn(Closure(params, body, env)))
+        IfExpr(cond, then_branch, else_branch) ->
+            if eval(cond, env)?.truthy()
+                eval(then_branch, child_env(env))
+            else
+                else_branch match
+                    Some(b) -> eval(b, child_env(env))
+                    None -> Ok(Nil)
+        Block(stmts) -> exec_block(stmts, child_env(env))
+        Bad -> fault(e.span, "this part of the program did not parse")
+end eval
+
+private unary(op: Tok, v: Value, at: Span) -> Step
+    op match
+        Minus ->
+            v match
+                Int(n) -> Ok(Int(-n))
+                Real(n) -> Ok(Real(-n))
+                other -> fault(at, s"`-` needs a number, and this is ${other.type_name()}")
+        Bang -> Ok(Bool(!v.truthy()))
+        _ -> fault(at, "this is not a prefix operator")
+end unary
+
+// **`&&` and `||` take their right-hand side unevaluated**, which is why they are here rather than
+// among the arithmetic: short-circuiting is the whole point of them, and an operator whose operands
+// are both evaluated first cannot do it.
+//
+// They answer the operand that decided, not a boolean -- `a || b` is `a` where `a` is truthy and `b`
+// otherwise. That is what nearly every dynamically typed language does, and it is the one place
+// slate's rule is not sysl's: sysl's operands are `bool` and there is nothing else for it to give
+// back.
+private binary(op: Tok, lhs: Expr, rhs: Expr, env: &Env, at: Span) -> Step
+    if op == AndAnd
+        val a = eval(lhs, env)?
+
+        return if a.truthy() then eval(rhs, env) else Ok(a)
+    end if
+
+    if op == OrOr
+        val a = eval(lhs, env)?
+
+        return if a.truthy() then Ok(a) else eval(rhs, env)
+    end if
+
+    val a = eval(lhs, env)?
+    val b = eval(rhs, env)?
+
+    op match
+        EqEq -> Ok(Bool(same(a, b)))
+        BangEq -> Ok(Bool(!same(a, b)))
+        _ -> arith(op, a, b, at)
+end binary
+
+// -- arithmetic and comparison ------------------------------------------------------------------
+
+// **A real and an integer meet as reals**, which is the promotion every language with both takes,
+// and `+` on two strings joins them. Everything else is a fault naming both sides.
+private arith(op: Tok, a: Value, b: Value, at: Span) -> Step
+    if op == Plus
+        a match
+            Str(x) ->
+                b match
+                    Str(y) -> return Ok(Str(x + y))
+                    _ -> ()
+            _ -> ()
+    end if
+
+    if is_number(a) && is_number(b)
+        if is_int(a) && is_int(b) then return int_arith(op, as_int(a), as_int(b), at)
+
+        return real_arith(op, as_real(a), as_real(b), at)
+    end if
+
+    // Ordering strings is worth having and is not arithmetic, so it is tested after the numbers.
+    a match
+        Str(x) ->
+            b match
+                Str(y) -> return compare_str(op, x, y, at)
+                _ -> ()
+        _ -> ()
+
+    fault(at, s"`${op_text(op)}` does not apply to ${a.type_name()} and ${b.type_name()}")
+end arith
+
+private int_arith(op: Tok, x: long, y: long, at: Span) -> Step
+    op match
+        Plus -> Ok(Int(x + y))
+        Minus -> Ok(Int(x - y))
+        Star -> Ok(Int(x * y))
+        Slash ->
+            if y == 0 then fault(at, "this divides by zero") else Ok(Int(x / y))
+        Percent ->
+            if y == 0 then fault(at, "this takes a remainder by zero") else Ok(Int(x % y))
+        Lt -> Ok(Bool(x < y))
+        LtEq -> Ok(Bool(x <= y))
+        Gt -> Ok(Bool(x > y))
+        GtEq -> Ok(Bool(x >= y))
+        _ -> fault(at, "this is not an arithmetic operator")
+end int_arith
+
+private real_arith(op: Tok, x: real, y: real, at: Span) -> Step
+    op match
+        Plus -> Ok(Real(x + y))
+        Minus -> Ok(Real(x - y))
+        Star -> Ok(Real(x * y))
+        Slash -> Ok(Real(x / y))
+        Percent -> fault(at, "a remainder is taken of integers")
+        Lt -> Ok(Bool(x < y))
+        LtEq -> Ok(Bool(x <= y))
+        Gt -> Ok(Bool(x > y))
+        GtEq -> Ok(Bool(x >= y))
+        _ -> fault(at, "this is not an arithmetic operator")
+end real_arith
+
+private compare_str(op: Tok, x: string, y: string, at: Span) -> Step
+    op match
+        Lt -> Ok(Bool(x < y))
+        LtEq -> Ok(Bool(x <= y))
+        Gt -> Ok(Bool(x > y))
+        GtEq -> Ok(Bool(x >= y))
+        _ -> fault(at, s"`${op_text(op)}` does not apply to two strings")
+end compare_str
+
+private is_number(v: Value) -> bool = v match
+    Int(_) -> true
+    Real(_) -> true
+    _ -> false
+
+private is_int(v: Value) -> bool = v match
+    Int(_) -> true
+    _ -> false
+
+private as_int(v: Value) -> long = v match
+    Int(n) -> n
+    _ -> 0
+
+private as_real(v: Value) -> real = v match
+    Int(n) -> real(n)
+    Real(n) -> n
+    _ -> 0.0
+
+// Whether two values are the same.
+//
+// **Deep for arrays and objects rather than by identity**, which is the choice Python makes and
+// JavaScript does not. It is the one a person expects of `[1, 2] == [1, 2]`, and the recursion it
+// costs is four lines.
+same(a: Value, b: Value) -> bool
+    a match
+        Nil -> b match
+            Nil -> true
+            _ -> false
+        Bool(x) -> b match
+            Bool(y) -> x == y
+            _ -> false
+        Str(x) -> b match
+            Str(y) -> x == y
+            _ -> false
+        Int(x) -> b match
+            Int(y) -> x == y
+            Real(y) -> real(x) == y
+            _ -> false
+        Real(x) -> b match
+            Int(y) -> x == real(y)
+            Real(y) -> x == y
+            _ -> false
+        Array(xs) -> b match
+            Array(ys) -> same_array(xs, ys)
+            _ -> false
+        Object(xs) -> b match
+            Object(ys) -> same_object(xs, ys)
+            _ -> false
+        Fn(_) -> false
+        Native(x) -> b match
+            Native(y) -> x == y
+            _ -> false
+end same
+
+private same_array(xs: &Buf[Value], ys: &Buf[Value]) -> bool
+    if xs.len() != ys.len() then return false
+
+    for i in 0..<xs.len()
+        if !same(xs.at(i), ys.at(i)) then return false
+
+    true
+end same_array
+
+private same_object(xs: &Map[string, Value], ys: &Map[string, Value]) -> bool
+    if xs.len() != ys.len() then return false
+
+    var walk = xs.walk()
+
+    loop
+        walk.next() match
+            None -> break
+            Some(pair) ->
+                ys.get(pair.0) match
+                    Some(v) -> if !same(pair.1, v) then return false
+                    None -> return false
+
+    true
+end same_object
+
+// -- reading ------------------------------------------------------------------------------------
+
+private read_at(container: Value, k: Value, at: Span) -> Step
+    container match
+        Array(items) ->
+            k match
+                Int(i) ->
+                    if i < 0 || usize(i) >= items.len()
+                        return fault(at, s"the index ${i} is outside an array of ${items.len()}")
+
+                    Ok(items.at(usize(i)))
+                other -> fault(at, s"an array is indexed by an integer, and this is ${other.type_name()}")
+        Object(fields) ->
+            k match
+                Str(name) -> Ok(fields.get(name).unwrap_or(Nil))
+                other -> fault(at, s"an object is indexed by a string, and this is ${other.type_name()}")
+        Str(sv) ->
+            k match
+                Int(_) -> fault(at, "a string is not indexed -- slate has no character type")
+                other -> fault(at, s"a string is not indexed by ${other.type_name()}")
+        other -> fault(at, s"${other.type_name()} cannot be indexed")
+end read_at
+
+// **A field that is not there reads as `nil` rather than faulting**, which is the choice every
+// dynamically typed language with objects makes: a record grows fields over its life, and `o.maybe`
+// is how a program asks whether this one has.
+private read_field(target: Value, name: string, at: Span) -> Step
+    target match
+        Object(fields) -> Ok(fields.get(name).unwrap_or(Nil))
+        other -> fault(at, s"a field belongs to an object, and this is ${other.type_name()}")
+
+// -- calls --------------------------------------------------------------------------------------
+
+// **A call is where `Ret` stops travelling.** Every other signal passes through untouched, so a
+// `break` written inside a function body and outside any loop reaches the top and is reported
+// there rather than quietly ending the call.
+private do_call(callee: Expr, args: Buf[Expr], env: &Env, at: Span) -> Step
+    val f = eval(callee, env)?
+    var vals: Buf[Value] = buf()
+
+    for i in 0..<args.len()
+        vals.push(eval(args.at(i), env)?)
+
+    apply(f, vals, at, env)
+end do_call
+
+// Call a value with arguments already evaluated.
+//
+// The calling scope is passed for the run's world, not for its names: a closure's body is evaluated
+// in a child of the scope the closure *captured*, which is what makes it a closure rather than a
+// function with dynamic scoping.
+apply(f: Value, vals: Buf[Value], at: Span, env: &Env) -> Step
+    f match
+        Native(name) -> call_native(name, vals, at, env)
+        Fn(c) ->
+            if vals.len() != c.arity()
+                return fault(at, s"this function takes ${c.arity()} arguments and was given ${vals.len()}")
+
+            val scope = child_env(c.scope)
+
+            for i in 0..<c.params.len()
+                scope.declare(c.params.at(i), vals.at(i), true)
+
+            eval(c.body, scope) match
+                Ok(v) -> Ok(v)
+                Err(Ret(v)) -> Ok(v)
+                Err(other) -> Err(other)
+        other -> fault(at, s"${other.type_name()} is not something that can be called")
+end apply
