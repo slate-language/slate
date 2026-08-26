@@ -11,7 +11,7 @@ position from the byte that caused it all the way to the sentence a person reads
 one of those awkward, that is the finding, and the finding is the point.
 
 ```
-slate/
+dev/slatelang/slate/
     tok.sysl        what the lexer answers with
     lex.sysl        bytes to tokens, with indentation as structure
     ast.sysl        the tree
@@ -24,10 +24,19 @@ slate/
     builtin.sysl    the functions a program has without writing them
     show.sysl       the tree as `(+ 1 (* 2 3))`, for the tests
     tests.sysl      what all of it claims, run by `sysl test .`
-main.sysl           the driver: a path in, a report out
+    main.sysl       the driver: a path in, a report out
 examples/tour.sl    the language in one file
 examples/match.sl   the patterns, in another
 ```
+
+The module is **`dev.slatelang.slate`**, reversed from the domain the way `sh.sysl.*` is reversed
+from sysl.sh. A module in sysl *is* a directory, so the path on disk and the name in the source have
+to agree — and since a hyphen cannot appear in a module path, the domain is `slatelang.dev` rather
+than the `slate-lang.dev` that redirects to it.
+
+`main.sysl` sits inside the module rather than importing it. That is only possible because of the
+prefix: the executable is named for the package, so while the sources lived in a directory called
+`slate/` the linker had a binary and a directory competing for `./slate`.
 
 A slate program is a **`.sl`** file. A literate one — prose with the program in it, as sysl has for
 `.lsysl` — will be **`.lsl`**, and is not built yet.
