@@ -1,0 +1,397 @@
+module slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// `from_utf8_unchecked` needs no import: it is one of the compiler's special forms, not a library
+// function. Every lexeme here came out of a `Source` the lexer already walked, so the bytes are
+// known well formed and there is nothing left to validate.
+
+// Tokens to a tree.
+//
+// Recursive descent for the statements, and `sh.sysl.parsing`'s binding-power loop for the
+// expressions -- which is the split nearly every hand-written front end takes, because statement
+// forms are told apart by their first word and expressions are not.
+//
+// **The `TokenStream` the loop runs on is this parser, not its token cursor.** The package's own
+// note says why it matters: a `led` callback is handed the `*S` it was called with, so making `S`
+// the parser is what lets a callback reach the report and the source text. A grammar that made `S`
+// the bare cursor would have callbacks that can read tokens and cannot complain about them.
+
+// Everything the grammar needs in one place, so that a bare-arrow callback reaches all of it.
+struct Parser
+    toks: Tokens[Tok]
+    src: Source
+    report: Report
+
+    // The kind of the next token. `Eof` where there is none, so that no caller unwraps.
+    peek(self) -> Tok = self.toks.peek() match
+        Some(t) -> t.value
+        None -> Eof
+
+    // The kind of the token `n` further on, for the one lookahead slate's grammar needs.
+    peek_kind_at(self, n: usize) -> Tok = self.toks.peek_at(n) match
+        Some(t) -> t.value
+        None -> Eof
+
+    // The kind of the token just taken, which is what says whether a block has only now closed.
+    prev(self) -> Tok
+        if self.toks.position == 0 then return Eof
+
+        self.toks.items.at(self.toks.position - 1).value
+    end prev
+
+    // Where the next token is.
+    here(self) -> Span = self.toks.here()
+
+    // Where the token just taken was.
+    just_taken(self) -> Span = self.toks.previous()
+
+    at(self, k: Tok) -> bool = self.peek() == k
+
+    // Take the next token, whatever it is.
+    bump(*self)
+        self.toks.advance()
+
+    // Take the next token if it is this one.
+    accept(*self, k: Tok) -> bool
+        if self.peek() != k then return false
+
+        self.toks.advance()
+        true
+    end accept
+
+    // Take the next token, complaining if it is not the one wanted.
+    //
+    // The complaint names what was wanted and quotes what was found, which is the shape
+    // `expected`/`found_at` build and is why they are reached for rather than composed by hand.
+    expect(*self, k: Tok, want: string) -> bool
+        if self.accept(k) then return true
+
+        val at = self.here()
+
+        self.report.add(expected(at, want, self.found(at)))
+        false
+    end expect
+
+    // What is at the cursor, as the `found ...` half of a complaint.
+    //
+    // A structural token has no text to quote -- the whole point of `Indent` is that it stands for
+    // whitespace -- so it is named rather than shown.
+    found(self, at: Span) -> string
+        self.peek() match
+            Eof -> "found the end of the file"
+            Newline -> "found the end of the line"
+            Indent -> "found an indented block"
+            Dedent -> "found the end of a block"
+            _ -> found_at(self.src, at)
+    end found
+
+    // Say something is wrong, and keep going.
+    fault(*self, at: Span, message: string)
+        self.report.add(error(at, message))
+
+    // The text a token was written as.
+    text(self, at: Span) -> string = from_utf8_unchecked(self.src.text(at))
+
+    // Whether the statement just parsed has ended.
+    //
+    // **A block closing ends the statement that contained it**, which is the case that is easy to
+    // leave out: `if c` with an indented body is followed by a `Dedent` and by no `Newline`, the
+    // newline having been spent inside the block. Without this an `if` statement and the line under
+    // it would read as two statements on one line.
+    end_of_statement(*self) -> bool
+        if self.accept(Newline) then return true
+
+        self.prev() == Dedent || self.at(Dedent) || self.at(Eof)
+    end end_of_statement
+
+    // Skip over newlines. Used where a construct spans lines but its parts are not statements.
+    skip_newlines(*self)
+        loop
+            if !self.accept(Newline) then break
+end Parser
+
+impl TokenStream for Parser
+    type Token = Spanned[Tok]
+
+    look(self) -> Option[Spanned[Tok]] = self.toks.peek()
+
+    take(*self) -> Option[Spanned[Tok]] = self.toks.advance()
+
+// -- entry point --------------------------------------------------------------------------------
+
+// What reading a whole file answers with.
+struct Parsed
+    program: Program
+    report: Report
+
+    ok(self) -> bool = !self.report.has_errors()
+end Parsed
+
+// Read a source into a tree.
+//
+// **The lexer's complaints and the parser's arrive together.** A file whose literal is malformed
+// still has a shape, and reporting the shape's mistakes in the same pass is what stops a second run
+// from being needed.
+parse(src: Source) -> Parsed
+    val lexed = lex(src)
+    var p = Parser(lexed.tokens, src, lexed.report)
+    val stmts = parse_stmts(&p, false)
+
+    Parsed(Program(stmts), p.report)
+end parse
+
+// A run of statements, to the end of the file or to the close of the block they are in.
+private parse_stmts(p: *Parser, in_block: bool) -> Buf[Stmt]
+    var stmts: Buf[Stmt] = buf()
+
+    p.skip_newlines()
+
+    loop
+        if p.at(Eof) then break
+        if in_block && p.at(Dedent) then break
+
+        stmts.push(parse_stmt(p))
+
+        if !p.end_of_statement()
+            // The statement did not end where one has to. Say so once, then step past whatever is
+            // there, so that the loop cannot spin on a token nothing consumes.
+            p.fault(p.here(), "this is where the statement should have ended")
+            p.bump()
+        end if
+
+        p.skip_newlines()
+    end loop
+
+    stmts
+end parse_stmts
+
+// -- statements ---------------------------------------------------------------------------------
+
+private parse_stmt(p: *Parser) -> Stmt
+    p.peek() match
+        Val -> parse_binding(p, true)
+        Var -> parse_binding(p, false)
+        Return -> parse_return(p)
+        Break -> parse_word_stmt(p, StmtKind.Break)
+        Continue -> parse_word_stmt(p, StmtKind.Continue)
+        While -> parse_while(p)
+        For -> parse_for(p)
+        Loop -> parse_loop(p)
+        _ ->
+            if at_definition(p) then parse_def(p) else parse_expr_stmt(p)
+end parse_stmt
+
+// `val name = ...` and `var name = ...`.
+private parse_binding(p: *Parser, immutable: bool) -> Stmt
+    val start = p.here()
+
+    p.bump()
+
+    val name = parse_name(p, "a name for the binding")
+
+    p.expect(Assign, "`=` and a value")
+
+    val init = parse_body(p)
+
+    stmt(start.to(p.just_taken()), if immutable then Val(name, init) else Var(name, init))
+end parse_binding
+
+// `return`, with or without a value.
+//
+// **A bare `return` is told from one with a value by what follows it**, and slate needs no rule of
+// its own for that: an expression cannot begin with a newline or with the end of a block, which is
+// exactly what `starts_expr` answers.
+private parse_return(p: *Parser) -> Stmt
+    val start = p.here()
+
+    p.bump()
+
+    val value: Option[Expr] = if starts_expr(p.peek()) then Some(parse_expr(p)) else None
+
+    stmt(start.to(p.just_taken()), Return(value))
+end parse_return
+
+private parse_word_stmt(p: *Parser, k: StmtKind) -> Stmt
+    val start = p.here()
+
+    p.bump()
+
+    stmt(start, k)
+
+// `while cond` with a body.
+private parse_while(p: *Parser) -> Stmt
+    val start = p.here()
+
+    p.bump()
+
+    val cond = parse_expr(p)
+    val body = parse_body(p)
+
+    stmt(start.to(p.just_taken()), While(cond, body))
+end parse_while
+
+// `for name in iterable` with a body.
+private parse_for(p: *Parser) -> Stmt
+    val start = p.here()
+
+    p.bump()
+
+    val name = parse_name(p, "a name for each element")
+
+    p.expect(In, "`in`")
+
+    val iter = parse_expr(p)
+    val body = parse_body(p)
+
+    stmt(start.to(p.just_taken()), For(name, iter, body))
+end parse_for
+
+// `loop` with a body.
+//
+// The unconditional loop is a form of its own rather than `while true`, which is the rule sysl
+// states for itself and slate follows: the form the language names says what is meant, and the
+// condition that is always true is a condition a reader has to evaluate to find out there isn't one.
+private parse_loop(p: *Parser) -> Stmt
+    val start = p.here()
+
+    p.bump()
+
+    val body = parse_body(p)
+
+    stmt(start.to(p.just_taken()), Loop(body))
+end parse_loop
+
+// Whether the cursor is on a function definition rather than on a call.
+//
+// **This is the one place slate's grammar needs to look ahead, and it is what taking sysl's
+// keyword-free function form costs.** `add(a, b)` is a definition when a body follows it and a call
+// when one does not, and the two are identical up to that point. So the shape is checked without
+// committing: a name, a parenthesised list of nothing but names, and then `=` or an indented block.
+//
+// Reading it as a *call* first and reinterpreting on seeing the body was the alternative, and it is
+// worse in the one way that matters -- `f(a.b)` would parse and then have to be un-parsed, and the
+// complaint about it would come from a function that no longer knows a definition was expected.
+private at_definition(p: *Parser) -> bool
+    if !p.at(Ident) then return false
+    if p.peek_kind_at(1) != LParen then return false
+
+    var i: usize = 2
+
+    // An empty list is a definition of a function of no arguments.
+    if p.peek_kind_at(i) == RParen
+        return body_follows(p, i + 1)
+
+    loop
+        if p.peek_kind_at(i) != Ident then return false
+
+        i += 1
+
+        p.peek_kind_at(i) match
+            Comma -> i += 1
+            RParen -> return body_follows(p, i + 1)
+            _ -> return false
+    end loop
+end at_definition
+
+// Whether what sits at `i` is a function body.
+private body_follows(p: *Parser, i: usize) -> bool
+    val k = p.peek_kind_at(i)
+
+    k == Assign || k == Indent
+
+// `name(a, b)` with a body.
+private parse_def(p: *Parser) -> Stmt
+    val start = p.here()
+    val name = parse_name(p, "a name for the function")
+
+    p.expect(LParen, "`(`")
+
+    var params: Buf[string] = buf()
+
+    if !p.at(RParen)
+        loop
+            params.push(parse_name(p, "a parameter name"))
+
+            if !p.accept(Comma) then break
+
+    p.expect(RParen, "`)`")
+
+    // Two body forms, and the `=` is what tells them apart: `double(x) = x * 2` puts the result on
+    // the line, and an indented block puts it in a run of statements. sysl has both for the same
+    // reason -- a body should not have to change shape when it outgrows a line -- and `=` may open
+    // an indented block too, which needs nothing here because `parse_body` looks for the `Indent`.
+    p.accept(Assign)
+
+    val body = parse_body(p)
+
+    stmt(start.to(p.just_taken()), Def(name, params, body))
+end parse_def
+
+// An expression on its own, or an assignment to one.
+private parse_expr_stmt(p: *Parser) -> Stmt
+    val start = p.here()
+    val target = parse_expr(p)
+
+    if !p.accept(Assign)
+        return stmt(start.to(p.just_taken()), Eval(target))
+
+    val value = parse_body(p)
+
+    if !assignable(target)
+        p.fault(target.span, "this cannot be assigned to")
+
+    stmt(start.to(p.just_taken()), Assign(target, value))
+end parse_expr_stmt
+
+// What may stand on the left of an `=`.
+//
+// The check is here rather than in the interpreter so that the tree handed on is one whose targets
+// are known good, and so that the complaint points at the expression rather than at the moment it
+// was evaluated.
+private assignable(e: Expr) -> bool
+    *e.kind match
+        Name(_) -> true
+        Field(_, _) -> true
+        Index(_, _) -> true
+        _ -> false
+end assignable
+
+// -- bodies -------------------------------------------------------------------------------------
+
+// A construct's body: an indented block, or a single expression on the same line.
+//
+// **`=` is not consumed here.** A binding writes its own, and a construct whose body is a block has
+// none, so the two are kept apart by their callers.
+private parse_body(p: *Parser) -> Expr
+    if p.at(Indent) then parse_block(p) else parse_expr(p)
+
+// An indented run of statements, whose value is its trailing expression.
+//
+// Not `private`, because `private` in sysl is private to the *file*: `expr.sysl` reads this to give
+// a lambda and an `if` their indented forms.
+parse_block(p: *Parser) -> Expr
+    val start = p.here()
+
+    if !p.expect(Indent, "an indented block")
+        return expr(start, Bad)
+
+    val stmts = parse_stmts(p, true)
+
+    p.expect(Dedent, "the end of the block")
+
+    expr(start.to(p.just_taken()), Block(stmts))
+end parse_block
+
+// One identifier, or a complaint and an empty name.
+parse_name(p: *Parser, want: string) -> string
+    val at = p.here()
+
+    if !p.at(Ident)
+        p.report.add(expected(at, want, p.found(at)))
+        return ""
+
+    p.bump()
+    p.text(at)
+end parse_name
