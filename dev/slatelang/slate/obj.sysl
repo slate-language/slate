@@ -285,17 +285,37 @@ roots(h: *gc.Heap)
 
     for i in 0..<root_envs.len()
         gc.mark(h, ptr_cast(root_envs.at(i)))
+
+    // The emergency objects a full heap is answered with. Nothing else refers to them until the
+    // moment they are handed out, so nothing else would keep them.
+    mark_spares(h)
 end roots
 
 // How much of the heap is spoken for.
 heap_used() -> usize = gc.used(&slate_heap)
 
+// How many collections this program has run, which is what makes a claim about *when* slate collects
+// something a test can check rather than something a comment asserts.
+var collections: usize = 0
+
 // Collect, at a point the interpreter has chosen because it knows what is live.
 collect_now()
+    collections += 1
     gc.collect(&slate_heap, &roots)
 
-// How much may be allocated before a collection is worth doing.
-private const CollectAbove: usize = 262144
+// The smallest live set worth collecting over. Below this a program is cheap enough that tracing it
+// costs more than the storage it would give back.
+private const CollectFloor: usize = 262144
+
+// How much the live set may grow to before the next collection. Raised after every collection to a
+// multiple of what survived it.
+var collect_above: usize = CollectFloor
+
+// How much bigger than the surviving set the heap may get before collecting again.
+//
+// **Two means half the work a program does is collecting a heap that has doubled**, which is the
+// usual place to start and is what most generational-free collectors settle on.
+private const Headroom: usize = 2
 
 // Collect if enough has been allocated to be worth it.
 //
@@ -304,8 +324,25 @@ private const CollectAbove: usize = 262144
 // chose the top of a statement, where what is live is the scope chain plus whatever the frames above
 // have pushed onto the shadow stack. A collection anywhere else would sweep a value some sysl local
 // was halfway through building.
+//
+// **The number read is `live_size` and the threshold moves, and both halves were wrong here.** This
+// asked whether `used` had passed a *fixed* 256 KiB, and `used` is the bump high-water mark, which
+// never falls -- so once a program had ever allocated that much it ran a full mark-sweep at **every
+// statement** for the rest of its life, reclaiming almost nothing each time. A 20,000-iteration loop
+// building one small object per turn ran **19,629 collections**. Nothing was wrong with the answers,
+// which is why it went unnoticed: the only symptom was speed.
+//
+// Reading `live_size` fixes half of it. The other half is that a fixed threshold puts a program
+// whose genuine live set sits above it straight back into the same loop -- so the threshold is
+// raised to a multiple of what survived, which is what makes the cost of collecting proportional to
+// the garbage produced rather than to the statements executed.
 maybe_collect()
-    if gc.used(&slate_heap) > CollectAbove then collect_now()
+    if gc.live_size(&slate_heap) > collect_above
+        collect_now()
+
+        val survived = gc.live_size(&slate_heap) * Headroom
+
+        collect_above = if survived > CollectFloor then survived else CollectFloor
 
 // Give the heap back, and run every finalizer still outstanding.
 //
@@ -316,7 +353,10 @@ reset_heap()
     gc.dispose(&slate_heap)
     root_values.clear()
     root_envs.clear()
+    collections = 0
+    collect_above = CollectFloor
     heap_exhausted = false
+    reserve_spares()
 
 // -- allocation ---------------------------------------------------------------------------------
 
@@ -332,8 +372,55 @@ reset_heap()
 // at -- an allocator has no idea which line of the program it is serving.
 var heap_exhausted: bool = false
 
-// Try once, collect, try again. Null after that means the live set genuinely does not fit.
-private alloc_or_collect(size: usize, kind: *gc.Kind) -> *u8
+// One object of every kind, taken while the heap is empty and never given back.
+//
+// **These are what a full heap is answered with, and without them it was answered with `null`.** The
+// comment above has always said that writing through a full heap's answer is a wild write, and every
+// one of the constructors below did exactly that: `alloc_or_collect` set `heap_exhausted` and
+// returned null, and `new_str` wrote `o.s = s` straight through it. The flag is read at the *next*
+// statement boundary, which the process never reached -- a slate program that outgrew the heap died
+// with a bare SIGSEGV, no diagnostic, and none of the output it had already produced.
+//
+// A reserve is a real object in the heap with a real header, so it can be written to, traced and
+// marked like any other. Handing the same one out twice makes two slate values share it, which is
+// wrong and does not matter: the program stops at the end of the statement that got it.
+private var spare_str: *StrObj = null
+private var spare_array: *ArrayObj = null
+private var spare_object: *ObjectObj = null
+private var spare_closure: *ClosureObj = null
+private var spare_env: *EnvObj = null
+private var spare_promise: *PromiseObj = null
+
+// Take the reserves. Called with an empty heap, where the allocation cannot fail.
+private reserve_spares()
+    spare_str = ptr_cast(gc.alloc(&slate_heap, sizeof(StrObj), &str_kind))
+    spare_array = ptr_cast(gc.alloc(&slate_heap, sizeof(ArrayObj), &array_kind))
+    spare_object = ptr_cast(gc.alloc(&slate_heap, sizeof(ObjectObj), &object_kind))
+    spare_closure = ptr_cast(gc.alloc(&slate_heap, sizeof(ClosureObj), &closure_kind))
+    spare_env = ptr_cast(gc.alloc(&slate_heap, sizeof(EnvObj), &env_kind))
+    spare_promise = ptr_cast(gc.alloc(&slate_heap, sizeof(PromiseObj), &promise_kind))
+
+    // A zeroed payload is a valid object of each of these kinds except the ones holding a `Buf` or a
+    // `Map`, which a tracer walks -- and a zero `Buf` is an empty one, so all six are safe to trace
+    // from the moment they exist.
+    heap_exhausted = false
+end reserve_spares
+
+// Keep the reserves alive. They are rooted rather than special-cased in the sweep, because a rooted
+// object is one the collector already knows how to keep.
+private mark_spares(h: *gc.Heap)
+    gc.mark(h, ptr_cast(spare_str))
+    gc.mark(h, ptr_cast(spare_array))
+    gc.mark(h, ptr_cast(spare_object))
+    gc.mark(h, ptr_cast(spare_closure))
+    gc.mark(h, ptr_cast(spare_env))
+    gc.mark(h, ptr_cast(spare_promise))
+
+// Try once, collect, try again -- and answer the reserve rather than null when even that fails.
+//
+// **The caller is going to write through whatever comes back**, so this may not answer null. What it
+// does instead is say so in `heap_exhausted`, which the statement boundary reports against a line.
+private alloc_or_collect(size: usize, kind: *gc.Kind, spare: *u8) -> *u8
     var p = gc.alloc(&slate_heap, size, kind)
 
     if p != null then return p
@@ -342,24 +429,25 @@ private alloc_or_collect(size: usize, kind: *gc.Kind) -> *u8
 
     p = gc.alloc(&slate_heap, size, kind)
 
-    if p == null then heap_exhausted = true
+    if p != null then return p
 
-    p
+    heap_exhausted = true
+    spare
 end alloc_or_collect
 new_str(s: string) -> *StrObj
-    var o: *StrObj = ptr_cast(alloc_or_collect(sizeof(StrObj), &str_kind))
+    var o: *StrObj = ptr_cast(alloc_or_collect(sizeof(StrObj), &str_kind, ptr_cast(spare_str)))
 
     o.s = s
     o
 
 new_array(items: Buf[Value]) -> *ArrayObj
-    var o: *ArrayObj = ptr_cast(alloc_or_collect(sizeof(ArrayObj), &array_kind))
+    var o: *ArrayObj = ptr_cast(alloc_or_collect(sizeof(ArrayObj), &array_kind, ptr_cast(spare_array)))
 
     o.items = items
     o
 
 new_object() -> *ObjectObj
-    var o: *ObjectObj = ptr_cast(alloc_or_collect(sizeof(ObjectObj), &object_kind))
+    var o: *ObjectObj = ptr_cast(alloc_or_collect(sizeof(ObjectObj), &object_kind, ptr_cast(spare_object)))
 
     o.entries = buf()
     o.index = fresh_index()
@@ -367,7 +455,7 @@ new_object() -> *ObjectObj
     o
 
 new_closure(params: Buf[string], body: usize, scope: *EnvObj) -> *ClosureObj
-    var o: *ClosureObj = ptr_cast(alloc_or_collect(sizeof(ClosureObj), &closure_kind))
+    var o: *ClosureObj = ptr_cast(alloc_or_collect(sizeof(ClosureObj), &closure_kind, ptr_cast(spare_closure)))
 
     o.params = params
     o.body = body
@@ -375,7 +463,7 @@ new_closure(params: Buf[string], body: usize, scope: *EnvObj) -> *ClosureObj
     o
 
 new_promise() -> *PromiseObj
-    var o: *PromiseObj = ptr_cast(alloc_or_collect(sizeof(PromiseObj), &promise_kind))
+    var o: *PromiseObj = ptr_cast(alloc_or_collect(sizeof(PromiseObj), &promise_kind, ptr_cast(spare_promise)))
 
     o.value = Null
     o.settled = false
@@ -387,7 +475,7 @@ new_promise() -> *PromiseObj
     o
 
 new_env(parent: *EnvObj) -> *EnvObj
-    var o: *EnvObj = ptr_cast(alloc_or_collect(sizeof(EnvObj), &env_kind))
+    var o: *EnvObj = ptr_cast(alloc_or_collect(sizeof(EnvObj), &env_kind, ptr_cast(spare_env)))
 
     o.names = map()
     o.mutable = map()

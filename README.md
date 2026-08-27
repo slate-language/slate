@@ -384,6 +384,17 @@ Two consequences worth knowing:
   tree-walker has those everywhere — a match subject, a half-built literal, a call's arguments — so
   the interpreter keeps a shadow stack and collects only at a statement boundary. That is the real
   cost of tracing over refcounting, and it is why `obj.sysl` has `hold` and `release`.
+- **Collection is scheduled on what is live, and the threshold moves.** The heap collects when the
+  live bytes pass a threshold, and that threshold is then raised to twice what survived — so the cost
+  of collecting tracks the garbage a program makes rather than the statements it executes. Reading
+  the high-water mark instead, against a fixed number, meant a full mark-sweep at every statement
+  once a program had ever grown past it: 6,000 live objects and 200,000 statements of ordinary work
+  took 1 minute 31 seconds and 205,631 collections, and now takes 0.22 seconds and 27.
+- **A program that outgrows the heap is told so, against the line that asked.** The heap does not
+  grow, and a full one used to answer `null` — which every constructor then wrote through, so the
+  program died of a segmentation fault with none of the output it had already produced. There is now
+  a reserve object of each kind for a full heap to answer with, which is somewhere real to write
+  while the statement finishes.
 - **The interpreter's state is module storage**, because a root function must be a top-level function
   to have an address and must reach that state. One interpreter to a process; `run` empties the heap
   on the way in, which is what lets two programs run one after another.
