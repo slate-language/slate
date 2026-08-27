@@ -275,11 +275,27 @@ would. `exists` answers `true` or `false` rather than failing, which is the whol
 over `stat`. Everything else fails with libuv's own sentence — `cannot read x: ENOENT: no such file
 or directory` — reaching the program through the promise it was awaiting.
 
-**Every one of them answers a promise, and there is no blocking form.** The binding offers both and
-slate takes one. A language whose entire event story is a single loop has nothing to gain from a call
-that stops it, and offering both would make *which one did I write* a question a reader has to ask at
-every call site. node draws the line in the same place and then regrets its `*Sync` family in every
-style guide written about it.
+**Every one of them has a blocking twin under a `Sync` suffix** — `readFileSync`, `writeFileSync`,
+`statSync` and the rest — which is node's arrangement and node's spelling:
+
+```
+mkdirSync("scratch")
+writeFileSync("scratch/notes.txt", "one line")
+
+print(readFileSync("scratch/notes.txt"))
+```
+
+The plain names are asynchronous because a language whose entire event story is one loop has a lot to
+lose from a call that stops it: a server that blocks on a read stops answering everybody. The `Sync`
+forms are there because a great many programs are not servers — a script that reads a configuration
+file before it does anything, or whose whole job is three file operations in order, gains nothing
+from a promise and pays for it in an `async` function that exists only to hold an `await`.
+
+**The naming is what keeps that from being a trap.** The blocking call is the one with the longer
+name and the suffix, so reaching for it is a decision rather than an accident, and a reader can see
+which was written without checking anything. The two halves agree on everything but the waiting: a
+`Sync` call answers the value its promise would have settled to, and fails as an ordinary fault at
+the statement that caused it rather than by rejecting.
 
 ### TCP
 
