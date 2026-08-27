@@ -34,17 +34,45 @@ private power_of(k: Tok) -> Power
         // writes both usually means the defaulting to happen last.
         QQ -> left_assoc(9)
         AndAnd -> left_assoc(20)
+
+        // **`is` sits between `&&` and the comparisons**, which is sysl's placement and is load
+        // bearing at both ends: the subject and the pattern are each held tighter than the `&&` that
+        // joins one test to the next, so `a is P && b > 0` is two terms rather than an `is` against a
+        // conjunction.
+        Is -> left_assoc(25)
+
+        // **Every comparison is one level, because a chain of them is ONE comparison.** `a < b < c`
+        // is `a < b && b < c` with `b` evaluated once, which is sysl's rule and mathematics'. Giving
+        // `==` a level of its own would make `a == b < c` group instead of chain.
         EqEq -> left_assoc(30)
         BangEq -> left_assoc(30)
-        Lt -> left_assoc(40)
-        LtEq -> left_assoc(40)
-        Gt -> left_assoc(40)
-        GtEq -> left_assoc(40)
+        Lt -> left_assoc(30)
+        LtEq -> left_assoc(30)
+        Gt -> left_assoc(30)
+        GtEq -> left_assoc(30)
+
+        // A range is tighter than a comparison and looser than the bitwise operators, so `a..b == c`
+        // compares the range and `a..b|c` ranges over the disjunction. sysl's order exactly.
+        DotDot -> left_assoc(35)
+        DotDotLt -> left_assoc(35)
+
+        Pipe -> left_assoc(40)
+        Caret -> left_assoc(42)
+        Amp -> left_assoc(44)
         Plus -> left_assoc(50)
         Minus -> left_assoc(50)
         Star -> left_assoc(60)
         Slash -> left_assoc(60)
         Percent -> left_assoc(60)
+
+        // **A shift binds like a multiplication**, which is sysl's deliberate correction to C -- where
+        // `a & b == c` and `1 << 2 + 3` both group in the way nobody predicts.
+        Shl -> left_assoc(60)
+        Shr -> left_assoc(60)
+
+        // `++` and `--` after a value are postfix, so they bind as tightly as a call does.
+        PlusPlus -> left_assoc(80)
+        MinusMinus -> left_assoc(80)
 
         // Calls, indexing and field access are postfix: they bind tighter than any arithmetic, so
         // `-f(x)` negates the result and `a.b + c` adds to the field.
@@ -103,6 +131,14 @@ private nud(t: Spanned[Tok], p: *Parser) -> Expr
         Ident -> expr(t.span, Name(p.text(t.span)))
         Minus -> prefix(p, t, Minus)
         Bang -> prefix(p, t, Bang)
+        Tilde -> prefix(p, t, Tilde)
+        PlusPlus -> pre_inc_dec(p, t, true)
+        MinusMinus -> pre_inc_dec(p, t, false)
+
+        // `..b` and `..` -- a range with its low end left out. In prefix position there is nothing to
+        // its left, which is the whole of what tells it from the infix form.
+        DotDot -> open_range(p, t, true)
+        DotDotLt -> open_range(p, t, false)
         Await ->
             val inner = parse_expr_bp(p, PrefixPower)
 
@@ -235,18 +271,20 @@ private if_expression(p: *Parser, t: Spanned[Tok]) -> Expr
     val cond = parse_expr(p)
 
     if p.accept(Then)
-        val a = parse_expr(p)
+        // **A one-line branch is a STATEMENT**, so `if n > 2 then break` is what it reads as. See
+        // `parse_control_body`: this is the same rule, spelled here because an `if` reads its `else`
+        // in the middle rather than at the end.
+        val a = if p.at(Indent) then parse_block(p) else inline_stmt_body(p)
+        val b = else_branch(p)
 
-        // The annotation is the compiler asking: a `None` does not take its type from the `Some`
-        // in the sibling branch, so nothing on this line says what it is an `Option` of.
-        val b = if p.accept(Else) then Some(parse_expr(p)) else None
-
+        accept_end(p, If)
         return expr(t.span.to(p.just_taken()), IfExpr(cond, a, b))
     end if
 
     val a = parse_block(p)
     val b = else_branch(p)
 
+    accept_end(p, If)
     expr(t.span.to(p.just_taken()), IfExpr(cond, a, b))
 end if_expression
 
@@ -255,18 +293,22 @@ end if_expression
 // **`elif` is sugar and nests into the `else` of the one before it**, so no node exists for it and
 // nothing downstream has to learn a rule about it. That is the arrangement sysl states for its own
 // `elif` and the reason given there holds here.
+// **Both may open a one-line body**, as sysl's do: `elif` takes the same `then` an `if` does, and an
+// `else` written on the same line as its `if` takes a statement rather than a block.
 private else_branch(p: *Parser) -> Option[Expr]
     val start = p.here()
 
-    if p.accept(Elif)
+    if accept_on_next_line(p, Elif)
         val cond = parse_expr(p)
-        val a = parse_block(p)
+        val a = parse_control_body(p, Then)
         val b = else_branch(p)
 
         return Some(expr(start.to(p.just_taken()), IfExpr(cond, a, b)))
     end if
 
-    if p.accept(Else) then Some(parse_block(p)) else None
+    if !accept_on_next_line(p, Else) then return None
+
+    Some(if p.at(Indent) then parse_block(p) else inline_stmt_body(p))
 end else_branch
 
 // -- infix and postfix position -----------------------------------------------------------------
@@ -281,15 +323,97 @@ private led(lhs: Expr, t: Spanned[Tok], p: *Parser) -> Expr
         LBracket -> index(p, lhs)
         Dot -> field(p, lhs)
         Arrow -> arrow(p, lhs, t)
+        PlusPlus -> expr(lhs.span.to(t.span), IncDec(lhs, true, false))
+        MinusMinus -> expr(lhs.span.to(t.span), IncDec(lhs, false, false))
+        Is -> is_test(p, lhs)
+        DotDot -> range_to(p, lhs, true)
+        DotDotLt -> range_to(p, lhs, false)
         Match ->
             val arms = parse_arms(p)
 
             expr(lhs.span.to(p.just_taken()), MatchExpr(lhs, arms))
         _ ->
+            if is_comparison(t.value) then return comparison(p, lhs, t)
+
             val rhs = parse_expr_bp(p, power_of(t.value).right)
 
             expr(lhs.span.to(rhs.span), Binary(t.value, lhs, rhs))
 end led
+
+private is_comparison(k: Tok) -> bool
+    k == EqEq || k == BangEq || k == Lt || k == LtEq || k == Gt || k == GtEq
+
+// A run of comparisons, which is one comparison however long it is.
+//
+// **Two operands stay an ordinary `Binary`**, so the overwhelmingly common case costs nothing and
+// the chain node exists only where there is a chain to hold.
+private comparison(p: *Parser, lhs: Expr, t: Spanned[Tok]) -> Expr
+    val power = power_of(t.value).right
+    var operands: Buf[Expr] = buf()
+    var ops: Buf[Tok] = buf()
+
+    operands.push(lhs)
+    ops.push(t.value)
+    operands.push(parse_expr_bp(p, power))
+
+    loop
+        if !is_comparison(p.peek()) then break
+
+        ops.push(p.peek())
+        p.bump()
+        operands.push(parse_expr_bp(p, power))
+
+    if ops.len() == 1
+        return expr(lhs.span.to(operands.at(1).span), Binary(ops.at(0), lhs, operands.at(1)))
+
+    expr(lhs.span.to(operands.at(operands.len() - 1).span), Compare(operands, ops))
+end comparison
+
+// `a..b` and `a..<b`, and the form whose high end is left out.
+//
+// **A range is non-associative**, so the high end is read at a power that stops before another `..`:
+// `a..b..c` is a mistake rather than a nest, which is what sysl's grammar says by writing each end as
+// the level below.
+private range_to(p: *Parser, lhs: Expr, inclusive: bool) -> Expr
+    val power = power_of(DotDot).left
+
+    if !starts_expr(p.peek())
+        return expr(lhs.span.to(p.just_taken()), Range(Some(lhs), None, inclusive))
+
+    val hi = parse_expr_bp(p, power)
+
+    expr(lhs.span.to(hi.span), Range(Some(lhs), Some(hi), inclusive))
+end range_to
+
+private open_range(p: *Parser, t: Spanned[Tok], inclusive: bool) -> Expr
+    if !starts_expr(p.peek())
+        return expr(t.span, Range(None, None, inclusive))
+
+    val hi = parse_expr_bp(p, power_of(DotDot).left)
+
+    expr(t.span.to(hi.span), Range(None, Some(hi), inclusive))
+end open_range
+
+// `x is Pat`, `x is not Pat`, and `x is A | B`.
+//
+// **`not` is a soft word**, read only here: it stays an ordinary name everywhere else, which is what
+// sysl does with both halves and what slate can still do with this one.
+private is_test(p: *Parser, lhs: Expr) -> Expr
+    val negated = if p.at(Ident) && p.text_at(0) == "not"
+        p.bump()
+        true
+    else
+        false
+
+    val pat = parse_pattern(p)
+
+    expr(lhs.span.to(pat.span), IsPattern(lhs, pat, negated))
+end is_test
+
+private pre_inc_dec(p: *Parser, t: Spanned[Tok], up: bool) -> Expr
+    val target = parse_expr_bp(p, PrefixPower)
+
+    expr(t.span.to(target.span), IncDec(target, up, true))
 
 // `f(a, b)`.
 private call(p: *Parser, callee: Expr) -> Expr

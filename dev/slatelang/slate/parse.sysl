@@ -100,6 +100,11 @@ struct Parser
     // The text a token was written as.
     text(self, at: Span) -> string = from_utf8_unchecked(self.src.text(at))
 
+    // The text of the token `n` further on, for a soft word that is only a keyword where one follows.
+    text_at(self, n: usize) -> string = self.toks.peek_at(n) match
+        Some(t) -> self.text(t.span)
+        None -> ""
+
     // Whether the statement just parsed has ended.
     //
     // **A block closing ends the statement that contained it**, which is the case that is easy to
@@ -188,6 +193,12 @@ private parse_stmt(p: *Parser) -> Stmt
         For -> parse_for(p)
         Loop -> parse_loop(p)
 
+        // **A `do` at the head of a statement can only be the post-test loop.** Everywhere else it
+        // introduces a body and so follows a loop header on the same line, where it is consumed by
+        // `parse_control_body` and never reaches here. That is sysl's own argument for the word
+        // doing both jobs.
+        Do -> parse_do_while(p)
+
         // **`async` is not on its own a definition.** `async f(x) = ...` defines one and
         // `async x -> x` is an expression, so the same shape check runs one token further along.
         Async ->
@@ -240,8 +251,9 @@ private parse_while(p: *Parser) -> Stmt
     p.bump()
 
     val cond = parse_expr(p)
-    val body = parse_body(p)
+    val body = parse_control_body(p, Do)
 
+    accept_end(p, While)
     stmt(start.to(p.just_taken()), While(cond, body))
 end parse_while
 
@@ -256,8 +268,9 @@ private parse_for(p: *Parser) -> Stmt
     p.expect(In, "`in`")
 
     val iter = parse_expr(p)
-    val body = parse_body(p)
+    val body = parse_control_body(p, Do)
 
+    accept_end(p, For)
     stmt(start.to(p.just_taken()), For(name, iter, body))
 end parse_for
 
@@ -266,13 +279,34 @@ end parse_for
 // The unconditional loop is a form of its own rather than `while true`, which is the rule sysl
 // states for itself and slate follows: the form the language names says what is meant, and the
 // condition that is always true is a condition a reader has to evaluate to find out there isn't one.
+// `do body while cond` -- the loop whose body runs before its test.
+//
+// **There is no `end do`**, and that is sysl's reasoning rather than an omission: the trailing
+// `while` already names where the body stopped, so a marker after it would close a block that has
+// just been closed.
+private parse_do_while(p: *Parser) -> Stmt
+    val start = p.here()
+
+    p.bump()
+
+    val body = if p.at(Indent) then parse_block(p) else inline_stmt_body(p)
+
+    p.skip_newlines()
+    p.expect(While, "`while` and the condition the loop repeats on")
+
+    val cond = parse_expr(p)
+
+    stmt(start.to(p.just_taken()), DoWhile(body, cond))
+end parse_do_while
+
 private parse_loop(p: *Parser) -> Stmt
     val start = p.here()
 
     p.bump()
 
-    val body = parse_body(p)
+    val body = parse_control_body(p, Do)
 
+    accept_end(p, Loop)
     stmt(start.to(p.just_taken()), Loop(body))
 end parse_loop
 
@@ -341,15 +375,22 @@ private parse_def(p: *Parser) -> Stmt
 
     val body = parse_body(p)
 
+    accept_end_named(p, name)
     stmt(start.to(p.just_taken()), Def(name, params, intern_body(body), is_async))
 end parse_def
 
-// An expression on its own, or an assignment to one.
+// An expression on its own, or an assignment to one -- to one place, or to several.
 private parse_expr_stmt(p: *Parser) -> Stmt
     val start = p.here()
     val target = parse_expr(p)
 
-    if !p.accept(Assign)
+    // **A comma here can only be a multi-assignment**, since nothing below a statement admits a bare
+    // comma. One target would be an ordinary assignment written the long way, so two is what commits.
+    if p.at(Comma) then return parse_multi_assign(p, start, target)
+
+    val op = assign_op(p)
+
+    if op == Eof
         return stmt(start.to(p.just_taken()), Eval(target))
 
     val value = parse_body(p)
@@ -357,8 +398,66 @@ private parse_expr_stmt(p: *Parser) -> Stmt
     if !assignable(target)
         p.fault(target.span, "this cannot be assigned to")
 
-    stmt(start.to(p.just_taken()), Assign(target, value))
+    stmt(start.to(p.just_taken()), Assign(op, target, value))
 end parse_expr_stmt
+
+// `a, b = b, a`, and the compound forms of it.
+private parse_multi_assign(p: *Parser, start: Span, first: Expr) -> Stmt
+    var targets: Buf[Expr] = buf()
+
+    targets.push(first)
+
+    loop
+        if !p.accept(Comma) then break
+
+        targets.push(parse_expr(p))
+
+    val op = assign_op(p)
+
+    if op == Eof
+        p.report.add(expected(p.here(), "`=` and the values to write", p.found(p.here())))
+        return stmt(start.to(p.just_taken()), Eval(first))
+
+    var values: Buf[Expr] = buf()
+
+    loop
+        values.push(parse_expr(p))
+
+        if !p.accept(Comma) then break
+
+    for i in 0..<targets.len()
+        if !assignable(targets.at(i))
+            p.fault(targets.at(i).span, "this cannot be assigned to")
+
+    if targets.len() != values.len()
+        p.fault(start.to(p.just_taken()),
+            s"this writes ${targets.len()} places and was given ${values.len()} values")
+
+    stmt(start.to(p.just_taken()), MultiAssign(op, targets, values))
+end parse_multi_assign
+
+// The assignment operator at the cursor, consumed -- or `Eof` where there is not one.
+//
+// **`Assign` stands for the plain form and the arithmetic operator for a compound one**, so that
+// `x += e` reaches the compiler as the operator it is rather than as a rewritten `x = x + e`. The
+// difference that makes is that the place is evaluated once.
+//
+// `Eof` as the "none" answer rather than an `Option`, because every caller immediately compares.
+private assign_op(p: *Parser) -> Tok
+    if p.accept(Assign) then return Assign
+    if p.accept(PlusEq) then return Plus
+    if p.accept(MinusEq) then return Minus
+    if p.accept(StarEq) then return Star
+    if p.accept(SlashEq) then return Slash
+    if p.accept(PercentEq) then return Percent
+    if p.accept(AmpEq) then return Amp
+    if p.accept(PipeEq) then return Pipe
+    if p.accept(CaretEq) then return Caret
+    if p.accept(ShlEq) then return Shl
+    if p.accept(ShrEq) then return Shr
+
+    Eof
+end assign_op
 
 // What may stand on the left of an `=`.
 //
@@ -375,12 +474,107 @@ end assignable
 
 // -- bodies -------------------------------------------------------------------------------------
 
-// A construct's body: an indented block, or a single expression on the same line.
+// A **value's** body: an indented block, or a single expression on the same line.
 //
 // **`=` is not consumed here.** A binding writes its own, and a construct whose body is a block has
 // none, so the two are kept apart by their callers.
+//
+// This is what a binding and a function take. A *control-flow* body is the one below, and the
+// difference is that it takes a statement.
 private parse_body(p: *Parser) -> Expr
     if p.at(Indent) then parse_block(p) else parse_expr(p)
+
+// A control-flow construct's body: an indented block, or one statement after the introducer.
+//
+// **The one-line body is a STATEMENT, not an expression, and that is the whole reason this exists.**
+// `if n > 2 then break` is the shape a loop is written in, and a `then` taking only an expression
+// refuses it -- along with `then return x` and `then continue`. sysl's `body(keyword)` is
+// `suite | inlineBody` where `inlineBody` is one statement, and this is that rule.
+//
+// **The introducer is required for a one-line body and optional before a block**, which is again
+// sysl's: a following newline and indent already say unambiguously where the body is, so `while c`
+// needs no `do` -- but `while c n = n + 1` would have nothing marking where the header stopped.
+// Not `private`: `expr.sysl` gives `elif` its body.
+parse_control_body(p: *Parser, intro: Tok) -> Expr
+    if !p.accept(intro) then return parse_block(p)
+
+    if p.at(Indent) then parse_block(p) else inline_stmt_body(p)
+
+// One statement standing where a block would, wrapped as the block of one it is.
+//
+// Not `private`: `expr.sysl` gives `if`'s branches their one-line forms.
+inline_stmt_body(p: *Parser) -> Expr
+    val s = parse_stmt(p)
+    var one: Buf[Stmt] = buf()
+
+    one.push(s)
+    expr(s.span, Block(one))
+end inline_stmt_body
+
+// `end if`, `end while`, `end for`, `end loop` -- optional, and only where the construct's own word
+// follows.
+//
+// **`end` stays a SOFT word**, which is what this shape is for: it is looked at rather than consumed
+// until both tokens are known, so a program that names a variable `end` is untouched. Newlines are
+// skipped over on the same terms -- looked past, and only stepped over once the marker is certain.
+//
+// Not `private`: `expr.sysl` closes an `if`.
+accept_end(p: *Parser, word: Tok) -> bool
+    var i: usize = 0
+
+    while p.peek_kind_at(i) == Newline
+        i += 1
+
+    if p.peek_kind_at(i) != Ident then return false
+    if p.peek_kind_at(i + 1) != word then return false
+    if p.text_at(i) != "end" then return false
+
+    for _ in 0..<(i + 2)
+        p.bump()
+
+    true
+end accept_end
+
+// A word that continues a construct from the line below it -- `elif`, `else`, and `while` closing a
+// `do`. **Newlines are looked past and only stepped over once the word is certain**, so the newline
+// that ends a statement is left alone where the construct really has ended. This is sysl's
+// `onNextLine`.
+//
+// Not `private`: `expr.sysl` reads `elif` and `else` with it.
+accept_on_next_line(p: *Parser, k: Tok) -> bool
+    var i: usize = 0
+
+    while p.peek_kind_at(i) == Newline
+        i += 1
+
+    if p.peek_kind_at(i) != k then return false
+
+    for _ in 0..<(i + 1)
+        p.bump()
+
+    true
+end accept_on_next_line
+
+// `end <name>` after a function, which is the marker a declaration carries instead of a keyword.
+private accept_end_named(p: *Parser, name: string) -> bool
+    var i: usize = 0
+
+    while p.peek_kind_at(i) == Newline
+        i += 1
+
+    if p.peek_kind_at(i) != Ident then return false
+    if p.peek_kind_at(i + 1) != Ident then return false
+    if p.text_at(i) != "end" then return false
+
+    // **The name has to match**, so that a function ending with `end` and the next declaration's
+    // name on the following line is not read as a marker.
+    if p.text_at(i + 1) != name then return false
+
+    for _ in 0..<(i + 2)
+        p.bump()
+
+    true
+end accept_end_named
 
 // An indented run of statements, whose value is its trailing expression.
 //

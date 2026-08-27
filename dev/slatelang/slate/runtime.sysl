@@ -3,7 +3,7 @@ module dev.slatelang.slate
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map}
-import sysl.text.{str_builder, StrBuilder}
+import sysl.text.{str_builder, StrBuilder, from_utf8_unchecked}
 
 // What running a program needs that is not the machine itself: equality, arithmetic, indexing,
 // pattern matching, and calling.
@@ -49,6 +49,14 @@ type Step = Result[Value, Signal]
 //
 // Not `private`: `private` in sysl is private to the *file*, and `builtin.sysl` complains too.
 fault(at: Span, message: string) -> Step = Err(Fail(at, message))
+
+// One end of a range, which has to be a whole number.
+//
+// Not `private`: the machine builds a range and `builtin.sysl` reports on one.
+range_end(v: Value, at: Span, which: string) -> Result[long, Signal]
+    v match
+        Int(n) -> Ok(n)
+        other -> Err(Fail(at, s"${which} of a range is a whole number, and this is ${other.type_name()}"))
 
 // Whether a value is the absent one.
 is_absent(v: Value) -> bool = v match
@@ -153,6 +161,10 @@ unary(op: Tok, v: Value, at: Span) -> Step
                 Real(n) -> Ok(Real(-n))
                 other -> fault(at, s"`-` needs a number, and this is ${other.type_name()}")
         Bang -> Ok(Bool(!v.truthy()))
+        Tilde ->
+            v match
+                Int(n) -> Ok(Int(~n))
+                other -> fault(at, s"`~` needs a whole number, and this is ${other.type_name()}")
         _ -> fault(at, "this is not a prefix operator")
 end unary
 
@@ -211,6 +223,16 @@ private int_arith(op: Tok, x: long, y: long, at: Span) -> Step
         LtEq -> Ok(Bool(x <= y))
         Gt -> Ok(Bool(x > y))
         GtEq -> Ok(Bool(x >= y))
+
+        // **The bitwise operators are integers only**, which needs no rule of its own: they are here
+        // and nowhere else, so a real reaching one falls through to the sentence naming both sides.
+        Amp -> Ok(Int(x & y))
+        Pipe -> Ok(Int(x | y))
+        Caret -> Ok(Int(x ^ y))
+        Shl ->
+            if y < 0 || y > 63 then fault(at, s"a shift is by 0 to 63 places, and this is by ${y}") else Ok(Int(x << y))
+        Shr ->
+            if y < 0 || y > 63 then fault(at, s"a shift is by 0 to 63 places, and this is by ${y}") else Ok(Int(x >> y))
         _ -> fault(at, "this is not an arithmetic operator")
 end int_arith
 
@@ -360,6 +382,18 @@ private same_plain(a: Value, b: Value, seen: *Buf[SeenPair], at: Span) -> Result
             _ -> Ok(false)
         Fn(_) -> Ok(false)
 
+        // Two ranges are equal when they cover the same numbers, which is what `..` and `..<` written
+        // two ways can do: `1..3` and `1..<4` are the same three.
+        RangeVal(alo, ahi, ainc, ahl, ahh) -> b match
+            RangeVal(blo, bhi, binc, bhl, bhh) ->
+                if ahl != bhl || ahh != bhh then return Ok(false)
+
+                val ax = if ainc then ahi else ahi - 1
+                val bx = if binc then bhi else bhi - 1
+
+                Ok(alo == blo && ax == bx)
+            _ -> Ok(false)
+
         // **A promise compares by identity, as a function does.** Two promises that will settle to
         // the same value are not the same promise, and asking whether they are equal before either
         // has settled has no answer that stays true.
@@ -420,6 +454,33 @@ private same_object(xs: *ObjectObj, ys: *ObjectObj, seen: *Buf[SeenPair], at: Sp
     Ok(true)
 end same_object
 
+// -- ranges ---------------------------------------------------------------------------------------
+
+// How many whole numbers a range covers. A `for` walks exactly this many.
+//
+// Not `private`: `builtin.sysl` answers `len` of one.
+range_count(lo: long, hi: long, inclusive: bool) -> usize
+    val last = if inclusive then hi else hi - 1
+
+    if last < lo then 0 else usize(last - lo + 1)
+
+// The half-open pair a range picks out of something `n` long, with the ends it did not name taken
+// from that length and every end held inside it.
+//
+// Not `private`: the machine slices with it too.
+range_within(r: Value, n: usize, at: Span) -> Result[(usize, usize), Signal]
+    r match
+        RangeVal(lo, hi, inclusive, has_lo, has_hi) ->
+            val start = if has_lo then lo else 0
+            val stop = if has_hi then (if inclusive then hi + 1 else hi) else long(n)
+
+            if start < 0 || stop < start || usize(stop) > n
+                return Err(Fail(at, s"this slice runs from ${start} to ${stop}, which is outside something ${n} long"))
+
+            Ok((usize(start), usize(stop)))
+        other -> Err(Fail(at, s"a slice is taken with a range, and this is ${other.type_name()}"))
+end range_within
+
 // -- reading ------------------------------------------------------------------------------------
 
 read_at(container: Value, k: Value, at: Span) -> Step
@@ -431,6 +492,20 @@ read_at(container: Value, k: Value, at: Span) -> Step
                         return fault(at, s"the index ${i} is outside an array of ${items.items.len()}")
 
                     Ok(items.items.at(usize(i)))
+
+                // **A range subscript is a slice, and it is what an open end is FOR.** `xs[2..]`
+                // takes an end from the array, which is the reading that makes a range with a side
+                // missing mean something rather than being syntax with nowhere to go.
+                RangeVal(_, _, _, _, _) ->
+                    val bounds = range_within(k, items.items.len(), at)?
+                    var out: Buf[Value] = buf()
+                    var i = bounds.0
+
+                    while i < bounds.1
+                        out.push(items.items.at(i))
+                        i += 1
+
+                    Ok(Array(new_array(out)))
                 other -> fault(at, s"an array is indexed by an integer, and this is ${other.type_name()}")
         Object(fields) ->
             k match
@@ -439,6 +514,14 @@ read_at(container: Value, k: Value, at: Span) -> Step
         Str(sv) ->
             k match
                 Int(_) -> fault(at, "a string is not indexed -- slate has no character type")
+
+                // A slice of a string IS a string, so this one has somewhere to land where a single
+                // index does not.
+                RangeVal(_, _, _, _, _) ->
+                    val b = sv.s.bytes
+                    val bounds = range_within(k, b.len, at)?
+
+                    Ok(str_value(from_utf8_unchecked(b[bounds.0..<bounds.1])))
                 other -> fault(at, s"a string is not indexed by ${other.type_name()}")
         other -> fault(at, s"${other.type_name()} cannot be indexed")
 end read_at

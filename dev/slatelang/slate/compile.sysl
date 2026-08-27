@@ -156,7 +156,8 @@ private compile_stmt(u: *Unit, e: *Emit, s: Stmt)
             push_n(e, DefineFn(intern_str(u, name), c), at, 0, 0)
             push_n(e, PushNil, at, 0, 1)
         Eval(x) -> compile_expr(u, e, x)
-        Assign(target, value) -> compile_assign(u, e, target, value, at)
+        Assign(op, target, value) -> compile_assign(u, e, op, target, value, at)
+        MultiAssign(op, targets, values) -> compile_multi_assign(u, e, op, targets, values, at)
         Return(value) ->
             value match
                 Some(x) -> compile_expr(u, e, x)
@@ -173,26 +174,126 @@ private compile_stmt(u: *Unit, e: *Emit, s: Stmt)
         While(cond, body) -> compile_while(u, e, cond, body, at)
         For(name, iter, body) -> compile_for(u, e, name, iter, body, at)
         Loop(body) -> compile_loop(u, e, body, at)
+        DoWhile(body, cond) -> compile_do_while(u, e, body, cond, at)
 end compile_stmt
 
-private compile_assign(u: *Unit, e: *Emit, target: Expr, value: Expr, at: Span)
+// `x = e`, and `x += e` and the rest.
+//
+// **A compound form evaluates its place ONCE**, which is the whole reason it is not desugared into
+// `x = x + e`: `xs[next()] += 1` calls `next` a single time. The place's parts are computed, copied
+// with `DupAt` for the read, and the copies underneath are what the write consumes.
+private compile_assign(u: *Unit, e: *Emit, op: Tok, target: Expr, value: Expr, at: Span)
+    val plain = op == Assign
+
     *target.kind match
         Name(n) ->
+            val k = intern_str(u, n)
+
+            if !plain then push_n(e, LoadName(k), target.span, 0, 1)
+
             compile_expr(u, e, value)
-            push_n(e, StoreName(intern_str(u, n)), target.span, 1, 0)
+
+            if !plain then push_n(e, BinaryOp(op), at, 2, 1)
+
+            push_n(e, StoreName(k), target.span, 1, 0)
         Field(obj, name) ->
+            val k = intern_str(u, name)
+
             compile_expr(u, e, obj)
+
+            if !plain
+                push_n(e, Dup, target.span, 0, 1)
+                push_n(e, GetField(k), target.span, 1, 1)
+
             compile_expr(u, e, value)
-            push_n(e, SetField(intern_str(u, name)), target.span, 2, 0)
+
+            if !plain then push_n(e, BinaryOp(op), at, 2, 1)
+
+            push_n(e, SetField(k), target.span, 2, 0)
         Index(t, key) ->
             compile_expr(u, e, t)
             compile_expr(u, e, key)
+
+            if !plain
+                push_n(e, DupAt(1), target.span, 0, 1)
+                push_n(e, DupAt(1), target.span, 0, 1)
+                push_n(e, GetIndex, target.span, 2, 1)
+
             compile_expr(u, e, value)
+
+            if !plain then push_n(e, BinaryOp(op), at, 2, 1)
+
             push_n(e, SetIndex, target.span, 3, 0)
         _ -> push_n(e, FailWith(intern_str(u, "this cannot be assigned to")), at, 0, 0)
 
     push_n(e, PushNil, at, 0, 1)
 end compile_assign
+
+// `a, b = b, a`.
+//
+// **Every value is computed before any place is written**, which is what makes the swap a swap. They
+// stay on the stack while the writes happen, and each write reaches back down to the one it wants --
+// so nothing needs a temporary the program could name.
+private compile_multi_assign(u: *Unit, e: *Emit, op: Tok, targets: Buf[Expr], values: Buf[Expr], at: Span)
+    val n = values.len()
+
+    for i in 0..<n
+        compile_expr(u, e, values.at(i))
+
+    // How far below the top the value for target `i` sits, before that target's own parts are pushed.
+    for i in 0..<targets.len()
+        if i >= n then break
+
+        val deep = n - 1 - i
+        val target = targets.at(i)
+
+        *target.kind match
+            Name(name) ->
+                val k = intern_str(u, name)
+
+                if op != Assign
+                    push_n(e, LoadName(k), target.span, 0, 1)
+                    push_n(e, DupAt(deep + 1), target.span, 0, 1)
+                    push_n(e, BinaryOp(op), at, 2, 1)
+                else
+                    push_n(e, DupAt(deep), target.span, 0, 1)
+
+                push_n(e, StoreName(k), target.span, 1, 0)
+            Field(obj, name) ->
+                val k = intern_str(u, name)
+
+                compile_expr(u, e, obj)
+
+                if op != Assign
+                    push_n(e, Dup, target.span, 0, 1)
+                    push_n(e, GetField(k), target.span, 1, 1)
+                    push_n(e, DupAt(deep + 2), target.span, 0, 1)
+                    push_n(e, BinaryOp(op), at, 2, 1)
+                else
+                    push_n(e, DupAt(deep + 1), target.span, 0, 1)
+
+                push_n(e, SetField(k), target.span, 2, 0)
+            Index(t, key) ->
+                compile_expr(u, e, t)
+                compile_expr(u, e, key)
+
+                if op != Assign
+                    push_n(e, DupAt(1), target.span, 0, 1)
+                    push_n(e, DupAt(1), target.span, 0, 1)
+                    push_n(e, GetIndex, target.span, 2, 1)
+                    push_n(e, DupAt(deep + 3), target.span, 0, 1)
+                    push_n(e, BinaryOp(op), at, 2, 1)
+                else
+                    push_n(e, DupAt(deep + 2), target.span, 0, 1)
+
+                push_n(e, SetIndex, target.span, 3, 0)
+            _ -> push_n(e, FailWith(intern_str(u, "this cannot be assigned to")), at, 0, 0)
+
+    for i in 0..<n
+        push_n(e, Pop, at, 1, 0)
+
+    push_n(e, PushNil, at, 0, 1)
+end compile_multi_assign
 
 // `break` and `continue`, which have to leave the loop as they found it.
 private jump_out(u: *Unit, e: *Emit, at: Span, breaking: bool)
@@ -260,9 +361,35 @@ private compile_loop(u: *Unit, e: *Emit, body: Expr, at: Span)
     push_n(e, PushNil, at, 0, 1)
 end compile_loop
 
+// **`continue` goes to the TEST, not to the top**, which is the whole reason this is not desugared
+// into a `while`: the body has already run once by the time the condition is first asked.
+private compile_do_while(u: *Unit, e: *Emit, body: Expr, cond: Expr, at: Span)
+    val top = here(e)
+
+    open_loop(e)
+    compile_body(u, e, body)
+
+    val test = here(e)
+
+    compile_expr(u, e, cond)
+
+    val out = push_n(e, JumpIfFalse(0), at, 1, 0)
+
+    put(e, Jump(top), at)
+    patch(e, out, here(e))
+    close_loop(e, test, here(e))
+    push_n(e, PushNil, at, 0, 1)
+end compile_do_while
+
 private compile_for(u: *Unit, e: *Emit, name: string, iter: Expr, body: Expr, at: Span)
     compile_expr(u, e, iter)
-    push_n(e, IterInit, at, 1, 1)
+
+    // **`IterInit` KEEPS the subject and pushes a counter beside it**, so it gives one and takes
+    // none. Accounting it as taking the subject left the counter unmatched: the compiler believed
+    // the stack was one shallower than it was, the single `Pop` below removed only the counter, and
+    // every `for` a program ran stranded its subject for the rest of the enclosing chunk. Fifty
+    // thousand turns of a loop containing one was a SIGSEGV with no output.
+    push_n(e, IterInit, at, 0, 1)
 
     val top = here(e)
 
@@ -283,7 +410,8 @@ private compile_for(u: *Unit, e: *Emit, name: string, iter: Expr, body: Expr, at
     patch(e, out, here(e))
     close_loop(e, top, here(e))
 
-    // The iterator itself goes.
+    // The counter and the subject both go -- two values, which is what `IterInit` left.
+    push_n(e, Pop, at, 1, 0)
     push_n(e, Pop, at, 1, 0)
     push_n(e, PushNil, at, 0, 1)
 end compile_for
@@ -325,6 +453,23 @@ compile_expr(u: *Unit, e: *Emit, x: Expr)
             compile_expr(u, e, rhs)
             push_n(e, UnaryOp(op), at, 1, 1)
         Binary(op, lhs, rhs) -> compile_binary(u, e, op, lhs, rhs, at)
+        Compare(operands, ops) -> compile_compare(u, e, operands, ops, at)
+        Range(lo, hi, inclusive) ->
+            lo match
+                Some(x) -> compile_expr(u, e, x)
+                None -> ()
+
+            hi match
+                Some(x) -> compile_expr(u, e, x)
+                None -> ()
+
+            val ends: usize = (if lo.is_some() then 1 else 0) + (if hi.is_some() then 1 else 0)
+
+            push_n(e, MakeRange(inclusive, lo.is_some(), hi.is_some()), at, ends, 1)
+        IsPattern(subject, pat, negated) ->
+            compile_expr(u, e, subject)
+            push_n(e, IsPat(intern_pattern(u, pat), negated), at, 1, 1)
+        IncDec(target, up, before) -> compile_inc_dec(u, e, target, up, before, at)
         Call(callee, args) ->
             compile_expr(u, e, callee)
 
@@ -376,6 +521,110 @@ compile_expr(u: *Unit, e: *Emit, x: Expr)
         // A program with one of these in it is never run: `parse` reports first.
         Bad -> push_n(e, FailWith(intern_str(u, "this expression did not parse")), at, 0, 1)
 end compile_expr
+
+// A chain of comparisons, which is one comparison.
+//
+// **The middle operand is evaluated once and kept on the stack**, which is the whole difference from
+// `a < b && b < c` written out: `a < f() < c` calls `f` a single time. Each step keeps a copy of the
+// right operand to be the next step's left, and a step that answers false jumps to a common exit
+// where whatever is still standing is dropped.
+private compile_compare(u: *Unit, e: *Emit, operands: Buf[Expr], ops: Buf[Tok], at: Span)
+    compile_expr(u, e, operands.at(0))
+
+    var short: Buf[usize] = buf()
+    val last = ops.len() - 1
+
+    for i in 0..<ops.len()
+        compile_expr(u, e, operands.at(i + 1))
+
+        if i == last
+            push_n(e, BinaryOp(ops.at(i)), at, 2, 1)
+        else
+            // Keep the right operand: it is the next step's left.
+            push_n(e, Dup, at, 0, 1)
+            push_n(e, RotUp(2), at, 0, 0)
+            push_n(e, BinaryOp(ops.at(i)), at, 2, 1)
+            short.push(push_n(e, JumpIfFalse(0), at, 1, 0))
+
+    val done = put(e, Jump(0), at)
+
+    // Reached with one value on the stack -- the operand the failing step had kept -- so the height
+    // is the same on both paths and the counter needs no correction.
+    val fail = here(e)
+
+    for i in 0..<short.len()
+        patch(e, short.at(i), fail)
+
+    push_n(e, Pop, at, 1, 0)
+    push_n(e, PushBool(false), at, 0, 1)
+    patch(e, done, here(e))
+end compile_compare
+
+// `++x`, `x++`, and the two decrements.
+//
+// **Prefix and postfix differ only in WHICH value is kept**, so both are the same four moves: read
+// the old value, put the one to keep out of the way underneath, copy it back to be written, write.
+private compile_inc_dec(u: *Unit, e: *Emit, target: Expr, up: bool, before: bool, at: Span)
+    val op: Tok = if up then Plus else Minus
+
+    *target.kind match
+        Name(n) ->
+            val k = intern_str(u, n)
+
+            push_n(e, LoadName(k), target.span, 0, 1)
+
+            if before
+                push_n(e, PushInt(1), at, 0, 1)
+                push_n(e, BinaryOp(op), at, 2, 1)
+                push_n(e, Dup, at, 0, 1)
+            else
+                push_n(e, Dup, at, 0, 1)
+                push_n(e, PushInt(1), at, 0, 1)
+                push_n(e, BinaryOp(op), at, 2, 1)
+
+            push_n(e, StoreName(k), target.span, 1, 0)
+        Field(obj, name) ->
+            val k = intern_str(u, name)
+
+            compile_expr(u, e, obj)
+            push_n(e, Dup, target.span, 0, 1)
+            push_n(e, GetField(k), target.span, 1, 1)
+
+            if before
+                push_n(e, PushInt(1), at, 0, 1)
+                push_n(e, BinaryOp(op), at, 2, 1)
+
+            // The value to keep goes under the receiver, and a copy of it comes back up to be stored.
+            push_n(e, RotUp(1), at, 0, 0)
+            push_n(e, DupAt(1), at, 0, 1)
+
+            if !before
+                push_n(e, PushInt(1), at, 0, 1)
+                push_n(e, BinaryOp(op), at, 2, 1)
+
+            push_n(e, SetField(k), target.span, 2, 0)
+        Index(t, key) ->
+            compile_expr(u, e, t)
+            compile_expr(u, e, key)
+            push_n(e, DupAt(1), target.span, 0, 1)
+            push_n(e, DupAt(1), target.span, 0, 1)
+            push_n(e, GetIndex, target.span, 2, 1)
+
+            if before
+                push_n(e, PushInt(1), at, 0, 1)
+                push_n(e, BinaryOp(op), at, 2, 1)
+
+            push_n(e, RotUp(2), at, 0, 0)
+            push_n(e, DupAt(2), at, 0, 1)
+
+            if !before
+                push_n(e, PushInt(1), at, 0, 1)
+                push_n(e, BinaryOp(op), at, 2, 1)
+
+            push_n(e, SetIndex, target.span, 3, 0)
+        _ ->
+            push_n(e, FailWith(intern_str(u, "only a name, a field or an element may be stepped")), at, 0, 1)
+end compile_inc_dec
 
 // **`&&` and `||` answer the operand that decided**, which is slate's rule and not sysl's -- so the
 // jump keeps what it tested rather than popping it.
