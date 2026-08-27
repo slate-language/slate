@@ -232,11 +232,10 @@ settled promise still resumes through the queue rather than continuing in place,
 scheduled first runs first; `await` of a plain value answers it and still yields, so a program cannot
 tell which of the two it was handed by watching what runs next.
 
-**A failed promise is what slate has instead of a thrown exception.** There is no `throw` and no
-`catch`: a promise fails when the `async` function running it faults, awaiting that promise raises
-the same fault in the awaiting function, and so a chain of `await`s carries a fault to whoever is
-waiting at the end of it. What a language with exceptions gets from unwinding, this gets from the
-chain.
+**A failed promise raises where it was awaited.** A promise fails when the `async` function running
+it faults; awaiting that promise raises the same fault in the awaiting function, so a chain of
+`await`s carries a fault to whoever is waiting at the end of it — and a `catch` anywhere along that
+chain stops it.
 
 **And a failure nothing was waiting for is the program's failure**, reported against the line that
 raised it. That is the one thing node gets wrong by default and warns about instead.
@@ -244,6 +243,43 @@ raised it. That is the one thing node gets wrong by default and warns about inst
 `sleep(ms)` answers a promise for later; `resolve(v)` and `reject(message)` answer one that has
 already settled. Top-level `await` is refused — the whole program would have to become a coroutine,
 which is a real design and one to make on purpose.
+
+### Handling a fault
+
+Two forms of one thing. The postfix one is an expression, so it stands where a value is wanted:
+
+```
+val text = readFileSync(path) catch e -> ""
+
+val port = toPort(argument) catch e ->
+    print(s"${e.message}, so using the default")
+    8080
+```
+
+and the block one is for a run of statements:
+
+```
+try
+    setUp()
+    run()
+catch e
+    print(s"${e.file}:${e.line} ${e.message}")
+```
+
+**A fault is an ordinary object** — `message`, `line` and `file` — for the same reason a module is
+one: slate objects already sort, print, go in arrays and match against patterns, so there is nothing
+here the rest of the language does not already do.
+
+**`catch` works across an `await`.** A coroutine carries its handlers with it when it is set aside, so
+a promise that fails minutes later still raises inside the `try` that was written around the `await`
+rather than escaping to the scheduler.
+
+**There is no `finally`, and no way to re-raise yet.** A `try` with nothing to handle the fault is
+refused rather than allowed to swallow it silently.
+
+**A fault in a callback is not caught by the call that scheduled it** — `try setTimeout(...)` guards
+the scheduling and nothing else, because the callback runs from the loop long afterwards. That is
+inherent rather than a gap: there is no statement of the program's left to attach it to.
 
 ### The file system
 

@@ -27,6 +27,34 @@ struct Frame
     // How tall the operand stack was when this call started. `Ret` cuts back to it.
     base: usize
 
+    // How many handlers were owed when this call started.
+    //
+    // **`return` out of a `try` body would otherwise leave its handler behind**, and a handler left
+    // behind is worse than a missing one: it names a place in a chunk nobody is standing in any
+    // more, so the next fault anywhere would restore the machine into the middle of a function that
+    // has already returned.
+    handlers: usize
+
+// Where to put the machine back to when a fault is caught.
+//
+// **Everything here is what the machine will be given back, not what it had.** A fault can be raised
+// any number of frames deep and with any amount of half-evaluated arithmetic on the stack, so
+// unwinding is not a matter of undoing steps -- it is a matter of having written down, once, what
+// the world looked like where the `try` began.
+struct Handler
+    // Where the `catch` starts. Both are needed: a `try` and its `catch` are always in one chunk,
+    // but the fault may have been raised several chunks away.
+    chunk: usize
+    pc: usize
+
+    // What the operand stack, the frame stack and the scope chain are cut back to.
+    sp: usize
+    frames: usize
+    scope: *EnvObj
+
+    // The frame base the `catch` runs at, which is the one the `try` was written in.
+    base: usize
+
 // Everything one line of execution is: its values, its calls, and where it is looking names up.
 //
 // **Bundled because `await` moves them together.** Suspending a call means setting all of them aside
@@ -50,13 +78,20 @@ struct Machine
     // out from under the machine.
     scope: *EnvObj
 
+    // The `try` blocks this line of execution is inside, innermost last.
+    //
+    // **A field of the machine and not module storage, because a coroutine takes its handlers with
+    // it.** `await` inside a `try` parks the whole machine; the promise may fail minutes later, and
+    // the `catch` that is owed the fault is the parked machine's own.
+    handlers: Buf[Handler]
+
     // **Whether this slot holds something, said rather than inferred.** Emptiness was read off the
     // frames and the scope until a machine parked with values on its stack and nothing else matched
     // the same test -- and the next park wrote over it.
     live: bool
 
 // The line of execution currently running.
-var vm: Machine = Machine(buf(), buf(), null, null, true)
+var vm: Machine = Machine(buf(), buf(), null, null, buf(), true)
 
 // The ones set aside. **Empty until `await` exists**, and here now because the thing that makes a
 // coroutine possible is that its state is data rather than sysl's own call stack -- which is the
@@ -67,7 +102,7 @@ var parked: Buf[Machine] = buf()
 park() -> usize
     val saved = vm
 
-    vm = Machine(buf(), buf(), null, null, true)
+    vm = Machine(buf(), buf(), null, null, buf(), true)
 
     for i in 0..<parked.len()
         if !parked.at(i).live
@@ -83,7 +118,7 @@ unpark(id: usize) -> Machine
     val displaced = vm
 
     vm = parked.at(id)
-    parked.set(id, Machine(buf(), buf(), null, null, false))
+    parked.set(id, Machine(buf(), buf(), null, null, buf(), false))
     displaced
 end unpark
 
@@ -116,7 +151,7 @@ var module_values: Buf[Value] = buf()
 
 // Empty the machine between runs.
 reset_vm()
-    vm = Machine(buf(), buf(), null, null, true)
+    vm = Machine(buf(), buf(), null, null, buf(), true)
     parked.clear()
     module_values.clear()
 
@@ -146,6 +181,12 @@ private mark_machine(h: *gc.Heap, m: Machine)
 
     gc.mark(h, ptr_cast(m.scope))
     gc.mark(h, ptr_cast(m.promise))
+
+    // **A handler's scope is a root, and nothing else refers to it.** It is the scope the `try` was
+    // written in, which the machine has since moved out of -- so between entering the body and
+    // catching a fault, this is the only thing keeping it alive.
+    for i in 0..<m.handlers.len()
+        gc.mark(h, ptr_cast(m.handlers.at(i).scope))
 
 // -- running ---------------------------------------------------------------------------------------
 
@@ -204,12 +245,113 @@ resume_chunk(u: *Unit) -> Step
     answer
 end resume_chunk
 
+// Carry on from an `await` whose promise FAILED, raising the fault where the `await` was written.
+//
+// **The machine is put back before the fault is raised, and that ordering is the whole point.** A
+// coroutine's `try` blocks are its own and went into `parked` with it, so a fault made into an `Err`
+// without restoring the machine would be offered to whatever happened to be running instead -- which
+// is the scheduler, which has no handlers and is not the code that wrote the `await`.
+resume_failed(u: *Unit, at: Span, message: string) -> Step
+    val back = vm.frames.at(vm.frames.len() - 1)
+    val outer_source = current_source
+
+    vm.frames.truncate(vm.frames.len() - 1)
+    vm.scope = back.scope
+    current_source = u.chunks.at(back.chunk).source
+
+    // Everything this machine has is its own, so every handler in it is allowed the fault.
+    val answer = guarded(u, Err(failure(at, message)), 0, null, 0)
+
+    current_source = outer_source
+    answer
+end resume_failed
+
+// The instruction loop, with any `catch` this call owns given first refusal on a fault.
+//
+// **The loop itself is untouched and keeps returning `Err` the way it always has**, which is the
+// whole reason this is a wrapper rather than a rewrite. A fault leaves `run_frames` from about
+// thirty-five places, every one of them a `?` or a bare `return fault(...)`; threading a handler
+// check through all of them would have been thirty-five chances to get it wrong. Catching a fault is
+// instead re-entering the loop somewhere else, which is exactly what resuming an `await` already is.
+private execute(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, outer_scope: *EnvObj) -> Step
+    // **Handlers that were already owed are not this call's to answer**, which is what keeps a
+    // native's callback -- a user `equals` reached from inside a table lookup -- from being caught by
+    // a `try` in the function that called the native. The fault leaves here as an `Err`, unwinds the
+    // native, and is caught by the outer loop's wrapper instead, which is where it belongs.
+    val floor_of_handlers = vm.handlers.len()
+    val answer = guarded(u, run_frames(u, start, from, base0, floor, outer_scope), floor, outer_scope, floor_of_handlers)
+
+    // **Not on a park.** `Await` swaps `vm` for a fresh machine before it raises `Wait`, so the
+    // handlers standing here are the new machine's and the count means nothing against them. The
+    // suspended machine took its own away with it, which is the point.
+    answer match
+        Err(Wait) -> ()
+        _ -> vm.handlers.truncate(floor_of_handlers)
+
+    answer
+end execute
+
+// Give a fault to the nearest `catch` that is allowed to have it, and run on from there.
+//
+// Not `private`: `async.sysl` hands a failed promise's fault to the machine that awaited it, and
+// that machine's handlers are the ones owed it.
+guarded(u: *Unit, first: Step, floor: usize, outer_scope: *EnvObj, floor_of_handlers: usize) -> Step
+    var outcome = first
+
+    loop
+        val caught = outcome match
+            Err(Fail(at, src, message)) -> (at, src, message)
+            _ -> return outcome
+
+        if vm.handlers.len() <= floor_of_handlers then return outcome
+
+        val (at, src, message) = caught
+        val h = vm.handlers.at(vm.handlers.len() - 1)
+
+        vm.handlers.truncate(vm.handlers.len() - 1)
+
+        // **The value is built before the stack is cut back, and held while it is built.** It is an
+        // object, so making it allocates, and allocating collects -- and everything the program still
+        // owns is on the very stack about to be truncated.
+        val mark = root_mark()
+        val v = fault_value(u, at, src, message)
+
+        hold(v)
+        vm.stack.truncate(h.sp)
+        vm.frames.truncate(h.frames)
+        vm.scope = h.scope
+        vm.stack.push(v)
+        release(mark)
+
+        outcome = run_frames(u, h.chunk, h.pc, h.base, floor, outer_scope)
+end guarded
+
+// What a `catch` binds: the sentence, and where it was raised.
+//
+// **An ordinary object, which is the same answer modules got.** A fault is a value a program reads,
+// sorts on, prints and puts in an array, and slate objects already do all of that -- so there is no
+// new kind of value here and nothing new for the collector to trace.
+private fault_value(u: *Unit, at: Span, src: usize, message: string) -> Value
+    val o = new_object()
+    val mark = root_mark()
+
+    hold(Object(o))
+
+    val where = u.sources.at(src)
+
+    obj_put_name(o, "message", str_value(message))
+    obj_put_name(o, "line", Int(long(where.locate(at.start).line)))
+    obj_put_name(o, "file", str_value(where.name))
+    release(mark)
+    Object(o)
+end fault_value
+
 // The instruction loop.
 //
 // **The instruction pointer and the scope are sysl locals rather than fields of the top frame**, and
 // written back only when a call pushes or pops one -- or when an `await` suspends. Reading them out of
 // a `Buf` on every instruction would copy a whole frame per step.
-private execute(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, outer_scope: *EnvObj) -> Step
+private run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, outer_scope: *EnvObj) -> Step
     var chunk_ix = start
 
     // **The machine keeps `current_source` in step with the chunk it is running**, which is what
@@ -239,6 +381,9 @@ private execute(u: *Unit, start: usize, from: usize, base0: usize, floor: usize,
             PushReal(v) -> vm.stack.push(Real(v))
             PushStr(k) -> vm.stack.push(str_value(u.strings.at(k)))
             PushModule(m) -> vm.stack.push(module_values.at(m))
+
+            PushHandler(to) -> vm.handlers.push(Handler(chunk_ix, to, vm.stack.len(), vm.frames.len(), vm.scope, base))
+            PopHandler -> vm.handlers.truncate(vm.handlers.len() - 1)
 
             LoadName(k) ->
                 val name = u.strings.at(k)
@@ -515,7 +660,7 @@ private execute(u: *Unit, start: usize, from: usize, base0: usize, floor: usize,
                         if vm.frames.len() >= MaxCallDepth
                             return fault(at, s"this call is ${MaxCallDepth} deep, which is farther than slate will go -- a recursion this deep is usually one that never ends")
 
-                        vm.frames.push(Frame(chunk_ix, pc, vm.scope, base))
+                        vm.frames.push(Frame(chunk_ix, pc, vm.scope, base, vm.handlers.len()))
 
                         val called = new_env(c.scope)
 
@@ -545,7 +690,7 @@ private execute(u: *Unit, start: usize, from: usize, base0: usize, floor: usize,
                 val awaited = peek(0)
 
                 // What `resume_chunk` will pick the loop up from.
-                vm.frames.push(Frame(chunk_ix, pc, vm.scope, base))
+                vm.frames.push(Frame(chunk_ix, pc, vm.scope, base, vm.handlers.len()))
 
                 val id = park()
 
@@ -581,6 +726,11 @@ private execute(u: *Unit, start: usize, from: usize, base0: usize, floor: usize,
                 val back = vm.frames.at(vm.frames.len() - 1)
 
                 vm.frames.truncate(vm.frames.len() - 1)
+
+                // **Anything the returning call was inside goes with it.** A `return` written in a
+                // `try` body skips its `PopHandler`, and a handler outliving the frame it was
+                // established in names an instruction nobody is standing at.
+                vm.handlers.truncate(back.handlers)
                 chunk_ix = back.chunk
                 code = u.chunks.at(chunk_ix).code
                 current_source = u.chunks.at(chunk_ix).source
@@ -588,7 +738,7 @@ private execute(u: *Unit, start: usize, from: usize, base0: usize, floor: usize,
                 vm.scope = back.scope
                 base = back.base
                 vm.stack.push(v)
-end execute
+end run_frames
 
 // -- the entry point --------------------------------------------------------------------------------
 

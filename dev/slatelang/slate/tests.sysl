@@ -2549,3 +2549,142 @@ a_timer_a_module_starts_is_run_by_the_same_loop()
     // The loop drains once, after every module has run -- so a module's own timer is not a special
     // case and does not need one.
     assert_eq(ran_out("tests/mods/uses_timer.sl"), "loaded\nfrom the module's own timer")
+
+// -- try and catch ---------------------------------------------------------------------------------
+
+// **Unwinding already existed; what `try` adds is a place to stop it.** A fault has left the
+// instruction loop as an `Err` since the machine was written, so catching one is not a new mechanism
+// -- it is a record of what the world looked like where the `try` began, and re-entering the loop
+// there. The tests that matter most are the ones where something ELSE leaves the body: a `return`, a
+// `break`, an `await`. Each of those is a way for a handler to be left behind, and a handler left
+// behind is worse than a missing one.
+
+@test
+a_catch_answers_where_the_body_faulted()
+    assert_eq(out("print(1 catch e -> 2)"), "1")
+    assert_eq(out("print(boom catch e -> 2)"), "2")
+    assert_eq(out("print(1 / 0 catch e -> -1)"), "-1")
+
+@test
+the_block_form_and_the_postfix_form_are_one_thing()
+    // Both build a `TryCatch`, so nothing downstream learns there are two -- which is what slate
+    // already does for `if`'s one-line and indented forms.
+    assert_eq(good_tree("x catch e -> 0"), "(try x catch e 0)")
+    assert_eq(good_tree("try\n    x\ncatch e\n    0"), "(try (block x) catch e (block 0))")
+
+@test
+a_fault_is_an_ordinary_object_saying_where_it_was()
+    // **No new kind of value**, which is the same answer modules got: slate objects already sort,
+    // print and go in arrays, so a fault is one.
+    assert_eq(out("val e = boom catch e -> e\nprint(e.message)"), "`boom` is not defined")
+    assert_eq(out("val e = boom catch e -> e\nprint(e.line)"), "1")
+    assert_eq(out("val e = boom catch e -> e\nprint(e.file)"), "t")
+
+@test
+a_fault_raised_several_calls_deep_is_caught_at_the_top()
+    val prog = "deep(n) = if n == 0 then bottom else deep(n - 1)\nprint(deep(5) catch e -> e.message)"
+
+    assert_eq(out(prog), "`bottom` is not defined")
+
+@test
+the_name_a_catch_binds_is_its_own()
+    // `PushScope`/`PopScope` around the handler, so nothing leaks past it.
+    assert(fails("val v = boom catch e -> 1\nprint(e)").contains("`e` is not defined"))
+
+@test
+a_try_that_does_not_fault_leaves_nothing_owed()
+    // **The silent one.** A `return` written inside a `try` skips its `PopHandler`, and a handler
+    // outliving the frame it was made in names an instruction nobody is standing at -- so the next
+    // fault anywhere in the program would be restored into a function that has already returned.
+    // `Frame.handlers` is what stops it, and this is what would notice.
+    val prog = "f() =\n    try\n        return 1\n    catch e\n        2\nprint(f())\nafterwards"
+    val said = fails(prog)
+
+    assert(said.contains("`afterwards` is not defined"))
+    assert(!said.contains("2"))
+
+@test
+breaking_out_of_a_try_drops_its_handler()
+    // The same hazard by the other route: `break` leaves the body without running `PopHandler`, and
+    // `unwind_to` is what emits them.
+    val prog = "g() =\n    for i in 1..5\n        try\n            break\n        catch e\n            0\n    \"done\"\nprint(g())\nafterwards"
+    val said = fails(prog)
+
+    assert(said.contains("`afterwards` is not defined"))
+
+@test
+a_try_in_a_loop_catches_each_turn_of_it()
+    val prog = "var out = []\nfor i in 1..4\n    try\n        if i == 2 then nope\n        push(out, i)\n    catch e\n        push(out, \"caught\")\nprint(out)"
+
+    assert_eq(out(prog), "[1, \"caught\", 3, 4]")
+
+@test
+a_break_out_of_a_try_still_leaves_the_loop()
+    val prog = "var out = []\nfor i in 1..5\n    try\n        if i == 3 then break\n        push(out, i)\n    catch e\n        push(out, \"caught\")\nprint(out)"
+
+    assert_eq(out(prog), "[1, 2]")
+
+@test
+a_fault_in_a_handler_reaches_the_one_outside_it()
+    val prog = "val v = try\n    try\n        boom\n    catch inner\n        deeper\ncatch outer\n    outer.message\nprint(v)"
+
+    assert_eq(out(prog), "`deeper` is not defined")
+
+@test
+a_try_may_be_written_where_a_value_is_wanted()
+    // **The layout pass again.** Brackets suspend the off-side rule, so `try` and a `catch`'s name
+    // are nominated to `opens_block` exactly as `match` is -- otherwise the arms of a `try` written
+    // as an argument would be inside a bracket pair where a newline means nothing.
+    assert_eq(out("print(try\n    boom\ncatch e\n    \"caught\")"), "caught")
+    assert_eq(out("var xs = []\npush(xs, try\n    1 / 0\ncatch e\n    -1)\nprint(xs)"), "[-1]")
+
+@test
+a_try_with_nothing_to_handle_the_fault_is_refused()
+    assert(fails("try\n    boom").contains("a `try` needs a `catch`"))
+
+@test
+a_fault_in_a_callback_is_not_caught_by_the_call_that_scheduled_it()
+    // **A callback runs from the loop, long after the `try` around `setTimeout` has finished.** That
+    // is inherent rather than a gap: there is no statement of the program's to attach the fault to,
+    // which is why the loop reports it against the line that wrote the callback.
+    val said = fails("try\n    setTimeout(() -> nope, 1)\ncatch e\n    print(\"not this\")\nprint(\"scheduled\")")
+
+    assert(said.contains("`nope` is not defined"))
+    assert(!said.contains("not this"))
+
+@test
+a_caught_fault_costs_nothing_the_collector_cannot_give_back()
+    // A fault is an object, so catching twenty thousand of them allocates twenty thousand -- and the
+    // handler's own scope is a root only while it is owed.
+    assert_eq(out("var n = 0\nvar i = 0\nwhile i < 20000\n    n += missing catch e -> 1\n    i += 1\nprint(n)"), "20000")
+
+// -- catching across a suspension and across a file ------------------------------------------------
+
+@test
+a_failed_promise_is_caught_by_the_call_that_awaited_it()
+    // **The case the whole arrangement is for.** A coroutine's handlers went into `parked` with it,
+    // so the fault has to be given to the machine after it is put back -- not made into an `Err` by
+    // the scheduler, which has no handlers and did not write the `await`.
+    val prog = "async main() =\n    val t = await readFile(\"/no/such/file\") catch e -> \"recovered\"\n    print(t)\nmain()"
+
+    assert_eq(out(prog), "recovered")
+
+@test
+the_block_form_catches_across_an_await_too()
+    val prog = "async main() =\n    try\n        await readFile(\"/no/such/file\")\n        print(\"never\")\n    catch e\n        print(\"caught\")\nmain()"
+
+    assert_eq(out(prog), "caught")
+
+@test
+a_caught_rejection_is_not_also_an_unhandled_one()
+    // Awaiting a promise marks it handled, and catching what it raised settles the matter -- so the
+    // drain has nothing left to report at the end.
+    val prog = "async main() =\n    val t = await readFile(\"/no/such/file\") catch e -> \"fine\"\n    print(t)\nmain()"
+    val r = run(source_of("t", prog))
+
+    assert(r.ok(), s"a caught rejection was still reported: ${r.render()}")
+
+@test
+a_fault_caught_from_another_file_says_which_file_raised_it()
+    // The fault carries its own source, so unwinding across a module boundary does not lose it.
+    assert_eq(ran_out("tests/mods/catches.sl"), "tests/mods/raises.sl:1 `not_a_name_in_here` is not defined")
