@@ -343,6 +343,60 @@ slot is reused, so the value a program holds carries the *generation* that claim
 socket held across a `close` would come to mean its successor and compare equal to it. That was a
 real defect, and the same one had been sitting in `setTimeout`'s ids since the loop was built.
 
+### Modules
+
+A file is a module. What another file can see is what it writes `export` in front of:
+
+```
+export val greeting = "hello"
+
+export double(x) = x * 2
+
+secret() = "no other file can reach this"
+```
+
+and a file takes what it needs by name, or takes the whole module under one:
+
+```
+import { double, greeting as hi } from "./util.sl"
+import * as util from "./util.sl"
+
+print(hi, double(21), util.shout("go"))
+```
+
+**Imports are resolved and compiled before anything runs, and the machine never sees one.** That is
+not a preference. slate's file surface is promise-shaped, so an import resolved at run time would
+need either a blocking read carved out as a special case or an `import` that answers a promise — and
+the second forces top-level `await`, which slate refuses, on every program that imports anything at
+all. Compiling imports away avoids both. What reaches the machine is one instruction carrying a
+number.
+
+What it costs is that a path cannot be computed, which is the same bargain sysl takes and is what
+makes the set of files a program is made of knowable by reading it.
+
+**A path is relative to the file the import is written in**, so a directory of files that import each
+other works wherever the program is run from. A bare `util.sl` is refused rather than guessed at: a
+specifier with no `./` is what a package will be called when slate has packages, and a language that
+resolved it as a file today could not tell the two apart tomorrow.
+
+**A circle of imports is refused, with the chain named.** node allows one and initialises half a
+module, which is a famous source of confusion; refusing can be relaxed later, and half-built modules
+cannot be un-shipped.
+
+**A module is an object**, so there is no new kind of value and nothing new for the collector to
+trace — `util.double` is the field selection a program writes for itself. It follows that a module's
+exports are a *snapshot* taken when its file finishes: an `export var` the module changes afterwards
+is not seen changing from outside, which is where this parts company with TypeScript's live bindings.
+
+**Asking for a name a file does not export is a complaint before the program runs**, and it says what
+the file does export. Left to run time it would arrive as an absent field, and the message would be
+about `undefined` being bound to a name — true, and about the wrong thing.
+
+**Every complaint is drawn against the file it is about.** A fault carries the file its span belongs
+to rather than looking one up when it is reported, because a signal outlives the statement that
+raised it: an unhandled rejection is reported after the loop has drained, by which time the machine
+is somewhere else entirely.
+
 ## What it leans on
 
 `sh.sysl.parsing` does the scanner tier — spans, the byte cursor, literal reading, the diagnostic
@@ -428,8 +482,9 @@ Two consequences worth knowing:
 
 ## What is not here yet
 
-A module system, a literate `.lsl` form, a name resolver for `connect`, and anything resembling a
-standard library beyond the builtins.
+A literate `.lsl` form, a name resolver for `connect`, a way to turn a real into a whole number, and
+anything resembling a standard library beyond the builtins. Modules have no packages behind them yet
+either — every path is a file on disk.
 
 **`defer` is on sysl's list and is deliberately not here.** It earns its place in Go and in sysl
 because neither collects: a function that acquires something has to release it on every exit path,

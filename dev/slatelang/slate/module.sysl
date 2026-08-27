@@ -1,0 +1,320 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.read_bytes
+import sysl.text.{from_utf8_unchecked, str_builder}
+
+// Reading a program that is several files.
+//
+// **Every one of these decisions happens before the machine starts, and that is the design rather
+// than an implementation detail.** slate's file surface is promise-shaped, so an `import` resolved
+// at run time would need either a blocking read carved out as a special case or an `import` that
+// answers a promise -- and the second forces top-level `await`, which slate refuses, on every
+// program that imports anything at all. Compiling imports away avoids both, and gets a cycle check
+// and one-compile-per-file for nothing.
+//
+// What it costs is that a module path cannot be computed. That is the same bargain sysl itself
+// takes, and it is what makes the set of files a program is made of knowable by reading it.
+
+// -- lexical paths ---------------------------------------------------------------------------------
+//
+// **Hand-rolled here because sysl has no lexical path module yet**, which is filed as card 0316.
+// Nothing below touches the disk: joining and normalising a path is string work, and doing it
+// lexically is what lets a diagnostic name a file that does not exist.
+
+// Everything up to and including the last `/`, or nothing where the path names a file in the
+// working directory.
+private dir_of(path: string) -> string
+    val b = path.bytes
+    var cut: usize = 0
+    var seen = false
+
+    for i in 0..<b.len
+        if b[i] == u8('/')
+            cut = i + 1
+            seen = true
+
+    if seen then from_utf8_unchecked(b[0..<cut]) else ""
+end dir_of
+
+// A path split at its separators, empty pieces and all.
+private segments(path: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    val b = path.bytes
+    var start: usize = 0
+
+    for i in 0..<b.len
+        if b[i] == u8('/')
+            out.push(from_utf8_unchecked(b[start..<i]))
+            start = i + 1
+
+    out.push(from_utf8_unchecked(b[start..]))
+    out
+end segments
+
+// A path with its `.` and `..` segments taken out, without asking the filesystem anything.
+//
+// **A leading `..` survives and a leading `..` on an absolute path does not**, which is the one rule
+// that is easy to get wrong: `../a` cannot be simplified without knowing where it starts from, while
+// `/../a` is `/a` because the root has no parent.
+normalize_path(path: string) -> string
+    val b = path.bytes
+    val absolute = b.len > 0 && b[0] == u8('/')
+    val parts = segments(path)
+    var keep: Buf[string] = buf()
+
+    for i in 0..<parts.len()
+        val part = parts.at(i)
+
+        if part == "" || part == "."
+            continue
+        elif part == ".."
+            if keep.len() > 0 && keep.at(keep.len() - 1) != ".."
+                keep.truncate(keep.len() - 1)
+            elif !absolute
+                keep.push("..")
+        else
+            keep.push(part)
+
+    var out = str_builder()
+
+    if absolute then out.push("/")
+
+    for i in 0..<keep.len()
+        if i > 0 then out.push("/")
+
+        out.push(keep.at(i))
+
+    val text = out.finish()
+
+    if text == "" then "." else text
+end normalize_path
+
+// Where an import written in one file points.
+//
+// **Relative to the importing FILE, not to the working directory**, which is the rule every module
+// system worth copying uses: a directory of files that import each other keeps working wherever the
+// program is run from.
+resolve_import(importer: string, raw: string) -> string
+    if raw.bytes.len > 0 && raw.bytes[0] == u8('/') then return normalize_path(raw)
+
+    normalize_path(s"${dir_of(importer)}${raw}")
+end resolve_import
+
+// Whether a path says for itself where it starts.
+//
+// **A bare `util.sl` is refused rather than guessed at.** node's ESM rule, and for node's reason: a
+// specifier with no `./` is what a package name will look like when slate has packages, and a
+// language that resolved it as a file today could not tell the two apart tomorrow.
+private is_relative(raw: string) -> bool
+    val b = raw.bytes
+
+    if b.len > 0 && b[0] == u8('/') then return true
+    if b.len > 1 && b[0] == u8('.') && b[1] == u8('/') then return true
+
+    b.len > 2 && b[0] == u8('.') && b[1] == u8('.') && b[2] == u8('/')
+end is_relative
+
+// -- loading -----------------------------------------------------------------------------------
+
+// Every file a program is made of, and everything that was wrong with any of them.
+struct Loaded
+    // The files, in the order they were read: the entry is source zero and its imports follow
+    // depth-first. **A `Chunk.source` and a `Signal.Fail`'s `src` index this**, so the order is part
+    // of the contract between here and the machine.
+    sources: Buf[Source]
+
+    // What each file parsed to, indexed as `sources` is.
+    programs: Buf[Program]
+
+    report: Report
+
+    // Which file each diagnostic is about, in step with the report's own items.
+    srcs: Buf[usize]
+
+    // The source index of each module in the order it has to RUN -- every file before any file that
+    // imports it, and the entry last. **This is not the order they were read in**: reading is
+    // depth-first from the entry, running is post-order.
+    order: Buf[usize]
+
+    ok(self) -> bool = !self.report.has_errors()
+end Loaded
+
+// Read a program and everything it imports.
+//
+// The entry arrives already read, because the driver is what decides where a program comes from --
+// a file, standard input, a test's string literal. Everything it imports is read here.
+load_program(entry: Source) -> Loaded
+    clear_bodies()
+
+    var l = Loaded(buf(), buf(), report(), buf(), buf())
+    var stack: Buf[string] = buf()
+
+    load_file(&l, source(normalize_path(entry.name), entry.bytes), &stack)
+    check_exports(&l)
+    l
+end load_program
+
+// Take one file's diagnostics, remembering which file they were about.
+private absorb_from(l: *Loaded, me: usize, rep: Report)
+    for i in 0..<rep.len()
+        l.report.add(rep.at(i))
+        l.srcs.push(me)
+
+// Say something about a place in one file.
+private complain(l: *Loaded, me: usize, at: Span, message: string)
+    l.report.add(error(at, message))
+    l.srcs.push(me)
+
+// Which source has this path, or nothing.
+private source_named(l: *Loaded, path: string) -> Option[usize]
+    for i in 0..<l.sources.len()
+        if l.sources.at(i).name == path then return Some(i)
+
+    None
+end source_named
+
+private on_stack(stack: *Buf[string], path: string) -> bool
+    for i in 0..<stack.len()
+        if stack.at(i) == path then return true
+
+    false
+end on_stack
+
+// Parse one file, chase what it imports, and record it once its imports are all in place.
+//
+// **`order` is appended to on the way OUT of the recursion**, which is the whole of the ordering: a
+// file is recorded only once everything it imports already has been, so running the list front to
+// back never reaches a module whose dependencies have not run.
+private load_file(l: *Loaded, src: Source, stack: *Buf[string]) -> usize
+    val parsed = parse_source(src)
+    val me = l.sources.len()
+
+    l.sources.push(src)
+    l.programs.push(parsed.program)
+    absorb_from(l, me, parsed.report)
+
+    // **A file that did not parse has its imports left alone.** Its tree is full of `Bad` nodes and
+    // its paths are as likely to be wreckage as not, so chasing them would bury the mistake that
+    // actually happened under a list of files that were never really asked for.
+    if !parsed.ok()
+        l.order.push(me)
+        return me
+
+    stack.push(src.name)
+
+    for i in 0..<parsed.program.stmts.len()
+        val st = parsed.program.stmts.at(i)
+
+        *st.kind match
+            ImportNames(path, path_at, _, _) -> take_import(l, me, path, path_at, st.span, stack)
+            ImportAll(path, path_at, _) -> take_import(l, me, path, path_at, st.span, stack)
+            _ -> ()
+
+    stack.truncate(stack.len() - 1)
+    l.order.push(me)
+    me
+end load_file
+
+// One import: check the shape of the path, refuse a cycle, and read the file if it is new.
+private take_import(l: *Loaded, me: usize, raw: string, path_at: Span, whole: Span, stack: *Buf[string])
+    if raw == "" then return
+
+    if !is_relative(raw)
+        complain(l, me, path_at, s"a module path says where it starts, so `${raw}` has to be written `./${raw}` -- a bare name is what a package will be called when slate has packages")
+        return
+    end if
+
+    val path = resolve_import(l.sources.at(me).name, raw)
+
+    if on_stack(stack, path)
+        complain(l, me, whole, s"${cycle_text(stack, path)} -- a file cannot import something that is waiting for it, so one of the two has to give up what it needs from the other")
+        return
+    end if
+
+    // Already read, and finished: two files importing the same third is ordinary, and it is read and
+    // run once.
+    source_named(l, path) match
+        Some(_) -> return
+        None -> ()
+
+    read_bytes(path) match
+        Err(e) -> complain(l, me, path_at, s"cannot read `${path}`: ${e}")
+        Ok(bytes) -> load_file(l, source(path, bytes), stack)
+end take_import
+
+// The chain a cycle closes, written out so the reader knows which files are in it.
+private cycle_text(stack: *Buf[string], path: string) -> string
+    var from: usize = 0
+
+    for i in 0..<stack.len()
+        if stack.at(i) == path then from = i
+
+    var out = str_builder()
+
+    out.push("this import closes a circle: ")
+
+    for i in from..<stack.len()
+        out.push(stack.at(i))
+        out.push(" imports ")
+
+    out.push(path)
+    out.finish()
+end cycle_text
+
+// -- what one file asks of another ------------------------------------------------------------
+
+// Every imported name checked against what the file it comes from actually exports.
+//
+// **The compiler could leave this to run time and the message would be far worse.** A missing export
+// reaches the machine as an absent field, so the complaint would be about `undefined` being bound to
+// a name -- true, and about the wrong thing. Everything needed to say it properly is known here.
+private check_exports(l: *Loaded)
+    for me in 0..<l.programs.len()
+        val prog = l.programs.at(me)
+
+        for i in 0..<prog.stmts.len()
+            val st = prog.stmts.at(i)
+
+            *st.kind match
+                ImportNames(path, _, names, _) ->
+                    val target = source_named(l, resolve_import(l.sources.at(me).name, path))
+
+                    target match
+                        Some(other) -> check_names(l, me, st.span, path, names, l.programs.at(other).exports)
+                        None -> ()
+                _ -> ()
+end check_exports
+
+private check_names(l: *Loaded, me: usize, at: Span, path: string, names: Buf[string], exports: Buf[string])
+    for i in 0..<names.len()
+        if !holds_name(exports, names.at(i))
+            complain(l, me, at, s"`${path}` does not export `${names.at(i)}`${nearby(exports)}")
+end check_names
+
+private holds_name(names: Buf[string], want: string) -> bool
+    for i in 0..<names.len()
+        if names.at(i) == want then return true
+
+    false
+end holds_name
+
+// What the file does export, for the reader who mistyped one -- or the sentence that says the file
+// exports nothing at all, which is the commoner mistake and is otherwise invisible.
+private nearby(exports: Buf[string]) -> string
+    if exports.len() == 0 then return ", and exports nothing at all -- a name is only visible to another file if it is written `export`"
+
+    var out = str_builder()
+
+    out.push(". It exports ")
+
+    for i in 0..<exports.len()
+        if i > 0 then out.push(if i == exports.len() - 1 then " and " else ", ")
+
+        out.push("`")
+        out.push(exports.at(i))
+        out.push("`")
+
+    out.finish()
+end nearby

@@ -94,21 +94,58 @@ end unwind_to
 
 // -- entry ----------------------------------------------------------------------------------------
 
-// A parsed program to a unit the machine can run.
-compile_program(u: *Unit, prog: Program) -> unit
+// Which file is being compiled, as an index into the unit's sources.
+//
+// **Module storage, for the same reason `current_source` is**: a chunk is made deep inside
+// `compile_expr`, which has no business carrying a file down to it, and the answer is the same for
+// everything one call to `compile_module` emits. The machine's copy is the run-time twin of this.
+private var compiling_source: usize = 0
+
+// One file to a chunk of its own, answering the module index other files name it by.
+//
+// **Every module is compiled the same way and the entry is simply the last one**, which is what
+// makes a program of one file a program of one module rather than a special case.
+//
+// **A module's value is its exports and not its last statement.** The statements run for their
+// effect, their value is dropped, and what the chunk answers is an object built out of the names the
+// file marked `export` -- so a module is an ordinary object, `util.double` is an ordinary field
+// selection, and the collector needs to know nothing new.
+//
+// **The object is a snapshot taken when the file finishes.** An `export var` that the module changes
+// afterwards is not seen changing from outside, which is where this parts company with TypeScript's
+// live bindings -- and is the honest reading of "a module is an object".
+compile_module(u: *Unit, prog: Program, src: usize, name: string) -> usize
+    val at = u.chunks.len()
+    var params: Buf[string] = buf()
+
+    compiling_source = src
+    u.chunks.push(Chunk(buf(), params, name, false, src))
+
     // **The top level is not async, so top-level `await` is refused.** node draws the same line for a
     // script, and lifting it would mean the whole program becoming a coroutine -- which is a real
     // design, and one to make on purpose rather than by leaving a flag `true` here.
     var e = fresh_emit(false)
 
     compile_stmts(u, &e, prog.stmts, point(0))
+    push_n(&e, Pop, point(0), 1, 0)
+
+    for i in 0..<prog.exports.len()
+        val k = intern_str(u, prog.exports.at(i))
+
+        push_n(&e, PushStr(k), point(0), 0, 1)
+        push_n(&e, LoadName(k), point(0), 0, 1)
+
+    push_n(&e, MakeObject(prog.exports.len()), point(0), prog.exports.len() * 2, 1)
     put(&e, Ret, point(0))
 
-    var top = u.chunks.at(0)
+    var c = u.chunks.at(at)
 
-    top.code = e.code
-    u.chunks.set(0, top)
-end compile_program
+    c.code = e.code
+    u.chunks.set(at, c)
+    u.modules.push(at)
+    u.module_paths.push(name)
+    u.modules.len() - 1
+end compile_module
 
 // A function body to a chunk of its own, answering where it landed.
 private compile_chunk(u: *Unit, params: Buf[string], body: Expr, name: string, is_async: bool) -> usize
@@ -116,7 +153,9 @@ private compile_chunk(u: *Unit, params: Buf[string], body: Expr, name: string, i
     // index that already exists.
     val at = u.chunks.len()
 
-    u.chunks.push(Chunk(buf(), params, name, is_async))
+    // Every chunk a compilation makes belongs to the file being compiled, which `compile_module`
+    // named before it started.
+    u.chunks.push(Chunk(buf(), params, name, is_async, compiling_source))
 
     var e = fresh_emit(is_async)
 
@@ -175,7 +214,47 @@ private compile_stmt(u: *Unit, e: *Emit, s: Stmt)
             push_n(e, PushNil, at, 0, 1)
         Break(label, value) -> jump_out(u, e, at, true, label, value)
         Continue(label) -> jump_out(u, e, at, false, label, None)
+
+        // **An import is three ordinary instructions per name and no new machinery.** The module is
+        // already an object sitting in a slot, so taking a name out of it is the same `GetField` a
+        // program writes for itself, and binding it is the same `DeclareVal` a `val` uses.
+        //
+        // Every path here resolved while loading -- a file that did not, or that does not export
+        // what was asked of it, has already stopped the run with a diagnostic -- so a lookup that
+        // fails now is a compiler bug and is emitted as one.
+        ImportNames(path, _, names, locals) ->
+            module_index(u, path) match
+                Some(m) ->
+                    for i in 0..<names.len()
+                        push_n(e, PushModule(m), at, 0, 1)
+                        push_n(e, GetField(intern_str(u, names.at(i))), at, 1, 1)
+                        push_n(e, DeclareVal(intern_str(u, locals.at(i))), at, 1, 0)
+                None -> push_n(e, FailWith(intern_str(u, s"the module `${path}` was never loaded")), at, 0, 0)
+
+            push_n(e, PushNil, at, 0, 1)
+        ImportAll(path, _, alias) ->
+            module_index(u, path) match
+                Some(m) ->
+                    push_n(e, PushModule(m), at, 0, 1)
+                    push_n(e, DeclareVal(intern_str(u, alias)), at, 1, 0)
+                None -> push_n(e, FailWith(intern_str(u, s"the module `${path}` was never loaded")), at, 0, 0)
+
+            push_n(e, PushNil, at, 0, 1)
 end compile_stmt
+
+// Which module a path written in the file being compiled names.
+//
+// **It resolves the path the same way the loader did, from the same two strings**, rather than
+// having the loader hand a table down -- there is one rule for what a path means and it lives in
+// `module.sysl`, so asking it twice cannot disagree with itself.
+private module_index(u: *Unit, raw: string) -> Option[usize]
+    val want = resolve_import(u.sources.at(compiling_source).name, raw)
+
+    for i in 0..<u.module_paths.len()
+        if u.module_paths.at(i) == want then return Some(i)
+
+    None
+end module_index
 
 // `x = e`, and `x += e` and the rest.
 //

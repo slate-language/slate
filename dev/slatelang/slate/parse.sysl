@@ -26,6 +26,20 @@ struct Parser
     src: Source
     report: Report
 
+    // The names this file lets other files see, in the order they were written.
+    //
+    // **Gathered here rather than left in the tree.** `export` prefixes an ordinary binding or
+    // definition and changes nothing about it, so the word adds a name to this list and hands the
+    // statement on unchanged -- which is why `StmtKind` has no `Export`.
+    exports: Buf[string]
+
+    // How many blocks deep the statement being read is.
+    //
+    // **`export` and `import` belong to a file and not to a block**, which is a rule the grammar has
+    // to keep rather than the loader: a module's exports are known before it runs, and a name
+    // exported from inside an `if` would not be. Zero is the top level of the file.
+    depth: usize
+
     // The kind of the next token. `Eof` where there is none, so that no caller unwraps.
     peek(self) -> Tok = self.toks.peek() match
         Some(t) -> t.value
@@ -147,13 +161,21 @@ end Parsed
 // from being needed.
 parse(src: Source) -> Parsed
     clear_bodies()
+    parse_source(src)
 
+// The same, over a file that is one of several.
+//
+// **It does NOT clear the body table, and that is the whole difference.** Bodies are interned into
+// one table shared by the run, and a `Lambda` or a `Def` names one by its index there -- so a second
+// file clearing the table would leave the first file's functions pointing at somebody else's code.
+// `load_program` clears once, before it reads anything.
+parse_source(src: Source) -> Parsed
     val lexed = lex(src)
-    var p = Parser(lexed.tokens, src, lexed.report)
+    var p = Parser(lexed.tokens, src, lexed.report, buf(), 0)
     val stmts = parse_stmts(&p, false)
 
-    Parsed(Program(stmts), p.report)
-end parse
+    Parsed(Program(stmts, p.exports), p.report)
+end parse_source
 
 // A run of statements, to the end of the file or to the close of the block they are in.
 private parse_stmts(p: *Parser, in_block: bool) -> Buf[Stmt]
@@ -184,6 +206,8 @@ end parse_stmts
 
 private parse_stmt(p: *Parser) -> Stmt
     p.peek() match
+        Import -> parse_import(p)
+        Export -> parse_export(p)
         Val -> parse_binding(p, true)
         Var -> parse_binding(p, false)
         Return -> parse_return(p)
@@ -215,6 +239,137 @@ private parse_binding(p: *Parser, immutable: bool) -> Stmt
 
     stmt(start.to(p.just_taken()), if immutable then Val(name, init) else Var(name, init))
 end parse_binding
+
+// -- modules -------------------------------------------------------------------------------------
+
+// `export` in front of a binding or a definition.
+//
+// **The word adds a name to the file's export list and changes nothing else**, which is why there is
+// no `Export` node: the statement it prefixes is parsed by the very function that would have parsed
+// it without the word, and compiles identically. What the export list is *for* is the object built
+// at the end of the module's chunk, and that is the only place it is read.
+//
+// TypeScript's rule, taken deliberately: a name is private unless it says otherwise. The other
+// direction -- everything public, with a way to hide -- is the one that cannot be changed later
+// without breaking every program that relied on reaching in.
+private parse_export(p: *Parser) -> Stmt
+    val start = p.here()
+    val top = p.depth == 0
+
+    p.bump()
+
+    if !top
+        p.fault(start, "`export` belongs to the top level of a file -- what a module lets others see has to be known before it runs, and a name exported from inside a block would not be")
+
+    val s = p.peek() match
+        Val -> parse_binding(p, true)
+        Var -> parse_binding(p, false)
+
+        // `export async f(x) = ...`. The shape check runs one token further along, exactly as
+        // `parse_stmt`'s does, because `async` alone does not make a definition.
+        Async -> if at_definition_from(p, 1) then parse_def(p) else bad_export(p, start)
+        _ -> if at_definition_from(p, 0) then parse_def(p) else bad_export(p, start)
+
+    if top
+        *s.kind match
+            Val(name, _) -> p.exports.push(name)
+            Var(name, _) -> p.exports.push(name)
+            Def(name, _, _, _) -> p.exports.push(name)
+            _ -> ()
+
+    s
+end parse_export
+
+// `export` in front of something that has no name to export.
+private bad_export(p: *Parser, at: Span) -> Stmt
+    p.fault(at, "`export` goes in front of a `val`, a `var` or a definition, and there is nothing here for it to name")
+    parse_expr_stmt(p)
+
+// `import { a, b as c } from "./util.sl"`, and `import * as util from "./util.sl"`.
+//
+// **No default export.** It is the part of TypeScript's module system its own users regret: a
+// default has no name, so every importer invents one and the same thing is called four things
+// across a codebase. Everything here is named where it is written and named again where it is read.
+private parse_import(p: *Parser) -> Stmt
+    val start = p.here()
+
+    p.bump()
+
+    if p.depth != 0
+        p.fault(start, "`import` belongs to the top level of a file -- what a file depends on is worked out before it runs, so an import inside a block would have nothing to say")
+
+    if p.accept(Star)
+        expect_soft(p, "as")
+
+        val alias = parse_name(p, "a name for the module")
+
+        expect_soft(p, "from")
+
+        val (path, path_at) = parse_module_path(p)
+
+        return stmt(start.to(p.just_taken()), ImportAll(path, path_at, alias))
+    end if
+
+    var names: Buf[string] = buf()
+    var locals: Buf[string] = buf()
+
+    p.expect(LBrace, "`{` or `*`")
+
+    if !p.at(RBrace)
+        loop
+            val n = parse_name(p, "an exported name")
+
+            names.push(n)
+            locals.push(if accept_soft(p, "as") then parse_name(p, "a name to call it here") else n)
+
+            if !p.accept(Comma) then break
+            if p.at(RBrace) then break
+    end if
+
+    p.expect(RBrace, "`}`")
+    expect_soft(p, "from")
+
+    val (path, path_at) = parse_module_path(p)
+
+    stmt(start.to(p.just_taken()), ImportNames(path, path_at, names, locals))
+end parse_import
+
+// The quoted path an import names, and where it was written.
+//
+// **The span is kept because every complaint about the file is about this span** -- it cannot be
+// read, it is not there, it closes a cycle -- and those are reported long after the token is gone.
+private parse_module_path(p: *Parser) -> (string, Span)
+    val at = p.here()
+
+    if !p.at(StrLit)
+        p.report.add(expected(at, "a quoted path, like `\"./util.sl\"`", p.found(at)))
+        return ("", at)
+
+    p.bump()
+    (read_str_at(p, at), at)
+end parse_module_path
+
+// `from` and `as`, which are words only here.
+//
+// **Soft, where `import` and `export` are hard.** Both are read at a point where the parser already
+// knows what it is looking for, so nothing has to be decided from the word alone -- and taking them
+// as keywords would cost every program two perfectly ordinary names.
+private accept_soft(p: *Parser, word: string) -> bool
+    if !p.at(Ident) then return false
+    if p.text(p.here()) != word then return false
+
+    p.bump()
+    true
+end accept_soft
+
+private expect_soft(p: *Parser, word: string) -> bool
+    if accept_soft(p, word) then return true
+
+    val at = p.here()
+
+    p.report.add(expected(at, s"`${word}`", p.found(at)))
+    false
+end expect_soft
 
 // `return`, with or without a value.
 //
@@ -569,7 +724,12 @@ parse_control_body(p: *Parser, intro: Tok) -> Expr
 //
 // Not `private`: `expr.sysl` gives `if`'s branches their one-line forms.
 inline_stmt_body(p: *Parser) -> Expr
+    p.depth += 1
+
     val s = parse_stmt(p)
+
+    p.depth -= 1
+
     var one: Buf[Stmt] = buf()
 
     one.push(s)
@@ -651,7 +811,11 @@ parse_block(p: *Parser) -> Expr
     if !p.expect(Indent, "an indented block")
         return expr(start, Bad)
 
+    p.depth += 1
+
     val stmts = parse_stmts(p, true)
+
+    p.depth -= 1
 
     p.expect(Dedent, "the end of the block")
 

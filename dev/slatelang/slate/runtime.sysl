@@ -3,6 +3,7 @@ module dev.slatelang.slate
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map}
+import sysl.slices.sort_by
 import sysl.text.{str_builder, StrBuilder, from_utf8_unchecked}
 
 // What running a program needs that is not the machine itself: equality, arithmetic, indexing,
@@ -30,7 +31,12 @@ enum Signal
     Cont
 
     // Something the program did that it may not.
-    Fail(at: Span, message: string)
+    //
+    // **`src` is which file the span is an offset into**, and it travels with the fault rather than
+    // being looked up when the fault is reported. A `Signal` outlives the statement that raised it —
+    // an unhandled rejection is reported after the loop has drained, by which time the machine is
+    // somewhere else entirely — so the file has to be captured where the span was.
+    Fail(at: Span, src: usize, message: string)
 
     // An `await` set the running machine aside.
     //
@@ -48,7 +54,21 @@ type Step = Result[Value, Signal]
 // A fault at a place, as the error channel wants it.
 //
 // Not `private`: `private` in sysl is private to the *file*, and `builtin.sysl` complains too.
-fault(at: Span, message: string) -> Step = Err(Fail(at, message))
+// Which file the machine is currently running code from, as an index into the unit's sources.
+//
+// **Module storage, set by the machine as it enters and leaves a chunk**, because the alternative is
+// threading a file through every one of the 116 places that can raise a fault. A chunk knows which
+// file it was compiled from; the machine knows which chunk it is in; so this is the two facts joined
+// at the one moment anybody needs them.
+var current_source: usize = 0
+
+// A fault as a bare `Signal`, for the callers whose error channel is not a `Step`.
+//
+// **This is the ONE place a `Fail` is built**, which is what lets it learn the current file without
+// 116 call sites saying so. `Fail` is otherwise only ever matched on.
+failure(at: Span, message: string) -> Signal = Fail(at, current_source, message)
+
+fault(at: Span, message: string) -> Step = Err(failure(at, message))
 
 // One end of a range, which has to be a whole number.
 //
@@ -56,7 +76,7 @@ fault(at: Span, message: string) -> Step = Err(Fail(at, message))
 range_end(v: Value, at: Span, which: string) -> Result[long, Signal]
     v match
         Int(n) -> Ok(n)
-        other -> Err(Fail(at, s"${which} of a range is a whole number, and this is ${other.type_name()}"))
+        other -> Err(failure(at, s"${which} of a range is a whole number, and this is ${other.type_name()}"))
 
 // Whether a value is the absent one.
 is_absent(v: Value) -> bool = v match
@@ -91,22 +111,82 @@ is_nullish(v: Value) -> bool = v match
 // the one place it still knows.
 keepable(v: Value, at: Span, what: string) -> Result[unit, Signal]
     if is_absent(v)
-        return Err(Fail(at, s"this field is not there, and `undefined` cannot be ${what} -- give it a value with `??`, or ask `has` first"))
+        return Err(failure(at, s"this field is not there, and `undefined` cannot be ${what} -- give it a value with `??`, or ask `has` first"))
 
     Ok(())
 end keepable
 
 // -- entry point --------------------------------------------------------------------------------
 
+// Where a diagnostic is, for putting a report in reading order across several files.
+//
+// **The file comes first and the index is the last resort**, which is `sh.sysl.parsing`'s own
+// `Placed` with one field in front of it: sorting on the triple makes every key distinct, so an
+// unstable sort still leaves two complaints about one place in the order they were made.
+private struct Placed
+    src: usize
+    start: usize
+    index: usize
+
 // What running a program answers with.
 struct Ran
     value: Value
     report: Report
 
+    // Which file each diagnostic is about, in step with the report's own items.
+    //
+    // **A parallel list rather than a field on the `Diagnostic`.** `Diagnostic` belongs to
+    // `sh.sysl.parsing`, which the sysl compiler, `json` and `ogol` all share, so a field there would
+    // be paid for by every construction in the organisation for one consumer's benefit -- and the
+    // same argument that keeps the file out of `Span` keeps it out of here. What makes the parallel
+    // list safe is that a report is append-only and `Report.render` sorts a table of positions rather
+    // than the report, so the items stay in the order they were added.
+    srcs: Buf[usize]
+
+    // Every file the program was made of, indexed by what `srcs` holds.
+    sources: Buf[Source]
+
     // The lines the program printed, in order.
     output: &Buf[string]
 
     ok(self) -> bool = !self.report.has_errors()
+
+    // Every complaint rendered against the file it is actually about.
+    //
+    // **`Report.render` cannot do this and must not be asked to**: it takes one `Source` and renders
+    // everything against it, which quotes the wrong line as soon as a program is more than one file.
+    // Rendering per item is what `Report.at` exists for.
+    //
+    // Sorted by file and then by position, so the complaints about one file arrive together and in
+    // reading order, with the files in the order they were read -- the entry first.
+    render(self) -> string
+        var order: Buf[Placed] = buf()
+
+        for i in 0..<self.report.len()
+            order.push(Placed(self.srcs.at(i), self.report.at(i).span.start, i))
+
+        val xs = order.view()
+
+        sort_by(xs, (p, q) -> p.src < q.src
+            || (p.src == q.src && p.start < q.start)
+            || (p.src == q.src && p.start == q.start && p.index < q.index))
+
+        // The same handful `sh.sysl.parsing` prints, and for its reason: a grammar that resumes
+        // after a mistake reports the same one several ways, and the twentieth is never read.
+        val shown = if xs.len > ReportLimit then ReportLimit else xs.len
+        var b = str_builder()
+
+        for i in 0..<shown
+            if i > 0 then b.push("\n")
+
+            val at = xs[i]
+
+            b.push(self.report.at(at.index).render(self.sources.at(at.src)))
+
+        if shown < xs.len then b.push(s"\nshowing the first ${shown} of ${xs.len}\n")
+
+        b.finish()
+    end render
 
     // Everything printed, joined by newlines -- which is what a test compares against.
     printed(self) -> string
@@ -121,13 +201,24 @@ struct Ran
     end printed
 end Ran
 
+// How many complaints are printed before the rest are counted.
+private const ReportLimit: usize = 5
+
 // Where to point at a signal that escaped to the top.
 signal_span(s: Signal) -> Span = s match
-    Fail(at, _) -> at
+    Fail(at, _, _) -> at
     _ -> point(0)
 
+// Which file a signal that escaped to the top is about.
+//
+// **Zero for the ones that carry no place**, which is the entry: a `break` outside a loop is a
+// complaint about the program the user named, and there is nowhere better to point.
+signal_source(s: Signal) -> usize = s match
+    Fail(_, src, _) -> src
+    _ -> 0
+
 signal_message(s: Signal) -> string = s match
-    Fail(_, m) -> m
+    Fail(_, _, m) -> m
     Ret(_) -> "`return` outside a function"
     Brk -> "`break` outside a loop"
     Cont -> "`continue` outside a loop"
@@ -493,10 +584,10 @@ range_within(r: Value, n: usize, at: Span) -> Result[(usize, usize), Signal]
             val stop = if has_hi then (if inclusive then hi + 1 else hi) else long(n)
 
             if start < 0 || stop < start || usize(stop) > n
-                return Err(Fail(at, s"this slice runs from ${start} to ${stop}, which is outside something ${n} long"))
+                return Err(failure(at, s"this slice runs from ${start} to ${stop}, which is outside something ${n} long"))
 
             Ok((usize(start), usize(stop)))
-        other -> Err(Fail(at, s"a slice is taken with a range, and this is ${other.type_name()}"))
+        other -> Err(failure(at, s"a slice is taken with a range, and this is ${other.type_name()}"))
 end range_within
 
 // -- reading ------------------------------------------------------------------------------------

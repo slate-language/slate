@@ -107,10 +107,23 @@ private const MaxCallDepth: usize = 10000
 // needs is found here rather than threaded through every comparison.
 var current_unit: Unit = new_unit()
 
+// What each module exported, in the order the modules ran.
+//
+// **A root the collector has to walk, and the only one the module system adds.** A module's exports
+// are an ordinary object, so nothing else here is new: the closures in it hold their module's scope,
+// the scope holds whatever it captured, and the tracer already knows how to follow all of it.
+var module_values: Buf[Value] = buf()
+
 // Empty the machine between runs.
 reset_vm()
     vm = Machine(buf(), buf(), null, null, true)
     parked.clear()
+    module_values.clear()
+
+// Everything the loaded modules still hold.
+mark_modules(h: *gc.Heap)
+    for i in 0..<module_values.len()
+        mark_value(h, module_values.at(i))
 
 // Everything the machine can still reach, for the collector.
 //
@@ -151,8 +164,21 @@ run_chunk(u: *Unit, start: usize, scope0: *EnvObj) -> Step
     val floor = vm.frames.len()
     val outer_scope = vm.scope
 
+    // **The file has to be put back, and forgetting to was a diagnostic that named the wrong file
+    // entirely.** `execute` sets `current_source` from the chunk it is starting, and a nested run --
+    // an `async` call routed through `start_async`, a user `equals` reached from inside a table --
+    // returns into the middle of an outer `execute` whose own `chunk_ix` never changed. So the outer
+    // chunk carried on stamping its faults with the callee's file: a fault three lines after
+    // `await slowly(1)` was reported against `waits.sl`, at a line number that happened to exist and
+    // was blank. Nothing about that message says it is pointing at the wrong file.
+    val outer_source = current_source
+
     vm.scope = scope0
-    execute(u, start, 0, vm.stack.len(), floor, outer_scope)
+
+    val answer = execute(u, start, 0, vm.stack.len(), floor, outer_scope)
+
+    current_source = outer_source
+    answer
 end run_chunk
 
 // Carry on from where an `await` left off.
@@ -167,10 +193,15 @@ end run_chunk
 // what puts a machine back.
 resume_chunk(u: *Unit) -> Step
     val back = vm.frames.at(vm.frames.len() - 1)
+    val outer_source = current_source
 
     vm.frames.truncate(vm.frames.len() - 1)
     vm.scope = back.scope
-    execute(u, back.chunk, back.pc, back.base, 0, null)
+
+    val answer = execute(u, back.chunk, back.pc, back.base, 0, null)
+
+    current_source = outer_source
+    answer
 end resume_chunk
 
 // The instruction loop.
@@ -180,6 +211,11 @@ end resume_chunk
 // a `Buf` on every instruction would copy a whole frame per step.
 private execute(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, outer_scope: *EnvObj) -> Step
     var chunk_ix = start
+
+    // **The machine keeps `current_source` in step with the chunk it is running**, which is what
+    // lets `failure` stamp a fault with the file its span belongs to. It is set here and at every
+    // point below that changes `chunk_ix`; there are three, and they are the only three.
+    current_source = u.chunks.at(chunk_ix).source
     var pc = from
     var base = base0
     var code = u.chunks.at(chunk_ix).code
@@ -202,6 +238,7 @@ private execute(u: *Unit, start: usize, from: usize, base0: usize, floor: usize,
             PushInt(v) -> vm.stack.push(Int(v))
             PushReal(v) -> vm.stack.push(Real(v))
             PushStr(k) -> vm.stack.push(str_value(u.strings.at(k)))
+            PushModule(m) -> vm.stack.push(module_values.at(m))
 
             LoadName(k) ->
                 val name = u.strings.at(k)
@@ -487,6 +524,7 @@ private execute(u: *Unit, start: usize, from: usize, base0: usize, floor: usize,
 
                         chunk_ix = c.body
                         code = u.chunks.at(chunk_ix).code
+                        current_source = u.chunks.at(chunk_ix).source
                         pc = 0
                         vm.scope = called
                         base = vm.stack.len()
@@ -545,6 +583,7 @@ private execute(u: *Unit, start: usize, from: usize, base0: usize, floor: usize,
                 vm.frames.truncate(vm.frames.len() - 1)
                 chunk_ix = back.chunk
                 code = u.chunks.at(chunk_ix).code
+                current_source = u.chunks.at(chunk_ix).source
                 pc = back.pc
                 vm.scope = back.scope
                 base = back.base
@@ -553,7 +592,7 @@ end execute
 
 // -- the entry point --------------------------------------------------------------------------------
 
-// Compile a source and run it on the machine.
+// Compile a source and everything it imports, and run the lot.
 run(src: Source) -> Ran
     reset_heap()
     reset_vm()
@@ -561,20 +600,37 @@ run(src: Source) -> Ran
     reset_async()
     output.clear()
 
-    val parsed = parse(src)
+    val loaded = load_program(src)
 
-    if !parsed.ok() then return Ran(Null, parsed.report, output)
+    // **Nothing is compiled while anything is wrong with any file**, which is what makes a
+    // diagnostic about a missing export a diagnostic rather than a fault at run time.
+    if !loaded.ok() then return Ran(Null, loaded.report, loaded.srcs, loaded.sources, output)
 
     current_unit = new_unit()
 
-    compile_program(&current_unit, parsed.program)
+    // **The unit is told about every file before anything is compiled from any of them**, because a
+    // chunk is stamped with an index into this list and a fault carries the same index out.
+    for i in 0..<loaded.sources.len()
+        current_unit.sources.push(loaded.sources.at(i))
+
+    // Post-order, so a module is compiled -- and later run -- only once everything it imports has
+    // been. The entry is the last of them.
+    for i in 0..<loaded.order.len()
+        val which = loaded.order.at(i)
+
+        compile_module(&current_unit, loaded.programs.at(which), which, loaded.sources.at(which).name)
 
     var env = new_env(null)
 
     hold_env(env)
     install_builtins(env)
 
-    var rep = parsed.report
+    var rep = loaded.report
+
+    // **The report and the file list are copied out of `loaded` because a fault appends to both.**
+    // The signal the program stopped with carries the file its span belongs to, so the pair stays in
+    // step exactly as the parse-time ones did.
+    var srcs = loaded.srcs
 
     // **The program runs, and then the loop drains.** A slate program with a timer or a pending
     // `await` in it does not exit when its last statement does, which is node's rule and the whole
@@ -583,7 +639,7 @@ run(src: Source) -> Ran
     // **A failure nothing was waiting for is the program's failure**, checked once everything has
     // settled: until then there is no telling a promise that will be awaited on the next line from
     // one that never will be.
-    val answer: Step = run_chunk(&current_unit, 0, env) match
+    val answer: Step = run_modules(env) match
         Ok(v) -> drain_events() match
             Ok(_) -> unhandled_rejection() match
                 Some(s) -> Err(s)
@@ -592,8 +648,40 @@ run(src: Source) -> Ran
         Err(s) -> Err(s)
 
     answer match
-        Ok(v) -> Ran(v, rep, output)
+        Ok(v) -> Ran(v, rep, srcs, loaded.sources, output)
         Err(s) ->
             rep.add(error(signal_span(s), signal_message(s)))
-            Ran(Null, rep, output)
+            srcs.push(signal_source(s))
+            Ran(Null, rep, srcs, loaded.sources, output)
 end run
+
+// Every module in turn, each in a scope of its own under the builtins.
+//
+// **A module gets its own scope and not a shared one**, which is the whole of what makes a file's
+// top-level `val` private to it: nothing but what the file exported can be reached from outside, and
+// two files may each call something `helper` without either knowing.
+//
+// The value answered is the entry module's exports, the entry being the last to run.
+private run_modules(builtins: *EnvObj) -> Step
+    var last: Value = Null
+
+    for i in 0..<current_unit.modules.len()
+        val scope = new_env(builtins)
+        val mark = env_mark()
+
+        hold_env(scope)
+
+        val answer = run_chunk(&current_unit, current_unit.modules.at(i), scope)
+
+        release_env(mark)
+
+        answer match
+            Ok(v) ->
+                // **Pushed with nothing allocated in between**, so the object cannot be swept
+                // between being answered and becoming a root.
+                module_values.push(v)
+                last = v
+            Err(s) -> return Err(s)
+
+    Ok(last)
+end run_modules
