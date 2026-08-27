@@ -453,6 +453,46 @@ to rather than looking one up when it is reported, because a signal outlives the
 raised it: an unhandled rejection is reported after the loop has drained, by which time the machine
 is somewhere else entirely.
 
+### Text and numbers
+
+**A slate string is a sequence of characters and never of bytes**, so a program that has never
+thought about UTF-8 cannot get it wrong:
+
+```
+len("日本語")           // 3
+"日本語"[0..<1]         // 日
+"héllo"[1]              // é
+indexOf("héllo", "llo") // 2 -- by character; it is 3 by byte
+```
+
+There is still no character type, so a single character is a string of one. That is Python's answer,
+and it is what lets indexing, `chars` and `split` all hand back the same kind of thing.
+
+```
+chars  split  join  contains  indexOf  lastIndexOf  startsWith  endsWith
+trim  trimStart  trimEnd  upper  lower  replace  repeat
+```
+
+`indexOf` answers `null` rather than `-1`, because slate has a null and the operators that go with
+it: `indexOf(s, x) ?? 0` says what a sentinel makes a reader work out. `split` on an empty separator
+splits into characters.
+
+**`upper` and `lower` are ASCII**, which is `sysl.text`'s own boundary — its case conversion says of
+itself that a Unicode case table is above that layer. `é` comes back as it went in. That is a known
+limit with a test on it rather than a surprise.
+
+Numbers:
+
+```
+num  int  real  abs  floor  ceil  round  trunc  sqrt  pow  min  max
+```
+
+`num` reads a number out of a string and answers `null` where there is not one, which is how a
+program checks input without raising. `int` and `real` move between the two kinds slate keeps apart;
+the four roundings leave an integer alone, an integer already being whole. `min` and `max` take as
+many arguments as they are given and answer an integer when every one of them was — a `min` that
+answered a real for two integers would make every use of it in an index a conversion.
+
 ### Types
 
 A type is a shape with a name:
@@ -696,9 +736,10 @@ Two consequences worth knowing:
 
 ## What is not here yet
 
-A literate `.lsl` form, a name resolver for `connect`, a way to turn a real into a whole number, and
-anything resembling a standard library beyond the builtins. Modules have no packages behind them yet
-either — every path is a file on disk.
+A literate `.lsl` form, a name resolver for `connect`, Unicode case conversion, and a standard
+library beyond the builtins. Modules have no packages behind them either — every path is a file on
+disk. On the object side: `super`, a check that a proto satisfies a `type` when it is attached, and
+`class` as sugar over prototypes.
 
 **`defer` is on sysl's list and is deliberately not here.** It earns its place in Go and in sysl
 because neither collects: a function that acquires something has to release it on every exit path,

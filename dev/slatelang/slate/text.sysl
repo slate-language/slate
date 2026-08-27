@@ -1,0 +1,382 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.math.{Float, min, max}
+import sysl.text.{Ascii, Search, char_indices, chars_of, from_utf8_unchecked, join, parse_long, parse_real, repeat, replace_all, split, str_builder, to_lower, to_upper}
+
+// Text and numbers, as a slate program reaches them.
+//
+// **A slate string is measured in CHARACTERS and not in bytes**, which is the user's call and the
+// only defensible one: `len("日本語")` answering 9 and `"日本語"[0..<1]` answering half of a
+// character are not facts about the program, they are facts about UTF-8 leaking through a language
+// that has no business exposing it. Everything here counts and cuts by character.
+//
+// **The conversion is the tax, and it is paid here rather than by every caller.** `sysl.text`'s
+// searching answers byte offsets, because that is what a scanner wants; a slate program never sees
+// one. `char_span` and `char_of_byte` are the two functions that translate, and every builtin below
+// goes through them.
+//
+// **There is still no character type**, so a single character is a string of one. That is Python's
+// answer and it is what lets `s[i]`, `chars(s)` and `split` all hand back the same kind of thing.
+
+// -- counting and cutting by character -----------------------------------------------------------
+
+// How many characters a string holds.
+//
+// **Bytes that are not text count as the one replacement character a walk would hand back**, so this
+// agrees with what `chars` produces rather than with the byte length.
+char_count(s: string) -> usize = chars_of(s.bytes).count()
+
+// The byte offsets a run of characters occupies.
+//
+// Either end past the last character lands at the end of the string, which is what a slice of a
+// range running off the end means and is what keeps this out of the business of refusing one.
+char_span(s: string, from: usize, to: usize) -> (usize, usize)
+    var lo = s.bytes.len
+    var hi = s.bytes.len
+    var i: usize = 0
+
+    for entry in char_indices(s.bytes)
+        if i == from then lo = entry.0
+        if i == to then hi = entry.0
+
+        i += 1
+
+    (lo, hi)
+end char_span
+
+// The characters a run of them is.
+char_slice(s: string, from: usize, to: usize) -> string
+    val span = char_span(s, from, to)
+
+    if span.1 <= span.0 then return ""
+
+    from_utf8_unchecked(s.bytes[span.0..<span.1])
+end char_slice
+
+// Which character a byte offset falls on, for turning a search's answer into one a program can use.
+private char_of_byte(s: string, b: usize) -> usize
+    var n: usize = 0
+
+    for entry in char_indices(s.bytes)
+        if entry.0 >= b then return n
+
+        n += 1
+
+    n
+end char_of_byte
+
+// -- what a program calls: text --------------------------------------------------------------------
+
+// The one shape nearly all of these take: some strings in, one value out.
+private text_of(v: Value, at: Span, name: string, which: string) -> Result[string, Signal]
+    v match
+        Str(p) -> Ok(p.s)
+        other -> Err(failure(at, s"`${name}` takes ${which}, and this is ${other.type_name()}"))
+
+private wants(args: Buf[Value], n: usize, at: Span, name: string, what: string) -> Result[unit, Signal]
+    if args.len() != n then return Err(failure(at, s"`${name}` takes ${what}, and was given ${args.len()} arguments"))
+
+    Ok(())
+
+// `chars(s)` -- every character, each as a string of one.
+do_chars(args: Buf[Value], at: Span) -> Step
+    wants(args, 1, at, "chars", "one string")?
+
+    val s = text_of(args.at(0), at, "chars", "a string")?
+    val mark = root_mark()
+    var items: Buf[Value] = buf()
+
+    for entry in char_indices(s.bytes)
+        val one = str_value(char_slice(s, char_of_byte(s, entry.0), char_of_byte(s, entry.0) + 1))
+
+        hold(one)
+        items.push(one)
+
+    val made = Array(new_array(items))
+
+    release(mark)
+    Ok(made)
+end do_chars
+
+// `split(s, sep)` -- the pieces between each occurrence.
+//
+// **An empty separator splits into characters**, which is what every language that answers this
+// question at all answers, and saves a program reaching for `chars` under another name.
+do_split(args: Buf[Value], at: Span) -> Step
+    wants(args, 2, at, "split", "a string and a separator")?
+
+    val s = text_of(args.at(0), at, "split", "a string")?
+    val sep = text_of(args.at(1), at, "split", "a separator")?
+
+    // **An empty separator splits into characters**, and hands the work to the builtin that already
+    // does exactly that -- with an argument list of its own, `chars` taking one where this took two.
+    if sep == ""
+        var one: Buf[Value] = buf()
+
+        one.push(args.at(0))
+        return do_chars(one, at)
+    end if
+
+    val mark = root_mark()
+    val parts = split(s, sep)
+    var items: Buf[Value] = buf()
+
+    for i in 0..<parts.len
+        val one = str_value(parts[i])
+
+        hold(one)
+        items.push(one)
+
+    val made = Array(new_array(items))
+
+    release(mark)
+    Ok(made)
+end do_split
+
+// `join(xs, sep)` -- the other direction. Anything that is not a string is rendered as `print` would.
+do_join(args: Buf[Value], at: Span) -> Step
+    wants(args, 2, at, "join", "an array and a separator")?
+
+    val sep = text_of(args.at(1), at, "join", "a separator")?
+
+    args.at(0) match
+        Array(a) ->
+            var out = str_builder()
+
+            for i in 0..<a.items.len()
+                if i > 0 then out.push(sep)
+
+                out.push(value_text(a.items.at(i)))
+
+            Ok(str_value(out.finish()))
+        other -> fault(at, s"`join` takes an array, and this is ${other.type_name()}")
+end do_join
+
+do_contains(args: Buf[Value], at: Span) -> Step
+    wants(args, 2, at, "contains", "a string and what to look for")?
+
+    val s = text_of(args.at(0), at, "contains", "a string")?
+    val sub = text_of(args.at(1), at, "contains", "what to look for")?
+
+    Ok(Bool(s.contains(sub)))
+
+// `indexOf(s, sub)` -- where it is, IN CHARACTERS, or null.
+//
+// **Null rather than -1**, because slate has a null and the operators that go with it: `indexOf(s,
+// x) ?? 0` says what a sentinel makes a reader work out.
+do_index_of(args: Buf[Value], at: Span, last: bool) -> Step
+    val name = if last then "lastIndexOf" else "indexOf"
+
+    wants(args, 2, at, name, "a string and what to look for")?
+
+    val s = text_of(args.at(0), at, name, "a string")?
+    val sub = text_of(args.at(1), at, name, "what to look for")?
+
+    val found = if last then s.last_index_of(sub) else s.index_of(sub)
+
+    found match
+        Some(b) -> Ok(Int(long(char_of_byte(s, b))))
+        None -> Ok(Null)
+end do_index_of
+
+do_edge(args: Buf[Value], at: Span, start: bool) -> Step
+    val name = if start then "startsWith" else "endsWith"
+
+    wants(args, 2, at, name, "a string and what to look for")?
+
+    val s = text_of(args.at(0), at, name, "a string")?
+    val sub = text_of(args.at(1), at, name, "what to look for")?
+
+    Ok(Bool(if start then s.starts_with(sub) else s.ends_with(sub)))
+
+// `trim(s)`, `trimStart(s)`, `trimEnd(s)`.
+do_trim(args: Buf[Value], at: Span, front: bool, back: bool) -> Step
+    val name = if front && back then "trim" elif front then "trimStart" else "trimEnd"
+
+    wants(args, 1, at, name, "one string")?
+
+    val s = text_of(args.at(0), at, name, "a string")?
+    val n = char_count(s)
+    var lo: usize = 0
+    var hi = n
+
+    if front
+        loop
+            if lo >= hi then break
+            if !blank_at(s, lo) then break
+
+            lo += 1
+
+    if back
+        loop
+            if hi <= lo then break
+            if !blank_at(s, hi - 1) then break
+
+            hi -= 1
+
+    Ok(str_value(char_slice(s, lo, hi)))
+end do_trim
+
+// Whether the character at a position is one `trim` takes off.
+private blank_at(s: string, i: usize) -> bool
+    val one = char_slice(s, i, i + 1)
+
+    if one.bytes.len != 1 then return false
+
+    one.bytes[0].is_space()
+end blank_at
+
+do_case(args: Buf[Value], at: Span, up: bool) -> Step
+    val name = if up then "upper" else "lower"
+
+    wants(args, 1, at, name, "one string")?
+
+    val s = text_of(args.at(0), at, name, "a string")?
+
+    Ok(str_value(if up then to_upper(s) else to_lower(s)))
+
+do_replace(args: Buf[Value], at: Span) -> Step
+    wants(args, 3, at, "replace", "a string, what to replace, and what to put there")?
+
+    val s = text_of(args.at(0), at, "replace", "a string")?
+    val old = text_of(args.at(1), at, "replace", "what to replace")?
+    val new = text_of(args.at(2), at, "replace", "what to put there")?
+
+    if old == "" then return fault(at, "`replace` cannot replace the empty string -- there is one of it between every pair of characters")
+
+    Ok(str_value(replace_all(s, old, new)))
+end do_replace
+
+do_repeat(args: Buf[Value], at: Span) -> Step
+    wants(args, 2, at, "repeat", "a string and a count")?
+
+    val s = text_of(args.at(0), at, "repeat", "a string")?
+
+    args.at(1) match
+        Int(n) ->
+            if n < 0 then return fault(at, s"`repeat` takes a count that is not negative, and this is ${n}")
+
+            Ok(str_value(repeat(s, usize(n))))
+        other -> fault(at, s"`repeat` takes a whole number of times, and this is ${other.type_name()}")
+end do_repeat
+
+// -- what a program calls: numbers -------------------------------------------------------------------
+
+// `num(s)` -- a string read as a number, or null where it is not one.
+//
+// **A whole number where it was written as one**, so `num("3")` is an integer and `num("3.0")` is a
+// real -- which is the distinction slate keeps everywhere else and would be odd to drop here.
+do_num(args: Buf[Value], at: Span) -> Step
+    wants(args, 1, at, "num", "one string")?
+
+    args.at(0) match
+        Int(n) -> return Ok(Int(n))
+        Real(x) -> return Ok(Real(x))
+        _ -> ()
+
+    val s = text_of(args.at(0), at, "num", "a string or a number")?
+
+    parse_long(s) match
+        Ok(n) -> return Ok(Int(n))
+        Err(_) -> ()
+
+    parse_real(s) match
+        Ok(x) -> Ok(Real(x))
+        Err(_) -> Ok(Null)
+end do_num
+
+// `int(x)` -- a number without its fraction, towards zero.
+do_int(args: Buf[Value], at: Span) -> Step
+    wants(args, 1, at, "int", "one number")?
+
+    args.at(0) match
+        Int(n) -> Ok(Int(n))
+        Real(x) -> Ok(Int(long(x.trunc())))
+        other -> fault(at, s"`int` takes a number, and this is ${other.type_name()} -- `num` is what reads one out of a string")
+
+// `real(x)` -- a number as a real, whatever it was written as.
+do_real(args: Buf[Value], at: Span) -> Step
+    wants(args, 1, at, "real", "one number")?
+
+    args.at(0) match
+        Int(n) -> Ok(Real(real(n)))
+        Real(x) -> Ok(Real(x))
+        other -> fault(at, s"`real` takes a number, and this is ${other.type_name()}")
+
+// The four that round, which keep the kind they were given: an integer is already whole.
+do_round(args: Buf[Value], at: Span, which: usize) -> Step
+    val name = if which == 0 then "floor" elif which == 1 then "ceil" elif which == 2 then "round" else "trunc"
+
+    wants(args, 1, at, name, "one number")?
+
+    args.at(0) match
+        Int(n) -> Ok(Int(n))
+        Real(x) ->
+            val r = if which == 0 then x.floor() elif which == 1 then x.ceil() elif which == 2 then x.round() else x.trunc()
+
+            Ok(Real(r))
+        other -> fault(at, s"`${name}` takes a number, and this is ${other.type_name()}")
+end do_round
+
+do_abs(args: Buf[Value], at: Span) -> Step
+    wants(args, 1, at, "abs", "one number")?
+
+    args.at(0) match
+        Int(n) -> Ok(Int(if n < 0 then -n else n))
+        Real(x) -> Ok(Real(x.abs()))
+        other -> fault(at, s"`abs` takes a number, and this is ${other.type_name()}")
+
+do_sqrt(args: Buf[Value], at: Span) -> Step
+    wants(args, 1, at, "sqrt", "one number")?
+
+    val x = number_of(args.at(0), at, "sqrt")?
+
+    if x < 0.0 then return fault(at, s"`sqrt` takes a number that is not negative, and this is ${x}")
+
+    Ok(Real(x.sqrt()))
+end do_sqrt
+
+do_pow(args: Buf[Value], at: Span) -> Step
+    wants(args, 2, at, "pow", "a number and an exponent")?
+
+    val a = number_of(args.at(0), at, "pow")?
+    val b = number_of(args.at(1), at, "pow")?
+
+    Ok(Real(a.pow(b)))
+end do_pow
+
+// `min(a, b, ...)` and `max(a, b, ...)`, over as many as are given.
+//
+// **Integers in, integer out.** A `min` that answered a real for two integers would make every use
+// of it in an index a conversion.
+do_extreme(args: Buf[Value], at: Span, smallest: bool) -> Step
+    val name = if smallest then "min" else "max"
+
+    if args.len() == 0 then return fault(at, s"`${name}` takes at least one number and was given none")
+
+    var whole = true
+
+    for i in 0..<args.len()
+        args.at(i) match
+            Int(_) -> ()
+            Real(_) -> whole = false
+            other -> return fault(at, s"`${name}` takes numbers, and one of these is ${other.type_name()}")
+
+    var best = number_of(args.at(0), at, name)?
+
+    for i in 1..<args.len()
+        val x = number_of(args.at(i), at, name)?
+
+        best = if smallest then min(best, x) else max(best, x)
+
+    if whole then Ok(Int(long(best))) else Ok(Real(best))
+end do_extreme
+
+// Any number as a real, for the arithmetic that has only one form.
+private number_of(v: Value, at: Span, name: string) -> Result[real, Signal]
+    v match
+        Int(n) -> Ok(real(n))
+        Real(x) -> Ok(x)
+        other -> Err(failure(at, s"`${name}` takes a number, and this is ${other.type_name()}"))
