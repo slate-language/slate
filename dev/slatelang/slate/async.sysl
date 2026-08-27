@@ -1,0 +1,235 @@
+module dev.slatelang.slate
+
+import sh.sysl.gc
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// Promises, and the queue that hands their answers back.
+//
+// **A promise needs nothing from the machine, and `await` needs everything from it.** That split is
+// the whole shape of this file: settling a promise is bookkeeping any interpreter could do, while
+// resuming the call that was waiting means putting a whole line of execution back where it was --
+// operand stack, frames, scope -- which is possible only because `vm.sysl` made all of that data.
+//
+// ## Three queues, and why the ready one is not the event loop
+//
+// `event.sysl` runs libuv, which answers *when something happened outside the program*: a timer
+// expired, a socket had bytes. This queue answers something narrower -- *a value a suspended call is
+// owed is now known* -- and it has to drain completely between two turns of the loop. That is
+// JavaScript's microtask/macrotask split, and it is not a refinement: a program that resolved a
+// promise from a timer callback and then ran the next timer before the awaiting function had moved
+// would interleave in an order nobody can reason about.
+//
+// ## What a rejection is here
+//
+// slate has no `throw` and no `catch`, so a promise fails when the `async` function running it
+// faults. Awaiting that promise raises the same fault in the awaiting function, which -- having no
+// catch either -- fails in turn. A chain of `await`s therefore propagates a fault to whoever is
+// waiting at the end of it, which is what a language with exceptions gets from unwinding.
+//
+// **And a fault nobody is waiting for is reported rather than dropped.** That is the one thing node
+// gets wrong by default and warns about instead; here it is the program's fault, pointed at the line
+// that raised it.
+
+// A machine that is owed a value, and the value it is owed.
+//
+// **The answer travels with the id rather than being read back off the promise**, because a promise
+// may be settled once and awaited by many: each waiter is queued with what the promise held at the
+// moment it settled, and nothing later can change what any of them sees.
+struct Resumption
+    // Which parked machine.
+    machine: usize
+
+    value: Value
+
+    // Whether the promise failed, and with what. `await` raises this instead of answering.
+    failed: bool
+    message: string
+    at: Span
+
+// The answers waiting to be handed back. **Not `private`: `vm.sysl`'s `Await` queues onto it.**
+var ready: Buf[Resumption] = buf()
+
+// How far down `ready` the drain has got. A cursor rather than a shift, so that a resumption which
+// queues more work does not move the entries behind it.
+var ready_head: usize = 0
+
+// Every promise that has failed, whether or not anything was waiting.
+//
+// **Kept until the program ends, because "was this handled?" cannot be answered when it fails.** A
+// promise may be awaited long after it settles -- `val p = risky()` and then `await p` three lines
+// later is the ordinary shape -- so the question is asked once, at the end, of everything that failed.
+var rejections: Buf[*PromiseObj] = buf()
+
+// What the scheduler can still reach. Called from `roots`.
+mark_scheduler(h: *gc.Heap)
+    for i in ready_head..<ready.len()
+        mark_value(h, ready.at(i).value)
+
+    for i in 0..<rejections.len()
+        gc.mark(h, ptr_cast(rejections.at(i)))
+
+// Give the queues back between runs.
+reset_async()
+    ready.clear()
+    ready_head = 0
+    rejections.clear()
+
+// -- settling ---------------------------------------------------------------------------------------
+
+// **A promise settles once.** A second answer is dropped rather than refused, which is JavaScript's
+// rule: the call that resolved it first has already been told it succeeded, and there is no honest
+// way to take that back.
+settle_ok(pr: *PromiseObj, v: Value)
+    if pr.settled then return
+
+    pr.settled = true
+    pr.failed = false
+    pr.value = v
+    wake(pr)
+
+settle_err(pr: *PromiseObj, message: string, at: Span)
+    if pr.settled then return
+
+    pr.settled = true
+    pr.failed = true
+    pr.value = Null
+    pr.message = message
+    pr.at = at
+
+    // Recorded whether or not anything is waiting -- see `rejections`.
+    rejections.push(pr)
+    wake(pr)
+end settle_err
+
+// Queue everything that was waiting on this.
+private wake(pr: *PromiseObj)
+    for i in 0..<pr.waiters.len()
+        ready.push(Resumption(pr.waiters.at(i), pr.value, pr.failed, pr.message, pr.at))
+
+    pr.waiters.clear()
+end wake
+
+// The first failure nothing ever awaited, if there is one.
+//
+// **It points at where the fault happened rather than at the call nobody awaited**, which is the
+// useful end of the chain: a fault propagates from one promise to the next carrying the span it was
+// raised at, so the last promise in the chain names the first line that went wrong. node's unhandled
+// rejection warning shows the original stack for the same reason.
+unhandled_rejection() -> Option[Signal]
+    for i in 0..<rejections.len()
+        val pr = rejections.at(i)
+
+        if !pr.handled
+            return Some(Fail(pr.at, s"this failed inside an `async` function whose promise nothing awaited: ${pr.message}"))
+
+    None
+end unhandled_rejection
+
+// -- starting a coroutine -----------------------------------------------------------------------------
+
+// Call an `async` function: it gets a machine of its own, and the caller gets a promise at once.
+//
+// **The body runs immediately and only stops at its first `await`**, which is JavaScript's rule and
+// the one that makes an async function readable: everything above the first `await` has already
+// happened by the time the caller sees the promise.
+start_async(c: *ClosureObj, args: Buf[Value], at: Span) -> Step
+    val mark = root_mark()
+    val emark = env_mark()
+
+    // The arguments live only in this sysl local, which the mark phase cannot see, and `new_promise`
+    // allocates.
+    for i in 0..<args.len()
+        hold(args.at(i))
+
+    val pr = new_promise()
+
+    hold(Promise(pr))
+
+    // From here the caller's machine is parked and `vm` is the coroutine's.
+    val here = park()
+
+    vm.promise = pr
+
+    val scope = new_env(c.scope)
+
+    hold_env(scope)
+
+    for i in 0..<c.params.len()
+        declare(scope, c.params.at(i), args.at(i), true)
+
+    finish(run_chunk(&current_unit, c.body, scope))
+
+    // Whether it finished or suspended, the caller is what runs next.
+    unpark(here)
+    release_env(emark)
+    release(mark)
+    Ok(Promise(pr))
+end start_async
+
+// Write a finished line of execution's answer into the promise it belongs to.
+//
+// **A suspended one falls through both arms**, and not by an omission: `Await` parks before it raises
+// `Wait`, so by the time this is reached `vm` is the fresh machine that park left behind and its
+// promise is null. The coroutine's own promise went into `parked` with it, to be settled by whichever
+// resumption finally runs it to the end.
+finish(outcome: Step)
+    val pr = vm.promise
+
+    if pr == null then return
+
+    outcome match
+        Ok(v) -> settle_ok(pr, v)
+        Err(Fail(at, m)) -> settle_err(pr, m, at)
+        Err(Wait) -> ()
+        Err(s) -> settle_err(pr, signal_message(s), signal_span(s))
+end finish
+
+// -- draining -----------------------------------------------------------------------------------------
+
+// Hand every owed answer back, including any owed by the ones that run.
+//
+// **It drains to empty rather than taking a turn**, which is what makes it a microtask queue: a
+// resumption that resolves another promise is run before the event loop gets another turn.
+run_microtasks()
+    loop
+        if ready_head >= ready.len()
+            // Everything queued has run, so the buffer starts again from nothing.
+            ready.clear()
+            ready_head = 0
+            return
+
+        val r = ready.at(ready_head)
+
+        ready_head += 1
+        resume_one(r)
+end run_microtasks
+
+// Put one machine back and let it carry on.
+private resume_one(r: Resumption)
+    val mark = root_mark()
+
+    hold(r.value)
+
+    // The line of execution that was running -- the main program, or another coroutine -- is set
+    // aside rather than left in a sysl local, so that its values stay rooted while this one runs.
+    val here = park()
+
+    unpark(r.machine)
+
+    // **The answer is written OVER the promise `await` left on the stack.** That is the other half of
+    // the bargain `Await` made by not popping: the promise stayed reachable while the machine was
+    // parked, and the slot it occupied is where its value belongs.
+    vm.stack.set(vm.stack.len() - 1, r.value)
+
+    val outcome: Step = if r.failed
+        // A failed promise raises in the call that awaited it. With no `catch` in the language that
+        // ends the coroutine, and its own promise fails in turn.
+        Err(Fail(r.at, r.message))
+    else
+        resume_chunk(&current_unit)
+
+    finish(outcome)
+    unpark(here)
+    release(mark)
+end resume_one

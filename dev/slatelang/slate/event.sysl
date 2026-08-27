@@ -34,6 +34,10 @@ struct Pending
     // What to call. `Null` once the slot is spent, which is what makes it collectable again.
     callback: Value
 
+    // The promise to settle instead of calling anything, which is what `sleep` is. Null for a timer
+    // a program set with `setTimeout`.
+    promise: *PromiseObj
+
     // The handle, kept alive here for as long as the program may still cancel it.
     timer: Option[&libuv.Timer]
 
@@ -55,13 +59,16 @@ var outstanding: usize = 0
 // Mark what the loop can still reach.
 mark_pending(h: *gc.Heap)
     for i in 0..<pending.len()
-        if pending.at(i).live then mark_value(h, pending.at(i).callback)
+        if pending.at(i).live
+            mark_value(h, pending.at(i).callback)
+            gc.mark(h, ptr_cast(pending.at(i).promise))
 
 // Give the table back between runs.
 reset_events()
     // Every handle is dropped, which closes the timers with it.
     pending.clear()
     outstanding = 0
+    loop_fault = None
 
 // Take a slot, reusing a spent one where there is one.
 private claim(p: Pending) -> usize
@@ -87,6 +94,7 @@ private surrender(id: usize)
 
     slot.live = false
     slot.callback = Null
+    slot.promise = null
 
     // **The handle is CLOSED and not merely dropped.** A handle holds a reference to itself while it
     // is open, so letting go of the last name for it stops nothing -- deliberately, since dropping a
@@ -114,18 +122,24 @@ private fire(id: usize)
     if !slot.live then return
 
     val cb = slot.callback
+    val pr = slot.promise
     var none: Buf[Value] = buf()
     val mark = root_mark()
 
     hold(cb)
 
     // A one-shot is spent before its callback runs, so that a callback which sets another timer
-    // cannot be given its own slot back underneath it.
+    // cannot be given its own slot back underneath it. **The promise is read out first**, because
+    // this is also what clears the slot's copy of it.
     if !slot.repeating then surrender(id)
 
-    apply(cb, none, point(0)) match
-        Ok(_) -> ()
-        Err(s) -> loop_fault = Some(s)
+    if pr != null
+        // `sleep`: there is nothing to call, only a promise whose time has come.
+        settle_ok(pr, Null)
+    else
+        apply(cb, none, point(0)) match
+            Ok(_) -> ()
+            Err(s) -> loop_fault = Some(s)
 
     release(mark)
 end fire
@@ -148,7 +162,7 @@ set_timer(cb: Value, ms: long, repeating: bool, at: Span) -> Step
     libuv.timer() match
         Err(e) -> fault(at, s"this timer could not be made: ${e}")
         Ok(t) ->
-            val id = claim(Pending(cb, Some(t), true, repeating))
+            val id = claim(Pending(cb, null, Some(t), true, repeating))
 
             // **The closure captures the id and not the value**, which is the whole arrangement: the
             // collector cannot see through this box, so what it holds must be something the collector
@@ -160,6 +174,33 @@ set_timer(cb: Value, ms: long, repeating: bool, at: Span) -> Step
                 Ok(_) -> Ok(Int(long(id)))
 end set_timer
 
+// `sleep(ms)` -- a promise that settles when the time is up.
+//
+// **This is the one builtin that makes `await` worth having on its own.** Everything else a program
+// can build for itself out of an `async` function; waiting for the clock needs a handle, and a handle
+// needs the table above.
+sleep_promise(ms: long, at: Span) -> Step
+    val delay = if ms < 0 then 0u64 else u64(ms)
+
+    libuv.timer() match
+        Err(e) -> fault(at, s"this timer could not be made: ${e}")
+        Ok(t) ->
+            val pr = new_promise()
+            val mark = root_mark()
+
+            hold(Promise(pr))
+
+            val id = claim(Pending(Null, pr, Some(t), true, false))
+
+            release(mark)
+
+            t.start(delay, 0u64, () -> fire(id)) match
+                Err(e) ->
+                    surrender(id)
+                    fault(at, s"this timer could not be started: ${e}")
+                Ok(_) -> Ok(Promise(pr))
+end sleep_promise
+
 // `clearTimeout(id)` and `clearInterval(id)`.
 clear_timer(v: Value, at: Span) -> Step
     v match
@@ -169,18 +210,45 @@ clear_timer(v: Value, at: Span) -> Step
             Ok(Null)
         other -> fault(at, s"a timer is cancelled by its id, and this is ${other.type_name()}")
 
-// Run the loop until nothing is outstanding.
+// Run until nothing is outstanding and nothing is owed.
 //
 // **This is what makes a slate program with a timer in it not exit immediately.** node does the same:
 // the process lives as long as something is scheduled.
+//
+// **Two queues, drained in a fixed order, and the order is the whole rule.** Everything a suspended
+// call is owed is handed back *before* the loop is allowed another turn -- so a promise resolved
+// inside a timer callback moves its awaiting function along before the next timer fires. Running
+// libuv to completion in one go, as this used to, would have batched every callback ahead of every
+// resumption and interleaved them in an order nothing could predict. JavaScript's microtask rule is
+// exactly this, and it is why `RUN_ONCE` is asked for rather than the default.
 drain_events() -> Result[unit, Signal]
-    if outstanding == 0 then return Ok(())
+    loop
+        run_microtasks()
 
-    val ran: Result[unit, Signal] = libuv.default_loop().run() match
+        // A resumption may have faulted its way out to a promise nobody holds, and a callback may
+        // have faulted outright. Either ends the program.
+        loop_fault match
+            Some(s) -> return Err(s)
+            None -> ()
+
+        if outstanding == 0 then break
+
+        val more = libuv.default_loop().run(libuv.RUN_ONCE) match
+            Err(e) -> return Err(Fail(point(0), s"the event loop stopped: ${e}"))
+            Ok(alive) -> alive
+
+        // Nothing left for the loop to wait on, whatever the count says. Bailing here rather than
+        // trusting the count is what stops a bookkeeping mistake from becoming a spin.
+        if !more then break
+    end loop
+
+    // A handle that was closed needs one more turn for its close callback, and there is nothing left
+    // to wait for -- so this returns as soon as those have run.
+    val closed: Result[unit, Signal] = libuv.default_loop().run() match
         Err(e) -> Err(Fail(point(0), s"the event loop stopped: ${e}"))
         Ok(_) -> Ok(())
 
-    ran?
+    closed?
 
     loop_fault match
         Some(s) -> Err(s)

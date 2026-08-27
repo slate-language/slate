@@ -1,6 +1,7 @@
 module dev.slatelang.slate
 
 import sh.sysl.gc
+import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map}
 
@@ -82,6 +83,37 @@ struct ClosureObj
 
     scope: *EnvObj
 
+// A value that is not there yet.
+//
+// **It is a collected object like any other, and it has to be**: a promise outlives the call that
+// made it by definition, is held by whoever awaits it *and* by the coroutine that will settle it, and
+// those two release it in an order nobody controls.
+//
+// **What it holds that an object does not is a list of lines of execution.** A machine waiting here
+// is parked, and its id is what this keeps -- an index into `parked` rather than a pointer, so
+// nothing in the collected heap has to know what a `Machine` is.
+struct PromiseObj
+    // What it settled to. Meaningless until `settled`, and `Null` when it failed.
+    value: Value
+
+    settled: bool
+    failed: bool
+
+    // The complaint and where it was raised, for a promise that failed. A `string` lives here the way
+    // `StrObj`'s does, with the finalizer below giving it back.
+    message: string
+    at: Span
+
+    // The parked machines to hand the answer to. Emptied as they are queued.
+    waiters: Buf[usize]
+
+    // Whether anything has ever awaited this.
+    //
+    // **This is what tells a rejection that was dealt with from one that vanished.** A promise that
+    // fails with nothing waiting on it is the commonest way an async program loses an error -- node
+    // calls it an unhandled rejection and warns about it, and slate reports it as the program's fault.
+    handled: bool
+
 // A scope: the names written in one block, and the scope it sits inside.
 struct EnvObj
     names: Map[string, Value]
@@ -101,6 +133,7 @@ mark_value(h: *gc.Heap, v: Value)
         Array(p) -> gc.mark(h, ptr_cast(p))
         Object(p) -> gc.mark(h, ptr_cast(p))
         Fn(p) -> gc.mark(h, ptr_cast(p))
+        Promise(p) -> gc.mark(h, ptr_cast(p))
         _ -> ()
 end mark_value
 
@@ -164,6 +197,19 @@ finalize_closure(p: *u8)
 
     o.params = buf()
 
+// **A parked machine's own roots are not reached from here.** The waiters are ids, and `mark_vm`
+// walks `parked` on its own -- so what this owes is the settled value and nothing else.
+trace_promise(p: *u8, h: *gc.Heap)
+    val o: *PromiseObj = ptr_cast(p)
+
+    mark_value(h, o.value)
+
+finalize_promise(p: *u8)
+    val o: *PromiseObj = ptr_cast(p)
+
+    o.message = ""
+    o.waiters = buf()
+
 trace_env(p: *u8, h: *gc.Heap)
     val o: *EnvObj = ptr_cast(p)
 
@@ -183,6 +229,7 @@ var array_kind: gc.Kind = gc.Kind(&trace_array, &finalize_array, null, null)
 var object_kind: gc.Kind = gc.Kind(&trace_object, &finalize_object, null, null)
 var closure_kind: gc.Kind = gc.Kind(&trace_closure, &finalize_closure, null, null)
 var env_kind: gc.Kind = gc.Kind(&trace_env, &finalize_env, null, null)
+var promise_kind: gc.Kind = gc.Kind(&trace_promise, &finalize_promise, null, null)
 
 // -- the roots ----------------------------------------------------------------------------------
 
@@ -228,6 +275,10 @@ roots(h: *gc.Heap)
 
     // Everything the event loop may still call. Nothing else knows these are reachable.
     mark_pending(h)
+
+    // The answers waiting to be handed back to a suspended call, and the promises that failed with
+    // nobody watching. Both are held in module storage and nowhere else.
+    mark_scheduler(h)
 
     for i in 0..<root_values.len()
         mark_value(h, root_values.at(i))
@@ -321,6 +372,18 @@ new_closure(params: Buf[string], body: usize, scope: *EnvObj) -> *ClosureObj
     o.params = params
     o.body = body
     o.scope = scope
+    o
+
+new_promise() -> *PromiseObj
+    var o: *PromiseObj = ptr_cast(alloc_or_collect(sizeof(PromiseObj), &promise_kind))
+
+    o.value = Null
+    o.settled = false
+    o.failed = false
+    o.message = ""
+    o.at = point(0)
+    o.waiters = buf()
+    o.handled = false
     o
 
 new_env(parent: *EnvObj) -> *EnvObj

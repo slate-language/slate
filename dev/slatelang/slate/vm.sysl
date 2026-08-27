@@ -28,12 +28,20 @@ struct Frame
 
 // Everything one line of execution is: its values, its calls, and where it is looking names up.
 //
-// **Bundled because `await` is going to move them together.** Suspending a call means setting all
-// three aside and running something else; resuming means putting all three back. They were three
-// module variables until it became clear that no operation ever wants one without the others.
+// **Bundled because `await` moves them together.** Suspending a call means setting all of them aside
+// and running something else; resuming means putting them back. They were three module variables
+// until it became clear that no operation ever wants one without the others.
 struct Machine
     stack: Buf[Value]
     frames: Buf[Frame]
+
+    // The promise this line of execution settles when it finishes, and null for the main program.
+    //
+    // **This is the whole of what makes a machine a coroutine.** An `async` function is called by
+    // giving its body a machine of its own with this filled in; the caller is handed the promise
+    // straight back and carries on, and whatever the body eventually answers -- a value, or a fault --
+    // is written here for whoever awaited it.
+    promise: *PromiseObj
 
     // The scope the running frame is looking names up in. **Not a sysl local, and that is not a style
     // choice**: `alloc` can collect at any allocation, so the scope in hand has to be reachable from
@@ -47,7 +55,7 @@ struct Machine
     live: bool
 
 // The line of execution currently running.
-var vm: Machine = Machine(buf(), buf(), null, true)
+var vm: Machine = Machine(buf(), buf(), null, null, true)
 
 // The ones set aside. **Empty until `await` exists**, and here now because the thing that makes a
 // coroutine possible is that its state is data rather than sysl's own call stack -- which is the
@@ -58,7 +66,7 @@ var parked: Buf[Machine] = buf()
 park() -> usize
     val saved = vm
 
-    vm = Machine(buf(), buf(), null, true)
+    vm = Machine(buf(), buf(), null, null, true)
 
     for i in 0..<parked.len()
         if !parked.at(i).live
@@ -74,7 +82,7 @@ unpark(id: usize) -> Machine
     val displaced = vm
 
     vm = parked.at(id)
-    parked.set(id, Machine(buf(), buf(), null, false))
+    parked.set(id, Machine(buf(), buf(), null, null, false))
     displaced
 end unpark
 
@@ -100,7 +108,7 @@ var current_unit: Unit = new_unit()
 
 // Empty the machine between runs.
 reset_vm()
-    vm = Machine(buf(), buf(), null, true)
+    vm = Machine(buf(), buf(), null, null, true)
     parked.clear()
 
 // Everything the machine can still reach, for the collector.
@@ -123,6 +131,7 @@ private mark_machine(h: *gc.Heap, m: Machine)
         gc.mark(h, ptr_cast(m.frames.at(i).scope))
 
     gc.mark(h, ptr_cast(m.scope))
+    gc.mark(h, ptr_cast(m.promise))
 
 // -- running ---------------------------------------------------------------------------------------
 
@@ -135,20 +144,43 @@ private pop() -> Value
 private peek(back: usize) -> Value = vm.stack.at(vm.stack.len() - 1 - back)
 
 // Run a chunk to completion and answer what it left.
-//
-// **The instruction pointer and the scope are sysl locals rather than fields of the top frame**, and
-// written back only when a call pushes or pops one. Reading them out of a `Buf` on every instruction
-// would copy a whole frame per step.
 run_chunk(u: *Unit, start: usize, scope0: *EnvObj) -> Step
     // **Where this call stops unwinding.** A native can call back into slate -- a user `equals` does
     // exactly that -- so a nested run must hand back at its own depth rather than at an empty stack.
     val floor = vm.frames.len()
-    var chunk_ix = start
-    var pc: usize = 0
     val outer_scope = vm.scope
 
     vm.scope = scope0
-    var base = vm.stack.len()
+    execute(u, start, 0, vm.stack.len(), floor, outer_scope)
+end run_chunk
+
+// Carry on from where an `await` left off.
+//
+// **The frame on top says where.** `Await` writes the frame it was standing in back before it parks,
+// which is the one thing `execute` never does for itself -- so putting a machine back is popping that
+// frame and starting the loop at the numbers in it.
+//
+// The floor is zero and the outer scope is null because a coroutine's machine is its own: it was
+// created empty by the call that started it, so there is nothing underneath to hand back to.
+// Not `private`: `private` in sysl is private to the *file*, and the scheduler in `async.sysl` is
+// what puts a machine back.
+resume_chunk(u: *Unit) -> Step
+    val back = vm.frames.at(vm.frames.len() - 1)
+
+    vm.frames.truncate(vm.frames.len() - 1)
+    vm.scope = back.scope
+    execute(u, back.chunk, back.pc, back.base, 0, null)
+end resume_chunk
+
+// The instruction loop.
+//
+// **The instruction pointer and the scope are sysl locals rather than fields of the top frame**, and
+// written back only when a call pushes or pops one -- or when an `await` suspends. Reading them out of
+// a `Buf` on every instruction would copy a whole frame per step.
+private execute(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, outer_scope: *EnvObj) -> Step
+    var chunk_ix = start
+    var pc = from
+    var base = base0
     var code = u.chunks.at(chunk_ix).code
 
     loop
@@ -339,6 +371,13 @@ run_chunk(u: *Unit, start: usize, scope0: *EnvObj) -> Step
                         if args.len() != c.params.len()
                             return fault(at, s"this function takes ${c.params.len()} arguments and was given ${args.len()}")
 
+                        // **An `async` function is not called, it is STARTED**, on a machine of its
+                        // own, and what the caller gets back is a promise rather than a result.
+                        if u.chunks.at(c.body).is_async
+                            vm.stack.push(start_async(c, args, at)?)
+                            continue
+                        end if
+
                         // The frame this call is leaving is written back only here, which is what
                         // makes the ordinary instruction cheap.
                         if vm.frames.len() >= MaxCallDepth
@@ -358,6 +397,45 @@ run_chunk(u: *Unit, start: usize, scope0: *EnvObj) -> Step
                         base = vm.stack.len()
                     other -> return fault(at, s"${other.type_name()} is not something that can be called")
 
+            Op.Await ->
+                // **A machine that is not a coroutine has nowhere to come back from.** The compiler
+                // refuses `await` outside an `async` function, so this is only reachable if a chunk
+                // were started the ordinary way -- and suspending the main program would leave `run`
+                // with nothing to return.
+                if vm.promise == null || floor != 0
+                    return fault(at, "`await` cannot suspend this call")
+
+                // **The awaited value stays on the stack while the machine is parked**, which is what
+                // keeps a pending promise reachable: the shadow stack cannot hold it across the park,
+                // and the machine's own operand stack is a root the tracer already walks. The answer
+                // is written over it when the machine comes back.
+                val awaited = peek(0)
+
+                // What `resume_chunk` will pick the loop up from.
+                vm.frames.push(Frame(chunk_ix, pc, vm.scope, base))
+
+                val id = park()
+
+                awaited match
+                    Promise(pr) ->
+                        pr.handled = true
+
+                        // **A settled promise still goes round the queue.** Continuing here instead
+                        // would make `await` on a finished promise run the rest of the function before
+                        // anything else queued ahead of it -- which is the ordering bug every async
+                        // runtime that took the shortcut has had to undo. JavaScript resolves this
+                        // case through a microtask for the same reason.
+                        if pr.settled
+                            ready.push(Resumption(id, pr.value, pr.failed, pr.message, pr.at))
+                        else
+                            pr.waiters.push(id)
+                    other ->
+                        // `await 5` is 5, as in JavaScript -- and it still yields, so that a program
+                        // cannot tell which of the two it was given by watching what runs next.
+                        ready.push(Resumption(id, other, false, "", at))
+
+                return Err(Wait)
+
             Ret ->
                 val v = pop()
 
@@ -376,19 +454,16 @@ run_chunk(u: *Unit, start: usize, scope0: *EnvObj) -> Step
                 vm.scope = back.scope
                 base = back.base
                 vm.stack.push(v)
-end run_chunk
+end execute
 
 // -- the entry point --------------------------------------------------------------------------------
 
 // Compile a source and run it on the machine.
-//
-// **The same shape as `run`, deliberately**, so the test suite can put a program through both and
-// compare. That is the whole migration plan: the walker is the oracle, and the machine is finished
-// when every one of slate's tests answers the same on both.
 run(src: Source) -> Ran
     reset_heap()
     reset_vm()
     reset_events()
+    reset_async()
     output.clear()
 
     val parsed = parse(src)
@@ -406,11 +481,18 @@ run(src: Source) -> Ran
 
     var rep = parsed.report
 
-    // **The program runs, and then the loop drains.** A slate program with a timer in it does not
-    // exit when its last statement does, which is node's rule and the whole point of having a loop.
+    // **The program runs, and then the loop drains.** A slate program with a timer or a pending
+    // `await` in it does not exit when its last statement does, which is node's rule and the whole
+    // point of having a loop.
+    //
+    // **A failure nothing was waiting for is the program's failure**, checked once everything has
+    // settled: until then there is no telling a promise that will be awaited on the next line from
+    // one that never will be.
     val answer: Step = run_chunk(&current_unit, 0, env) match
         Ok(v) -> drain_events() match
-            Ok(_) -> Ok(v)
+            Ok(_) -> unhandled_rejection() match
+                Some(s) -> Err(s)
+                None -> Ok(v)
             Err(s) -> Err(s)
         Err(s) -> Err(s)
 

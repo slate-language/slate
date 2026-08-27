@@ -24,6 +24,8 @@ dev/slatelang/slate/
     code.sysl       the instruction set, and the unit a program compiles to
     compile.sysl    the tree to instructions
     vm.sysl         the machine
+    event.sysl      the event loop, over libuv: timers, and what roots a callback
+    async.sysl      promises, and the queue that resumes a suspended call
     runtime.sysl    equality, arithmetic, indexing, matching and calling
     builtin.sysl    the functions a program has without writing them
     show.sysl       the tree as `(+ 1 (* 2 3))`, for the tests
@@ -130,13 +132,59 @@ it would be bound down one path and not the other. **There is no exhaustiveness 
 cannot be one** — slate is dynamically typed, so the set of values a name may hold is not known; a
 subject matching no arm is a runtime fault, as Scala's `MatchError` is.
 
-It is dynamically typed. Values are `null`, booleans, integers, reals, strings, arrays, objects and
-functions. Arrays and objects are reference types and compare by their contents. Only `false` and
+It is dynamically typed. Values are `null`, booleans, integers, reals, strings, arrays, objects,
+functions and promises. Arrays and objects are reference types and compare by their contents. Only `false` and
 `null` are false — zero and the empty string are not, which is the rule Ruby and Lua take and the one
 JavaScript and Python are most often criticised for.
 
 `&&` and `||` short-circuit and answer the operand that decided, which is the one place slate's rule
 is not sysl's: sysl's operands are `bool` and there is nothing else for it to give back.
+
+### async and await
+
+An `async` function answers a promise rather than a value, and `await` waits for one:
+
+```
+async work(name, ms, turns)
+    var i = 0
+
+    while i < turns
+        await sleep(ms)
+        print(name, "step", i)
+        i = i + 1
+
+    name + " finished"
+
+async main()
+    val a = work("a", 8, 3)
+    val b = work("b", 20, 2)
+
+    print("started both")
+    print(await a)
+    print(await b)
+```
+
+Everything above a function's first `await` runs before its caller sees the promise, and everything
+below it runs after the caller has moved on — which is node's rule, and why `started both` prints
+before either worker's first step. The two workers then interleave by their own clocks.
+
+**`undefined` aside, `await` is the place slate departs from JavaScript least and on purpose.** A
+settled promise still resumes through the queue rather than continuing in place, so what was
+scheduled first runs first; `await` of a plain value answers it and still yields, so a program cannot
+tell which of the two it was handed by watching what runs next.
+
+**A failed promise is what slate has instead of a thrown exception.** There is no `throw` and no
+`catch`: a promise fails when the `async` function running it faults, awaiting that promise raises
+the same fault in the awaiting function, and so a chain of `await`s carries a fault to whoever is
+waiting at the end of it. What a language with exceptions gets from unwinding, this gets from the
+chain.
+
+**And a failure nothing was waiting for is the program's failure**, reported against the line that
+raised it. That is the one thing node gets wrong by default and warns about instead.
+
+`sleep(ms)` answers a promise for later; `resolve(v)` and `reject(message)` answer one that has
+already settled. Top-level `await` is refused — the whole program would have to become a coroutine,
+which is a real design and one to make on purpose.
 
 ## What it leans on
 
@@ -168,7 +216,17 @@ runs *from* an event loop, never from inside an expression — so callbacks and 
 been fine as they were. `await` is not.
 
 A slate call pushes a frame onto an array rather than recursing in sysl, so a call chain of any depth
-is one sysl frame, and a suspended call is a frame nobody is currently running.
+is one sysl frame, and a suspended call is a frame nobody is currently running. Calling an `async`
+function starts a **machine of its own** — operand stack, frames, scope and the promise it will
+settle — and `await` sets that whole machine aside into a table the collector roots, which is the
+whole of what makes a coroutine here. A parked line of execution is not running and is not therefore
+any less alive.
+
+There are two queues and the order between them is fixed. libuv answers *something happened outside
+the program*; a second, drained to empty between every turn of it, answers *a value a suspended call
+is owed is now known*. That is JavaScript's microtask/macrotask split, and it is not a refinement — a
+program that resolved a promise from a timer callback and then ran the next timer before the awaiting
+function had moved would interleave in an order nothing could predict.
 
 **The collector got simpler on the way.** A tree-walker's working values live in host locals, which a
 precise mark phase cannot see, so every one of them has to be pushed onto a shadow stack by hand —
@@ -202,8 +260,8 @@ Two consequences worth knowing:
 
 ## What is not here yet
 
-String interpolation, a module system, a literate `.lsl` form, and anything resembling a standard
-library beyond five builtins.
+String interpolation, a module system, a literate `.lsl` form, files and sockets over the libuv
+binding, and anything resembling a standard library beyond a dozen builtins.
 
 The two examples are the current surface, and it is meant to grow in whatever direction puts the most
 pressure on sysl.

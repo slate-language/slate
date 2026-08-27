@@ -61,7 +61,12 @@ val person = { name: "ada", born: 1815 }
 
 person.born = 1816
 
-print(person, person.name, person.missing)
+print(person, person.name)
+
+// A field that is not there reads as `undefined`, which is second class: it may be compared,
+// defaulted and tested, and it may not be stored, passed or put in a container.
+print(has(person, "born"), has(person, "missing"))
+print(person.missing ?? "no such field")
 
 // The loops.
 while n < 3
@@ -100,3 +105,27 @@ print(describe({ name: "ada" }))
 print(describe("sun"))
 print(describe("hi"))
 print(describe(true))
+
+// An `async` function answers a promise, and `await` waits for one. Everything above a function's
+// first `await` runs before its caller sees the promise; everything below it runs after the caller
+// has moved on -- which is why "started both" prints before either worker's first line.
+async work(name, ms, turns)
+    var i = 0
+
+    while i < turns
+        await sleep(ms)
+        print(name, "step", i)
+        i = i + 1
+
+    name + " finished"
+
+async main()
+    val a = work("a", 8, 3)
+    val b = work("b", 20, 2)
+
+    print("started both")
+    print(await a)
+    print(await b)
+
+main()
+print("the last synchronous line")

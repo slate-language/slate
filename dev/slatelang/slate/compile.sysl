@@ -28,6 +28,12 @@ struct Emit
     // The loops enclosing this point, innermost last.
     loops: Buf[LoopFrame]
 
+    // Whether the chunk being compiled is an `async` one, which is what says whether `await` is
+    // allowed in it. **A compile-time question rather than a run-time one**: a machine that reached an
+    // `await` it could not honour would have to decide what to do with a half-evaluated expression,
+    // and there is no good answer -- so the code is never emitted.
+    is_async: bool
+
 // Where `break` and `continue` have to get back to, and what they have to tidy on the way.
 struct LoopFrame
     sp: usize
@@ -37,7 +43,7 @@ struct LoopFrame
     breaks: Buf[usize]
     continues: Buf[usize]
 
-private fresh_emit() -> Emit = Emit(buf(), 0, 0, buf())
+private fresh_emit(is_async: bool) -> Emit = Emit(buf(), 0, 0, buf(), is_async)
 
 // Put one instruction down and answer where it went.
 private put(e: *Emit, op: Op, at: Span) -> usize
@@ -86,7 +92,10 @@ end unwind_to
 
 // A parsed program to a unit the machine can run.
 compile_program(u: *Unit, prog: Program) -> unit
-    var e = fresh_emit()
+    // **The top level is not async, so top-level `await` is refused.** node draws the same line for a
+    // script, and lifting it would mean the whole program becoming a coroutine -- which is a real
+    // design, and one to make on purpose rather than by leaving a flag `true` here.
+    var e = fresh_emit(false)
 
     compile_stmts(u, &e, prog.stmts, point(0))
     put(&e, Ret, point(0))
@@ -98,14 +107,14 @@ compile_program(u: *Unit, prog: Program) -> unit
 end compile_program
 
 // A function body to a chunk of its own, answering where it landed.
-private compile_chunk(u: *Unit, params: Buf[string], body: Expr, name: string) -> usize
+private compile_chunk(u: *Unit, params: Buf[string], body: Expr, name: string, is_async: bool) -> usize
     // The slot is claimed before the body is compiled, so a function that calls itself finds a chunk
     // index that already exists.
     val at = u.chunks.len()
 
-    u.chunks.push(Chunk(buf(), params, name))
+    u.chunks.push(Chunk(buf(), params, name, is_async))
 
-    var e = fresh_emit()
+    var e = fresh_emit(is_async)
 
     compile_expr(u, &e, body)
     put(&e, Ret, body.span)
@@ -141,8 +150,8 @@ private compile_stmt(u: *Unit, e: *Emit, s: Stmt)
             compile_expr(u, e, init)
             push_n(e, DeclareVar(intern_str(u, name)), at, 1, 0)
             push_n(e, PushNil, at, 0, 1)
-        Def(name, params, body) ->
-            val c = compile_chunk(u, params, body_at(body), name)
+        Def(name, params, body, is_async) ->
+            val c = compile_chunk(u, params, body_at(body), name, is_async)
 
             push_n(e, DefineFn(intern_str(u, name), c), at, 0, 0)
             push_n(e, PushNil, at, 0, 1)
@@ -341,10 +350,20 @@ compile_expr(u: *Unit, e: *Emit, x: Expr)
                 compile_expr(u, e, values.at(i))
 
             push_n(e, MakeObject(keys.len()), at, keys.len() * 2, 1)
-        Lambda(params, body) ->
-            val c = compile_chunk(u, params, body_at(body), "a function")
+        Lambda(params, body, is_async) ->
+            val c = compile_chunk(u, params, body_at(body), "a function", is_async)
 
             push_n(e, MakeClosure(c), at, 0, 1)
+        Await(inner) ->
+            compile_expr(u, e, inner)
+
+            // **Refused the way `break` outside a loop is**, with an instruction that faults where it
+            // stands: the tree is compiled without a report to write into, and a fault carrying this
+            // span points at the same character a parse error would have.
+            if e.is_async
+                push_n(e, Op.Await, at, 1, 1)
+            else
+                push_n(e, FailWith(intern_str(u, "`await` belongs in an `async` function")), at, 1, 1)
         Block(stmts) ->
             push_n(e, PushScope, at, 0, 0)
             e.scopes += 1
