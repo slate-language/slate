@@ -20,7 +20,11 @@ dev/slatelang/slate/
     pattern.sysl    patterns, and the arms of a `match`
     obj.sysl        the collected heap: the objects, their tracers, and the roots
     value.sysl      what a program computes with, and the scope chain
-    eval.sysl       the walk
+    table.sysl      the hash table an object is, and how a value is hashed
+    code.sysl       the instruction set, and the unit a program compiles to
+    compile.sysl    the tree to instructions
+    vm.sysl         the machine
+    runtime.sysl    equality, arithmetic, indexing, matching and calling
     builtin.sysl    the functions a program has without writing them
     show.sysl       the tree as `(+ 1 (* 2 3))`, for the tests
     tests.sysl      what all of it claims, run by `sysl test .`
@@ -153,6 +157,25 @@ Two of its own notes turn out to matter here and are worth repeating:
   about what it just read.
 - **A parse error is a node, not a `Result`.** It keeps the tree shaped and lets one pass report
   every mistake in a file.
+
+## How it runs
+
+A program is compiled to instructions and run on a stack machine. It was a tree-walker until it
+needed to be something else, and the reason is worth stating because it is the only one:
+**`await` has to suspend in the middle of an expression, and a tree-walker's state is the host
+language's own call stack, which cannot be captured.** A callback does not need this — a callback
+runs *from* an event loop, never from inside an expression — so callbacks and promises would have
+been fine as they were. `await` is not.
+
+A slate call pushes a frame onto an array rather than recursing in sysl, so a call chain of any depth
+is one sysl frame, and a suspended call is a frame nobody is currently running.
+
+**The collector got simpler on the way.** A tree-walker's working values live in host locals, which a
+precise mark phase cannot see, so every one of them has to be pushed onto a shadow stack by hand —
+and a forgotten push is a crash that only appears under memory pressure. A machine keeps its values
+in an operand stack that is an ordinary array, so the tracer walks it and the whole class of mistake
+goes away. That claim was tested the hard way: keeping the running frame's scope in a host local for
+speed reintroduced exactly that bug, and it swept the live scope chain out from under the machine.
 
 ## Memory
 
