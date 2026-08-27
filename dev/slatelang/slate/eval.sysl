@@ -219,9 +219,7 @@ private store_at(container: Value, k: Value, v: Value, at: Span) -> Step
                 other -> fault(at, s"an array is indexed by an integer, and this is ${other.type_name()}")
         Object(fields) ->
             k match
-                _ ->
-                    obj_put(fields, k, v)
-                    Ok(Nil)
+                _ -> obj_put(fields, k, v, at)
         other -> fault(at, s"${other.type_name()} cannot be indexed")
 end store_at
 
@@ -382,8 +380,8 @@ private binary(op: Tok, lhs: Expr, rhs: Expr, env: *EnvObj, at: Span) -> Step
     val b = eval(rhs, env)?
 
     op match
-        EqEq -> Ok(Bool(same(a, b)))
-        BangEq -> Ok(Bool(!same(a, b)))
+        EqEq -> Ok(Bool(same(a, b, at)?))
+        BangEq -> Ok(Bool(!same(a, b, at)?))
         _ -> arith(op, a, b, at)
 end binary
 
@@ -490,6 +488,29 @@ private in_progress(seen: *Buf[SeenPair], a: *u8, b: *u8) -> bool
     false
 end in_progress
 
+// Whether a value equals a literal written in a pattern.
+//
+// **A pattern does not consult an object's `equals`, and that is deliberate.** A literal pattern is a
+// shape test: `5 -> ...` asks whether the subject *is* five, not whether something has been persuaded
+// to say it is. Keeping hooks out of it also keeps `match_pattern` infallible, so an arm cannot fault
+// halfway through binding.
+private same_literal(v: Value, lit: Value) -> bool = v match
+    Nil -> lit match
+        Nil -> true
+        _ -> false
+    Bool(x) -> lit match
+        Bool(y) -> x == y
+        _ -> false
+    Int(x) -> lit match
+        Int(y) -> x == y
+        Real(y) -> real(x) == y
+        _ -> false
+    Real(x) -> lit match
+        Int(y) -> x == real(y)
+        Real(y) -> x == y
+        _ -> false
+    _ -> false
+
 // Whether two values are the same.
 //
 // **Deep for arrays and objects rather than by identity**, which is the choice Python makes and
@@ -500,45 +521,63 @@ end in_progress
 // single values cannot express that, because what is being asked is whether *this* value equals
 // *that* one -- so the record is of pairs. Without it `b == c` over two self-referential arrays
 // descends until the stack is gone, and sysl reports that as a bare SIGSEGV (card 0299).
-same(a: Value, b: Value) -> bool
+same(a: Value, b: Value, at: Span) -> Result[bool, Signal]
     var seen: Buf[SeenPair] = buf()
 
-    same_in(a, b, &seen)
+    same_in(a, b, &seen, at)
 
-private same_in(a: Value, b: Value, seen: *Buf[SeenPair]) -> bool
+// **The left side's `equals` decides, and only the left side's**, which is Java's rule for
+// `a.equals(b)`. Consulting both and disagreeing has no answer, and consulting the right side when
+// the left declined would make `==` non-obvious to read.
+//
+// A hook makes `==` run arbitrary slate code, so a lookup re-enters the interpreter and a bad
+// `equals` can fault or loop. Java lives with exactly this.
+private same_in(a: Value, b: Value, seen: *Buf[SeenPair], at: Span) -> Result[bool, Signal]
+    hook_of(a, "equals") match
+        Some(f) ->
+            var args: Buf[Value] = buf()
+
+            args.push(b)
+            return Ok(apply(f, args, at)?.truthy())
+        None -> ()
+
+    same_plain(a, b, seen, at)
+end same_in
+
+private same_plain(a: Value, b: Value, seen: *Buf[SeenPair], at: Span) -> Result[bool, Signal]
     a match
         Nil -> b match
-            Nil -> true
-            _ -> false
+            Nil -> Ok(true)
+            _ -> Ok(false)
         Bool(x) -> b match
-            Bool(y) -> x == y
-            _ -> false
+            Bool(y) -> Ok(x == y)
+            _ -> Ok(false)
         Str(x) -> b match
             // **`x == y` here would compare the two `*StrObj` POINTERS**, which is identity and not
             // equality -- and it compiles, because pointers do compare. Moving a string from a value
             // into the collected heap turned a structural comparison into an identity one silently,
             // and fourteen tests caught it. Go has the same distinction and answers it the same way.
-            Str(y) -> x.s == y.s
-            _ -> false
+            Str(y) -> Ok(x.s == y.s)
+            _ -> Ok(false)
         Int(x) -> b match
-            Int(y) -> x == y
-            Real(y) -> real(x) == y
-            _ -> false
+            Int(y) -> Ok(x == y)
+            Real(y) -> Ok(real(x) == y)
+            _ -> Ok(false)
         Real(x) -> b match
-            Int(y) -> x == real(y)
-            Real(y) -> x == y
-            _ -> false
+            Int(y) -> Ok(x == real(y))
+            Real(y) -> Ok(x == y)
+            _ -> Ok(false)
         Array(xs) -> b match
-            Array(ys) -> same_array(xs, ys, seen)
-            _ -> false
+            Array(ys) -> same_array(xs, ys, seen, at)
+            _ -> Ok(false)
         Object(xs) -> b match
-            Object(ys) -> same_object(xs, ys, seen)
-            _ -> false
-        Fn(_) -> false
+            Object(ys) -> same_object(xs, ys, seen, at)
+            _ -> Ok(false)
+        Fn(_) -> Ok(false)
         Native(x) -> b match
-            Native(y) -> x == y
-            _ -> false
-end same_in
+            Native(y) -> Ok(x == y)
+            _ -> Ok(false)
+end same_plain
 
 // **Identity first, and it is not only an optimisation.** `a == a` over a structure that reaches
 // itself is the commonest way to meet a cycle, and answering it by walking would visit every node
@@ -547,30 +586,30 @@ end same_in
 // **A pairing left on `seen` by a failing comparison is never consulted again**, which is why only
 // the true path pops: a `false` propagates straight out of every frame above it, so the walk that
 // would have read a stale entry does not happen.
-private same_array(xs: *ArrayObj, ys: *ArrayObj, seen: *Buf[SeenPair]) -> bool
+private same_array(xs: *ArrayObj, ys: *ArrayObj, seen: *Buf[SeenPair], at: Span) -> Result[bool, Signal]
     val ax: *u8 = ptr_cast(xs)
     val ay: *u8 = ptr_cast(ys)
 
-    if ax == ay then return true
-    if in_progress(seen, ax, ay) then return true
-    if xs.items.len() != ys.items.len() then return false
+    if ax == ay then return Ok(true)
+    if in_progress(seen, ax, ay) then return Ok(true)
+    if xs.items.len() != ys.items.len() then return Ok(false)
 
     seen.push(SeenPair(ax, ay))
 
     for i in 0..<xs.items.len()
-        if !same_in(xs.items.at(i), ys.items.at(i), seen) then return false
+        if !same_in(xs.items.at(i), ys.items.at(i), seen, at)? then return Ok(false)
 
     seen.truncate(seen.len() - 1)
-    true
+    Ok(true)
 end same_array
 
-private same_object(xs: *ObjectObj, ys: *ObjectObj, seen: *Buf[SeenPair]) -> bool
+private same_object(xs: *ObjectObj, ys: *ObjectObj, seen: *Buf[SeenPair], at: Span) -> Result[bool, Signal]
     val ax: *u8 = ptr_cast(xs)
     val ay: *u8 = ptr_cast(ys)
 
-    if ax == ay then return true
-    if in_progress(seen, ax, ay) then return true
-    if xs.live != ys.live then return false
+    if ax == ay then return Ok(true)
+    if in_progress(seen, ax, ay) then return Ok(true)
+    if xs.live != ys.live then return Ok(false)
 
     seen.push(SeenPair(ax, ay))
 
@@ -581,12 +620,12 @@ private same_object(xs: *ObjectObj, ys: *ObjectObj, seen: *Buf[SeenPair]) -> boo
         val e = xs.entries.at(i)
 
         if !e.dead
-            obj_get(ys, e.key) match
-                Some(v) -> if !same_in(e.value, v, seen) then return false
-                None -> return false
+            obj_get(ys, e.key, at)? match
+                Some(v) -> if !same_in(e.value, v, seen, at)? then return Ok(false)
+                None -> return Ok(false)
 
     seen.truncate(seen.len() - 1)
-    true
+    Ok(true)
 end same_object
 
 // -- reading ------------------------------------------------------------------------------------
@@ -603,7 +642,7 @@ private read_at(container: Value, k: Value, at: Span) -> Step
                 other -> fault(at, s"an array is indexed by an integer, and this is ${other.type_name()}")
         Object(fields) ->
             k match
-                _ -> Ok(obj_get(fields, k).unwrap_or(Nil))
+                _ -> Ok(obj_get(fields, k, at)?.unwrap_or(Nil))
                 other -> fault(at, s"an object is indexed by a string, and this is ${other.type_name()}")
         Str(sv) ->
             k match
@@ -641,7 +680,7 @@ private do_call(callee: Expr, args: Buf[Expr], env: *EnvObj, at: Span) -> Step
         hold(v)
         vals.push(v)
 
-    val answer = apply(f, vals, at, env)
+    val answer = apply(f, vals, at)
 
     release(mark)
     answer
@@ -649,10 +688,11 @@ end do_call
 
 // Call a value with arguments already evaluated.
 //
-// The calling scope is passed for the run's world, not for its names: a closure's body is evaluated
-// in a child of the scope the closure *captured*, which is what makes it a closure rather than a
-// function with dynamic scoping.
-apply(f: Value, vals: Buf[Value], at: Span, env: *EnvObj) -> Step
+// **No calling scope is passed, and that is what a closure means.** The body runs in a child of the
+// scope the closure *captured*, so nothing about where the call was written matters -- which is also
+// what lets `==` call a user-supplied `equals` from inside a table lookup, where there is no
+// interpreter scope to hand over.
+apply(f: Value, vals: Buf[Value], at: Span) -> Step
     f match
         Native(f) -> call_native(f, vals, at)
         Fn(c) ->
@@ -748,10 +788,14 @@ match_pattern(pat: Pattern, v: Value, scope: *EnvObj) -> bool
 
             declare(scope, name, v, false)
             true
-        IntPat(want) -> same(v, Int(want))
-        RealPat(want) -> same(v, Real(want))
-        StrPat(want) -> same(v, str_value(want))
-        BoolPat(want) -> same(v, Bool(want))
+        IntPat(want) -> same_literal(v, Int(want))
+        RealPat(want) -> same_literal(v, Real(want))
+        StrPat(want) -> v match
+            // Compared against the sysl `string` directly, so a pattern never boxes one onto the
+            // collected heap just to throw it away.
+            Str(p) -> p.s == want
+            _ -> false
+        BoolPat(want) -> same_literal(v, Bool(want))
         NilPat -> v match
             Nil -> true
             _ -> false
