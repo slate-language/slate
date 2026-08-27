@@ -28,7 +28,7 @@ first_even(xs)
     for x in xs
         if x % 2 == 0
             return x
-    nil
+    null
 
 print(first_even([1, 3, 6, 7]))
 

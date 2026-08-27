@@ -80,7 +80,7 @@ first_even(xs)
     for x in xs
         if x % 2 == 0
             return x
-    nil
+    null
 
 counter()
     var count = 0
@@ -111,7 +111,7 @@ classify(v)
         _ -> "something else"
 ```
 
-**A bare name in a pattern tests for a kind where it names one, and binds otherwise** — `nil`,
+**A bare name in a pattern tests for a kind where it names one, and binds otherwise** — `null`,
 `bool`, `int`, `real`, `num`, `str`, `array`, `object`, `fn`. That is sysl's own bare-name rule (a
 bare identifier is a nullary-variant pattern when it names one of the scrutinee's variants), applied
 to a scrutinee that is always a value: those words *are* the variants. So a type test needs no syntax
@@ -130,9 +130,9 @@ it would be bound down one path and not the other. **There is no exhaustiveness 
 cannot be one** — slate is dynamically typed, so the set of values a name may hold is not known; a
 subject matching no arm is a runtime fault, as Scala's `MatchError` is.
 
-It is dynamically typed. Values are `nil`, booleans, integers, reals, strings, arrays, objects and
+It is dynamically typed. Values are `null`, booleans, integers, reals, strings, arrays, objects and
 functions. Arrays and objects are reference types and compare by their contents. Only `false` and
-`nil` are false — zero and the empty string are not, which is the rule Ruby and Lua take and the one
+`null` are false — zero and the empty string are not, which is the rule Ruby and Lua take and the one
 JavaScript and Python are most often criticised for.
 
 `&&` and `||` short-circuit and answer the operand that decided, which is the one place slate's rule
