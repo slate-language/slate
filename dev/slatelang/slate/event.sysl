@@ -227,6 +227,10 @@ clear_timer(v: Value, at: Span) -> Step
 // resumption and interleaved them in an order nothing could predict. JavaScript's microtask rule is
 // exactly this, and it is why `RUN_ONCE` is asked for rather than the default.
 drain_events() -> Result[unit, Signal]
+    // How many turns in a row have reported nothing active and settled nothing of ours. See the
+    // guard below for what it is for.
+    var idle = 0
+
     loop
         run_microtasks()
 
@@ -238,13 +242,29 @@ drain_events() -> Result[unit, Signal]
 
         if outstanding == 0 then break
 
+        // **A turn reporting nothing active does NOT end the drain, and thinking it did cost a
+        // working file system.** A timer is a handle and libuv counts it, so a loop with one
+        // pending says it is alive and the count and the loop agree. **An `fs` call is a
+        // REQUEST**: the turn that answers the last one outstanding processes its callback and
+        // *then* reports nothing active, so breaking on that answer throws away everything the
+        // callback settled -- the promise resolves, and the coroutine awaiting it is never handed
+        // its value because `run_microtasks` at the top of this loop is what does the handing.
+        //
+        // `outstanding` is the authority on whether there is work, and the loop's answer is only a
+        // check on it. Two turns running with nothing active and nothing of ours settled means the
+        // count is wrong, and stopping is better than spinning on it.
+        if idle >= 2 then break
+
+        // **Read a turn beginning HERE and not after the last one ended.** `run_microtasks` above
+        // resumes coroutines, and a resumed coroutine starts the next request -- so a count taken
+        // at the bottom of the loop is a count of work this turn had nothing to do with.
+        val before = outstanding
+
         val more = libuv.default_loop().run(libuv.RUN_ONCE) match
             Err(e) -> return Err(Fail(point(0), s"the event loop stopped: ${e}"))
             Ok(alive) -> alive
 
-        // Nothing left for the loop to wait on, whatever the count says. Bailing here rather than
-        // trusting the count is what stops a bookkeeping mistake from becoming a spin.
-        if !more then break
+        idle = if !more && outstanding == before then idle + 1 else 0
     end loop
 
     // A handle that was closed needs one more turn for its close callback, and there is nothing left
@@ -254,6 +274,10 @@ drain_events() -> Result[unit, Signal]
         Ok(_) -> Ok(())
 
     closed?
+
+    // That last turn may itself have settled something, and a promise settled with nobody handed
+    // the answer is a coroutine abandoned mid-statement.
+    run_microtasks()
 
     loop_fault match
         Some(s) -> Err(s)

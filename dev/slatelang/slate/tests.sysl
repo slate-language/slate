@@ -1,9 +1,11 @@
 module dev.slatelang.slate
 @tests
 
+import sh.sysl.libuv
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
-import sysl.text.{str_builder, Search}
+import sysl.fs.read_bytes
+import sysl.text.{replace_all, str_builder, Search}
 
 // What slate claims, run by `sysl test .`.
 
@@ -1672,3 +1674,205 @@ a_complaint_inside_a_hole_points_at_the_hole()
 
     assert(said.contains("`nope` is not defined"))
     assert(said.contains("2 | print(s\"x ${nope} y\")"))
+
+// -- the file system ----------------------------------------------------------------------------
+
+// **These are the only tests that touch a real disk**, so each of them gets a directory of its own
+// and gives it back afterwards. A shared one would make two tests read each other's files, and
+// inventing a path rather than asking for one is the race `mkdtemp` exists to avoid.
+//
+// `<dir>` anywhere in the program text is the directory that was made.
+private in_scratch(text: string) -> string
+    val dir = libuv.mkdtemp_sync("/tmp/slate-fs-XXXXXX").unwrap()
+    val said = out(replace_all(text, "<dir>", dir))
+
+    scrub(dir)
+    said
+end in_scratch
+
+// The same, for a program expected to fail.
+private fails_in_scratch(text: string) -> string
+    val dir = libuv.mkdtemp_sync("/tmp/slate-fs-XXXXXX").unwrap()
+    val said = fails(replace_all(text, "<dir>", dir))
+
+    scrub(dir)
+    said
+end fails_in_scratch
+
+// Everything a program left behind, and the directory with it.
+private scrub(dir: string)
+    libuv.scandir_sync(dir) match
+        Ok(entries) ->
+            for i in 0..<entries.len
+                val path = s"${dir}/${entries[i].name}"
+
+                // A directory refuses `unlink`, and telling the two apart that way costs nothing --
+                // there is no shape of these tests where a second `stat` would be worth making.
+                if libuv.unlink_sync(path).is_err() then scrub(path)
+        Err(_) -> ()
+
+    libuv.rmdir_sync(dir)
+end scrub
+
+@test
+a_file_written_is_a_file_read_back()
+    assert_eq(in_scratch("async main()\n    await writeFile(\"<dir>/a.txt\", \"hello slate\")\n    print(await readFile(\"<dir>/a.txt\"))\nmain()"), "hello slate")
+
+    // A second write replaces what was there rather than appending to it.
+    assert_eq(in_scratch("async main()\n    await writeFile(\"<dir>/a.txt\", \"long enough to notice\")\n    await writeFile(\"<dir>/a.txt\", \"short\")\n    print(await readFile(\"<dir>/a.txt\"))\nmain()"), "short")
+
+    // Anything that is not a string is written as `print` would render it.
+    assert_eq(in_scratch("async main()\n    await writeFile(\"<dir>/a.txt\", [1, 2, 3])\n    print(await readFile(\"<dir>/a.txt\"))\nmain()"), "[1, 2, 3]")
+
+@test
+the_answer_to_the_last_request_outstanding_is_still_handed_back()
+    // **The bug this pins made the whole file system look like it did nothing.** A timer is a handle
+    // and libuv counts it; an `fs` call is a *request*, and the turn of the loop that answers the
+    // last one outstanding reports nothing active afterwards. The drain used to take that as its
+    // signal to stop -- so the callback ran, the promise settled, and the coroutine awaiting it was
+    // never handed the value, because handing it back is what the *next* turn does. A program that
+    // awaited one file and printed the answer printed nothing at all and exited 0.
+    assert_eq(in_scratch("async main()\n    await writeFile(\"<dir>/a.txt\", \"only\")\n    print(await readFile(\"<dir>/a.txt\"))\nmain()"), "only")
+
+    // The same for a call that makes no request of its own to follow it.
+    assert_eq(in_scratch("async main()\n    print(await exists(\"<dir>\"))\nmain()"), "true")
+
+@test
+every_file_system_call_answers_a_promise()
+    // **There is no blocking form**, which is the one place slate is stricter than node: a call not
+    // awaited answers a promise like any other, rather than a value.
+    assert_eq(in_scratch("print(exists(\"<dir>\"))"), "<promise pending>")
+    assert_eq(in_scratch("print(readDir(\"<dir>\"))"), "<promise pending>")
+
+@test
+read_bytes_reads_what_read_file_will_not()
+    assert_eq(in_scratch("async main()\n    await writeFile(\"<dir>/a.txt\", \"AB\")\n    print(await readBytes(\"<dir>/a.txt\"))\nmain()"), "[65, 66]")
+
+    // An empty file is an empty array rather than a failure.
+    assert_eq(in_scratch("async main()\n    await writeFile(\"<dir>/a.txt\", \"\")\n    print(await readBytes(\"<dir>/a.txt\"), await readFile(\"<dir>/a.txt\"))\nmain()"), "[] ")
+
+@test
+a_file_that_is_not_text_is_refused_by_name()
+    // `/bin/ls` is not text on any machine this runs on, and reading it is the shortest way to say
+    // so without writing bytes slate has no way to write.
+    val said = fails("async main()\n    await readFile(\"/bin/ls\")\nmain()")
+
+    assert(said.contains("is not text"))
+    assert(said.contains("`readBytes`"))
+
+@test
+a_directory_is_made_listed_and_taken_away()
+    val prog = "async main()\n    await mkdir(\"<dir>/sub\")\n    await writeFile(\"<dir>/sub/one\", \"1\")\n    print(await readDir(\"<dir>/sub\"))\n    await remove(\"<dir>/sub/one\")\n    print(await readDir(\"<dir>/sub\"))\n    await rmdir(\"<dir>/sub\")\n    print(await exists(\"<dir>/sub\"))\nmain()"
+
+    assert_eq(in_scratch(prog), "[\"one\"]\n[]\nfalse")
+
+@test
+stat_says_how_big_a_file_is_and_what_kind_it_is()
+    val prog = "async main()\n    await writeFile(\"<dir>/a.txt\", \"12345\")\n    val f = await stat(\"<dir>/a.txt\")\n    val d = await stat(\"<dir>\")\n    print(f.size, f.isFile, f.isDir)\n    print(d.isFile, d.isDir)\nmain()"
+
+    assert_eq(in_scratch(prog), "5 true false\nfalse true")
+
+@test
+exists_answers_rather_than_failing()
+    // **The whole of what this adds over `stat`.** Asking whether something is there and being made
+    // to survive a failure to find out would be a question the language answered with an error.
+    assert_eq(in_scratch("async main()\n    print(await exists(\"<dir>\"), await exists(\"<dir>/nope\"))\nmain()"), "true false")
+
+@test
+rename_moves_a_file_and_leaves_nothing_behind()
+    val prog = "async main()\n    await writeFile(\"<dir>/a.txt\", \"kept\")\n    await rename(\"<dir>/a.txt\", \"<dir>/b.txt\")\n    print(await readDir(\"<dir>\"), await readFile(\"<dir>/b.txt\"))\nmain()"
+
+    assert_eq(in_scratch(prog), "[\"b.txt\"] kept")
+
+@test
+a_file_system_failure_reaches_the_program_that_awaited_it()
+    // Every one of these carries libuv's own sentence, because a program that cannot open a file
+    // wants to know whether the path was wrong or the permissions were.
+    assert(fails("async main()\n    await readFile(\"/no/such/file\")\nmain()").contains("ENOENT"))
+    assert(fails("async main()\n    await readDir(\"/no/such/dir\")\nmain()").contains("cannot list /no/such/dir"))
+    assert(fails("async main()\n    await mkdir(\"/no/such/dir\")\nmain()").contains("cannot make /no/such/dir"))
+    assert(fails("async main()\n    await stat(\"/no/such/file\")\nmain()").contains("cannot stat /no/such/file"))
+    assert(fails("async main()\n    await writeFile(\"/no/such/dir/x\", \"hi\")\nmain()").contains("cannot write /no/such/dir/x"))
+    assert(fails("async main()\n    await remove(\"/no/such/file\")\nmain()").contains("cannot remove /no/such/file"))
+    assert(fails("async main()\n    await rename(\"/no/such/file\", \"/tmp/x\")\nmain()").contains("cannot rename /no/such/file"))
+
+    // A directory that is not empty is the failure `rmdir` is for.
+    assert(fails_in_scratch("async main()\n    await writeFile(\"<dir>/a.txt\", \"x\")\n    await rmdir(\"<dir>\")\nmain()").contains("cannot remove"))
+
+@test
+a_file_system_builtin_says_what_it_wanted_when_given_something_else()
+    assert(fails("async main()\n    await readFile(42)\nmain()").contains("`readFile` takes a path, and this is an integer"))
+    assert(fails("async main()\n    await mkdir(null)\nmain()").contains("`mkdir` takes a path"))
+    assert(fails("async main()\n    await readFile()\nmain()").contains("`readFile` takes one path and was given 0 arguments"))
+    assert(fails("async main()\n    await writeFile(\"a\")\nmain()").contains("`writeFile` takes a path and its contents"))
+    assert(fails("async main()\n    await rename(\"a\")\nmain()").contains("`rename` takes two paths"))
+
+@test
+requests_in_flight_together_all_answer()
+    // Eight writes started before any of them is awaited, which is what the promises are for -- and
+    // what a drain that stopped at the first quiet turn would have lost all but one of.
+    val prog = "async main()\n    var ps = []\n    for i in 0..<8\n        push(ps, writeFile(\"<dir>/f\" + str(i), str(i)))\n    for p in ps\n        await p\n    val names = await readDir(\"<dir>\")\n    var total = 0\n    for n in names\n        total = total + len(await readFile(\"<dir>/\" + n))\n    print(len(names), total)\nmain()"
+
+    assert_eq(in_scratch(prog), "8 8")
+
+@test
+the_collector_runs_while_a_request_is_outstanding()
+    // **A pending request roots its promise through the table `event.sysl` keeps**, and nothing else
+    // knows about it: the closure libuv holds captures a slot id rather than a value, precisely so
+    // that a collection between the call and its answer cannot free what the answer is for.
+    val prog = "async main()\n    val p = readFile(\"<dir>/a.txt\")\n    for i in 0..<2000\n        val junk = { a: i, b: [i, i, i], c: \"x\" + str(i) }\n    print(await p)\nmain()"
+    val dir = libuv.mkdtemp_sync("/tmp/slate-fs-XXXXXX").unwrap()
+
+    libuv.write_file_sync(s"${dir}/a.txt", "survived".bytes).unwrap()
+
+    val said = out(replace_all(prog, "<dir>", dir))
+
+    scrub(dir)
+    assert_eq(said, "survived")
+
+@test
+timers_and_the_file_system_share_one_loop()
+    // A handle and a request in the same drain, which is the case the two halves of `drain_events`
+    // have to agree about.
+    //
+    // **This one passed while the file system did not work**, and that is worth knowing: a live
+    // timer is an active handle, so the loop kept saying it had work and the request's answer was
+    // never the thing that ended the drain. A file system test that has a timer in it cannot see
+    // the bug above, which is why the tests that pin it have no timer.
+    // **The order the two arrive in is not asserted, because it is not guaranteed.** A timer set
+    // for a millisecond and a write that goes through a thread pool race, and which wins says
+    // something about how busy the machine is rather than about slate. What *is* guaranteed is that
+    // both arrive and neither is dropped, which is the claim worth pinning.
+    val prog = "async main()\n    setTimeout(() -> print(\"timer\"), 1)\n    await writeFile(\"<dir>/a.txt\", \"file\")\n    print(await readFile(\"<dir>/a.txt\"))\n    await sleep(3)\nmain()"
+    val said = in_scratch(prog)
+
+    assert(said.contains("file"))
+    assert(said.contains("timer"))
+
+// -- the examples -------------------------------------------------------------------------------
+
+// **The examples are reading material, and reading material rots.** Every one of them is a slate
+// program the suite otherwise never runs, so a change to the language leaves them saying something
+// that no longer compiles and nothing notices until somebody opens the file. A stale
+// `person.missing` survived the `undefined` change exactly that way and had to be found by hand.
+//
+// **The path is relative to the project root**, which is where `sysl test .` runs.
+private ran_clean(path: string) -> string
+    read_bytes(path) match
+        Err(e) -> s"cannot read ${path}: ${e}"
+        Ok(bytes) ->
+            val src = source(path, bytes)
+            val r = run(src)
+
+            if r.ok() then "" else r.report.render(src)
+end ran_clean
+
+@test
+every_example_runs_with_nothing_to_report()
+    assert_eq(ran_clean("examples/tour.sl"), "")
+    assert_eq(ran_clean("examples/match.sl"), "")
+
+    // **`files.sl` makes and removes a `scratch/` directory beside the project**, and does it in
+    // that order so that running it twice is the same as running it once. A file left behind would
+    // make the next run of this test fail on the `mkdir`.
+    assert_eq(ran_clean("examples/files.sl"), "")

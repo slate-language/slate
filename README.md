@@ -229,6 +229,42 @@ raised it. That is the one thing node gets wrong by default and warns about inst
 already settled. Top-level `await` is refused — the whole program would have to become a coroutine,
 which is a real design and one to make on purpose.
 
+### The file system
+
+Ten builtins, on node's names, over the libuv binding's thread pool:
+
+```
+async main()
+    await mkdir("scratch")
+    await writeFile("scratch/notes.txt", "one line")
+
+    print(await readFile("scratch/notes.txt"))
+    print(await readDir("scratch"))
+
+    val about = await stat("scratch/notes.txt")
+
+    print(about.size, about.isFile, about.isDir)
+
+    await rename("scratch/notes.txt", "scratch/kept.txt")
+    await remove("scratch/kept.txt")
+    await rmdir("scratch")
+
+main()
+```
+
+`readFile` answers text and `readBytes` answers an array of numbers; a file that is not valid UTF-8
+has no slate string to become, so `readFile` refuses it by name and points at `readBytes`.
+`writeFile` replaces whatever was there, and renders anything that is not a string the way `print`
+would. `exists` answers `true` or `false` rather than failing, which is the whole of what it adds
+over `stat`. Everything else fails with libuv's own sentence — `cannot read x: ENOENT: no such file
+or directory` — reaching the program through the promise it was awaiting.
+
+**Every one of them answers a promise, and there is no blocking form.** The binding offers both and
+slate takes one. A language whose entire event story is a single loop has nothing to gain from a call
+that stops it, and offering both would make *which one did I write* a question a reader has to ask at
+every call site. node draws the line in the same place and then regrets its `*Sync` family in every
+style guide written about it.
+
 ## What it leans on
 
 `sh.sysl.parsing` does the scanner tier — spans, the byte cursor, literal reading, the diagnostic
@@ -303,21 +339,23 @@ Two consequences worth knowing:
 
 ## What is not here yet
 
-A module system, a literate `.lsl` form, files and sockets over the libuv binding, and anything
-resembling a standard library beyond a dozen builtins.
+A module system, a literate `.lsl` form, sockets over the libuv binding, and anything resembling a
+standard library beyond the builtins.
 
 **`defer` is on sysl's list and is deliberately not here.** It earns its place in Go and in sysl
 because neither collects: a function that acquires something has to release it on every exit path,
 and `defer` is what stops that being a maintenance problem. slate has a tracing collector, so memory
-needs no cleanup at all — and the only external resource it has is a timer, which `clearTimeout`
-closes. There is nothing to defer.
+needs no cleanup at all — and its external resources are a timer, which `clearTimeout` closes, and a
+file, which no program ever holds open: `readFile` and `writeFile` are whole-file calls that open and
+close within one promise. There is nothing to defer.
 
 If that changes, the answer will not be `defer`. slate's object model already carries `hash` and
 `equals` as ordinary fields, so a `dispose` read the same way — scope-based, as JavaScript's `using`
 is — would be the third of a pattern rather than a new mechanism.
 
-The two examples are the current surface, and it is meant to grow in whatever direction puts the most
-pressure on sysl.
+The examples are the current surface, and it is meant to grow in whatever direction puts the most
+pressure on sysl. Every one of them is run by the suite, so a change to the language cannot leave one
+of them saying something that no longer compiles.
 
 ## Licence
 
