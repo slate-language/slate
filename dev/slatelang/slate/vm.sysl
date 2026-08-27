@@ -1,6 +1,7 @@
 module dev.slatelang.slate
 
 import sh.sysl.gc
+import sh.sysl.libuv
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.text.str_builder
@@ -142,6 +143,22 @@ private const MaxCallDepth: usize = 10000
 // needs is found here rather than threaded through every comparison.
 var current_unit: Unit = new_unit()
 
+// One `@test` the entry file declared.
+struct TestCase
+    name: string
+
+    // Which file it came from, so a failure is rendered against the right one.
+    source: usize
+
+    fn: Value
+
+// The tests the file being run declared, in the order they were written.
+//
+// **A root the collector has to walk.** A test function is reached from nothing else once its
+// module's scope has been left, and it is the closure that keeps that scope -- and everything the
+// test can see -- alive.
+var registered_tests: Buf[TestCase] = buf()
+
 // What each module exported, in the order the modules ran.
 //
 // **A root the collector has to walk, and the only one the module system adds.** A module's exports
@@ -154,11 +171,15 @@ reset_vm()
     vm = Machine(buf(), buf(), null, null, buf(), true)
     parked.clear()
     module_values.clear()
+    registered_tests.clear()
 
 // Everything the loaded modules still hold.
 mark_modules(h: *gc.Heap)
     for i in 0..<module_values.len()
         mark_value(h, module_values.at(i))
+
+    for i in 0..<registered_tests.len()
+        mark_value(h, registered_tests.at(i).fn)
 
 // Everything the machine can still reach, for the collector.
 //
@@ -381,6 +402,8 @@ private run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usi
             PushReal(v) -> vm.stack.push(Real(v))
             PushStr(k) -> vm.stack.push(str_value(u.strings.at(k)))
             PushModule(m) -> vm.stack.push(module_values.at(m))
+
+            DefineTest(k) -> registered_tests.push(TestCase(u.strings.at(k), u.chunks.at(chunk_ix).source, pop()))
 
             PushHandler(to) -> vm.handlers.push(Handler(chunk_ix, to, vm.stack.len(), vm.frames.len(), vm.scope, base))
             PopHandler -> vm.handlers.truncate(vm.handlers.len() - 1)
@@ -768,7 +791,7 @@ run(src: Source) -> Ran
     for i in 0..<loaded.order.len()
         val which = loaded.order.at(i)
 
-        compile_module(&current_unit, loaded.programs.at(which), which, loaded.sources.at(which).name)
+        compile_module(&current_unit, loaded.programs.at(which), which, loaded.sources.at(which).name, which == 0)
 
     var env = new_env(null)
 
@@ -804,6 +827,174 @@ run(src: Source) -> Ran
             srcs.push(signal_source(s))
             Ran(Null, rep, srcs, loaded.sources, output)
 end run
+
+// -- running the tests a file declared -------------------------------------------------------------
+
+// How one `@test` went.
+struct TestRan
+    name: string
+    ok: bool
+
+    // The failure, rendered against the file that raised it. Empty where it passed.
+    said: string
+
+    // What the test printed, which is worth showing only when it did not pass.
+    printed: string
+
+    // How long it took, in milliseconds.
+    ms: u64
+end TestRan
+
+// Everything `slate test` found in one file.
+struct Tested
+    // Empty unless the file would not load or would not compile, in which case no test ran.
+    report: string
+
+    results: Buf[TestRan]
+
+    passed(self) -> usize
+        var n: usize = 0
+
+        for i in 0..<self.results.len()
+            if self.results.at(i).ok then n += 1
+
+        n
+    end passed
+
+    failed(self) -> usize = self.results.len() - self.passed()
+end Tested
+
+// Load a file, run its top level, and then run every `@test` it declared.
+//
+// **The top level runs first and its faults are the file's, not any test's.** A file whose module
+// body fails has no working tests to speak of, so that is reported as the file failing to load
+// rather than as every test failing for the same reason.
+run_tests(src: Source) -> Tested
+    val started = prepare(src)
+
+    if started != "" then return Tested(started, buf())
+
+    // The tests were registered as the entry module ran, and the closures in `registered_tests` are
+    // what keep their module's scope -- and everything they can see -- alive.
+    var results: Buf[TestRan] = buf()
+
+    for i in 0..<registered_tests.len()
+        results.push(run_one_test(registered_tests.at(i)))
+
+    Tested("", results)
+end run_tests
+
+// Everything `run` does up to and including the modules, answering a rendered complaint or nothing.
+private prepare(src: Source) -> string
+    reset_heap()
+    reset_vm()
+    reset_events()
+    reset_async()
+    output.clear()
+
+    val loaded = load_program(src)
+
+    if !loaded.ok() then return Ran(Null, loaded.report, loaded.srcs, loaded.sources, output).render()
+
+    current_unit = new_unit()
+
+    for i in 0..<loaded.sources.len()
+        current_unit.sources.push(loaded.sources.at(i))
+
+    for i in 0..<loaded.order.len()
+        val which = loaded.order.at(i)
+
+        compile_module(&current_unit, loaded.programs.at(which), which, loaded.sources.at(which).name, which == 0)
+
+    var env = new_env(null)
+
+    hold_env(env)
+    install_builtins(env)
+
+    run_modules(env) match
+        Err(sig) -> return complaint(sig)
+        Ok(_) -> ()
+
+    drain_events() match
+        Err(sig) -> return complaint(sig)
+        Ok(_) -> ()
+
+    unhandled_rejection() match
+        Some(sig) -> complaint(sig)
+        None -> ""
+end prepare
+
+// One signal, drawn against the file it came from.
+private complaint(sig: Signal) -> string
+    var rep = report()
+    var srcs: Buf[usize] = buf()
+
+    rep.add(error(signal_span(sig), signal_message(sig)))
+    srcs.push(signal_source(sig))
+    Ran(Null, rep, srcs, current_unit.sources, output).render()
+end complaint
+
+// One test: call it, let the loop settle, and read the verdict.
+//
+// **An `async` test is waited for rather than refused.** Calling one starts a coroutine and hands
+// back a promise that has not settled, so a runner that read the answer straight away would call
+// every asynchronous test a pass. The promise is marked handled first, so that a failure is reported
+// here as this test's rather than at the end of the drain as the file's.
+private run_one_test(t: TestCase) -> TestRan
+    val began = libuv.hrtime()
+    var args: Buf[Value] = buf()
+
+    output.clear()
+
+    val outcome = apply(t.fn, args, point(0))
+
+    outcome match
+        Ok(v) ->
+            v match
+                Promise(pr) -> pr.handled = true
+                _ -> ()
+
+            val after = drain_events() match
+                Err(sig) -> complaint(sig)
+                Ok(_) -> unhandled_rejection() match
+                    Some(sig) -> complaint(sig)
+                    None -> awaited_verdict(v)
+
+            finished(t, after, began)
+        Err(sig) -> finished(t, complaint(sig), began)
+end run_one_test
+
+// What an `async` test's promise came to, once the loop has run it to the end.
+private awaited_verdict(v: Value) -> string
+    v match
+        Promise(pr) ->
+            if !pr.settled
+                return "this test never finished -- something it awaited was never going to settle"
+
+            if pr.failed then said_at(pr.message, pr.at) else ""
+        _ -> ""
+end awaited_verdict
+
+// A message and a place, drawn against the file the machine was last in.
+private said_at(message: string, at: Span) -> string
+    var rep = report()
+    var srcs: Buf[usize] = buf()
+
+    rep.add(error(at, message))
+    srcs.push(current_source)
+    Ran(Null, rep, srcs, current_unit.sources, output).render()
+end said_at
+
+private finished(t: TestCase, said: string, began: u64) -> TestRan
+    var out = str_builder()
+
+    for i in 0..<output.len()
+        if i > 0 then out.push_char('\n')
+
+        out.push(output.at(i))
+
+    TestRan(t.name, said == "", said, out.finish(), (libuv.hrtime() - began) / 1000000)
+end finished
 
 // Every module in turn, each in a scope of its own under the builtins.
 //
