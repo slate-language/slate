@@ -1876,3 +1876,156 @@ every_example_runs_with_nothing_to_report()
     // that order so that running it twice is the same as running it once. A file left behind would
     // make the next run of this test fail on the `mkdir`.
     assert_eq(ran_clean("examples/files.sl"), "")
+
+    // **`echo.sl` is a server and a client in one program**, and it closes both sockets -- which is
+    // what stops this from hanging the suite rather than failing it.
+    assert_eq(ran_clean("examples/echo.sl"), "")
+
+// -- TCP ------------------------------------------------------------------------------------------
+
+// **A socket keeps the program alive, so a test that forgets to close one hangs the whole suite
+// forever with nothing printed.** That is a bad enough failure to be worth three lines of insurance:
+// every program here gets a watchdog timer that stops it with a complaint, and a `done()` to cancel
+// the watchdog where the program is expected to finish. A test that stops finishing therefore fails
+// in three seconds saying so, rather than never returning.
+//
+// The watchdog is cancelled and not merely ignored, because an uncancelled timer is itself a handle
+// the loop would wait three seconds for.
+//
+// **It stops the program by naming something that does not exist**, so that its complaint cannot be
+// mistaken for the one a test was looking for. A watchdog that divided by zero would have satisfied
+// the assertion in `a_fault_in_a_socket_callback_stops_the_program` without the fault under test
+// ever happening.
+private netted(body: string) -> string =
+    "stalled() = theProgramDidNotFinish\nval theGuard = setTimeout(stalled, 3000)\ndone() = clearTimeout(theGuard)\n" + body
+
+// What a networked program printed.
+private net_out(body: string) -> string = out(netted(body))
+
+// The complaint a networked program drew.
+private net_fails(body: string) -> string = fails(netted(body))
+
+// An echo server, and the port it ended up on. Every test below opens with some version of this.
+private const Echo: string = "serve(conn)\n    heard(chunk)\n        if chunk == null\n            close(conn)\n        else\n            send(conn, \"echo: \" + chunk)\n    onData(conn, heard)\nval server = listen(0, serve)\nval port = localPort(server)\n"
+
+@test
+a_client_and_a_server_talk_to_each_other()
+    val body = Echo + "async main()\n    val c = await connect(\"127.0.0.1\", port)\n    reply(chunk)\n        print(chunk)\n        close(c)\n        close(server)\n        done()\n    onData(c, reply)\n    await send(c, \"hello\")\nmain()"
+
+    assert_eq(net_out(body), "echo: hello")
+
+@test
+a_port_of_zero_is_the_kernels_to_pick_and_local_port_says_which()
+    // **The whole reason `localPort` exists.** A test that named a port would fail whenever anything
+    // else on the machine happened to have it, which is the kind of failure nobody can reproduce.
+    val body = "val s = listen(0, print)\nprint(localPort(s) > 0, localPort(s) < 65536)\nclose(s)\ndone()"
+
+    assert_eq(net_out(body), "true true")
+
+@test
+the_end_of_a_stream_is_null_and_not_a_failure()
+    // **libuv's own distinction, and the right one**: a peer closing its half is how a request
+    // ordinarily ends, so it arrives as a value rather than as a fault.
+    val body = "serve(conn)\n    heard(chunk)\n        send(conn, \"bye\")\n        close(conn)\n    onData(conn, heard)\nval server = listen(0, serve)\nasync main()\n    val c = await connect(\"127.0.0.1\", localPort(server))\n    reply(chunk)\n        if chunk == null\n            print(\"end\")\n            close(c)\n            close(server)\n            done()\n        else\n            print(chunk)\n    onData(c, reply)\n    await send(c, \"go\")\nmain()"
+
+    assert_eq(net_out(body), "bye\nend")
+
+@test
+on_bytes_reads_a_socket_that_carries_something_other_than_text()
+    val body = Echo + "async main()\n    val c = await connect(\"127.0.0.1\", port)\n    reply(chunk)\n        if chunk != null\n            print(chunk)\n            close(c)\n            close(server)\n            done()\n    onBytes(c, reply)\n    await send(c, \"AB\")\nmain()"
+
+    assert_eq(net_out(body), "[101, 99, 104, 111, 58, 32, 65, 66]")
+
+@test
+several_connections_are_served_at_once()
+    val body = Echo + "var heardBack = 0\nasync one(n)\n    val c = await connect(\"127.0.0.1\", port)\n    var got = null\n    reply(chunk)\n        if chunk != null\n            got = chunk\n            heardBack = heardBack + 1\n            close(c)\n    onData(c, reply)\n    await send(c, str(n))\n    await sleep(20)\n    got\nasync main()\n    val a = one(1)\n    val b = one(2)\n    val d = one(3)\n    print(await a, await b, await d)\n    print(heardBack)\n    close(server)\n    done()\nmain()"
+
+    assert_eq(net_out(body), "echo: 1 echo: 2 echo: 3\n3")
+
+@test
+a_closed_socket_is_not_whatever_took_its_slot()
+    // **A use-after-free wearing an integer's clothes, and it was silent.** A spent slot is reused,
+    // so a socket named by its position alone came to mean whatever took the position next: the
+    // closed socket compared *equal* to the live one, and `localPort` on it answered the live one's
+    // port. Every id a program is handed carries the generation that claimed the slot, and a
+    // generation is never reused.
+    val body = "val a = listen(0, print)\nclose(a)\nval b = listen(0, print)\nprint(a == b)\nclose(b)\ndone()"
+
+    assert_eq(net_out(body), "false")
+
+    // And the closed one is refused by name rather than answering about the live one.
+    val used = "val a = listen(0, print)\nclose(a)\nval b = listen(0, print)\nlocalPort(a)"
+
+    assert(net_fails(used).contains("this socket is closed, and `localPort` needs an open one"))
+
+@test
+a_cancelled_timers_id_cancels_nothing_else()
+    // **The same defect, found in the same place and older.** `setTimeout` handed back a slot
+    // number, so cancelling an already-cancelled timer cancelled whatever had since taken the slot
+    // -- and the program waiting on that second timer simply never heard from it.
+    val body = "val first = setTimeout(() -> print(\"first\"), 3000)\nclearTimeout(first)\nsetTimeout(() -> print(\"second\"), 1)\nclearTimeout(first)\ndone()"
+
+    assert_eq(net_out(body), "second")
+
+@test
+connecting_to_nothing_fails_the_promise()
+    // **`done()` before the drain and not after it.** The failure is an unhandled rejection, which
+    // is only reported once everything has settled -- so a watchdog still ticking would end the
+    // drain first and the program would be reported as stalled instead.
+    val body = "async main()\n    await connect(\"127.0.0.1\", 1)\nmain()\ndone()"
+    val said = net_fails(body)
+
+    assert(said.contains("cannot connect to 127.0.0.1:1"))
+    assert(said.contains("ECONNREFUSED"))
+
+@test
+a_port_already_taken_is_refused_by_name()
+    val body = "val a = listen(0, print)\nlisten(localPort(a), print)"
+
+    assert(net_fails(body).contains("EADDRINUSE"))
+
+@test
+a_socket_builtin_says_what_it_wanted_when_given_something_else()
+    assert(net_fails("listen(\"x\", print)").contains("`listen` takes a port number, and this is a string"))
+    assert(net_fails("listen(80)").contains("`listen` takes a port and a function, and was given 1 arguments"))
+    assert(net_fails("listen(0, 5)").contains("`listen` needs a function to call with each connection"))
+    assert(net_fails("listen(99999, print)").contains("a port is between 0 and 65535, and this is 99999"))
+    assert(net_fails("connect(1, 2)").contains("`connect` takes an address, and this is an integer"))
+    assert(net_fails("send(5, \"x\")").contains("`send` takes a socket, and this is an integer"))
+    assert(net_fails("close(5)").contains("`close` takes a socket, and this is an integer"))
+    assert(net_fails("localPort(5)").contains("`localPort` takes a socket, and this is an integer"))
+    assert(net_fails("onData(5, print)").contains("`onData` takes a socket, and this is an integer"))
+    assert(net_fails("onBytes(5, print)").contains("`onBytes` takes a socket, and this is an integer"))
+
+@test
+closing_a_socket_twice_is_not_an_error()
+    // A server closing its connections and a read callback closing its own at end-of-stream is the
+    // ordinary way to write this, so the second close must not be a failure.
+    val body = "val s = listen(0, print)\nclose(s)\nclose(s)\nprint(\"fine\")\ndone()"
+
+    assert_eq(net_out(body), "fine")
+
+@test
+a_fault_in_a_socket_callback_stops_the_program()
+    // **There is no statement to attach it to** -- the loop is not running one -- so it is reported
+    // against the whole run, as a timer's fault is. It also has to stop a program whose server would
+    // otherwise keep the loop alive forever.
+    val body = "serve(conn)\n    onData(conn, chunk -> 1 / 0)\nval server = listen(0, serve)\nasync main()\n    val c = await connect(\"127.0.0.1\", localPort(server))\n    await send(c, \"boom\")\nmain()"
+
+    assert(net_fails(body).contains("this divides by zero"))
+
+@test
+the_collector_runs_while_a_connection_is_open()
+    // **A socket's slot roots the slate callback the program gave it**, and nothing else does: the
+    // sysl closure libuv holds captures the slot and the generation, so a collection between the
+    // call and the answer cannot free what the answer is for.
+    val body = Echo + "async main()\n    val c = await connect(\"127.0.0.1\", port)\n    reply(chunk)\n        if chunk != null\n            print(chunk)\n            close(c)\n            close(server)\n            done()\n    onData(c, reply)\n    for i in 0..<3000\n        val junk = { a: i, b: [i, i], c: \"x\" + str(i) }\n    await send(c, \"survived\")\nmain()"
+
+    assert_eq(net_out(body), "echo: survived")
+
+@test
+a_second_reader_replaces_the_first()
+    // What makes a protocol that changes what it expects halfway through writable at all.
+    val body = Echo + "async main()\n    val c = await connect(\"127.0.0.1\", port)\n    second(chunk)\n        print(\"second:\", chunk)\n        close(c)\n        close(server)\n        done()\n    first(chunk)\n        print(\"never\")\n    onData(c, first)\n    onData(c, second)\n    await send(c, \"once\")\nmain()"
+
+    assert_eq(net_out(body), "second: echo: once")

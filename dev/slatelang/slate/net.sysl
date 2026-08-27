@@ -1,0 +1,297 @@
+module dev.slatelang.slate
+
+import sh.sysl.libuv
+import sh.sysl.libuv.Handle
+import sh.sysl.libuv.Stream
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8
+
+// TCP, as far as a language with one event loop needs it.
+//
+// **A socket is where this stops looking like the file system.** Every file-system call is one
+// request with one answer, so every one of them is a promise and the slot that roots it is given
+// back as the answer arrives. A socket is a *handle*: it is opened, it produces a run of events over
+// whatever time it lives, and it ends when the program says so. So its slot is claimed once and
+// surrendered only by `close`, and what a program holds is the slot's id.
+//
+// That split decides the shape of every builtin here:
+//
+// - **`connect` and `send` answer promises**, because each is one attempt with one outcome.
+// - **`listen` and `onData` take callbacks**, because neither has one outcome to wait for. A
+//   listener that answered a promise could answer it once, and a connection is not one connection.
+//
+// **A socket keeps the program alive**, exactly as a timer does and for the same reason: the slot is
+// counted in `outstanding`, so a program that starts a server and reaches the end of its last
+// statement does not exit. node's rule, and the reason `close` is not optional.
+//
+// ## What a callback may capture, which is the rule `event.sysl` and `fs.sysl` also keep
+//
+// **A `usize` and a `Span`.** The collector cannot see through an ARC box, so a sysl closure holding
+// a `Value` would hold it where the mark phase cannot find it. An id indexes the table this program
+// roots; a `Span` is two integers. The slate closure a program passed lives in the slot.
+
+// The socket in a slot, or nothing where the id names no live socket.
+//
+// Not `private`: `builtin.sysl` checks an argument is a socket before doing anything with it.
+socket_at(id: usize, gen: usize) -> Option[&libuv.Tcp]
+    if !holds(id, gen) then return None
+
+    pending.at(id).socket
+end socket_at
+
+// The socket a builtin was handed, as the slot and generation that name it -- or the complaint about
+// what it was handed instead.
+private socket_of(v: Value, at: Span, name: string) -> Result[(usize, usize), Signal]
+    v match
+        Socket(id, gen) ->
+            if socket_at(id, gen).is_some() then Ok((id, gen)) else Err(Fail(at, s"this socket is closed, and `${name}` needs an open one"))
+        other -> Err(Fail(at, s"`${name}` takes a socket, and this is ${other.type_name()}"))
+
+// Take a slot for a socket, and put the slate callback that goes with it in the same place.
+//
+// **`repeating` is true and nothing ever fires it.** The flag is what stops `fire` from spending a
+// slot when its callback runs, and a socket's slot is spent by `close` alone -- so the value that
+// means "not one-shot" is the right one here even though this is not a timer.
+private hold_socket(sock: &libuv.Tcp, cb: Value) -> Value
+    val id = claim(Pending(cb, null, None, Some(sock), true, true, 0))
+
+    Socket(id, gen_at(id))
+end hold_socket
+
+// The slate callback a socket's slot is holding.
+private callback_of(id: usize, gen: usize) -> Value
+    if !holds(id, gen) then return Null
+
+    pending.at(id).callback
+end callback_of
+
+// Replace it, which is what a second `onData` on one socket does.
+private set_callback(id: usize, gen: usize, cb: Value)
+    if !holds(id, gen) then return
+
+    var slot = pending.at(id)
+
+    slot.callback = cb
+    pending.set(id, slot)
+end set_callback
+
+// Call a socket's slate callback with one argument.
+//
+// **A fault inside it stops the program**, as it does for a timer and for the same reason: the loop
+// is not running a statement, so there is nothing to attach the complaint to but the whole run.
+private deliver(id: usize, gen: usize, v: Value)
+    val cb = callback_of(id, gen)
+
+    cb match
+        Null -> return
+        _ -> ()
+
+    var args: Buf[Value] = buf()
+    val mark = root_mark()
+
+    hold(cb)
+    hold(v)
+    args.push(v)
+
+    apply(cb, args, point(0)) match
+        Ok(_) -> ()
+        Err(s) -> loop_fault = Some(s)
+
+    release(mark)
+end deliver
+
+// Stop the program with a sentence of slate's own, from inside a callback.
+private loop_fails(message: string)
+    loop_fault match
+        Some(_) -> ()
+        None -> loop_fault = Some(Fail(point(0), message))
+
+// -- what a program calls --------------------------------------------------------------------------
+
+// `listen(port, onConnection)` -- a server, accepting on every interface.
+//
+// **A port of `0` asks the kernel for one**, which is what `localPort` is for and what lets a test
+// run without choosing a number no other program is using.
+listen_socket(port: long, cb: Value, at: Span) -> Step
+    cb match
+        Fn(_) -> ()
+        Native(_) -> ()
+        other -> return fault(at, s"`listen` needs a function to call with each connection, and this is ${other.type_name()}")
+
+    if port < 0 || port > 65535 then return fault(at, s"a port is between 0 and 65535, and this is ${port}")
+
+    val server = libuv.tcp() match
+        Err(e) -> return fault(at, s"this socket could not be made: ${e}")
+        Ok(t) -> t
+
+    val addr = libuv.ip4("0.0.0.0", int(port)) match
+        Err(e) -> return fault(at, s"this address could not be read: ${e}")
+        Ok(a) -> a
+
+    server.bind(addr) match
+        Err(e) -> return fault(at, s"cannot listen on port ${port}: ${e}")
+        Ok(_) -> ()
+
+    val held = hold_socket(server, cb)
+    val (id, gen) = slot_of(held)
+
+    server.listen(128, () -> accepted(id, gen)) match
+        Err(e) ->
+            surrender(id)
+            fault(at, s"cannot listen on port ${port}: ${e}")
+        Ok(_) -> Ok(held)
+end listen_socket
+
+// The slot and generation inside a socket value, for the two places here that made one and know it
+// is a socket.
+private slot_of(v: Value) -> (usize, usize) = v match
+    Socket(id, gen) -> (id, gen)
+    _ -> (0, 0)
+
+// One connection has arrived, and libuv guarantees exactly one per call of this.
+private accepted(id: usize, gen: usize)
+    socket_at(id, gen) match
+        None -> ()
+        Some(server) ->
+            server.accept() match
+                Err(e) -> loop_fails(s"a connection could not be accepted: ${e}")
+                Ok(conn) ->
+                    // **The connection gets a slot of its own with no callback yet.** It is the
+                    // program's to read from, write to and close, and until it calls `onData` there
+                    // is nothing to deliver anything to.
+                    deliver(id, gen, hold_socket(conn, Null))
+
+// `connect(host, port)` -- a promise of a connected socket.
+//
+// **`host` is an address and not a name.** There is no resolver here yet, so `"localhost"` is not a
+// thing that can be connected to and the failure says so in libuv's words.
+connect_socket(host: string, port: long, at: Span) -> Step
+    if port < 0 || port > 65535 then return fault(at, s"a port is between 0 and 65535, and this is ${port}")
+
+    val client = libuv.tcp() match
+        Err(e) -> return fault(at, s"this socket could not be made: ${e}")
+        Ok(t) -> t
+
+    val addr = libuv.ip4(host, int(port)) match
+        Err(e) -> return fault(at, s"cannot connect to ${host}: ${e}")
+        Ok(a) -> a
+
+    // **Two slots, and they are not the same thing.** One holds the socket for as long as the
+    // program has it; the other roots the promise for the length of the attempt and is given back
+    // when the attempt finishes. Settling the promise would otherwise take the socket with it.
+    val held = hold_socket(client, Null)
+    val (id, gen) = slot_of(held)
+    val waiting = begin_request()
+    val what = s"cannot connect to ${host}:${port}"
+
+    client.connect(addr, (r) ->
+        r match
+            Ok(_) -> answer_request(waiting, Socket(id, gen))
+            Err(e) ->
+                surrender(id)
+                refuse_request(waiting, at, what, e)) match
+        Err(e) ->
+            surrender(id)
+            refuse_request(waiting, at, what, e)
+            Ok(awaited_request(waiting))
+        Ok(_) -> Ok(awaited_request(waiting))
+end connect_socket
+
+// `onData(sock, fn)` and `onBytes(sock, fn)` -- start reading.
+//
+// `fn` is called with each chunk as it arrives and with `null` once the peer has finished sending.
+// **A second call replaces the first's function**, which is what makes a protocol that changes what
+// it expects halfway through writable at all.
+read_socket(v: Value, cb: Value, as_text: bool, at: Span) -> Step
+    val name = if as_text then "onData" else "onBytes"
+
+    cb match
+        Fn(_) -> ()
+        Native(_) -> ()
+        other -> return fault(at, s"`${name}` needs a function to call with each chunk, and this is ${other.type_name()}")
+
+    val (id, gen) = socket_of(v, at, name)?
+    val sock = socket_at(id, gen).unwrap()
+
+    set_callback(id, gen, cb)
+
+    // **Stopped before started, because libuv refuses `read_start` on a stream already reading** --
+    // `EALREADY`, which would make a second `onData` a failure rather than the replacement it is
+    // meant to be. Stopping keeps the callback and the buffer, so this costs nothing and a socket
+    // that was not reading does not mind being told to stop.
+    sock.read_stop()
+
+    sock.read_start((r) -> arrived(id, gen, r, as_text)) match
+        Err(e) -> fault(at, s"cannot read from this socket: ${e}")
+        Ok(_) -> Ok(Null)
+end read_socket
+
+// Something came off the wire.
+//
+// **The end of the stream is `null` and not a failure**, which is libuv's own distinction and the
+// right one: a peer closing its half is how a request ordinarily ends.
+private arrived(id: usize, gen: usize, r: libuv.Read, as_text: bool)
+    r match
+        End -> deliver(id, gen, Null)
+        Failed(e) -> loop_fails(s"this connection failed: ${e}")
+        Data(bytes) ->
+            if as_text
+                // **A chunk is a chunk and not a message**, so this can split a character in half
+                // where a peer sends one across two packets. `onBytes` is the reader that cannot.
+                from_utf8(bytes) match
+                    Ok(text) -> deliver(id, gen, str_value(text))
+                    Err(_) -> loop_fails("this chunk is not text -- `onBytes` reads a socket that carries something else")
+            else
+                var items: Buf[Value] = buf()
+
+                for i in 0..<bytes.len
+                    items.push(Int(long(bytes[i])))
+
+                val mark = root_mark()
+                val a = new_array(items)
+
+                hold(Array(a))
+                deliver(id, gen, Array(a))
+                release(mark)
+
+// `send(sock, data)` -- a promise that settles when the bytes have gone.
+//
+// `Ok` from libuv means the write was queued; the promise is what says it happened.
+send_socket(v: Value, text: string, at: Span) -> Step
+    val (id, gen) = socket_of(v, at, "send")?
+    val sock = socket_at(id, gen).unwrap()
+    val waiting = begin_request()
+
+    sock.write(text.bytes, (r) ->
+        r match
+            Ok(_) -> answer_request(waiting, Null)
+            Err(e) -> refuse_request(waiting, at, "cannot send", e)) match
+        Err(e) ->
+            refuse_request(waiting, at, "cannot send", e)
+            Ok(awaited_request(waiting))
+        Ok(_) -> Ok(awaited_request(waiting))
+end send_socket
+
+// `close(sock)` -- and with it the slot, which is what lets the program exit.
+close_socket(v: Value, at: Span) -> Step
+    v match
+        Socket(id, gen) ->
+            // **Closing a socket twice is not an error.** A server closing its connections and a
+            // read callback closing its own on end-of-stream is the ordinary way to write this, and
+            // making the second one a failure would make the ordinary way wrong.
+            if socket_at(id, gen).is_some() then surrender(id)
+
+            Ok(Null)
+        other -> fault(at, s"`close` takes a socket, and this is ${other.type_name()}")
+
+// `localPort(sock)` -- the port this end is actually on.
+//
+// **The whole reason a program may ask for port `0`.** The kernel picks one, and this is how the
+// program finds out which, so nothing has to guess at a number that is free.
+local_port(v: Value, at: Span) -> Step
+    val (id, gen) = socket_of(v, at, "localPort")?
+
+    socket_at(id, gen).unwrap().sockname() match
+        Err(e) -> fault(at, s"this socket has no address: ${e}")
+        Ok(a) -> Ok(Int(long(a.port())))

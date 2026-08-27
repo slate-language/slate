@@ -265,6 +265,57 @@ that stops it, and offering both would make *which one did I write* a question a
 every call site. node draws the line in the same place and then regrets its `*Sync` family in every
 style guide written about it.
 
+### TCP
+
+Seven builtins over the same loop:
+
+```
+serve(conn)
+    heard(chunk)
+        if chunk == null
+            close(conn)
+        else
+            send(conn, "echo: " + chunk)
+
+    onData(conn, heard)
+
+val server = listen(0, serve)
+
+async main()
+    val client = await connect("127.0.0.1", localPort(server))
+
+    reply(chunk)
+        if chunk != null
+            print(chunk)
+            close(client)
+            close(server)
+
+    onData(client, reply)
+    await send(client, "hello")
+
+main()
+```
+
+**`connect` and `send` answer promises; `listen`, `onData` and `onBytes` take callbacks.** That split
+is not a matter of taste: a connect and a send are each one attempt with one outcome, which is what a
+promise is, and a listener does not have one connection any more than a connection has one chunk.
+`onData` hands over each chunk as it arrives and `null` once the peer has finished sending — the end
+of a stream is a value here rather than a failure, because a peer closing its half is how a request
+ordinarily ends. `onBytes` is the same reader for a socket carrying something that is not text, and
+calling either a second time replaces the function rather than adding one.
+
+A port of `0` asks the kernel to pick one and `localPort` says which, so nothing has to guess at a
+number that is free. `connect` takes an address rather than a name — there is no resolver yet.
+
+**A socket keeps the program alive, exactly as a timer does**, so `close` is not optional; a program
+that leaves one open never exits. Closing twice is fine, which is what lets a server close its
+connections while a read callback closes its own.
+
+**A closed socket is not whatever opens next.** A socket is a slot in the table the loop keeps and a
+slot is reused, so the value a program holds carries the *generation* that claimed it — otherwise a
+socket held across a `close` would come to mean its successor and compare equal to it. That was a
+real defect, and the same one had been sitting in `setTimeout`'s ids since the loop was built.
+
 ## What it leans on
 
 `sh.sysl.parsing` does the scanner tier — spans, the byte cursor, literal reading, the diagnostic
@@ -339,15 +390,18 @@ Two consequences worth knowing:
 
 ## What is not here yet
 
-A module system, a literate `.lsl` form, sockets over the libuv binding, and anything resembling a
+A module system, a literate `.lsl` form, a name resolver for `connect`, and anything resembling a
 standard library beyond the builtins.
 
 **`defer` is on sysl's list and is deliberately not here.** It earns its place in Go and in sysl
 because neither collects: a function that acquires something has to release it on every exit path,
 and `defer` is what stops that being a maintenance problem. slate has a tracing collector, so memory
-needs no cleanup at all — and its external resources are a timer, which `clearTimeout` closes, and a
-file, which no program ever holds open: `readFile` and `writeFile` are whole-file calls that open and
-close within one promise. There is nothing to defer.
+needs no cleanup at all. Its external resources are a timer, which `clearTimeout` closes; a file,
+which no program ever holds open, since `readFile` and `writeFile` open and close within one promise;
+and a socket, which a program does hold and does close. **That last one is the case worth watching**
+— it is the first resource here with a lifetime a program manages — but `defer` would not be the
+answer to it either, since a socket is closed from a callback far away from where it was opened, and
+that is precisely where a scope-based release does not reach.
 
 If that changes, the answer will not be `defer`. slate's object model already carries `hash` and
 `equals` as ordinary fields, so a `dispose` read the same way — scope-based, as JavaScript's `using`

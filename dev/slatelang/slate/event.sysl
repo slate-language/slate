@@ -41,11 +41,26 @@ struct Pending
     // The handle, kept alive here for as long as the program may still cancel it.
     timer: Option[&libuv.Timer]
 
+    // A socket, kept here for the same reason and closed the same way. **A socket differs from a
+    // timer in what ends it**: a timer is spent when it fires and a socket lives until the program
+    // says otherwise, so its slot is never surrendered by anything but `close`.
+    socket: Option[&libuv.Tcp]
+
     // Whether this slot is in use. A spent slot is reused rather than grown past.
     live: bool
 
     // A repeating timer keeps firing; a one-shot frees its slot as it goes.
     repeating: bool
+
+    // **Which occupant of this slot this is, and it is what makes an id safe to hand a program.**
+    // A spent slot is reused, so an id on its own names a *position* rather than a thing: hold one
+    // across a `close` and it comes to mean whatever took the position next. That is a use-after-free
+    // wearing an integer's clothes, and it is silent -- `clearTimeout` on a cancelled timer's id
+    // cancelled a *different* timer, and a closed socket's value compared equal to a live one.
+    //
+    // Every claim takes the next number, so a stale id carries a generation the slot no longer has
+    // and every lookup misses. It is never reused and never reset.
+    gen: usize
 
 // Everything the loop may still call.
 //
@@ -55,6 +70,9 @@ var pending: Buf[Pending] = buf()
 
 // How many callbacks are still outstanding, which is what decides whether the loop has work.
 var outstanding: usize = 0
+
+// The number the next claim will stamp its slot with. See `Pending.gen`.
+var generation: usize = 0
 
 // Mark what the loop can still reach.
 mark_pending(h: *gc.Heap)
@@ -68,6 +86,12 @@ reset_events()
     // Every handle is dropped, which closes the timers with it.
     pending.clear()
     outstanding = 0
+
+    // **Back to zero, so that what a program is shown does not depend on what ran before it.** The
+    // generation only has to be unique within one run -- nothing survives a `reset` to collide with
+    // -- and letting it carry over would make a socket's printed name a function of the suite's
+    // order.
+    generation = 0
     loop_fault = None
 
 // Take a slot, reusing a spent one where there is one.
@@ -75,16 +99,54 @@ reset_events()
 // Not `private`: `private` in sysl is private to the *file*, and `fs.sysl` claims a slot for every
 // request it has outstanding.
 claim(p: Pending) -> usize
+    var slot = p
+
+    generation += 1
+    slot.gen = generation
+
     for i in 0..<pending.len()
         if !pending.at(i).live
-            pending.set(i, p)
+            pending.set(i, slot)
             outstanding += 1
             return i
 
-    pending.push(p)
+    pending.push(slot)
     outstanding += 1
     pending.len() - 1
 end claim
+
+// Which occupant of a slot is in it now. `0` for a slot that has never been claimed, which no live
+// id can carry -- `generation` counts from one.
+//
+// Not `private`: every id a program is given carries one of these, so `net.sysl` checks them too.
+gen_at(id: usize) -> usize
+    if id >= pending.len() then return 0
+
+    pending.at(id).gen
+end gen_at
+
+// The slot a generation is in, if it is still in one.
+//
+// **A linear scan, and it is the right shape.** The table holds what the loop may still call, which
+// is bounded by how much a program has in flight at once rather than by how much it has ever done --
+// and the one caller is `clearTimeout`, which no program is in a hurry about.
+slot_of_gen(gen: usize) -> Option[usize]
+    for i in 0..<pending.len()
+        val slot = pending.at(i)
+
+        if slot.live && slot.gen == gen then return Some(i)
+
+    None
+end slot_of_gen
+
+// Whether an id and the generation it was handed out with still name what they named.
+holds(id: usize, gen: usize) -> bool
+    if id >= pending.len() then return false
+
+    val slot = pending.at(id)
+
+    slot.live && slot.gen == gen
+end holds
 
 // Give a slot back. **The callback goes to `Null` here and not only the flag**, because the flag is
 // what the mark phase reads and a live-looking slot would keep a dead closure alive forever.
@@ -109,7 +171,14 @@ surrender(id: usize)
         Some(t) -> t.close(() -> ())
         None -> ()
 
+    // A socket is closed for the same reason a timer is, and libuv insists on it for one more:
+    // a handle that is never closed is one `run` waits on forever.
+    slot.socket match
+        Some(c) -> c.close(() -> ())
+        None -> ()
+
     slot.timer = None
+    slot.socket = None
     pending.set(id, slot)
     outstanding -= 1
 end surrender
@@ -152,6 +221,103 @@ end fire
 // The first fault a callback raised, if any. Read once the loop stops.
 var loop_fault: Option[Signal] = None
 
+// -- a request, which is a slot holding nothing but a promise ---------------------------------------
+
+// **The other thing a slot can be, and the reason this table is not called the timer table.** A file
+// system call and a socket's connect and send are each one attempt with one outcome, so each takes a
+// slot that roots a promise and gives the slot back as the answer arrives. Nothing here knows what
+// kind of request it is; `fs.sysl` and `net.sysl` are the two that do.
+//
+// **The slot is also what keeps the loop running.** `outstanding` counts it, so a program does not
+// exit with a read still in the thread pool.
+
+// Start a request: a promise, and the slot that roots it until libuv answers.
+//
+// The slot is what keeps the loop running too -- `outstanding` counts it, so a program does not exit
+// with a read still in the thread pool.
+begin_request() -> usize
+    val mark = root_mark()
+    val pr = new_promise()
+
+    hold(Promise(pr))
+
+    val id = claim(Pending(Null, pr, None, None, true, false, 0))
+
+    release(mark)
+    id
+end begin_request
+
+// The promise a slot is holding, as the value a program gets back.
+awaited_request(id: usize) -> Value = Promise(pending.at(id).promise)
+
+// Hand an answer back and give the slot up.
+//
+// **The promise is read out before the slot is surrendered**, because surrendering is also what
+// clears the slot's copy of it -- the same ordering `fire` needs and for the same reason.
+answer_request(id: usize, v: Value)
+    if id >= pending.len() then return
+
+    val slot = pending.at(id)
+
+    if !slot.live then return
+
+    val pr = slot.promise
+
+    surrender(id)
+
+    if pr != null then settle_ok(pr, v)
+end answer_request
+
+// Fail a request, with the sentence libuv gave and the place the program called from.
+refuse_request(id: usize, at: Span, what: string, e: libuv.Error)
+    if id >= pending.len() then return
+
+    val slot = pending.at(id)
+
+    if !slot.live then return
+
+    val pr = slot.promise
+
+    surrender(id)
+
+    if pr != null then settle_err(pr, s"${what}: ${e}", at)
+end refuse_request
+
+// Fail a request with a sentence of slate's own, where there is no libuv error to quote.
+deny_request(id: usize, at: Span, message: string)
+    if id >= pending.len() then return
+
+    val slot = pending.at(id)
+
+    if !slot.live then return
+
+    val pr = slot.promise
+
+    surrender(id)
+
+    if pr != null then settle_err(pr, message, at)
+end deny_request
+
+// A request libuv would not even start is one whose callback will never run, so the promise it was
+// given has to fail here instead of waiting forever.
+request_started(id: usize, at: Span, what: string, r: Result[unit, libuv.Error]) -> Step
+    r match
+        Ok(_) -> Ok(awaited_request(id))
+        Err(e) ->
+            refuse_request(id, at, what, e)
+            Ok(awaited_request(id))
+end request_started
+
+// The same check, for a step taken from inside a callback rather than from the builtin.
+//
+// **A chain of requests has one promise and several chances to fail to start.** `request_started`
+// answers the value the builtin hands back; this one has nobody to answer, and exists only so that a
+// step libuv refused fails the promise instead of leaving it pending for the rest of the program.
+request_continued(id: usize, at: Span, what: string, r: Result[unit, libuv.Error])
+    r match
+        Ok(_) -> ()
+        Err(e) -> refuse_request(id, at, what, e)
+
 // -- what a program calls --------------------------------------------------------------------------
 
 // `setTimeout(fn, ms)` and `setInterval(fn, ms)`, which differ only in the repeat.
@@ -167,7 +333,7 @@ set_timer(cb: Value, ms: long, repeating: bool, at: Span) -> Step
     libuv.timer() match
         Err(e) -> fault(at, s"this timer could not be made: ${e}")
         Ok(t) ->
-            val id = claim(Pending(cb, null, Some(t), true, repeating))
+            val id = claim(Pending(cb, null, Some(t), None, true, repeating, 0))
 
             // **The closure captures the id and not the value**, which is the whole arrangement: the
             // collector cannot see through this box, so what it holds must be something the collector
@@ -176,7 +342,7 @@ set_timer(cb: Value, ms: long, repeating: bool, at: Span) -> Step
                 Err(e) ->
                     surrender(id)
                     fault(at, s"this timer could not be started: ${e}")
-                Ok(_) -> Ok(Int(long(id)))
+                Ok(_) -> Ok(Int(long(gen_at(id))))
 end set_timer
 
 // `sleep(ms)` -- a promise that settles when the time is up.
@@ -195,7 +361,7 @@ sleep_promise(ms: long, at: Span) -> Step
 
             hold(Promise(pr))
 
-            val id = claim(Pending(Null, pr, Some(t), true, false))
+            val id = claim(Pending(Null, pr, Some(t), None, true, false, 0))
 
             release(mark)
 
@@ -207,10 +373,21 @@ sleep_promise(ms: long, at: Span) -> Step
 end sleep_promise
 
 // `clearTimeout(id)` and `clearInterval(id)`.
+//
+// **The number a program holds is the GENERATION and not the slot**, which is the whole of what
+// makes cancelling safe. A slot is reused, so cancelling a timer by its position cancelled whatever
+// had since taken the position -- silently, and the program relying on that second timer simply
+// never heard from it. A generation is never reused, so a stale id finds nothing.
+//
+// That it is a number at all is node's convention. Nothing but this pair of functions reads it, and
+// nothing about it is promised beyond being able to name one timer once.
 clear_timer(v: Value, at: Span) -> Step
     v match
         Int(n) ->
-            if n >= 0 then surrender(usize(n))
+            if n >= 0
+                slot_of_gen(usize(n)) match
+                    Some(id) -> surrender(id)
+                    None -> ()
 
             Ok(Null)
         other -> fault(at, s"a timer is cancelled by its id, and this is ${other.type_name()}")
