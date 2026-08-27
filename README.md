@@ -453,6 +453,58 @@ to rather than looking one up when it is reported, because a signal outlives the
 raised it: an unhandled rejection is reported after the loop has drained, by which time the machine
 is somewhere else entirely.
 
+### Objects that share their behaviour
+
+`proto` is an ordinary field, and a lookup that misses carries on into it:
+
+```
+val Shape = {
+    describe: self -> s"${self.kind} with area ${self.area()}",
+    kind: "shape"
+}
+
+val Square = { proto: Shape, kind: "square", area: self -> self.side * self.side }
+
+square(side) = { side: side, proto: Square }
+
+print(square(4).describe())          // square with area 16
+```
+
+**No syntax and no new kind of value** — slate already looked `hash` and `equals` up by name, so a
+well-known field is the mechanism the language had rather than a new one. A proto may have a proto,
+so chains and overriding come free; `describe` lives on `Shape` and calls `area`, which only the
+concrete shapes have, so the call goes back down to whichever object it started from. That is
+dispatch, and it needed no keyword.
+
+**A method reached through a proto is handed the object it was found on.** One `dist` serves every
+point, so it cannot have captured a particular one — it has to be told, and `self` is an ordinary
+first parameter. A method stored on the object itself has already captured what it needs and is given
+nothing extra:
+
+```
+counter() =
+    var n = 0
+    var c = {}
+    c.bump = () ->
+        n += 1
+        n
+    c
+```
+
+That is not two rules but one: **captured methods take no receiver, shared ones must.** It is also
+what let protos arrive without breaking anything — every hook written before them is a closure of
+exactly that second kind.
+
+Only `o.m(...)` passes a receiver. `o.m` on its own hands back the bare function, so taking a method
+off an object and calling it later is allowed and gives you what you took.
+
+**The proto is the identity.** `p.proto == Point` is an ordinary expression and says what
+`instanceof` says; `p is Point` cannot mean it, a bare name in pattern position being a binding.
+
+**And it is what makes objects affordable.** Three methods written as captured closures cost three
+closures *per instance*; on a proto they cost three once. On slate's 4 MiB heap that is four thousand
+objects against eight.
+
 ### Tests
 
 `@test` marks a function of no arguments, and `slate test` is the only thing that calls one:
