@@ -306,9 +306,15 @@ Two consequences worth knowing:
 A module system, a literate `.lsl` form, files and sockets over the libuv binding, and anything
 resembling a standard library beyond a dozen builtins.
 
-`defer` is the one thing on sysl's list that applies and is not here: it needs a per-scope list run on
-every exit path — block end, `break`, `continue`, `return`, fault — which is a semantics feature
-rather than a piece of syntax.
+**`defer` is on sysl's list and is deliberately not here.** It earns its place in Go and in sysl
+because neither collects: a function that acquires something has to release it on every exit path,
+and `defer` is what stops that being a maintenance problem. slate has a tracing collector, so memory
+needs no cleanup at all — and the only external resource it has is a timer, which `clearTimeout`
+closes. There is nothing to defer.
+
+If that changes, the answer will not be `defer`. slate's object model already carries `hash` and
+`equals` as ordinary fields, so a `dispose` read the same way — scope-based, as JavaScript's `using`
+is — would be the third of a pattern rather than a new mechanism.
 
 The two examples are the current surface, and it is meant to grow in whatever direction puts the most
 pressure on sysl.
