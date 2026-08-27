@@ -20,7 +20,16 @@ val port = localPort(server)
 print("listening on a port the kernel picked:", port > 0)
 
 async main()
-    val client = await connect("127.0.0.1", port)
+    // `connect` answers a result: a refused connection is the ordinary thing a client has to handle,
+    // not a reason to stop the program.
+    val opened = await connect("127.0.0.1", port)
+
+    if !opened.ok
+        print("could not connect:", opened.error)
+        close(server)
+        return
+
+    val client = opened.value
 
     onData(client, chunk ->
         if chunk != null

@@ -290,12 +290,17 @@ async main()
     await mkdir("scratch")
     await writeFile("scratch/notes.txt", "one line")
 
-    print(await readFile("scratch/notes.txt"))
-    print(await readDir("scratch"))
+    val notes = await readFile("scratch/notes.txt")
 
-    val about = await stat("scratch/notes.txt")
+    if notes.ok
+        print(notes.value)
+    else
+        print("could not read it:", notes.error)
 
-    print(about.size, about.isFile, about.isDir)
+    // A result is an ordinary object, so a pattern takes one apart.
+    await readDir("scratch") match
+        { ok: true, value: names } -> print(names)
+        { error: e } -> print(e)
 
     await rename("scratch/notes.txt", "scratch/kept.txt")
     await remove("scratch/kept.txt")
@@ -304,12 +309,23 @@ async main()
 main()
 ```
 
+**A call that can fail answers a result — `{ ok: true, value: v }` or `{ ok: false, error: text }` —
+and the promise never rejects.** A file that is not there is not a defect in the program asking for
+it, so the caller is handed something it has to look at rather than an unwind it has to be ready for.
+That is the division `catch` exists for the other half of: results for the failures a caller was
+always going to deal with, unwinding for the ones nothing could have anticipated.
+
+It costs no new machinery. A result is an ordinary object, so `match` already destructures one and
+the collector already traces one — the same argument that made a module an object.
+
 `readFile` answers text and `readBytes` answers an array of numbers; a file that is not valid UTF-8
-has no slate string to become, so `readFile` refuses it by name and points at `readBytes`.
-`writeFile` replaces whatever was there, and renders anything that is not a string the way `print`
-would. `exists` answers `true` or `false` rather than failing, which is the whole of what it adds
-over `stat`. Everything else fails with libuv's own sentence — `cannot read x: ENOENT: no such file
-or directory` — reaching the program through the promise it was awaiting.
+has no slate string to become, so `readFile` answers an error naming `readBytes`. `writeFile`
+replaces whatever was there, and renders anything that is not a string the way `print` would.
+`exists` is the one call with no failure case, so it answers a plain `true` or `false`. Every error
+carries libuv's own sentence — `cannot read x: ENOENT: no such file or directory`.
+
+**Giving a builtin the wrong kind of argument still raises**, because that is a defect in the program
+rather than a condition it can handle: `readFile(42)` faults, `readFile("/gone")` answers.
 
 **Every one of them has a blocking twin under a `Sync` suffix** — `readFileSync`, `writeFileSync`,
 `statSync` and the rest — which is node's arrangement and node's spelling:
@@ -318,8 +334,11 @@ or directory` — reaching the program through the promise it was awaiting.
 mkdirSync("scratch")
 writeFileSync("scratch/notes.txt", "one line")
 
-print(readFileSync("scratch/notes.txt"))
+print(readFileSync("scratch/notes.txt").value)
 ```
+
+The blocking half answers the same result shape as the promise-shaped half, so the two differ in the
+waiting and in nothing else.
 
 The plain names are asynchronous because a language whose entire event story is one loop has a lot to
 lose from a call that stops it: a server that blocks on a read stops answering everybody. The `Sync`
@@ -330,8 +349,7 @@ from a promise and pays for it in an `async` function that exists only to hold a
 **The naming is what keeps that from being a trap.** The blocking call is the one with the longer
 name and the suffix, so reaching for it is a decision rather than an accident, and a reader can see
 which was written without checking anything. The two halves agree on everything but the waiting: a
-`Sync` call answers the value its promise would have settled to, and fails as an ordinary fault at
-the statement that caused it rather than by rejecting.
+`Sync` call answers the same result its promise would have settled to, error and all.
 
 ### TCP
 
@@ -346,7 +364,7 @@ val server = listen(0, conn ->
             send(conn, "echo: " + chunk)))
 
 async main()
-    val client = await connect("127.0.0.1", localPort(server))
+    val client = (await connect("127.0.0.1", localPort(server))).value
 
     onData(client, chunk ->
         if chunk != null
@@ -359,9 +377,11 @@ async main()
 main()
 ```
 
-**`connect` and `send` answer promises; `listen`, `onData` and `onBytes` take callbacks.** That split
-is not a matter of taste: a connect and a send are each one attempt with one outcome, which is what a
-promise is, and a listener does not have one connection any more than a connection has one chunk.
+**`connect` and `send` answer promises of a result; `listen`, `onData` and `onBytes` take
+callbacks.** That split is not a matter of taste: a connect and a send are each one attempt with one
+outcome, which is what a promise is, and a listener does not have one connection any more than a
+connection has one chunk. A refused connection is the ordinary thing a client handles, so it comes
+back as `{ ok: false, error: ... }` rather than stopping the program.
 `onData` hands over each chunk as it arrives and `null` once the peer has finished sending — the end
 of a stream is a value here rather than a failure, because a peer closing its half is how a request
 ordinarily ends. `onBytes` is the same reader for a socket carrying something that is not text, and
