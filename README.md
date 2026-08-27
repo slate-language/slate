@@ -183,6 +183,22 @@ multiplication rather than like C's.
 `s"a ${b} c"` interpolates, `[v; n]` is an array of copies, `base with { f: v }` is a copy with a
 field changed, and every comma list takes a trailing comma.
 
+**A lambda's body may be a block, written where the lambda is passed.** A newline inside brackets
+normally means nothing — that is what lets an argument list be split over lines — so a callback would
+otherwise have to be lifted out and named before the call that wanted it:
+
+```
+each([1, 2, 3], x ->
+    val doubled = x * 2
+    print(x, doubled))
+```
+
+`->` and `match` are the two tokens that suspend that rule, and only where they end a line: an arrow
+written mid-line would hand the block to whatever line came next. **A block lambda has to be the last
+argument**, because its block runs to the end of its last line and a `,` arriving there has nothing
+to mean. Every callback slate itself takes is last for that reason; `setTimeout(fn, ms)` keeps node's
+order and so takes a one-line function.
+
 ### async and await
 
 An `async` function answers a promise rather than a value, and `await` waits for one:
@@ -270,27 +286,22 @@ style guide written about it.
 Seven builtins over the same loop:
 
 ```
-serve(conn)
-    heard(chunk)
+val server = listen(0, conn ->
+    onData(conn, chunk ->
         if chunk == null
             close(conn)
         else
-            send(conn, "echo: " + chunk)
-
-    onData(conn, heard)
-
-val server = listen(0, serve)
+            send(conn, "echo: " + chunk)))
 
 async main()
     val client = await connect("127.0.0.1", localPort(server))
 
-    reply(chunk)
+    onData(client, chunk ->
         if chunk != null
             print(chunk)
             close(client)
-            close(server)
+            close(server))
 
-    onData(client, reply)
     await send(client, "hello")
 
 main()
