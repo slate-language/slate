@@ -1,0 +1,188 @@
+module dev.slatelang.slate
+
+import sh.sysl.gc
+import sh.sysl.libuv
+
+// `close` is a `Handle` member, and a trait has to be in scope to reach one. Every handle type in
+// the binding needs it, so it is imported here rather than at each use.
+import sh.sysl.libuv.Handle
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// The event loop, and what a slate program does with it.
+//
+// **A callback needs nothing from the machine, and that is worth knowing.** It runs *from* the loop,
+// between statements of nothing, rather than from inside a half-evaluated expression -- so a
+// tree-walker could have done all of this. `await` is the one that could not, because it suspends
+// mid-expression, and it is built on top of what is here.
+//
+// ## The one thing embedding a loop costs a collected language
+//
+// **A pending callback is a root, and nothing else knows it.** `Timer.start` takes a sysl closure and
+// the binding keeps it alive by reference counting -- but the *slate* closure that sysl closure means
+// to call is a `Value` pointing into the collected heap, and the mark phase cannot see through an ARC
+// box to find it. A timer set and then forgotten by the program is exactly the case: the only
+// reference left is the one libuv holds, the collector frees the closure, and the timer eventually
+// calls into swept memory.
+//
+// So the slate closure is held **here**, in a table this file roots, and the sysl closure captures a
+// `usize` into it rather than the value. The same table holds the `&Timer`, because a counted box may
+// not live in GC memory at all (see `obj.sysl`) and a slate program only ever sees the integer id.
+
+// One thing the loop is going to call back.
+struct Pending
+    // What to call. `Nil` once the slot is spent, which is what makes it collectable again.
+    callback: Value
+
+    // The handle, kept alive here for as long as the program may still cancel it.
+    timer: Option[&libuv.Timer]
+
+    // Whether this slot is in use. A spent slot is reused rather than grown past.
+    live: bool
+
+    // A repeating timer keeps firing; a one-shot frees its slot as it goes.
+    repeating: bool
+
+// Everything the loop may still call.
+//
+// **Module storage and a collector root.** See the header: this table is the only thing standing
+// between a pending callback and the sweep.
+var pending: Buf[Pending] = buf()
+
+// How many callbacks are still outstanding, which is what decides whether the loop has work.
+var outstanding: usize = 0
+
+// Mark what the loop can still reach.
+mark_pending(h: *gc.Heap)
+    for i in 0..<pending.len()
+        if pending.at(i).live then mark_value(h, pending.at(i).callback)
+
+// Give the table back between runs.
+reset_events()
+    // Every handle is dropped, which closes the timers with it.
+    pending.clear()
+    outstanding = 0
+
+// Take a slot, reusing a spent one where there is one.
+private claim(p: Pending) -> usize
+    for i in 0..<pending.len()
+        if !pending.at(i).live
+            pending.set(i, p)
+            outstanding += 1
+            return i
+
+    pending.push(p)
+    outstanding += 1
+    pending.len() - 1
+end claim
+
+// Give a slot back. **The callback goes to `Nil` here and not only the flag**, because the flag is
+// what the mark phase reads and a live-looking slot would keep a dead closure alive forever.
+private surrender(id: usize)
+    if id >= pending.len() then return
+
+    var slot = pending.at(id)
+
+    if !slot.live then return
+
+    slot.live = false
+    slot.callback = Nil
+
+    // **The handle is CLOSED and not merely dropped.** A handle holds a reference to itself while it
+    // is open, so letting go of the last name for it stops nothing -- deliberately, since dropping a
+    // `setInterval` in JavaScript does not cancel it either. A handle never closed is also a handle
+    // `run` will wait on forever, so this is what lets a program with a one-shot timer in it exit.
+    slot.timer match
+        Some(t) -> t.close(() -> ())
+        None -> ()
+
+    slot.timer = None
+    pending.set(id, slot)
+    outstanding -= 1
+end surrender
+
+// Run the slate callback in a slot.
+//
+// **A fault inside a callback stops the program**, as an uncaught throw does in node. There is no
+// statement to attach it to -- the loop is not running any -- so it is reported against the whole
+// run.
+private fire(id: usize)
+    if id >= pending.len() then return
+
+    val slot = pending.at(id)
+
+    if !slot.live then return
+
+    val cb = slot.callback
+    var none: Buf[Value] = buf()
+    val mark = root_mark()
+
+    hold(cb)
+
+    // A one-shot is spent before its callback runs, so that a callback which sets another timer
+    // cannot be given its own slot back underneath it.
+    if !slot.repeating then surrender(id)
+
+    apply(cb, none, point(0)) match
+        Ok(_) -> ()
+        Err(s) -> loop_fault = Some(s)
+
+    release(mark)
+end fire
+
+// The first fault a callback raised, if any. Read once the loop stops.
+var loop_fault: Option[Signal] = None
+
+// -- what a program calls --------------------------------------------------------------------------
+
+// `setTimeout(fn, ms)` and `setInterval(fn, ms)`, which differ only in the repeat.
+set_timer(cb: Value, ms: long, repeating: bool, at: Span) -> Step
+    cb match
+        Fn(_) -> ()
+        Native(_) -> ()
+        other -> return fault(at, s"a timer needs a function to call, and this is ${other.type_name()}")
+
+    val delay = if ms < 0 then 0u64 else u64(ms)
+    val every = if repeating then delay else 0u64
+
+    libuv.timer() match
+        Err(e) -> fault(at, s"this timer could not be made: ${e}")
+        Ok(t) ->
+            val id = claim(Pending(cb, Some(t), true, repeating))
+
+            // **The closure captures the id and not the value**, which is the whole arrangement: the
+            // collector cannot see through this box, so what it holds must be something the collector
+            // does not have to see.
+            t.start(delay, every, () -> fire(id)) match
+                Err(e) ->
+                    surrender(id)
+                    fault(at, s"this timer could not be started: ${e}")
+                Ok(_) -> Ok(Int(long(id)))
+end set_timer
+
+// `clearTimeout(id)` and `clearInterval(id)`.
+clear_timer(v: Value, at: Span) -> Step
+    v match
+        Int(n) ->
+            if n >= 0 then surrender(usize(n))
+
+            Ok(Nil)
+        other -> fault(at, s"a timer is cancelled by its id, and this is ${other.type_name()}")
+
+// Run the loop until nothing is outstanding.
+//
+// **This is what makes a slate program with a timer in it not exit immediately.** node does the same:
+// the process lives as long as something is scheduled.
+drain_events() -> Result[unit, Signal]
+    if outstanding == 0 then return Ok(())
+
+    val ran: Result[unit, Signal] = libuv.default_loop().run() match
+        Err(e) -> Err(Fail(point(0), s"the event loop stopped: ${e}"))
+        Ok(_) -> Ok(())
+
+    ran?
+
+    loop_fault match
+        Some(s) -> Err(s)
+        None -> Ok(())
+end drain_events
