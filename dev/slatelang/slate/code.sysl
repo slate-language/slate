@@ -1,0 +1,162 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// What the compiler emits and the machine runs.
+//
+// **The tree-walker is being replaced because of `await`, and for no other reason.** A callback runs
+// from an event loop, never from the middle of an expression, so callbacks and promises need nothing
+// new. `await` has to suspend *inside* an expression, and a tree-walker's state is the sysl call
+// stack, which cannot be captured. So the state moves onto a heap of slate's own, where a suspension
+// is nothing more grand than declining to run a frame for a while.
+//
+// **The collector gets simpler, which was not the reason but is the larger gain.** `alloc` never
+// collects, so a value held in a sysl local is invisible to the mark phase -- which is why the
+// tree-walker carries a shadow stack of `hold`/`release` pairs, and why a missed one shows up as a
+// rare crash rather than a failing test. A machine keeps its values in an operand stack that is an
+// ordinary array, so the tracer walks it and the whole class of mistake goes away.
+//
+// **What is deliberately NOT compiled is a pattern.** `match_pattern` already exists, is tested, and
+// is not on any hot path, so an arm's pattern is one instruction carrying an index into a table. The
+// same goes for arithmetic and for calling: `binary` and `apply` are called by the machine exactly as
+// the walker called them. A rewrite that reimplements settled semantics is a rewrite that changes
+// them by accident.
+
+// One instruction.
+//
+// **The operand stack is where everything happens**, so most of these say only what to do; the values
+// they do it to are already on top.
+enum Op
+    // -- constants --
+    PushNil
+    PushBool(v: bool)
+    PushInt(v: long)
+    PushReal(v: real)
+
+    // The text lives in the unit's string table, so an instruction stays a fixed-size thing with no
+    // reference-counted member in it.
+    PushStr(k: usize)
+
+    // -- names --
+    //
+    // **Names are still looked up in the scope chain rather than in numbered slots.** Slot-indexing
+    // locals is the obvious next optimisation and is deliberately not done here: this rewrite has to
+    // preserve behaviour exactly, and resolving names at compile time changes when a mistake is
+    // reported.
+    LoadName(k: usize)
+    DeclareVal(k: usize)
+    DeclareVar(k: usize)
+    StoreName(k: usize)
+
+    // -- operators, run by the same code the walker ran --
+    UnaryOp(op: Tok)
+    BinaryOp(op: Tok)
+
+    // -- containers --
+    MakeArray(n: usize)
+
+    // Takes `n` key/value pairs from the stack, keys first in each pair.
+    MakeObject(n: usize)
+
+    GetIndex
+    SetIndex
+    GetField(k: usize)
+    SetField(k: usize)
+
+    // -- control --
+    Jump(to: usize)
+    JumpIfFalse(to: usize)
+
+    // **The short-circuit pair leave the operand that decided.** `a || b` answers `a` when `a` is
+    // truthy, which is slate's rule and not sysl's -- so these jump without popping.
+    JumpIfTrueKeep(to: usize)
+    JumpIfFalseKeep(to: usize)
+
+    Pop
+    Dup
+
+    // -- scopes --
+    //
+    // A block gets one, and so does each turn of a loop: a closure made inside a loop body captures
+    // that turn's scope and not the one before it.
+    PushScope
+    PopScope
+
+    // -- functions --
+    MakeClosure(chunk: usize)
+
+    // A named function, which is a `val` holding a closure and is kept apart from one only so that
+    // the name is in scope inside the body -- which is what makes it recursive.
+    DefineFn(k: usize, chunk: usize)
+
+    CallFn(argc: usize)
+    Ret
+
+    // -- matching --
+    //
+    // Tests the pattern against the value on top, in the current scope, and pushes whether it took.
+    // The subject stays put, because a failed arm is followed by another that wants it.
+    TestPat(k: usize)
+
+    // -- iteration --
+    //
+    // `for x in e`. The subject is on the stack under a position that `IterNext` keeps.
+    IterInit
+    IterNext(to: usize)
+
+    // Stop with a fault. Used where a `match` ran out of arms.
+    FailWith(k: usize)
+end Op
+
+// An instruction and where it came from.
+//
+// **Every one carries a span**, because a machine has no tree to ask afterwards. That is the tax a
+// bytecode interpreter pays for its speed, and paying it per instruction is what keeps a runtime
+// complaint pointing at the same character the walker pointed at.
+struct Ins
+    op: Op
+    at: Span
+
+// One function's code: the top level is a chunk, and so is every lambda and every named function.
+struct Chunk
+    code: Buf[Ins]
+    params: Buf[string]
+
+    // What a fault calls it, and what a `<function>` prints as.
+    name: string
+
+// Everything a compiled program is.
+//
+// **It lives outside the collected heap and holds counted boxes freely**, which the objects in the
+// heap may not -- see `obj.sysl`. A chunk is immutable and acyclic once built, so reference counting
+// frees it correctly and nothing here needs tracing.
+struct Unit
+    chunks: Buf[Chunk]
+    strings: Buf[string]
+    patterns: Buf[Pattern]
+
+// An empty unit, with the top-level chunk already in place at index zero.
+new_unit() -> Unit
+    var u = Unit(buf(), buf(), buf())
+    var top: Buf[string] = buf()
+
+    u.chunks.push(Chunk(buf(), top, "the program"))
+    u
+end new_unit
+
+// Add a string to the table, reusing one that is already there.
+//
+// **Reuse matters more than it looks**: a field name appears once per access in the source and every
+// one of them would otherwise be a separate copy in the unit.
+intern_str(u: *Unit, s: string) -> usize
+    for i in 0..<u.strings.len()
+        if u.strings.at(i) == s then return i
+
+    u.strings.push(s)
+    u.strings.len() - 1
+end intern_str
+
+intern_pattern(u: *Unit, p: Pattern) -> usize
+    u.patterns.push(p)
+    u.patterns.len() - 1

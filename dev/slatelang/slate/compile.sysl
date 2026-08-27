@@ -1,0 +1,460 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// The tree to instructions.
+//
+// **Two counters make this whole file work, and both are compile-time.** `sp` is how many values will
+// be on the operand stack when this instruction runs, and `scopes` is how deep the scope chain will
+// be. Neither is needed at run time, and knowing both here is what lets `break` emit exactly the
+// right number of `Pop`s and `PopScope`s to leave the loop balanced -- rather than the machine
+// carrying unwind tables to work it out again.
+//
+// **Every statement leaves exactly one value on the stack**, and the statement after it begins by
+// popping that. A block's value is therefore whatever the last statement left, which is slate's rule,
+// and an empty block pushes `nil` so the rule holds with nothing in it.
+
+// What one chunk's compilation is carrying.
+struct Emit
+    code: Buf[Ins]
+
+    // How tall the operand stack will be here.
+    sp: usize
+
+    // How deep the scope chain will be here.
+    scopes: usize
+
+    // The loops enclosing this point, innermost last.
+    loops: Buf[LoopFrame]
+
+// Where `break` and `continue` have to get back to, and what they have to tidy on the way.
+struct LoopFrame
+    sp: usize
+    scopes: usize
+
+    // Instruction positions to patch once the two destinations are known.
+    breaks: Buf[usize]
+    continues: Buf[usize]
+
+private fresh_emit() -> Emit = Emit(buf(), 0, 0, buf())
+
+// Put one instruction down and answer where it went.
+private put(e: *Emit, op: Op, at: Span) -> usize
+    e.code.push(Ins(op, at))
+    e.code.len() - 1
+
+// Put an instruction down and account for what it does to the stack.
+private push_n(e: *Emit, op: Op, at: Span, takes: usize, gives: usize) -> usize
+    e.sp = e.sp - takes + gives
+    put(e, op, at)
+
+private here(e: *Emit) -> usize = e.code.len()
+
+// Aim a jump that was emitted before its destination was known.
+private patch(e: *Emit, at: usize, to: usize)
+    val old = e.code.at(at)
+
+    val aimed: Op = old.op match
+        Jump(_) -> Jump(to)
+        JumpIfFalse(_) -> JumpIfFalse(to)
+        JumpIfTrueKeep(_) -> JumpIfTrueKeep(to)
+        JumpIfFalseKeep(_) -> JumpIfFalseKeep(to)
+        IterNext(_) -> IterNext(to)
+        other -> other
+
+    e.code.set(at, Ins(aimed, old.at))
+end patch
+
+// Drop back to a stack height and a scope depth, which is what leaving a block means.
+private unwind_to(e: *Emit, sp: usize, scopes: usize, at: Span)
+    var n = e.sp
+
+    while n > sp
+        put(e, Pop, at)
+        n -= 1
+
+    var d = e.scopes
+
+    while d > scopes
+        put(e, PopScope, at)
+        d -= 1
+end unwind_to
+
+// -- entry ----------------------------------------------------------------------------------------
+
+// A parsed program to a unit the machine can run.
+compile_program(u: *Unit, prog: Program) -> unit
+    var e = fresh_emit()
+
+    compile_stmts(u, &e, prog.stmts, point(0))
+    put(&e, Ret, point(0))
+
+    var top = u.chunks.at(0)
+
+    top.code = e.code
+    u.chunks.set(0, top)
+end compile_program
+
+// A function body to a chunk of its own, answering where it landed.
+private compile_chunk(u: *Unit, params: Buf[string], body: Expr, name: string) -> usize
+    // The slot is claimed before the body is compiled, so a function that calls itself finds a chunk
+    // index that already exists.
+    val at = u.chunks.len()
+
+    u.chunks.push(Chunk(buf(), params, name))
+
+    var e = fresh_emit()
+
+    compile_expr(u, &e, body)
+    put(&e, Ret, body.span)
+
+    var c = u.chunks.at(at)
+
+    c.code = e.code
+    u.chunks.set(at, c)
+    at
+end compile_chunk
+
+// -- statements -----------------------------------------------------------------------------------
+
+// A run of statements, leaving the last one's value.
+compile_stmts(u: *Unit, e: *Emit, stmts: Buf[Stmt], at: Span)
+    push_n(e, PushNil, at, 0, 1)
+
+    for i in 0..<stmts.len()
+        push_n(e, Pop, stmts.at(i).span, 1, 0)
+        compile_stmt(u, e, stmts.at(i))
+end compile_stmts
+
+private compile_stmt(u: *Unit, e: *Emit, s: Stmt)
+    val at = s.span
+
+    *s.kind match
+        Val(name, init) ->
+            compile_expr(u, e, init)
+            push_n(e, DeclareVal(intern_str(u, name)), at, 1, 0)
+            push_n(e, PushNil, at, 0, 1)
+        Var(name, init) ->
+            compile_expr(u, e, init)
+            push_n(e, DeclareVar(intern_str(u, name)), at, 1, 0)
+            push_n(e, PushNil, at, 0, 1)
+        Def(name, params, body) ->
+            val c = compile_chunk(u, params, body_at(body), name)
+
+            push_n(e, DefineFn(intern_str(u, name), c), at, 0, 0)
+            push_n(e, PushNil, at, 0, 1)
+        Eval(x) -> compile_expr(u, e, x)
+        Assign(target, value) -> compile_assign(u, e, target, value, at)
+        Return(value) ->
+            value match
+                Some(x) -> compile_expr(u, e, x)
+                None -> push_n(e, PushNil, at, 0, 1)
+
+            put(e, Ret, at)
+
+            // Nothing after a `return` runs, but the block it sits in still has to typecheck as
+            // leaving one value, so the counter is told what the machine would have had.
+            e.sp = e.sp - 1
+            push_n(e, PushNil, at, 0, 1)
+        Break -> jump_out(e, at, true)
+        Continue -> jump_out(e, at, false)
+        While(cond, body) -> compile_while(u, e, cond, body, at)
+        For(name, iter, body) -> compile_for(u, e, name, iter, body, at)
+        Loop(body) -> compile_loop(u, e, body, at)
+end compile_stmt
+
+private compile_assign(u: *Unit, e: *Emit, target: Expr, value: Expr, at: Span)
+    *target.kind match
+        Name(n) ->
+            compile_expr(u, e, value)
+            push_n(e, StoreName(intern_str(u, n)), target.span, 1, 0)
+        Field(obj, name) ->
+            compile_expr(u, e, obj)
+            compile_expr(u, e, value)
+            push_n(e, SetField(intern_str(u, name)), target.span, 2, 0)
+        Index(t, key) ->
+            compile_expr(u, e, t)
+            compile_expr(u, e, key)
+            compile_expr(u, e, value)
+            push_n(e, SetIndex, target.span, 3, 0)
+        _ -> push_n(e, FailWith(intern_str(u, "this cannot be assigned to")), at, 0, 0)
+
+    push_n(e, PushNil, at, 0, 1)
+end compile_assign
+
+// `break` and `continue`, which have to leave the loop as they found it.
+private jump_out(e: *Emit, at: Span, breaking: bool)
+    if e.loops.len() == 0
+        val word = if breaking then "`break` outside a loop" else "`continue` outside a loop"
+
+        push_n(e, FailWith(0), at, 0, 0)
+        push_n(e, PushNil, at, 0, 1)
+        return
+
+    var frame = e.loops.at(e.loops.len() - 1)
+    val sp = e.sp
+    val scopes = e.scopes
+
+    unwind_to(e, frame.sp, frame.scopes, at)
+
+    val j = put(e, Jump(0), at)
+
+    if breaking then frame.breaks.push(j) else frame.continues.push(j)
+    e.loops.set(e.loops.len() - 1, frame)
+
+    // Control never falls through, so the counters go back to what the following code expects.
+    e.sp = sp
+    e.scopes = scopes
+    push_n(e, PushNil, at, 0, 1)
+end jump_out
+
+private open_loop(e: *Emit)
+    e.loops.push(LoopFrame(e.sp, e.scopes, buf(), buf()))
+
+private close_loop(e: *Emit, continue_to: usize, break_to: usize)
+    val frame = e.loops.at(e.loops.len() - 1)
+
+    for i in 0..<frame.breaks.len()
+        patch(e, frame.breaks.at(i), break_to)
+
+    for i in 0..<frame.continues.len()
+        patch(e, frame.continues.at(i), continue_to)
+
+    e.loops.truncate(e.loops.len() - 1)
+end close_loop
+
+private compile_while(u: *Unit, e: *Emit, cond: Expr, body: Expr, at: Span)
+    val top = here(e)
+
+    open_loop(e)
+    compile_expr(u, e, cond)
+
+    val out = push_n(e, JumpIfFalse(0), at, 1, 0)
+
+    compile_body(u, e, body)
+    put(e, Jump(top), at)
+    patch(e, out, here(e))
+    close_loop(e, top, here(e))
+    push_n(e, PushNil, at, 0, 1)
+end compile_while
+
+private compile_loop(u: *Unit, e: *Emit, body: Expr, at: Span)
+    val top = here(e)
+
+    open_loop(e)
+    compile_body(u, e, body)
+    put(e, Jump(top), at)
+    close_loop(e, top, here(e))
+    push_n(e, PushNil, at, 0, 1)
+end compile_loop
+
+private compile_for(u: *Unit, e: *Emit, name: string, iter: Expr, body: Expr, at: Span)
+    compile_expr(u, e, iter)
+    push_n(e, IterInit, at, 1, 1)
+
+    val top = here(e)
+
+    open_loop(e)
+
+    // Answers the next element, or jumps out when there is none.
+    val out = push_n(e, IterNext(0), at, 0, 1)
+
+    push_n(e, PushScope, at, 0, 0)
+    e.scopes += 1
+    push_n(e, DeclareVal(intern_str(u, name)), at, 1, 0)
+
+    compile_stmt_body(u, e, body)
+
+    push_n(e, PopScope, at, 0, 0)
+    e.scopes -= 1
+    put(e, Jump(top), at)
+    patch(e, out, here(e))
+    close_loop(e, top, here(e))
+
+    // The iterator itself goes.
+    push_n(e, Pop, at, 1, 0)
+    push_n(e, PushNil, at, 0, 1)
+end compile_for
+
+// A loop body, run for effect: its value is discarded each turn.
+private compile_body(u: *Unit, e: *Emit, body: Expr)
+    push_n(e, PushScope, body.span, 0, 0)
+    e.scopes += 1
+    compile_stmt_body(u, e, body)
+    push_n(e, PopScope, body.span, 0, 0)
+    e.scopes -= 1
+end compile_body
+
+// The inside of a loop body, with its own scope already open.
+private compile_stmt_body(u: *Unit, e: *Emit, body: Expr)
+    *body.kind match
+        Block(stmts) ->
+            compile_stmts(u, e, stmts, body.span)
+            push_n(e, Pop, body.span, 1, 0)
+        _ ->
+            compile_expr(u, e, body)
+            push_n(e, Pop, body.span, 1, 0)
+end compile_stmt_body
+
+// -- expressions ----------------------------------------------------------------------------------
+
+compile_expr(u: *Unit, e: *Emit, x: Expr)
+    val at = x.span
+
+    *x.kind match
+        IntLit(v) -> push_n(e, PushInt(v), at, 0, 1)
+        RealLit(v) -> push_n(e, PushReal(v), at, 0, 1)
+        BoolLit(v) -> push_n(e, PushBool(v), at, 0, 1)
+        StrLit(v) -> push_n(e, PushStr(intern_str(u, v)), at, 0, 1)
+        NilLit -> push_n(e, PushNil, at, 0, 1)
+        Name(n) -> push_n(e, LoadName(intern_str(u, n)), at, 0, 1)
+        Unary(op, rhs) ->
+            compile_expr(u, e, rhs)
+            push_n(e, UnaryOp(op), at, 1, 1)
+        Binary(op, lhs, rhs) -> compile_binary(u, e, op, lhs, rhs, at)
+        Call(callee, args) ->
+            compile_expr(u, e, callee)
+
+            for i in 0..<args.len()
+                compile_expr(u, e, args.at(i))
+
+            push_n(e, CallFn(args.len()), at, args.len() + 1, 1)
+        Index(t, key) ->
+            compile_expr(u, e, t)
+            compile_expr(u, e, key)
+            push_n(e, GetIndex, at, 2, 1)
+        Field(t, name) ->
+            compile_expr(u, e, t)
+            push_n(e, GetField(intern_str(u, name)), at, 1, 1)
+        ArrayLit(items) ->
+            for i in 0..<items.len()
+                compile_expr(u, e, items.at(i))
+
+            push_n(e, MakeArray(items.len()), at, items.len(), 1)
+        ObjectLit(keys, values) ->
+            for i in 0..<keys.len()
+                push_n(e, PushStr(intern_str(u, keys.at(i))), at, 0, 1)
+                compile_expr(u, e, values.at(i))
+
+            push_n(e, MakeObject(keys.len()), at, keys.len() * 2, 1)
+        Lambda(params, body) ->
+            val c = compile_chunk(u, params, body_at(body), "a function")
+
+            push_n(e, MakeClosure(c), at, 0, 1)
+        Block(stmts) ->
+            push_n(e, PushScope, at, 0, 0)
+            e.scopes += 1
+            compile_stmts(u, e, stmts, at)
+            push_n(e, PopScope, at, 0, 0)
+            e.scopes -= 1
+        IfExpr(cond, then_branch, else_branch) -> compile_if(u, e, cond, then_branch, else_branch, at)
+        MatchExpr(subject, arms) -> compile_match(u, e, subject, arms, at)
+
+        // A program with one of these in it is never run: `parse` reports first.
+        Bad -> push_n(e, FailWith(intern_str(u, "this expression did not parse")), at, 0, 1)
+end compile_expr
+
+// **`&&` and `||` answer the operand that decided**, which is slate's rule and not sysl's -- so the
+// jump keeps what it tested rather than popping it.
+private compile_binary(u: *Unit, e: *Emit, op: Tok, lhs: Expr, rhs: Expr, at: Span)
+    if op == AndAnd || op == OrOr
+        compile_expr(u, e, lhs)
+
+        val skip = if op == AndAnd
+            push_n(e, JumpIfFalseKeep(0), at, 0, 0)
+        else
+            push_n(e, JumpIfTrueKeep(0), at, 0, 0)
+
+        push_n(e, Pop, at, 1, 0)
+        compile_expr(u, e, rhs)
+        patch(e, skip, here(e))
+        return
+
+    compile_expr(u, e, lhs)
+    compile_expr(u, e, rhs)
+    push_n(e, BinaryOp(op), at, 2, 1)
+end compile_binary
+
+private compile_if(u: *Unit, e: *Emit, cond: Expr, then_branch: Expr, else_branch: Option[Expr], at: Span)
+    compile_expr(u, e, cond)
+
+    val otherwise = push_n(e, JumpIfFalse(0), at, 1, 0)
+    val before = e.sp
+
+    push_n(e, PushScope, at, 0, 0)
+    e.scopes += 1
+    compile_expr(u, e, then_branch)
+    push_n(e, PopScope, at, 0, 0)
+    e.scopes -= 1
+
+    val done = put(e, Jump(0), at)
+
+    patch(e, otherwise, here(e))
+    e.sp = before
+
+    push_n(e, PushScope, at, 0, 0)
+    e.scopes += 1
+
+    else_branch match
+        Some(x) -> compile_expr(u, e, x)
+        None -> push_n(e, PushNil, at, 0, 1)
+
+    push_n(e, PopScope, at, 0, 0)
+    e.scopes -= 1
+    patch(e, done, here(e))
+end compile_if
+
+// **An arm gets a scope of its own, thrown away when it does not take.** A pattern binds as it goes,
+// so a failed arm has already written names, and the only thing keeping them out of the next arm is
+// somewhere separate to write them.
+private compile_match(u: *Unit, e: *Emit, subject: Expr, arms: Buf[Arm], at: Span)
+    compile_expr(u, e, subject)
+
+    val subject_sp = e.sp
+    var leaves: Buf[usize] = buf()
+
+    for i in 0..<arms.len()
+        val arm = arms.at(i)
+
+        push_n(e, PushScope, at, 0, 0)
+        e.scopes += 1
+
+        // Reads the subject where it lies and answers whether it took; the subject stays, because the
+        // arm after this one wants it.
+        push_n(e, TestPat(intern_pattern(u, arm.pattern)), at, 0, 1)
+
+        val missed = push_n(e, JumpIfFalse(0), at, 1, 0)
+        var guard_missed: usize = 0
+        var guarded = false
+
+        arm.guard match
+            Some(g) ->
+                compile_expr(u, e, g)
+                guard_missed = push_n(e, JumpIfFalse(0), at, 1, 0)
+                guarded = true
+            None -> ()
+
+        // It took: the subject is finished with, and the body's value takes its place.
+        push_n(e, Pop, at, 1, 0)
+        compile_expr(u, e, arm.body)
+        push_n(e, PopScope, at, 0, 0)
+        e.scopes -= 1
+        leaves.push(put(e, Jump(0), at))
+
+        // It did not: give the scope back and try the next one, with the subject still in place.
+        patch(e, missed, here(e))
+
+        if guarded then patch(e, guard_missed, here(e))
+
+        push_n(e, PopScope, at, 0, 0)
+        e.scopes += 1
+        e.scopes -= 1
+        e.sp = subject_sp
+
+    push_n(e, FailWith(intern_str(u, "no arm of this match applies")), at, 0, 0)
+    e.sp = subject_sp
+
+    for i in 0..<leaves.len()
+        patch(e, leaves.at(i), here(e))
+end compile_match

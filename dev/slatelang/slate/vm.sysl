@@ -1,0 +1,292 @@
+module dev.slatelang.slate
+
+import sh.sysl.gc
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// The machine.
+//
+// **The operand stack and the frame stack are ordinary arrays, and that is the point.** The walker
+// kept its working values in sysl locals, which the mark phase cannot see -- so every one of them had
+// to be pushed onto a shadow stack by hand, and a forgotten `hold` was a crash that only appeared
+// under memory pressure. Here the tracer walks two arrays and is finished.
+//
+// **A frame is data, which is what `await` will need.** Suspending a call means leaving its frame
+// where it is and running something else; resuming means putting it back. Neither is possible while
+// the state of a call is sysl's own call stack, and that -- not speed -- is why this exists.
+
+// One call in progress.
+struct Frame
+    chunk: usize
+    pc: usize
+
+    // The scope names are looked up in. A block moves this to a child and back.
+    scope: *EnvObj
+
+    // How tall the operand stack was when this call started. `Ret` cuts back to it.
+    base: usize
+
+// The operand stack. **Module storage, because the collector's root function must be top-level and
+// must reach it** -- the same constraint that put the interpreter's other state there.
+var vm_stack: Buf[Value] = buf()
+
+// The calls in progress, innermost last.
+var vm_frames: Buf[Frame] = buf()
+
+// Empty the machine between runs.
+reset_vm()
+    vm_stack.clear()
+    vm_frames.clear()
+
+// Everything the machine can still reach, for the collector.
+//
+// **This replaces most of the shadow stack.** What is left of `hold`/`release` is only what code
+// outside the machine holds -- a native builtin building an array, say.
+mark_vm(h: *gc.Heap)
+    for i in 0..<vm_stack.len()
+        mark_value(h, vm_stack.at(i))
+
+    for i in 0..<vm_frames.len()
+        gc.mark(h, ptr_cast(vm_frames.at(i).scope))
+
+// -- running ---------------------------------------------------------------------------------------
+
+private pop() -> Value
+    val v = vm_stack.at(vm_stack.len() - 1)
+
+    vm_stack.truncate(vm_stack.len() - 1)
+    v
+
+private peek(back: usize) -> Value = vm_stack.at(vm_stack.len() - 1 - back)
+
+// Run a chunk to completion and answer what it left.
+//
+// **The instruction pointer and the scope are sysl locals rather than fields of the top frame**, and
+// written back only when a call pushes or pops one. Reading them out of a `Buf` on every instruction
+// would copy a whole frame per step.
+run_chunk(u: *Unit, start: usize, scope0: *EnvObj) -> Step
+    var chunk_ix = start
+    var pc: usize = 0
+    var scope = scope0
+    var base = vm_stack.len()
+    var code = u.chunks.at(chunk_ix).code
+
+    loop
+        if pc >= code.len()
+            // A chunk that ran off its end answers nil, which only happens for an empty body.
+            vm_stack.push(Nil)
+            pc = code.len()
+
+        val ins = code.at(pc)
+        val at = ins.at
+
+        pc += 1
+
+        ins.op match
+            PushNil -> vm_stack.push(Nil)
+            PushBool(v) -> vm_stack.push(Bool(v))
+            PushInt(v) -> vm_stack.push(Int(v))
+            PushReal(v) -> vm_stack.push(Real(v))
+            PushStr(k) -> vm_stack.push(str_value(u.strings.at(k)))
+
+            LoadName(k) ->
+                val name = u.strings.at(k)
+
+                lookup(scope, name) match
+                    Some(v) -> vm_stack.push(v)
+                    None -> return fault(at, s"`${name}` is not defined")
+            DeclareVal(k) -> declare(scope, u.strings.at(k), pop(), false)
+            DeclareVar(k) -> declare(scope, u.strings.at(k), pop(), true)
+            StoreName(k) ->
+                val name = u.strings.at(k)
+
+                assign_name(scope, name, pop()) match
+                    Written -> ()
+                    Immutable -> return fault(at, s"`${name}` is a `val`, so it is written once")
+                    Unknown -> return fault(at, s"`${name}` is not defined")
+
+            UnaryOp(op) ->
+                val v = pop()
+
+                vm_stack.push(unary(op, v, at)?)
+            BinaryOp(op) ->
+                val b = pop()
+                val a = pop()
+
+                vm_stack.push(on_values(op, a, b, at)?)
+
+            MakeArray(n) ->
+                var items: Buf[Value] = buf()
+
+                for i in 0..<n
+                    items.push(peek(n - 1 - i))
+
+                vm_stack.truncate(vm_stack.len() - n)
+                vm_stack.push(Array(new_array(items)))
+            MakeObject(n) ->
+                val o = new_object()
+                val mark = root_mark()
+
+                hold(Object(o))
+
+                for i in 0..<n
+                    val key = peek((n - 1 - i) * 2 + 1)
+                    val value = peek((n - 1 - i) * 2)
+
+                    obj_put(o, key, value, at)?
+
+                release(mark)
+                vm_stack.truncate(vm_stack.len() - n * 2)
+                vm_stack.push(Object(o))
+
+            GetIndex ->
+                val k = pop()
+                val target = pop()
+
+                vm_stack.push(read_at(target, k, at)?)
+            SetIndex ->
+                val v = pop()
+                val k = pop()
+                val target = pop()
+
+                store_at(target, k, v, at)?
+            GetField(k) ->
+                val target = pop()
+
+                vm_stack.push(read_field(target, u.strings.at(k), at)?)
+            SetField(k) ->
+                val v = pop()
+
+                pop() match
+                    Object(o) -> obj_put_name(o, u.strings.at(k), v)
+                    other -> return fault(at, s"a field belongs to an object, and this is ${other.type_name()}")
+
+            Jump(to) -> pc = to
+            JumpIfFalse(to) -> if !pop().truthy() then pc = to
+            JumpIfTrueKeep(to) -> if peek(0).truthy() then pc = to
+            JumpIfFalseKeep(to) -> if !peek(0).truthy() then pc = to
+
+            Pop -> vm_stack.truncate(vm_stack.len() - 1)
+            Dup -> vm_stack.push(peek(0))
+
+            PushScope -> scope = new_env(scope)
+            PopScope -> scope = scope.parent
+
+            MakeClosure(c) -> vm_stack.push(Fn(new_closure(u.chunks.at(c).params, c, scope)))
+            DefineFn(k, c) ->
+                val name = u.strings.at(k)
+
+                // Bound before the closure is built, so the body can see its own name -- which is the
+                // whole of what makes a named function recursive.
+                declare(scope, name, Nil, false)
+                declare(scope, name, Fn(new_closure(u.chunks.at(c).params, c, scope)), false)
+
+            TestPat(k) ->
+                val took = match_pattern(u.patterns.at(k), peek(0), scope)
+
+                vm_stack.push(Bool(took))
+
+            IterInit ->
+                peek(0) match
+                    Array(_) -> vm_stack.push(Int(0))
+                    other -> return fault(at, s"`for` walks an array, and this is ${other.type_name()}")
+            IterNext(to) ->
+                val i = peek(0) match
+                    Int(n) -> usize(n)
+                    _ -> 0
+
+                val items = peek(1) match
+                    Array(p) -> p
+                    _ -> return fault(at, "`for` walks an array")
+
+                if i >= items.items.len()
+                    pc = to
+                else
+                    vm_stack.set(vm_stack.len() - 1, Int(long(i + 1)))
+                    vm_stack.push(items.items.at(i))
+
+            FailWith(k) -> return fault(at, u.strings.at(k))
+
+            CallFn(argc) ->
+                var args: Buf[Value] = buf()
+
+                for i in 0..<argc
+                    args.push(peek(argc - 1 - i))
+
+                val callee = peek(argc)
+
+                vm_stack.truncate(vm_stack.len() - argc - 1)
+
+                callee match
+                    Native(f) -> vm_stack.push(call_native(f, args, at)?)
+                    Fn(c) ->
+                        if args.len() != c.params.len()
+                            return fault(at, s"this function takes ${c.params.len()} arguments and was given ${args.len()}")
+
+                        // The frame this call is leaving is written back only here, which is what
+                        // makes the ordinary instruction cheap.
+                        vm_frames.push(Frame(chunk_ix, pc, scope, base))
+
+                        val called = new_env(c.scope)
+
+                        for i in 0..<c.params.len()
+                            declare(called, c.params.at(i), args.at(i), true)
+
+                        chunk_ix = c.body
+                        code = u.chunks.at(chunk_ix).code
+                        pc = 0
+                        scope = called
+                        base = vm_stack.len()
+                    other -> return fault(at, s"${other.type_name()} is not something that can be called")
+
+            Ret ->
+                val v = pop()
+
+                vm_stack.truncate(base)
+
+                if vm_frames.len() == 0 then return Ok(v)
+
+                val back = vm_frames.at(vm_frames.len() - 1)
+
+                vm_frames.truncate(vm_frames.len() - 1)
+                chunk_ix = back.chunk
+                code = u.chunks.at(chunk_ix).code
+                pc = back.pc
+                scope = back.scope
+                base = back.base
+                vm_stack.push(v)
+end run_chunk
+
+// -- the entry point --------------------------------------------------------------------------------
+
+// Compile a source and run it on the machine.
+//
+// **The same shape as `run`, deliberately**, so the test suite can put a program through both and
+// compare. That is the whole migration plan: the walker is the oracle, and the machine is finished
+// when every one of slate's tests answers the same on both.
+run_vm(src: Source) -> Ran
+    reset_heap()
+    reset_vm()
+    output.clear()
+
+    val parsed = parse(src)
+
+    if !parsed.ok() then return Ran(Nil, parsed.report, output)
+
+    var u = new_unit()
+
+    compile_program(&u, parsed.program)
+
+    var env = new_env(null)
+
+    hold_env(env)
+    install_builtins(env)
+
+    var rep = parsed.report
+
+    run_chunk(&u, 0, env) match
+        Ok(v) -> Ran(v, rep, output)
+        Err(s) ->
+            rep.add(error(signal_span(s), signal_message(s)))
+            Ran(Nil, rep, output)
+end run_vm
