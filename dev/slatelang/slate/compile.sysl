@@ -39,6 +39,10 @@ struct LoopFrame
     sp: usize
     scopes: usize
 
+    // The name this loop was given, or the empty string. A `break` with no label takes the innermost
+    // frame whatever its name; one with a label walks outward until the names agree.
+    label: string
+
     // Instruction positions to patch once the two destinations are known.
     breaks: Buf[usize]
     continues: Buf[usize]
@@ -169,12 +173,8 @@ private compile_stmt(u: *Unit, e: *Emit, s: Stmt)
             // leaving one value, so the counter is told what the machine would have had.
             e.sp = e.sp - 1
             push_n(e, PushNil, at, 0, 1)
-        Break -> jump_out(u, e, at, true)
-        Continue -> jump_out(u, e, at, false)
-        While(cond, body) -> compile_while(u, e, cond, body, at)
-        For(name, iter, body) -> compile_for(u, e, name, iter, body, at)
-        Loop(body) -> compile_loop(u, e, body, at)
-        DoWhile(body, cond) -> compile_do_while(u, e, body, cond, at)
+        Break(label, value) -> jump_out(u, e, at, true, label, value)
+        Continue(label) -> jump_out(u, e, at, false, label, None)
 end compile_stmt
 
 // `x = e`, and `x += e` and the rest.
@@ -296,24 +296,62 @@ private compile_multi_assign(u: *Unit, e: *Emit, op: Tok, targets: Buf[Expr], va
 end compile_multi_assign
 
 // `break` and `continue`, which have to leave the loop as they found it.
-private jump_out(u: *Unit, e: *Emit, at: Span, breaking: bool)
-    if e.loops.len() == 0
-        val word = if breaking then "`break` outside a loop" else "`continue` outside a loop"
+//
+// **A `break` leaves its value where the loop's own would have gone**, which is why the value is
+// compiled AFTER the unwind: everything the loop had is dropped first, and what is pushed onto the
+// bare stack is what the loop answers.
+private jump_out(u: *Unit, e: *Emit, at: Span, breaking: bool, label: string, value: Option[Expr])
+    val which = loop_named(e, label)
+
+    if which == 0
+        val word = if label != ""
+            s"no enclosing loop is called `'${label}`"
+        elif breaking then
+            "`break` outside a loop"
+        else
+            "`continue` outside a loop"
 
         push_n(e, FailWith(intern_str(u, word)), at, 0, 0)
         push_n(e, PushNil, at, 0, 1)
         return
+    end if
 
-    var frame = e.loops.at(e.loops.len() - 1)
+    val slot = which - 1
+    var frame = e.loops.at(slot)
     val sp = e.sp
     val scopes = e.scopes
 
-    unwind_to(e, frame.sp, frame.scopes, at)
+    if breaking
+        // **The value is compiled BEFORE anything is unwound**, and that is not an optimisation: the
+        // scopes the unwind is about to close are the ones holding the names it may use, so
+        // `for x in xs do if p(x) then break x` would find `x` already gone. It is then slid beneath
+        // the values the loop had and they are dropped from above it.
+        value match
+            Some(x) -> compile_expr(u, e, x)
+            None -> push_n(e, PushNil, at, 0, 1)
+
+        val extra = sp - frame.sp
+
+        if extra > 0
+            push_n(e, RotUp(extra), at, 0, 0)
+
+            for i in 0..<extra
+                push_n(e, Pop, at, 1, 0)
+
+        var d = e.scopes
+
+        while d > frame.scopes
+            put(e, PopScope, at)
+            d -= 1
+
+        e.scopes = frame.scopes
+    else
+        unwind_to(e, frame.sp, frame.scopes, at)
 
     val j = put(e, Jump(0), at)
 
     if breaking then frame.breaks.push(j) else frame.continues.push(j)
-    e.loops.set(e.loops.len() - 1, frame)
+    e.loops.set(slot, frame)
 
     // Control never falls through, so the counters go back to what the following code expects.
     e.sp = sp
@@ -321,8 +359,25 @@ private jump_out(u: *Unit, e: *Emit, at: Span, breaking: bool)
     push_n(e, PushNil, at, 0, 1)
 end jump_out
 
-private open_loop(e: *Emit)
-    e.loops.push(LoopFrame(e.sp, e.scopes, buf(), buf()))
+private open_loop(e: *Emit, label: string)
+    e.loops.push(LoopFrame(e.sp, e.scopes, label, buf(), buf()))
+
+// Which enclosing loop a `break` or a `continue` means, counted from the innermost.
+//
+// **The empty string means "the nearest one", not "the one with no name"**, so a labelled loop is
+// still what an unlabelled `break` inside it leaves.
+private loop_named(e: *Emit, label: string) -> usize
+    if e.loops.len() == 0 then return 0
+
+    var i = e.loops.len()
+
+    while i > 0
+        i -= 1
+
+        if label == "" || e.loops.at(i).label == label then return i + 1
+
+    0
+end loop_named
 
 private close_loop(e: *Emit, continue_to: usize, break_to: usize)
     val frame = e.loops.at(e.loops.len() - 1)
@@ -336,10 +391,13 @@ private close_loop(e: *Emit, continue_to: usize, break_to: usize)
     e.loops.truncate(e.loops.len() - 1)
 end close_loop
 
-private compile_while(u: *Unit, e: *Emit, cond: Expr, body: Expr, at: Span)
+// **A loop is an expression, and a `break` is what gives it a value other than null.** The two exits
+// therefore meet at one place with one value already on the stack: the normal one runs any `else` and
+// pushes null, and a `break` arrives with its own value already pushed.
+private compile_while(u: *Unit, e: *Emit, label: string, cond: Expr, body: Expr, otherwise: Option[Expr], at: Span)
     val top = here(e)
 
-    open_loop(e)
+    open_loop(e, label)
     compile_expr(u, e, cond)
 
     val out = push_n(e, JumpIfFalse(0), at, 1, 0)
@@ -347,26 +405,43 @@ private compile_while(u: *Unit, e: *Emit, cond: Expr, body: Expr, at: Span)
     compile_body(u, e, body)
     put(e, Jump(top), at)
     patch(e, out, here(e))
+    compile_else(u, e, otherwise, at)
+
+    // **A `break` lands just past what the normal exit pushed, having pushed its own value instead.**
+    // Both exits therefore leave exactly one value and no jump is needed to join them.
     close_loop(e, top, here(e))
-    push_n(e, PushNil, at, 0, 1)
 end compile_while
 
-private compile_loop(u: *Unit, e: *Emit, body: Expr, at: Span)
+// What a loop answers when it finished on its own.
+//
+// **The `else`'s value IS the loop's**, which was checked against sysl rather than assumed: a `for`
+// over nothing with an `else -1` answers `-1` there. That is what makes the search idiom read --
+// `break` gives the answer that was found and `else` gives the one for having found none -- and it
+// is why this leaves a value where a Python-style clause run for effect would not.
+private compile_else(u: *Unit, e: *Emit, otherwise: Option[Expr], at: Span)
+    otherwise match
+        Some(x) -> compile_expr(u, e, x)
+        None -> push_n(e, PushNil, at, 0, 1)
+
+private compile_loop(u: *Unit, e: *Emit, label: string, body: Expr, at: Span)
     val top = here(e)
 
-    open_loop(e)
+    open_loop(e, label)
     compile_body(u, e, body)
     put(e, Jump(top), at)
+
+    // There is no normal exit from a `loop`, so the only way out already carries a value -- and the
+    // counter is told about it here, there being no instruction that pushed one.
     close_loop(e, top, here(e))
-    push_n(e, PushNil, at, 0, 1)
+    e.sp += 1
 end compile_loop
 
 // **`continue` goes to the TEST, not to the top**, which is the whole reason this is not desugared
 // into a `while`: the body has already run once by the time the condition is first asked.
-private compile_do_while(u: *Unit, e: *Emit, body: Expr, cond: Expr, at: Span)
+private compile_do_while(u: *Unit, e: *Emit, label: string, body: Expr, cond: Expr, otherwise: Option[Expr], at: Span)
     val top = here(e)
 
-    open_loop(e)
+    open_loop(e, label)
     compile_body(u, e, body)
 
     val test = here(e)
@@ -377,11 +452,11 @@ private compile_do_while(u: *Unit, e: *Emit, body: Expr, cond: Expr, at: Span)
 
     put(e, Jump(top), at)
     patch(e, out, here(e))
+    compile_else(u, e, otherwise, at)
     close_loop(e, test, here(e))
-    push_n(e, PushNil, at, 0, 1)
 end compile_do_while
 
-private compile_for(u: *Unit, e: *Emit, name: string, iter: Expr, body: Expr, at: Span)
+private compile_for(u: *Unit, e: *Emit, label: string, name: string, iter: Expr, body: Expr, otherwise: Option[Expr], at: Span)
     compile_expr(u, e, iter)
 
     // **`IterInit` KEEPS the subject and pushes a counter beside it**, so it gives one and takes
@@ -393,7 +468,7 @@ private compile_for(u: *Unit, e: *Emit, name: string, iter: Expr, body: Expr, at
 
     val top = here(e)
 
-    open_loop(e)
+    open_loop(e, label)
 
     // Answers the next element, or jumps out when there is none.
     val out = push_n(e, IterNext(0), at, 0, 1)
@@ -408,12 +483,28 @@ private compile_for(u: *Unit, e: *Emit, name: string, iter: Expr, body: Expr, at
     e.scopes -= 1
     put(e, Jump(top), at)
     patch(e, out, here(e))
-    close_loop(e, top, here(e))
 
-    // The counter and the subject both go -- two values, which is what `IterInit` left.
+    // The counter and the subject both go -- two values, which is what `IterInit` left -- and they go
+    // *before* the answer is built, so that the two Pops cannot take it.
     push_n(e, Pop, at, 1, 0)
     push_n(e, Pop, at, 1, 0)
-    push_n(e, PushNil, at, 0, 1)
+    compile_else(u, e, otherwise, at)
+
+    val done = put(e, Jump(0), at)
+
+    // **A `break` arrives with the walk still on the stack under its value**, having unwound only to
+    // the frame's own height -- so the value is slid beneath them and they are dropped from above it.
+    val brk = here(e)
+    val after = e.sp
+
+    push_n(e, RotUp(2), at, 0, 0)
+    push_n(e, Pop, at, 1, 0)
+    push_n(e, Pop, at, 1, 0)
+
+    // The two paths meet, so the counter follows the one that fell through rather than this one.
+    e.sp = after
+    close_loop(e, top, brk)
+    patch(e, done, here(e))
 end compile_for
 
 // A loop body, run for effect: its value is discarded each turn.
@@ -484,6 +575,23 @@ compile_expr(u: *Unit, e: *Emit, x: Expr)
         Field(t, name) ->
             compile_expr(u, e, t)
             push_n(e, GetField(intern_str(u, name)), at, 1, 1)
+        Interp(pieces) ->
+            for i in 0..<pieces.len()
+                compile_expr(u, e, pieces.at(i))
+
+            push_n(e, Join(pieces.len()), at, pieces.len(), 1)
+        ArrayRepeat(value, count) ->
+            compile_expr(u, e, value)
+            compile_expr(u, e, count)
+            push_n(e, Repeat, at, 2, 1)
+        WithFields(base, keys, values) ->
+            compile_expr(u, e, base)
+
+            for i in 0..<keys.len()
+                push_n(e, PushStr(intern_str(u, keys.at(i))), at, 0, 1)
+                compile_expr(u, e, values.at(i))
+
+            push_n(e, WithObject(keys.len()), at, keys.len() * 2 + 1, 1)
         ArrayLit(items) ->
             for i in 0..<items.len()
                 compile_expr(u, e, items.at(i))
@@ -517,6 +625,10 @@ compile_expr(u: *Unit, e: *Emit, x: Expr)
             e.scopes -= 1
         IfExpr(cond, then_branch, else_branch) -> compile_if(u, e, cond, then_branch, else_branch, at)
         MatchExpr(subject, arms) -> compile_match(u, e, subject, arms, at)
+        While(label, cond, body, otherwise) -> compile_while(u, e, label, cond, body, otherwise, at)
+        For(label, name, iter, body, otherwise) -> compile_for(u, e, label, name, iter, body, otherwise, at)
+        Loop(label, body) -> compile_loop(u, e, label, body, at)
+        DoWhile(label, body, cond, otherwise) -> compile_do_while(u, e, label, body, cond, otherwise, at)
 
         // A program with one of these in it is never run: `parse` reports first.
         Bad -> push_n(e, FailWith(intern_str(u, "this expression did not parse")), at, 0, 1)

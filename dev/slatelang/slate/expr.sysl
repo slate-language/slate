@@ -2,6 +2,7 @@ module dev.slatelang.slate
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
+import sysl.text.{str_builder, from_utf8_unchecked}
 
 // Expressions, by binding power.
 //
@@ -80,6 +81,10 @@ private power_of(k: Tok) -> Power
         LBracket -> left_assoc(80)
         Dot -> left_assoc(80)
 
+        // **A tail rather than a binary operator**, so it binds as tightly as a field selection and
+        // `a + b with { ... }` changes `b` rather than the sum. sysl says the same.
+        With -> left_assoc(80)
+
         // Anything else is not an infix operator, and answering zero is how the loop knows to stop.
         _ -> left_assoc(0)
 end power_of
@@ -124,6 +129,7 @@ private nud(t: Spanned[Tok], p: *Parser) -> Expr
         IntLit -> expr(t.span, ExprKind.IntLit(read_int_at(p, t.span)))
         RealLit -> expr(t.span, ExprKind.RealLit(read_real_at(p, t.span)))
         StrLit -> expr(t.span, ExprKind.StrLit(read_str_at(p, t.span)))
+        StrInterp -> interpolated(p, t)
         True -> expr(t.span, BoolLit(true))
         False -> expr(t.span, BoolLit(false))
         Null -> expr(t.span, NullLit)
@@ -148,6 +154,13 @@ private nud(t: Spanned[Tok], p: *Parser) -> Expr
         LBracket -> array_literal(p, t)
         LBrace -> object_literal(p, t)
         If -> if_expression(p, t)
+
+        // The loops, which are expressions here as they are in sysl.
+        While -> parse_while(p, "", t.span)
+        For -> parse_for(p, "", t.span)
+        Loop -> parse_loop(p, "", t.span)
+        Do -> parse_do_while(p, "", t.span)
+        Label -> parse_labelled(p, t.span)
         _ ->
             p.report.add(expected(t.span, "an expression", p.found(t.span)))
             expr(t.span, Bad)
@@ -193,6 +206,7 @@ private lambda_params(p: *Parser) -> Option[Buf[string]]
             p.bump()
 
             if !p.accept(Comma) then break
+            if p.at(RParen) then break
     end if
 
     if !p.accept(RParen) || !p.accept(Arrow)
@@ -232,12 +246,47 @@ private array_literal(p: *Parser, t: Spanned[Tok]) -> Expr
         loop
             items.push(parse_expr(p))
 
+            // `[v; n]` -- one value and a count, which is a different form from a list and is told
+            // apart by the `;` after the first element.
+            if items.len() == 1 && p.accept(Semi)
+                val count = parse_expr(p)
+
+                p.expect(RBracket, "`]`")
+
+                return expr(t.span.to(p.just_taken()), ArrayRepeat(items.at(0), count))
+
             if !p.accept(Comma) then break
+            if p.at(RBracket) then break
 
     p.expect(RBracket, "`]`")
 
     expr(t.span.to(p.just_taken()), ArrayLit(items))
 end array_literal
+
+// `base with { f: v, ... }` -- a copy with fields changed.
+//
+// **A copy is the point.** An object is a reference type here, so a program that wants to change one
+// in place just writes to it; what it has no other way to say is "the same but for this", which is
+// what an immutable-minded reader reaches for and what a shared object makes dangerous to fake.
+private with_fields(p: *Parser, base: Expr) -> Expr
+    var keys: Buf[string] = buf()
+    var values: Buf[Expr] = buf()
+
+    p.expect(LBrace, "`{` and the fields to change")
+
+    if !p.at(RBrace)
+        loop
+            keys.push(parse_name(p, "a field name"))
+            p.expect(Colon, "`:` and a value")
+            values.push(parse_expr(p))
+
+            if !p.accept(Comma) then break
+            if p.at(RBrace) then break
+
+    p.expect(RBrace, "`}`")
+
+    expr(base.span.to(p.just_taken()), WithFields(base, keys, values))
+end with_fields
 
 // `{ name: value, ... }`.
 //
@@ -256,6 +305,7 @@ private object_literal(p: *Parser, t: Spanned[Tok]) -> Expr
             values.push(parse_expr(p))
 
             if !p.accept(Comma) then break
+            if p.at(RBrace) then break
 
     p.expect(RBrace, "`}`")
 
@@ -326,6 +376,7 @@ private led(lhs: Expr, t: Spanned[Tok], p: *Parser) -> Expr
         PlusPlus -> expr(lhs.span.to(t.span), IncDec(lhs, true, false))
         MinusMinus -> expr(lhs.span.to(t.span), IncDec(lhs, false, false))
         Is -> is_test(p, lhs)
+        With -> with_fields(p, lhs)
         DotDot -> range_to(p, lhs, true)
         DotDotLt -> range_to(p, lhs, false)
         Match ->
@@ -424,6 +475,7 @@ private call(p: *Parser, callee: Expr) -> Expr
             args.push(parse_expr(p))
 
             if !p.accept(Comma) then break
+            if p.at(RParen) then break
 
     p.expect(RParen, "`)`")
 
@@ -460,6 +512,127 @@ private arrow(p: *Parser, lhs: Expr, t: Spanned[Tok]) -> Expr
 
     lambda_body(p, lhs.span, params)
 end arrow
+
+// `s"a ${b} c"` taken apart into the pieces it renders.
+//
+// **A hole is parsed IN PLACE, against a source padded out to its own offset**, which is what keeps a
+// complaint inside one pointing at the right character. The alternative -- lexing the hole's text on
+// its own -- gives spans measured from the hole rather than from the file, so every diagnostic in an
+// interpolation would name a column nobody could find. The padding costs a copy of the prefix per
+// hole, which for a language this size is not worth avoiding.
+private interpolated(p: *Parser, t: Spanned[Tok]) -> Expr
+    val bytes = p.src.text(t.span)
+    var pieces: Buf[Expr] = buf()
+
+    // Past the `s` and the opening quote, and stopping before the closing one.
+    var i: usize = 2
+    val last = bytes.len - 1
+    var chunk: usize = i
+
+    loop
+        if i >= last
+            add_chunk(p, &pieces, t.span, bytes, chunk, i)
+            break
+
+        if bytes[i] == u8('\\')
+            i += 2
+            continue
+
+        if bytes[i] == u8('$') && i + 1 < last && bytes[i + 1] == u8('{')
+            add_chunk(p, &pieces, t.span, bytes, chunk, i)
+
+            val open = i + 2
+            val close = hole_end(bytes, open, last)
+
+            pieces.push(hole_expr(p, t.span, open, close))
+
+            i = close + 1
+            chunk = i
+            continue
+        end if
+
+        i += 1
+    end loop
+
+    expr(t.span, Interp(pieces))
+end interpolated
+
+// Keep a run of literal text, with its escapes read the way an ordinary string's are.
+//
+// **Nothing is kept for an empty run**, so `s"${a}${b}"` renders two pieces rather than five.
+private add_chunk(p: *Parser, pieces: *Buf[Expr], at: Span, bytes: []const u8, from: usize, to: usize)
+    if to <= from then return
+
+    // Quoted back up and handed to the same reader an ordinary literal uses, so the escapes a
+    // program may write are one list rather than two that drift.
+    var s = scanner(("\"" + from_utf8_unchecked(bytes[from..<to]) + "\"").bytes)
+
+    val text = read_quoted(&s, u8('"')) match
+        Ok(v) -> v
+        _ -> ""
+
+    pieces.push(expr(at, ExprKind.StrLit(text)))
+end add_chunk
+
+// Where the `}` closing a hole that opened at `from` is, counting nesting as the lexer did.
+private hole_end(bytes: []const u8, from: usize, last: usize) -> usize
+    var depth: usize = 1
+    var i = from
+
+    while i < last
+        if bytes[i] == u8('{')
+            depth += 1
+        elif bytes[i] == u8('}')
+            depth -= 1
+
+            if depth == 0 then return i
+        elif bytes[i] == u8('"')
+            i += 1
+
+            while i < last
+                if bytes[i] == u8('\\') then i += 1
+                elif bytes[i] == u8('"') then break
+
+                i += 1
+        end if
+
+        i += 1
+
+    last
+end hole_end
+
+// One hole's expression, read at the offsets it occupies in the file it was written in.
+private hole_expr(p: *Parser, at: Span, open: usize, close: usize) -> Expr
+    val start = at.start + open
+    val stop = at.start + close
+    val whole = p.src.text(Span(0, stop))
+    var padded = str_builder()
+
+    // Everything before the hole becomes spaces, so the tokens land on their true offsets and carry
+    // spans this file's own renderer can point with.
+    for i in 0..<start
+        padded.push_char(' ')
+
+    padded.push(from_utf8_unchecked(whole[start..<stop]))
+
+    val sub = source_of(p.src.name, padded.finish())
+    val lexed = lex(sub)
+    var inner = Parser(lexed.tokens, sub, lexed.report)
+
+    // **The padding is indentation as far as the layout pass is concerned**, so the hole opens a
+    // block before its first token. Stepping over that is what makes the offsets free: everything
+    // inside the hole then lines up against its own column, which is what a nested block in one wants
+    // anyway.
+    if inner.at(Indent) then inner.bump()
+
+    val e = parse_expr(&inner)
+
+    // Whatever the hole complained about is the program's complaint.
+    for i in 0..<inner.report.len()
+        p.report.add(inner.report.items.at(i))
+
+    e
+end hole_expr
 
 // -- literals ---------------------------------------------------------------------------------
 

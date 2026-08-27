@@ -187,18 +187,12 @@ private parse_stmt(p: *Parser) -> Stmt
         Val -> parse_binding(p, true)
         Var -> parse_binding(p, false)
         Return -> parse_return(p)
-        Break -> parse_word_stmt(p, StmtKind.Break)
-        Continue -> parse_word_stmt(p, StmtKind.Continue)
-        While -> parse_while(p)
-        For -> parse_for(p)
-        Loop -> parse_loop(p)
+        Break -> parse_break(p)
+        Continue -> parse_continue(p)
 
-        // **A `do` at the head of a statement can only be the post-test loop.** Everywhere else it
-        // introduces a body and so follows a loop header on the same line, where it is consumed by
-        // `parse_control_body` and never reaches here. That is sysl's own argument for the word
-        // doing both jobs.
-        Do -> parse_do_while(p)
-
+        // **The loops are not here, because they are expressions**: `while`, `for`, `loop`, `do` and
+        // the label one of them may carry all begin one, so they reach `nud` through
+        // `parse_expr_stmt` like any other value.
         // **`async` is not on its own a definition.** `async f(x) = ...` defines one and
         // `async x -> x` is an expression, so the same shape check runs one token further along.
         Async ->
@@ -237,6 +231,64 @@ private parse_return(p: *Parser) -> Stmt
     stmt(start.to(p.just_taken()), Return(value))
 end parse_return
 
+// `break`, `break 'outer`, `break v`, and `break 'outer v`.
+//
+// A bare one is told from one with a value by what follows, exactly as `return` is: an expression
+// cannot begin with a newline or with the end of a block.
+private parse_break(p: *Parser) -> Stmt
+    val start = p.here()
+
+    p.bump()
+
+    val label = accept_label(p)
+    val value = if starts_expr(p.peek()) then Some(parse_expr(p)) else None
+
+    stmt(start.to(p.just_taken()), StmtKind.Break(label, value))
+end parse_break
+
+private parse_continue(p: *Parser) -> Stmt
+    val start = p.here()
+
+    p.bump()
+
+    stmt(start.to(p.just_taken()), StmtKind.Continue(accept_label(p)))
+
+// The name a `break` or a `continue` gave, or the empty string for the innermost loop.
+private accept_label(p: *Parser) -> string
+    if !p.at(Label) then return ""
+
+    val at = p.here()
+
+    p.bump()
+
+    // The apostrophe is part of the lexeme and no part of the name.
+    label_name(p.text(at))
+end accept_label
+
+private label_name(text: string) -> string = from_utf8_unchecked(text.bytes[1..])
+
+// `'outer while ...`, and the same for the other three loops.
+//
+// **A label is read only immediately before a loop's own keyword**, which is what keeps a stray one
+// from being reported as something else entirely.
+//
+// Not `private`: `expr.sysl` reads one where a value is wanted.
+parse_labelled(p: *Parser, at: Span) -> Expr
+    val name = label_name(p.text(at))
+    val kind = p.peek()
+
+    if kind == While || kind == For || kind == Loop || kind == Do then p.bump()
+
+    kind match
+        While -> parse_while(p, name, at)
+        For -> parse_for(p, name, at)
+        Loop -> parse_loop(p, name, at)
+        Do -> parse_do_while(p, name, at)
+        _ ->
+            p.report.add(expected(p.here(), "a loop for this label to name", p.found(p.here())))
+            expr(at, Bad)
+end parse_labelled
+
 private parse_word_stmt(p: *Parser, k: StmtKind) -> Stmt
     val start = p.here()
 
@@ -245,23 +297,28 @@ private parse_word_stmt(p: *Parser, k: StmtKind) -> Stmt
     stmt(start, k)
 
 // `while cond` with a body.
-private parse_while(p: *Parser) -> Stmt
-    val start = p.here()
-
-    p.bump()
+// Not `private`: `expr.sysl` reads a loop wherever a value is wanted.
+parse_while(p: *Parser, label: string, start: Span) -> Expr
 
     val cond = parse_expr(p)
     val body = parse_control_body(p, Do)
+    val otherwise = loop_else(p)
 
     accept_end(p, While)
-    stmt(start.to(p.just_taken()), While(cond, body))
+    expr(start.to(p.just_taken()), While(label, cond, body, otherwise))
 end parse_while
 
-// `for name in iterable` with a body.
-private parse_for(p: *Parser) -> Stmt
-    val start = p.here()
+// The `else` a loop may carry, which runs when it finished on its own rather than by `break`.
+//
+// **The same clause an `if` uses**, read from the next line, so a loop's `else` and a conditional's
+// are one grammar rather than two that drift.
+private loop_else(p: *Parser) -> Option[Expr]
+    if !accept_on_next_line(p, Else) then return None
 
-    p.bump()
+    Some(if p.at(Indent) then parse_block(p) else inline_stmt_body(p))
+
+// `for name in iterable` with a body.
+parse_for(p: *Parser, label: string, start: Span) -> Expr
 
     val name = parse_name(p, "a name for each element")
 
@@ -269,9 +326,10 @@ private parse_for(p: *Parser) -> Stmt
 
     val iter = parse_expr(p)
     val body = parse_control_body(p, Do)
+    val otherwise = loop_else(p)
 
     accept_end(p, For)
-    stmt(start.to(p.just_taken()), For(name, iter, body))
+    expr(start.to(p.just_taken()), For(label, name, iter, body, otherwise))
 end parse_for
 
 // `loop` with a body.
@@ -284,10 +342,7 @@ end parse_for
 // **There is no `end do`**, and that is sysl's reasoning rather than an omission: the trailing
 // `while` already names where the body stopped, so a marker after it would close a block that has
 // just been closed.
-private parse_do_while(p: *Parser) -> Stmt
-    val start = p.here()
-
-    p.bump()
+parse_do_while(p: *Parser, label: string, start: Span) -> Expr
 
     val body = if p.at(Indent) then parse_block(p) else inline_stmt_body(p)
 
@@ -295,19 +350,19 @@ private parse_do_while(p: *Parser) -> Stmt
     p.expect(While, "`while` and the condition the loop repeats on")
 
     val cond = parse_expr(p)
+    val otherwise = loop_else(p)
 
-    stmt(start.to(p.just_taken()), DoWhile(body, cond))
+    expr(start.to(p.just_taken()), DoWhile(label, body, cond, otherwise))
 end parse_do_while
 
-private parse_loop(p: *Parser) -> Stmt
-    val start = p.here()
-
-    p.bump()
+parse_loop(p: *Parser, label: string, start: Span) -> Expr
 
     val body = parse_control_body(p, Do)
 
+    // **No `else`, because an `else` runs when a loop finishes on its own and this one never does.**
+    // sysl says the same in as many words.
     accept_end(p, Loop)
-    stmt(start.to(p.just_taken()), Loop(body))
+    expr(start.to(p.just_taken()), Loop(label, body))
 end parse_loop
 
 // Whether the cursor is on a function definition rather than on a call.
@@ -337,7 +392,11 @@ private at_definition_from(p: *Parser, start: usize) -> bool
         i += 1
 
         p.peek_kind_at(i) match
-            Comma -> i += 1
+            Comma ->
+                i += 1
+
+                // A trailing comma still closes the list, so the `)` after one is a definition.
+                if p.peek_kind_at(i) == RParen then return body_follows(p, i + 1)
             RParen -> return body_follows(p, i + 1)
             _ -> return false
     end loop
@@ -364,6 +423,7 @@ private parse_def(p: *Parser) -> Stmt
             params.push(parse_name(p, "a parameter name"))
 
             if !p.accept(Comma) then break
+            if p.at(RParen) then break
 
     p.expect(RParen, "`)`")
 
@@ -403,6 +463,11 @@ end parse_expr_stmt
 
 // `a, b = b, a`, and the compound forms of it.
 private parse_multi_assign(p: *Parser, start: Span, first: Expr) -> Stmt
+    // **Read speculatively, and commit only on the `=`.** A comma after an expression is a
+    // multi-assignment far more often than not, but it is also what a `match` written as a
+    // non-final argument leaves behind -- and a rule that committed here would answer that with a
+    // sentence about assignment, replacing the one diagnostic that says what is actually wrong.
+    val m = p.toks.mark()
     var targets: Buf[Expr] = buf()
 
     targets.push(first)
@@ -415,7 +480,7 @@ private parse_multi_assign(p: *Parser, start: Span, first: Expr) -> Stmt
     val op = assign_op(p)
 
     if op == Eof
-        p.report.add(expected(p.here(), "`=` and the values to write", p.found(p.here())))
+        p.toks.reset(m)
         return stmt(start.to(p.just_taken()), Eval(first))
 
     var values: Buf[Expr] = buf()

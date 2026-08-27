@@ -106,6 +106,56 @@ print(describe("sun"))
 print(describe("hi"))
 print(describe(true))
 
+// The syntax is sysl's. A one-line body is a *statement*, `do` introduces one for a loop, and `end`
+// closes a block where the block is long enough to want it.
+// A loop is an expression: `break` gives it a value, and `else` runs when it finished on its own.
+find_first(xs, wanted)
+    for i in 0..<len(xs) do
+        if xs[i] == wanted then break i
+    else
+        -1
+end find_first
+
+print(find_first(["a", "b", "c"], "b"), find_first([1], 9))
+
+// A label says which loop a `break` leaves, which is the only way out of a nested one.
+first_pair_over(limit)
+    'search for a in [1, 2, 3]
+        for b in [1, 2, 3]
+            if a * b > limit then break 'search [a, b]
+    else
+        null
+end first_pair_over
+
+print(first_pair_over(3))
+
+// Compound assignment evaluates its place once; `++` and `--` step a name, a field or an element.
+var counts = { hits: 0 }
+
+counts.hits += 2
+counts.hits++
+print(counts, s"there were ${counts.hits} of them")
+
+// Comparisons chain rather than associate, so this asks what it looks like it asks -- and the middle
+// operand is evaluated once.
+val n = 5
+
+print(0 <= n < 10)
+
+// A pattern where a condition is wanted, which is the same grammar a `match` arm uses.
+print(n is num, n is not str, n is 1 | 3 | 5)
+
+// Ranges are values: `for` walks one, and a subscript slices with one. An end left out is taken from
+// whatever it is used on.
+val letters = ["a", "b", "c", "d"]
+
+print(letters[1..<3], letters[2..], "hello"[..2])
+
+// A copy with a field changed, rather than a change in place.
+val base = { size: 1, colour: "red" }
+
+print(base with { size: 9 })
+
 // An `async` function answers a promise, and `await` waits for one. Everything above a function's
 // first `await` runs before its caller sees the promise; everything below it runs after the caller
 // has moved on -- which is why "started both" prints before either worker's first line.

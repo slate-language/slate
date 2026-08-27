@@ -140,6 +140,49 @@ JavaScript and Python are most often criticised for.
 `&&` and `||` short-circuit and answer the operand that decided, which is the one place slate's rule
 is not sysl's: sysl's operands are `bool` and there is nothing else for it to give back.
 
+### The shape of it
+
+The syntax is sysl's, minus what a dynamically typed language with no pointers has no use for.
+
+**A one-line body is a statement, not an expression**, which is the rule that makes the short forms
+worth having: `if n > 2 then break`, `then return x`, `then continue`, and the same inside a `match`
+arm. `do` introduces a one-line loop body — `while c do …`, `for x in xs do …`, `loop do …` — and
+`end if` / `end while` / `end for` / `end loop` / `end <name>` close a block that has grown long
+enough to want it. `end` stays a soft word, so a program may still call something `end`.
+
+**Every loop is an expression, and `break` is what gives it a value.** A loop that finishes on its own
+answers `null`, or whatever its `else` clause left:
+
+```
+find_first(xs, wanted)
+    for i in 0..<len(xs) do
+        if xs[i] == wanted then break i
+    else
+        -1
+end find_first
+```
+
+That an `else`'s value *is* the loop's was checked against sysl rather than assumed. A label says
+which loop a `break` leaves — `'search for a in …` then `break 'search [a, b]` — which is the only way
+out of a nested one.
+
+**Comparisons chain rather than associate**, so `0 <= n < 10` asks what it looks like it asks and `n`
+is evaluated once. `is` puts a pattern where a condition is wanted — `v is num`, `v is not str`,
+`v is 1 | 3 | 5` — using the same grammar a `match` arm does.
+
+**Ranges are values**: `for i in 0..<n`, `xs[1..<3]`, `"hello"[..2]`, and an end left out is taken
+from whatever the range is used on. `a..=b` is refused by name, since a reader arriving from Rust
+writes it once.
+
+Assignment has the compound forms `+= -= *= /= %=` and the bitwise `&= |= ^= <<= >>=`, and writes
+several places at once with `a, b = b, a`. A compound form evaluates its place **once**, so
+`xs[next()] += 1` calls `next` a single time. `++` and `--` step a name, a field or an element, prefix
+or postfix. The bitwise operators are `| ^ & ~` and the shifts `<< >>`, which bind like a
+multiplication rather than like C's.
+
+`s"a ${b} c"` interpolates, `[v; n]` is an array of copies, `base with { f: v }` is a copy with a
+field changed, and every comma list takes a trailing comma.
+
 ### async and await
 
 An `async` function answers a promise rather than a value, and `await` waits for one:
@@ -260,8 +303,12 @@ Two consequences worth knowing:
 
 ## What is not here yet
 
-String interpolation, a module system, a literate `.lsl` form, files and sockets over the libuv
-binding, and anything resembling a standard library beyond a dozen builtins.
+A module system, a literate `.lsl` form, files and sockets over the libuv binding, and anything
+resembling a standard library beyond a dozen builtins.
+
+`defer` is the one thing on sysl's list that applies and is not here: it needs a per-scope list run on
+every exit path — block end, `break`, `continue`, `return`, fault — which is a semantics feature
+rather than a piece of syntax.
 
 The two examples are the current surface, and it is meant to grow in whatever direction puts the most
 pressure on sysl.
