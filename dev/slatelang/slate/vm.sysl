@@ -26,12 +26,58 @@ struct Frame
     // How tall the operand stack was when this call started. `Ret` cuts back to it.
     base: usize
 
-// The operand stack. **Module storage, because the collector's root function must be top-level and
-// must reach it** -- the same constraint that put the interpreter's other state there.
-var vm_stack: Buf[Value] = buf()
+// Everything one line of execution is: its values, its calls, and where it is looking names up.
+//
+// **Bundled because `await` is going to move them together.** Suspending a call means setting all
+// three aside and running something else; resuming means putting all three back. They were three
+// module variables until it became clear that no operation ever wants one without the others.
+struct Machine
+    stack: Buf[Value]
+    frames: Buf[Frame]
 
-// The calls in progress, innermost last.
-var vm_frames: Buf[Frame] = buf()
+    // The scope the running frame is looking names up in. **Not a sysl local, and that is not a style
+    // choice**: `alloc` can collect at any allocation, so the scope in hand has to be reachable from
+    // the root function at every instant. Keeping it in a local once swept the whole live scope chain
+    // out from under the machine.
+    scope: *EnvObj
+
+    // **Whether this slot holds something, said rather than inferred.** Emptiness was read off the
+    // frames and the scope until a machine parked with values on its stack and nothing else matched
+    // the same test -- and the next park wrote over it.
+    live: bool
+
+// The line of execution currently running.
+var vm: Machine = Machine(buf(), buf(), null, true)
+
+// The ones set aside. **Empty until `await` exists**, and here now because the thing that makes a
+// coroutine possible is that its state is data rather than sysl's own call stack -- which is the
+// whole reason the tree-walker was replaced.
+var parked: Buf[Machine] = buf()
+
+// Set the running machine aside and answer where it went. The caller gets a clean one.
+park() -> usize
+    val saved = vm
+
+    vm = Machine(buf(), buf(), null, true)
+
+    for i in 0..<parked.len()
+        if !parked.at(i).live
+            parked.set(i, saved)
+            return i
+
+    parked.push(saved)
+    parked.len() - 1
+end park
+
+// Put one back, and answer what was running in its place.
+unpark(id: usize) -> Machine
+    val displaced = vm
+
+    vm = parked.at(id)
+    parked.set(id, Machine(buf(), buf(), null, false))
+    displaced
+end unpark
+
 
 // How deep a slate program may call.
 //
@@ -45,15 +91,6 @@ var vm_frames: Buf[Frame] = buf()
 // that wants more depth than this wants a loop.
 private const MaxCallDepth: usize = 10000
 
-// The scope the running frame is looking names up in.
-//
-// **Module storage rather than a local, and this is not a style choice.** `alloc` can collect at any
-// allocation, so the scope in hand has to be reachable from the root function at every instant -- not
-// only at the moments a frame is written back. Keeping it in a sysl local reintroduced exactly the
-// class of bug the machine exists to remove: a collection swept the whole live scope chain and the
-// machine walked freed memory afterwards.
-var vm_scope: *EnvObj = null
-
 // The unit being run.
 //
 // **Module storage, because a hook has to reach it.** A user-supplied `equals` is called from inside
@@ -63,31 +100,39 @@ var current_unit: Unit = new_unit()
 
 // Empty the machine between runs.
 reset_vm()
-    vm_stack.clear()
-    vm_frames.clear()
+    vm = Machine(buf(), buf(), null, true)
+    parked.clear()
 
 // Everything the machine can still reach, for the collector.
 //
 // **This replaces most of the shadow stack.** What is left of `hold`/`release` is only what code
 // outside the machine holds -- a native builtin building an array, say.
 mark_vm(h: *gc.Heap)
-    for i in 0..<vm_stack.len()
-        mark_value(h, vm_stack.at(i))
+    mark_machine(h, vm)
 
-    for i in 0..<vm_frames.len()
-        gc.mark(h, ptr_cast(vm_frames.at(i).scope))
+    // **Every parked line of execution is a root too.** A suspended call is not running, and is not
+    // therefore any less alive -- everything it will touch when it resumes has to survive until then.
+    for i in 0..<parked.len()
+        if parked.at(i).live then mark_machine(h, parked.at(i))
 
-    gc.mark(h, ptr_cast(vm_scope))
+private mark_machine(h: *gc.Heap, m: Machine)
+    for i in 0..<m.stack.len()
+        mark_value(h, m.stack.at(i))
+
+    for i in 0..<m.frames.len()
+        gc.mark(h, ptr_cast(m.frames.at(i).scope))
+
+    gc.mark(h, ptr_cast(m.scope))
 
 // -- running ---------------------------------------------------------------------------------------
 
 private pop() -> Value
-    val v = vm_stack.at(vm_stack.len() - 1)
+    val v = vm.stack.at(vm.stack.len() - 1)
 
-    vm_stack.truncate(vm_stack.len() - 1)
+    vm.stack.truncate(vm.stack.len() - 1)
     v
 
-private peek(back: usize) -> Value = vm_stack.at(vm_stack.len() - 1 - back)
+private peek(back: usize) -> Value = vm.stack.at(vm.stack.len() - 1 - back)
 
 // Run a chunk to completion and answer what it left.
 //
@@ -97,19 +142,19 @@ private peek(back: usize) -> Value = vm_stack.at(vm_stack.len() - 1 - back)
 run_chunk(u: *Unit, start: usize, scope0: *EnvObj) -> Step
     // **Where this call stops unwinding.** A native can call back into slate -- a user `equals` does
     // exactly that -- so a nested run must hand back at its own depth rather than at an empty stack.
-    val floor = vm_frames.len()
+    val floor = vm.frames.len()
     var chunk_ix = start
     var pc: usize = 0
-    val outer_scope = vm_scope
+    val outer_scope = vm.scope
 
-    vm_scope = scope0
-    var base = vm_stack.len()
+    vm.scope = scope0
+    var base = vm.stack.len()
     var code = u.chunks.at(chunk_ix).code
 
     loop
         if pc >= code.len()
             // A chunk that ran off its end answers null, which only happens for an empty body.
-            vm_stack.push(Null)
+            vm.stack.push(Null)
             pc = code.len()
 
         val ins = code.at(pc)
@@ -118,29 +163,29 @@ run_chunk(u: *Unit, start: usize, scope0: *EnvObj) -> Step
         pc += 1
 
         ins.op match
-            PushNil -> vm_stack.push(Null)
-            PushUndefined -> vm_stack.push(Undefined)
-            PushBool(v) -> vm_stack.push(Bool(v))
-            PushInt(v) -> vm_stack.push(Int(v))
-            PushReal(v) -> vm_stack.push(Real(v))
-            PushStr(k) -> vm_stack.push(str_value(u.strings.at(k)))
+            PushNil -> vm.stack.push(Null)
+            PushUndefined -> vm.stack.push(Undefined)
+            PushBool(v) -> vm.stack.push(Bool(v))
+            PushInt(v) -> vm.stack.push(Int(v))
+            PushReal(v) -> vm.stack.push(Real(v))
+            PushStr(k) -> vm.stack.push(str_value(u.strings.at(k)))
 
             LoadName(k) ->
                 val name = u.strings.at(k)
 
-                lookup(vm_scope, name) match
-                    Some(v) -> vm_stack.push(v)
+                lookup(vm.scope, name) match
+                    Some(v) -> vm.stack.push(v)
                     None -> return fault(at, s"`${name}` is not defined")
             DeclareVal(k) ->
                 val v = pop()
 
                 keepable(v, at, s"bound to `${u.strings.at(k)}`")?
-                declare(vm_scope, u.strings.at(k), v, false)
+                declare(vm.scope, u.strings.at(k), v, false)
             DeclareVar(k) ->
                 val v = pop()
 
                 keepable(v, at, s"bound to `${u.strings.at(k)}`")?
-                declare(vm_scope, u.strings.at(k), v, true)
+                declare(vm.scope, u.strings.at(k), v, true)
             StoreName(k) ->
                 val name = u.strings.at(k)
 
@@ -148,7 +193,7 @@ run_chunk(u: *Unit, start: usize, scope0: *EnvObj) -> Step
 
                 keepable(stored, at, s"written to `${name}`")?
 
-                assign_name(vm_scope, name, stored) match
+                assign_name(vm.scope, name, stored) match
                     Written -> ()
                     Immutable -> return fault(at, s"`${name}` is a `val`, so it is written once")
                     Unknown -> return fault(at, s"`${name}` is not defined")
@@ -156,12 +201,12 @@ run_chunk(u: *Unit, start: usize, scope0: *EnvObj) -> Step
             UnaryOp(op) ->
                 val v = pop()
 
-                vm_stack.push(unary(op, v, at)?)
+                vm.stack.push(unary(op, v, at)?)
             BinaryOp(op) ->
                 val b = pop()
                 val a = pop()
 
-                vm_stack.push(on_values(op, a, b, at)?)
+                vm.stack.push(on_values(op, a, b, at)?)
 
             MakeArray(n) ->
                 var items: Buf[Value] = buf()
@@ -175,8 +220,8 @@ run_chunk(u: *Unit, start: usize, scope0: *EnvObj) -> Step
                 // collects when the heap is full.
                 val made = Array(new_array(items))
 
-                vm_stack.truncate(vm_stack.len() - n)
-                vm_stack.push(made)
+                vm.stack.truncate(vm.stack.len() - n)
+                vm.stack.push(made)
             MakeObject(n) ->
                 val o = new_object()
                 val mark = root_mark()
@@ -192,14 +237,14 @@ run_chunk(u: *Unit, start: usize, scope0: *EnvObj) -> Step
                     obj_put(o, key, value, at)?
 
                 release(mark)
-                vm_stack.truncate(vm_stack.len() - n * 2)
-                vm_stack.push(Object(o))
+                vm.stack.truncate(vm.stack.len() - n * 2)
+                vm.stack.push(Object(o))
 
             GetIndex ->
                 val k = pop()
                 val target = pop()
 
-                vm_stack.push(read_at(target, k, at)?)
+                vm.stack.push(read_at(target, k, at)?)
             SetIndex ->
                 val v = pop()
                 val k = pop()
@@ -212,7 +257,7 @@ run_chunk(u: *Unit, start: usize, scope0: *EnvObj) -> Step
             GetField(k) ->
                 val target = pop()
 
-                vm_stack.push(read_field(target, u.strings.at(k), at)?)
+                vm.stack.push(read_field(target, u.strings.at(k), at)?)
             SetField(k) ->
                 val v = pop()
 
@@ -228,29 +273,29 @@ run_chunk(u: *Unit, start: usize, scope0: *EnvObj) -> Step
             JumpIfPresentKeep(to) -> if !is_nullish(peek(0)) then pc = to
             JumpIfFalseKeep(to) -> if !peek(0).truthy() then pc = to
 
-            Pop -> vm_stack.truncate(vm_stack.len() - 1)
-            Dup -> vm_stack.push(peek(0))
+            Pop -> vm.stack.truncate(vm.stack.len() - 1)
+            Dup -> vm.stack.push(peek(0))
 
-            PushScope -> vm_scope = new_env(vm_scope)
-            PopScope -> vm_scope = vm_scope.parent
+            PushScope -> vm.scope = new_env(vm.scope)
+            PopScope -> vm.scope = vm.scope.parent
 
-            MakeClosure(c) -> vm_stack.push(Fn(new_closure(u.chunks.at(c).params, c, vm_scope)))
+            MakeClosure(c) -> vm.stack.push(Fn(new_closure(u.chunks.at(c).params, c, vm.scope)))
             DefineFn(k, c) ->
                 val name = u.strings.at(k)
 
                 // Bound before the closure is built, so the body can see its own name -- which is the
                 // whole of what makes a named function recursive.
-                declare(vm_scope, name, Null, false)
-                declare(vm_scope, name, Fn(new_closure(u.chunks.at(c).params, c, vm_scope)), false)
+                declare(vm.scope, name, Null, false)
+                declare(vm.scope, name, Fn(new_closure(u.chunks.at(c).params, c, vm.scope)), false)
 
             TestPat(k) ->
-                val took = match_pattern(u.patterns.at(k), peek(0), vm_scope)
+                val took = match_pattern(u.patterns.at(k), peek(0), vm.scope)
 
-                vm_stack.push(Bool(took))
+                vm.stack.push(Bool(took))
 
             IterInit ->
                 peek(0) match
-                    Array(_) -> vm_stack.push(Int(0))
+                    Array(_) -> vm.stack.push(Int(0))
                     other -> return fault(at, s"`for` walks an array, and this is ${other.type_name()}")
             IterNext(to) ->
                 val i = peek(0) match
@@ -264,8 +309,8 @@ run_chunk(u: *Unit, start: usize, scope0: *EnvObj) -> Step
                 if i >= items.items.len()
                     pc = to
                 else
-                    vm_stack.set(vm_stack.len() - 1, Int(long(i + 1)))
-                    vm_stack.push(items.items.at(i))
+                    vm.stack.set(vm.stack.len() - 1, Int(long(i + 1)))
+                    vm.stack.push(items.items.at(i))
 
             FailWith(k) -> return fault(at, u.strings.at(k))
             FailNoArm -> return fault(at, s"no arm of this match applies to ${value_text(peek(0))}")
@@ -286,20 +331,20 @@ run_chunk(u: *Unit, start: usize, scope0: *EnvObj) -> Step
 
                 val callee = peek(argc)
 
-                vm_stack.truncate(vm_stack.len() - argc - 1)
+                vm.stack.truncate(vm.stack.len() - argc - 1)
 
                 callee match
-                    Native(f) -> vm_stack.push(call_native(f, args, at)?)
+                    Native(f) -> vm.stack.push(call_native(f, args, at)?)
                     Fn(c) ->
                         if args.len() != c.params.len()
                             return fault(at, s"this function takes ${c.params.len()} arguments and was given ${args.len()}")
 
                         // The frame this call is leaving is written back only here, which is what
                         // makes the ordinary instruction cheap.
-                        if vm_frames.len() >= MaxCallDepth
+                        if vm.frames.len() >= MaxCallDepth
                             return fault(at, s"this call is ${MaxCallDepth} deep, which is farther than slate will go -- a recursion this deep is usually one that never ends")
 
-                        vm_frames.push(Frame(chunk_ix, pc, vm_scope, base))
+                        vm.frames.push(Frame(chunk_ix, pc, vm.scope, base))
 
                         val called = new_env(c.scope)
 
@@ -309,28 +354,28 @@ run_chunk(u: *Unit, start: usize, scope0: *EnvObj) -> Step
                         chunk_ix = c.body
                         code = u.chunks.at(chunk_ix).code
                         pc = 0
-                        vm_scope = called
-                        base = vm_stack.len()
+                        vm.scope = called
+                        base = vm.stack.len()
                     other -> return fault(at, s"${other.type_name()} is not something that can be called")
 
             Ret ->
                 val v = pop()
 
-                vm_stack.truncate(base)
+                vm.stack.truncate(base)
 
-                if vm_frames.len() == floor
-                    vm_scope = outer_scope
+                if vm.frames.len() == floor
+                    vm.scope = outer_scope
                     return Ok(v)
 
-                val back = vm_frames.at(vm_frames.len() - 1)
+                val back = vm.frames.at(vm.frames.len() - 1)
 
-                vm_frames.truncate(vm_frames.len() - 1)
+                vm.frames.truncate(vm.frames.len() - 1)
                 chunk_ix = back.chunk
                 code = u.chunks.at(chunk_ix).code
                 pc = back.pc
-                vm_scope = back.scope
+                vm.scope = back.scope
                 base = back.base
-                vm_stack.push(v)
+                vm.stack.push(v)
 end run_chunk
 
 // -- the entry point --------------------------------------------------------------------------------
