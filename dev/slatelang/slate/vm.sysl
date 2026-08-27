@@ -33,6 +33,29 @@ var vm_stack: Buf[Value] = buf()
 // The calls in progress, innermost last.
 var vm_frames: Buf[Frame] = buf()
 
+// The scope the running frame is looking names up in.
+//
+// **Module storage rather than a local, and this is not a style choice.** `alloc` can collect at any
+// allocation, so the scope in hand has to be reachable from the root function at every instant -- not
+// only at the moments a frame is written back. Keeping it in a sysl local reintroduced exactly the
+// class of bug the machine exists to remove: a collection swept the whole live scope chain and the
+// machine walked freed memory afterwards.
+var vm_scope: *EnvObj = null
+
+// The unit being run.
+//
+// **Module storage, because a hook has to reach it.** A user-supplied `equals` is called from inside
+// a table lookup, which is called from `same`, which knows nothing about units -- so the chunk it
+// needs is found here rather than threaded through every comparison.
+var current_unit: Unit = new_unit()
+
+// Which interpreter this run belongs to.
+//
+// **One run uses one of them, which is what makes a single `usize` in `ClosureObj.body` unambiguous**
+// -- it indexes `bodies` for the walker and `chunks` for the machine, and nothing ever holds closures
+// from both at once.
+var on_machine: bool = false
+
 // Empty the machine between runs.
 reset_vm()
     vm_stack.clear()
@@ -48,6 +71,8 @@ mark_vm(h: *gc.Heap)
 
     for i in 0..<vm_frames.len()
         gc.mark(h, ptr_cast(vm_frames.at(i).scope))
+
+    gc.mark(h, ptr_cast(vm_scope))
 
 // -- running ---------------------------------------------------------------------------------------
 
@@ -65,9 +90,14 @@ private peek(back: usize) -> Value = vm_stack.at(vm_stack.len() - 1 - back)
 // written back only when a call pushes or pops one. Reading them out of a `Buf` on every instruction
 // would copy a whole frame per step.
 run_chunk(u: *Unit, start: usize, scope0: *EnvObj) -> Step
+    // **Where this call stops unwinding.** A native can call back into slate -- a user `equals` does
+    // exactly that -- so a nested run must hand back at its own depth rather than at an empty stack.
+    val floor = vm_frames.len()
     var chunk_ix = start
     var pc: usize = 0
-    var scope = scope0
+    val outer_scope = vm_scope
+
+    vm_scope = scope0
     var base = vm_stack.len()
     var code = u.chunks.at(chunk_ix).code
 
@@ -92,15 +122,15 @@ run_chunk(u: *Unit, start: usize, scope0: *EnvObj) -> Step
             LoadName(k) ->
                 val name = u.strings.at(k)
 
-                lookup(scope, name) match
+                lookup(vm_scope, name) match
                     Some(v) -> vm_stack.push(v)
                     None -> return fault(at, s"`${name}` is not defined")
-            DeclareVal(k) -> declare(scope, u.strings.at(k), pop(), false)
-            DeclareVar(k) -> declare(scope, u.strings.at(k), pop(), true)
+            DeclareVal(k) -> declare(vm_scope, u.strings.at(k), pop(), false)
+            DeclareVar(k) -> declare(vm_scope, u.strings.at(k), pop(), true)
             StoreName(k) ->
                 val name = u.strings.at(k)
 
-                assign_name(scope, name, pop()) match
+                assign_name(vm_scope, name, pop()) match
                     Written -> ()
                     Immutable -> return fault(at, s"`${name}` is a `val`, so it is written once")
                     Unknown -> return fault(at, s"`${name}` is not defined")
@@ -121,8 +151,13 @@ run_chunk(u: *Unit, start: usize, scope0: *EnvObj) -> Step
                 for i in 0..<n
                     items.push(peek(n - 1 - i))
 
+                // **Allocated before the stack shrinks.** Between the truncate and the alloc the
+                // elements would live only in `items`, which the mark phase cannot see -- and `alloc`
+                // collects when the heap is full.
+                val made = Array(new_array(items))
+
                 vm_stack.truncate(vm_stack.len() - n)
-                vm_stack.push(Array(new_array(items)))
+                vm_stack.push(made)
             MakeObject(n) ->
                 val o = new_object()
                 val mark = root_mark()
@@ -169,20 +204,20 @@ run_chunk(u: *Unit, start: usize, scope0: *EnvObj) -> Step
             Pop -> vm_stack.truncate(vm_stack.len() - 1)
             Dup -> vm_stack.push(peek(0))
 
-            PushScope -> scope = new_env(scope)
-            PopScope -> scope = scope.parent
+            PushScope -> vm_scope = new_env(vm_scope)
+            PopScope -> vm_scope = vm_scope.parent
 
-            MakeClosure(c) -> vm_stack.push(Fn(new_closure(u.chunks.at(c).params, c, scope)))
+            MakeClosure(c) -> vm_stack.push(Fn(new_closure(u.chunks.at(c).params, c, vm_scope)))
             DefineFn(k, c) ->
                 val name = u.strings.at(k)
 
                 // Bound before the closure is built, so the body can see its own name -- which is the
                 // whole of what makes a named function recursive.
-                declare(scope, name, Nil, false)
-                declare(scope, name, Fn(new_closure(u.chunks.at(c).params, c, scope)), false)
+                declare(vm_scope, name, Nil, false)
+                declare(vm_scope, name, Fn(new_closure(u.chunks.at(c).params, c, vm_scope)), false)
 
             TestPat(k) ->
-                val took = match_pattern(u.patterns.at(k), peek(0), scope)
+                val took = match_pattern(u.patterns.at(k), peek(0), vm_scope)
 
                 vm_stack.push(Bool(took))
 
@@ -206,6 +241,14 @@ run_chunk(u: *Unit, start: usize, scope0: *EnvObj) -> Step
                     vm_stack.push(items.items.at(i))
 
             FailWith(k) -> return fault(at, u.strings.at(k))
+            FailNoArm -> return fault(at, s"no arm of this match applies to ${value_text(peek(0))}")
+
+            Tick ->
+                maybe_collect()
+
+                // A full heap is reported where there is a line to point at; the allocator has no
+                // idea which statement it was serving.
+                if heap_exhausted then return fault(at, "this program has run out of memory")
 
             CallFn(argc) ->
                 var args: Buf[Value] = buf()
@@ -225,7 +268,7 @@ run_chunk(u: *Unit, start: usize, scope0: *EnvObj) -> Step
 
                         // The frame this call is leaving is written back only here, which is what
                         // makes the ordinary instruction cheap.
-                        vm_frames.push(Frame(chunk_ix, pc, scope, base))
+                        vm_frames.push(Frame(chunk_ix, pc, vm_scope, base))
 
                         val called = new_env(c.scope)
 
@@ -235,7 +278,7 @@ run_chunk(u: *Unit, start: usize, scope0: *EnvObj) -> Step
                         chunk_ix = c.body
                         code = u.chunks.at(chunk_ix).code
                         pc = 0
-                        scope = called
+                        vm_scope = called
                         base = vm_stack.len()
                     other -> return fault(at, s"${other.type_name()} is not something that can be called")
 
@@ -244,7 +287,9 @@ run_chunk(u: *Unit, start: usize, scope0: *EnvObj) -> Step
 
                 vm_stack.truncate(base)
 
-                if vm_frames.len() == 0 then return Ok(v)
+                if vm_frames.len() == floor
+                    vm_scope = outer_scope
+                    return Ok(v)
 
                 val back = vm_frames.at(vm_frames.len() - 1)
 
@@ -252,7 +297,7 @@ run_chunk(u: *Unit, start: usize, scope0: *EnvObj) -> Step
                 chunk_ix = back.chunk
                 code = u.chunks.at(chunk_ix).code
                 pc = back.pc
-                scope = back.scope
+                vm_scope = back.scope
                 base = back.base
                 vm_stack.push(v)
 end run_chunk
@@ -264,18 +309,19 @@ end run_chunk
 // **The same shape as `run`, deliberately**, so the test suite can put a program through both and
 // compare. That is the whole migration plan: the walker is the oracle, and the machine is finished
 // when every one of slate's tests answers the same on both.
-run_vm(src: Source) -> Ran
+run(src: Source) -> Ran
     reset_heap()
     reset_vm()
     output.clear()
+    on_machine = true
 
     val parsed = parse(src)
 
     if !parsed.ok() then return Ran(Nil, parsed.report, output)
 
-    var u = new_unit()
+    current_unit = new_unit()
 
-    compile_program(&u, parsed.program)
+    compile_program(&current_unit, parsed.program)
 
     var env = new_env(null)
 
@@ -284,9 +330,9 @@ run_vm(src: Source) -> Ran
 
     var rep = parsed.report
 
-    run_chunk(&u, 0, env) match
+    run_chunk(&current_unit, 0, env) match
         Ok(v) -> Ran(v, rep, output)
         Err(s) ->
             rep.add(error(signal_span(s), signal_message(s)))
             Ran(Nil, rep, output)
-end run_vm
+end run
