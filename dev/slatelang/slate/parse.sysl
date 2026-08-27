@@ -29,6 +29,11 @@ struct Parser
     // The definitions written under `@test`, in the order they were written.
     tests: Buf[string]
 
+    // The types this file declared, in the order they were written.
+    type_names: Buf[string]
+    type_pats: Buf[Pattern]
+    type_public: Buf[bool]
+
     // The names this file lets other files see, in the order they were written.
     //
     // **Gathered here rather than left in the tree.** `export` prefixes an ordinary binding or
@@ -174,10 +179,10 @@ parse(src: Source) -> Parsed
 // `load_program` clears once, before it reads anything.
 parse_source(src: Source) -> Parsed
     val lexed = lex(src)
-    var p = Parser(lexed.tokens, src, lexed.report, buf(), buf(), 0)
+    var p = Parser(lexed.tokens, src, lexed.report, buf(), buf(), buf(), buf(), buf(), 0)
     val stmts = parse_stmts(&p, false)
 
-    Parsed(Program(stmts, p.exports, p.tests), p.report)
+    Parsed(Program(stmts, p.exports, p.type_names, p.type_pats, p.type_public, p.tests), p.report)
 end parse_source
 
 // A run of statements, to the end of the file or to the close of the block they are in.
@@ -226,8 +231,48 @@ private parse_stmt(p: *Parser) -> Stmt
         Async ->
             if at_definition_from(p, 1) then parse_def(p) else parse_expr_stmt(p)
         _ ->
-            if at_definition_from(p, 0) then parse_def(p) else parse_expr_stmt(p)
+            if at_type_decl(p, 0) then parse_type_decl(p, false)
+            elif at_definition_from(p, 0) then parse_def(p)
+            else parse_expr_stmt(p)
 end parse_stmt
+
+// Whether what stands at `i` is `type Name =`.
+//
+// **`type` is a SOFT word**, so a program may still call a variable `type`. Three tokens settle it
+// and the parser has the cursor, which is the same test `end` gets and for the same reason.
+private at_type_decl(p: *Parser, i: usize) -> bool
+    if p.peek_kind_at(i) != Ident then return false
+    if p.text_at(i) != "type" then return false
+    if p.peek_kind_at(i + 1) != Ident then return false
+
+    p.peek_kind_at(i + 2) == Assign
+end at_type_decl
+
+// `type Point = { x: num, y: num }`.
+//
+// **The right-hand side is an ordinary PATTERN**, read by the parser that reads a `match` arm's. That
+// is the whole design: slate already had structural tests over object shapes, and a type is one of
+// those given a name -- so `p is Point` is the `is` slate already had, and nothing new runs.
+private parse_type_decl(p: *Parser, public: bool) -> Stmt
+    val start = p.here()
+
+    p.bump()
+
+    val name = parse_name(p, "a name for the type")
+
+    p.expect(Assign, "`=` and the shape the type stands for")
+
+    val pat = parse_pattern(p)
+
+    if p.depth != 0
+        p.fault(start, "a type belongs to the top level of a file -- it is resolved while compiling, and one declared inside a block would not be there to resolve against")
+    else
+        p.type_names.push(name)
+        p.type_pats.push(pat)
+        p.type_public.push(public)
+
+    stmt(start.to(p.just_taken()), TypeDecl(name, pat))
+end parse_type_decl
 
 // `val name = ...` and `var name = ...`.
 private parse_binding(p: *Parser, immutable: bool) -> Stmt
@@ -264,6 +309,10 @@ private parse_export(p: *Parser) -> Stmt
 
     if !top
         p.fault(start, "`export` belongs to the top level of a file -- what a module lets others see has to be known before it runs, and a name exported from inside a block would not be")
+
+    // **`export type` is how a type crosses a file**, and it reads the same way every other export
+    // does. A type that is not exported is this file's own, exactly as a `val` is.
+    if at_type_decl(p, 0) then return parse_type_decl(p, top)
 
     val s = p.peek() match
         Val -> parse_binding(p, true)
@@ -596,6 +645,37 @@ private at_definition_from(p: *Parser, start: usize) -> bool
 
         i += 1
 
+        // **`p: Point` still leaves a definition told from a call by what follows the `)`**, so all
+        // this has to do is find the end of the list. The annotation is a pattern and a pattern may
+        // hold brackets of its own, which is why the skip counts them rather than looking for the
+        // first `,` it meets.
+        if p.peek_kind_at(i) == Colon
+            i += 1
+
+            var depth: usize = 0
+
+            loop
+                val k = p.peek_kind_at(i)
+
+                if k == Eof then return false
+
+                if k == LBrace || k == LBracket || k == LParen
+                    depth += 1
+                elif k == RBrace || k == RBracket
+                    if depth == 0 then return false
+
+                    depth -= 1
+                elif k == RParen
+                    if depth == 0 then break
+
+                    depth -= 1
+                elif k == Comma && depth == 0
+                    break
+
+                i += 1
+            end loop
+        end if
+
         p.peek_kind_at(i) match
             Comma ->
                 i += 1
@@ -622,10 +702,24 @@ private parse_def(p: *Parser) -> Stmt
     p.expect(LParen, "`(`")
 
     var params: Buf[string] = buf()
+    var checks: Buf[Stmt] = buf()
 
     if !p.at(RParen)
         loop
-            params.push(parse_name(p, "a parameter name"))
+            val pname = parse_name(p, "a parameter name")
+
+            params.push(pname)
+
+            // **`p: Point` becomes a statement at the top of the body**, which is what keeps
+            // annotations off `Def` and `Lambda` and off everything downstream that reads them. What
+            // it buys is the whole point of writing one: the complaint arrives where the value was
+            // handed over rather than wherever it was first used wrongly.
+            if p.accept(Colon)
+                val tname = if p.at(Ident) then p.text(p.here()) else ""
+                val tat = p.here()
+                val tpat = parse_pattern(p)
+
+                checks.push(stmt(tat.to(p.just_taken()), CheckType(pname, tname, tpat)))
 
             if !p.accept(Comma) then break
             if p.at(RParen) then break
@@ -638,11 +732,28 @@ private parse_def(p: *Parser) -> Stmt
     // an indented block too, which needs nothing here because `parse_body` looks for the `Indent`.
     p.accept(Assign)
 
-    val body = parse_body(p)
+    val body = with_checks(checks, parse_body(p))
 
     accept_end_named(p, name)
     stmt(start.to(p.just_taken()), Def(name, params, intern_body(body), is_async))
 end parse_def
+
+// A body with its parameters' checks run before it.
+//
+// **The body is left alone where nothing was annotated**, so an unannotated function is the same
+// tree it always was and costs not one instruction more.
+private with_checks(checks: Buf[Stmt], body: Expr) -> Expr
+    if checks.len() == 0 then return body
+
+    var stmts: Buf[Stmt] = buf()
+
+    for i in 0..<checks.len()
+        stmts.push(checks.at(i))
+
+    // The body's own value is the function's, so it goes last and the checks are only statements.
+    stmts.push(stmt(body.span, Eval(body)))
+    expr(body.span, Block(stmts))
+end with_checks
 
 // An expression on its own, or an assignment to one -- to one place, or to several.
 private parse_expr_stmt(p: *Parser) -> Stmt

@@ -453,6 +453,55 @@ to rather than looking one up when it is reported, because a signal outlives the
 raised it: an unhandled rejection is reported after the loop has drained, by which time the machine
 is somewhere else entirely.
 
+### Types
+
+A type is a shape with a name:
+
+```
+type Point = { x: num, y: num }
+type Circle = { centre: Point, radius: num }
+
+print({ x: 3, y: 4 } is Point)          // true
+
+describe(v) = v match
+    Circle -> s"a circle of radius ${v.radius}"
+    Point  -> s"the point ${v.x}, ${v.y}"
+    _      -> "no idea"
+
+distance(a: Point, b: Point) = ...
+```
+
+**It is TypeScript's `type`, and deliberately so** — the same declaration, the same structural
+reading, asking for *at least* those fields. What differs is that slate's is not erased, and that is
+the whole of its value: one declaration serves both the pattern and the check at a boundary. A
+TypeScript app that reads an API response writes the shape twice, once as a `type` for the checker
+and once as a zod schema for the run; slate needs one.
+
+**Nothing of a type exists at run time.** A name standing in a pattern is replaced by the pattern the
+type declared, while the program is compiled — so `p is Point` is the `is` slate always had, and a
+type costs no instruction.
+
+**A bare name that names no type is still a binding.** That is sysl's rule for a nullary variant and
+slate already had it; declaring a type is what makes the name name something.
+
+**`export type` is how an interface leaves the file it was written in.** It counts as an export for
+the import check and imports like anything else, but binds nothing — the module has no field of that
+name, a type never having been a value.
+
+**A parameter may say what it takes**, and then the complaint lands where the value was handed over:
+
+```
+error: `b` was declared Point, and was given {x: 0}
+```
+
+which is most of what a type buys a language with no checker. What is lost against TypeScript is
+real and worth saying: TS catches a mistake on a path you never ran, and this only fires when that
+path executes.
+
+An interface, in the sense of a set of operations, needs nothing further — functions are values, so
+`type Drawable = { draw: fn }` is one. And a trait's other half, the default methods, is what a proto
+already is.
+
 ### Objects that share their behaviour
 
 `proto` is an ordinary field, and a lookup that misses carries on into it:

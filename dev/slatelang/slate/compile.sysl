@@ -127,6 +127,137 @@ end unwind_to
 // everything one call to `compile_module` emits. The machine's copy is the run-time twin of this.
 private var compiling_source: usize = 0
 
+// -- types -----------------------------------------------------------------------------------------
+
+// Every type any module has declared so far, and where.
+//
+// **Filled as each module compiles, which is why no pre-pass is needed**: modules are compiled in
+// post-order, so by the time a file that imports something is compiled, everything it imports has
+// already registered whatever it declared.
+private var known_source: Buf[usize] = buf()
+private var known_name: Buf[string] = buf()
+private var known_pat: Buf[Pattern] = buf()
+private var known_public: Buf[bool] = buf()
+
+// The types the file being compiled may name: its own, and the exported ones it imported.
+private var visible_names: Buf[string] = buf()
+private var visible_pats: Buf[Pattern] = buf()
+
+// The names this file imported that turned out to be TYPES rather than values.
+//
+// **They must not be compiled into a binding.** A type has no runtime existence, so the module it
+// came from has no field of that name to take -- the import is satisfied entirely by the resolution
+// that already happened while the patterns were compiled.
+private var imported_types: Buf[string] = buf()
+
+// Forget everything, for the next program.
+reset_types()
+    known_source.clear()
+    known_name.clear()
+    known_pat.clear()
+    known_public.clear()
+    visible_names.clear()
+    visible_pats.clear()
+    imported_types.clear()
+
+private declared_in(src: usize, name: string, want_public: bool) -> Option[Pattern]
+    for i in 0..<known_name.len()
+        if known_source.at(i) == src && known_name.at(i) == name
+            if want_public && !known_public.at(i) then return None
+
+            return Some(known_pat.at(i))
+
+    None
+end declared_in
+
+// What `Point` stands for in the file being compiled, if anything does.
+private visible_type(name: string) -> Option[Pattern]
+    for i in 0..<visible_names.len()
+        if visible_names.at(i) == name then return Some(visible_pats.at(i))
+
+    None
+end visible_type
+
+// How deep a type may be resolved through other types before slate calls it a circle.
+private const MaxTypeDepth: usize = 32
+
+// A pattern with every name that stands for a type replaced by what that type stands for.
+//
+// **A bare name in pattern position is a BINDING unless it names something**, which is sysl's rule
+// for a nullary variant and is exactly the rule here -- so `p is Point` is a shape test where a
+// `Point` was declared and binds a variable where none was, with no new syntax either way.
+private resolve_pattern(pat: Pattern, depth: usize) -> Pattern
+    if depth >= MaxTypeDepth then return pat
+
+    *pat.kind match
+        Bind(name) ->
+            visible_type(name) match
+                Some(found) -> resolve_pattern(found, depth + 1)
+                None -> pat
+        At(name, inner) -> pattern(pat.span, PatKind.At(name, resolve_pattern(inner, depth)))
+        ArrayPat(items, open, rest) ->
+            var out: Buf[Pattern] = buf()
+
+            for i in 0..<items.len()
+                out.push(resolve_pattern(items.at(i), depth))
+
+            pattern(pat.span, ArrayPat(out, open, rest))
+        ObjectPat(keys, values) ->
+            var out: Buf[Pattern] = buf()
+
+            for i in 0..<values.len()
+                out.push(resolve_pattern(values.at(i), depth))
+
+            pattern(pat.span, ObjectPat(keys, out))
+        OrPat(alts) ->
+            var out: Buf[Pattern] = buf()
+
+            for i in 0..<alts.len()
+                out.push(resolve_pattern(alts.at(i), depth))
+
+            pattern(pat.span, OrPat(out))
+        _ -> pat
+end resolve_pattern
+
+// A pattern into the unit's table, resolved first.
+private intern_resolved(u: *Unit, pat: Pattern) -> usize = intern_pattern(u, resolve_pattern(pat, 0))
+
+// Record what a module declared, and work out what it may name.
+//
+// **A file sees its own types whether or not they were exported, and an imported one only where
+// `export type` was written** -- which is the same rule every other name in slate follows.
+private open_types(u: *Unit, prog: Program, src: usize)
+    for i in 0..<prog.type_names.len()
+        known_source.push(src)
+        known_name.push(prog.type_names.at(i))
+        known_pat.push(prog.type_pats.at(i))
+        known_public.push(prog.type_public.at(i))
+
+    visible_names.clear()
+    visible_pats.clear()
+    imported_types.clear()
+
+    for i in 0..<prog.type_names.len()
+        visible_names.push(prog.type_names.at(i))
+        visible_pats.push(prog.type_pats.at(i))
+
+    for i in 0..<prog.stmts.len()
+        *prog.stmts.at(i).kind match
+            ImportNames(path, _, names, locals) ->
+                val from = resolve_import(u.sources.at(src).name, path)
+
+                for j in 0..<u.module_paths.len()
+                    if u.module_paths.at(j) == from
+                        for k in 0..<names.len()
+                            declared_in(u.chunks.at(u.modules.at(j)).source, names.at(k), true) match
+                                Some(found) ->
+                                    visible_names.push(locals.at(k))
+                                    visible_pats.push(found)
+                                    imported_types.push(locals.at(k))
+                                None -> ()
+            _ -> ()
+end open_types
+
 // One file to a chunk of its own, answering the module index other files name it by.
 //
 // **Every module is compiled the same way and the entry is simply the last one**, which is what
@@ -145,6 +276,7 @@ compile_module(u: *Unit, prog: Program, src: usize, name: string, is_entry: bool
     var params: Buf[string] = buf()
 
     compiling_source = src
+    open_types(u, prog, src)
     u.chunks.push(Chunk(buf(), params, name, false, src))
 
     // **The top level is not async, so top-level `await` is refused.** node draws the same line for a
@@ -248,6 +380,12 @@ private compile_stmt(u: *Unit, e: *Emit, s: Stmt)
             // leaving one value, so the counter is told what the machine would have had.
             e.sp = e.sp - 1
             push_n(e, PushNil, at, 0, 1)
+        TypeDecl(_, _) ->
+            // A type has no runtime existence: the resolution happened while this was compiled.
+            push_n(e, PushNil, at, 0, 1)
+        CheckType(name, declared, pat) ->
+            push_n(e, Op.CheckType(intern_str(u, name), intern_str(u, declared), intern_resolved(u, pat)), at, 0, 0)
+            push_n(e, PushNil, at, 0, 1)
         Break(label, value) -> jump_out(u, e, at, true, label, value)
         Continue(label) -> jump_out(u, e, at, false, label, None)
 
@@ -262,9 +400,12 @@ private compile_stmt(u: *Unit, e: *Emit, s: Stmt)
             module_index(u, path) match
                 Some(m) ->
                     for i in 0..<names.len()
-                        push_n(e, PushModule(m), at, 0, 1)
-                        push_n(e, GetField(intern_str(u, names.at(i))), at, 1, 1)
-                        push_n(e, DeclareVal(intern_str(u, locals.at(i))), at, 1, 0)
+                        // A type came in when the file was opened and has nothing to bind: the
+                        // module has no field of that name, a type never having been a value.
+                        if !is_imported_type(locals.at(i))
+                            push_n(e, PushModule(m), at, 0, 1)
+                            push_n(e, GetField(intern_str(u, names.at(i))), at, 1, 1)
+                            push_n(e, DeclareVal(intern_str(u, locals.at(i))), at, 1, 0)
                 None -> push_n(e, FailWith(intern_str(u, s"the module `${path}` was never loaded")), at, 0, 0)
 
             push_n(e, PushNil, at, 0, 1)
@@ -277,6 +418,13 @@ private compile_stmt(u: *Unit, e: *Emit, s: Stmt)
 
             push_n(e, PushNil, at, 0, 1)
 end compile_stmt
+
+private is_imported_type(name: string) -> bool
+    for i in 0..<imported_types.len()
+        if imported_types.at(i) == name then return true
+
+    false
+end is_imported_type
 
 // Which module a path written in the file being compiled names.
 //
@@ -730,7 +878,7 @@ compile_expr(u: *Unit, e: *Emit, x: Expr)
             push_n(e, MakeRange(inclusive, lo.is_some(), hi.is_some()), at, ends, 1)
         IsPattern(subject, pat, negated) ->
             compile_expr(u, e, subject)
-            push_n(e, IsPat(intern_pattern(u, pat), negated), at, 1, 1)
+            push_n(e, IsPat(intern_resolved(u, pat), negated), at, 1, 1)
         IncDec(target, up, before) -> compile_inc_dec(u, e, target, up, before, at)
         Call(callee, args) ->
             // **`o.m(a)` is compiled as one thing, because that is the only form a receiver is
@@ -992,7 +1140,7 @@ private compile_match(u: *Unit, e: *Emit, subject: Expr, arms: Buf[Arm], at: Spa
 
         // Reads the subject where it lies and answers whether it took; the subject stays, because the
         // arm after this one wants it.
-        push_n(e, TestPat(intern_pattern(u, arm.pattern)), at, 0, 1)
+        push_n(e, TestPat(intern_resolved(u, arm.pattern)), at, 0, 1)
 
         val missed = push_n(e, JumpIfFalse(0), at, 1, 0)
         var guard_missed: usize = 0
