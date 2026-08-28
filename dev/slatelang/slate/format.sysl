@@ -1,0 +1,269 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{repeat, str_builder}
+import sysl.time.{Instant, LocalDate, LocalDateTime, LocalTime, day_of, day_of_year, hour_of,
+    minute_of, month_name, month_of, second_of, us_per_second, weekday, weekday_name, year_of}
+
+// `v.format(pattern)` -- a reading written the way a person wants to read it.
+//
+// **The pattern language is the user's own**, from `io.github.edadma.datetime`, written when Scala
+// Native had no date library at all. It is moment.js-flavoured -- `YYYY-MM-DD`, `WWWW`, `h12`, `a`
+// -- with one improvement over moment worth keeping: **literal text is fenced with `|` bars** rather
+// than moment's `[...]`, which reads far better in a pattern that is mostly punctuation:
+// `WWWW, MMMM D, Y |at| h12:mm a`.
+//
+// | `Y` `YY` `YYYY` | the year: as written, its last two digits, or four padded |
+// | `M` `MM` | the month as a number |
+// | `MMM` `MMMM` | `Aug`, `August` |
+// | `D` `DD` | the day of the month |
+// | `DDD` | the day of the year |
+// | `WWW` `WWWW` | `Fri`, `Friday` |
+// | `h` `hh` | the hour, 0 to 23 |
+// | `h12` `hh12` | the hour, 1 to 12 |
+// | `a` `A` | `am`, `AM` |
+// | `m` `mm` `s` `ss` | the minute and the second |
+// | `f` to `ffffff` | the fraction of a second, to that many digits |
+// | `z` `zz` | `-04:00`, `-0400` |
+// | `zzz` `zzzz` | `EDT`, `America/Toronto` |
+// | `\|text\|` | written out as it stands |
+//
+// **Three changes from the Scala one, and all three are corrections rather than taste:**
+//
+// - **`h12` at midnight and at noon.** The original reads `if (hours > 12) hours - 12 else hours`,
+//   which renders 00:30 as `0:30 am` where every clock in the world shows `12:30`. It is `% 12` with
+//   zero meaning twelve.
+// - **`a` is `am` and `A` is `AM`**, where the original wrote `a.m.`. moment's rule, and the one a
+//   reader will guess; a pattern wanting the stops writes them itself with `|a.m.|`.
+// - **`z` is lower case**, so `Z` stays a literal and the original's `YYYY-MM-DDThh:mm:ss.fffZ`
+//   still means what it meant. The zone elements are new here because the Scala library had one
+//   type and slate has a zone to ask.
+//
+// **AN ELEMENT THE VALUE DOES NOT HAVE IS REFUSED, NOT FILLED IN WITH ZEROS.** `date.format("hh:mm")`
+// says a date has no time of day. A date rendered as `00:00` is a midnight the program never meant,
+// and it is exactly the kind of value that then gets compared, stored and reported on.
+
+// What every element of a pattern reads from, gathered once before the scan begins.
+struct Reading
+    dated: bool
+    timed: bool
+    zoned: bool
+    date: LocalDate
+    time: LocalTime
+    zone: usize
+    us: long
+
+do_format(args: Buf[Value], at: Span) -> Step
+    wants(args, 2, at, "format", "a reading and a pattern")?
+
+    val v = args.at(0)
+    val pattern = text_argument(args.at(1), at, "format", "a pattern")?
+
+    wall_reading(v) match
+        Some(w) ->
+            val r = v match
+                ZonedVal(us, z) -> Reading(true, true, true, w.date, w.time, z, us)
+                _ -> Reading(has_date(v), has_time(v), false, w.date, w.time, 0, 0)
+
+            Ok(str_value(rendered(r, pattern, at)?))
+        None ->
+            // **An instant is the one temporal value with nothing to format**, and the message says
+            // the fix rather than only the refusal: it has no calendar until a zone is named.
+            v match
+                InstantVal(_) -> fault(at, "an instant has no calendar to format -- read it in a zone first, with `t.at(zone)`")
+                other -> fault(at, s"`format` takes a date, a time, a dateTime or a zoned reading, and this is ${other.type_name()}")
+end do_format
+
+// The scan itself: a run of one letter is an element, a `|` opens literal text, anything else stands
+// for itself.
+private rendered(r: Reading, pattern: string, at: Span) -> Result[string, Signal]
+    val b = pattern.bytes
+    var out = str_builder()
+    var i: usize = 0
+
+    loop
+        if i >= b.len then return Ok(out.finish())
+
+        val c = b[i]
+
+        if c == u8('|')
+            var j = i + 1
+
+            loop
+                if j >= b.len then return Err(failure(at, "this pattern opens literal text with `|` and never closes it"))
+                if b[j] == u8('|') then break
+
+                out.push_char(char(u32(b[j])))
+                j = j + 1
+
+            i = j + 1
+        elif is_element(c)
+            var n: usize = 1
+
+            loop
+                if i + n >= b.len || b[i + n] != c then break
+
+                n = n + 1
+
+            // `h12` and `hh12` are the two elements whose spelling is not a run of one letter, and
+            // they are read here rather than by the scanner above so that a bare `h` keeps working.
+            var twelve = false
+
+            if c == u8('h') && i + n + 1 < b.len && b[i + n] == u8('1') && b[i + n + 1] == u8('2')
+                twelve = true
+
+            out.push(element(r, c, n, twelve, at)?)
+            i = i + n + (if twelve then 2 else 0)
+        else
+            out.push_char(char(u32(c)))
+            i = i + 1
+end rendered
+
+// Which letters begin an element, every other character standing for itself.
+private is_element(c: u8) -> bool
+    if c == u8('Y') || c == u8('M') || c == u8('D') || c == u8('W') then return true
+    if c == u8('h') || c == u8('m') || c == u8('s') || c == u8('f') then return true
+
+    c == u8('a') || c == u8('A') || c == u8('z')
+
+// One element, rendered.
+private element(r: Reading, c: u8, n: usize, twelve: bool, at: Span) -> Result[string, Signal]
+    if c == u8('Y')
+        needs_date(r, "the year", at)?
+
+        val y = year_of(r.date)
+
+        if n == 1 then return Ok(s"${y}")
+        if n == 2 then return Ok(pad(long(y % 100), 2))
+        if n == 4 then return Ok(pad(long(y), 4))
+
+        return Err(failure(at, s"a year is `Y`, `YY` or `YYYY`, and this is ${repeat("Y", n)}"))
+
+    if c == u8('M')
+        needs_date(r, "the month", at)?
+
+        val m = month_of(r.date)
+
+        if n == 1 then return Ok(s"${m}")
+        if n == 2 then return Ok(pad(long(m), 2))
+        if n == 3 then return Ok(shortened(month_name(m)))
+        if n == 4 then return Ok(month_name(m))
+
+        return Err(failure(at, s"a month is `M`, `MM`, `MMM` or `MMMM`, and this is ${repeat("M", n)}"))
+
+    if c == u8('D')
+        needs_date(r, "the day", at)?
+
+        if n == 1 then return Ok(s"${day_of(r.date)}")
+        if n == 2 then return Ok(pad(long(day_of(r.date)), 2))
+        if n == 3 then return Ok(pad(long(day_of_year(r.date)), 3))
+
+        return Err(failure(at, s"a day is `D` or `DD`, and the day of the year is `DDD`, and this is ${repeat("D", n)}"))
+
+    if c == u8('W')
+        needs_date(r, "the weekday", at)?
+
+        val name = weekday_name(weekday(r.date))
+
+        if n == 3 then return Ok(shortened(name))
+        if n == 4 then return Ok(name)
+
+        return Err(failure(at, s"a weekday is `WWW` or `WWWW`, and this is ${repeat("W", n)}"))
+
+    if c == u8('h')
+        needs_time(r, "the hour", at)?
+
+        val h = hour_of(r.time)
+        val shown = if twelve then (if h % 12 == 0 then 12 else h % 12) else h
+
+        if n == 1 then return Ok(s"${shown}")
+        if n == 2 then return Ok(pad(long(shown), 2))
+
+        return Err(failure(at, s"an hour is `h`, `hh`, `h12` or `hh12`, and this is ${repeat("h", n)}"))
+
+    if c == u8('m')
+        needs_time(r, "the minute", at)?
+
+        if n == 1 then return Ok(s"${minute_of(r.time)}")
+        if n == 2 then return Ok(pad(long(minute_of(r.time)), 2))
+
+        return Err(failure(at, s"a minute is `m` or `mm`, and this is ${repeat("m", n)}"))
+
+    if c == u8('s')
+        needs_time(r, "the second", at)?
+
+        if n == 1 then return Ok(s"${second_of(r.time)}")
+        if n == 2 then return Ok(pad(long(second_of(r.time)), 2))
+
+        return Err(failure(at, s"a second is `s` or `ss`, and this is ${repeat("s", n)}"))
+
+    if c == u8('f')
+        needs_time(r, "the fraction of a second", at)?
+
+        // **Six digits and no more, because a slate reading is microseconds.** A pattern asking for
+        // nanoseconds would be asking for three digits that are always zero, which is a lie about
+        // the precision of the value it is rendering.
+        if n > 6 then return Err(failure(at, s"a fraction of a second is up to six digits here, since a reading is microseconds, and this is ${repeat("f", n)}"))
+
+        var scaled = r.time.us % us_per_second
+
+        for _ in 0..<(6 - n)
+            scaled = scaled / 10
+
+        return Ok(pad(scaled, n))
+
+    if c == u8('a') || c == u8('A')
+        needs_time(r, "morning or afternoon", at)?
+
+        if n != 1 then return Err(failure(at, s"morning or afternoon is `a` or `A`, and this is ${repeat(if c == u8('a') then "a" else "A", n)}"))
+
+        val pm = hour_of(r.time) >= 12
+
+        return Ok(if c == u8('a') then (if pm then "pm" else "am") else (if pm then "PM" else "AM"))
+
+    // The zone, which only a zoned reading has -- and the message says so rather than writing `Z`
+    // for an offset nobody stated.
+    if !r.zoned
+        return Err(failure(at, "only a zoned reading knows its zone -- read this one at a zone first, with `.at(zone)`"))
+
+    if n == 1 then return Ok(offset_written(zone_offset(r.zone, Instant(r.us)).minutes, true))
+    if n == 2 then return Ok(offset_written(zone_offset(r.zone, Instant(r.us)).minutes, false))
+    if n == 3 then return Ok(zone_short_name(r.zone, Instant(r.us)))
+    if n == 4 then return Ok(zone_title(r.zone))
+
+    Err(failure(at, s"a zone is `z`, `zz`, `zzz` or `zzzz`, and this is ${repeat("z", n)}"))
+end element
+
+// The two refusals, which name the part of the pattern rather than the pattern.
+private needs_date(r: Reading, what: string, at: Span) -> Result[unit, Signal]
+    if r.dated then return Ok(())
+
+    Err(failure(at, s"this pattern asks for ${what} and the value has no date"))
+
+private needs_time(r: Reading, what: string, at: Span) -> Result[unit, Signal]
+    if r.timed then return Ok(())
+
+    Err(failure(at, s"this pattern asks for ${what} and the value has no time of day"))
+
+// A number written to at least this many digits.
+private pad(n: long, width: usize) -> string
+    val digits = s"${n}"
+
+    if digits.bytes.len >= width then return digits
+
+    s"${repeat("0", width - digits.bytes.len)}${digits}"
+
+// The first three letters of a name, which is what `MMM` and `WWW` are.
+//
+// **Cut from the long name rather than held in a second table**, so the two can never disagree about
+// what a month is called -- and the three-letter forms are exactly the first three letters in
+// English for all nineteen names.
+private shortened(name: string) -> string
+    var out = str_builder()
+    val b = name.bytes
+
+    for i in 0..<3
+        out.push_char(char(u32(b[i])))
+
+    out.finish()

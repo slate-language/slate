@@ -1,0 +1,513 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, str_builder}
+import sysl.time.{Instant, LocalDate, LocalDateTime, LocalTime, Offset, Resolution, Weekday, at_offset,
+    checked_date, date_at, date_text, datetime_at, day_of, day_of_year, days_in_month, from_offset,
+    hour_of, leap_year, minute_of, month_name, month_of, on_or_after, parse_date, parse_datetime,
+    parse_offset, parse_time, parse_timestamp, plus_days, plus_months, resolve, second_of, time_at,
+    us_of, us_per_day, us_per_hour, us_per_milli, us_per_minute, us_per_second, wall_of,
+    wall_us, weekday, weekday_name, year_of}
+import sysl.time.tzif
+import sysl.posix.time.{local_offset, local_zone_data, monotonic, now, zone_data}
+
+// Dates and times, as a slate program reaches them.
+//
+// **JavaScript has one date type and everything wrong with it follows from that.** A `Date` is an
+// instant that answers calendar questions by silently reading the host's zone, so `d.getFullYear()`
+// gives one answer on the machine it was written on and another on the server, with nothing in the
+// program saying which zone was meant. slate has eight types instead, and the split is the design:
+//
+// | `instant` | a point on the timeline. No year, no month, no hour |
+// | `zoned` | an instant read in a zone: the type an appointment holds |
+// | `date`, `time`, `dateTime` | civil readings, which name no point until a zone is given |
+// | `zone` | a region's rules, or a fixed offset |
+// | `duration` | an exact length of timeline |
+// | `period` | a calendar length: months and days |
+//
+// **`duration` against `period` is the one that earns its keep.** A duration may be added to
+// anything and lands exactly that far along the timeline; a period may be added only to a calendar
+// reading and moves it by the calendar. So `t + days(1)` keeps the wall clock across a daylight
+// saving change and `t + hours(24)` does not, and the program says which it meant instead of getting
+// whichever the library picked. Every "meeting moved by an hour twice a year" bug is this
+// distinction missing.
+//
+// **The arithmetic underneath is `sysl.time`'s**, which is a civil calendar, an instant and a
+// duration and no host in it at all; the zone half is `sysl.time.tzif` reading the IANA database
+// through `sysl.posix.time`. Nothing here reimplements a calendar.
+
+// -- zones ----------------------------------------------------------------------------------------
+
+// A zone slate has been asked for, kept for as long as the process runs.
+//
+// **A `ZoneVal` is a slot in this table and not the rules themselves**, for the reason `Socket` is a
+// slot: a parsed zone is a struct of counted sequences and a counted box may not live in the
+// collected heap at all (`obj.sysl`). Unlike a socket there is nothing to release, so no generation
+// is stamped -- a slot means the same zone for the life of the program.
+//
+// **The bytes are kept and the parse is redone per question.** `tzif.Zone` is a *view* of the bytes
+// it was decoded from, so keeping the view without its data is a dangling one; and the decode is a
+// handful of offset reads with no allocation in it, which is cheaper than the file read it would
+// save.
+struct ZoneEntry
+    name: string
+
+    // A zone that is a fixed offset carries it here and no table at all. `+05:30` and `UTC` are
+    // zones in every sense that matters to a reading -- they say what the clock shows -- and making
+    // them a separate slate type would double every signature to no purpose.
+    fixed: bool
+    minutes: int
+    data: []u8
+
+// **Module storage, and there is one of these to a process**, as the interpreter's other tables are.
+var zones: Buf[ZoneEntry] = buf()
+
+// Put the zone table back to nothing.
+//
+// A zone is immutable and interning one twice is harmless, so this exists for the suite's sake
+// rather than the machine's: a test that names a zone should not depend on whether an earlier test
+// named it first.
+reset_zones()
+    zones = buf()
+
+// The slot for a zone that is a fixed offset from UTC, interning it if this is the first ask.
+private fixed_zone(name: string, minutes: int) -> usize
+    for i in 0..<zones.len()
+        if zones.at(i).name == name then return i
+
+    zones.push(ZoneEntry(name, true, minutes, []))
+    zones.len() - 1
+
+// The slot for `UTC`, which every program that formats an instant reaches for.
+utc_zone() -> usize = fixed_zone("UTC", 0)
+
+// The slot for a zone named the way the IANA database names one, or the sentence saying why there is
+// no such zone.
+//
+// **A name is refused before it reaches the file system where it could not be a zone name**, because
+// `zone(name)` takes a string a program may have read from a file: a name with a `..` in it would
+// otherwise name any file on the host, which would be read and then complained about as a malformed
+// zone -- a complaint about the wrong thing, from a read that should never have happened.
+zone_named(name: string) -> Result[usize, string]
+    for i in 0..<zones.len()
+        if zones.at(i).name == name then return Ok(i)
+
+    if name == "UTC" || name == "Z" || name == "GMT" then return Ok(fixed_zone("UTC", 0))
+
+    val b = name.bytes
+
+    if b.len > 0 && (b[0] == u8('+') || b[0] == u8('-'))
+        return parse_offset(name) match
+            Ok(o) -> Ok(fixed_zone(name, o.minutes))
+            Err(_) -> Err(s"`${name}` is not an offset -- an offset is written `+05:30` or `-0400`")
+
+    if b.len == 0 || b[0] == u8('/') || name.contains("..")
+        return Err(s"`${name}` is not the name of a zone")
+
+    zone_data(name) match
+        Ok(bytes) ->
+            // **Parsed once here and thrown away**, to find out whether the file is a zone at all.
+            // A name that turns out to be an ordinary file has to be refused where the program named
+            // it, not later from inside an arithmetic call that has nothing to say about it.
+            tzif.parse(bytes) match
+                Ok(_) ->
+                    zones.push(ZoneEntry(name, false, 0, bytes))
+                    Ok(zones.len() - 1)
+                Err(_) -> Err(s"`${name}` names a file that is not a time zone")
+        Err(_) -> Err(s"there is no zone called `${name}` on this host")
+
+// The zone this host is set to.
+//
+// **Two ways of answering it, and the second is not a lesser one.** `/etc/localtime` carries the
+// whole table, so a reading a year from now is right; where it cannot be read, libc still answers
+// what the offset is *now*, which is enough for everything but a date far from today. Faulting
+// instead would take a program down over a host's configuration, and there is a correct answer to
+// give.
+local_zone() -> usize
+    for i in 0..<zones.len()
+        if zones.at(i).name == "local" then return i
+
+    local_zone_data() match
+        Ok(bytes) ->
+            tzif.parse(bytes) match
+                Ok(_) ->
+                    zones.push(ZoneEntry("local", false, 0, bytes))
+                    return zones.len() - 1
+                Err(_) -> ()
+        Err(_) -> ()
+
+    fixed_zone("local", local_offset(now()).minutes)
+
+// What the zone at this slot is called.
+zone_title(id: usize) -> string = zones.at(id).name
+
+// How far this zone's clocks were set from UTC at that instant.
+//
+// **A table that will not decode answers zero rather than raising**, which cannot happen: the bytes
+// were decoded once before the slot was ever handed out. Saying so here would put a `Result` on
+// every reading in the file for a case that is already excluded.
+zone_offset(id: usize, t: Instant) -> Offset
+    val z = zones.at(id)
+
+    if z.fixed then return Offset(z.minutes)
+
+    tzif.parse(z.data) match
+        Ok(table) ->
+            tzif.offset_at(table, t) match
+                Ok(o) -> o
+                Err(_) -> Offset(0)
+        Err(_) -> Offset(0)
+
+// Whether daylight saving was in force here at that instant. A fixed offset never has any.
+zone_in_dst(id: usize, t: Instant) -> bool
+    val z = zones.at(id)
+
+    if z.fixed then return false
+
+    tzif.parse(z.data) match
+        Ok(table) ->
+            tzif.is_dst_at(table, t) match
+                Ok(b) -> b
+                Err(_) -> false
+        Err(_) -> false
+
+// What the zone called itself at that instant -- `EST`, `EDT`, `+0545`.
+zone_short_name(id: usize, t: Instant) -> string
+    val z = zones.at(id)
+
+    if z.fixed then return z.name
+
+    tzif.parse(z.data) match
+        Ok(table) ->
+            tzif.abbrev_at(table, t) match
+                Ok(s) -> s
+                Err(_) -> z.name
+        Err(_) -> z.name
+
+// -- reading a value back as a calendar -------------------------------------------------------
+
+// The civil reading a zoned value shows.
+zoned_wall(us: long, zid: usize) -> LocalDateTime = at_offset(Instant(us), zone_offset(zid, Instant(us)))
+
+// The wall reading any of the three calendar-shaped values carries, or nothing where the value is
+// not one of them.
+//
+// **One question asked of three types**, which is what lets `year`, `month`, `day` and the rest be
+// one implementation each rather than three. A `date` reads as midnight and a `time` as the epoch's
+// own day; a caller that would be wrong to accept one of those checks for itself.
+wall_reading(v: Value) -> Option[LocalDateTime] = v match
+    DateVal(d) -> Some(LocalDateTime(LocalDate(d), LocalTime(0)))
+    TimeVal(us) -> Some(LocalDateTime(LocalDate(0), LocalTime(us)))
+    DateTimeVal(d, us) -> Some(LocalDateTime(LocalDate(d), LocalTime(us)))
+    ZonedVal(us, z) -> Some(zoned_wall(us, z))
+    _ -> None
+
+// Whether this value carries a date, which the year, month and weekday questions need and a bare
+// time of day does not have.
+has_date(v: Value) -> bool = v match
+    DateVal(_) -> true
+    DateTimeVal(_, _) -> true
+    ZonedVal(_, _) -> true
+    _ -> false
+
+// Whether this value carries a time of day.
+has_time(v: Value) -> bool = v match
+    TimeVal(_) -> true
+    DateTimeVal(_, _) -> true
+    ZonedVal(_, _) -> true
+    _ -> false
+
+// -- how a temporal value prints ----------------------------------------------------------------
+
+// ISO 8601 throughout, which is the one format that sorts as text in the order it sorts as time.
+//
+// **A zoned reading prints its offset and then its zone in brackets**, which is Java's form and is
+// the only one that round-trips: the offset alone loses which zone it was, and the name alone loses
+// which side of a transition the reading was on.
+temporal_text(v: Value) -> string = v match
+    InstantVal(us) -> s"${date_text(wall_of(us).date)}T${clock_text(wall_of(us).time.us)}Z"
+    DurationVal(us) -> duration_text(us)
+    DateVal(d) -> date_text(LocalDate(d))
+    TimeVal(us) -> clock_text(us)
+    DateTimeVal(d, us) -> s"${date_text(LocalDate(d))}T${clock_text(us)}"
+    ZoneVal(id) -> zone_title(id)
+    ZonedVal(us, z) ->
+        val wall = zoned_wall(us, z)
+        val off = offset_written(zone_offset(z, Instant(us)).minutes, true)
+
+        // **A zone that is a fixed offset does not name itself again.** `...Z[UTC]` and
+        // `...+05:30[+05:30]` say one thing twice; the bracket is there for a zone whose rules the
+        // offset alone does not identify, which is exactly the named ones. Java's form, and its
+        // reason.
+        val named = if zones.at(z).fixed then "" else s"[${zone_title(z)}]"
+
+        s"${date_text(wall.date)}T${clock_text(wall.time.us)}${off}${named}"
+    PeriodVal(months, days) -> period_text(months, days)
+    _ -> "?"
+
+// A time of day, always with its seconds.
+//
+// **`sysl.time`'s own `time_text` drops the seconds where they are zero**, which is Java's rule and
+// is right for a library whose output a person reads. slate prints values into logs and into files
+// that other programs read back column by column, so a rendering whose *shape* depends on the value
+// is a trap: `09:30` and `09:30:01` are different lengths, and every consumer that lines them up or
+// slices them has to handle both. The fraction is the one part that appears only when it is there,
+// since six zeros after every timestamp is noise nothing wants.
+clock_text(us: long) -> string
+    val h = two_digits(int(us / us_per_hour))
+    val m = two_digits(int(us % us_per_hour / us_per_minute))
+    val s = two_digits(int(us % us_per_minute / us_per_second))
+    val fraction = us % us_per_second
+
+    if fraction == 0 then return s"${h}:${m}:${s}"
+
+    var digits = str_builder()
+    var scale = us_per_second / 10
+    var left = fraction
+
+    // Trailing zeros are dropped, so a millisecond reads as `.001` rather than `.001000`.
+    loop
+        if left == 0 then break
+
+        digits.push(s"${left / scale}")
+        left = left % scale
+        scale = scale / 10
+
+    s"${h}:${m}:${s}.${digits.finish()}"
+
+// An offset as a clock reading is written, `+05:30` or `-0400`, with `Z` for none of it.
+offset_written(minutes: int, colon: bool) -> string
+    if minutes == 0 then return "Z"
+
+    val sign = if minutes < 0 then "-" else "+"
+    val n = if minutes < 0 then -minutes else minutes
+
+    s"${sign}${two_digits(n / 60)}${if colon then ":" else ""}${two_digits(n % 60)}"
+
+// A number as two digits, which every part of a clock reading is written as.
+two_digits(n: int) -> string = if n < 10 then s"0${n}" else s"${n}"
+
+// A length of timeline as a person states one: `1h 30m`, `-45s`, `0s`.
+//
+// **Not ISO 8601's `PT1H30M`**, which is a format for machines and is what a program would have to
+// take apart to say anything to a person. Nothing reads this back -- `micros` and its siblings are
+// what a program asks with -- so the only reader is a person and it is written for them.
+private duration_text(us: long) -> string
+    if us == 0 then return "0s"
+
+    val neg = us < 0
+    var left = if neg then -us else us
+    var out = str_builder()
+
+    if neg then out.push("-")
+
+    val h = left / us_per_hour
+    left = left % us_per_hour
+
+    val m = left / us_per_minute
+    left = left % us_per_minute
+
+    val s = left / us_per_second
+    left = left % us_per_second
+
+    var first = true
+
+    if h != 0
+        out.push(s"${h}h")
+        first = false
+
+    if m != 0
+        if !first then out.push(" ")
+
+        out.push(s"${m}m")
+        first = false
+
+    if s != 0
+        if !first then out.push(" ")
+
+        out.push(s"${s}s")
+        first = false
+
+    if left != 0
+        if !first then out.push(" ")
+
+        // Sub-second remainders are written in milliseconds where they are whole ones, since that is
+        // the unit a person reading a duration is nearly always working in.
+        if left % us_per_milli == 0 then out.push(s"${left / us_per_milli}ms") else out.push(s"${left}us")
+
+    out.finish()
+
+// A calendar length: `1y 2mo 3d`, and `0d` for none of it.
+//
+// **Months and days are printed separately and never folded together**, which is the type's whole
+// claim: `months(1)` and `days(30)` are different lengths and a rendering that made them look alike
+// would be the first place the distinction leaked away.
+private period_text(months: int, days: int) -> string
+    if months == 0 && days == 0 then return "0d"
+
+    var out = str_builder()
+    val y = months / 12
+    val mo = months % 12
+    var first = true
+
+    if y != 0
+        out.push(s"${y}y")
+        first = false
+
+    if mo != 0
+        if !first then out.push(" ")
+
+        out.push(s"${mo}mo")
+        first = false
+
+    if days != 0
+        if !first then out.push(" ")
+
+        out.push(s"${days}d")
+
+    out.finish()
+
+// A string argument, checked the way `text.sysl` checks one.
+//
+// **A second name for one question, and the module namespace is the reason.** `text_of` is taken
+// twice already -- `text.sysl` reads a slate string out of a value and `project.sysl` reads one out
+// of a manifest -- and a file-private name still occupies the module's namespace, so a third
+// spelling was cheaper than renaming either. Nothing about it is temporal; it lives here because
+// `calendar.sysl` and `format.sysl` both want it.
+text_argument(v: Value, at: Span, name: string, which: string) -> Result[string, Signal]
+    v match
+        Str(p) -> Ok(p.s)
+        other -> Err(failure(at, s"`${name}` takes ${which}, and this is ${other.type_name()}"))
+
+// -- arithmetic ----------------------------------------------------------------------------------
+
+// `+`, `-`, `*` and the orderings, where either side is temporal.
+//
+// **It answers `None` for a pair it has nothing to say about**, so `arith` in `runtime.sysl` falls
+// through to the sentence naming both sides and there is one such sentence rather than two.
+//
+// **The rule that makes it worth reading: a `duration` may be added to anything and a `period` only
+// to a calendar reading.** An instant plus a period is refused in as many words, because a period is
+// a calendar step and an instant has no calendar -- `now() + days(1)` has no answer until somebody
+// says where they are standing.
+temporal_arith(op: Tok, a: Value, b: Value, at: Span) -> Option[Step] = a match
+    InstantVal(x) -> b match
+        DurationVal(d) -> shifted(op, at, InstantVal(x + d), InstantVal(x - d))
+        InstantVal(y) -> if op == Minus then Some(Ok(DurationVal(x - y))) else ordered(op, x, y)
+        PeriodVal(_, _) ->
+            if op == Plus || op == Minus
+                Some(fault(at, "an instant has no calendar to move by -- read it in a zone first, with `t.at(zone)`"))
+            else None
+        _ -> None
+    DurationVal(x) -> b match
+        DurationVal(y) ->
+            if op == Plus then Some(Ok(DurationVal(x + y)))
+            elif op == Minus then Some(Ok(DurationVal(x - y)))
+            else ordered(op, x, y)
+        Int(n) -> if op == Star then Some(Ok(DurationVal(x * n))) elif op == Slash then divided(at, x, n) else None
+        InstantVal(y) -> if op == Plus then Some(Ok(InstantVal(x + y))) else None
+        _ -> None
+    PeriodVal(mo, d) -> b match
+        PeriodVal(mo2, d2) ->
+            if op == Plus then Some(Ok(PeriodVal(mo + mo2, d + d2)))
+            elif op == Minus then Some(Ok(PeriodVal(mo - mo2, d - d2)))
+            else None
+        Int(n) -> if op == Star then Some(Ok(PeriodVal(mo * int(n), d * int(n)))) else None
+        _ -> None
+    DateVal(day) -> b match
+        PeriodVal(mo, d) -> shifted(op, at, DateVal(moved_date(day, mo, d)), DateVal(moved_date(day, -mo, -d)))
+        DateVal(other) ->
+            // **The difference of two dates is a period of DAYS and not of months**, because the
+            // number of months between two dates depends on which end you count from: January 31st
+            // to March 1st is one month and a day, or two months less a day, and neither is wrong.
+            if op == Minus then Some(Ok(PeriodVal(0, day - other))) else ordered(op, long(day), long(other))
+        _ -> None
+    TimeVal(x) -> b match
+        // A bare reading has no arithmetic at all -- see `value.sysl`. Ordering two of them is not
+        // arithmetic and is perfectly meaningful.
+        TimeVal(y) -> ordered(op, x, y)
+        _ -> None
+    DateTimeVal(day, us) -> b match
+        DurationVal(d) -> shifted(op, at, wall_shifted(day, us, d), wall_shifted(day, us, -d))
+        PeriodVal(mo, d) ->
+            shifted(op, at, DateTimeVal(moved_date(day, mo, d), us), DateTimeVal(moved_date(day, -mo, -d), us))
+        DateTimeVal(day2, us2) ->
+            val x = long(day) * us_per_day + us
+            val y = long(day2) * us_per_day + us2
+
+            if op == Minus then Some(Ok(DurationVal(x - y))) else ordered(op, x, y)
+        _ -> None
+    ZonedVal(us, z) -> b match
+        // **A duration moves a zoned reading along the timeline and a period moves its calendar.**
+        // An hour after 01:30 on a night the clocks go forward is 03:30; a day after Saturday at
+        // 09:00 is Sunday at 09:00, whatever happened to the clocks in between. Both are right and
+        // they are different answers, which is the entire reason for two types.
+        DurationVal(d) -> shifted(op, at, ZonedVal(us + d, z), ZonedVal(us - d, z))
+        PeriodVal(mo, d) -> shifted(op, at, calendar_moved(us, z, mo, d), calendar_moved(us, z, -mo, -d))
+        ZonedVal(us2, _) ->
+            // **Ordered by the instant, so two readings in different zones compare as moments.**
+            // Equality is stricter and lives in `same_plain`: 09:00 in Toronto and 09:00 in Tokyo
+            // are not the same reading even though neither is before the other.
+            if op == Minus then Some(Ok(DurationVal(us - us2))) else ordered(op, us, us2)
+        _ -> None
+    Int(n) -> b match
+        DurationVal(y) -> if op == Star then Some(Ok(DurationVal(n * y))) else None
+        _ -> None
+    _ -> None
+
+// `+` and `-` over a pair this file has already worked out both answers for.
+private shifted(op: Tok, at: Span, forward: Value, back: Value) -> Option[Step]
+    if op == Plus then return Some(Ok(forward))
+    if op == Minus then return Some(Ok(back))
+
+    None
+
+// The four orderings, over whatever pair of numbers stands for the two values.
+private ordered(op: Tok, x: long, y: long) -> Option[Step] = op match
+    Lt -> Some(Ok(Bool(x < y)))
+    LtEq -> Some(Ok(Bool(x <= y)))
+    Gt -> Some(Ok(Bool(x > y)))
+    GtEq -> Some(Ok(Bool(x >= y)))
+    _ -> None
+
+// A duration cut into equal parts, which is the one division that means anything here.
+private divided(at: Span, us: long, n: long) -> Option[Step]
+    if n == 0 then return Some(fault(at, "this divides a duration by zero"))
+
+    Some(Ok(DurationVal(us / n)))
+
+// A day count moved by whole months and then by whole days.
+//
+// **Months first and days after, which is the order every calendar library settles on** and is worth
+// stating because the other order gives different answers: the 31st of January plus one month plus
+// one day is the 1st of March, and plus one day plus one month is the 1st of March too -- but the
+// 30th of January plus a month and a day is the 1st of March one way and the 28th of February plus
+// a day the other. Months are clamped to the length of the month they land in.
+private moved_date(day: int, months: int, days: int) -> int =
+    plus_days(LocalDateTime(plus_months(LocalDate(day), months), LocalTime(0)), days).date.day
+
+// A civil reading moved along the wall clock by a length of timeline.
+private wall_shifted(day: int, us: long, by: long) -> Value
+    val moved = wall_of(long(day) * us_per_day + us + by)
+
+    DateTimeVal(moved.date.day, moved.time.us)
+
+// A zoned reading moved by the calendar: the wall clock is kept and the instant is worked out again.
+//
+// **This is what a period is for.** The reading moves by whole days and months as a person would read
+// them off a calendar, and where that lands on a wall time the zone does not have -- the hour the
+// clocks skipped -- the reading is pushed forward past the gap rather than refused, since a program
+// adding a day to a date is not asking a question about daylight saving.
+private calendar_moved(us: long, zid: usize, months: int, days: int) -> Value
+    val wall = zoned_wall(us, zid)
+    val moved = LocalDateTime(LocalDate(moved_date(wall.date.day, months, days)), wall.time)
+
+    resolve(moved, t -> zone_offset(zid, t)) match
+        Unique(t) -> ZonedVal(t.us, zid)
+
+        // An hour that happens twice takes the first of them, which is what a calendar entry means
+        // by it: the clock reads that once before the change and once after, and the earlier is the
+        // one the day continued into.
+        Ambiguous(earlier, _) -> ZonedVal(earlier.us, zid)
+        Gap(before, _) -> ZonedVal(from_offset(moved, before).us, zid)

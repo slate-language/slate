@@ -1,0 +1,576 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.to_lower
+import sysl.time.{Instant, LocalDate, LocalDateTime, LocalTime, Resolution, Weekday, at_offset, checked_date,
+    date_at, day_of, day_of_year, days_in_month, from_offset, hour_of, leap_year, minute_of,
+    month_name, month_of, on_or_after, parse_date, parse_datetime, parse_time, parse_timestamp,
+    resolve, second_of, time_at, us_per_day, us_per_hour, us_per_milli, us_per_minute, us_per_second,
+    weekday, weekday_name, year_of}
+import sysl.posix.time.{monotonic, now}
+
+// What a program calls to ask a calendar question.
+//
+// **One word per question, and the receiver says which question it is.** `2.hours()` makes a length
+// and `d.hours()` asks how many whole hours a length is; `date(2026, 8, 28)` builds a calendar day
+// and `date(z)` reads one off a zoned reading. That is `method.sysl`'s rule -- a builtin method is
+// the free function with the receiver in front -- carried into a vocabulary where English already
+// uses one word for the noun and the verb.
+//
+// **The plural is a length and the singular is a part of a reading**: `years(3)` against `year(d)`,
+// `months(2)` against `month(d)`. Nothing else tells them apart and nothing else needs to.
+
+// `now()` -- this moment, as a point on the timeline.
+//
+// **It answers an instant and not a reading**, so `now().year()` does not exist and the program has
+// to say `now().at(zone).year()`. That is the whole design in one call: JavaScript's `new Date()`
+// answers something that will happily tell you a year, using a zone nobody named.
+do_now(args: Buf[Value], at: Span) -> Step
+    wants(args, 0, at, "now", "no arguments")?
+
+    Ok(InstantVal(now().us))
+
+// `monotonic()` -- a length read off a clock that only ever goes forward.
+//
+// **What an elapsed time is measured with, and the reason it is not `now()`.** The wall clock can be
+// set backwards -- by an operator, by NTP, by daylight saving on a host that keeps local time in
+// hardware -- so a difference of two `now()`s can be negative or can silently miss a second. This
+// counts from an arbitrary point and is good for nothing except subtracting from itself, which is
+// exactly what a measurement is.
+do_monotonic(args: Buf[Value], at: Span) -> Step
+    wants(args, 0, at, "monotonic", "no arguments")?
+
+    Ok(DurationVal(monotonic().us))
+
+// `date(y, m, d)` builds a calendar day; `date(v)` reads one off a reading that has one.
+//
+// **A date the calendar does not have is a fault, not a rounded one.** `date(2026, 2, 30)` is a
+// defect in the program that wrote it -- the same kind of thing as `pop([])` -- where a date read
+// out of *text* is a condition, which is why `parseDate` answers a result instead. JavaScript rolls
+// it over to the 2nd of March without a word.
+do_date(args: Buf[Value], at: Span) -> Step
+    if args.len() == 1
+        return args.at(0) match
+            DateVal(d) -> Ok(DateVal(d))
+            other ->
+                if !has_date(other)
+                    return fault(at, s"`date` reads a date off something that has one, and this is ${other.type_name()}")
+
+                Ok(DateVal(wall_reading(other).unwrap().date.day))
+
+    wants(args, 3, at, "date", "a year, a month and a day, or one value to read a date off")?
+
+    val y = whole_of(args.at(0), at, "date", "a year")?
+    val m = whole_of(args.at(1), at, "date", "a month")?
+    val d = whole_of(args.at(2), at, "date", "a day")?
+
+    checked_date(int(y), int(m), int(d)) match
+        Some(made) -> Ok(DateVal(made.day))
+        None -> fault(at, s"there is no such date -- the calendar has no ${d} of month ${m} in ${y}")
+
+// `time(h, m)`, `time(h, m, s)`, `time(h, m, s, us)`, or `time(v)` for the reading a value shows.
+do_time(args: Buf[Value], at: Span) -> Step
+    if args.len() == 1
+        return args.at(0) match
+            TimeVal(us) -> Ok(TimeVal(us))
+            other ->
+                if !has_time(other)
+                    return fault(at, s"`time` reads a time of day off something that has one, and this is ${other.type_name()}")
+
+                Ok(TimeVal(wall_reading(other).unwrap().time.us))
+
+    if args.len() < 2 || args.len() > 4
+        return fault(at, s"`time` takes an hour and a minute, and optionally seconds and microseconds, and was given ${args.len()} arguments")
+
+    val h = whole_of(args.at(0), at, "time", "an hour")?
+    val m = whole_of(args.at(1), at, "time", "a minute")?
+    val s = if args.len() > 2 then whole_of(args.at(2), at, "time", "a second")? else 0
+    val us = if args.len() > 3 then whole_of(args.at(3), at, "time", "a number of microseconds")? else 0
+
+    if h < 0 || h > 23 then return fault(at, s"an hour is 0 to 23, and this is ${h}")
+    if m < 0 || m > 59 then return fault(at, s"a minute is 0 to 59, and this is ${m}")
+
+    // **60 is refused rather than taken as a leap second.** A leap second is a fact about UTC that no
+    // civil clock in this library can represent, and accepting it here would put a value into a
+    // program that every later comparison would be wrong about.
+    if s < 0 || s > 59 then return fault(at, s"a second is 0 to 59, and this is ${s}")
+    if us < 0 || us >= us_per_second then return fault(at, s"a number of microseconds is 0 to 999999, and this is ${us}")
+
+    Ok(TimeVal(h * us_per_hour + m * us_per_minute + s * us_per_second + us))
+
+// `dateTime(y, mo, d, h, mi[, s[, us]])`, `dateTime(date, time)`, or `dateTime(v)`.
+do_date_time(args: Buf[Value], at: Span) -> Step
+    if args.len() == 1
+        return args.at(0) match
+            DateTimeVal(d, us) -> Ok(DateTimeVal(d, us))
+            other ->
+                if !has_date(other) || !has_time(other)
+                    return fault(at, s"`dateTime` reads a date and a time off one value, and this is ${other.type_name()}")
+
+                val w = wall_reading(other).unwrap()
+
+                Ok(DateTimeVal(w.date.day, w.time.us))
+
+    if args.len() == 2
+        val d = args.at(0)
+        val t = args.at(1)
+
+        return d match
+            DateVal(day) -> t match
+                TimeVal(us) -> Ok(DateTimeVal(day, us))
+                other -> fault(at, s"`dateTime` takes a date and a time, and the second is ${other.type_name()}")
+            other -> fault(at, s"`dateTime` takes a date and a time, and the first is ${other.type_name()}")
+
+    if args.len() < 5 || args.len() > 7
+        return fault(at, s"`dateTime` takes a date and a time, or a year through to a minute with optional seconds, and was given ${args.len()} arguments")
+
+    val y = whole_of(args.at(0), at, "dateTime", "a year")?
+    val mo = whole_of(args.at(1), at, "dateTime", "a month")?
+    val d = whole_of(args.at(2), at, "dateTime", "a day")?
+    val h = whole_of(args.at(3), at, "dateTime", "an hour")?
+    val mi = whole_of(args.at(4), at, "dateTime", "a minute")?
+    val s = if args.len() > 5 then whole_of(args.at(5), at, "dateTime", "a second")? else 0
+    val us = if args.len() > 6 then whole_of(args.at(6), at, "dateTime", "a number of microseconds")? else 0
+
+    // **The two halves are checked by the two constructors and not again here**, so a bad month and a
+    // bad hour say what they say in `date` and in `time`. A `dateTime` that checked for itself would
+    // be a third set of sentences to keep in step with the other two.
+    val day = do_date(three(Int(y), Int(mo), Int(d)), at)?
+    val wall = do_time(four(Int(h), Int(mi), Int(s), Int(us)), at)?
+
+    day match
+        DateVal(dd) -> wall match
+            TimeVal(uu) -> Ok(DateTimeVal(dd, uu))
+            _ -> fault(at, "unreachable")
+        _ -> fault(at, "unreachable")
+
+// `zone(name)` -- a zone by the name the IANA database gives it, or a fixed offset.
+//
+// **A result, because the name usually comes from outside the program** -- a configuration file, a
+// user's profile, a request header -- and because which zones a host has is the host's business. A
+// program that names one it knows still handles the answer, which is a line, and gets a sentence
+// naming the zone rather than a crash if it is ever run somewhere thinner.
+//
+// `zone(v)` on a zoned reading is the other question and answers the zone itself: that value already
+// carries one, so there is nothing to fail.
+do_zone(args: Buf[Value], at: Span) -> Step
+    wants(args, 1, at, "zone", "a zone name, or a value to read the zone off")?
+
+    args.at(0) match
+        Str(p) ->
+            zone_named(p.s) match
+                Ok(id) -> Ok(ok_value(ZoneVal(id)))
+                Err(why) -> Ok(err_value(why))
+        ZoneVal(id) -> Ok(ZoneVal(id))
+        ZonedVal(_, z) -> Ok(ZoneVal(z))
+        other -> fault(at, s"`zone` takes a zone name or a zoned reading, and this is ${other.type_name()}")
+
+// `localZone()` -- the zone this host is set to.
+//
+// **Not a result, where `zone` is one.** There is always an answer: the whole table where
+// `/etc/localtime` can be read, and the offset libc reports where it cannot. A host that is
+// misconfigured about its own zone is not a condition a slate program can do anything about, and
+// making every program handle it would be ceremony for a branch nobody can write.
+do_local_zone(args: Buf[Value], at: Span) -> Step
+    wants(args, 0, at, "localZone", "no arguments")?
+
+    Ok(ZoneVal(local_zone()))
+
+// `instant(v)` -- the point on the timeline a zoned reading names.
+do_instant(args: Buf[Value], at: Span) -> Step
+    wants(args, 1, at, "instant", "a zoned reading")?
+
+    args.at(0) match
+        InstantVal(us) -> Ok(InstantVal(us))
+        ZonedVal(us, _) -> Ok(InstantVal(us))
+        other -> fault(at, s"`instant` takes a zoned reading, and this is ${other.type_name()}")
+
+// `epochSeconds(n)` makes an instant; `t.epochSeconds()` reads one back. Likewise millis and micros.
+//
+// **The unit is in the name because there is no default that is not a trap.** JavaScript counts
+// milliseconds, Unix counts seconds, and every program that has ever moved a timestamp between the
+// two has had this bug once.
+do_epoch(args: Buf[Value], at: Span, which: usize) -> Step
+    val name = if which == 0 then "epochSeconds" elif which == 1 then "epochMillis" else "epochMicros"
+    val factor = if which == 0 then us_per_second elif which == 1 then us_per_milli else 1
+
+    wants(args, 1, at, name, "a whole number, or an instant to read one off")?
+
+    args.at(0) match
+        Int(n) -> Ok(InstantVal(n * factor))
+        InstantVal(us) -> Ok(Int(us / factor))
+        other -> fault(at, s"`${name}` takes a whole number or an instant, and this is ${other.type_name()}")
+
+// The exact lengths: `micros`, `millis`, `seconds`, `minutes`, `hours`.
+//
+// **A whole number makes a length and a length answers how many whole ones it is**, truncated toward
+// zero. `hours(1) + minutes(30)` read back as `minutes` is 90 -- these are totals rather than the
+// parts of a written-out duration, since the parts are `d.minutes() % 60` and nothing needs a second
+// vocabulary to say that.
+//
+// **There is no `days` here and that is the point.** A day is not a fixed length of timeline -- the
+// two a year that a zone's clocks move through are 23 and 25 hours long -- so `days` makes a period
+// and belongs with the calendar lengths below.
+do_length(args: Buf[Value], at: Span, which: usize) -> Step
+    val name = length_name(which)
+    val factor = length_factor(which)
+
+    wants(args, 1, at, name, "a whole number, or a duration to read one off")?
+
+    args.at(0) match
+        Int(n) -> Ok(DurationVal(n * factor))
+        DurationVal(us) -> Ok(Int(us / factor))
+
+        // **`micros` alone also reads the fraction off a clock reading**, which is the only way a
+        // program can reach the part of a second a `time` carries. The other four would be asking
+        // how many minutes past midnight it is, which is not a question anybody spells this way.
+        other ->
+            if which == 0 && has_time(other)
+                return Ok(Int(wall_reading(other).unwrap().time.us % us_per_second))
+
+            fault(at, s"`${name}` takes a whole number or a duration, and this is ${other.type_name()}")
+
+// The name each exact length goes by, and how many microseconds one of them is.
+private length_name(which: usize) -> string =
+    if which == 0 then "micros"
+    elif which == 1 then "millis"
+    elif which == 2 then "seconds"
+    elif which == 3 then "minutes"
+    else "hours"
+
+private length_factor(which: usize) -> long =
+    if which == 0 then 1
+    elif which == 1 then us_per_milli
+    elif which == 2 then us_per_second
+    elif which == 3 then us_per_minute
+    else us_per_hour
+
+// The calendar lengths: `days`, `weeks`, `months`, `years`.
+//
+// **Months and days are two scales and never convert.** `months(1).days()` is zero rather than 30,
+// because a month is 28, 29, 30 or 31 days depending on which month and which year, and any number
+// this answered would be wrong somewhere. `weeks(2).days()` is 14, since a week always is one.
+do_calendar_length(args: Buf[Value], at: Span, which: usize) -> Step
+    val name = if which == 0 then "days" elif which == 1 then "weeks" elif which == 2 then "months" else "years"
+
+    wants(args, 1, at, name, "a whole number, or a period to read one off")?
+
+    args.at(0) match
+        Int(n) ->
+            if which == 0 then Ok(PeriodVal(0, int(n)))
+            elif which == 1 then Ok(PeriodVal(0, int(n) * 7))
+            elif which == 2 then Ok(PeriodVal(int(n), 0))
+            else Ok(PeriodVal(int(n) * 12, 0))
+        PeriodVal(months, days) ->
+            if which == 0 then Ok(Int(long(days)))
+            elif which == 1 then Ok(Int(long(days / 7)))
+            elif which == 2 then Ok(Int(long(months)))
+            else Ok(Int(long(months / 12)))
+        other -> fault(at, s"`${name}` takes a whole number or a period, and this is ${other.type_name()}")
+
+// The parts a reading is made of: `year`, `month`, `day`, `hour`, `minute`, `second`, `weekday`,
+// `monthName`, `dayOfYear`, `daysInMonth`, `isLeapYear`.
+//
+// **`weekday` answers a name and not a number**, because every library that answers a number has to
+// then say which day the week starts on, and no two of them agree. JavaScript's `getDay()` is 0 for
+// Sunday and its `getDate()` is the day of the month -- two names three characters apart meaning
+// entirely different things.
+do_part(args: Buf[Value], at: Span, which: usize) -> Step
+    val name = part_name(which)
+    val needs_time = which >= 3 && which <= 5
+
+    wants(args, 1, at, name, "a date, a dateTime or a zoned reading")?
+
+    val v = args.at(0)
+
+    if needs_time && !has_time(v)
+        return fault(at, s"`${name}` reads a time of day, and ${v.type_name()} has none")
+
+    if !needs_time && !has_date(v)
+        return fault(at, s"`${name}` reads a date, and ${v.type_name()} has none")
+
+    val w = wall_reading(v).unwrap()
+
+    if which == 0 then Ok(Int(long(year_of(w.date))))
+    elif which == 1 then Ok(Int(long(month_of(w.date))))
+    elif which == 2 then Ok(Int(long(day_of(w.date))))
+    elif which == 3 then Ok(Int(long(hour_of(w.time))))
+    elif which == 4 then Ok(Int(long(minute_of(w.time))))
+    elif which == 5 then Ok(Int(long(second_of(w.time))))
+    elif which == 6 then Ok(str_value(weekday_name(weekday(w.date))))
+    elif which == 7 then Ok(str_value(month_name(month_of(w.date))))
+    elif which == 8 then Ok(Int(long(day_of_year(w.date))))
+    elif which == 9 then Ok(Int(long(days_in_month(year_of(w.date), month_of(w.date)))))
+    else Ok(Bool(leap_year(year_of(w.date))))
+
+// The name each part goes by, which is also what its complaint says.
+private part_name(which: usize) -> string =
+    if which == 0 then "year"
+    elif which == 1 then "month"
+    elif which == 2 then "day"
+    elif which == 3 then "hour"
+    elif which == 4 then "minute"
+    elif which == 5 then "second"
+    elif which == 6 then "weekday"
+    elif which == 7 then "monthName"
+    elif which == 8 then "dayOfYear"
+    elif which == 9 then "daysInMonth"
+    else "isLeapYear"
+
+// `at` -- the one word for reading one thing in terms of another.
+//
+// | `instant.at(zone)` | the reading that zone shows at that moment |
+// | `zoned.at(zone)` | the same moment, read somewhere else |
+// | `dateTime.at(zone)` | a **result**: a wall reading may name no instant, or two |
+// | `date.at(time)` | the two halves of a civil reading, put together |
+//
+// **The `dateTime` case is a result because the answer genuinely may not exist.** The hour a zone
+// skips going into daylight saving is a wall reading no clock there ever showed, and the hour it
+// repeats coming out is one that names two instants. Every library that answers anyway picks one
+// silently; this one hands the choice back, and `dt.at(zone, "earlier")`, `"later"` or `"after"`
+// makes it explicitly.
+do_at(args: Buf[Value], at: Span) -> Step
+    if args.len() != 1 && args.len() != 2 && args.len() != 3
+        return fault(at, s"`at` takes a value and what to read it at, and was given ${args.len()} arguments")
+
+    if args.len() == 1
+        return fault(at, "`at` takes something to read the value at -- a zone, or a time of day for a date")
+
+    val v = args.at(0)
+    val what = args.at(1)
+
+    v match
+        InstantVal(us) -> what match
+            ZoneVal(z) -> Ok(ZonedVal(us, z))
+            other -> fault(at, s"an instant is read at a zone, and this is ${other.type_name()}")
+        ZonedVal(us, _) -> what match
+            ZoneVal(z) -> Ok(ZonedVal(us, z))
+            other -> fault(at, s"a zoned reading is read at another zone, and this is ${other.type_name()}")
+        DateVal(day) -> what match
+            TimeVal(us) -> Ok(DateTimeVal(day, us))
+            other -> fault(at, s"a date is read at a time of day, and this is ${other.type_name()}")
+        DateTimeVal(day, us) -> what match
+            ZoneVal(z) -> resolved_at(day, us, z, args, at)
+            other -> fault(at, s"a dateTime is read at a zone, and this is ${other.type_name()}")
+        other -> fault(at, s"`at` reads an instant, a zoned reading, a date or a dateTime, and this is ${other.type_name()}")
+
+// A wall reading turned into a moment in a zone, with the two awkward cases said out loud.
+private resolved_at(day: int, us: long, zid: usize, args: Buf[Value], at: Span) -> Step
+    val wall = LocalDateTime(LocalDate(day), LocalTime(us))
+    val choice = if args.len() == 3 then text_argument(args.at(2), at, "at", "which reading to take")? else ""
+
+    if choice != "" && choice != "earlier" && choice != "later" && choice != "after"
+        return fault(at, s"`at` takes `\"earlier\"`, `\"later\"` or `\"after\"`, and this is `${choice}`")
+
+    resolve(wall, t -> zone_offset(zid, t)) match
+        Unique(t) -> Ok(ok_value(ZonedVal(t.us, zid)))
+        Ambiguous(earlier, later) ->
+            if choice == "earlier" then return Ok(ok_value(ZonedVal(earlier.us, zid)))
+            if choice == "later" then return Ok(ok_value(ZonedVal(later.us, zid)))
+
+            Ok(err_value(s"${temporal_text(DateTimeVal(day, us))} happens twice in ${zone_title(zid)}, when the clocks go back -- say `.at(zone, \"earlier\")` or `\"later\"`"))
+        Gap(before, after) ->
+            if choice == "after" then return Ok(ok_value(ZonedVal(from_offset(wall, before).us, zid)))
+
+            Ok(err_value(s"${temporal_text(DateTimeVal(day, us))} never happens in ${zone_title(zid)} -- the clocks go from ${offset_written(before.minutes, true)} to ${offset_written(after.minutes, true)} -- say `.at(zone, \"after\")` to take the reading past the gap"))
+
+// `zoned.offset()` and `zone.offset(instant)` -- how far the clocks are set from UTC, **as a
+// duration**.
+//
+// **An offset is a length of time and slate already has that type**, so there is no ninth one. It
+// means offset arithmetic is ordinary duration arithmetic, and `.offset().hours()` is how a program
+// asks the question it usually wants.
+do_offset(args: Buf[Value], at: Span) -> Step
+    val t = zone_question(args, at, "offset")?
+
+    Ok(DurationVal(long(zone_offset(t.0, Instant(t.1)).minutes) * us_per_minute))
+
+// `zoned.isDST()` and `zone.isDST(instant)`.
+do_is_dst(args: Buf[Value], at: Span) -> Step
+    val t = zone_question(args, at, "isDST")?
+
+    Ok(Bool(zone_in_dst(t.0, Instant(t.1))))
+
+// `zoned.abbrev()` and `zone.abbrev(instant)` -- `EST`, `EDT`, `+0545`.
+//
+// **A display string and nothing else.** `CST` names three different offsets around the world, so
+// nothing may be read back from it; a timestamp that has to survive a round trip carries the number,
+// which is what `.string()` writes.
+do_abbrev(args: Buf[Value], at: Span) -> Step
+    val t = zone_question(args, at, "abbrev")?
+
+    Ok(str_value(zone_short_name(t.0, Instant(t.1))))
+
+// The zone and the moment the three questions above are asked of, however they were written.
+//
+// **Two spellings and one implementation**: a zoned reading already carries both, and a bare zone
+// needs the instant handed to it because a zone's answer changes through the year -- which is the
+// thing about zones that a program written against a fixed offset forgets.
+private zone_question(args: Buf[Value], at: Span, name: string) -> Result[(usize, long), Signal]
+    if args.len() == 1
+        return args.at(0) match
+            ZonedVal(us, z) -> Ok((z, us))
+            other -> Err(failure(at, s"`${name}` takes a zoned reading, or a zone and an instant, and this is ${other.type_name()}"))
+
+    if args.len() != 2
+        return Err(failure(at, s"`${name}` takes a zoned reading, or a zone and an instant, and was given ${args.len()} arguments"))
+
+    args.at(0) match
+        ZoneVal(z) -> args.at(1) match
+            InstantVal(us) -> Ok((z, us))
+            ZonedVal(us, _) -> Ok((z, us))
+            other -> Err(failure(at, s"`${name}` asks a zone about an instant, and this is ${other.type_name()}"))
+        other -> Err(failure(at, s"`${name}` takes a zone and an instant, and the first is ${other.type_name()}"))
+
+// `startOf(v, unit)` -- the beginning of the year, month, week, day, hour, minute or second the
+// reading falls in.
+//
+// **What a report is written with**: everything grouped by month starts by putting each reading at
+// the start of its month, and a program that did it by hand would rebuild the value part by part and
+// get the week wrong.
+do_start_of(args: Buf[Value], at: Span) -> Step
+    wants(args, 2, at, "startOf", "a reading and a unit")?
+
+    val v = args.at(0)
+    val unit = text_argument(args.at(1), at, "startOf", "a unit")?
+
+    if !has_date(v) && !has_time(v)
+        return fault(at, s"`startOf` takes a date, a dateTime or a zoned reading, and this is ${v.type_name()}")
+
+    val w = wall_reading(v).unwrap()
+    val truncated = truncate_wall(w, unit, at)?
+
+    v match
+        DateVal(_) ->
+            if unit == "day" || unit == "hour" || unit == "minute" || unit == "second"
+                return fault(at, s"a date has no ${unit} to start at")
+
+            Ok(DateVal(truncated.date.day))
+        DateTimeVal(_, _) -> Ok(DateTimeVal(truncated.date.day, truncated.time.us))
+        ZonedVal(_, z) -> Ok(calendar_start(truncated, z))
+        other -> fault(at, s"`startOf` takes a date, a dateTime or a zoned reading, and this is ${other.type_name()}")
+
+// A wall reading cut back to the start of the unit it names.
+private truncate_wall(w: LocalDateTime, unit: string, at: Span) -> Result[LocalDateTime, Signal]
+    if unit == "year" then return Ok(LocalDateTime(date_at(year_of(w.date), 1, 1), LocalTime(0)))
+    if unit == "month" then return Ok(LocalDateTime(date_at(year_of(w.date), month_of(w.date), 1), LocalTime(0)))
+
+    // **A week starts on Monday**, which is ISO 8601's answer and the one the rest of the world uses.
+    // `weekday` is the way to ask which day it is; nothing here makes the reader guess.
+    if unit == "week"
+        val back = (int(weekday(w.date)) + 6) % 7
+
+        return Ok(LocalDateTime(LocalDate(w.date.day - back), LocalTime(0)))
+
+    if unit == "day" then return Ok(LocalDateTime(w.date, LocalTime(0)))
+    if unit == "hour" then return Ok(LocalDateTime(w.date, LocalTime(w.time.us / us_per_hour * us_per_hour)))
+    if unit == "minute" then return Ok(LocalDateTime(w.date, LocalTime(w.time.us / us_per_minute * us_per_minute)))
+    if unit == "second" then return Ok(LocalDateTime(w.date, LocalTime(w.time.us / us_per_second * us_per_second)))
+
+    Err(failure(at, s"`startOf` takes `\"year\"`, `\"month\"`, `\"week\"`, `\"day\"`, `\"hour\"`, `\"minute\"` or `\"second\"`, and this is `${unit}`"))
+
+// A truncated wall reading put back into its zone.
+//
+// **A midnight the zone skips is pushed past the gap rather than refused**, because a program asking
+// for the start of a day is not asking a question about daylight saving -- and there are zones where
+// midnight is exactly the reading that goes missing.
+private calendar_start(w: LocalDateTime, zid: usize) -> Value
+    resolve(w, t -> zone_offset(zid, t)) match
+        Unique(t) -> ZonedVal(t.us, zid)
+        Ambiguous(earlier, _) -> ZonedVal(earlier.us, zid)
+        Gap(before, _) -> ZonedVal(from_offset(w, before).us, zid)
+
+// `onOrAfter(d, "monday")` -- the first such day from this one on, which is what "every Monday"
+// means once it has been given a starting point.
+do_on_or_after(args: Buf[Value], at: Span) -> Step
+    wants(args, 2, at, "onOrAfter", "a date and a weekday")?
+
+    val name = text_argument(args.at(1), at, "onOrAfter", "a weekday")?
+    val wanted = weekday_named(name)
+
+    if wanted < 0
+        return fault(at, s"`onOrAfter` takes a weekday, and `${name}` is not one")
+
+    args.at(0) match
+        DateVal(d) -> Ok(DateVal(on_or_after(LocalDate(d), Weekday(wanted)).day))
+        other -> fault(at, s"`onOrAfter` takes a date, and this is ${other.type_name()}")
+
+// Which day of the week a name names, or -1 for none of them. Case is ignored: a weekday arrives
+// from a configuration file as often as from a literal.
+private weekday_named(name: string) -> int
+    val n = to_lower(name)
+
+    if n == "sunday" then 0
+    elif n == "monday" then 1
+    elif n == "tuesday" then 2
+    elif n == "wednesday" then 3
+    elif n == "thursday" then 4
+    elif n == "friday" then 5
+    elif n == "saturday" then 6
+    else -1
+
+// `parseDate`, `parseTime`, `parseDateTime`, `parseTimestamp` -- ISO 8601 in, a **result** out.
+//
+// **Text is the boundary every date library gets wrong.** `new Date("not a date")` is an `Invalid
+// Date`, an ordinary value that spreads `NaN` through every calculation it touches and complains
+// nowhere; the failure is found three functions later, if at all. slate answers a result, which is
+// the same channel `parseJSON` uses and for the same reason: text from a file, a socket or a person
+// is a condition the caller was always going to handle.
+do_parse_temporal(args: Buf[Value], at: Span, which: usize) -> Step
+    val name = if which == 0 then "parseDate" elif which == 1 then "parseTime" elif which == 2 then "parseDateTime" else "parseTimestamp"
+
+    wants(args, 1, at, name, "one string")?
+
+    val s = text_argument(args.at(0), at, name, "a string")?
+
+    // **The text being read is quoted back in the complaint**, because the reason on its own -- "day
+    // is out of range" -- says nothing a reader can act on when the string came out of a file with a
+    // thousand lines in it.
+    if which == 0
+        return parse_date(s) match
+            Ok(d) -> Ok(ok_value(DateVal(d.day)))
+            Err(e) -> Ok(err_value(s"cannot read \"${s}\" as a date: ${e}"))
+
+    if which == 1
+        return parse_time(s) match
+            Ok(t) -> Ok(ok_value(TimeVal(t.us)))
+            Err(e) -> Ok(err_value(s"cannot read \"${s}\" as a time of day: ${e}"))
+
+    if which == 2
+        return parse_datetime(s) match
+            Ok(w) -> Ok(ok_value(DateTimeVal(w.date.day, w.time.us)))
+            Err(e) -> Ok(err_value(s"cannot read \"${s}\" as a dateTime: ${e}"))
+
+    parse_timestamp(s) match
+        Ok(t) -> Ok(ok_value(InstantVal(t.us)))
+        Err(e) -> Ok(err_value(s"cannot read \"${s}\" as a timestamp: ${e}"))
+
+// -- the small shared checks --------------------------------------------------------------------
+
+// A whole number argument, which every constructor here takes several of.
+//
+// **A real is refused rather than truncated.** `date(2026, 8.5, 1)` is a program that has computed
+// something wrong, and rounding it would hide which of the three arguments was the mistake.
+private whole_of(v: Value, at: Span, name: string, which: string) -> Result[long, Signal]
+    v match
+        Int(n) -> Ok(n)
+        other -> Err(failure(at, s"`${name}` takes ${which} as a whole number, and this is ${other.type_name()}"))
+
+// Argument lists built here rather than by a caller, so that one constructor may reach another.
+private three(a: Value, b: Value, c: Value) -> Buf[Value]
+    var out: Buf[Value] = buf()
+
+    out.push(a)
+    out.push(b)
+    out.push(c)
+    out
+
+private four(a: Value, b: Value, c: Value, d: Value) -> Buf[Value]
+    var out: Buf[Value] = buf()
+
+    out.push(a)
+    out.push(b)
+    out.push(c)
+    out.push(d)
+    out
