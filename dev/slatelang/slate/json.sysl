@@ -1,0 +1,175 @@
+module dev.slatelang.slate
+
+// **The module is imported whole rather than its names lifted**, because slate has a `parse` of its
+// own and `Json`'s variants are `Null`, `Bool`, `Int`, `Real` and `Str` -- every one of which is
+// also a `Value` variant. Qualifying is what keeps the two vocabularies apart in a file whose whole
+// job is to translate between them.
+import sh.sysl.json
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// JSON, in and out.
+//
+// **slate's value model already IS JSON's** -- null, booleans, two kinds of number, strings, arrays
+// and records, and nothing else -- so the binding is two conversions and no design. `sh.sysl.json`
+// does the reading and the rendering; what is here is the mapping between its `Json` and slate's
+// `Value`, and the two decisions about what to do where the mapping does not hold.
+//
+// **A DOCUMENT THAT WILL NOT PARSE IS A RESULT, AND A VALUE THAT WILL NOT RENDER IS A FAULT.** That
+// is slate's two-channel rule applied to the two directions, and they genuinely differ: text arriving
+// from a file, a socket or a person is a condition every caller was always going to handle, and a
+// function or a circle in a value a program built itself is a defect in that program. `JSON.parse`
+// throws for the first and `JSON.stringify` throws for the second, so node treats them alike; slate
+// does not.
+
+// `parseJSON(text)` -- `{ ok: true, value }`, or `{ ok: false, error }`.
+do_parse_json(args: Buf[Value], at: Span) -> Step
+    if args.len() != 1 then return fault(at, s"`parseJSON` takes one string and was given ${args.len()} arguments")
+
+    val text = args.at(0) match
+        Str(p) -> p.s
+        other -> return fault(at, s"`parseJSON` takes a string, and this is ${other.type_name()}")
+
+    val src = source_of("json", text)
+
+    json.parse(src) match
+        // **The whole rendering, not just the headline.** A JSON document is usually machine-written
+        // and long, so *"unexpected `}`"* on its own says nothing a person can act on; the rendering
+        // carries the line and the caret, which is where the document actually went wrong.
+        Err(d) -> Ok(err_value(d.render(src)))
+        Ok(j) -> Ok(ok_value(slate_of_json(j, at)?))
+end do_parse_json
+
+// `toJSON(value)` and `toJSON(value, indent)` -- the compact form and the laid-out one.
+//
+// **Two arguments rather than two names**, unlike `sh.sysl.json`'s own split, because at slate's
+// level the indent is the only thing that differs and a program often chooses it at run time.
+do_to_json(args: Buf[Value], at: Span) -> Step
+    if args.is_empty() || args.len() > 2
+        return fault(at, s"`toJSON` takes a value and an optional indent, and was given ${args.len()} arguments")
+
+    val indent = if args.len() == 2
+        args.at(1) match
+            Int(n) ->
+                if n < 0 || n > 16 then return fault(at, s"`toJSON` indents by 0 to 16 spaces, and this is by ${n}")
+
+                usize(n)
+            other -> return fault(at, s"`toJSON` takes an indent as a number, and this is ${other.type_name()}")
+    else
+        0
+
+    var path: Buf[*u8] = buf()
+    val j = json_of_slate(args.at(0), at, &path)?
+
+    Ok(str_value(if indent == 0 then s"${j}" else json.pretty(j, indent)))
+end do_to_json
+
+// -- the mapping, one direction each --------------------------------------------------------------
+
+// **Each container is built and HELD before its contents are**, for the reason every builtin here
+// has: a sysl `Buf` of values is not a root, so a nested conversion that allocates could collect
+// everything converted so far. Pushing into a collected array as each value arrives is what keeps it.
+private slate_of_json(j: json.Json, at: Span) -> Step
+    j match
+        json.Json.Null -> Ok(Value.Null)
+        Bool(b) -> Ok(Value.Bool(b))
+        Int(n) -> Ok(Value.Int(n))
+        Real(x) -> Ok(Value.Real(x))
+        Str(s) -> Ok(str_value(s))
+        Arr(items) ->
+            val mark = root_mark()
+            val out = new_array(buf())
+
+            hold(Value.Array(out))
+
+            for i in 0..<items.len()
+                slate_of_json(items.at(i), at) match
+                    Ok(v) -> out.items.push(v)
+                    Err(e) ->
+                        release(mark)
+                        return Err(e)
+
+            release(mark)
+            Ok(Value.Array(out))
+        Obj(members) ->
+            val mark = root_mark()
+            val out = new_object()
+
+            hold(Value.Object(out))
+
+            for i in 0..<members.len()
+                val m = members.at(i)
+
+                slate_of_json(m.value, at) match
+                    Ok(v) -> obj_put_name(out, m.key, v)
+                    Err(e) ->
+                        release(mark)
+                        return Err(e)
+
+            release(mark)
+            Ok(Value.Object(out))
+end slate_of_json
+
+// Whether this object or array is already on the path being walked, which is how a circle is caught.
+private on_the_path(path: *Buf[*u8], here: *u8) -> bool
+    for i in 0..<path.len()
+        if path.at(i) == here then return true
+
+    false
+
+// The other direction, where the mapping can fail.
+//
+// **A value with no JSON form is a FAULT naming it, and that is where slate parts company with
+// node.** `JSON.stringify` drops a function and an `undefined` silently from an object and turns
+// them into `null` inside an array -- so a request body goes out with a field missing and nothing
+// anywhere says which. There is no reading of "encode this function" that is right, so slate says so
+// at the value that has no encoding.
+private json_of_slate(v: Value, at: Span, path: *Buf[*u8]) -> Result[json.Json, Signal]
+    v match
+        Value.Null -> Ok(json.Json.Null)
+        Bool(b) -> Ok(json.Json.Bool(b))
+        Int(n) -> Ok(json.Json.Int(n))
+        Real(x) -> Ok(json.Json.Real(x))
+        Str(p) -> Ok(json.Json.Str(p.s))
+        Array(a) ->
+            val here: *u8 = ptr_cast(a)
+
+            if on_the_path(path, here)
+                return Err(failure(at, "this array holds itself, so there is no JSON for it -- a document has no way to point back at what contains it"))
+
+            path.push(here)
+
+            var items: Buf[json.Json] = buf()
+
+            for i in 0..<a.items.len()
+                items.push(json_of_slate(a.items.at(i), at, path)?)
+
+            path.truncate(path.len() - 1)
+            Ok(json.Json.Arr(items))
+        Object(o) ->
+            val here: *u8 = ptr_cast(o)
+
+            if on_the_path(path, here)
+                return Err(failure(at, "this object holds itself, so there is no JSON for it -- a document has no way to point back at what contains it"))
+
+            path.push(here)
+
+            var members: Buf[json.Member] = buf()
+
+            for i in 0..<o.entries.len()
+                val e = o.entries.at(i)
+
+                if !e.dead
+                    // **A JSON name is a string and a slate key is any value**, so a key that is not
+                    // one has no encoding. Rendering it as text would make `{ 1: "a" }` and
+                    // `{ "1": "a" }` the same document, which they are not.
+                    val key = e.key match
+                        Str(kp) -> kp.s
+                        other -> return Err(failure(at, s"a JSON name is a string, and this object has a key that is ${other.type_name()}"))
+
+                    members.push(json.Member(key, json_of_slate(e.value, at, path)?))
+
+            path.truncate(path.len() - 1)
+            Ok(json.Json.Obj(members))
+        other -> Err(failure(at, s"there is no JSON for ${other.type_name()}"))
+end json_of_slate
