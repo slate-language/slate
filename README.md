@@ -554,6 +554,16 @@ type MaybePoint = Point | null
 type Shape = { side: number } | { radius: number }
 ```
 
+**A definition may say what it answers**, which is what anything downstream of a call needs:
+
+```
+double(x: number) -> number = x * 2
+name(p: { id: number }) -> string = p.id     // faults: answers string, gave back 7
+```
+
+**`any` is a type**, and is what an unannotated thing is. slate is dynamically typed at the edges and
+always will be, so `any` is a claim about a value rather than a refusal to make one.
+
 **A parameter may say what it takes**, and then the complaint lands where the value was handed over:
 
 ```

@@ -1,0 +1,187 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{str_builder, StrBuilder}
+
+// What a value is, as the compiler would like to know it.
+//
+// **This is not a `Pattern`, and the difference is the whole reason the file exists.** A pattern
+// *tests* a value and a type *describes* one, and the two part company as soon as anything is asked
+// of them beyond a shape: a pattern has no function type, no notion of "anything", and no way to say
+// what a call answered. Every static check slate will ever do is a question about these rather than
+// about patterns.
+//
+// **Nothing reads this at run time and nothing ever should.** A type is a compile-time claim; what
+// the machine does is test patterns, which is what `CheckType` carries. The two are built from the
+// same annotation and go their separate ways -- `type_from_pattern` is the fork.
+//
+// **`Any` is what an unannotated thing is**, which is the shape a gradual system has to have: slate
+// is dynamically typed and always will be at the edges, so the checker's job is to say something
+// useful about the parts that were written down and nothing at all about the rest. TypeScript made
+// the same choice and named it the same way.
+
+struct Type
+    kind: &TypeKind
+end Type
+
+enum TypeKind
+    // Nothing is known. An unannotated parameter, a call whose callee is unknown, a field read from
+    // an object whose shape nobody wrote down.
+    Any
+
+    // The primitives, spelled as slate spells them.
+    NullType
+    BooleanType
+    IntegerType
+    RealType
+    StringType
+
+    // `number`, which is `integer` or `real` and is one word rather than a union because slate's own
+    // bare-name rule already treats it as a kind.
+    NumberType
+
+    // `array`, and `array of T` once there is a syntax for saying so. **`Any` for the element is not
+    // a placeholder for a missing feature** -- it is what `array` on its own means.
+    ArrayOf(element: Type)
+
+    // An object with at least these fields. **At least**, which is the object pattern's rule and has
+    // to be the type's as well or the two would disagree about the same annotation.
+    ObjectWith(keys: Buf[string], values: Buf[Type])
+
+    // A function. `result` is what a call answers, which is the whole reason return annotations had
+    // to come first: without one, nothing downstream of a call can be said at all.
+    FunctionType(params: Buf[Type], result: Type)
+
+    // `A | B`, flattened -- a union never holds a union.
+    OneOf(alts: Buf[Type])
+end TypeKind
+
+// The constructor, here so that the boxing does not appear on every line that builds one.
+type_of(kind: TypeKind) -> Type = Type(kind)
+
+// -- from what the parser read -------------------------------------------------------------------
+
+// The type an annotation describes, given the pattern it was parsed as.
+//
+// **One annotation makes both**, which is what keeps a single grammar honest: the pattern goes to the
+// machine to be tested and the type stays here to be reasoned about. A pattern that could not be a
+// type does not reach this -- an annotation that binds is already refused, and so is a type
+// declaration that does.
+type_from_pattern(pat: Pattern) -> Type
+    *pat.kind match
+        Wild -> type_of(Any)
+        TypePat(test) -> type_of(from_test(test))
+        NullPat -> type_of(NullType)
+        BoolPat(_) -> type_of(BooleanType)
+        IntPat(_) -> type_of(IntegerType)
+        RealPat(_) -> type_of(RealType)
+        StrPat(_) -> type_of(StringType)
+        ArrayPat(_, _, _) -> type_of(ArrayOf(type_of(Any)))
+        ObjectPat(keys, values) ->
+            var out: Buf[Type] = buf()
+
+            for i in 0..<values.len()
+                out.push(type_from_pattern(values.at(i)))
+
+            type_of(ObjectWith(keys, out))
+        OrPat(alts) ->
+            var out: Buf[Type] = buf()
+
+            // **Flattened as it is built**, so nothing downstream has to ask whether a union holds
+            // one. `A | (B | C)` cannot be written today and will be able to be.
+            for i in 0..<alts.len()
+                val one = type_from_pattern(alts.at(i))
+
+                *one.kind match
+                    OneOf(inner) ->
+                        for j in 0..<inner.len()
+                            out.push(inner.at(j))
+                    _ -> out.push(one)
+
+            type_of(OneOf(out))
+
+        // A binding cannot be a type and does not reach here; answering `Any` rather than refusing
+        // keeps this total, which a conversion wants to be.
+        _ -> type_of(Any)
+end type_from_pattern
+
+private from_test(test: TypeTest) -> TypeKind
+    test match
+        IsNull -> NullType
+        IsBool -> BooleanType
+        IsInt -> IntegerType
+        IsReal -> RealType
+        IsNum -> NumberType
+        IsStr -> StringType
+        IsArray -> ArrayOf(type_of(Any))
+        IsObject -> ObjectWith(buf(), buf())
+        IsFn -> FunctionType(buf(), type_of(Any))
+end from_test
+
+// -- saying one out loud ----------------------------------------------------------------------------
+
+// How a type is written, for a diagnostic and for a test to compare against.
+//
+// **It is written the way a program would write it**, so that a message quoting a type and a reader
+// writing one are looking at the same thing.
+show_type(t: Type) -> string
+    var out = str_builder()
+
+    write_type(&out, t)
+    out.finish()
+end show_type
+
+private write_type(out: *StrBuilder, t: Type)
+    *t.kind match
+        Any -> out.push("any")
+        NullType -> out.push("null")
+        BooleanType -> out.push("boolean")
+        IntegerType -> out.push("integer")
+        RealType -> out.push("real")
+        NumberType -> out.push("number")
+        StringType -> out.push("string")
+        ArrayOf(element) ->
+            *element.kind match
+                Any -> out.push("array")
+                _ ->
+                    out.push("array of ")
+                    write_type(out, element)
+        ObjectWith(keys, values) ->
+            if keys.len() == 0
+                out.push("object")
+                return
+
+            out.push("{ ")
+
+            for i in 0..<keys.len()
+                if i > 0 then out.push(", ")
+
+                out.push(keys.at(i))
+                out.push(": ")
+                write_type(out, values.at(i))
+
+            out.push(" }")
+        FunctionType(params, result) ->
+            if params.len() == 0
+                *result.kind match
+                    Any ->
+                        out.push("function")
+                        return
+                    _ -> ()
+
+            out.push("(")
+
+            for i in 0..<params.len()
+                if i > 0 then out.push(", ")
+
+                write_type(out, params.at(i))
+
+            out.push(") -> ")
+            write_type(out, result)
+        OneOf(alts) ->
+            for i in 0..<alts.len()
+                if i > 0 then out.push(" | ")
+
+                write_type(out, alts.at(i))
+end write_type
