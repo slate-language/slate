@@ -1,0 +1,431 @@
+module dev.slatelang.slate
+
+import sh.sysl.libuv
+import sh.sysl.libuv.Handle
+import sh.sysl.libuv.Stream
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.env
+import sysl.text.from_utf8
+
+// Running another program, and reading what it said.
+//
+// **On libuv, like every other host binding here.** slate is an asynchronous language -- `await`, a
+// promise type, an event loop -- and `sysl.process` is blocking throughout, so a `run` written on it
+// would stop the loop dead: every timer, every socket and every coroutine in the program would wait
+// for the child. `fs.sysl`, `net.sysl` and `event.sysl` all reach past the standard library for the
+// same reason, and this is that same case rather than a new one. (The user's call, 2026-08-28:
+// *"slate is an async language, so it should just make best use of libuv"*.)
+//
+// **`run` captures and does not stream, which is the whole surface for now.** It is what a program
+// nearly always wants -- start a program, wait, read what it printed -- and it is `execFile` in node
+// and `subprocess.run` in Python. A streaming form, where a program reads a long-lived child's
+// output as it arrives, is a handle with a lifetime and belongs with the socket machinery; it is not
+// built.
+//
+// **The child's standard input is closed rather than inherited.** A child that reads from it gets
+// end of file at once, where an inherited descriptor would have it competing with slate for the
+// terminal -- and a child waiting on input nobody is going to type is a program that hangs with no
+// output and nothing to look at.
+
+// One `run` in flight.
+//
+// **Module storage and a slot, for `event.sysl`'s reason**: a libuv callback is a sysl closure, which
+// the collector cannot see through, so it captures an index into this table and nothing else. Unlike
+// a socket there is no id handed to the program -- a `run` is one call with one answer -- so no
+// generation is stamped and the slot is spent when the promise settles.
+struct Run
+    live: bool
+
+    // The request slot in `event.sysl` whose promise this settles.
+    request: usize
+
+    // What was being run, for the sentence a failure carries.
+    what: string
+    at: Span
+
+    // The three handles, kept alive here for as long as libuv may still call back.
+    proc: Option[&libuv.Process]
+    watchdog: Option[&libuv.Timer]
+    out: Buf[u8]
+    err: Buf[u8]
+
+    // **The three things that have to have happened before there is an answer.** The child exiting
+    // is not enough on its own: a child may exit with output still in the pipe, and settling then
+    // would hand back a truncated answer that looks complete.
+    exited: bool
+    out_done: bool
+    err_done: bool
+    status: long
+    signal: int
+
+    // Whether the watchdog fired, which turns the answer from a status into a complaint.
+    timed_out: bool
+
+var running: Buf[Run] = buf()
+
+// Put the table back to nothing, so that one program's children cannot be seen by the next.
+reset_runs()
+    running = buf()
+
+// Take a slot.
+private claim_run(request: usize, what: string, at: Span) -> usize
+    for i in 0..<running.len()
+        if !running.at(i).live
+            running.set(i, Run(true, request, what, at, None, None, buf(), buf(), false, false, false, 0, 0, false))
+            return i
+
+    running.push(Run(true, request, what, at, None, None, buf(), buf(), false, false, false, 0, 0, false))
+    running.len() - 1
+
+// `run(command, args)` and `run(command, args, options)` -- a promise of what the program did.
+//
+// The answer is a result, as every other promise from a host call here is: `{ status, signal, out,
+// err }` where it ran, and an error where it could not be started. **A child that ran and failed is
+// a success**, its non-zero status being the answer to the question that was asked; `Err` means
+// there was no child. That is `sysl.process`'s split and Rust's, and it is the one that lets a caller
+// tell "the program said no" from "there is no such program".
+start_program(command: string, args: Buf[Value], options: Value, at: Span) -> Step
+    val argv = string_list(args, at, "run")?
+    val cwd = option_text(options, "cwd", at)?
+    val environment = option_env(options, at)?
+    val limit = option_timeout(options, at)?
+
+    val out_pipe = libuv.pipe() match
+        Err(e) -> return fault(at, s"a pipe for the output could not be made: ${e}")
+        Ok(p) -> p
+
+    val err_pipe = libuv.pipe() match
+        Err(e) -> return fault(at, s"a pipe for the errors could not be made: ${e}")
+        Ok(p) -> p
+
+    val waiting = begin_request()
+
+    // Read before anything can refuse it -- `request_started` in `event.sysl` says why, and this is
+    // the call that found it: a program that is not on the host is refused by `spawn` on the spot.
+    val promised = awaited_request(waiting)
+    val slot = claim_run(waiting, command, at)
+
+    // **`WRITABLE_PIPE` is from the CHILD's point of view**, so a pipe this program reads is one the
+    // child writes. The libuv package's own header warns about this and it is the one thing here
+    // that is easy to get backwards.
+    var stdio: Buf[libuv.Stdio] = buf()
+
+    stdio.push(libuv.Ignore)
+    stdio.push(libuv.ToPipe(out_pipe, libuv.WRITABLE_PIPE))
+    stdio.push(libuv.ToPipe(err_pipe, libuv.WRITABLE_PIPE))
+
+    val child = libuv.spawn(command, argv.view(), (status, signal) ->
+            record_exit(slot, status, signal),
+        stdio.view(), cwd, environment.view(), 0, libuv.default_loop()) match
+        Err(e) ->
+            out_pipe.close(() -> ())
+            err_pipe.close(() -> ())
+            drop_run(slot)
+            deny_request(waiting, at, s"cannot run `${command}`: ${e}")
+            return Ok(promised)
+        Ok(c) -> c
+
+    var held = running.at(slot)
+
+    held.proc = Some(child)
+    running.set(slot, held)
+
+    // **The exit callback is replaced now that there is a handle to capture**, which is what
+    // `on_exit` exists for: `spawn` takes its callback before the child exists, and a callback that
+    // has to close the handle cannot be written until there is one. Nothing can have run in
+    // between -- a callback only fires on a turn of the loop, and `spawn` returns before it turns.
+    child.on_exit((status, signal) ->
+        record_exit(slot, status, signal)
+        child.close(() -> ()))
+
+    read_into(slot, out_pipe, true)
+    read_into(slot, err_pipe, false)
+
+    if limit > 0 then start_watchdog(slot, limit)
+
+    Ok(promised)
+end start_program
+
+// Read one of the child's pipes into the slot until it ends.
+//
+// **A read that fails is an end and not a fault.** The pipe is the child's output, and a child that
+// died mid-sentence has still told us everything it managed to say; refusing the whole call would
+// throw that away along with the status, which is the part the caller asked for.
+private read_into(slot: usize, p: &libuv.Pipe, is_out: bool)
+    p.read_start((r) ->
+        r match
+            Data(bytes) -> collect(slot, bytes, is_out)
+            End ->
+                p.close(() -> ())
+                finished_stream(slot, is_out)
+            Failed(_) ->
+                p.close(() -> ())
+                finished_stream(slot, is_out)) match
+        Err(_) ->
+            p.close(() -> ())
+            finished_stream(slot, is_out)
+        Ok(_) -> ()
+
+// A chunk of the child's output.
+private collect(slot: usize, bytes: []const u8, is_out: bool)
+    if slot >= running.len() then return
+
+    var r = running.at(slot)
+
+    if !r.live then return
+
+    if is_out
+        for b in bytes do r.out.push(b)
+    else
+        for b in bytes do r.err.push(b)
+
+    running.set(slot, r)
+
+// One of the two pipes has ended.
+private finished_stream(slot: usize, is_out: bool)
+    if slot >= running.len() then return
+
+    var r = running.at(slot)
+
+    if !r.live then return
+
+    if is_out then r.out_done = true else r.err_done = true
+
+    running.set(slot, r)
+    settle_run(slot)
+
+// The child has gone.
+private record_exit(slot: usize, status: i64, signal: i32)
+    if slot >= running.len() then return
+
+    var r = running.at(slot)
+
+    if !r.live then return
+
+    r.exited = true
+    r.status = long(status)
+    r.signal = int(signal)
+    running.set(slot, r)
+    settle_run(slot)
+
+// A child that has run too long, where the caller asked for a limit.
+//
+// **`SIGKILL` and not `SIGTERM`**, because a timeout is the caller saying they are no longer willing
+// to wait: a signal the child may ignore would leave the promise pending exactly as it was. A
+// program that wants to ask nicely has the status of a child it started itself and can send its own
+// signal -- which is a streaming `spawn` and is not built.
+private start_watchdog(slot: usize, ms: long)
+    libuv.timer() match
+        Err(_) -> ()
+        Ok(t) ->
+            var r = running.at(slot)
+
+            r.watchdog = Some(t)
+            running.set(slot, r)
+
+            t.start(u64(ms), 0, () -> kill_run(slot)) match
+                Err(_) -> ()
+                Ok(_) -> ()
+
+private kill_run(slot: usize)
+    if slot >= running.len() then return
+
+    var r = running.at(slot)
+
+    if !r.live then return
+
+    r.timed_out = true
+    running.set(slot, r)
+
+    r.proc match
+        Some(p) ->
+            p.kill(libuv.SIGKILL) match
+                Err(_) -> ()
+                Ok(_) -> ()
+        None -> ()
+
+// Hand back the answer, once the child has gone and both pipes have ended.
+//
+// **All three, and the two that are not the exit are the ones a program gets wrong.** A child may
+// exit with output still in the pipe, so settling on the exit alone hands back an answer that is
+// short and looks whole.
+private settle_run(slot: usize)
+    var r = running.at(slot)
+
+    if !r.live then return
+    if !r.exited || !r.out_done || !r.err_done then return
+
+    val request = r.request
+    val timed_out = r.timed_out
+    val what = r.what
+    val status = r.status
+    val signal = r.signal
+    val text = from_utf8(r.out.view())
+    val errors = from_utf8(r.err.view())
+
+    drop_run(slot)
+
+    if timed_out
+        deny_request(request, r.at, s"`${what}` took too long and was stopped")
+        return
+
+    // **Output that is not text is a failed call rather than a mangled string.** A child that writes
+    // bytes is writing something this call has no way to hand back -- there is no byte value in
+    // slate for it to be -- and replacing what will not decode would put a value into the program
+    // that is neither what the child said nor anything it could be told apart from.
+    val said = text match
+        Ok(t) -> t
+        Err(_) ->
+            deny_request(request, r.at, s"what `${what}` printed is not text")
+            return
+
+    val complained = errors match
+        Ok(t) -> t
+        Err(_) ->
+            deny_request(request, r.at, s"what `${what}` printed on its error output is not text")
+            return
+
+    val mark = root_mark()
+    val o = new_object()
+
+    hold(Object(o))
+    obj_put_name(o, "status", Int(status))
+
+    // **A signal is `null` and not zero, because zero is a status a program can exit with.** A caller
+    // reading `r.signal` has to be able to tell "it was killed by signal 0" -- which is not a thing
+    // -- from "it was not killed", and slate has a null for exactly this.
+    obj_put_name(o, "signal", if signal == 0 then Null else Int(long(signal)))
+    obj_put_name(o, "out", str_value(said))
+    obj_put_name(o, "err", str_value(complained))
+    release(mark)
+    answer_request(request, Object(o))
+end settle_run
+
+// Give the slot up, closing the watchdog with it.
+private drop_run(slot: usize)
+    if slot >= running.len() then return
+
+    var r = running.at(slot)
+
+    r.watchdog match
+        Some(t) -> t.close(() -> ())
+        None -> ()
+
+    r.live = false
+    r.proc = None
+    r.watchdog = None
+    r.out = buf()
+    r.err = buf()
+    running.set(slot, r)
+
+// -- the arguments a program writes ---------------------------------------------------------------
+
+// The array of strings a command's arguments have to be.
+private string_list(args: Buf[Value], at: Span, name: string) -> Result[Buf[string], Signal]
+    var out: Buf[string] = buf()
+
+    for i in 0..<args.len()
+        args.at(i) match
+            Str(p) -> out.push(p.s)
+            other -> return Err(failure(at, s"`${name}` takes its arguments as strings, and one of them is ${other.type_name()}"))
+
+    Ok(out)
+
+// One text option out of the options object, or "" where it was not given.
+private option_text(options: Value, key: string, at: Span) -> Result[string, Signal]
+    options match
+        Value.Null -> Ok("")
+        Object(o) ->
+            val (v, _) = field_from(o, key, at)?
+
+            v match
+                Undefined -> Ok("")
+                Str(p) -> Ok(p.s)
+                other -> Err(failure(at, s"`${key}` is a string, and this is ${other.type_name()}"))
+        other -> Err(failure(at, s"`run` takes its options as an object, and this is ${other.type_name()}"))
+
+// **The environment REPLACES the child's rather than adding to it**, which is what libuv does and
+// what `sysl.process` does. It is the sharper of the two behaviours and the one that cannot be
+// written on top of the other: a program that wants to add a variable reads the ones it cares about
+// with `env(name)` and passes them through, and a program that wants a child with nothing in its
+// environment has no other way to say so.
+private option_env(options: Value, at: Span) -> Result[Buf[string], Signal]
+    var out: Buf[string] = buf()
+
+    options match
+        Value.Null -> return Ok(out)
+        Object(o) ->
+            val (v, _) = field_from(o, "env", at)?
+
+            v match
+                Undefined -> return Ok(out)
+                Object(e) ->
+                    for i in 0..<e.entries.len()
+                        val entry = e.entries.at(i)
+
+                        if !entry.dead
+                            entry.key match
+                                Str(k) ->
+                                    entry.value match
+                                        Str(val_) -> out.push(s"${k.s}=${val_.s}")
+                                        other -> return Err(failure(at, s"an environment variable is a string, and `${k.s}` is ${other.type_name()}"))
+                                other -> return Err(failure(at, s"an environment variable is named by a string, and this is ${other.type_name()}"))
+
+                    return Ok(out)
+                other -> return Err(failure(at, s"`env` is an object of names and values, and this is ${other.type_name()}"))
+        other -> return Err(failure(at, s"`run` takes its options as an object, and this is ${other.type_name()}"))
+
+// The timeout, in milliseconds, or zero for none.
+//
+// **A duration or a number of milliseconds**, exactly as `sleep` and `setTimeout` take one -- and
+// this is the call where writing `seconds(30)` rather than `30000` is worth most, a timeout being a
+// number nobody reads twice.
+private option_timeout(options: Value, at: Span) -> Result[long, Signal]
+    options match
+        Value.Null -> Ok(0)
+        Object(o) ->
+            val (v, _) = field_from(o, "timeout", at)?
+
+            v match
+                Undefined -> Ok(0)
+                Int(n) -> Ok(n)
+                DurationVal(us) -> Ok(us / 1000)
+                other -> Err(failure(at, s"`timeout` is a duration or a number of milliseconds, and this is ${other.type_name()}"))
+        other -> Err(failure(at, s"`run` takes its options as an object, and this is ${other.type_name()}"))
+
+// -- what a program calls ---------------------------------------------------------------------
+
+// `run(command, args)` and `run(command, args, options)`.
+do_run(args: Buf[Value], at: Span) -> Step
+    if args.len() < 1 || args.len() > 3
+        return fault(at, s"`run` takes a command, its arguments and optionally some options, and was given ${args.len()} arguments")
+
+    val command = text_argument(args.at(0), at, "run", "a command")?
+
+    var argv: Buf[Value] = buf()
+
+    if args.len() > 1
+        args.at(1) match
+            Array(a) ->
+                for i in 0..<a.items.len() do argv.push(a.items.at(i))
+            other -> return fault(at, s"`run` takes the arguments as an array, and this is ${other.type_name()}")
+
+    val options = if args.len() > 2 then args.at(2) else Value.Null
+
+    start_program(command, argv, options, at)
+end do_run
+
+// `env(name)` -- what a variable holds in this program's own environment, or null.
+//
+// **Reading only.** Setting one changes what every later `run` inherits and what libraries loaded
+// into this process see, from anywhere in a program, which is a global variable wearing a
+// string's clothes; a child that needs a different environment is given one at the call.
+do_env(args: Buf[Value], at: Span) -> Step
+    wants(args, 1, at, "env", "one variable name")?
+
+    val name = text_argument(args.at(0), at, "env", "a variable name")?
+
+    env.get(name) match
+        Some(v) -> Ok(str_value(v))
+        None -> Ok(Null)
