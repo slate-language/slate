@@ -43,3 +43,11 @@ print(head, tail)
 //     val [a, b] = [1]        this binding takes 2 elements out of an array, and this one has 1
 //     val { a } = { b: 1 }    this object has no field called `a`, which this binding takes out of it
 //     val [a] = 5             this binding takes an array apart, and this is an integer
+
+// `?.` reads a field only where there is something to read it from, and answers `null` otherwise.
+// It guards its own link and not the rest of the chain, so each place absence is allowed says so.
+
+val config = { server: { port: 8080 } }
+
+print(config?.server?.port)
+print(config?.database?.port ?? 5432)
