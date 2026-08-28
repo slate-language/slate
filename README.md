@@ -521,6 +521,11 @@ and once as a zod schema for the run; slate needs one.
 type declared, while the program is compiled — so `p is Point` is the `is` slate always had, and a
 type costs no instruction.
 
+**A type is a shape and may not bind a name.** `type Tagged = { x: n }` is refused: a name written
+inside a type would be introduced wherever the type is used, which is not what a declaration that
+reads as a shape should do. It is the rule a union alternative already followed. An ordinary pattern
+outside a declaration binds exactly as it always did.
+
 **A bare name that names no type is still a binding.** That is sysl's rule for a nullary variant and
 slate already had it; declaring a type is what makes the name name something.
 
