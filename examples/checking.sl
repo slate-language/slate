@@ -51,3 +51,18 @@ print(area(len(holds), 2))
 
 print("done" match
     whatever -> whatever)
+
+// A test narrows the name it tested, so a call inside the branch is checked against what the test
+// proved. `&&` narrows by both, and a negated test narrows the other branch.
+describe(v) =
+    if v is string
+        upper(v)
+    elif v is number
+        v * 2
+    else
+        "something else"
+
+print(describe("shout"), describe(21), describe(true))
+
+// A `var` is never narrowed, because the branch may write to it -- and a stale narrowing would be
+// too narrow, which is refusing a program that runs.

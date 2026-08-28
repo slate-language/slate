@@ -125,10 +125,15 @@ end is_kind_of
 struct TypeEnv
     names: Buf[string]
     types: Buf[Type]
+
+    // **Whether a name may be written to, which only NARROWING needs.** A `var` reassigned inside
+    // the branch that narrowed it makes the narrowed type stale, and a stale type here is too narrow
+    // -- which refuses a program that runs. So a mutable name is never narrowed.
+    settled: Buf[bool]
     marks: Buf[usize]
 end TypeEnv
 
-type_env() -> TypeEnv = TypeEnv(buf(), buf(), buf())
+type_env() -> TypeEnv = TypeEnv(buf(), buf(), buf(), buf())
 
 enter_scope(e: *TypeEnv)
     e.marks.push(e.names.len())
@@ -138,6 +143,7 @@ leave_scope(e: *TypeEnv)
         Some(mark) ->
             e.names.truncate(mark)
             e.types.truncate(mark)
+            e.settled.truncate(mark)
         None -> ()
 
 // **AN OBJECT'S SHAPE IS NOT CARRIED BY A NAME, AND THAT IS THE CONSERVATIVE BOUNDARY OF THIS
@@ -153,8 +159,13 @@ leave_scope(e: *TypeEnv)
 // Carrying one through a name wants either immutable records or an escape analysis, and is the next
 // piece of work rather than a thing to guess at.
 note_type(e: *TypeEnv, name: string, t: Type)
+    note_binding(e, name, t, true)
+
+// The same, saying whether the name may later be written to.
+note_binding(e: *TypeEnv, name: string, t: Type, settled: bool)
     e.names.push(name)
     e.types.push(unshaped(t))
+    e.settled.push(settled)
 
 private unshaped(t: Type) -> Type
     *t.kind match
@@ -172,6 +183,53 @@ known_type(e: *TypeEnv, name: string) -> Type
 
         if e.names.at(i) == name then return e.types.at(i)
 end known_type
+
+// Whether a name is one narrowing may say anything about.
+private may_narrow(e: *TypeEnv, name: string) -> bool
+    var i = e.names.len()
+
+    loop
+        if i == 0 then return false
+
+        i -= 1
+
+        if e.names.at(i) == name then return e.settled.at(i)
+end may_narrow
+
+// **`x is string` makes `x` a string for as long as the test held.** The feature a reader coming
+// from TypeScript looks for first, and the reason it is safe here is the flag above: a name that may
+// be written to is left alone, so a branch that reassigns what it narrowed cannot leave a stale
+// claim behind.
+//
+// **Only a bare name is narrowed.** `o.f is string` would need to say something about `o` that the
+// next line could undo by writing to the field, and this pass says nothing about an object's fields
+// in the first place.
+private narrow_by(cond: Expr, want_true: bool, env: *TypeEnv)
+    *cond.kind match
+        IsPattern(subject, pat, negated) ->
+            // A negated test narrows the OTHER branch, which is the same rule read backwards.
+            if negated == want_true then return
+
+            *subject.kind match
+                Name(name) ->
+                    if !may_narrow(env, name) then return
+
+                    val narrowed = type_from_pattern(resolve_pattern(pat, 0))
+
+                    // A pattern that binds tells us nothing; one that tests tells us everything.
+                    first_binding(pat) match
+                        Some(_) -> ()
+                        None -> note_binding(env, name, narrowed, true)
+                _ -> ()
+
+        // **`a && b` narrows by both**, which is what makes `if x is string && len(x) > 0` work --
+        // the second operand is already inside the first's narrowing when the machine evaluates it.
+        Binary(op, lhs, rhs) ->
+            if op == AndAnd && want_true
+                narrow_by(lhs, true, env)
+                narrow_by(rhs, true, env)
+        _ -> ()
+end narrow_by
 
 // -- the walk -----------------------------------------------------------------------------------
 
@@ -386,7 +444,7 @@ private check_stmt(s: Stmt, env: *TypeEnv)
         // a program the checker had not read all of.
         Var(name, init) ->
             check_expr(init, env)
-            note_type(env, name, type_of(Any))
+            note_binding(env, name, type_of(Any), false)
         Unpack(pat, init, _) ->
             check_expr(init, env)
             note_bindings(pat, env)
@@ -543,13 +601,31 @@ private check_expr(x: Expr, env: *TypeEnv)
             for i in 0..<values.len()
                 check_expr(values.at(i), env)
         Await(inner) -> check_expr(inner, env)
-        Ensures(value, _, _) -> check_expr(value, env)
+        Ensures(value, declared, pat) ->
+            check_expr(value, env)
+
+            // **A body that is one expression is checked against what the definition promised.** A
+            // block answers `Any` here and is left alone, which is also what keeps an early `return`
+            // out of it: nothing about a block's value is known, so nothing is claimed.
+            val answered = type_of_expr(value, env)
+            val promised = type_from_pattern(resolve_pattern(pat, 0))
+
+            if !fits(answered, promised)
+                complain_here(value.span, s"this was declared to answer ${declared}, and answers ${show_type(answered)}")
         IfExpr(cond, then_branch, else_branch) ->
             check_expr(cond, env)
+
+            enter_scope(env)
+            narrow_by(cond, true, env)
             check_expr(then_branch, env)
+            leave_scope(env)
 
             else_branch match
-                Some(other) -> check_expr(other, env)
+                Some(other) ->
+                    enter_scope(env)
+                    narrow_by(cond, false, env)
+                    check_expr(other, env)
+                    leave_scope(env)
                 None -> ()
         MatchExpr(subject, arms) ->
             check_expr(subject, env)
@@ -560,6 +636,7 @@ private check_expr(x: Expr, env: *TypeEnv)
                 // therefore silent about all of them.
                 enter_scope(env)
                 note_bindings(arms.at(i).pattern, env)
+                narrow_by_arm(subject, arms.at(i).pattern, env)
                 check_expr(arms.at(i).body, env)
                 leave_scope(env)
         While(_, cond, body, otherwise) ->
@@ -587,6 +664,20 @@ private check_expr(x: Expr, env: *TypeEnv)
         Lambda(params, body, _) -> check_body(params, body_at(body), env)
         _ -> ()
 end check_expr
+
+// **An arm narrows its subject the way an `is` narrows its operand**, and for the same reason: the
+// arm only runs where the pattern took. `note_bindings` has already put the arm's own names in, so
+// this is on top of them and a name the pattern bound wins by being nearer.
+private narrow_by_arm(subject: Expr, pat: Pattern, env: *TypeEnv)
+    *subject.kind match
+        Name(name) ->
+            if !may_narrow(env, name) then return
+
+            first_binding(pat) match
+                Some(_) -> ()
+                None -> note_binding(env, name, type_from_pattern(resolve_pattern(pat, 0)), true)
+        _ -> ()
+end narrow_by_arm
 
 private check_otherwise(otherwise: Option[Expr], env: *TypeEnv)
     otherwise match
@@ -684,5 +775,5 @@ end named
 //   `ObjectWith`; what is missing is only the lookup.
 // - **A function's RESULT is not checked against its body.** `-> integer` is enforced by
 //   `CheckResult` at run time and believed here.
-// - **Nothing narrows.** `if x is string then ...` does not make `x` a string inside the branch,
-//   which is the feature a TypeScript reader will miss first.
+// - **Narrowing reaches an `if` and a `match` arm and nothing else.** A `while`, a guard and the
+//   right-hand side of `||` all leave the subject as it was.
