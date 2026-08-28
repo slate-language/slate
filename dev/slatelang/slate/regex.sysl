@@ -1,0 +1,346 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sh.sysl.pcre2
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+import sysl.text.{char_indices, from_utf8_unchecked}
+
+// Regular expressions, on PCRE2.
+//
+// **The dialect is Perl's, which is what a person writing a regular expression expects.** sysl's own
+// `sysl.regex` is POSIX extended syntax — no `\d`, no lazy quantifier, no lookaround, no
+// backreference — and under it `\d` is not an error but a literal `d`, which is the worst of both:
+// the pattern compiles and quietly matches nothing. PCRE2 is what `sh.sysl.pcre2` binds and what
+// this file reaches for.
+//
+// **THREE THINGS HERE ARE DELIBERATELY NOT JAVASCRIPT'S, AND EACH IS A DEFECT OF ITS DESIGN.**
+//
+//   - **A regular expression carries no state.** JavaScript's `/g` patterns hold a mutable
+//     `lastIndex`, so `re.test(s)` called twice on the same string answers `true` then `false` —
+//     the single most reported surprise in the language, and one that only shows up on the second
+//     call. There is no `g` flag here: `replace` replaces everything and `findAll` finds everything,
+//     both at once and both from the start.
+//   - **`replace` replaces every match.** JavaScript's replaces the first unless `/g` is set, which
+//     is why `replaceAll` had to be added to the language twenty years later. Here the bare verb
+//     does the whole job and `replaceFirst` is the one that stops early — the same rule
+//     `array.sysl` follows for `sort` against `sorted`.
+//   - **A group that took no part in the match is `null`.** It cannot be `undefined`: slate's
+//     absence may not be stored in a container, and a groups array is a container.
+//
+// **A pattern that will not compile is a fault where it is written**, naming the offset PCRE2
+// stopped at, rather than something that goes wrong later.
+
+// -- the table ------------------------------------------------------------------------------------
+
+// One compiled pattern, and what it was written as.
+private struct Compiled
+    source: string
+    flags: string
+    re: &pcre2.Regex
+end Compiled
+
+// **A slot in this table, and not the compiled pattern itself.** A `&pcre2.Regex` is a counted box,
+// and a counted box may not live in the collected heap at all (see `obj.sysl`) — so what a program
+// holds is the slot, exactly as it does for a socket.
+//
+// **Keyed by the pattern and its flags, so an identical pattern compiles once.** That is the
+// difference from a socket's table and it is what makes a slot safe to keep forever: a socket's slot
+// is reused after a `close`, so a socket value needs a generation to tell one occupant from the next.
+// Nothing here is ever released — a compiled pattern has no `close` and a program cannot ask for one
+// — so a slot always names the pattern it named, and one number is the whole value.
+//
+// A loop compiling the same pattern text costs one entry; a program building genuinely different
+// patterns pays for each, which is what compiling them means.
+var compiled: Buf[Compiled] = buf()
+var pattern_ids: Map[string, usize] = map()
+
+// The compiled pattern a value names.
+private regex_of(v: Value, at: Span, name: string) -> Result[usize, Signal] = v match
+    RegexVal(id) -> Ok(id)
+    other -> Err(failure(at, s"`${name}` takes a regular expression, and this is ${other.type_name()}"))
+
+// **The flags a program may write, and nothing else.** An unknown letter is a fault naming it rather
+// than a flag silently ignored — `g` is the one people will try, and telling them it does not exist
+// is the whole point of not having it.
+private options_for(flags: string, at: Span) -> Result[pcre2.Options, Signal]
+    var icase = false
+    var multiline = false
+    var dotall = false
+    var extended = false
+
+    for b in flags.bytes
+        if b == u8('i') then
+            icase = true
+        elif b == u8('m') then
+            multiline = true
+        elif b == u8('s') then
+            dotall = true
+        elif b == u8('x') then
+            extended = true
+        elif b == u8('g') then
+            return Err(failure(at, "there is no `g` flag -- `replace` already replaces every match and `findAll` already finds every one"))
+        else
+            return Err(failure(at, s"`${char_text(b)}` is not a regular expression flag -- the flags are `i`, `m`, `s` and `x`"))
+
+    // The last two are `dollar_end_only` and `unicode_classes`, and both are JavaScript's answer:
+    // `$` means the very end rather than also the position before a final newline, and `\d` is
+    // `[0-9]` rather than every decimal digit in Unicode. A pattern wanting the second writes
+    // `\p{Nd}`, which works either way.
+    Ok(pcre2.Options(icase, multiline, dotall, true, extended, false))
+end options_for
+
+private char_text(b: u8) -> string = from_utf8_unchecked([b])
+
+// The slot for this pattern, compiling it if this is the first time it has been asked for.
+private pattern_slot(source: string, flags: string, at: Span) -> Result[usize, Signal]
+    // The flags are only ever `imsx`, so a colon after them cannot be mistaken for part of one and
+    // the key needs no escaping.
+    val key = s"${flags}:${source}"
+
+    pattern_ids.get(key) match
+        Some(id) -> return Ok(id)
+        None -> ()
+
+    val options = options_for(flags, at)?
+
+    pcre2.compile_with(source, options, pcre2.default_limits()) match
+        Ok(re) ->
+            val id = compiled.len()
+
+            compiled.push(Compiled(source, flags, re))
+            pattern_ids.put(key, id)
+            Ok(id)
+        Err(e) -> Err(failure(at, s"this is not a regular expression: ${pcre2.describe(e)}"))
+end pattern_slot
+
+// What a match that would not finish is, said in slate's terms rather than PCRE2's.
+//
+// **The budget exists because PCRE2 backtracks.** `(a+)+$` against a subject with no `b` costs an
+// unbounded amount of time on a pattern and a subject both short enough to fit on one line, and
+// node has no limit at all — so a program there stops answering where a program here raises a fault
+// naming the pattern.
+private gave_up(name: string, source: string, e: pcre2.Error, at: Span) -> Signal = e match
+    MatchLimit -> failure(at, s"`${name}` gave up on /${source}/ -- this pattern and this subject need more backtracking than a match is allowed")
+    DepthLimit -> failure(at, s"`${name}` gave up on /${source}/ -- this pattern nests deeper than a match is allowed")
+    other -> failure(at, s"`${name}` could not match /${source}/: ${pcre2.describe(other)}")
+
+// -- turning a match into a value -------------------------------------------------------------
+
+// Byte offsets into character positions, in ONE walk of the subject.
+//
+// **slate counts a string in characters and PCRE2 answers in bytes**, so every offset that crosses
+// has to be converted. Doing it one offset at a time would walk the subject once per group and once
+// per match; a `findAll` over a long text would then cost the square of its length. This walks the
+// subject once and answers every offset asked for, which is the only reason it is worth its own
+// function.
+private char_positions(s: string, offsets: Buf[int]) -> Buf[int]
+    var out: Buf[int] = buf()
+
+    for i in 0..<offsets.len()
+        out.push(offsets.at(i))
+
+    var n: int = 0
+
+    for entry in char_indices(s.bytes)
+        for i in 0..<offsets.len()
+            if offsets.at(i) >= 0 && usize(offsets.at(i)) == entry.0 then out.set(i, n)
+
+        n += 1
+
+    // An offset at the very end of the subject falls on no character, so the walk never reaches it.
+    for i in 0..<offsets.len()
+        if offsets.at(i) >= 0 && usize(offsets.at(i)) == s.bytes.len then out.set(i, n)
+
+    out
+end char_positions
+
+// What a program is handed for a match: the text, where it landed, its groups, and its named groups.
+//
+// **`groups` holds the whole match at 0**, which is what every other language answers and what makes
+// `m.groups[1]` the first written group rather than the second.
+private match_value(m: pcre2.Match, id: usize, subject: string) -> Value
+    val mark = root_mark()
+    val o = new_object()
+
+    hold(Object(o))
+
+    var offsets: Buf[int] = buf()
+
+    for i in 0..<m.slots.len
+        offsets.push(m.slots[i])
+
+    val positions = char_positions(subject, offsets)
+
+    obj_put_name(o, "text", str_value(m.text()))
+    obj_put_name(o, "start", Int(long(positions.at(0))))
+    obj_put_name(o, "end", Int(long(positions.at(1))))
+
+    var groups: Buf[Value] = buf()
+
+    for i in 0..<m.group_count()
+        groups.push(m.group(i) match
+            Some(g) -> str_value(g)
+            None -> Value.Null)
+
+    val ga = new_array(groups)
+
+    hold(Array(ga))
+    obj_put_name(o, "groups", Array(ga))
+
+    // **`named` is always here, empty where the pattern names nothing.** A field that appears only
+    // sometimes is one a program has to test for before reading, and the shape of a match should not
+    // depend on the pattern that made it.
+    val named = new_object()
+
+    hold(Object(named))
+
+    val names = compiled.at(id).re.named_groups()
+
+    for i in 0..<names.len()
+        val g = names.at(i)
+
+        obj_put_name(named, g.name, m.group(g.number) match
+            Some(t) -> str_value(t)
+            None -> Value.Null)
+
+    obj_put_name(o, "named", Object(named))
+    release(mark)
+    Object(o)
+end match_value
+
+// -- what a program calls ---------------------------------------------------------------------
+
+// `regex(pattern)` and `regex(pattern, flags)`.
+do_regex(args: Buf[Value], at: Span) -> Step
+    if args.len() < 1 || args.len() > 2
+        return fault(at, s"`regex` takes a pattern and optionally its flags, and was given ${args.len()} arguments")
+
+    val source = text_argument(args.at(0), at, "regex", "a pattern")?
+    val flags = if args.len() > 1 then text_argument(args.at(1), at, "regex", "its flags")? else ""
+
+    Ok(RegexVal(pattern_slot(source, flags, at)?))
+end do_regex
+
+// `re.test(s)` -- whether the subject matches anywhere.
+do_regex_test(args: Buf[Value], at: Span) -> Step
+    wants(args, 2, at, "test", "a regular expression and a subject")?
+
+    val id = regex_of(args.at(0), at, "test")?
+    val subject = text_argument(args.at(1), at, "test", "a subject")?
+    val c = compiled.at(id)
+
+    c.re.is_match(subject) match
+        Ok(b) -> Ok(Bool(b))
+        Err(e) -> Err(gave_up("test", c.source, e, at))
+end do_regex_test
+
+// `re.find(s)` -- the leftmost match, or null.
+do_regex_find(args: Buf[Value], at: Span) -> Step
+    wants(args, 2, at, "find", "a regular expression and a subject")?
+
+    val id = regex_of(args.at(0), at, "find")?
+    val subject = text_argument(args.at(1), at, "find", "a subject")?
+    val c = compiled.at(id)
+
+    c.re.find(subject) match
+        Ok(found) -> found match
+            Some(m) -> Ok(match_value(m, id, subject))
+            None -> Ok(Null)
+        Err(e) -> Err(gave_up("find", c.source, e, at))
+end do_regex_find
+
+// `re.findAll(s)` -- every match, left to right and non-overlapping.
+do_regex_find_all(args: Buf[Value], at: Span) -> Step
+    wants(args, 2, at, "findAll", "a regular expression and a subject")?
+
+    val id = regex_of(args.at(0), at, "findAll")?
+    val subject = text_argument(args.at(1), at, "findAll", "a subject")?
+    val c = compiled.at(id)
+
+    c.re.find_all(subject) match
+        Err(e) -> Err(gave_up("findAll", c.source, e, at))
+        Ok(ms) ->
+            // **The array is made first and held**, because each match builds two objects and an
+            // array of its own, and a `Buf` of values is not a root -- so a collection part-way
+            // through the walk would take everything already found.
+            val mark = root_mark()
+            var items: Buf[Value] = buf()
+            val out = new_array(items)
+
+            hold(Array(out))
+
+            for i in 0..<ms.len()
+                val v = match_value(ms.at(i), id, subject)
+
+                hold(v)
+                out.items.push(v)
+
+            release(mark)
+            Ok(Array(out))
+end do_regex_find_all
+
+// `re.replace(s, with)` -- **every** match replaced.
+do_regex_replace(args: Buf[Value], at: Span) -> Step = substitute(args, at, "replace", true)
+
+// `re.replaceFirst(s, with)` -- the leftmost match replaced, and the rest left alone.
+do_regex_replace_first(args: Buf[Value], at: Span) -> Step = substitute(args, at, "replaceFirst", false)
+
+private substitute(args: Buf[Value], at: Span, name: string, every: bool) -> Step
+    wants(args, 3, at, name, "a regular expression, a subject and a replacement")?
+
+    val id = regex_of(args.at(0), at, name)?
+    val subject = text_argument(args.at(1), at, name, "a subject")?
+    val with = text_argument(args.at(2), at, name, "a replacement")?
+    val c = compiled.at(id)
+
+    val r = if every then c.re.replace_all(subject, with) else c.re.replace_first(subject, with)
+
+    r match
+        Ok(s) -> Ok(str_value(s))
+        Err(e) -> Err(gave_up(name, c.source, e, at))
+end substitute
+
+// `re.split(s)` -- the pieces between the matches.
+do_regex_split(args: Buf[Value], at: Span) -> Step
+    wants(args, 2, at, "split", "a regular expression and a subject")?
+
+    val id = regex_of(args.at(0), at, "split")?
+    val subject = text_argument(args.at(1), at, "split", "a subject")?
+    val c = compiled.at(id)
+
+    c.re.split(subject) match
+        Err(e) -> Err(gave_up("split", c.source, e, at))
+        Ok(parts) ->
+            val mark = root_mark()
+            var items: Buf[Value] = buf()
+            val out = new_array(items)
+
+            hold(Array(out))
+
+            for i in 0..<parts.len()
+                out.items.push(str_value(parts.at(i)))
+
+            release(mark)
+            Ok(Array(out))
+end do_regex_split
+
+// `re.pattern()` -- what the regular expression was written as.
+do_regex_pattern(args: Buf[Value], at: Span) -> Step
+    wants(args, 1, at, "pattern", "a regular expression")?
+
+    Ok(str_value(compiled.at(regex_of(args.at(0), at, "pattern")?).source))
+end do_regex_pattern
+
+// `re.flags()` -- the flags it was made with.
+do_regex_flags(args: Buf[Value], at: Span) -> Step
+    wants(args, 1, at, "flags", "a regular expression")?
+
+    Ok(str_value(compiled.at(regex_of(args.at(0), at, "flags")?).flags))
+end do_regex_flags
+
+// What `show` prints for a regular expression. Not `private`: `builtin.sysl` renders every value and
+// this table is this file's.
+regex_source(id: usize) -> string = compiled.at(id).source
+
+regex_flags(id: usize) -> string = compiled.at(id).flags
