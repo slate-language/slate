@@ -82,6 +82,12 @@ fits(got: Type, want: Type) -> bool
 
                 true
             _ -> false
+        // **A temporal type fits its own word and nothing else**, which mirrors `is_kind` exactly:
+        // each of the eight tests one variant of `Value` and no two of them overlap. There is no
+        // promotion here as there is between an integer and a real -- a date is a date.
+        TemporalType(want_name) -> *got.kind match
+            TemporalType(got_name) -> got_name == want_name
+            _ -> false
         FunctionType(want_params, _) -> *got.kind match
             // **Arity only, for now.** A parameter's type is contravariant and slate has no syntax
             // for writing a function type down, so every function type the walk builds has `Any`
@@ -280,6 +286,50 @@ private install_builtin_types(e: *TypeEnv)
 
     val position = type_of(OneOf(maybe_at))
 
+    // **The temporal builtins, and only the ones whose answer does not depend on what they were
+    // given.** `seconds(n)` makes a duration and `seconds(d)` reads one back, so its result is an
+    // integer or a duration depending on the argument -- a signature naming one would refuse the
+    // other. The same goes for `date`, `time`, `dateTime`, `zone` and the epoch words, and for
+    // anything whose arity varies. What is left is the part a program gets wrong most often anyway:
+    // the readings.
+    val instant_t = type_of(TemporalType("instant"))
+    val duration_t = type_of(TemporalType("duration"))
+    val date_t = type_of(TemporalType("date"))
+    val zone_t = type_of(TemporalType("zone"))
+
+    none(e, "now", instant_t)
+    none(e, "monotonic", duration_t)
+    none(e, "localZone", zone_t)
+    one(e, "instant", any, instant_t)
+    one(e, "year", any, whole)
+    one(e, "month", any, whole)
+    one(e, "day", any, whole)
+    one(e, "hour", any, whole)
+    one(e, "minute", any, whole)
+    one(e, "second", any, whole)
+    one(e, "dayOfYear", any, whole)
+    one(e, "daysInMonth", any, whole)
+    one(e, "weekday", any, text)
+    one(e, "monthName", any, text)
+    one(e, "isLeapYear", any, truth)
+    one(e, "parseDate", text, record)
+    one(e, "parseTime", text, record)
+    one(e, "parseDateTime", text, record)
+    one(e, "parseTimestamp", text, record)
+    two(e, "format", any, text, text)
+    two(e, "startOf", any, text, any)
+    two(e, "onOrAfter", date_t, text, date_t)
+
+    // **`env` answers a string or nothing, and that union is a real check**: handing it straight to
+    // something that wants a string is a fault the machine would raise, and `?? ""` is what a
+    // program writes instead.
+    var maybe_text: Buf[Type] = buf()
+
+    maybe_text.push(text)
+    maybe_text.push(nothing)
+
+    one(e, "env", text, type_of(OneOf(maybe_text)))
+
     one(e, "len", any, whole)
     one(e, "chars", text, list)
     one(e, "trim", text, text)
@@ -327,6 +377,14 @@ private install_builtin_types(e: *TypeEnv)
     three(e, "reduce", list, callable, any, any)
     three(e, "insert", list, whole, any, nothing)
 end install_builtin_types
+
+// A builtin of no arguments.
+//
+// **It is only expressible because the RESULT is known**, `FunctionType(no params, any result)`
+// being the bare word `function` and saying nothing. So `now()` can be counted -- `now(5)` is
+// refused -- and a builtin of no arguments whose answer nobody can name could not be.
+private none(e: *TypeEnv, name: string, result: Type)
+    note_type(e, name, type_of(FunctionType(buf(), result)))
 
 private one(e: *TypeEnv, name: string, a: Type, result: Type)
     var params: Buf[Type] = buf()
@@ -577,6 +635,7 @@ private check_expr(x: Expr, env: *TypeEnv)
             for i in 0..<args.len()
                 check_expr(args.at(i), env)
 
+            check_method(callee, env)
             check_call(callee, args, env, at)
         Binary(op, lhs, rhs) ->
             check_expr(lhs, env)
@@ -684,6 +743,66 @@ private check_otherwise(otherwise: Option[Expr], env: *TypeEnv)
         Some(x) -> check_expr(x, env)
         None -> ()
 
+// `x.m(...)` where the kind of `x` is known: a method name that kind does not have.
+//
+// **This is the most common mistake a checker can catch in a dynamic language** -- a name off by a
+// letter, or one borrowed from another type -- and it is sound here because it asks the machine's own
+// question. `methods_of` is the table `builtin_method` dispatches through, so what this refuses is
+// exactly what the machine would refuse, and a name added to a kind is added in one place.
+//
+// **An object is not asked about**, its names being the program's; nor is anything whose type is not
+// certain, which is the ordinary case in unannotated code.
+private check_method(callee: Expr, env: *TypeEnv)
+    *callee.kind match
+        Field(target, name, _) ->
+            val t = type_of_expr(target, env)
+
+            if !certain(t) then return
+
+            val kind = method_kind_word(t)
+
+            if kind == "" then return
+            if methods_of(kind, name).is_some() then return
+
+            // **The same sentence the machine would have printed**, down to the article: a reader
+            // who meets this at compile time and then at run time must not have to work out that the
+            // two are one complaint.
+            complain_here(callee.span, s"`${name}` is not something ${article(kind)} ${kind} can do")
+        _ -> ()
+end check_method
+
+// The word a type's methods are looked up under, or `""` where it has none to look up.
+//
+// **Only the kinds `method.sysl` has a table for**, which is what keeps this from claiming anything
+// about an object, a function or `null`: an object's names belong to the program, and the other two
+// have no methods at all, so a complaint about either would have to come from somewhere that knows
+// more than this does.
+private method_kind_word(t: Type) -> string
+    *t.kind match
+        StringType -> "string"
+
+        // **`integer` and `real` rather than `number`**, since that is what `type_name` says at run
+        // time and the two messages have to read alike. `methods_of` takes all three words and
+        // answers from the one table.
+        IntegerType -> "integer"
+        RealType -> "real"
+        NumberType -> "number"
+        ArrayOf(_) -> "array"
+        TemporalType(name) -> name
+        _ -> ""
+end method_kind_word
+
+// `a` or `an`, so that a complaint reads as English.
+private article(word: string) -> string
+    val b = word.bytes
+
+    if b.len == 0 then return "a"
+
+    val c = b[0]
+
+    if c == u8('a') || c == u8('e') || c == u8('i') || c == u8('o') || c == u8('u') then "an" else "a"
+end article
+
 // A call whose callee is a function the pass knows the shape of.
 //
 // **Arity first, and it stops there when it is wrong**, because a mismatched count makes every
@@ -747,11 +866,24 @@ private check_binary(op: Tok, lhs: Expr, rhs: Expr, env: *TypeEnv, at: Span)
     if numeric(a) && numeric(b) then return
     if op == Plus && is_kind_of(a, StringType) && is_kind_of(b, StringType) then return
 
+    // **A temporal operand is left to the machine, and this pass may not do otherwise.** What `+`,
+    // `-` and `*` mean over the eight temporal kinds is a table of its own in `time.sysl` -- an
+    // instant minus an instant is a duration, a zoned reading plus a period is a zoned reading, a
+    // duration times an integer is a duration -- and restating it here would be a second copy to
+    // keep in step by hand. It refused `monotonic() - a`, which runs, the first time it was tried.
+    if is_temporal(a) || is_temporal(b) then return
+
     // Anything not certainly one of the two workable pairings is left to the machine.
     if !certain(a) || !certain(b) then return
 
     complain_here(at, s"`${op_text(op)}` does not apply to ${show_type(a)} and ${show_type(b)}")
 end check_binary
+
+// Whether this is one of the eight temporal kinds, whose operators are their own subject.
+private is_temporal(t: Type) -> bool
+    *t.kind match
+        TemporalType(_) -> true
+        _ -> false
 
 // Whether enough is known about a type to argue from it.
 private certain(t: Type) -> bool
@@ -786,3 +918,14 @@ end named
 //   `CheckResult` at run time and believed here.
 // - **Narrowing reaches an `if` and a `match` arm and nothing else.** A `while`, a guard and the
 //   right-hand side of `||` all leave the subject as it was.
+// - **A temporal operator is not checked at all.** What `+`, `-` and `*` mean over the eight
+//   temporal kinds is a table in `time.sysl`, and restating it here would be a second copy kept in
+//   step by hand -- so `check_binary` steps aside for them. Reading that table rather than copying
+//   it is the way in, if it is ever worth doing.
+//
+// **A METHOD NAME IS CHECKED NOW, AND IT IS THE MOST USEFUL THING THIS PASS DOES.** `"abc".push(1)`
+// and `date(2026, 1, 1).hour()` are refused before they run, which is the commonest mistake there is
+// in a language with per-kind method tables. It is sound because it asks the machine's own question:
+// `methods_of` in `method.sysl` is the table `builtin_method` dispatches through, so a name added to
+// a kind is added in one place and the two can never disagree. An object is never asked about -- its
+// names are the program's -- and nor is a receiver whose type is not certain.
