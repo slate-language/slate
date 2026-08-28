@@ -1,0 +1,226 @@
+module dev.slatelang.slate
+
+// **The module is imported whole and qualified `json.`**, for the reason `json.sysl` gives: every
+// one of `Json`'s variants is also a `Value` variant, and a file that traffics in both wants to say
+// which it means.
+import sh.sysl.json
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// A project manifest: a slate object literal, read as data and never run.
+//
+// **The manifest is written in slate's own syntax because slate's value model already IS the config
+// model** -- null, booleans, two kinds of number, strings, arrays and records, and nothing else.
+// That is the same observation `json.sysl` is built on, and it means a manifest reader is a
+// restriction over the parser slate already has rather than a second grammar to maintain. sysl
+// reaches for HOCON because a config format is genuinely foreign to a statically compiled language
+// with no runtime value type; here the opposite is true, and importing a foreign format would mean
+// writing several hundred lines to end up with something slate could already parse.
+//
+// **What it buys, none of which is written here:** `//` comments, the whole of slate's literal
+// syntax, and -- the one that matters most for a file people edit by hand -- the `Span`/`Report`
+// machinery, so a manifest that is wrong gets the same source-quoting, caret-drawing diagnostic a
+// program that is wrong gets. No config format bolted on from outside would have that, and it is
+// the reason to be the language rather than to embed one.
+//
+// **THE FILE IS PARSED AND NOT EVALUATED, AND THAT IS THE WHOLE DESIGN.** A manifest names what a
+// project depends on, so it is read by tools that have not chosen to trust it -- a resolver working
+// out what to fetch is reading a file that arrived *with* the thing it is deciding whether to fetch.
+// A manifest that ran would make that a code-execution step, which is npm's install-scripts problem
+// and the reason `package.json` is inert. It would also drag the whole machine into the resolver:
+// `read_manifest` needs the lexer and the parser and nothing else, no heap, no collector, no VM.
+//
+// **The restriction is a pass over the tree rather than a smaller grammar, and that is what keeps
+// the door open.** A literal object is already an ordinary slate expression, so a manifest can later
+// become "a slate file that evaluates to an object" and every file written against this reader keeps
+// working unchanged -- there is no format to migrate. It also means the gate can be widened one
+// construct at a time and each widening named: string concatenation, then a conditional over a
+// platform value, then some set of pure builtins. Widening is available at any time; narrowing, once
+// a manifest may run, never is. So it starts shut.
+
+// What reading a manifest answers with.
+//
+// **Shaped like `Parsed`, and for its reason**: the value and the complaints arrive together, so a
+// caller that wants to report everything wrong with a file can, rather than being handed the first
+// fault and having to come back for the rest. The value is `Null` where the report has errors.
+struct Manifest
+    value: json.Json
+    report: Report
+
+    ok(self) -> bool = !self.report.has_errors()
+end Manifest
+
+// Read a manifest out of a source.
+//
+// **`parse_source` rather than `parse`, deliberately.** The two differ in whether the shared body
+// table is cleared, and a manifest has no bodies of its own to put there -- a lambda is the first
+// thing the restriction pass refuses. Clearing would be at best pointless and at worst destructive:
+// were this ever reached from inside a running program, `parse` would leave every closure that
+// program had already made pointing at somebody else's code.
+read_manifest(src: Source) -> Manifest
+    val parsed = parse_source(src)
+    var report = parsed.report
+
+    // A file that will not parse has nothing for the restriction pass to walk, and the parser's own
+    // complaints are the ones worth reading. Reporting "this is not a literal" about wreckage would
+    // send the reader to look at the wrong thing.
+    if report.has_errors() then return Manifest(json.Json.Null, report)
+
+    val stmts = parsed.program.stmts
+
+    if stmts.is_empty()
+        report.add(error(Span(0, src.bytes.len), "a manifest is one object, and this file is empty")
+            .with_note("the shortest manifest a file can hold is `{}`"))
+
+        return Manifest(json.Json.Null, report)
+    end if
+
+    // **The second statement is where the caret goes, not the first.** A file with two things in it
+    // is nearly always one object that was closed too early, and the reader needs to be looking at
+    // what came after the close rather than at the object, which is fine.
+    if stmts.len() > 1
+        report.add(error(stmts.at(1).span, "a manifest is one object, and this is a second statement after it")
+            .with_label("everything a manifest says goes inside the one object")
+            .with_note("a `}` earlier in the file may have closed it sooner than it looks"))
+
+        return Manifest(json.Json.Null, report)
+    end if
+
+    val only = stmts.at(0)
+
+    val e = *only.kind match
+        Eval(x) -> x
+        other ->
+            report.add(error(only.span, s"a manifest is one object written out, and this is ${statement_word(other)}")
+                .with_note("a manifest is data -- it declares nothing and runs nothing"))
+
+            return Manifest(json.Json.Null, report)
+
+    Manifest(literal_of(e, &report), report)
+end read_manifest
+
+// The same, over text that is not on disk. What the tests use.
+read_manifest_text(name: string, text: string) -> Manifest = read_manifest(source_of(name, text))
+
+// -- the restriction pass -------------------------------------------------------------------------
+
+// One expression as data, or a complaint about why it is not data.
+//
+// **Every arm that refuses says what the thing IS, not merely that it is not allowed.** "not a
+// literal" is true of a name, a call, a lambda and an `await` alike, and sends the reader to stare
+// at a line whose problem it has not named. The house rule is that a diagnostic is judged by where
+// it sends the reader, and the answer here is nearly always "you wrote code, and this file is data"
+// -- so each message says which code.
+private literal_of(e: Expr, report: *Report) -> json.Json
+    val at = e.span
+
+    *e.kind match
+        IntLit(v) -> json.Json.Int(v)
+        RealLit(v) -> json.Json.Real(v)
+        StrLit(v) -> json.Json.Str(v)
+        BoolLit(b) -> json.Json.Bool(b)
+        NullLit -> json.Json.Null
+
+        // **Negative numbers are the one operator the pass allows, and it is not an exception to the
+        // rule.** `-1` is a `Unary` in the tree because the lexer has no signed literal, so refusing
+        // every operator would refuse a number a person wrote as one number. The gate is narrow on
+        // purpose: the operand must itself be a numeric literal, so `-x` and `-(1 + 1)` are refused
+        // by the same walk that lets `-1` through.
+        Unary(op, rhs) ->
+            if op != Tok.Minus
+                report.add(error(at, s"a manifest is data, and `${op_text(op)}` is an operator")
+                    .with_note("the only operator a manifest may use is the `-` in front of a number"))
+
+                return json.Json.Null
+            end if
+
+            *rhs.kind match
+                IntLit(v) -> json.Json.Int(-v)
+                RealLit(v) -> json.Json.Real(-v)
+                other ->
+                    report.add(error(at, "a manifest may write `-` in front of a number and nothing else")
+                        .with_label(s"this is ${expression_word(other)}"))
+
+                    json.Json.Null
+
+        ArrayLit(items) ->
+            var out: Buf[json.Json] = buf()
+
+            // **Every item is walked even after one has failed**, so a manifest with three mistakes
+            // in it reports three. The `Null` a failed item leaves behind is never read: the caller
+            // checks the report, which is what `ok` is for.
+            for i in 0..<items.len()
+                out.push(literal_of(items.at(i), report))
+
+            json.Json.Arr(out)
+
+        ObjectLit(keys, values) ->
+            var members: Buf[json.Member] = buf()
+
+            for i in 0..<keys.len()
+                // **A repeated key is refused rather than resolved.** Either answer -- first wins or
+                // last wins -- silently discards something a person wrote, and in a file whose whole
+                // job is to be believed by a tool that is a bad trade. JSON leaves this undefined and
+                // every reader picks differently, which is exactly the outcome to avoid here.
+                var seen = false
+
+                for j in 0..<members.len()
+                    if members.at(j).key == keys.at(i) then seen = true
+
+                if seen
+                    report.add(error(values.at(i).span, s"`${keys.at(i)}` is written twice in this object")
+                        .with_note("a manifest refuses a repeated key rather than choosing one of them"))
+
+                members.push(json.Member(keys.at(i), literal_of(values.at(i), report)))
+
+            json.Json.Obj(members)
+
+        other ->
+            report.add(error(at, s"a manifest is data, and this is ${expression_word(other)}")
+                .with_note("a manifest is parsed and never run, so it holds only numbers, strings, booleans, `null`, arrays and objects"))
+
+            json.Json.Null
+end literal_of
+
+// -- naming what was found ------------------------------------------------------------------------
+
+// What an expression is, in the words a person would use for it.
+//
+// **The phrase completes "this is ..."**, so each one is an article and a noun and reads as part of
+// the sentence rather than as a category name printed after a colon.
+private expression_word(k: ExprKind) -> string
+    k match
+        Name(name) -> s"the name `${name}`, and a manifest has nothing to read it from"
+        Call(callee, args) -> "a call"
+        Lambda(params, body, is_async) -> "a function"
+        Field(target, name, optional) -> "a field being read off something"
+        Index(target, key) -> "an index into something"
+        Binary(op, lhs, rhs) -> s"a `${op_text(op)}` between two things"
+        Unary(op, rhs) -> s"a `${op_text(op)}` applied to something"
+        Interp(pieces) -> "an interpolated string, which is a computation"
+        WithFields(base, keys, values) -> "a `with`, which copies a value this file does not have"
+        IfExpr(cond, then_branch, else_branch) -> "an `if`"
+        MatchExpr(subject, arms) -> "a `match`"
+        Await(inner) -> "an `await`"
+        Range(lo, hi, inclusive) -> "a range"
+        Compare(operands, ops) -> "a comparison"
+        IsPattern(subject, pat, negated) -> "an `is`"
+        IncDec(target, up, before) -> "a change to a variable"
+        ArrayRepeat(value, count) -> "a repeated array, which is a computation"
+        UndefinedLit -> "`undefined`, which has no written form a tool could read back"
+        other -> "not something a manifest can hold"
+end expression_word
+
+// What a statement is, in the same voice.
+private statement_word(k: StmtKind) -> string
+    k match
+        Val(name, init) -> s"a `val` binding `${name}`"
+        Var(name, init) -> s"a `var` binding `${name}`"
+        Def(name, params, body, is_async) -> s"a definition of `${name}`"
+        Unpack(pat, init, immutable) -> "a destructuring binding"
+        Assign(op, target, value) -> "an assignment"
+        MultiAssign(op, targets, values) -> "an assignment"
+        Return(value) -> "a `return`"
+        Break(label, value) -> "a `break`"
+        other -> "a statement rather than an object"
+end statement_word
