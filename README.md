@@ -528,6 +528,17 @@ slate already had it; declaring a type is what makes the name name something.
 the import check and imports like anything else, but binds nothing — the module has no field of that
 name, a type never having been a value.
 
+**Annotating is per parameter**, so `f(a, b: Point, c)` is fine — nothing has to be annotated for
+anything to be.
+
+**A type may be a union, and `null` may be one of the alternatives**, which is how a parameter says
+it will take nothing:
+
+```
+type MaybePoint = Point | null
+type Shape = { side: num } | { radius: num }
+```
+
 **A parameter may say what it takes**, and then the complaint lands where the value was handed over:
 
 ```
