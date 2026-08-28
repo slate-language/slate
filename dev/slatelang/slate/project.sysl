@@ -1,0 +1,190 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// What a `package.sl` says, once it has been read as data and then read as a project.
+//
+// **Two passes and not one, because they answer different questions.** `manifest.sysl` asks whether
+// a file is data at all -- it knows nothing about slate's package system and would read a manifest
+// for something else unchanged. This asks whether that data is a project: the keys that must be
+// there, the kinds they must be, and the ones nothing knows. Keeping them apart is what lets the
+// restriction pass stay a property of the *format* rather than a list of slate's own field names.
+//
+// **Every complaint here points with a caret**, which is what the spans in `Doc` are carried for.
+// The mistakes people actually make in a config file are a misspelt key and a value of the wrong
+// kind, not a lambda where a number goes -- so a schema layer that could only name a key would have
+// given back most of what writing the manifest in slate's own syntax was for.
+
+// A project's own facts, and what it depends on.
+struct Project
+    name: string
+    version: string
+
+    // The file a `slate run` would start at. `""` where the manifest does not say.
+    main: string
+
+    dependencies: Buf[Dependency]
+end Project
+
+// One entry of `dependencies`.
+//
+// **`git` and `version` are both required and both plain strings.** What the coordinate means, and
+// whether the version is exact or a range, is not decided here -- this pass reports that they were
+// written and of what kind, and resolution is a separate thing that does not exist yet.
+struct Dependency
+    name: string
+
+    // Where the dependency's own key was written, which is where a complaint about it points.
+    at: Span
+
+    git: string
+    version: string
+end Dependency
+
+// A manifest read all the way to a project, with everything wrong with it.
+//
+// **Shaped like `Manifest` and `Parsed` before it**: the value and the complaints together, so a
+// file with four mistakes reports four rather than one at a time.
+struct ProjectFile
+    project: Project
+    report: Report
+
+    ok(self) -> bool = !self.report.has_errors()
+end ProjectFile
+
+// What a project's manifest is called. **A fixed name and not a search**: a directory either is a
+// slate project or is not, and a tool that accepted three spellings would make that a question.
+val ManifestFile: string = "package.sl"
+
+// The keys a project may write. Anything else is warned about rather than refused -- see below.
+private val ProjectKeys: []const string = ["name", "version", "main", "dependencies"]
+private val DependencyKeys: []const string = ["git", "version"]
+
+// Read a `package.sl`.
+read_project(src: Source) -> ProjectFile
+    val m = read_manifest(src)
+    var report = m.report
+
+    // A file that is not data has nothing for this pass to read, and `manifest.sysl` has already
+    // said what is wrong with it in the words that fit. Adding "and it is not a project either"
+    // would be a second complaint about one mistake.
+    if report.has_errors() then return ProjectFile(empty_project(), report)
+
+    ProjectFile(project_of(m.doc, &report), report)
+end read_project
+
+// The same, over text that is not on disk. What the tests use.
+read_project_text(name: string, text: string) -> ProjectFile = read_project(source_of(name, text))
+
+private empty_project() -> Project = Project("", "", "", buf())
+
+private project_of(d: Doc, report: *Report) -> Project
+    *d.kind match
+        Obj(members) ->
+            unknown_keys(members, ProjectKeys, "a project", report)
+
+            Project(
+                required_text(d, "name", "project", report),
+                required_text(d, "version", "project", report),
+                optional_text(d, "main", report),
+                dependencies_of(d, report))
+        other ->
+            report.add(error(d.span, s"a project is an object, and this is ${value_word(*d.kind)}")
+                .with_note("a `package.sl` says `{ name: ..., version: ... }` and what the project depends on"))
+
+            empty_project()
+end project_of
+
+private dependencies_of(d: Doc, report: *Report) -> Buf[Dependency]
+    var out: Buf[Dependency] = buf()
+
+    d.get("dependencies") match
+        None -> return out
+        Some(m) ->
+            *m.value.kind match
+                Obj(members) ->
+                    for i in 0..<members.len()
+                        out.push(dependency_of(members.at(i), report))
+                other ->
+                    report.add(error(m.at, s"`dependencies` is an object of one entry per package, and this is ${value_word(*m.value.kind)}")
+                        .with_note("write `dependencies: { parsing: { git: \"...\", version: \"...\" } }`"))
+
+    out
+end dependencies_of
+
+private dependency_of(m: DocMember, report: *Report) -> Dependency
+    *m.value.kind match
+        Obj(members) ->
+            unknown_keys(members, DependencyKeys, s"the dependency `${m.key}`", report)
+
+            Dependency(m.key, m.at,
+                required_text(m.value, "git", "dependency", report),
+                required_text(m.value, "version", "dependency", report))
+        other ->
+            report.add(error(m.at, s"a dependency says where it comes from and which version, and `${m.key}` is ${value_word(*m.value.kind)}")
+                .with_note("write `{ git: \"github.com/owner/repo\", version: \"0.1.0\" }`"))
+
+            Dependency(m.key, m.at, "", "")
+end dependency_of
+
+// -- reading one member ---------------------------------------------------------------------------
+
+// A key that has to be there, and has to be text.
+//
+// **A missing key points at the object and a wrong one points at the key**, which is as close as
+// each can get to where the reader has to go. There is nothing in the file to put a caret under for
+// something that was not written.
+//
+// **`owner` is the word the sentence ends on**, and it is a parameter because the same missing key
+// means two different things: a project has to say its `version` and so does each dependency, and a
+// message reading "every project says one" under a caret sitting on a dependency would be telling
+// the reader to look at the wrong object.
+private required_text(o: Doc, key: string, owner: string, report: *Report) -> string
+    o.get(key) match
+        None ->
+            // **The caret is one character wide and sits on the `{`.** The span of the object is
+            // the whole object, and underlining a forty-line manifest to say a key is absent from it
+            // is a wall of carets that names nothing -- where the brace is the one place a reader
+            // can be sent to look for something that is not there.
+            report.add(error(Span(o.span.start, o.span.start + 1), s"`${key}` is missing, and every ${owner} says one")
+                .with_label(s"nothing here writes `${key}`"))
+
+            ""
+        Some(m) -> text_of(m, key, report)
+end required_text
+
+// The same, for a key that may simply be absent.
+private optional_text(o: Doc, key: string, report: *Report) -> string
+    o.get(key) match
+        None -> ""
+        Some(m) -> text_of(m, key, report)
+end optional_text
+
+private text_of(m: DocMember, key: string, report: *Report) -> string
+    m.value.text() match
+        Some(t) -> t
+        None ->
+            report.add(error(m.at, s"`${key}` is a string, and this one is ${value_word(*m.value.kind)}")
+                .with_label(s"write it in quotes"))
+
+            ""
+end text_of
+
+// **A key nothing knows is a WARNING and not an error, which is a deliberate asymmetry.** A manifest
+// outlives the slate that reads it: a project written for a later version, or one carrying a key for
+// some other tool, would otherwise stop working on an older one -- and a package system whose files
+// only ever read forwards is a package system nobody can upgrade halfway. A typo still gets said out
+// loud, which is what the warning is for.
+private unknown_keys(members: Buf[DocMember], known: []const string, what: string, report: *Report)
+    for i in 0..<members.len()
+        val key = members.at(i).key
+        var seen = false
+
+        for j in 0..<known.len
+            if known[j] == key then seen = true
+
+        if !seen
+            report.add(warning(members.at(i).at, s"${what} says nothing about `${key}`")
+                .with_note("it is read by nothing, and a later slate may give it a meaning"))
+end unknown_keys

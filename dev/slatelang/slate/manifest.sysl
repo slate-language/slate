@@ -38,16 +38,124 @@ import sysl.buf.{Buf, buf}
 // platform value, then some set of pure builtins. Widening is available at any time; narrowing, once
 // a manifest may run, never is. So it starts shut.
 
+// -- what a manifest holds -------------------------------------------------------------------------
+
+// One value out of a manifest, with where it was written.
+//
+// **The span is the whole reason this is not a `json.Json`.** A `Json` is the value and nothing
+// else, so a complaint about it can name a key and cannot point at one -- and the argument for
+// writing a manifest in slate's own syntax was, above everything else, that a manifest gets the
+// caret-drawing diagnostics a program gets. Losing them one layer up, at exactly the mistakes people
+// actually make in a config file, would have given most of that back. `to_json` is the way out for a
+// caller that wants the plain value.
+struct Doc
+    span: Span
+    kind: &DocKind
+
+    // The member of this object with a given key, where this is an object that has one.
+    get(self, key: string) -> Option[DocMember]
+        *self.kind match
+            Obj(members) ->
+                for i in 0..<members.len()
+                    if members.at(i).key == key then return Some(members.at(i))
+
+                None
+            other -> None
+    end get
+
+    // This value as text, where it is text.
+    text(self) -> Option[string]
+        *self.kind match
+            Scalar(v) ->
+                v match
+                    Str(t) -> Some(t)
+                    other -> None
+            other -> None
+    end text
+end Doc
+
+// What a manifest value is.
+//
+// **Three variants and not seven: everything with no children keeps its `json.Json`.** A span is
+// only wanted where a complaint can point *inside* a value, and a number has no inside -- so
+// restating the five scalar kinds here would have been a second copy of `Json`'s leaves, kept in
+// step by hand, for nothing. `to_json` is a line and a half because of it.
+//
+// **`Arr` and `Obj` are safe names where `Int` and `Str` were not.** slate's own `Value` already has
+// an `Int`, a `Str`, a `Null`, a `Bool` and a `Real`, and two enums in one module sharing a variant
+// name is only resolved where an expected type says which -- so adding those five here broke an
+// inference in `vm.sysl` that had nothing to do with manifests. `Value` spells its own composites
+// `Array` and `Object`.
+enum DocKind
+    Scalar(v: json.Json)
+    Arr(items: Buf[Doc])
+    Obj(members: Buf[DocMember])
+end DocKind
+
+// One `key: value` of an object.
+//
+// **`at` is where the KEY was written, not the value.** A complaint about a key -- one nothing knows,
+// one written twice, one whose value is the wrong kind -- has to point at the key, or it sends the
+// reader to inspect a value that is fine.
+struct DocMember
+    key: string
+    at: Span
+    value: Doc
+end DocMember
+
+doc(span: Span, kind: DocKind) -> Doc = Doc(span, kind)
+
+// The same value with the spans dropped, for a caller that wants plain data -- writing a lockfile,
+// handing a manifest to something that speaks JSON, or a test saying the whole shape in one string.
+to_json(d: Doc) -> json.Json
+    *d.kind match
+        Scalar(v) -> v
+        Arr(items) ->
+            var out: Buf[json.Json] = buf()
+
+            for i in 0..<items.len()
+                out.push(to_json(items.at(i)))
+
+            json.Json.Arr(out)
+        Obj(members) ->
+            var out: Buf[json.Member] = buf()
+
+            for i in 0..<members.len()
+                out.push(json.Member(members.at(i).key, to_json(members.at(i).value)))
+
+            json.Json.Obj(out)
+end to_json
+
+// What a value is, in the words a person would use for it. Completes "this is ...".
+value_word(k: DocKind) -> string
+    k match
+        Scalar(v) ->
+            v match
+                Null -> "`null`"
+                Bool(_) -> "a boolean"
+                Int(_) -> "a whole number"
+                Real(_) -> "a number"
+                Str(_) -> "a string"
+                other -> "a value"
+        Arr(_) -> "a list"
+        Obj(_) -> "an object"
+end value_word
+
+// -- reading one --------------------------------------------------------------------------------
+
 // What reading a manifest answers with.
 //
 // **Shaped like `Parsed`, and for its reason**: the value and the complaints arrive together, so a
 // caller that wants to report everything wrong with a file can, rather than being handed the first
 // fault and having to come back for the rest. The value is `Null` where the report has errors.
 struct Manifest
-    value: json.Json
+    doc: Doc
     report: Report
 
     ok(self) -> bool = !self.report.has_errors()
+
+    // The manifest as plain data.
+    value(self) -> json.Json = to_json(self.doc)
 end Manifest
 
 // Read a manifest out of a source.
@@ -60,19 +168,20 @@ end Manifest
 read_manifest(src: Source) -> Manifest
     val parsed = parse_source(src)
     var report = parsed.report
+    val whole = Span(0, src.bytes.len)
 
     // A file that will not parse has nothing for the restriction pass to walk, and the parser's own
     // complaints are the ones worth reading. Reporting "this is not a literal" about wreckage would
     // send the reader to look at the wrong thing.
-    if report.has_errors() then return Manifest(json.Json.Null, report)
+    if report.has_errors() then return Manifest(doc(whole, DocKind.Scalar(json.Json.Null)), report)
 
     val stmts = parsed.program.stmts
 
     if stmts.is_empty()
-        report.add(error(Span(0, src.bytes.len), "a manifest is one object, and this file is empty")
+        report.add(error(whole, "a manifest is one object, and this file is empty")
             .with_note("the shortest manifest a file can hold is `{}`"))
 
-        return Manifest(json.Json.Null, report)
+        return Manifest(doc(whole, DocKind.Scalar(json.Json.Null)), report)
     end if
 
     // **The second statement is where the caret goes, not the first.** A file with two things in it
@@ -83,7 +192,7 @@ read_manifest(src: Source) -> Manifest
             .with_label("everything a manifest says goes inside the one object")
             .with_note("a `}` earlier in the file may have closed it sooner than it looks"))
 
-        return Manifest(json.Json.Null, report)
+        return Manifest(doc(whole, DocKind.Scalar(json.Json.Null)), report)
     end if
 
     val only = stmts.at(0)
@@ -94,7 +203,7 @@ read_manifest(src: Source) -> Manifest
             report.add(error(only.span, s"a manifest is one object written out, and this is ${statement_word(other)}")
                 .with_note("a manifest is data -- it declares nothing and runs nothing"))
 
-            return Manifest(json.Json.Null, report)
+            return Manifest(doc(whole, DocKind.Scalar(json.Json.Null)), report)
 
     Manifest(literal_of(e, &report), report)
 end read_manifest
@@ -111,15 +220,15 @@ read_manifest_text(name: string, text: string) -> Manifest = read_manifest(sourc
 // at a line whose problem it has not named. The house rule is that a diagnostic is judged by where
 // it sends the reader, and the answer here is nearly always "you wrote code, and this file is data"
 // -- so each message says which code.
-private literal_of(e: Expr, report: *Report) -> json.Json
+private literal_of(e: Expr, report: *Report) -> Doc
     val at = e.span
 
     *e.kind match
-        IntLit(v) -> json.Json.Int(v)
-        RealLit(v) -> json.Json.Real(v)
-        StrLit(v) -> json.Json.Str(v)
-        BoolLit(b) -> json.Json.Bool(b)
-        NullLit -> json.Json.Null
+        IntLit(v) -> doc(at, DocKind.Scalar(json.Json.Int(v)))
+        RealLit(v) -> doc(at, DocKind.Scalar(json.Json.Real(v)))
+        StrLit(v) -> doc(at, DocKind.Scalar(json.Json.Str(v)))
+        BoolLit(b) -> doc(at, DocKind.Scalar(json.Json.Bool(b)))
+        NullLit -> doc(at, DocKind.Scalar(json.Json.Null))
 
         // **Negative numbers are the one operator the pass allows, and it is not an exception to the
         // rule.** `-1` is a `Unary` in the tree because the lexer has no signed literal, so refusing
@@ -131,20 +240,20 @@ private literal_of(e: Expr, report: *Report) -> json.Json
                 report.add(error(at, s"a manifest is data, and `${op_text(op)}` is an operator")
                     .with_note("the only operator a manifest may use is the `-` in front of a number"))
 
-                return json.Json.Null
+                return doc(at, DocKind.Scalar(json.Json.Null))
             end if
 
             *rhs.kind match
-                IntLit(v) -> json.Json.Int(-v)
-                RealLit(v) -> json.Json.Real(-v)
+                IntLit(v) -> doc(at, DocKind.Scalar(json.Json.Int(-v)))
+                RealLit(v) -> doc(at, DocKind.Scalar(json.Json.Real(-v)))
                 other ->
                     report.add(error(at, "a manifest may write `-` in front of a number and nothing else")
                         .with_label(s"this is ${expression_word(other)}"))
 
-                    json.Json.Null
+                    doc(at, DocKind.Scalar(json.Json.Null))
 
         ArrayLit(items) ->
-            var out: Buf[json.Json] = buf()
+            var out: Buf[Doc] = buf()
 
             // **Every item is walked even after one has failed**, so a manifest with three mistakes
             // in it reports three. The `Null` a failed item leaves behind is never read: the caller
@@ -152,10 +261,10 @@ private literal_of(e: Expr, report: *Report) -> json.Json
             for i in 0..<items.len()
                 out.push(literal_of(items.at(i), report))
 
-            json.Json.Arr(out)
+            doc(at, DocKind.Arr(out))
 
-        ObjectLit(keys, values) ->
-            var members: Buf[json.Member] = buf()
+        ObjectLit(keys, key_spans, values) ->
+            var members: Buf[DocMember] = buf()
 
             for i in 0..<keys.len()
                 // **A repeated key is refused rather than resolved.** Either answer -- first wins or
@@ -168,18 +277,18 @@ private literal_of(e: Expr, report: *Report) -> json.Json
                     if members.at(j).key == keys.at(i) then seen = true
 
                 if seen
-                    report.add(error(values.at(i).span, s"`${keys.at(i)}` is written twice in this object")
+                    report.add(error(key_spans.at(i), s"`${keys.at(i)}` is written twice in this object")
                         .with_note("a manifest refuses a repeated key rather than choosing one of them"))
 
-                members.push(json.Member(keys.at(i), literal_of(values.at(i), report)))
+                members.push(DocMember(keys.at(i), key_spans.at(i), literal_of(values.at(i), report)))
 
-            json.Json.Obj(members)
+            doc(at, DocKind.Obj(members))
 
         other ->
             report.add(error(at, s"a manifest is data, and this is ${expression_word(other)}")
                 .with_note("a manifest is parsed and never run, so it holds only numbers, strings, booleans, `null`, arrays and objects"))
 
-            json.Json.Null
+            doc(at, DocKind.Scalar(json.Json.Null))
 end literal_of
 
 // -- naming what was found ------------------------------------------------------------------------
