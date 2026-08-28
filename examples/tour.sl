@@ -89,12 +89,12 @@ print("ended at", n)
 describe(v)
     v match
         0 -> "zero"
-        n @ num if n < 0 -> "negative"
-        n @ num -> "the number " + str(n)
+        n @ number if n < 0 -> "negative"
+        n @ number -> "the number " + str(n)
         [a, b] -> "a pair summing " + str(a + b)
         { name } -> "someone called " + name
         "sat" | "sun" -> "a weekend"
-        s @ str -> "the text " + s
+        s @ string -> "the text " + s
         _ -> "something else"
 
 print(describe(0))
@@ -143,7 +143,7 @@ val n = 5
 print(0 <= n < 10)
 
 // A pattern where a condition is wanted, which is the same grammar a `match` arm uses.
-print(n is num, n is not str, n is 1 | 3 | 5)
+print(n is number, n is not string, n is 1 | 3 | 5)
 
 // Ranges are values: `for` walks one, and a subscript slices with one. An end left out is taken from
 // whatever it is used on.

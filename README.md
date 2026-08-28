@@ -114,16 +114,16 @@ classify(v)
 ```
 
 **A bare name in a pattern tests for a kind where it names one, and binds otherwise** — `null`,
-`bool`, `int`, `real`, `num`, `str`, `array`, `object`, `fn`. That is sysl's own bare-name rule (a
+`bool`, `int`, `real`, `number`, `string`, `array`, `object`, `fn`. That is sysl's own bare-name rule (a
 bare identifier is a nullary-variant pattern when it names one of the scrutinee's variants), applied
 to a scrutinee that is always a value: those words *are* the variants. So a type test needs no syntax
 of its own, and `n @ pat` — again sysl's spelling — is how a program tests and names at once. None of
 them is a keyword: `val int = 3` still works.
 
-`num` is the one that is not a variant, being the union of `int` and `real`. It earns its place
+`number` is the one that is not a variant, being the union of `int` and `real`. It earns its place
 because the two are separate values, so a pattern guarding arithmetic would otherwise be written
 twice. It is also what makes a broad guard safe: `n if n < 0` binds *anything*, so the guard
-evaluates `[3, 4] < 0` and faults, where `n @ num if n < 0` cannot reach the guard with the wrong
+evaluates `[3, 4] < 0` and faults, where `n @ number if n < 0` cannot reach the guard with the wrong
 kind.
 
 An object pattern matches an object with *at least* those fields, because a record grows fields over
@@ -167,7 +167,7 @@ which loop a `break` leaves — `'search for a in …` then `break 'search [a, b
 out of a nested one.
 
 **Comparisons chain rather than associate**, so `0 <= n < 10` asks what it looks like it asks and `n`
-is evaluated once. `is` puts a pattern where a condition is wanted — `v is num`, `v is not str`,
+is evaluated once. `is` puts a pattern where a condition is wanted — `v is number`, `v is not str`,
 `v is 1 | 3 | 5` — using the same grammar a `match` arm does.
 
 **Ranges are values**: `for i in 0..<n`, `xs[1..<3]`, `"hello"[..2]`, and an end left out is taken
@@ -498,8 +498,8 @@ answered a real for two integers would make every use of it in an index a conver
 A type is a shape with a name:
 
 ```
-type Point = { x: num, y: num }
-type Circle = { centre: Point, radius: num }
+type Point = { x: number, y: number }
+type Circle = { centre: Point, radius: number }
 
 print({ x: 3, y: 4 } is Point)          // true
 
@@ -541,7 +541,7 @@ it will take nothing:
 
 ```
 type MaybePoint = Point | null
-type Shape = { side: num } | { radius: num }
+type Shape = { side: number } | { radius: number }
 ```
 
 **A parameter may say what it takes**, and then the complaint lands where the value was handed over:

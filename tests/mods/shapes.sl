@@ -1,4 +1,4 @@
-export type Point = { x: num, y: num }
+export type Point = { x: number, y: number }
 
 type Secret = { hidden: bool }
 

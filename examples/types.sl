@@ -1,7 +1,7 @@
 // Types: a shape with a name.
 //
 // **A type is a named pattern and nothing else runs.** slate already tested object shapes -- `v is
-// { x: num }` has always worked -- so a type is one of those given a name, resolved where it stands
+// { x: number }` has always worked -- so a type is one of those given a name, resolved where it stands
 // while the program is compiled.
 //
 // It is TypeScript's `type`, and deliberately so. What differs is that slate's is not erased: the
@@ -9,9 +9,9 @@
 // is why a TS app that reads an API response writes the shape twice -- once as a `type` for the
 // checker and once as a zod schema for the run.
 
-type Point = { x: num, y: num }
-type Circle = { centre: Point, radius: num }
-type Named = { name: str }
+type Point = { x: number, y: number }
+type Circle = { centre: Point, radius: number }
+type Named = { name: string }
 
 val here = { x: 3, y: 4 }
 
