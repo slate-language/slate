@@ -46,7 +46,14 @@ distance(a: Point, b: Point) =
     dx * dx + dy * dy
 
 print(distance(here, { x: 0, y: 0 }))
-print(distance(here, { x: 0 }) catch e -> s"caught: ${e.message}")
+
+// The same mistake written out is now caught while compiling -- the annotation is checked at both
+// ends. What reaches the run-time check is a value the compiler could not see the shape of, which is
+// exactly what the run-time check is there for: something that arrived from a file, a socket or a
+// person. An unannotated function answers `any`, so this is one.
+elsewhere(v) = v
+
+print(distance(here, elsewhere({ x: 0 })) catch e -> s"caught: ${e.message}")
 
 // A bare name that names no type is a binding, exactly as it always was.
 print(42 match

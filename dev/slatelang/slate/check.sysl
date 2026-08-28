@@ -1,0 +1,545 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// The static check: what the compiler can say about a program without running it.
+//
+// **THE RULE THIS PASS IS BUILT ON: IT MAY ONLY REPORT WHAT THE MACHINE WOULD ALSO REFUSE.** slate is
+// dynamically typed and stays that way -- the checker's job is to move a fault from the run that
+// finds it to the compile that could have, and never to invent one. So every relation here mirrors
+// the run-time test exactly (`fits` against `is_kind`), and anything the walk is not sure of is
+// `Any`, which fits everything. A checker that is sometimes wrong is worse than no checker, because
+// a program then has to be written around it.
+//
+// **That is also what makes it gradual rather than optional.** An unannotated parameter is `Any` and
+// says nothing; an annotated one says everything it can. TypeScript's bargain, and the reason
+// `types.sysl` starts from `Any` rather than from a lattice.
+//
+// What it checks today: **a call's arity and its arguments**, against a function whose parameters
+// were annotated, and a **binary operator** whose two sides cannot meet. What it does not yet check
+// is written down at the end of this file.
+
+// -- what fits where -------------------------------------------------------------------------------
+
+// Whether a value known to be `got` may stand where `want` is asked for.
+//
+// **`Any` fits in both directions and that is not a hole**, it is the whole of gradual typing: a
+// value nothing is known about may go anywhere, and anything may go where nothing is asked. Every
+// unknown in the walk becomes `Any`, so this is what keeps the pass from reporting a program it
+// merely failed to understand.
+fits(got: Type, want: Type) -> bool
+    *want.kind match
+        Any -> return true
+        _ -> ()
+
+    *got.kind match
+        Any -> return true
+
+        // **Every alternative must fit, since the value is one of them and nobody knows which.**
+        OneOf(alts) ->
+            for i in 0..<alts.len()
+                if !fits(alts.at(i), want) then return false
+
+            return true
+        _ -> ()
+
+    *want.kind match
+        // One that accepts is enough on this side.
+        OneOf(alts) ->
+            for i in 0..<alts.len()
+                if fits(got, alts.at(i)) then return true
+
+            false
+        NullType -> is_kind_of(got, NullType)
+        BooleanType -> is_kind_of(got, BooleanType)
+        StringType -> is_kind_of(got, StringType)
+
+        // **An integer does NOT fit a `real`, and that mirrors `is_kind`.** Arithmetic promotes one
+        // to the other and a type test does not, so `f(x: real)` given `1` faults at run time --
+        // and a checker that let it through would be describing a different language.
+        // **A `number` on THIS side fits both, because it may be either.** Refusing it would be
+        // refusing a program on the strength of not knowing which one it is, which is the one thing
+        // this pass may not do.
+        IntegerType -> is_kind_of(got, IntegerType) || is_kind_of(got, NumberType)
+        RealType -> is_kind_of(got, RealType) || is_kind_of(got, NumberType)
+        NumberType -> is_kind_of(got, IntegerType) || is_kind_of(got, RealType) || is_kind_of(got, NumberType)
+        ArrayOf(want_element) -> *got.kind match
+            ArrayOf(got_element) -> fits(got_element, want_element)
+            _ -> false
+        ObjectWith(want_keys, want_values) -> *got.kind match
+            // **At least these fields**, which is the object pattern's rule and has to be the type's
+            // too, or one annotation would mean two things.
+            ObjectWith(got_keys, got_values) ->
+                for i in 0..<want_keys.len()
+                    var found = false
+
+                    for j in 0..<got_keys.len()
+                        if got_keys.at(j) == want_keys.at(i) && fits(got_values.at(j), want_values.at(i))
+                            found = true
+
+                    if !found then return false
+
+                true
+            _ -> false
+        FunctionType(want_params, _) -> *got.kind match
+            // **Arity only, for now.** A parameter's type is contravariant and slate has no syntax
+            // for writing a function type down, so every function type the walk builds has `Any`
+            // parameters -- a check over them would be a check of `Any` against `Any`.
+            FunctionType(got_params, _) -> got_params.len() == want_params.len() || want_params.is_empty()
+            _ -> false
+        _ -> true
+end fits
+
+private is_kind_of(t: Type, k: TypeKind) -> bool
+    *t.kind match
+        NullType -> k match
+            NullType -> true
+            _ -> false
+        BooleanType -> k match
+            BooleanType -> true
+            _ -> false
+        IntegerType -> k match
+            IntegerType -> true
+            _ -> false
+        RealType -> k match
+            RealType -> true
+            _ -> false
+        NumberType -> k match
+            NumberType -> true
+            _ -> false
+        StringType -> k match
+            StringType -> true
+            _ -> false
+        _ -> false
+end is_kind_of
+
+// -- what is known about a name ----------------------------------------------------------------
+
+// The names in scope and what is known about each.
+//
+// **A flat stack with marks rather than a chain of tables**, because this is compile-time and short:
+// a lookup walks backwards to the first match, which is shadowing for free, and leaving a scope is
+// one `truncate`. A chain would need a counted box per scope for a structure that never outlives the
+// walk.
+struct TypeEnv
+    names: Buf[string]
+    types: Buf[Type]
+    marks: Buf[usize]
+end TypeEnv
+
+type_env() -> TypeEnv = TypeEnv(buf(), buf(), buf())
+
+enter_scope(e: *TypeEnv)
+    e.marks.push(e.names.len())
+
+leave_scope(e: *TypeEnv)
+    e.marks.pop() match
+        Some(mark) ->
+            e.names.truncate(mark)
+            e.types.truncate(mark)
+        None -> ()
+
+// **AN OBJECT'S SHAPE IS NOT CARRIED BY A NAME, AND THAT IS THE CONSERVATIVE BOUNDARY OF THIS
+// PASS.** An object is mutable and a field may be added to it anywhere -- by the next line, by a
+// function it was passed to, through a second name for the same object -- so a shape recorded when
+// it was built is a claim that goes out of date without anything local saying so. A stale shape is
+// too NARROW, which makes the check refuse a program that runs, and that is the one mistake this
+// pass may not make.
+//
+// **So a shape is checked only where the argument is an object LITERAL written at the call**, which
+// cannot have been touched between being built and being handed over. That is the case the mistake
+// is actually made in -- `distance(here, { x: 0 })` -- and it costs nothing to be sure about.
+// Carrying one through a name wants either immutable records or an escape analysis, and is the next
+// piece of work rather than a thing to guess at.
+note_type(e: *TypeEnv, name: string, t: Type)
+    e.names.push(name)
+    e.types.push(unshaped(t))
+
+private unshaped(t: Type) -> Type
+    *t.kind match
+        ObjectWith(_, _) -> type_of(Any)
+        _ -> t
+
+// **Backwards, so the innermost binding of a name is the one found.**
+known_type(e: *TypeEnv, name: string) -> Type
+    var i = e.names.len()
+
+    loop
+        if i == 0 then return type_of(Any)
+
+        i -= 1
+
+        if e.names.at(i) == name then return e.types.at(i)
+end known_type
+
+// -- the walk -----------------------------------------------------------------------------------
+
+// Check one file's statements. Reported through the compiler's own channel, so a complaint from here
+// stops the program exactly as a parse error does.
+check_program(prog: Program)
+    var env = type_env()
+
+    enter_scope(&env)
+    check_stmts(prog.stmts, &env)
+    leave_scope(&env)
+end check_program
+
+// **Every definition in a block is noted before any statement is walked**, so a function may call
+// one written below it and one written above may call it back. Whether the *machine* has run the
+// definition by then is a different question and a different fault.
+private check_stmts(stmts: Buf[Stmt], env: *TypeEnv)
+    for i in 0..<stmts.len()
+        *stmts.at(i).kind match
+            Def(name, params, body, is_async) -> note_type(env, name, signature_of(params, body_at(body), is_async))
+            _ -> ()
+
+    for i in 0..<stmts.len()
+        check_stmt(stmts.at(i), env)
+end check_stmts
+
+// The type of a definition, read back off the checks its annotations were desugared into.
+//
+// **The annotations are not on the `Def` and must not be put there.** The parser turns `f(x: string)`
+// into a `CheckType` statement at the top of the body and `-> string` into an `Ensures` around it,
+// which is what keeps every node downstream of a definition free of them. So this reads them back,
+// and a parameter with no `CheckType` is `Any` -- which is what an unannotated parameter means.
+private signature_of(params: Buf[string], body: Expr, is_async: bool) -> Type
+    var types: Buf[Type] = buf()
+
+    for i in 0..<params.len()
+        types.push(annotation_for(params.at(i), body))
+
+    // **An `async` function answers a promise and not what its body says**, so a result annotation
+    // on one describes the awaited value rather than the call. Nothing here can say that yet, so it
+    // says nothing.
+    val result = if is_async then type_of(Any) else result_annotation(body)
+
+    type_of(FunctionType(types, result))
+end signature_of
+
+// The `CheckType` a parameter's annotation became, if it had one.
+private annotation_for(name: string, body: Expr) -> Type
+    *body.kind match
+        Ensures(inner, _, _) -> return annotation_for(name, inner)
+        Block(stmts) ->
+            for i in 0..<stmts.len()
+                *stmts.at(i).kind match
+                    // **Only the run of checks at the TOP of the body is read.** They are what the
+                    // parser put there; a `CheckType` further down could not exist, and stopping at
+                    // the first ordinary statement is what keeps that true if one ever could.
+                    CheckType(checked, _, pat) ->
+                        if checked == name then return type_from_pattern(resolve_pattern(pat, 0))
+                    _ -> return type_of(Any)
+
+            type_of(Any)
+        _ -> type_of(Any)
+end annotation_for
+
+private result_annotation(body: Expr) -> Type
+    *body.kind match
+        Ensures(_, _, pat) -> type_from_pattern(resolve_pattern(pat, 0))
+        _ -> type_of(Any)
+
+private check_stmt(s: Stmt, env: *TypeEnv)
+    *s.kind match
+        Val(name, init) ->
+            check_expr(init, env)
+            note_type(env, name, type_of_expr(init, env))
+
+        // **A `var` is `Any` whatever it was initialised with**, because a later assignment may put
+        // anything there and this pass does not follow assignments. Narrowing one would be reporting
+        // a program the checker had not read all of.
+        Var(name, init) ->
+            check_expr(init, env)
+            note_type(env, name, type_of(Any))
+        Unpack(_, init, _) -> check_expr(init, env)
+        Assign(_, target, value) ->
+            check_expr(target, env)
+            check_expr(value, env)
+        MultiAssign(_, targets, values) ->
+            for i in 0..<targets.len()
+                check_expr(targets.at(i), env)
+
+            for i in 0..<values.len()
+                check_expr(values.at(i), env)
+        Def(_, params, body, _) -> check_body(params, body_at(body), env)
+        Eval(x) -> check_expr(x, env)
+        Return(value) -> value match
+            Some(x) -> check_expr(x, env)
+            None -> ()
+        _ -> ()
+end check_stmt
+
+// A definition's body, with its parameters in scope at the types its annotations gave them.
+private check_body(params: Buf[string], body: Expr, env: *TypeEnv)
+    enter_scope(env)
+
+    for i in 0..<params.len()
+        note_type(env, params.at(i), annotation_for(params.at(i), body))
+
+    check_expr(body, env)
+    leave_scope(env)
+end check_body
+
+// -- what an expression is -------------------------------------------------------------------------
+
+// The type of an expression, as far as the pass can tell. **`Any` wherever it cannot.**
+type_of_expr(x: Expr, env: *TypeEnv) -> Type
+    *x.kind match
+        IntLit(_) -> type_of(IntegerType)
+        RealLit(_) -> type_of(RealType)
+        StrLit(_) -> type_of(StringType)
+        BoolLit(_) -> type_of(BooleanType)
+        Interp(_) -> type_of(StringType)
+        Name(name) -> known_type(env, name)
+        ArrayLit(_) -> type_of(ArrayOf(type_of(Any)))
+        ArrayRepeat(_, _) -> type_of(ArrayOf(type_of(Any)))
+        ObjectLit(keys, values) ->
+            var out: Buf[Type] = buf()
+
+            for i in 0..<values.len()
+                out.push(type_of_expr(values.at(i), env))
+
+            type_of(ObjectWith(keys, out))
+        Lambda(params, _, _) ->
+            var out: Buf[Type] = buf()
+
+            for i in 0..<params.len()
+                out.push(type_of(Any))
+
+            type_of(FunctionType(out, type_of(Any)))
+
+        // A comparison and an `is` are booleans whatever they compared.
+        Compare(_, _) -> type_of(BooleanType)
+        IsPattern(_, _, _) -> type_of(BooleanType)
+        Unary(op, rhs) -> op match
+            Bang -> type_of(BooleanType)
+            _ -> type_of_expr(rhs, env)
+        Binary(op, lhs, rhs) -> binary_type(op, type_of_expr(lhs, env), type_of_expr(rhs, env))
+        Call(callee, _) -> *type_of_expr(callee, env).kind match
+            FunctionType(_, result) -> result
+            _ -> type_of(Any)
+        Ensures(_, _, pat) -> type_from_pattern(resolve_pattern(pat, 0))
+        _ -> type_of(Any)
+end type_of_expr
+
+// What an operator answers, given what it was handed.
+//
+// **Only the cases that are certain.** `+` over two integers is an integer; over anything less known
+// it is `Any`, because the operator is overloaded on strings and promotes across the two number
+// kinds. Saying `number` where it could be a string would be a claim the checker cannot support.
+private binary_type(op: Tok, lhs: Type, rhs: Type) -> Type
+    op match
+        AndAnd -> return type_of(BooleanType)
+        OrOr -> return type_of(BooleanType)
+        _ -> ()
+
+    if !is_arithmetic(op) then return type_of(Any)
+
+    if is_kind_of(lhs, StringType) && is_kind_of(rhs, StringType) && op == Plus
+        return type_of(StringType)
+
+    if is_kind_of(lhs, IntegerType) && is_kind_of(rhs, IntegerType) then return type_of(IntegerType)
+
+    // **A real anywhere in it makes the answer a real**, which is slate's promotion. Saying
+    // `number` here instead would be true and too weak: `1.0 * 2` would then not fit a `real`
+    // parameter, and the checker would be refusing a program that runs.
+    if numeric(lhs) && numeric(rhs)
+        if is_kind_of(lhs, RealType) || is_kind_of(rhs, RealType) then return type_of(RealType)
+
+        return type_of(NumberType)
+
+    type_of(Any)
+end binary_type
+
+private numeric(t: Type) -> bool =
+    is_kind_of(t, IntegerType) || is_kind_of(t, RealType) || is_kind_of(t, NumberType)
+
+private is_arithmetic(op: Tok) -> bool = op match
+    Plus -> true
+    Minus -> true
+    Star -> true
+    Slash -> true
+    Percent -> true
+    _ -> false
+
+// -- what is complained about ----------------------------------------------------------------------
+
+private check_expr(x: Expr, env: *TypeEnv)
+    val at = x.span
+
+    *x.kind match
+        Call(callee, args) ->
+            check_expr(callee, env)
+
+            for i in 0..<args.len()
+                check_expr(args.at(i), env)
+
+            check_call(callee, args, env, at)
+        Binary(op, lhs, rhs) ->
+            check_expr(lhs, env)
+            check_expr(rhs, env)
+            check_binary(op, lhs, rhs, env, at)
+        Unary(_, rhs) -> check_expr(rhs, env)
+        Block(stmts) ->
+            enter_scope(env)
+            check_stmts(stmts, env)
+            leave_scope(env)
+        ArrayLit(items) -> for i in 0..<items.len() do check_expr(items.at(i), env)
+        ObjectLit(_, values) -> for i in 0..<values.len() do check_expr(values.at(i), env)
+        Interp(pieces) -> for i in 0..<pieces.len() do check_expr(pieces.at(i), env)
+        Compare(operands, _) -> for i in 0..<operands.len() do check_expr(operands.at(i), env)
+        Field(target, _, _) -> check_expr(target, env)
+        Index(target, key) ->
+            check_expr(target, env)
+            check_expr(key, env)
+        WithFields(base, _, values) ->
+            check_expr(base, env)
+
+            for i in 0..<values.len()
+                check_expr(values.at(i), env)
+        Await(inner) -> check_expr(inner, env)
+        Ensures(value, _, _) -> check_expr(value, env)
+        IfExpr(cond, then_branch, else_branch) ->
+            check_expr(cond, env)
+            check_expr(then_branch, env)
+
+            else_branch match
+                Some(other) -> check_expr(other, env)
+                None -> ()
+        MatchExpr(subject, arms) ->
+            check_expr(subject, env)
+
+            for i in 0..<arms.len()
+                // **A pattern's bindings are not typed yet**, so the arm's body is walked in a scope
+                // that knows nothing new -- which is `Any` for every name the pattern introduced, and
+                // therefore silent about all of them.
+                enter_scope(env)
+                check_expr(arms.at(i).body, env)
+                leave_scope(env)
+        While(_, cond, body, otherwise) ->
+            check_expr(cond, env)
+            check_expr(body, env)
+            check_otherwise(otherwise, env)
+        For(_, _, iter, body, otherwise) ->
+            check_expr(iter, env)
+            enter_scope(env)
+            check_expr(body, env)
+            leave_scope(env)
+            check_otherwise(otherwise, env)
+        Loop(_, body) -> check_expr(body, env)
+        DoWhile(_, body, cond, otherwise) ->
+            check_expr(body, env)
+            check_expr(cond, env)
+            check_otherwise(otherwise, env)
+        TryCatch(body, _, handler) ->
+            check_expr(body, env)
+            enter_scope(env)
+            check_expr(handler, env)
+            leave_scope(env)
+        Lambda(params, body, _) -> check_body(params, body_at(body), env)
+        _ -> ()
+end check_expr
+
+private check_otherwise(otherwise: Option[Expr], env: *TypeEnv)
+    otherwise match
+        Some(x) -> check_expr(x, env)
+        None -> ()
+
+// A call whose callee is a function the pass knows the shape of.
+//
+// **Arity first, and it stops there when it is wrong**, because a mismatched count makes every
+// argument's position a guess -- reporting four type errors for one missing argument is the
+// commonest way a checker becomes something to work around.
+private check_call(callee: Expr, args: Buf[Expr], env: *TypeEnv, at: Span)
+    *type_of_expr(callee, env).kind match
+        FunctionType(params, result) ->
+            // A lambda's type has `Any` parameters and says nothing; a definition with no annotated
+            // parameter has the same shape. Either way there is nothing here to check against.
+            // **`FunctionType(no params, any result)` IS THE BARE WORD `function`**, which says
+            // callable and nothing about arity -- `f: function` writes exactly that. Counting
+            // against it would refuse `f(1)` inside a function whose parameter was annotated
+            // `function`, which runs. The cost is that a genuine `() -> x` has the same shape and
+            // goes uncounted too, and the cost is worth paying to be sure.
+            if !says_nothing(params, result) && params.len() != args.len()
+                complain_here(at, s"${named(callee)} takes ${params.len()} arguments and this gives it ${args.len()}")
+                return
+            end if
+
+            // **Nothing is checked where the counts disagree**, which is also the case a type
+            // saying nothing about arity leaves behind: there is no parameter opposite an argument
+            // to compare it to.
+            if params.len() != args.len() then return
+
+            for i in 0..<args.len()
+                val want = params.at(i)
+                val got = type_of_expr(args.at(i), env)
+
+                if !fits(got, want)
+                    complain_here(args.at(i).span, s"${named(callee)} takes ${show_type(want)} here, and this is ${show_type(got)}")
+        _ -> ()
+end check_call
+
+private says_nothing(params: Buf[Type], result: Type) -> bool
+    if !params.is_empty() then return false
+
+    *result.kind match
+        Any -> true
+        _ -> false
+end says_nothing
+
+// **Only where BOTH sides are known and neither could meet the other.** `1 + "a"` is a fault the
+// machine would raise, so saying it now is moving the same complaint earlier; anything less certain
+// is left alone.
+private check_binary(op: Tok, lhs: Expr, rhs: Expr, env: *TypeEnv, at: Span)
+    if !is_arithmetic(op) then return
+
+    val a = type_of_expr(lhs, env)
+    val b = type_of_expr(rhs, env)
+
+    if numeric(a) && numeric(b) then return
+    if op == Plus && is_kind_of(a, StringType) && is_kind_of(b, StringType) then return
+
+    // Anything not certainly one of the two workable pairings is left to the machine.
+    if !certain(a) || !certain(b) then return
+
+    complain_here(at, s"`${op_text(op)}` does not apply to ${show_type(a)} and ${show_type(b)}")
+end check_binary
+
+// Whether enough is known about a type to argue from it.
+private certain(t: Type) -> bool
+    *t.kind match
+        Any -> false
+        OneOf(_) -> false
+        _ -> true
+end certain
+
+// How a callee is named in a complaint, which is its name where it has one.
+private named(callee: Expr) -> string
+    *callee.kind match
+        Name(name) -> s"`${name}`"
+        Field(_, name, _) -> s"`${name}`"
+        _ -> "this function"
+end named
+
+// -- what this pass does NOT do yet ----------------------------------------------------------------
+//
+// Written down because the absences are decisions rather than oversights, and because each one is
+// the next piece of work rather than a thing to be surprised by.
+//
+// - **A name bound by a PATTERN has no type.** A `match` arm, a `catch`, a destructuring binding and
+//   a `for` head all introduce names the walk leaves as `Any`. The patterns already carry the
+//   information -- `type_from_pattern` would answer for most of them -- and threading it in is the
+//   obvious next step.
+// - **A `var` is always `Any`**, because this pass does not follow assignments. Narrowing one would
+//   be reporting a program the checker has not read all of.
+// - **A field read is `Any`**, even off an object whose type is known. The information is there in
+//   `ObjectWith`; what is missing is only the lookup.
+// - **A function's RESULT is not checked against its body.** `-> integer` is enforced by
+//   `CheckResult` at run time and believed here.
+// - **A builtin has no type.** `len`, `map` and the rest are `Native` values the walk knows nothing
+//   about, so a call to one is never checked. A table of their signatures is a day's work and would
+//   be the largest single gain left.
+// - **Nothing narrows.** `if x is string then ...` does not make `x` a string inside the branch,
+//   which is the feature a TypeScript reader will miss first.
