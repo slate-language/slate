@@ -1,0 +1,141 @@
+module dev.slatelang.slate
+
+import sh.sysl.libuv
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, remove_dir_all, rename, write_text}
+import sysl.text.{split, Search}
+
+// Downloading a package into the cache.
+//
+// **Where the resolver stops and this begins**: `packages.sysl` works out *which* package at *which*
+// version, entirely from manifests; this is the part that puts the code on the disk. Nothing here
+// makes a decision -- if it has to choose something, that belongs one file over.
+
+// The URL a coordinate at a version is served from.
+//
+// **Only GitHub, and an unknown host is refused rather than guessed at.** A coordinate is a host and
+// a path, and the URL a tarball lives at is that host's own convention -- GitLab, Codeberg and a
+// bare git server each spell it differently. Guessing would produce a 404 reported as a missing
+// version, which sends the reader to check a tag that is fine.
+tarball_url(git: string, version: string) -> Result[string, string]
+    val parts = split(git, "/")
+
+    if parts.len != 3 || parts[0] != "github.com"
+        return Err(s"`${git}` is not a coordinate slate knows how to fetch -- it can fetch `github.com/<owner>/<repo>`")
+
+    Ok(s"https://github.com/${parts[1]}/${parts[2]}/archive/refs/tags/v${version}.tar.gz")
+end tarball_url
+
+// Put one package in the cache, answering what its contents hashed to.
+//
+// **It is unpacked beside its home and moved into place, never into it.** A download that fails
+// halfway would otherwise leave a directory that looks like a package and is half of one -- and the
+// next run would find it, skip the fetch, and compile against it. A rename is the only step that
+// makes a package visible, and a rename is atomic.
+fetch_package(pkg: Package) -> Result[string, string]
+    val url = tarball_url(pkg.git, pkg.version)?
+    val reply = get(url)?
+
+    if reply.status == 404
+        return Err(s"${pkg.git} has no version ${pkg.version} -- ${url} is not there")
+
+    if reply.status != 200
+        return Err(s"${url} answered ${reply.status}")
+
+    val archive = gunzip(reply.body)?
+    val entries = read_tar(archive)?
+
+    val parent = dir_of(pkg.dir)
+
+    make_dir_all(parent) match
+        Err(e) -> return Err(s"cannot make ${parent}: ${e}")
+        Ok(_) -> ()
+
+    // **A sibling of the destination and not `/tmp`**, so the rename below is within one filesystem.
+    // A rename across filesystems is a copy that can fail halfway, which is the thing being avoided.
+    val staging = libuv.mkdtemp_sync(s"${parent}/.fetching-XXXXXX") match
+        Err(e) -> return Err(s"cannot make room to unpack in ${parent}: ${e}")
+        Ok(d) -> d
+
+    val unpacked = extract_tar(entries, staging, 1)
+
+    unpacked match
+        Err(e) ->
+            remove_dir_all(staging)
+
+            return Err(e)
+        Ok(_) -> ()
+
+    val hash = tree_hash(staging) match
+        None ->
+            remove_dir_all(staging)
+
+            return Err(s"${url} unpacked to nothing")
+        Some(h) -> h
+
+    rename(staging, pkg.dir) match
+        Err(e) ->
+            remove_dir_all(staging)
+
+            return Err(s"cannot put ${pkg.name} in ${pkg.dir}: ${e}")
+        Ok(_) -> ()
+
+    Ok(hash)
+end fetch_package
+
+// Fetch everything a project needs that is not there yet, and record what arrived.
+//
+// **A package already in the cache is not fetched again and not re-verified here.** Its hash was
+// checked when it arrived and is checked again by `slate deps`; re-downloading what is already
+// present is what makes a package manager slow.
+struct Fetched
+    got: usize
+    already: usize
+    notes: Buf[string]
+    failed: bool
+end Fetched
+
+fetch_packages(root: string, packages: Packages) -> Fetched
+    var f = Fetched(0, 0, buf(), false)
+    var sums = read_sums(root)
+    var added = false
+
+    for i in 0..<packages.found.len()
+        val pkg = packages.found.at(i)
+
+        if is_fetched(pkg)
+            f.already += 1
+            continue
+        end if
+
+        f.notes.push(s"fetching ${pkg.git} v${pkg.version}")
+
+        fetch_package(pkg) match
+            Err(e) ->
+                f.notes.push(s"error: ${e}")
+                f.failed = true
+            Ok(hash) ->
+                f.got += 1
+
+                // **What arrived is recorded against what was recorded before, and a disagreement
+                // stops everything.** This is the moment the sum file exists for: a version that
+                // was published once and has changed since is caught here, before any of it is
+                // compiled.
+                sums.at(pkg.git, pkg.version) match
+                    Some(e) ->
+                        if e.hash != hash
+                            f.notes.push(s"error: ${pkg.git} v${pkg.version} does not match ${SumFile}: it was recorded as ${e.hash} and what arrived is ${hash}")
+                            f.failed = true
+                    None ->
+                        sums.entries.push(SumEntry(pkg.git, pkg.version, hash))
+                        added = true
+
+    // **The sum file is written only where nothing went wrong**, so a failed run cannot record a
+    // hash for something it also complained about.
+    if added && !f.failed
+        write_text(s"${root}/${SumFile}", render_sums(sums)) match
+            Err(e) -> f.notes.push(s"error: cannot write ${root}/${SumFile}: ${e}")
+            Ok(_) -> f.notes.push(s"recorded what arrived in ${SumFile}")
+
+    f
+end fetch_packages

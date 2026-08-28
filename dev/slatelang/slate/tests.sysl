@@ -5404,3 +5404,117 @@ THE_WHOLE_CHAIN_A_FETCH_WILL_RUN_WORKS_WITH_ONLY_THE_DOWNLOAD_MISSING()
 
     scrub(second)
     scrub(dir)
+
+// -- fetching ------------------------------------------------------------------------------------
+
+// **Everything here runs without a network.** The parts of a fetch that can be wrong in an
+// interesting way are the URL a coordinate maps to, what a redirect means, and how a reply is read
+// -- none of which needs a peer. The download itself is verified by hand against GitHub, because a
+// unit suite that needs the internet fails on a train.
+
+@test
+A_COORDINATE_MAPS_TO_THE_URL_ITS_HOST_SERVES_TARBALLS_FROM()
+    assert_eq(tarball_url("github.com/sysl-lang/parsing", "0.4.0").unwrap(),
+        "https://github.com/sysl-lang/parsing/archive/refs/tags/v0.4.0.tar.gz")
+
+    // **An unknown host is refused rather than guessed at.** GitLab, Codeberg and a bare git server
+    // each spell this differently, and guessing would produce a 404 reported as a missing version --
+    // which sends the reader to check a tag that is fine.
+    assert(tarball_url("gitlab.com/o/r", "1.0.0").unwrap_err().contains("not a coordinate slate knows how to fetch"))
+    assert(tarball_url("github.com/only-two-parts", "1.0.0").is_err())
+
+@test
+A_URL_IS_BROKEN_INTO_THE_THREE_PARTS_A_REQUEST_NEEDS()
+    val u = parse_url("https://github.com/sysl-lang/parsing/archive/v1.tar.gz").unwrap()
+
+    assert_eq(u.host, "github.com")
+    assert_eq(u.port, 443)
+    assert_eq(u.path, "/sysl-lang/parsing/archive/v1.tar.gz")
+
+    // A host with no path at all still has one.
+    assert_eq(parse_url("https://example.com").unwrap().path, "/")
+
+    // A port written in the authority is taken.
+    val p = parse_url("https://example.com:8443/x").unwrap()
+
+    assert_eq(p.host, "example.com")
+    assert_eq(p.port, 8443)
+
+    assert(parse_url("https://").unwrap_err().contains("names no host"))
+    assert(parse_url("ftp://example.com/x").unwrap_err().contains("not an https URL"))
+
+@test
+A_PACKAGE_MAY_NOT_ARRIVE_OVER_CLEARTEXT_EVEN_IF_A_REDIRECT_ASKS()
+    // **The attacker who can redirect you can also serve you the package**, so a fetcher that could
+    // be talked down to plain HTTP by a response it was told to follow would have no security at
+    // all. Refused in both places a URL can come from.
+    assert(parse_url("http://example.com/x").unwrap_err().contains("cleartext"))
+    assert(absolute("https://a.example/x", "http://b.example/y").unwrap_err().contains("cleartext"))
+
+@test
+A_REDIRECT_MAY_BE_A_WHOLE_URL_OR_A_PATH_ON_THE_SAME_HOST()
+    // GitHub's archive URLs always redirect -- `github.com/<o>/<r>/archive/...` sends you to
+    // `codeload.github.com` -- so a fetcher that stopped at a 302 would work for nothing anybody
+    // actually publishes.
+    assert_eq(absolute("https://github.com/o/r/archive/v1.tar.gz",
+        "https://codeload.github.com/o/r/tar.gz/refs/tags/v1").unwrap(),
+        "https://codeload.github.com/o/r/tar.gz/refs/tags/v1")
+
+    assert_eq(absolute("https://example.com/a/b", "/c/d").unwrap(), "https://example.com/c/d")
+    assert_eq(absolute("https://example.com/a/b", "c/d").unwrap(), "https://example.com/c/d")
+
+@test
+A_REPLY_IS_READ_FOR_ITS_STATUS_ITS_LOCATION_AND_ITS_BODY()
+    val raw = "HTTP/1.1 200 OK\r\nContent-Type: application/gzip\r\nContent-Length: 5\r\n\r\nhello"
+    val r = parse_response(raw.bytes).unwrap()
+
+    assert_eq(r.status, 200)
+    assert_eq(r.location, "")
+    assert_eq(from_utf8_unchecked(r.body), "hello")
+
+    // **Header names are case-insensitive, and that is not a nicety**: `Location` and `location` are
+    // both sent in the wild, so matching one would follow some redirects and not others.
+    val moved = parse_response("HTTP/1.1 302 Found\r\nlocation: https://elsewhere.example/x\r\n\r\n".bytes).unwrap()
+
+    assert_eq(moved.status, 302)
+    assert_eq(moved.location, "https://elsewhere.example/x")
+
+    assert(parse_response("not http at all".bytes).unwrap_err().contains("no end to its headers"))
+
+@test
+A_CHUNKED_REPLY_IS_REASSEMBLED_BECAUSE_GITHUBS_IS()
+    // **Both framings have to be understood even though the request says `Connection: close`.** A
+    // server may chunk anyway and GitHub's does -- taking the bytes as they came would leave the hex
+    // lengths in the middle of the tarball, which reaches the gzip reader as a corrupt file and
+    // complains about the wrong thing entirely.
+    val raw = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" +
+        "5\r\nhello\r\n" +
+        "6\r\n world\r\n" +
+        "0\r\n\r\n"
+
+    assert_eq(from_utf8_unchecked(parse_response(raw.bytes).unwrap().body), "hello world")
+
+    // A chunk length may carry a `;` extension after it, which is skipped.
+    val extended = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n"
+
+    assert_eq(from_utf8_unchecked(parse_response(extended.bytes).unwrap().body), "abc")
+
+    // A reply that stops mid-chunk is a complaint, not a shorter body -- the truncated-download case.
+    val cut = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n9\r\nshort"
+
+    assert(parse_response(cut.bytes).unwrap_err().contains("stops in the middle of a chunk"))
+
+@test
+A_DIRECTORY_ALREADY_IN_THE_CACHE_IS_NOT_FETCHED_AGAIN()
+    // **"Is it here" and "is it a slate package" are two questions**, and `is_fetched` asks the
+    // first. It asked the second until it was caught: a coordinate holding a *sysl* package, whose
+    // manifest is a `package.hocon`, was reported as never fetched, downloaded again on every run,
+    // and then failed to move into place over itself with `directory not empty`.
+    val dir = libuv.mkdtemp_sync("/tmp/slate-here-XXXXXX").unwrap()
+
+    write_text(s"${dir}/package.hocon", "package { name = \"other\" }\n").unwrap()
+
+    assert(is_fetched(Package("other", "1.0.0", "github.com/example/other", dir)))
+    assert(!is_fetched(Package("gone", "1.0.0", "github.com/example/gone", s"${dir}/nope")))
+
+    scrub(dir)

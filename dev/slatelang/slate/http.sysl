@@ -1,0 +1,432 @@
+module dev.slatelang.slate
+
+import sh.sysl.openssl
+import sysl.buf.{Buf, buf}
+import sysl.posix.net.{resolve, socket, Address, Shutdown, Socket}
+import sysl.text.{from_utf8_unchecked, split, Search}
+
+// An HTTPS GET, which is the whole of what fetching a package needs.
+//
+// **Blocking, and that is the right shape here rather than a limitation.** `module.sysl` resolves
+// imports before the machine starts, deliberately -- an import resolved at run time would need
+// either a blocking read carved out as a special case or an `import` that answers a promise, and the
+// second forces top-level `await` on every program that imports anything. At fetch time there is no
+// event loop running and no coroutine to suspend, so there is nothing to yield to.
+//
+// **HTTPS ONLY, and a redirect to plain HTTP is refused.** A package manager that could be talked
+// down to cleartext by a response it was told to follow would have no security at all -- the
+// attacker who can redirect you can also serve you the package. `sysl.posix.net` carries the bytes
+// and `sh.sysl.openssl` encrypts them; the TLS binding is over memory buffers, so it never sees the
+// socket and this file is what joins the two.
+
+// What came back.
+struct Response
+    status: int
+    body: []u8
+
+    // Where a `3xx` points, empty otherwise.
+    location: string
+end Response
+
+// A URL broken into the three parts a request needs.
+//
+// **Public, like several others here, only because `private` is private to the FILE in sysl** and
+// the tests are another one. Nothing outside this file and `tests.sysl` should reach for it.
+struct Url
+    host: string
+    port: int
+    path: string
+end Url
+
+private val MaxRedirects: usize = 5
+private val Timeout: int = 30000
+// **A `const` rather than a `val`, because an array's length has to be one.** The buffers below are
+// stack arrays and the compiler will not take a `val` as a bound.
+private const ChunkBytes: usize = 32768
+
+// Fetch a URL, following redirects.
+//
+// **A redirect is followed rather than reported**, because GitHub's archive URLs always redirect --
+// `github.com/<o>/<r>/archive/...` sends you to `codeload.github.com` -- so a fetcher that stopped
+// at a `302` would work for nothing anybody actually publishes.
+get(url: string) -> Result[Response, string]
+    var here = url
+    var left = MaxRedirects
+
+    loop
+        val r = get_once(here)?
+
+        if r.status < 300 || r.status > 399 then return Ok(r)
+
+        if r.location == ""
+            return Err(s"${here} answered ${r.status} and did not say where to go instead")
+
+        if left == 0
+            return Err(s"${url} redirected more than ${MaxRedirects} times, which is a loop rather than a route")
+
+        left -= 1
+        here = absolute(here, r.location)?
+end get
+
+// A `Location` may be a whole URL or a path on the same host.
+absolute(from: string, location: string) -> Result[string, string]
+    if location.starts_with("https://") then return Ok(location)
+
+    if location.starts_with("http://")
+        return Err(s"a redirect to `${location}` would drop to plain HTTP, and a package must not arrive over cleartext")
+
+    val base = parse_url(from)?
+
+    if location.starts_with("/") then return Ok(s"https://${base.host}${location}")
+
+    Ok(s"https://${base.host}/${location}")
+end absolute
+
+parse_url(url: string) -> Result[Url, string]
+    if url.starts_with("http://")
+        return Err(s"`${url}` is plain HTTP, and a package must not arrive over cleartext")
+
+    if !url.starts_with("https://") then return Err(s"`${url}` is not an https URL")
+
+    val rest = from_utf8_unchecked(url.bytes[8..])
+    var cut = rest.bytes.len
+
+    for i in 0..<rest.bytes.len
+        if rest.bytes[i] == u8('/')
+            cut = i
+            break
+
+    val authority = from_utf8_unchecked(rest.bytes[0..<cut])
+    val path = if cut == rest.bytes.len then "/" else from_utf8_unchecked(rest.bytes[cut..])
+
+    if authority == "" then return Err(s"`${url}` names no host")
+
+    // **A port written in the authority is taken, and a name holding a colon is not a host.** No
+    // credentials and no IPv6 literal: a package coordinate is a domain name, and accepting more
+    // than that would be accepting shapes nothing here can produce.
+    for i in 0..<authority.bytes.len
+        if authority.bytes[i] == u8(':')
+            val host = from_utf8_unchecked(authority.bytes[0..<i])
+            val port_text = from_utf8_unchecked(authority.bytes[(i + 1)..])
+
+            return Ok(Url(host, number_or(port_text, 443), path))
+
+    Ok(Url(authority, 443, path))
+end parse_url
+
+private number_or(text: string, fallback: int) -> int
+    var n = 0
+
+    for i in 0..<text.bytes.len
+        val c = text.bytes[i]
+
+        if c < u8('0') || c > u8('9') then return fallback
+
+        n = n * 10 + int(c - u8('0'))
+
+    if text == "" then fallback else n
+end number_or
+
+// -- one request ------------------------------------------------------------------------------------
+
+private get_once(url: string) -> Result[Response, string]
+    val target = parse_url(url)?
+    val addresses = resolve(target.host, target.port) match
+        Err(e) -> return Err(s"cannot find `${target.host}`: ${e}")
+        Ok(found) -> found
+
+    if addresses.len() == 0 then return Err(s"`${target.host}` resolved to no addresses")
+
+    // **The first address the machine offered, and not a search.** `resolve` answers in the order
+    // the host's own resolver chose, which is where the happy-eyeballs preference already lives.
+    val address = addresses.at(0)
+    var sock = socket(address) match
+        Err(e) -> return Err(s"cannot make a socket: ${e}")
+        Ok(s) -> s
+
+    val answer = talk(&sock, address, target)
+
+    sock.shutdown(Shutdown.Both)
+    sock.close()
+    answer
+end get_once
+
+// Everything that happens once there is a socket. **Separate so the close above happens on every
+// path out**, including the failures.
+private talk(sock: *Socket, address: Address, target: Url) -> Result[Response, string]
+    sock.connect(address) match
+        Err(e) -> return Err(s"cannot reach ${target.host}: ${e}")
+        Ok(_) -> ()
+
+    sock.read_timeout(Timeout)
+    sock.write_timeout(Timeout)
+
+    val tls = openssl.client() match
+        Err(e) -> return Err(s"${e}")
+        Ok(c) -> c
+
+    val stream = openssl.connect(tls, target.host) match
+        Err(e) -> return Err(s"${e}")
+        Ok(s) -> s
+
+    handshake(sock, stream)?
+
+    val request = s"GET ${target.path} HTTP/1.1\r\nHost: ${target.host}\r\n" +
+        "User-Agent: slate\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+
+    send_plain(sock, stream, request.bytes)?
+
+    val raw = read_all(sock, stream)?
+
+    parse_response(raw.view())
+end talk
+
+// **ASK, THEN DRAIN, THEN FEED. The order is not free.** Nothing is in the outgoing buffer until
+// something has been asked to produce it, so a loop that drains first sends no ClientHello and then
+// blocks reading a socket the server is also blocked reading -- which looks exactly like a network
+// fault. `sh.sysl.openssl` has a test named for it.
+private handshake(sock: *Socket, stream: &openssl.Stream) -> Result[unit, string]
+    var wire: [ChunkBytes]u8
+
+    loop
+        val step = stream.handshake() match
+            Err(e) -> return Err(s"${e}")
+            Ok(s) -> s
+
+        drain(sock, stream, wire[0..<ChunkBytes])?
+
+        if step == openssl.Step.Done then return Ok(())
+
+        val got = sock.recv(wire[0..<ChunkBytes]) match
+            Err(e) -> return Err(s"the connection failed during the TLS handshake: ${e}")
+            Ok(n) -> n
+
+        if got == 0 then return Err("the connection ended during the TLS handshake")
+
+        stream.incoming(wire[0..<got]) match
+            Err(e) -> return Err(s"${e}")
+            Ok(_) -> ()
+end handshake
+
+// Everything TLS has to send, written to the socket.
+private drain(sock: *Socket, stream: &openssl.Stream, wire: []u8) -> Result[unit, string]
+    loop
+        val n = stream.outgoing(wire)
+
+        if n == 0 then return Ok(())
+
+        sock.send_all(wire[0..<n]) match
+            Err(e) -> return Err(s"the connection failed while sending: ${e}")
+            Ok(_) -> ()
+end drain
+
+private send_plain(sock: *Socket, stream: &openssl.Stream, bytes: []const u8) -> Result[unit, string]
+    var wire: [ChunkBytes]u8
+    var at: usize = 0
+
+    loop
+        if at >= bytes.len then break
+
+        stream.send(bytes[at..]) match
+            Err(e) -> return Err(s"${e}")
+            Ok(sent) ->
+                sent match
+                    Took(n) -> at += n
+                    Wants -> ()
+
+        drain(sock, stream, wire[0..<ChunkBytes])?
+
+    drain(sock, stream, wire[0..<ChunkBytes])
+end send_plain
+
+// Read until the peer stops. **`Connection: close` is asked for in the request**, so the end of the
+// body is the end of the stream and there is no need to understand the framing twice.
+private read_all(sock: *Socket, stream: &openssl.Stream) -> Result[Buf[u8], string]
+    var out: Buf[u8] = buf()
+    var plain: [ChunkBytes]u8
+    var wire: [ChunkBytes]u8
+
+    loop
+        val received = stream.receive(plain[0..<ChunkBytes]) match
+            Err(e) -> return Err(s"${e}")
+            Ok(r) -> r
+
+        received match
+            Data(n) ->
+                out.extend(plain[0..<n])
+                continue
+            Closed -> break
+            Wants -> ()
+
+        drain(sock, stream, wire[0..<ChunkBytes])?
+
+        val got = sock.recv(wire[0..<ChunkBytes]) match
+            Err(e) -> return Err(s"the connection failed while reading: ${e}")
+            Ok(n) -> n
+
+        // **The socket ending is not the TLS session ending**, and the difference matters: a stream
+        // cut short with no close-notify is a truncation, which for a download is the failure to
+        // catch rather than a quiet short answer. What makes it safe to stop here is that the
+        // gzip checksum and the `slate.sum` hash both run over what arrived.
+        if got == 0 then break
+
+        stream.incoming(wire[0..<got]) match
+            Err(e) -> return Err(s"${e}")
+            Ok(_) -> ()
+
+    Ok(out)
+end read_all
+
+// -- reading what came back ---------------------------------------------------------------------------
+
+parse_response(raw: []const u8) -> Result[Response, string]
+    val split_at = header_end(raw)
+
+    if split_at == 0 then return Err("the reply has no end to its headers, so it is not HTTP")
+
+    val head = from_utf8_unchecked(raw[0..<(split_at - 4)])
+    val lines = split(head, "\r\n")
+
+    if lines.len == 0 then return Err("the reply is empty")
+
+    val status = status_of(lines[0])?
+    var location = ""
+
+    for i in 1..<lines.len
+        val line = lines[i]
+
+        if header_is(line, "location") then location = header_value(line)
+
+    val body = body_of(raw[split_at..], lines)?
+
+    Ok(Response(status, body, location))
+end parse_response
+
+// A chunked body is reassembled; anything else is taken as it stands.
+//
+// **Both framings have to be understood even though the request said `Connection: close`.** A server
+// is free to chunk anyway, and GitHub's does -- taking the bytes as they came would leave the hex
+// lengths in the middle of the tarball, which reaches the gzip reader as a corrupt file and says so
+// about the wrong thing.
+private body_of(rest: []const u8, lines: []const string) -> Result[[]u8, string]
+    var chunked = false
+
+    for i in 1..<lines.len
+        if header_is(lines[i], "transfer-encoding") && header_value(lines[i]).contains("chunked")
+            chunked = true
+
+    if !chunked
+        var plain: []u8 = [u8(0); rest.len]
+
+        for i in 0..<rest.len
+            plain[i] = rest[i]
+
+        return Ok(plain)
+
+    var out: Buf[u8] = buf()
+    var at: usize = 0
+
+    loop
+        val line_end = crlf_at(rest, at)
+
+        if line_end == 0 then return Err("a chunked reply stops in the middle of a chunk header")
+
+        val size = hex_of(rest[at..<line_end])?
+
+        at = line_end + 2
+
+        if size == 0 then break
+
+        if at + size > rest.len then return Err("a chunked reply stops in the middle of a chunk")
+
+        out.extend(rest[at..<(at + size)])
+
+        at += size + 2
+
+    var joined: []u8 = [u8(0); out.len()]
+
+    for i in 0..<out.len()
+        joined[i] = out.at(i)
+
+    Ok(joined)
+end body_of
+
+private status_of(line: string) -> Result[int, string]
+    val parts = split(line, " ")
+
+    if parts.len < 2 then return Err(s"`${line}` is not an HTTP status line")
+
+    Ok(number_or(parts[1], 0))
+end status_of
+
+// **Header names are case-insensitive**, which is not a nicety: `Location` and `location` are both
+// sent in the wild and a fetcher that matched one would follow some redirects and not others.
+private header_is(line: string, name: string) -> bool
+    if line.bytes.len < name.bytes.len + 1 then return false
+
+    for i in 0..<name.bytes.len
+        if lower(line.bytes[i]) != name.bytes[i] then return false
+
+    line.bytes[name.bytes.len] == u8(':')
+end header_is
+
+private header_value(line: string) -> string
+    for i in 0..<line.bytes.len
+        if line.bytes[i] == u8(':')
+            var start = i + 1
+
+            loop
+                if start >= line.bytes.len then break
+                if line.bytes[start] != u8(' ') then break
+
+                start += 1
+
+            return from_utf8_unchecked(line.bytes[start..])
+
+    ""
+end header_value
+
+private lower(c: u8) -> u8 = if c >= u8('A') && c <= u8('Z') then c + 32 else c
+
+private header_end(raw: []const u8) -> usize
+    if raw.len < 4 then return 0
+
+    for i in 0..<(raw.len - 3)
+        if raw[i] == u8('\r') && raw[i + 1] == u8('\n') && raw[i + 2] == u8('\r') && raw[i + 3] == u8('\n')
+            return i + 4
+
+    0
+end header_end
+
+private crlf_at(raw: []const u8, from: usize) -> usize
+    if from + 1 >= raw.len then return 0
+
+    for i in from..<(raw.len - 1)
+        if raw[i] == u8('\r') && raw[i + 1] == u8('\n') then return i
+
+    0
+end crlf_at
+
+// A chunk length, which is hexadecimal and may carry a `;` extension after it.
+private hex_of(field: []const u8) -> Result[usize, string]
+    var n: usize = 0
+    var seen = false
+
+    for i in 0..<field.len
+        val c = field[i]
+
+        if c == u8(';') || c == u8(' ') then break
+
+        var d = -1
+
+        if c >= u8('0') && c <= u8('9') then d = int(c - u8('0'))
+        if c >= u8('a') && c <= u8('f') then d = int(c - u8('a')) + 10
+        if c >= u8('A') && c <= u8('F') then d = int(c - u8('A')) + 10
+
+        if d < 0 then return Err("a chunked reply has a chunk length that is not a number")
+
+        n = n * 16 + usize(d)
+        seen = true
+
+    if seen then Ok(n) else Err("a chunked reply has an empty chunk length")
+end hex_of
