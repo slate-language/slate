@@ -1,0 +1,511 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// What a program does to an array, and the table that lets it be written as a method.
+//
+// **Every one of these is an ordinary function whose first argument is the array**, so `map(xs, f)`
+// and `xs.map(f)` are the same call written two ways. That is the whole of slate's method syntax on
+// a builtin type: there is no array object, no prototype in the heap and no bound method -- only a
+// name looked up by the kind of the receiver, and the receiver passed in front.
+//
+// **A MUTATOR NEVER ANSWERS THE ARRAY IT CHANGED.** `sort` and `reverse` answer nothing; `pop` and
+// `removeAt` answer what they took out. That is the rule that stops `ys = xs.sort()` reading as a
+// fresh array when it is the same one -- JavaScript hands the array back from both, which is what
+// makes its mutating and non-mutating operations indistinguishable at the call site. The other half
+// of the same rule is in the naming: **the bare verb changes the array and the participle answers a
+// new one**, so `sort` against `sorted` and `reverse` against `reversed`. Python draws the line in
+// exactly these two places.
+
+// -- the shapes these all take --------------------------------------------------------------------
+
+private array_of(v: Value, at: Span, name: string) -> Result[*ArrayObj, Signal] = v match
+    Array(a) -> Ok(a)
+    other -> Err(failure(at, s"`${name}` takes an array, and this is ${other.type_name()}"))
+
+private takes(args: Buf[Value], n: usize, at: Span, name: string, what: string) -> Result[unit, Signal]
+    if args.len() != n then return Err(failure(at, s"`${name}` takes ${what}, and was given ${args.len()} arguments"))
+
+    Ok(())
+
+private index_of_value(v: Value, at: Span, name: string, n: usize) -> Result[usize, Signal] = v match
+    Int(i) ->
+        if i < 0 || usize(i) > n
+            Err(failure(at, s"`${name}` was given the position ${i}, and this array has ${n} places to put one"))
+        else
+            Ok(usize(i))
+    other -> Err(failure(at, s"`${name}` takes a position, and this is ${other.type_name()}"))
+
+// Whether the array is still the length the walk started at.
+//
+// **A CALLBACK MAY CHANGE THE ARRAY IT IS WALKING, AND WITHOUT THIS THAT IS A PANIC.** The loop
+// bound is read once, so an element removed part-way through leaves the next read past the end --
+// which sysl reports as `index 2 past the 2 elements of a Buf`, with no line, no file and nothing
+// naming the program. JavaScript's answer is quieter and worse: `map` visits whatever survives and
+// leaves holes for the rest, so the mistake becomes a short array nobody traces back.
+//
+// **The diagnostic names the fix**, because the reader who believes the message still has to know
+// what to do: walk a copy, or build a new array rather than changing this one.
+private walk_changed(at: Span, name: string) -> Signal =
+    failure(at, s"this array was changed while `${name}` was walking it -- walk a copy of it, or build a new array rather than changing this one")
+
+// Call a one-argument function on one element.
+//
+// **The element is the only thing handed over.** JavaScript passes the value, the index and the
+// array, which is why `["1", "2", "3"].map(parseInt)` answers `[1, NaN, NaN]` -- a function that
+// happens to take a second argument silently receives the index. A program that wants the index
+// here writes `for i in 0..<len(xs)`, which is what the index is for.
+private call_on(f: Value, v: Value, at: Span) -> Step
+    var one: Buf[Value] = buf()
+
+    one.push(v)
+    apply(f, one, at)
+
+// -- walking an array with a function ---------------------------------------------------------------
+
+// `map(xs, f)` -- every element put through `f`, as a new array.
+//
+// **The result array is made first and held, and each answer is pushed into it as it arrives.** A
+// sysl `Buf` of values is not a root, so a callback that allocates could collect everything mapped
+// so far; the array is traced, and pushing into it is what keeps them.
+do_map(args: Buf[Value], at: Span) -> Step
+    takes(args, 2, at, "map", "an array and a function")?
+
+    val xs = array_of(args.at(0), at, "map")?
+    val mark = root_mark()
+    val out = new_array(buf())
+
+    hold(Array(out))
+
+    val n = xs.items.len()
+
+    for i in 0..<n
+        call_on(args.at(1), xs.items.at(i), at) match
+            Ok(v) -> out.items.push(v)
+            Err(e) ->
+                release(mark)
+                return Err(e)
+
+        if xs.items.len() != n
+            release(mark)
+            return Err(walk_changed(at, "map"))
+
+    release(mark)
+    Ok(Array(out))
+end do_map
+
+// `filter(xs, f)` -- the elements `f` says yes to, in the order they were in.
+do_filter(args: Buf[Value], at: Span) -> Step
+    takes(args, 2, at, "filter", "an array and a function")?
+
+    val xs = array_of(args.at(0), at, "filter")?
+    val mark = root_mark()
+    val out = new_array(buf())
+
+    hold(Array(out))
+
+    val n = xs.items.len()
+
+    for i in 0..<n
+        val kept = call_on(args.at(1), xs.items.at(i), at) match
+            Ok(v) -> v.truthy()
+            Err(e) ->
+                release(mark)
+                return Err(e)
+
+        if xs.items.len() != n
+            release(mark)
+            return Err(walk_changed(at, "filter"))
+
+        if kept then out.items.push(xs.items.at(i))
+
+    release(mark)
+    Ok(Array(out))
+end do_filter
+
+// `reduce(xs, f, start)` -- `f` folded over the array from the left.
+//
+// **The starting value is required, and that is deliberate.** JavaScript's is optional and reducing
+// an empty array without one raises a `TypeError` from inside the library -- a failure mode that
+// exists only because the argument was made optional. Requiring it removes the case.
+do_reduce(args: Buf[Value], at: Span) -> Step
+    takes(args, 3, at, "reduce", "an array, a function and a starting value")?
+
+    val xs = array_of(args.at(0), at, "reduce")?
+    val mark = root_mark()
+    var acc = args.at(2)
+
+    hold(acc)
+
+    val n = xs.items.len()
+
+    for i in 0..<n
+        var two: Buf[Value] = buf()
+
+        two.push(acc)
+        two.push(xs.items.at(i))
+
+        apply(args.at(1), two, at) match
+            Ok(v) ->
+                acc = v
+
+                // The previous accumulator is dead and the new one has to be reachable across the
+                // next call, so the shadow stack is wound back to the mark and re-pushed each turn
+                // rather than growing by one for every element.
+                release(mark)
+                hold(acc)
+            Err(e) ->
+                release(mark)
+                return Err(e)
+
+        if xs.items.len() != n
+            release(mark)
+            return Err(walk_changed(at, "reduce"))
+
+    release(mark)
+    Ok(acc)
+end do_reduce
+
+// `find(xs, f)` and `findIndex(xs, f)` -- the first element `f` says yes to, or where it is.
+//
+// **Absent is `null` and not -1**, which is the same call `indexOf` makes and for the same reason:
+// slate has a null and the operators that go with it, so a sentinel would be an invented one.
+do_find(args: Buf[Value], at: Span, want_index: bool) -> Step
+    val name = if want_index then "findIndex" else "find"
+
+    takes(args, 2, at, name, "an array and a function")?
+
+    val xs = array_of(args.at(0), at, name)?
+
+    val n = xs.items.len()
+
+    for i in 0..<n
+        val hit = call_on(args.at(1), xs.items.at(i), at)?.truthy()
+
+        if xs.items.len() != n then return Err(walk_changed(at, name))
+
+        if hit then return Ok(if want_index then Int(long(i)) else xs.items.at(i))
+
+    Ok(Null)
+end do_find
+
+// `every(xs, f)` and `some(xs, f)`, which stop as soon as the answer is settled.
+//
+// Empty answers `true` for `every` and `false` for `some`, which is what the two questions mean
+// about nothing and is what every language answers.
+do_quantify(args: Buf[Value], at: Span, want_every: bool) -> Step
+    val name = if want_every then "every" else "some"
+
+    takes(args, 2, at, name, "an array and a function")?
+
+    val xs = array_of(args.at(0), at, name)?
+
+    val n = xs.items.len()
+
+    for i in 0..<n
+        val said = call_on(args.at(1), xs.items.at(i), at)?.truthy()
+
+        if xs.items.len() != n then return Err(walk_changed(at, name))
+
+        if said != want_every then return Ok(Bool(!want_every))
+
+    Ok(Bool(want_every))
+end do_quantify
+
+// -- order ------------------------------------------------------------------------------------------
+
+// Whether `a` comes before `b`, by a program's rule or by slate's own.
+//
+// **A COMPARATOR ANSWERS A BOOLEAN, NOT A NUMBER**, and the reason is slate's truthiness. Only
+// `null`, `undefined` and `false` are false here, so **zero is true** -- a JavaScript-style
+// comparator answering -1, 0 or 1 would read as "yes, yes, yes" and sort nothing, silently. A
+// boolean cannot be misread, `(a, b) -> a.age < b.age` is what the reader was going to write anyway,
+// and anything else is refused in a sentence.
+private comes_first(cmp: Value, a: Value, b: Value, at: Span) -> Result[bool, Signal]
+    if is_nullish(cmp)
+        // **Numbers order as numbers.** `[10, 9]` sorted answers `[9, 10]`, where JavaScript's
+        // default answers `[10, 9]` -- it renders both to text and compares those. slate's `<` is
+        // the rule, so two numbers compare as numbers, two strings as text, and a mixture is a
+        // fault naming both kinds rather than an arbitrary answer.
+        return on_values(Lt, a, b, at)? match
+            Bool(x) -> Ok(x)
+            other -> Err(failure(at, s"these cannot be put in order, being ${other.type_name()}"))
+
+    var two: Buf[Value] = buf()
+
+    two.push(a)
+    two.push(b)
+
+    apply(cmp, two, at)? match
+        Bool(x) -> Ok(x)
+        other -> Err(failure(at, s"a comparator answers whether the first value comes before the second, and this answered ${other.type_name()}"))
+end comes_first
+
+// Merge sort, which is what makes the order STABLE -- two elements the comparator calls equal come
+// out in the order they went in. An unstable sort makes `sorted(sorted(xs, byName), byAge)` lose the
+// first ordering, which is the whole reason a program sorts twice.
+//
+// **Both arrays are collected objects and both are held by the caller**, so every value in flight is
+// traced. A scratch `Buf` would not be, and a comparator is a program that allocates.
+private merge_sort(a: *ArrayObj, scratch: *ArrayObj, lo: usize, hi: usize, cmp: Value, n: usize, at: Span, name: string) -> Result[unit, Signal]
+    if hi - lo < 2 then return Ok(())
+
+    val mid = lo + (hi - lo) / 2
+
+    merge_sort(a, scratch, lo, mid, cmp, n, at, name)?
+    merge_sort(a, scratch, mid, hi, cmp, n, at, name)?
+
+    var i = lo
+    var j = mid
+    var k = lo
+
+    loop
+        if k >= hi then break
+
+        // **The right side is taken only where it comes STRICTLY first**, which is what makes the
+        // sort stable: a tie leaves the left run in front, and the left run is the earlier one.
+        var take_right = i >= mid
+
+        if !take_right && j < hi
+            take_right = comes_first(cmp, a.items.at(j), a.items.at(i), at)?
+
+            // A comparator is a program, and a program may change the array it is ordering.
+            if a.items.len() != n then return Err(walk_changed(at, name))
+
+        if take_right
+            scratch.items.set(k, a.items.at(j))
+            j += 1
+        else
+            scratch.items.set(k, a.items.at(i))
+            i += 1
+
+        k += 1
+
+    for n in lo..<hi
+        a.items.set(n, scratch.items.at(n))
+
+    Ok(())
+end merge_sort
+
+// `sort(xs)` changes the array; `sorted(xs)` answers a new one. Both take an optional comparator.
+do_sort(args: Buf[Value], at: Span, in_place: bool) -> Step
+    val name = if in_place then "sort" else "sorted"
+
+    if args.len() != 1 && args.len() != 2
+        return fault(at, s"`${name}` takes an array and an optional comparator, and was given ${args.len()} arguments")
+
+    val given = array_of(args.at(0), at, name)?
+    val cmp: Value = if args.len() == 2 then args.at(1) else Null
+    val mark = root_mark()
+    val target = if in_place then given else new_array(copy_of(given))
+
+    hold(Array(target))
+
+    val scratch = new_array(copy_of(target))
+
+    hold(Array(scratch))
+
+    val n = target.items.len()
+    val outcome = merge_sort(target, scratch, 0, n, cmp, n, at, name)
+
+    release(mark)
+    outcome?
+
+    // **Nothing is handed back from the mutating form**, so a sorted-in-place array cannot be
+    // mistaken for a fresh one at the call site.
+    Ok(if in_place then Null else Array(target))
+end do_sort
+
+// `reverse(xs)` changes the array; `reversed(xs)` answers a new one.
+do_reverse(args: Buf[Value], at: Span, in_place: bool) -> Step
+    val name = if in_place then "reverse" else "reversed"
+
+    takes(args, 1, at, name, "an array")?
+
+    val xs = array_of(args.at(0), at, name)?
+    val n = xs.items.len()
+
+    if !in_place
+        val mark = root_mark()
+        val out = new_array(buf())
+
+        hold(Array(out))
+
+        for i in 0..<n
+            out.items.push(xs.items.at(n - 1 - i))
+
+        release(mark)
+        return Ok(Array(out))
+    end if
+
+    for i in 0..<n / 2
+        val other = xs.items.at(n - 1 - i)
+
+        xs.items.set(n - 1 - i, xs.items.at(i))
+        xs.items.set(i, other)
+
+    Ok(Null)
+end do_reverse
+
+// -- changing an array in place ---------------------------------------------------------------------
+
+// `pop(xs)` -- the last element, taken off.
+//
+// **An empty array is a fault and not an absent value.** Popping nothing is a defect in the program:
+// JavaScript answers `undefined`, which travels, and slate's `undefined` is exactly the value that
+// may not travel -- so the honest answer is to say so where it happened.
+do_pop(args: Buf[Value], at: Span) -> Step
+    takes(args, 1, at, "pop", "an array")?
+
+    val xs = array_of(args.at(0), at, "pop")?
+
+    xs.items.pop() match
+        Some(v) -> Ok(v)
+        None -> fault(at, "there is nothing to pop off an empty array")
+end do_pop
+
+// `insert(xs, i, v)` -- put a value at a position, sliding the rest along.
+do_insert(args: Buf[Value], at: Span) -> Step
+    takes(args, 3, at, "insert", "an array, a position and a value")?
+
+    val xs = array_of(args.at(0), at, "insert")?
+
+    keepable(args.at(2), at, "stored")?
+    xs.items.insert(index_of_value(args.at(1), at, "insert", xs.items.len())?, args.at(2))
+    Ok(Null)
+end do_insert
+
+// `removeAt(xs, i)` -- take the element at a position out, and answer it.
+do_remove_at(args: Buf[Value], at: Span) -> Step
+    takes(args, 2, at, "removeAt", "an array and a position")?
+
+    val xs = array_of(args.at(0), at, "removeAt")?
+    val n = xs.items.len()
+
+    if n == 0 then return fault(at, "there is nothing to remove from an empty array")
+
+    Ok(xs.items.remove(index_of_value(args.at(1), at, "removeAt", n - 1)?))
+end do_remove_at
+
+// `clear(xs)` -- empty it.
+//
+// Named `do_clear_array` here because `do_clear` is already the timers'; the two are unrelated and
+// the slate names are `clear` and `clearTimeout`.
+do_clear_array(args: Buf[Value], at: Span) -> Step
+    takes(args, 1, at, "clear", "an array")?
+
+    array_of(args.at(0), at, "clear")?.items.clear()
+    Ok(Null)
+end do_clear_array
+
+// -- making one array out of others -------------------------------------------------------------
+
+private copy_of(a: *ArrayObj) -> Buf[Value]
+    var items: Buf[Value] = buf()
+
+    for i in 0..<a.items.len()
+        items.push(a.items.at(i))
+
+    items
+end copy_of
+
+// `concat(a, b, ...)` -- every element of every array given, in one new array.
+do_concat(args: Buf[Value], at: Span) -> Step
+    if args.len() == 0 then return fault(at, "`concat` takes at least one array and was given none")
+
+    val mark = root_mark()
+    val out = new_array(buf())
+
+    hold(Array(out))
+
+    for i in 0..<args.len()
+        args.at(i) match
+            Array(a) -> for j in 0..<a.items.len() do out.items.push(a.items.at(j))
+            other ->
+                release(mark)
+                return fault(at, s"`concat` joins arrays, and one of these is ${other.type_name()}")
+
+    release(mark)
+    Ok(Array(out))
+end do_concat
+
+// `flat(xs)` -- one level of nesting undone.
+//
+// **One level and not all of them**, which is JavaScript's default and the right one: a program that
+// flattens a tree of unknown depth is asking a different question, and doing it by accident to an
+// array of arrays of pairs loses the pairs.
+do_flat(args: Buf[Value], at: Span) -> Step
+    takes(args, 1, at, "flat", "an array")?
+
+    val xs = array_of(args.at(0), at, "flat")?
+    val mark = root_mark()
+    val out = new_array(buf())
+
+    hold(Array(out))
+
+    for i in 0..<xs.items.len()
+        xs.items.at(i) match
+            Array(inner) -> for j in 0..<inner.items.len() do out.items.push(inner.items.at(j))
+            other -> out.items.push(other)
+
+    release(mark)
+    Ok(Array(out))
+end do_flat
+
+// `sum(xs)` -- every element added up, starting from the integer zero.
+//
+// So an empty array sums to `0` and an array of reals to a real, `+` being what does the promoting.
+do_sum(args: Buf[Value], at: Span) -> Step
+    takes(args, 1, at, "sum", "an array")?
+
+    val xs = array_of(args.at(0), at, "sum")?
+    var total: Value = Int(0)
+
+    for i in 0..<xs.items.len()
+        total = on_values(Plus, total, xs.items.at(i), at)?
+
+    Ok(total)
+end do_sum
+
+// -- the questions an array answers about its contents --------------------------------------------
+
+// `contains(xs, v)` on an array, which `contains` on a string already answers about text.
+do_array_contains(args: Buf[Value], at: Span) -> Step
+    takes(args, 2, at, "contains", "an array and what to look for")?
+
+    val xs = array_of(args.at(0), at, "contains")?
+
+    val n = xs.items.len()
+
+    for i in 0..<n
+        // `same` reaches a user `equals` where an element has one, so this walk can be changed
+        // under its own feet exactly as one over a written callback can.
+        val found = same(xs.items.at(i), args.at(1), at)?
+
+        if xs.items.len() != n then return Err(walk_changed(at, "contains"))
+
+        if found then return Ok(Bool(true))
+
+    Ok(Bool(false))
+end do_array_contains
+
+// `indexOf(xs, v)` and `lastIndexOf(xs, v)` on an array -- the position, or `null`.
+do_array_index_of(args: Buf[Value], at: Span, last: bool) -> Step
+    val name = if last then "lastIndexOf" else "indexOf"
+
+    takes(args, 2, at, name, "an array and what to look for")?
+
+    val xs = array_of(args.at(0), at, name)?
+    val n = xs.items.len()
+
+    for i in 0..<n
+        val k = if last then n - 1 - i else i
+        val found = same(xs.items.at(k), args.at(1), at)?
+
+        if xs.items.len() != n then return Err(walk_changed(at, name))
+
+        if found then return Ok(Int(long(k)))
+
+    Ok(Null)
+end do_array_index_of
