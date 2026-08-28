@@ -1,0 +1,282 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.{Source, source}
+import sysl.buf.{Buf, buf}
+import sysl.env
+import sysl.fs.{current_dir, read_bytes}
+import sysl.text.{parse_long, split}
+
+// Where a package import points, worked out before anything runs.
+//
+// **A package is named and a file is pathed, and the resolver is what turns the first into the
+// second.** `import { parse } from parsing` says a name; what it resolves to is a directory, chosen
+// from the project's own `package.sl` and from the manifests of everything that reaches it. None of
+// that touches the network -- this reads manifests out of a cache that something else fills.
+//
+// **VERSIONS ARE EXACT AND THERE IS NO SOLVER.** A manifest writes `version: "0.4.0"` and means that
+// version, so the graph is fully determined by the manifests and there is nothing to search. What is
+// left is the one case exactness does not answer: two dependencies wanting different versions of the
+// same package. slate **takes the newest and says so**, which keeps a build working at the cost of
+// sometimes handing a package a version it never claimed to support -- and the note says that, since
+// a warning nobody can act on is worse than none.
+
+// One package the program is going to use.
+struct Package
+    name: string
+    version: string
+    git: string
+
+    // The directory it lives in, whether or not anything has put it there yet.
+    dir: string
+end Package
+
+// Every package a project needs, at one version each.
+//
+// **`notes` is plain sentences rather than a `Report`, and that is deliberate.** A diagnostic in this
+// organisation carries a `Span`, and a span means nothing without the file it indexes -- these arise
+// while reading several manifests at once, none of which is the program being compiled. A caret
+// drawn against the wrong file is worse than no caret, so what is said about the graph is said as
+// prose and what is said about an import is said at the import.
+struct Packages
+    found: Buf[Package]
+
+    // The directory holding the project's own `package.sl`, or `""` where there is none.
+    root: string
+
+    notes: Buf[string]
+
+    at(self, name: string) -> Option[Package]
+        for i in 0..<self.found.len()
+            if self.found.at(i).name == name then return Some(self.found.at(i))
+
+        None
+    end at
+end Packages
+
+// -- where packages are kept ----------------------------------------------------------------------
+
+// **The cache is a setting so that a test can point at a fixture.** `set_heap_limit` is the same
+// arrangement and exists for the same reason: the behaviour under test is identical whatever
+// directory it reads, and inventing a real one would make the suite depend on what a previous run
+// had downloaded.
+var package_cache_dir: string = ""
+
+set_package_cache(dir: string)
+    package_cache_dir = dir
+
+// Where a fetched package would be found.
+//
+// **`$HOME/.slate/pkg`, and a dot directory rather than the platform's own cache location.** sysl
+// keeps its packages under `~/Library/Caches/sysl/pkg` because its compiler runs on the JVM and can
+// ask a library where a cache belongs; **sysl's own standard library offers no such answer** -- there
+// is no home directory, no cache directory and no way to ask which operating system this is, so a
+// program written in sysl cannot spell that path portably at all. A dot directory in `$HOME` is
+// identical on every platform slate runs on, which is what `~/.cargo` and `~/.npm` settled on for
+// the same reason.
+package_cache() -> string
+    if package_cache_dir != "" then return package_cache_dir
+
+    env.get("SLATE_CACHE") match
+        Some(dir) -> dir
+        None ->
+            env.get("HOME") match
+                Some(home) -> s"${home}/.slate/pkg"
+                None -> ".slate/pkg"
+end package_cache
+
+// The directory one version of one package would occupy.
+//
+// **The coordinate is in the path, not only the name**, so two projects depending on different
+// versions of a thing share a cache without either overwriting the other -- and so the directory
+// says what is in it. sysl's layout, with slate's root.
+package_dir(git: string, version: string) -> string = s"${package_cache()}/${git}/@v${version}"
+
+// -- resolving ------------------------------------------------------------------------------------
+
+// Every package the project reaches, at one version each.
+//
+// **The walk is over MANIFESTS and not over code.** Reading a `package.sl` costs the lexer, the
+// parser and a walk, so working out the whole graph is cheap and happens before any slate file is
+// read -- which is what lets a conflict be settled once rather than being discovered halfway through
+// loading and having to unwind.
+resolve_packages(root: string, project: Project) -> Packages
+    var p = Packages(buf(), root, buf())
+    var pending: Buf[Dependency] = buf()
+
+    for i in 0..<project.dependencies.len()
+        pending.push(project.dependencies.at(i))
+
+    // **A cursor rather than a stack, so the queue is first-in-first-out.** What that buys is that
+    // the project's own dependencies are resolved in the order the manifest writes them, which is
+    // the order `slate deps` prints and the order a person put them in.
+    //
+    // **The step limit is not ceremony**: the graph is read out of manifests this program did not
+    // write, packages can name each other in a circle, and there is nothing here that detects one
+    // cheaply. A limit no real project can reach turns a hang into a sentence.
+    var next: usize = 0
+    var steps: usize = 0
+
+    loop
+        if next >= pending.len() then break
+
+        steps += 1
+
+        if steps > MaxResolutionSteps
+            p.notes.push(s"gave up working out the packages after ${MaxResolutionSteps} steps -- the manifests may depend on each other in a circle")
+            break
+        end if
+
+        val want = pending.at(next)
+
+        next += 1
+
+        if take_package(&p, want) then queue_dependencies_of(&p, want, &pending)
+
+    p
+end resolve_packages
+
+// Whether the package is actually on disk, which nothing yet puts it there.
+is_fetched(pkg: Package) -> bool = read_manifest_of(pkg.dir).is_some()
+
+private val MaxResolutionSteps: usize = 4096
+
+// Record one wanted package, answering whether its own manifest still has to be read.
+//
+// **The conflict rule lives here and nowhere else.** A name already chosen at the same version is
+// nothing to say; at a different version it is the one case exact pinning does not settle.
+private take_package(p: *Packages, want: Dependency) -> bool
+    for i in 0..<p.found.len()
+        val have = p.found.at(i)
+
+        if have.name != want.name then continue
+
+        if have.version == want.version then return false
+
+        if newer_version(want.version, have.version)
+            p.notes.push(conflict_note(want.name, have.version, want.version, want.version))
+            p.found.set(i, Package(want.name, want.version, want.git, package_dir(want.git, want.version)))
+
+            return true
+        end if
+
+        p.notes.push(conflict_note(want.name, have.version, want.version, have.version))
+
+        return false
+
+    p.found.push(Package(want.name, want.version, want.git, package_dir(want.git, want.version)))
+    true
+end take_package
+
+// **The note says what was chosen AND what it costs**, because a warning a reader cannot act on is
+// worse than no warning: the action here is to bump the older dependency, and the risk is that the
+// package which asked for the older version has never been run against the newer one.
+private conflict_note(name: string, a: string, b: string, chosen: string) -> string =
+    s"`${name}` is wanted at ${a} and at ${b} -- using ${chosen}, which is the newer. Whatever asked for the other one has not been tried against it"
+
+// A package's own dependencies, read out of the manifest in its directory.
+//
+// **A package that is not there yet is not a complaint here.** Nothing fetches, so an empty cache is
+// the ordinary state; what a missing package stops is an `import` of it, and that is where it is
+// said, against the line that wrote it.
+private queue_dependencies_of(p: *Packages, want: Dependency, pending: *Buf[Dependency])
+    read_manifest_of(package_dir(want.git, want.version)) match
+        None -> ()
+        Some(f) ->
+            for i in 0..<f.project.dependencies.len()
+                pending.push(f.project.dependencies.at(i))
+end queue_dependencies_of
+
+// The `package.sl` in a directory, where there is one that reads.
+//
+// **A manifest that is wrong is treated as one that is absent.** Its own complaints belong to
+// whoever is looking at that package, not to the program that happens to depend on it, and repeating
+// them here would point carets at a file the reader did not write.
+read_manifest_of(dir: string) -> Option[ProjectFile]
+    val path = s"${dir}/${ManifestFile}"
+
+    read_bytes(path) match
+        Err(_) -> None
+        Ok(bytes) ->
+            val f = read_project(source(path, bytes))
+
+            if f.ok() then Some(f) else None
+end read_manifest_of
+
+// -- comparing two exact versions -----------------------------------------------------------------
+
+// Whether `a` is a later version than `b`.
+//
+// **Dot-separated numbers, compared as numbers, with a missing part counting as zero**, so `0.10.0`
+// is later than `0.9.0` where comparing the text would have said the opposite. A part that is not a
+// number is compared as text.
+//
+// **That last rule is NOT semver's, and it is the thing to replace first if ranges ever arrive.**
+// semver sorts `1.0.0-rc1` *before* `1.0.0`; this sorts it after, because `"" < "-rc1"` is not a
+// question text comparison is being asked. Nothing here writes a prerelease today, and a manifest
+// writes exact versions -- so all this decides is which of two exact versions a conflict keeps.
+newer_version(a: string, b: string) -> bool
+    val x = split(a, ".")
+    val y = split(b, ".")
+    val n = if x.len > y.len then x.len else y.len
+
+    for i in 0..<n
+        val l = if i < x.len then x[i] else "0"
+        val r = if i < y.len then y[i] else "0"
+
+        if l == r then continue
+
+        val ln = parse_long(l)
+        val rn = parse_long(r)
+
+        if ln.is_ok() && rn.is_ok() then return ln.unwrap() > rn.unwrap()
+
+        return l > r
+
+    false
+end newer_version
+
+// -- finding the project a file belongs to ---------------------------------------------------------
+
+// The nearest directory at or above a file that holds a `package.sl`, or `""`.
+//
+// **Walking up is what makes a program work wherever it is run from and wherever it sits in the
+// tree**, which is the rule every tool with a project file uses. It stops at the root rather than
+// walking out of the filesystem, and a program with no project above it is not an error: a single
+// file that imports nothing is a perfectly good slate program.
+project_root_of(file: string) -> string
+    var dir = starting_dir(file)
+    var steps: usize = 0
+
+    loop
+        steps += 1
+
+        if steps > MaxProjectDepth then return ""
+
+        read_bytes(s"${dir}/${ManifestFile}") match
+            Ok(_) -> return dir
+            Err(_) -> ()
+
+        val up = normalize_path(s"${dir}/..")
+
+        if up == dir then return ""
+
+        dir = up
+end project_root_of
+
+private val MaxProjectDepth: usize = 256
+
+// The directory to start walking up from, made absolute.
+//
+// **Absolute, because the walk stops when going up changes nothing** -- `normalize_path("/..")` is
+// `/` and `normalize_path("../..")` is `../..`, so a relative path would climb until the step limit
+// caught it rather than until it ran out of tree.
+private starting_dir(file: string) -> string
+    val d = dir_of(file)
+    val base = if d == "" then "." else d
+
+    if base.bytes.len > 0 && base.bytes[0] == u8('/') then return normalize_path(base)
+
+    current_dir() match
+        Ok(cwd) -> normalize_path(s"${cwd}/${base}")
+        Err(_) -> normalize_path(base)
+end starting_dir

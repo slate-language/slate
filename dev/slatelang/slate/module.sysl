@@ -25,7 +25,10 @@ import sysl.text.{from_utf8_unchecked, str_builder}
 
 // Everything up to and including the last `/`, or nothing where the path names a file in the
 // working directory.
-private dir_of(path: string) -> string
+//
+// **Public because `private` is per-FILE in sysl**, and `packages.sysl` walks up from a file to find
+// the project it belongs to. It is not part of any surface anything else should reach for.
+dir_of(path: string) -> string
     val b = path.bytes
     var cut: usize = 0
     var seen = false
@@ -138,6 +141,10 @@ struct Loaded
     // depth-first from the entry, running is post-order.
     order: Buf[usize]
 
+    // Every package the project reaches, at one version each. Empty where the entry sits under no
+    // project at all, which is an ordinary thing for a single file to do.
+    packages: Packages
+
     ok(self) -> bool = !self.report.has_errors()
 end Loaded
 
@@ -148,13 +155,38 @@ end Loaded
 load_program(entry: Source) -> Loaded
     clear_bodies()
 
-    var l = Loaded(buf(), buf(), report(), buf(), buf())
+    val name = normalize_path(entry.name)
+    var l = Loaded(buf(), buf(), report(), buf(), buf(), packages_for(name))
     var stack: Buf[string] = buf()
 
-    load_file(&l, source(normalize_path(entry.name), entry.bytes), &stack)
+    load_file(&l, source(name, entry.bytes), &stack)
     check_exports(&l)
     l
 end load_program
+
+// The packages the file's project reaches, or none where it sits under no project.
+//
+// **The project is found by walking UP from the entry**, so a program works wherever it is run from
+// and wherever in its tree it sits. A file with no `package.sl` above it depends on nothing, which
+// is not an error -- a single file that imports nothing is a perfectly good slate program, and it is
+// what nearly every test in this repo is.
+private packages_for(entry: string) -> Packages
+    val root = project_root_of(entry)
+
+    if root == "" then return Packages(buf(), "", buf())
+
+    read_manifest_of(root) match
+        Some(f) -> resolve_packages(root, f.project)
+        None ->
+            var p = Packages(buf(), root, buf())
+
+            // **Saying nothing here would make every package import read as an unknown name.** The
+            // complaints about the manifest itself belong to `slate deps`, which renders them
+            // against the file; what this can do is send the reader there rather than let them hunt
+            // for a dependency they did in fact write down.
+            p.notes.push(s"${root}/${ManifestFile} could not be read as a project, so nothing it declares is available -- `slate deps` says what is wrong with it")
+            p
+end packages_for
 
 // Take one file's diagnostics, remembering which file they were about.
 private absorb_from(l: *Loaded, me: usize, rep: Report)
@@ -208,8 +240,8 @@ private load_file(l: *Loaded, src: Source, stack: *Buf[string]) -> usize
         val st = parsed.program.stmts.at(i)
 
         *st.kind match
-            ImportNames(path, path_at, _, _) -> take_import(l, me, path, path_at, st.span, stack)
-            ImportAll(path, path_at, _) -> take_import(l, me, path, path_at, st.span, stack)
+            ImportNames(path, path_at, is_package, _, _) -> take_import(l, me, path, path_at, is_package, st.span, stack)
+            ImportAll(path, path_at, is_package, _) -> take_import(l, me, path, path_at, is_package, st.span, stack)
             _ -> ()
 
     stack.truncate(stack.len() - 1)
@@ -218,15 +250,31 @@ private load_file(l: *Loaded, src: Source, stack: *Buf[string]) -> usize
 end load_file
 
 // One import: check the shape of the path, refuse a cycle, and read the file if it is new.
-private take_import(l: *Loaded, me: usize, raw: string, path_at: Span, whole: Span, stack: *Buf[string])
+private take_import(l: *Loaded, me: usize, raw: string, path_at: Span, is_package: bool, whole: Span, stack: *Buf[string])
     if raw == "" then return
 
-    if !is_relative(raw)
-        complain(l, me, path_at, s"a module path says where it starts, so `${raw}` has to be written `./${raw}` -- a bare name is what a package will be called when slate has packages")
+    if is_package
+        val (entry, trouble) = package_entry(l.packages, raw)
+
+        if entry == ""
+            complain(l, me, path_at, trouble)
+            return
+        end if
+
+        take_file(l, me, entry, path_at, whole, stack)
         return
     end if
 
-    val path = resolve_import(l.sources.at(me).name, raw)
+    if !is_relative(raw)
+        complain(l, me, path_at, s"a module path says where it starts, so a file has to be written `\"./${raw}\"` -- an unquoted `${raw}` is how a package is named")
+        return
+    end if
+
+    take_file(l, me, resolve_import(l.sources.at(me).name, raw), path_at, whole, stack)
+end take_import
+
+// One file, wherever it was worked out from: refuse a cycle, and read it if it is new.
+private take_file(l: *Loaded, me: usize, path: string, path_at: Span, whole: Span, stack: *Buf[string])
 
     if on_stack(stack, path)
         complain(l, me, whole, s"${cycle_text(stack, path)} -- a file cannot import something that is waiting for it, so one of the two has to give up what it needs from the other")
@@ -242,7 +290,46 @@ private take_import(l: *Loaded, me: usize, raw: string, path_at: Span, whole: Sp
     read_bytes(path) match
         Err(e) -> complain(l, me, path_at, s"cannot read `${path}`: ${e}")
         Ok(bytes) -> load_file(l, source(path, bytes), stack)
-end take_import
+end take_file
+
+// Where a package import points: the `main` of that package's own manifest.
+//
+// **Answers the path and the reason it has none, rather than complaining itself**, because
+// `check_exports` asks the same question a second time and must not report anything twice.
+package_entry(packages: Packages, name: string) -> (string, string)
+    packages.at(name) match
+        None -> ("", s"nothing this project depends on is called `${name}`${also_available(packages)}")
+        Some(pkg) ->
+            read_manifest_of(pkg.dir) match
+                None -> ("", s"`${name}` ${pkg.version} is not in ${pkg.dir} -- nothing fetches packages yet, so it has to be put there")
+                Some(f) ->
+                    if f.project.main == ""
+                        return ("", s"`${name}` does not say `main` in its `${ManifestFile}`, so there is nothing to import from it")
+
+                    (normalize_path(s"${pkg.dir}/${f.project.main}"), "")
+end package_entry
+
+// What the project does depend on, for the reader who mistyped one -- or the sentence for a project
+// that depends on nothing at all, which is the commoner case and is otherwise invisible.
+private also_available(packages: Packages) -> string
+    if packages.found.len() == 0
+        if packages.root == "" then return s" -- and there is no `${ManifestFile}` above this file, so it is not part of a project at all"
+
+        return s" -- ${packages.root}/${ManifestFile} declares no dependencies"
+
+    var out = str_builder()
+
+    out.push(". It depends on ")
+
+    for i in 0..<packages.found.len()
+        if i > 0 then out.push(if i == packages.found.len() - 1 then " and " else ", ")
+
+        out.push("`")
+        out.push(packages.found.at(i).name)
+        out.push("`")
+
+    out.finish()
+end also_available
 
 // The chain a cycle closes, written out so the reader knows which files are in it.
 private cycle_text(stack: *Buf[string], path: string) -> string
@@ -278,14 +365,27 @@ private check_exports(l: *Loaded)
             val st = prog.stmts.at(i)
 
             *st.kind match
-                ImportNames(path, _, names, _) ->
-                    val target = source_named(l, resolve_import(l.sources.at(me).name, path))
+                ImportNames(path, _, is_package, names, _) ->
+                    val target = source_named(l, import_target(l, me, path, is_package))
 
                     target match
                         Some(other) -> check_names(l, me, st.span, path, names, l.programs.at(other))
                         None -> ()
                 _ -> ()
 end check_exports
+
+// The file an import resolved to, asked a second time.
+//
+// **`package_entry` answering rather than complaining is what makes this safe**: an import that
+// could not be resolved was already reported by `take_import`, and asking again here has to add
+// nothing. A `""` simply finds no source and this pass says nothing more about it.
+private import_target(l: *Loaded, me: usize, raw: string, is_package: bool) -> string
+    if !is_package then return resolve_import(l.sources.at(me).name, raw)
+
+    val (entry, _) = package_entry(l.packages, raw)
+
+    entry
+end import_target
 
 // **A type counts as an export, and has to**, since `export type Point = ...` is how an interface
 // crosses a file. It is not a value, so nothing of it reaches run time -- the compiler drops the
