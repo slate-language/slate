@@ -40,7 +40,7 @@ print(trouble)
 // It carries across calls, however deep.
 deep(k) = if k == 0 then thisIsTheBottom else deep(k - 1)
 
-print(deep(6) catch e -> "came back from " + str(6) + " frames down")
+print(deep(6) catch e -> "came back from " + string(6) + " frames down")
 
 // And across a suspension: a coroutine keeps its handlers while it is set aside, so a promise that
 // fails later still raises inside the `try` that was written around the `await`.

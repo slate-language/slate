@@ -107,20 +107,20 @@ classify(v)
     v match
         { kind: "point", at: [0, 0] } -> "origin"
         { kind: "point", at: [x, y] } if x == y -> "diagonal"
-        [first, ...rest] -> "a list starting " + str(first)
+        [first, ...rest] -> "a list starting " + string(first)
         "sat" | "sun" -> "a weekend"
         n @ num if n < 0 -> "a negative number"
         _ -> "something else"
 ```
 
 **A bare name in a pattern tests for a kind where it names one, and binds otherwise** — `null`,
-`bool`, `int`, `real`, `number`, `string`, `array`, `object`, `fn`. That is sysl's own bare-name rule (a
+`boolean`, `integer`, `real`, `number`, `string`, `array`, `object`, `function`. That is sysl's own bare-name rule (a
 bare identifier is a nullary-variant pattern when it names one of the scrutinee's variants), applied
 to a scrutinee that is always a value: those words *are* the variants. So a type test needs no syntax
 of its own, and `n @ pat` — again sysl's spelling — is how a program tests and names at once. None of
 them is a keyword: `val int = 3` still works.
 
-`number` is the one that is not a variant, being the union of `int` and `real`. It earns its place
+`number` is the one that is not a variant, being the union of `integer` and `real`. It earns its place
 because the two are separate values, so a pattern guarding arithmetic would otherwise be written
 twice. It is also what makes a broad guard safe: `n if n < 0` binds *anything*, so the guard
 evaluates `[3, 4] < 0` and faults, where `n @ number if n < 0` cannot reach the guard with the wrong
@@ -484,11 +484,21 @@ limit with a test on it rather than a surprise.
 Numbers:
 
 ```
-num  int  real  abs  floor  ceil  round  trunc  sqrt  pow  min  max
+number  integer  real  boolean  string
+abs  floor  ceil  round  trunc  sqrt  pow  min  max
 ```
 
-`num` reads a number out of a string and answers `null` where there is not one, which is how a
-program checks input without raising. `int` and `real` move between the two kinds slate keeps apart;
+**The type words are the conversions.** `string` tests in a pattern and converts in an expression,
+and so do `number`, `integer`, `real` and `boolean` — the two positions never overlap, a word in
+pattern position being read as a type and nowhere else. So `string(123)` is `"123"`, `number("42")`
+is `42`, and `x is string` asks what it looks like it asks.
+
+**There are no abbreviations.** It is `boolean` and `function`, not `bool` and `fn`; writing a short
+form is refused with the long one named, since that is a mistake worth catching rather than a spelling
+to learn.
+
+`number` reads a number out of a string and answers `null` where there is not one, which is how a
+program checks input without raising. `integer` and `real` move between the two kinds slate keeps apart;
 the four roundings leave an integer alone, an integer already being whole. `min` and `max` take as
 many arguments as they are given and answer an integer when every one of them was — a `min` that
 answered a real for two integers would make every use of it in an index a conversion.
@@ -555,7 +565,7 @@ real and worth saying: TS catches a mistake on a path you never ran, and this on
 path executes.
 
 An interface, in the sense of a set of operations, needs nothing further — functions are values, so
-`type Drawable = { draw: fn }` is one. And a trait's other half, the default methods, is what a proto
+`type Drawable = { draw: function }` is one. And a trait's other half, the default methods, is what a proto
 already is.
 
 ### Objects that share their behaviour

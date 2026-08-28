@@ -48,13 +48,13 @@ print(upper("hello"), upper("héllo"))
 val ages = ["34", "7", "not a number", "1.5"]
 
 for a in ages
-    val n = num(a)
+    val n = number(a)
 
     print(if n == null then s"${a}: not a number" else s"${a}: ${n}")
 
 // `int` and `real` move between the two kinds slate keeps apart; the four roundings leave an integer
 // alone, an integer already being whole.
-print(int(3.7), int(-3.7), real(3))
+print(integer(3.7), integer(-3.7), real(3))
 print(floor(3.7), ceil(3.2), round(3.5), trunc(-3.7))
 print(abs(-4), sqrt(16), pow(2, 10))
 print(min(3, 1, 2), max(3, 1, 2))
@@ -65,7 +65,7 @@ average(rows) =
     var seen = 0
 
     for r in rows
-        val n = num(trim(r))
+        val n = number(trim(r))
 
         if n != null
             total = total + real(n)

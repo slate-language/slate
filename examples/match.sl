@@ -61,6 +61,6 @@ val labels = []
 for n in [1, 2, 3, 4, 5]
     push(labels, n % 3 match
         0 -> "fizz"
-        _ -> str(n))
+        _ -> string(n))
 
 print(labels)

@@ -90,8 +90,8 @@ describe(v)
     v match
         0 -> "zero"
         n @ number if n < 0 -> "negative"
-        n @ number -> "the number " + str(n)
-        [a, b] -> "a pair summing " + str(a + b)
+        n @ number -> "the number " + string(n)
+        [a, b] -> "a pair summing " + string(a + b)
         { name } -> "someone called " + name
         "sat" | "sun" -> "a weekend"
         s @ string -> "the text " + s
