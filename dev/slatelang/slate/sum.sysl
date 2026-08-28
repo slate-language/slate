@@ -1,0 +1,222 @@
+module dev.slatelang.slate
+
+import sysl.buf.{Buf, buf}
+import sysl.crypto.new_sha256
+import sysl.encoding.hex_string
+import sysl.fs.{entries, is_dir, read_bytes}
+import sysl.slices.sort
+import sysl.text.{from_utf8_unchecked, split, str_builder}
+
+// `slate.sum` -- what a package's contents were the first time slate saw them.
+//
+// **This is not a lockfile and the distinction is the whole design.** A lockfile answers *which
+// version*, and exact pinning has already answered that -- transitively too, since every package's
+// own manifest pins exactly, so the resolved graph is fully determined by the manifests and a
+// lockfile would only restate them. What is still open is *is this the same bytes*, because an exact
+// version is exact in **name** and not in **content**: a tag can be moved, and GitHub generates its
+// archives on demand rather than storing them and has changed their compression before, invalidating
+// every checksum in the world overnight.
+//
+// Go draws the same line and is explicit that `go.sum` is not a lockfile: `go.mod` holds versions,
+// `go.sum` holds hashes. `sysl.sum` is the same file in this organisation, and this is slate's.
+//
+// **THE HASH IS OVER THE EXTRACTED TREE, NOT OVER THE DOWNLOAD.** Hashing the tarball would hash the
+// one thing known to be unstable, and would tie the sum file to a transport -- a package fetched two
+// ways, or vendored by hand, would hash differently while holding identical code. A tree hash is a
+// fact about the contents, so it survives a change of transport, a re-compression, and a person
+// copying the directory in themselves.
+//
+// **It is append-only, like Go's.** An entry for a version nothing depends on any more is kept,
+// because the file's job is to hold what a hash *was* -- a version that changes under you is caught
+// even after you have moved off it, and a file holding only the current answer has nothing to
+// compare against. `sysl.sum` in slate's own root keeps `gc` at three versions for this reason.
+
+// What a package's contents hashed to.
+struct SumEntry
+    git: string
+    version: string
+    hash: string
+end SumEntry
+
+// What a `slate.sum` says, and what checking it against the cache found.
+struct Sums
+    entries: Buf[SumEntry]
+
+    at(self, git: string, version: string) -> Option[SumEntry]
+        for i in 0..<self.entries.len()
+            val e = self.entries.at(i)
+
+            if e.git == git && e.version == version then return Some(e)
+
+        None
+    end at
+end Sums
+
+// What a project's sum file is called, beside its `package.sl`.
+val SumFile: string = "slate.sum"
+
+// -- hashing a directory ---------------------------------------------------------------------------
+
+// What a directory of files hashes to, or nothing where it is not there.
+//
+// **Every file's PATH is hashed as well as its contents, and both are length-framed.** Without the
+// path, renaming a file would not change the answer; without the framing, two different trees could
+// be made to agree by moving bytes across a boundary -- `{"ab", "c"}` and `{"a", "bc"}` are the same
+// stream and must not be the same hash.
+//
+// **The order is the sorted path order and not the file system's**, which is what makes the answer
+// the same on two machines. `entries` gives whatever order the directory happens to hold.
+tree_hash(dir: string) -> Option[string]
+    if !is_dir(dir) then return None
+
+    var paths: Buf[string] = buf()
+
+    gather_files(dir, "", &paths)
+
+    var names = paths.view()
+
+    sort(names)
+
+    var h = new_sha256()
+
+    for i in 0..<names.len
+        val rel = names[i]
+
+        read_bytes(s"${dir}/${rel}") match
+            Err(_) -> return None
+            Ok(body) ->
+                h.update(rel.bytes)
+                h.update(framing)
+                h.update(s"${body.len}".bytes)
+                h.update(framing)
+                h.update(body)
+
+    var out: [32]u8
+
+    h.finish(out[0..<32]) match
+        Err(_) -> None
+        Ok(_) -> Some(s"sha256:${hex_string(out[0..<32])}")
+end tree_hash
+
+// One byte that cannot appear in a path or in a decimal length, which is what makes it a separator.
+private val framing: []const u8 = [u8(0)]
+
+// Every file at or under a directory, named relative to it.
+//
+// **A directory that cannot be read makes the whole hash fail rather than being skipped.** A hash
+// over the files that happened to be readable is a hash of something other than the package, and
+// answering one would be worse than answering nothing.
+private gather_files(root: string, prefix: string, out: *Buf[string])
+    entries(s"${root}/${prefix}") match
+        Err(_) -> ()
+        Ok(names) ->
+            for i in 0..<names.len()
+                val name = names.at(i)
+
+                if name == "." || name == ".." then continue
+
+                val rel = if prefix == "" then name else s"${prefix}/${name}"
+
+                if is_dir(s"${root}/${rel}")
+                    gather_files(root, rel, out)
+                else
+                    out.push(rel)
+end gather_files
+
+// -- the file -------------------------------------------------------------------------------------
+
+// Read a project's `slate.sum`. A file that is not there is an empty one, which is what a project
+// that has never fetched anything has.
+read_sums(root: string) -> Sums
+    var out: Buf[SumEntry] = buf()
+
+    read_bytes(s"${root}/${SumFile}") match
+        Err(_) -> return Sums(out)
+        Ok(bytes) ->
+            val text = from_utf8_unchecked(bytes)
+
+            for line in split(text, "\n")
+                val parts = split(line, " ")
+
+                // **A line that is not three fields is ignored rather than refused.** This file is
+                // machine-written and append-only, and a reader that stopped at the first line it
+                // did not understand would make a later slate's extra column break an older one.
+                if parts.len != 3 then continue
+
+                out.push(SumEntry(parts[0], version_of(parts[1]), parts[2]))
+
+    Sums(out)
+end read_sums
+
+// `v1.0.0` as written in the file is `1.0.0` as written in a manifest. **The `v` is the tag's and
+// not the version's**, which is the same distinction `package_dir` draws with its `@v` directory.
+private version_of(tagged: string) -> string
+    val b = tagged.bytes
+
+    if b.len > 1 && b[0] == u8('v') then from_utf8_unchecked(b[1..]) else tagged
+end version_of
+
+// The line a package contributes to the file.
+sum_line(e: SumEntry) -> string = s"${e.git} v${e.version} ${e.hash}"
+
+// Write a project's `slate.sum`, sorted, one line each.
+//
+// **Sorted so that two machines that fetched the same packages in different orders write the same
+// file**, which is what makes it reviewable in a diff.
+render_sums(s: Sums) -> string
+    var lines: Buf[string] = buf()
+
+    for i in 0..<s.entries.len()
+        lines.push(sum_line(s.entries.at(i)))
+
+    var view = lines.view()
+
+    sort(view)
+
+    var out = str_builder()
+
+    for i in 0..<view.len
+        out.push(view[i])
+        out.push("\n")
+
+    out.finish()
+end render_sums
+
+// -- checking -------------------------------------------------------------------------------------
+
+// What checking one package against the sum file found.
+enum Checked
+    // Recorded, and the contents still hash to what was recorded.
+    Same
+
+    // Not in the cache at all, so there is nothing to hash yet.
+    Absent
+
+    // In the cache and not in the file. **Not a failure**: it is what every package looks like
+    // before anything has recorded it, and the hash is carried so a caller can offer to.
+    Unrecorded(hash: string)
+
+    // In the cache, in the file, and different. **This is the failure the file exists for.**
+    Changed(was: string, now: string)
+end Checked
+
+// Check one package's contents against what was recorded for it.
+check_package(sums: Sums, pkg: Package) -> Checked
+    tree_hash(pkg.dir) match
+        None -> Checked.Absent
+        Some(now) ->
+            sums.at(pkg.git, pkg.version) match
+                None -> Checked.Unrecorded(now)
+                Some(e) -> if e.hash == now then Checked.Same else Checked.Changed(e.hash, now)
+end check_package
+
+// What a check has to say, in the words a person can act on. Empty where there is nothing to say.
+check_note(pkg: Package, verdict: Checked) -> string
+    verdict match
+        Same -> ""
+        Absent -> ""
+        Unrecorded(hash) -> s"${pkg.git} v${pkg.version} is not recorded in ${SumFile} -- ${hash}"
+        Changed(was, now) ->
+            s"${pkg.git} v${pkg.version} DOES NOT MATCH ${SumFile}: it was recorded as ${was} and is now ${now}. " +
+                "Either the published version was changed after it was first fetched, or the copy in the cache has been edited"
+end check_note

@@ -5018,3 +5018,208 @@ slate_deps_SHOWS_THE_RESOLVED_GRAPH_AND_NOT_THE_MANIFESTS_OWN_LIST()
     assert(said.contains("app 0.1.0"))
     assert(said.contains("loud 1.0.0 (github.com/example/loud)"))
     assert(!said.contains("greet 1.0.0"))
+
+// -- slate.sum ---------------------------------------------------------------------------------------
+
+// A directory holding the named files, for hashing.
+private tree_of(names: []const string, bodies: []const string) -> string
+    val dir = libuv.mkdtemp_sync("/tmp/slate-tree-XXXXXX").unwrap()
+
+    for i in 0..<names.len
+        write_text(s"${dir}/${names[i]}", bodies[i]).unwrap()
+
+    dir
+end tree_of
+
+private hash_of(names: []const string, bodies: []const string) -> string
+    val dir = tree_of(names, bodies)
+    val h = tree_hash(dir).unwrap()
+
+    scrub(dir)
+    h
+end hash_of
+
+@test
+A_TREE_HASH_IS_THE_SAME_ANSWER_TWICE_AND_A_DIFFERENT_ONE_FOR_DIFFERENT_CONTENTS()
+    val a = hash_of(["one.sl", "two.sl"], ["export x = 1\n", "export y = 2\n"])
+    val again = hash_of(["one.sl", "two.sl"], ["export x = 1\n", "export y = 2\n"])
+
+    assert_eq(a, again)
+
+    // **The order the file system hands entries back is not the order they are hashed in**, or two
+    // machines would disagree about identical trees. Written the other way round, same answer.
+    assert_eq(hash_of(["two.sl", "one.sl"], ["export y = 2\n", "export x = 1\n"]), a)
+
+    assert(hash_of(["one.sl", "two.sl"], ["export x = 1\n", "export y = 3\n"]) != a,
+        "changing a file did not change the hash")
+
+    assert(a.contains("sha256:"))
+
+@test
+A_TREE_HASH_COVERS_THE_PATHS_AND_NOT_ONLY_THE_BYTES()
+    // **Renaming a file has to change the answer.** A hash over contents alone would say a package
+    // whose entry point had been moved was the package it used to be.
+    val a = hash_of(["one.sl"], ["export x = 1\n"])
+    val b = hash_of(["other.sl"], ["export x = 1\n"])
+
+    assert(a != b, "renaming a file did not change the hash")
+
+@test
+A_TREE_HASH_FRAMES_EVERY_PIECE_SO_TWO_TREES_CANNOT_BE_MADE_TO_AGREE()
+    // **The attack a naive concatenation allows.** `{"ab", "c"}` and `{"a", "bc"}` are the same
+    // stream of bytes, so a hash that ran them together would call two different trees identical --
+    // which is exactly the claim a sum file must never get wrong. The length and the NUL are what
+    // stop it.
+    val a = hash_of(["f", "g"], ["ab", "c"])
+    val b = hash_of(["f", "g"], ["a", "bc"])
+
+    assert(a != b, "two different trees hashed the same, so the framing is not doing its job")
+
+@test
+A_DIRECTORY_THAT_IS_NOT_THERE_HAS_NO_HASH_RATHER_THAN_AN_EMPTY_ONE()
+    // Nothing fetches yet, so an absent package is the ordinary state -- and answering the hash of
+    // nothing would make an unfetched package look like one whose contents were empty.
+    assert(tree_hash("/tmp/there-is-no-such-directory-here").is_none())
+
+@test
+A_SUM_FILE_IS_READ_LINE_BY_LINE_AND_A_LINE_IT_CANNOT_READ_IS_SKIPPED()
+    val dir = libuv.mkdtemp_sync("/tmp/slate-sum-XXXXXX").unwrap()
+
+    write_text(s"${dir}/slate.sum",
+        "github.com/example/greet v1.0.0 sha256:aaaa\n" +
+        "\n" +
+        "this line is not three fields\n" +
+        "github.com/example/loud v2.3.4 sha256:bbbb\n").unwrap()
+
+    val sums = read_sums(dir)
+
+    assert_eq(sums.entries.len(), 2)
+
+    // **The `v` belongs to the tag and not to the version**, which is the same distinction the
+    // cache directory draws with its `@v`.
+    assert_eq(sums.at("github.com/example/greet", "1.0.0").unwrap().hash, "sha256:aaaa")
+    assert_eq(sums.at("github.com/example/loud", "2.3.4").unwrap().hash, "sha256:bbbb")
+
+    assert(sums.at("github.com/example/greet", "9.9.9").is_none())
+
+    // **A line it cannot read is skipped rather than refused**, so a later slate adding a column
+    // does not break an older one reading the same file.
+    assert_eq(read_sums("/tmp/there-is-no-such-directory-here").entries.len(), 0)
+
+    scrub(dir)
+
+@test
+A_SUM_FILE_IS_WRITTEN_SORTED_SO_TWO_MACHINES_PRODUCE_THE_SAME_FILE()
+    var es: Buf[SumEntry] = buf()
+
+    es.push(SumEntry("github.com/example/loud", "1.0.0", "sha256:bbbb"))
+    es.push(SumEntry("github.com/example/greet", "2.0.0", "sha256:cccc"))
+    es.push(SumEntry("github.com/example/greet", "1.0.0", "sha256:aaaa"))
+
+    assert_eq(render_sums(Sums(es)),
+        "github.com/example/greet v1.0.0 sha256:aaaa\n" +
+        "github.com/example/greet v2.0.0 sha256:cccc\n" +
+        "github.com/example/loud v1.0.0 sha256:bbbb\n")
+
+@test
+A_PACKAGE_IS_CHECKED_AGAINST_WHAT_WAS_RECORDED_AND_ONLY_A_CHANGE_IS_A_FAILURE()
+    val dir = tree_of(["a.sl"], ["export x = 1\n"])
+    val hash = tree_hash(dir).unwrap()
+    val pkg = Package("thing", "1.0.0", "github.com/example/thing", dir)
+
+    var recorded: Buf[SumEntry] = buf()
+
+    recorded.push(SumEntry("github.com/example/thing", "1.0.0", hash))
+
+    check_package(Sums(recorded), pkg) match
+        Same -> ()
+        other -> assert(false, "a package matching its record did not check out")
+
+    // **Not in the file is not a failure**: it is what every package looks like before anything has
+    // recorded it, and the hash comes back so a caller can offer to.
+    var empty: Buf[SumEntry] = buf()
+
+    check_package(Sums(empty), pkg) match
+        Unrecorded(h) -> assert_eq(h, hash)
+        other -> assert(false, "an unrecorded package was not reported as unrecorded")
+
+    // **A change IS the failure this file exists for.**
+    var wrong: Buf[SumEntry] = buf()
+
+    wrong.push(SumEntry("github.com/example/thing", "1.0.0", "sha256:something-else"))
+
+    check_package(Sums(wrong), pkg) match
+        Changed(was, now) ->
+            assert_eq(was, "sha256:something-else")
+            assert_eq(now, hash)
+        other -> assert(false, "a package that had changed was not reported as changed")
+
+    scrub(dir)
+
+    // Nothing in the cache to hash. Not a failure either -- nothing fetches yet.
+    check_package(Sums(empty), pkg) match
+        Absent -> ()
+        other -> assert(false, "a package that is not there was not reported as absent")
+
+@test
+slate_deps_SAYS_NOTHING_WHEN_EVERY_PACKAGE_MATCHES_ITS_RECORD()
+    // `tests/proj/slate.sum` holds the fixture cache's real hashes, so a clean check is silent.
+    val said = deps_said("tests/proj")
+
+    assert(!said.contains("slate.sum"))
+    assert_eq(deps_status("tests/proj"), 0)
+
+    // **The file keeps `greet` at 1.0.0, which nothing depends on any more.** That is the
+    // append-only property, and it is the whole reason a sum file catches a version that changed
+    // under you after you have moved off it -- a lockfile holds only the current answer and has
+    // nothing to compare against.
+    val sums = read_sums("tests/proj")
+
+    assert(sums.at("github.com/example/greet", "1.0.0").is_some())
+    assert(sums.at("github.com/example/greet", "2.0.0").is_some())
+
+@test
+A_PACKAGE_WHOSE_CONTENTS_CHANGED_FAILS_THE_COMMAND_AND_NAMES_BOTH_HASHES()
+    // **The one thing in the whole package system that fails a command.** Built in a scratch tree
+    // rather than by editing the checked-in fixture, so a failure here cannot leave the repo dirty.
+    val cache = libuv.mkdtemp_sync("/tmp/slate-cache-XXXXXX").unwrap()
+    val home = s"${cache}/github.com/example/thing/@v1.0.0"
+
+    libuv.mkdir_sync(s"${cache}/github.com", 493).unwrap()
+    libuv.mkdir_sync(s"${cache}/github.com/example", 493).unwrap()
+    libuv.mkdir_sync(s"${cache}/github.com/example/thing", 493).unwrap()
+    libuv.mkdir_sync(home, 493).unwrap()
+
+    write_text(s"${home}/package.sl", "{ name: \"thing\", version: \"1.0.0\", main: \"t.sl\" }\n").unwrap()
+    write_text(s"${home}/t.sl", "export x = 1\n").unwrap()
+
+    val proj = libuv.mkdtemp_sync("/tmp/slate-proj-XXXXXX").unwrap()
+
+    write_text(s"${proj}/package.sl",
+        "{ name: \"p\", version: \"1\", dependencies: { thing: { git: \"github.com/example/thing\", version: \"1.0.0\" } } }\n").unwrap()
+
+    set_package_cache(cache)
+
+    // Record what is there now.
+    write_text(s"${proj}/slate.sum", s"github.com/example/thing v1.0.0 ${tree_hash(home).unwrap()}\n").unwrap()
+
+    assert_eq(cli_status(["slate", "deps", proj]), 0)
+
+    // Then change it under the record.
+    write_text(s"${home}/t.sl", "export x = 2\n").unwrap()
+
+    val said = cli_said(["slate", "deps", proj])
+
+    assert_eq(cli_status(["slate", "deps", proj]), 1)
+    assert(said.contains("DOES NOT MATCH slate.sum"))
+    assert(said.contains("it was recorded as"))
+    assert(said.contains("and is now"))
+
+    // **The message says both readings of what happened**, because a reader cannot tell them apart
+    // and the two want opposite responses.
+    assert(said.contains("changed after it was first fetched"))
+    assert(said.contains("the copy in the cache has been edited"))
+
+    set_package_cache("")
+    scrub(proj)
+    scrub(cache)
