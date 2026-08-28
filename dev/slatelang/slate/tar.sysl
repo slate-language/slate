@@ -1,0 +1,258 @@
+module dev.slatelang.slate
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, write_bytes}
+import sysl.text.{from_utf8_unchecked, split}
+
+// Reading a tar archive, which is what a package arrives as.
+//
+// **Written here rather than shelled out to `tar`.** That is node's choice too -- npm unpacks with
+// `node-tar` and not with the system tool -- and it is the same reasoning that made a tarball
+// preferable to `git`: a fetcher whose correctness depends on which binaries a machine happens to
+// have is a fetcher that works differently on every machine. tar is also a very simple format: fixed
+// 512-byte blocks, a header of fixed fields, and the file's bytes rounded up to the next block.
+//
+// **What is read is the subset `git archive` produces**, which is what GitHub serves: regular files,
+// directories, and the pax headers git emits for the commit id and for long paths. Symbolic links,
+// hard links, device nodes and sparse files are refused rather than half-handled -- a package is
+// source code, and a fetcher that silently skipped an entry it did not understand would produce a
+// tree that is not what was published.
+
+// One thing in an archive.
+struct TarEntry
+    path: string
+    is_dir: bool
+
+    // The file's bytes, as a view into the archive rather than a copy of it.
+    body: []const u8
+end TarEntry
+
+private val BlockSize: usize = 512
+
+// Every entry in an archive.
+//
+// **The archive is walked once and nothing is copied.** A `body` is a slice of the bytes handed in,
+// so reading a forty-megabyte package costs the forty megabytes it already had.
+read_tar(bytes: []const u8) -> Result[Buf[TarEntry], string]
+    var out: Buf[TarEntry] = buf()
+    var at: usize = 0
+
+    // A pax header applies to the entry that follows it, so it is carried across one iteration.
+    var long_name = ""
+
+    loop
+        if at + BlockSize > bytes.len then break
+
+        val header = bytes[at..<(at + BlockSize)]
+
+        // **Two zero blocks end an archive, and one is enough to stop on.** Trailing padding after
+        // them is ordinary -- tar pads to a multiple of its block factor -- so anything after a zero
+        // header is not read rather than being reported as rubbish.
+        if all_zero(header) then break
+
+        at += BlockSize
+
+        val size = octal_at(header, 124, 12)?
+        val kind = header[156]
+        val name = if long_name != "" then long_name else joined_name(header)
+
+        long_name = ""
+
+        val body_end = at + size
+
+        if body_end > bytes.len then return Err("the archive ends in the middle of a file")
+
+        val body = bytes[at..<body_end]
+
+        // The file's bytes are padded out to the next block boundary.
+        at = body_end + padding_after(size)
+
+        if kind == u8('0') || kind == u8(0)
+            out.push(TarEntry(name, false, body))
+        elif kind == u8('5')
+            out.push(TarEntry(name, true, empty_bytes))
+        elif kind == u8('L')
+            // GNU's long name: the *body* is the next entry's path.
+            long_name = trimmed(body)
+        elif kind == u8('x') || kind == u8('g')
+            // pax extended headers. `git archive` writes a global one carrying the commit id, and a
+            // per-file one where a path will not fit in the 100-byte field.
+            pax_path(body) match
+                Some(p) -> long_name = p
+                None -> ()
+        else
+            return Err(s"the archive holds something that is not a file or a directory (type `${from_utf8_unchecked([kind])}`), and a package is source code")
+
+    Ok(out)
+end read_tar
+
+private val empty_bytes: []const u8 = []
+
+private all_zero(b: []const u8) -> bool
+    for i in 0..<b.len
+        if b[i] != 0 then return false
+
+    true
+end all_zero
+
+private padding_after(size: usize) -> usize
+    val over = size % BlockSize
+
+    if over == 0 then 0 else BlockSize - over
+end padding_after
+
+// A ustar header carries a `prefix` that is joined to `name` with a `/` when the path was too long
+// for the 100-byte field alone.
+private joined_name(header: []const u8) -> string
+    val name = trimmed(header[0..<100])
+    val prefix = trimmed(header[345..<500])
+
+    if prefix == "" then name else s"${prefix}/${name}"
+end joined_name
+
+// A fixed-width field, up to its first NUL.
+private trimmed(field: []const u8) -> string
+    var end: usize = 0
+
+    for i in 0..<field.len
+        if field[i] == 0 then break
+
+        end = i + 1
+
+    from_utf8_unchecked(field[0..<end])
+end trimmed
+
+// tar writes its numbers in octal text, NUL- or space-terminated.
+private octal_at(header: []const u8, offset: usize, width: usize) -> Result[usize, string]
+    var n: usize = 0
+    var seen = false
+
+    for i in offset..<(offset + width)
+        val c = header[i]
+
+        if c == 0 || c == u8(' ') then break
+
+        if c < u8('0') || c > u8('7')
+            return Err("the archive has a size field that is not a number")
+
+        n = n * 8 + usize(c - u8('0'))
+        seen = true
+
+    if seen then Ok(n) else Ok(0)
+end octal_at
+
+// The `path=` of a pax header, where it has one.
+//
+// **A pax record is `<length> <key>=<value>\n`**, with the length counting itself. Only `path` is
+// read; git's global header carries a `comment` holding the commit id, which is of no interest here.
+private pax_path(body: []const u8) -> Option[string]
+    val text = from_utf8_unchecked(body)
+
+    for record in split(text, "\n")
+        val space = index_of_space(record)
+
+        if space == 0 then continue
+
+        val rest = from_utf8_unchecked(record.bytes[space..])
+        val eq = index_of_eq(rest)
+
+        if eq == 0 then continue
+
+        if from_utf8_unchecked(rest.bytes[0..<eq]) == "path"
+            return Some(from_utf8_unchecked(rest.bytes[(eq + 1)..]))
+
+    None
+end pax_path
+
+private index_of_space(s: string) -> usize
+    for i in 0..<s.bytes.len
+        if s.bytes[i] == u8(' ') then return i + 1
+
+    0
+end index_of_space
+
+private index_of_eq(s: string) -> usize
+    for i in 0..<s.bytes.len
+        if s.bytes[i] == u8('=') then return i
+
+    0
+end index_of_eq
+
+// -- writing it out ---------------------------------------------------------------------------------
+
+// Write an archive's entries under a directory.
+//
+// **`strip` drops leading path components**, because an archive from GitHub holds everything under
+// one directory named for the repository and the commit -- `slate-0.1.0/` -- which is not part of
+// the package and would otherwise appear in every path a manifest names.
+extract_tar(entries: Buf[TarEntry], into: string, strip: usize) -> Result[usize, string]
+    var written: usize = 0
+
+    for i in 0..<entries.len()
+        val e = entries.at(i)
+        val rel = stripped(e.path, strip)
+
+        if rel == "" then continue
+
+        safe_path(rel)?
+
+        if e.is_dir
+            make_dir_all(s"${into}/${rel}") match
+                Err(err) -> return Err(s"could not make `${rel}`: ${err}")
+                Ok(_) -> continue
+
+        val dir = dir_of(s"${into}/${rel}")
+
+        if dir != ""
+            make_dir_all(dir) match
+                Err(err) -> return Err(s"could not make the directory for `${rel}`: ${err}")
+                Ok(_) -> ()
+
+        write_bytes(s"${into}/${rel}", e.body) match
+            Err(err) -> return Err(s"could not write `${rel}`: ${err}")
+            Ok(_) -> written += 1
+
+    Ok(written)
+end extract_tar
+
+private stripped(path: string, strip: usize) -> string
+    var rest = path
+    var left = strip
+
+    loop
+        if left == 0 then break
+
+        val cut = first_slash(rest)
+
+        if cut == 0 then return ""
+
+        rest = from_utf8_unchecked(rest.bytes[cut..])
+        left -= 1
+
+    rest
+end stripped
+
+private first_slash(s: string) -> usize
+    for i in 0..<s.bytes.len
+        if s.bytes[i] == u8('/') then return i + 1
+
+    0
+end first_slash
+
+// **AN ARCHIVE IS UNTRUSTED INPUT AND THIS IS THE CHECK THAT SAYS SO.**
+//
+// A package arrives from the network, and an entry named `../../.ssh/authorized_keys` would be
+// written exactly where it says unless something refuses it. That is the oldest bug in every
+// archive-extracting program ever written -- it has a name, tar-slip, and it is still found in
+// shipping software every year. Refused rather than sanitised: a package with such a path in it is
+// not a package with a mistake, and quietly rewriting the name would hide what was attempted.
+private safe_path(rel: string) -> Result[unit, string]
+    if rel.bytes.len > 0 && rel.bytes[0] == u8('/')
+        return Err(s"the archive holds an absolute path, `${rel}`, which would be written outside the package")
+
+    for part in split(rel, "/")
+        if part == ".."
+            return Err(s"the archive holds `${rel}`, which points outside the package")
+
+    Ok(())
+end safe_path

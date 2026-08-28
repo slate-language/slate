@@ -6,7 +6,7 @@ import sh.sysl.libuv
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.fs.{read_bytes, write_text}
-import sysl.text.{replace_all, str_builder, Search}
+import sysl.text.{from_utf8_unchecked, replace_all, str_builder, Search}
 
 // What slate claims, run by `sysl test .`.
 
@@ -5223,3 +5223,184 @@ A_PACKAGE_WHOSE_CONTENTS_CHANGED_FAILS_THE_COMMAND_AND_NAMES_BOTH_HASHES()
     set_package_cache("")
     scrub(proj)
     scrub(cache)
+
+// -- tar -------------------------------------------------------------------------------------------
+
+// **The fixtures are made by `git archive`, which is what GitHub serves.** An archive written by
+// this repo's own idea of the format would prove nothing about the one a fetch will actually meet --
+// the global pax header carrying the commit id is there because git puts it there, and it is the
+// first thing in the file.
+private tar_bytes(name: string) -> []const u8
+    read_bytes(s"tests/tar/${name}") match
+        Err(e) -> panic(s"cannot read tests/tar/${name}: ${e} -- this suite reads its fixtures by relative path, so it must be run from the project root")
+        Ok(b) -> b
+end tar_bytes
+
+@test
+A_REAL_git_archive_TARBALL_READS_TO_WHAT_IS_IN_IT()
+    val entries = read_tar(tar_bytes("greet-1.0.0.tar")).unwrap()
+
+    // Two directories and three files. **The `pax_global_header` git writes first is consumed rather
+    // than reported**, being a property of the archive and not a thing in it.
+    assert_eq(entries.len(), 5)
+
+    assert_eq(entries.at(0).path, "greet-1.0.0/")
+    assert(entries.at(0).is_dir)
+
+    assert_eq(entries.at(1).path, "greet-1.0.0/greet.sl")
+    assert(!entries.at(1).is_dir)
+    assert_eq(from_utf8_unchecked(entries.at(1).body), "export hello(name) = \"hello \" + name\n")
+
+    assert_eq(entries.at(3).path, "greet-1.0.0/lib/helper.sl")
+    assert_eq(from_utf8_unchecked(entries.at(3).body), "export helper() = 42\n")
+
+@test
+EXTRACTING_STRIPS_THE_DIRECTORY_GITHUB_WRAPS_A_PACKAGE_IN()
+    // **An archive from GitHub holds everything under one directory named for the repository and the
+    // tag.** That is not part of the package -- a manifest naming `main: "greet.sl"` means the file
+    // at the root of the package, not `greet-1.0.0/greet.sl` -- so the first component comes off.
+    val dir = libuv.mkdtemp_sync("/tmp/slate-tar-XXXXXX").unwrap()
+    val entries = read_tar(tar_bytes("greet-1.0.0.tar")).unwrap()
+
+    assert_eq(extract_tar(entries, dir, 1).unwrap(), 3)
+
+    assert_eq(from_utf8_unchecked(read_bytes(s"${dir}/greet.sl").unwrap()),
+        "export hello(name) = \"hello \" + name\n")
+    assert_eq(from_utf8_unchecked(read_bytes(s"${dir}/lib/helper.sl").unwrap()),
+        "export helper() = 42\n")
+    assert_eq(from_utf8_unchecked(read_bytes(s"${dir}/package.sl").unwrap()),
+        "{ name: \"greet\", version: \"1.0.0\", main: \"greet.sl\" }\n")
+
+    // A package extracted this way is one `read_project` can read, which is the whole point of the
+    // strip -- so the two halves are checked together rather than separately.
+    val f = read_project_text("package.sl", from_utf8_unchecked(read_bytes(s"${dir}/package.sl").unwrap()))
+
+    assert(f.ok())
+    assert_eq(f.project.main, "greet.sl")
+
+    scrub(dir)
+
+@test
+AN_ARCHIVE_THAT_POINTS_OUTSIDE_THE_PACKAGE_IS_REFUSED()
+    // **The oldest bug in every archive-extracting program ever written.** It has a name --
+    // tar-slip -- and it is still found in shipping software every year. A package arrives from the
+    // network, so an entry named `../../.ssh/authorized_keys` would be written exactly where it says
+    // unless something refuses it.
+    val dir = libuv.mkdtemp_sync("/tmp/slate-tar-XXXXXX").unwrap()
+    val entries = read_tar(tar_bytes("escape.tar")).unwrap()
+    val said = extract_tar(entries, dir, 1).unwrap_err()
+
+    assert(said.contains("points outside the package"))
+    assert(said.contains(".."))
+
+    // **Refused rather than sanitised.** An archive with such a path in it is not a package with a
+    // mistake in it, and quietly rewriting the name would hide what was attempted.
+    val absolute = read_tar(tar_bytes("absolute.tar")).unwrap()
+
+    assert(extract_tar(absolute, dir, 0).unwrap_err().contains("absolute path"))
+
+    scrub(dir)
+
+@test
+AN_ARCHIVE_THAT_STOPS_HALFWAY_IS_A_COMPLAINT_AND_NOT_A_SHORTER_PACKAGE()
+    // A truncated download is the ordinary network failure, and the one answer it must not get is a
+    // package that reads as complete with a file missing from it.
+    //
+    // **Cutting the TAIL off a tar truncates nothing**, which is worth knowing before writing a test
+    // like this: tar pads an archive out to a multiple of its block factor, so this fixture's real
+    // content ends at 5120 of its 10240 bytes and the rest is zeros. A cut has to land inside a
+    // file's own bytes to be a truncation at all.
+    val whole = tar_bytes("greet-1.0.0.tar")
+
+    // The last entry's header sits at 4096 and its 54 bytes begin at 4608, so 4620 is ten bytes into
+    // a file -- the only kind of cut that is a truncation rather than a shorter archive.
+    assert(read_tar(whole[0..<4620]).unwrap_err().contains("ends in the middle of a file"))
+
+    // And a cut that only takes the padding is not a truncation, which is the other half of the
+    // same fact and is why the archive still reads.
+    assert(read_tar(whole[0..<5120]).is_ok())
+
+// -- gzip, and the whole chain a fetch will run ------------------------------------------------------
+
+@test
+A_GZIP_FILE_UNWRAPS_TO_EXACTLY_WHAT_WENT_INTO_IT()
+    val packed = tar_bytes("greet-1.0.0.tar.gz")
+    val plain = tar_bytes("greet-1.0.0.tar")
+    val out = gunzip(packed).unwrap()
+
+    // **Byte for byte, which is the only claim worth making about a decompressor.** The two fixtures
+    // are the same archive, one of them run through `gzip`.
+    assert_eq(out.len, plain.len)
+
+    for i in 0..<out.len
+        if out[i] != plain[i] then assert(false, s"the unpacked bytes differ at ${i}")
+
+@test
+A_FILE_THAT_IS_NOT_GZIP_SAYS_SO_RATHER_THAN_FAILING_LATER()
+    // **The message has to name the format**, because the next thing along the chain is the tar
+    // reader, and letting a non-gzip file reach it produces a complaint about a malformed archive --
+    // which sends the reader to look at the wrong thing entirely.
+    assert(gunzip("this is not compressed at all, it is just text".bytes)
+        .unwrap_err().contains("not a gzip file"))
+
+    assert(gunzip("short".bytes).unwrap_err().contains("too short"))
+
+@test
+A_DAMAGED_DOWNLOAD_IS_CAUGHT_BY_THE_CHECKSUM_THE_FORMAT_ALREADY_CARRIES()
+    // **Worth the pass even though a `slate.sum` hash is coming.** The two catch different things at
+    // different moments: this one catches a download that arrived damaged, in those words, where the
+    // same corruption reaching the tar reader complains that an archive is malformed.
+    val packed = tar_bytes("greet-1.0.0.tar.gz")
+    var damaged: []u8 = [u8(0); packed.len]
+
+    for i in 0..<packed.len
+        damaged[i] = packed[i]
+
+    // A byte well inside the deflate stream, past the header.
+    damaged[40] = damaged[40] ^ u8(0xff)
+
+    val said = gunzip(damaged).unwrap_err()
+
+    assert(said.contains("damaged") || said.contains("checksum") || said.contains("incomplete"),
+        s"a corrupted gzip file said only `${said}`")
+
+    // And a stream that simply stops.
+    assert(gunzip(packed[0..<(packed.len - 40)]).unwrap_err() != "")
+
+@test
+THE_WHOLE_CHAIN_A_FETCH_WILL_RUN_WORKS_WITH_ONLY_THE_DOWNLOAD_MISSING()
+    // **This is `slate fetch` with the socket taken out.** A `.tar.gz` exactly as GitHub serves one,
+    // unwrapped, unpacked, stripped of the directory GitHub wraps a package in, read as a project,
+    // and hashed for `slate.sum` -- every step the fetcher will do once there is something to
+    // download, run against a real `git archive` tarball.
+    val dir = libuv.mkdtemp_sync("/tmp/slate-chain-XXXXXX").unwrap()
+
+    val unpacked = gunzip(tar_bytes("greet-1.0.0.tar.gz")).unwrap()
+    val entries = read_tar(unpacked).unwrap()
+
+    assert_eq(extract_tar(entries, dir, 1).unwrap(), 3)
+
+    // It is a project, and it says what to import from it.
+    val manifest = from_utf8_unchecked(read_bytes(s"${dir}/package.sl").unwrap())
+    val f = read_project_text("package.sl", manifest)
+
+    assert(f.ok())
+    assert_eq(f.project.name, "greet")
+    assert_eq(f.project.version, "1.0.0")
+    assert_eq(f.project.main, "greet.sl")
+
+    // And it hashes, which is what would be written into `slate.sum`.
+    val hash = tree_hash(dir).unwrap()
+
+    assert(hash.contains("sha256:"))
+
+    // **Unpacking it twice gives the same hash**, which is the property the whole sum file rests on
+    // and the one a fetch would break first if extraction were not deterministic.
+    val second = libuv.mkdtemp_sync("/tmp/slate-chain-XXXXXX").unwrap()
+
+    extract_tar(read_tar(gunzip(tar_bytes("greet-1.0.0.tar.gz")).unwrap()).unwrap(), second, 1).unwrap()
+
+    assert_eq(tree_hash(second).unwrap(), hash)
+
+    scrub(second)
+    scrub(dir)

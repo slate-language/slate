@@ -1,0 +1,113 @@
+module dev.slatelang.slate
+
+import sh.sysl.miniz
+
+// Unwrapping a `.gz`, which is what a package arrives inside.
+//
+// **gzip is a small header, a raw deflate stream, and an eight-byte trailer.** `sh.sysl.miniz` does
+// the deflate; everything here is the wrapper around it, which zlib's own format does not have and
+// which miniz therefore does not read.
+//
+// **The trailer is the reason this is easy.** miniz's own comment says a compressed stream does not
+// say how large its output will be, so a caller has to know from somewhere else -- and gzip's
+// trailer carries exactly that, an `ISIZE` giving the uncompressed length. So the buffer is sized
+// from the file rather than guessed at or grown.
+
+// The bytes a `.gz` holds.
+gunzip(bytes: []const u8) -> Result[[]u8, string]
+    // Ten bytes of header and eight of trailer is the smallest a gzip file can be.
+    if bytes.len < 18 then return Err("this is too short to be a gzip file")
+
+    if bytes[0] != u8(0x1f) || bytes[1] != u8(0x8b)
+        return Err("this does not begin with gzip's two magic bytes, so it is not a gzip file")
+
+    // **The only compression method gzip has ever had is deflate**, so anything else is a file from
+    // a future that does not exist rather than something to fall back over.
+    if bytes[2] != 8 then return Err(s"this gzip file says it uses compression method ${bytes[2]}, and the only one there is is deflate")
+
+    val flags = bytes[3]
+    var at: usize = 10
+
+    // FEXTRA: two bytes of length and that many bytes of vendor data.
+    if flags & 0x04 != 0
+        if at + 2 > bytes.len then return Err("this gzip file ends inside its header")
+
+        val extra = usize(bytes[at]) + usize(bytes[at + 1]) * 256
+
+        at += 2 + extra
+
+    // FNAME and FCOMMENT are each a NUL-terminated string. **Both are skipped rather than read**:
+    // the name inside an archive is the uploader's, and what a package is called is settled by the
+    // coordinate that fetched it.
+    if flags & 0x08 != 0 then at = past_nul(bytes, at)?
+    if flags & 0x10 != 0 then at = past_nul(bytes, at)?
+
+    // FHCRC: a checksum of the header alone.
+    if flags & 0x02 != 0 then at += 2
+
+    if at + 8 > bytes.len then return Err("this gzip file ends inside its header")
+
+    val body = bytes[at..<(bytes.len - 8)]
+    val size = le32(bytes, bytes.len - 4)
+
+    // **A ceiling, because `ISIZE` is the real length modulo 2^32 and a corrupt trailer is a number
+    // like any other.** Without it a damaged download asks for four gigabytes before failing.
+    if size > MaxUnpacked
+        return Err(s"this gzip file says it holds ${size} bytes, which is more than a package should be")
+
+    var storage = [u8(0); miniz.INFLATE_BYTES]
+    // **The annotation is what makes this storage rather than an array**: a repeat count worked out
+    // while running cannot be an array's bound, and `[]u8` is what says so.
+    var out: []u8 = [u8(0); size]
+
+    miniz.inflate(storage, body, out, miniz.Format.Raw) match
+        Err(e) -> return Err(why(e))
+        Ok(n) ->
+            if n != size
+                return Err(s"this gzip file said it held ${size} bytes and produced ${n}")
+
+    // **The checksum is worth the pass even though a `slate.sum` hash is coming.** They catch
+    // different things and at different moments: this one catches a download that arrived damaged,
+    // now, and says so in those words -- where the same corruption reaching the tar reader produces
+    // a complaint about an archive being malformed, which sends the reader to the wrong question.
+    val stated = le32(bytes, bytes.len - 8)
+    val actual = usize(miniz.crc32(out))
+
+    if actual != stated
+        return Err("this gzip file's checksum does not match its contents, so the download is damaged")
+
+    Ok(out)
+end gunzip
+
+// What miniz objected to, said in the words of someone unpacking a package.
+//
+// **`miniz.Error` has no `Display`**, so it cannot be interpolated -- and translating rather than
+// forwarding is the better answer anyway: miniz's vocabulary is about a compressed stream, and the
+// reader here is holding a download that did not work.
+private why(e: miniz.Error) -> string
+    e match
+        Truncated -> "the compressed data stops before it ends, so the download is incomplete"
+        Corrupt -> "the compressed data is damaged"
+        Full -> "the compressed data held more than its own trailer said it would"
+        Short(_) -> "the compressed data held more than its own trailer said it would"
+        NoRoom(needed) -> s"unpacking needed ${needed} bytes of working space"
+end why
+
+// No package is this large, and a number bigger than this in a trailer is damage rather than a size.
+private val MaxUnpacked: usize = 512 * 1024 * 1024
+
+private le32(bytes: []const u8, at: usize) -> usize =
+    usize(bytes[at]) + usize(bytes[at + 1]) * 256 + usize(bytes[at + 2]) * 65536 + usize(bytes[at + 3]) * 16777216
+
+private past_nul(bytes: []const u8, from: usize) -> Result[usize, string]
+    var i = from
+
+    loop
+        if i >= bytes.len then return Err("this gzip file ends inside its header")
+
+        val c = bytes[i]
+
+        i += 1
+
+        if c == 0 then return Ok(i)
+end past_nul
