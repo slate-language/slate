@@ -49,6 +49,7 @@ private struct Held
     method: string
     target: string
     keep_alive: bool
+    upgrade: bool
     names: Buf[string]
     values: Buf[string]
     body: Buf[u8]
@@ -67,7 +68,7 @@ private hold_request(r: &Request) -> Held
     for i in 0..<r.body.len()
         body.push(r.body.at(i))
 
-    Held(r.method, r.target, r.keep_alive, names, values, body)
+    Held(r.method, r.target, r.keep_alive, r.upgrade, names, values, body)
 end hold_request
 
 // The same, for a request whose body is not going to be held. The head is bounded and is copied for
@@ -80,7 +81,7 @@ private hold_head(h: &Head) -> Held
         names.push(h.headers.at(i).name)
         values.push(h.headers.at(i).value)
 
-    Held(h.method, h.target, h.keep_alive, names, values, buf())
+    Held(h.method, h.target, h.keep_alive, h.upgrade, names, values, buf())
 end hold_head
 
 // One thing a streaming parser has ready: a head, some bytes of a body, or the end of one.
@@ -112,9 +113,17 @@ private hold_part(p: Part) -> Piece = p match
 
 // Where a parser puts what it has finished, until slate asks for it. A parser fills one of the two
 // and never both.
+//
+// **`upgraded` is not a third thing that arrives, it is where the HTTP stopped.** llhttp answers
+// `Upgrade(n)` when a message said `Connection: upgrade` or was a `CONNECT`, and `n` counts the
+// bytes of *that* feed which were still HTTP -- so everything from `n` on is the protocol that was
+// upgraded to and is nobody's business but the caller's. It is recorded rather than answered
+// because `httpFeed` already means two things (nothing, or a refusal) and a third would have
+// broken every caller reading `.status` off the second.
 private struct Arrived
     done: Buf[Held]
     parts: Buf[Piece]
+    upgraded: Option[usize]
 end Arrived
 
 // One parser, and what it has ready. **`reader` accumulates and `flow` streams**, and a slot holds
@@ -139,7 +148,7 @@ forget_parsers()
 // bookkeeping about bytes that have already arrived, so it can never be the reason a program is
 // still running.
 new_parser(head: usize, body: usize) -> usize
-    val arrived: &Arrived = Arrived(buf(), buf())
+    val arrived: &Arrived = Arrived(buf(), buf(), None)
     val reader = requests((r) -> arrived.done.push(hold_request(r)), Limits(head, body))
 
     slots.push(Slot(Some(reader), None, arrived))
@@ -153,7 +162,7 @@ end new_parser
 // accumulating parser safe -- and that refuses the upload along with the attack -- simply is not
 // there.
 new_stream(head: usize) -> usize
-    val arrived: &Arrived = Arrived(buf(), buf())
+    val arrived: &Arrived = Arrived(buf(), buf(), None)
     val flow = stream((p) -> arrived.parts.push(hold_part(p)), head)
 
     slots.push(Slot(None, Some(flow), arrived))
@@ -177,7 +186,12 @@ feed_parser(id: usize, bytes: []const u8) -> Result[unit, (long, string)]
             None -> return Ok(())
 
     outcome match
-        Ok(_) -> Ok(())
+        Ok(stop) ->
+            stop match
+                Upgrade(n) -> slot.arrived.upgraded = Some(n)
+                other -> ()
+
+            Ok(())
         Err(why) -> why match
             Malformed(f) -> Err((400, f.reason))
             HeadTooLarge(n) -> Err((431, s"the headers are larger than ${n} bytes"))
@@ -241,6 +255,12 @@ private request_object(r: Held, with_body: bool) -> *ObjectObj
     if with_body then obj_put_name(o, "body", Str(new_str(from_utf8(r.body.view()).unwrap_or(""))))
 
     obj_put_name(o, "keepAlive", Bool(r.keep_alive))
+
+    // **The request that asks to stop being HTTP still arrives as a request.** A WebSocket handshake
+    // is a `GET` with `Connection: upgrade`, and everything a handler does about it -- reading
+    // `Sec-WebSocket-Key`, writing the 101 -- is done with the request in hand. This is how it knows
+    // to, and `httpUpgraded` is how it finds where the HTTP stopped.
+    obj_put_name(o, "upgrade", Bool(r.upgrade))
     o
 end request_object
 
@@ -294,6 +314,18 @@ take_part(id: usize) -> Option[Value]
             obj_put_name(o, "kind", Str(new_str("end")))
             Some(Object(o))
 end take_part
+
+// Where the HTTP stopped, for a parser that has seen an upgrade, and nothing for one that has not.
+//
+// **The answer counts bytes of the LAST feed rather than of the connection**, so it means something
+// only to a caller that asks straight after feeding, holding the chunk it fed. That is the shape
+// llhttp answers in and turning it into a running total would be inventing a number: the parser is
+// finished with the connection at that point and has counted nothing since.
+upgraded_at(id: usize) -> Option[usize]
+    if id >= slots.len() then return None
+
+    slots.at(id).arrived.upgraded
+end upgraded_at
 
 // Tell a parser the connection closed, so a request ending at end-of-file completes.
 finish_parser(id: usize)
@@ -409,6 +441,24 @@ do_http_finish(args: Buf[Value], at: Span) -> Step
     finish_parser(parser_of(args.at(0), at, "httpFinish")?)
     Ok(Null)
 end do_http_finish
+
+// `httpUpgraded(p)` -- how many bytes of the last feed were HTTP, where the message was an upgrade,
+// and null where it was not.
+//
+// **It is an offset into that chunk, so `chunk[n..]` is the other protocol's first bytes.** A
+// handshake arriving on its own answers the whole length of the feed and leaves nothing over, which
+// is the common case; a client that sent its first frame without waiting answers short of it, which
+// is the case that loses data if the number is ignored.
+//
+// **Zero is representable, so the test is `!= null` and never truthiness.** A caller writing
+// `if httpUpgraded(p)` reads a boundary at the very start of a chunk as no upgrade at all.
+do_http_upgraded(args: Buf[Value], at: Span) -> Step
+    if args.len() != 1 then return fault(at, s"`httpUpgraded` takes a parser, and was given ${counted(args.len(), "argument")}")
+
+    upgraded_at(parser_of(args.at(0), at, "httpUpgraded")?) match
+        Some(n) -> Ok(Int(long(n)))
+        None -> Ok(Null)
+end do_http_upgraded
 
 // `httpClose(p)` -- the connection has gone and the parser with it.
 do_http_close(args: Buf[Value], at: Span) -> Step

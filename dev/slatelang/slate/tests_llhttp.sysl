@@ -1,0 +1,170 @@
+module dev.slatelang.slate
+@tests
+
+import sysl.text.Search
+
+// `slate:llhttp` -- the parser `slate:http` is written over, handed to any program that asks.
+//
+// **These tests are the door rather than the parser.** What llhttp does with bytes is llhttp's own
+// suite's business and is tested in `sh.sysl.llhttp`; what is pinned here is that an ordinary
+// program -- one that is not one of slate's own modules -- can reach the parser at all, and that the
+// two things a package needs which `slate:http` never needed are there: whether a request asked to
+// stop being HTTP, and where the HTTP stopped.
+//
+// **The upgrade half is the reason the module exists.** A WebSocket handshake is an HTTP request and
+// everything after it is not, so a package that wants to speak anything upgraded from HTTP needs the
+// parser to hand over the boundary. Without it the module would be a parser a program could run and
+// not a parser a program could build on.
+
+private val LlhttpImport: string =
+    "import { httpParser, httpStream, httpFeed, httpTake, httpTakePart, httpFinish, httpClose, httpUpgraded } from slate:llhttp\n"
+
+private ll_out(text: string) -> string = out(LlhttpImport + text)
+
+private ll_fails(text: string) -> string = fails(LlhttpImport + text)
+
+// An ordinary request, as a slate expression -- so the `\r\n` below are two characters in this file
+// and one CRLF in the program.
+private val PlainText: string = "\"GET /a?b=1 HTTP/1.1\\r\\nHost: x\\r\\n\\r\\n\""
+
+// A WebSocket handshake, which is the request that asks to stop being HTTP.
+private val HandshakeText: string =
+    "\"GET /ws HTTP/1.1\\r\\nHost: x\\r\\nUpgrade: websocket\\r\\nConnection: Upgrade\\r\\n" +
+    "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\\r\\nSec-WebSocket-Version: 13\\r\\n\\r\\n\""
+
+@test
+A_PROGRAM_MAY_PARSE_A_REQUEST_WITH_slate_llhttp()
+    // **The whole point of the module in one program.** None of these names is in a program's own
+    // scope -- they are declared inside `install_natives`' `if everything`, where every name a
+    // built-in module has taken lives -- so before the export list existed this would not compile.
+    assert_eq(ll_out(
+        "val p = httpParser(8192, 1048576)\n" +
+        "httpFeed(p, toBytes(" + PlainText + "))\n" +
+        "val r = httpTake(p)\n" +
+        "print(r.method)\n" +
+        "print(r.path)\n" +
+        "print(r.query)\n" +
+        "print(r.headers.host)\n" +
+        "print(r.keepAlive)\n" +
+        "httpClose(p)"), "GET\n/a\nb=1\nx\ntrue")
+
+@test
+A_PARSER_WITH_NOTHING_READY_ANSWERS_null_RATHER_THAN_WAITING()
+    // Half a request is not a request, and the answer says so rather than blocking -- which is what
+    // makes the pump a loop a caller writes rather than one the parser runs.
+    assert_eq(ll_out(
+        "val p = httpParser(8192, 1048576)\n" +
+        "print(httpFeed(p, toBytes(\"GET / HTTP/1.1\\r\\nHo\")))\n" +
+        "print(httpTake(p))"), "null\nnull")
+
+@test
+A_REQUEST_THAT_ASKED_TO_UPGRADE_SAYS_SO_AND_SAYS_WHERE_THE_HTTP_STOPPED()
+    // **Both halves, because either alone is useless.** `upgrade` says the handshake happened and
+    // `httpUpgraded` says which bytes of the feed were still HTTP -- a package that had the first
+    // and not the second would know to write a 101 and not know where the frames begin.
+    //
+    // The three bytes after the handshake stand for the first frame the client sent without waiting,
+    // which is legal and is exactly the case that loses data when the boundary is not reported.
+    assert_eq(ll_out(
+        "val handshake = " + HandshakeText + "\n" +
+        "val p = httpParser(8192, 1048576)\n" +
+        "httpFeed(p, concat(toBytes(handshake), [1, 2, 3]))\n" +
+        "val r = httpTake(p)\n" +
+        "print(r.method)\n" +
+        "print(r.path)\n" +
+        "print(r.upgrade)\n" +
+        "print(r.headers[\"sec-websocket-key\"])\n" +
+        "print(httpUpgraded(p) == len(toBytes(handshake)))"),
+        "GET\n/ws\ntrue\ndGhlIHNhbXBsZSBub25jZQ==\ntrue")
+
+@test
+AN_ORDINARY_REQUEST_LEAVES_upgrade_false_AND_httpUpgraded_null()
+    // **`null` and not `0`, and the difference is the whole reason it is an `Option`.** Zero is a
+    // real answer -- a boundary at the very start of a chunk -- so a caller testing truthiness
+    // rather than `!= null` would read that upgrade as no upgrade at all.
+    assert_eq(ll_out(
+        "val p = httpParser(8192, 1048576)\n" +
+        "httpFeed(p, toBytes(" + PlainText + "))\n" +
+        "print(httpTake(p).upgrade)\n" +
+        "print(httpUpgraded(p))"), "false\nnull")
+
+@test
+THE_OFFSET_IS_INTO_THE_FEED_THAT_SAW_THE_UPGRADE_AND_NOT_INTO_THE_CONNECTION()
+    // **The number a caller must not mistake for a running total.** A handshake split across two
+    // reads is the ordinary case, and the answer counts bytes of the *second* feed alone -- so a
+    // caller holding that chunk indexes straight into it, and one that had added up what it sent
+    // would be pointing past the end.
+    //
+    // Fed in two pieces with three bytes of the upgraded protocol behind the second: the answer is
+    // the length of the second piece less those three, and it is nothing at all until the head is
+    // complete.
+    assert_eq(ll_out(
+        "val handshake = toBytes(" + HandshakeText + ")\n" +
+        "val first = handshake[0..<40]\n" +
+        "val rest = handshake[40..<len(handshake)]\n" +
+        "val p = httpParser(8192, 1048576)\n" +
+        "httpFeed(p, first)\n" +
+        "print(httpUpgraded(p))\n" +
+        "httpFeed(p, concat(rest, [1, 2, 3]))\n" +
+        "print(httpUpgraded(p) == len(rest))\n" +
+        "print(httpUpgraded(p) < len(handshake))"), "null\ntrue\ntrue")
+
+@test
+THE_STREAMING_PARSER_IS_REACHABLE_TOO_AND_ITS_HEAD_CARRIES_upgrade()
+    // `slate:http`'s `serveStream` is written over these, and a package that wants a body it does
+    // not have to hold wants the same three calls.
+    assert_eq(ll_out(
+        "val p = httpStream(8192)\n" +
+        "httpFeed(p, toBytes(\"POST /u HTTP/1.1\\r\\nHost: x\\r\\nContent-Length: 5\\r\\n\\r\\nhello\"))\n" +
+        "val head = httpTakePart(p)\n" +
+        "print(head.kind)\n" +
+        "print(head.method)\n" +
+        "print(head.upgrade)\n" +
+        "val body = httpTakePart(p)\n" +
+        "print(body.kind)\n" +
+        "print(fromBytes(body.chunk).value)\n" +
+        "print(httpTakePart(p).kind)"), "head\nPOST\nfalse\nbody\nhello\nend")
+
+@test
+A_REQUEST_SMUGGLING_PRIMITIVE_IS_REFUSED_THROUGH_THE_MODULE_AS_IT_IS_UNDER_IT()
+    // **The refusal is an answer and not a fault**, which is the contract `slate:http` already reads
+    // and is now part of the module's own. Two `Content-Length` headers is the classic smuggling
+    // shape: one hop reads a body where the next reads two requests.
+    assert_eq(ll_out(
+        "val p = httpParser(8192, 1048576)\n" +
+        "val bad = httpFeed(p, toBytes(\"GET / HTTP/1.1\\r\\nContent-Length: 1\\r\\nContent-Length: 2\\r\\n\\r\\n\"))\n" +
+        "print(bad.status)\n" +
+        "print(bad.message != null)"), "400\ntrue")
+
+@test
+A_HEAD_LARGER_THAN_THE_LIMIT_IS_431_AND_NOT_400()
+    // The distinction the tier exists for: bytes that were not HTTP against HTTP this server has
+    // decided not to hold. A server answering 400 to both would be calling a client broken for
+    // sending exactly what it was told to.
+    assert_eq(ll_out(
+        "val p = httpParser(64, 1048576)\n" +
+        "val bad = httpFeed(p, toBytes(\"GET / HTTP/1.1\\r\\nX: \" + repeat(\"y\", 200) + \"\\r\\n\\r\\n\"))\n" +
+        "print(bad.status)"), "431")
+
+@test
+THE_PARSER_CALLS_SAY_WHAT_THEY_TAKE_WHEN_GIVEN_SOMETHING_ELSE()
+    // Every native the module hands out is now reachable from a program, so every one of them can be
+    // called wrongly by a program -- and a diagnostic that named an internal is no longer good
+    // enough, because the reader is looking at their own file.
+    assert(ll_fails("httpUpgraded()").contains("`httpUpgraded` takes a parser, and was given 0 arguments"))
+    assert(ll_fails("httpUpgraded(\"p\")").contains("`httpUpgraded` takes a parser, and this is a string"))
+    assert(ll_fails("httpParser(8192)").contains("`httpParser` takes a head limit and a body limit"))
+    assert(ll_fails("httpFeed(httpParser(8192, 1048576), \"bytes\")").contains("`httpFeed` takes the bytes as an array"))
+
+@test
+A_PARSER_ID_NOTHING_MADE_IS_NOTHING_RATHER_THAN_SOMEBODY_ELSES()
+    // **The id is an index and is never reused**, so a stale or invented one has to answer emptily
+    // rather than reaching a live connection. That mattered less while only slate's own module held
+    // one; a program may now hold an integer it made up.
+    assert_eq(ll_out(
+        "print(httpTake(9999))\n" +
+        "print(httpUpgraded(9999))\n" +
+        "print(httpFeed(9999, [65]))\n" +
+        "httpFinish(9999)\n" +
+        "httpClose(9999)\n" +
+        "print(\"still here\")"), "null\nnull\nnull\nstill here")
