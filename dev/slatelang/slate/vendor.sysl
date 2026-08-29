@@ -1,0 +1,178 @@
+module dev.slatelang.slate
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{copy_file, entries, is_dir, make_dir_all, remove_dir_all}
+
+// Keeping a project's packages inside the project.
+//
+// **`vendor/` IS A SECOND CACHE LAID OUT EXACTLY LIKE THE FIRST**, down to the `@v` in the path, and
+// that identical layout is what earns the feature the rest of its properties. A vendored tree and a
+// cached one are the same tree in a different place, so `tree_hash` answers the same thing for both
+// and `slate.sum` verifies a vendored project without knowing it is one. Nothing else in the package
+// system had to learn the word `vendor`: the resolver asks which of the two homes exists and hands
+// back a directory, and every question after that is asked of a directory.
+//
+// **The version is in the path because the alternative is a silent mismatch.** Go drops it, having a
+// `modules.txt` to say what is really there; a layout that named only the package would let a
+// vendored 1.0.0 answer for a manifest asking 2.0.0, with nothing anywhere saying so. With the
+// version in the path a stale copy is simply never looked at.
+
+// The directory a project keeps its vendored packages in.
+vendor_root(root: string) -> string = s"${root}/vendor"
+
+// Where a vendored package lives.
+vendor_home(root: string, git: string, version: string) -> string =
+    s"${vendor_root(root)}/${git}/@v${version}"
+
+// The directory a package is read from: the project's own copy where there is one, the shared cache
+// otherwise.
+//
+// **The project wins, which is the whole point of vendoring** -- a checked-in copy is there to be
+// used rather than to be a backup of something the cache will supply anyway.
+package_home(root: string, git: string, version: string) -> string
+    if root != ""
+        val here = vendor_home(root, git, version)
+
+        if is_dir(here) then return here
+
+    package_dir(git, version)
+end package_home
+
+// What vendoring came to.
+struct Vendored
+    copied: usize
+    already: usize
+    notes: Buf[string]
+    failed: bool
+end Vendored
+
+// Put every package a project resolves to under `vendor/`, and take away what it no longer needs.
+//
+// **The source is always the CACHE and never the vendor copy**, which matters because the resolver
+// has already been asked and is answering vendor paths by the time this runs. Copying a directory
+// onto itself is the one thing this must not do.
+vendor_packages(root: string, packages: Packages) -> Vendored
+    var v = Vendored(0, 0, buf(), false)
+    var wanted: Buf[string] = buf()
+
+    for i in 0..<packages.found.len()
+        val pkg = packages.found.at(i)
+        val from = package_dir(pkg.git, pkg.version)
+        val to = vendor_home(root, pkg.git, pkg.version)
+
+        wanted.push(to)
+
+        // **A package that is only vendored is left where it is.** A project cloned with its
+        // `vendor/` already in it has the code and an empty cache, and re-fetching what is already
+        // present to copy it back over itself would be the one thing vendoring exists to avoid.
+        if !is_dir(from)
+            if is_dir(to)
+                v.already += 1
+                continue
+            end if
+
+            v.notes.push(s"error: ${pkg.name} ${pkg.version} is not in the cache -- run `slate fetch` first")
+            v.failed = true
+            continue
+        end if
+
+        if is_dir(to)
+            remove_dir_all(to) match
+                Err(_) -> ()
+                Ok(_) -> ()
+
+        copy_tree(from, to) match
+            Err(e) ->
+                v.notes.push(s"error: ${e}")
+                v.failed = true
+            Ok(_) -> v.copied += 1
+
+    if v.failed then return v
+
+    // **What the manifest no longer asks for is taken away.** A `vendor/` that accumulates every
+    // version a project ever depended on stops saying what the project needs, which is the one thing
+    // a checked-in copy is for.
+    if is_dir(vendor_root(root))
+        if kept_under(vendor_root(root), 0, wanted) == 0
+            remove_dir_all(vendor_root(root)) match
+                Err(_) -> ()
+                Ok(_) -> ()
+
+    v
+end vendor_packages
+
+// How many wanted things are at or under a directory, taking away everything that has none.
+//
+// **The walk is bounded by DEPTH rather than by what it finds**, a vendored package sitting exactly
+// four levels down -- host, owner, repository, version. Anything shallower is a directory on the way
+// there, and anything deeper is a package's own contents, which this must never look inside.
+//
+// **A file at any level counts as something kept**, so a `README` a person put in `vendor/` stops
+// the directory being taken away and is never removed itself. Nothing here deletes what it did not
+// write.
+private kept_under(dir: string, depth: usize, wanted: Buf[string]) -> usize
+    if depth == VendorDepth then return if holds_path(wanted, dir) then 1 else 0
+
+    val names = entries(dir) match
+        // A directory nobody can read is left exactly as it is: what is under it is unknown, and
+        // removing a tree on the strength of not being able to look at it is not a trade to make.
+        Err(_) -> return 1
+        Ok(n) -> n
+
+    var kept: usize = 0
+
+    for i in 0..<names.len()
+        val child = s"${dir}/${names.at(i)}"
+
+        if !is_dir(child)
+            kept += 1
+            continue
+        end if
+
+        if kept_under(child, depth + 1, wanted) == 0
+            remove_dir_all(child) match
+                Err(_) -> kept += 1
+                Ok(_) -> ()
+        else
+            kept += 1
+
+    kept
+end kept_under
+
+private val VendorDepth: usize = 4
+
+private holds_path(paths: Buf[string], path: string) -> bool
+    for i in 0..<paths.len()
+        if paths.at(i) == path then return true
+
+    false
+end holds_path
+
+// A directory and everything under it, copied.
+//
+// **Written here rather than shelled out to `cp`**, for the reason `tar.sysl` is written here: a
+// tool whose correctness depends on which binaries a machine happens to have works differently on
+// every machine.
+copy_tree(from: string, to: string) -> Result[unit, string]
+    make_dir_all(to) match
+        Err(e) -> return Err(s"cannot make ${to}: ${e}")
+        Ok(_) -> ()
+
+    val names = entries(from) match
+        Err(e) -> return Err(s"cannot read ${from}: ${e}")
+        Ok(n) -> n
+
+    for i in 0..<names.len()
+        val name = names.at(i)
+        val src = s"${from}/${name}"
+        val dst = s"${to}/${name}"
+
+        if is_dir(src)
+            copy_tree(src, dst)?
+        else
+            copy_file(src, dst) match
+                Err(e) -> return Err(s"cannot copy ${src} to ${dst}: ${e}")
+                Ok(_) -> ()
+
+    Ok(())
+end copy_tree

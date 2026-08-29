@@ -1,9 +1,9 @@
 module dev.slatelang.slate
 
-import sh.sysl.parsing.{Source, source}
+import sh.sysl.parsing.{Source, source, source_of}
 import sysl.buf.{Buf, buf}
-import sysl.fs.{entries, is_dir, read_bytes}
-import sysl.text.str_builder
+import sysl.fs.{entries, is_dir, read_bytes, write_text}
+import sysl.text.{from_utf8_unchecked, str_builder}
 
 // Running a slate program, and running its tests.
 //
@@ -42,6 +42,8 @@ run_cli(args: []string, say: string -> unit) -> int
         say("       slate test [path]")
         say("       slate deps [directory]")
         say("       slate fetch [directory]")
+        say("       slate add <package>[@<version>] [directory]")
+        say("       slate vendor [directory]")
 
         return Misused
     end if
@@ -49,6 +51,8 @@ run_cli(args: []string, say: string -> unit) -> int
     if args[1] == "test" then return test_command(if args.len > 2 then args[2] else ".", say)
     if args[1] == "deps" then return deps_command(if args.len > 2 then args[2] else ".", say)
     if args[1] == "fetch" then return fetch_command(if args.len > 2 then args[2] else ".", say)
+    if args[1] == "add" then return add_command(args, say)
+    if args[1] == "vendor" then return vendor_command(if args.len > 2 then args[2] else ".", say)
 
     run_program(args[1], say)
 end run_cli
@@ -113,7 +117,7 @@ private deps_command(dir: string, say: string -> unit) -> int
             // includes everything its dependencies drag in, and where two of them disagree it
             // includes one version rather than both -- so printing the manifest back would be
             // printing the question rather than the answer.
-            val packages = resolve_packages(dir_of(path), p)
+            val packages = resolve_packages(dir, p)
 
             if packages.found.len() == 0
                 say("  no dependencies")
@@ -131,7 +135,7 @@ private deps_command(dir: string, say: string -> unit) -> int
             for i in 0..<packages.notes.len()
                 say(s"note: ${packages.notes.at(i)}")
 
-            check_sums(dir_of(path), packages, say)
+            check_sums(dir, packages, say)
 end deps_command
 
 // Check what is in the cache against what `slate.sum` recorded.
@@ -175,13 +179,12 @@ private fetch_command(dir: string, say: string -> unit) -> int
             if !f.report.is_empty() then say_lines(f.report.render(src), "", say)
             if !f.ok() then return Failed
 
-            val root = dir_of(path)
-            val packages = resolve_packages(root, f.project)
+            val packages = resolve_packages(dir, f.project)
 
             for i in 0..<packages.notes.len()
                 say(s"note: ${packages.notes.at(i)}")
 
-            val done = fetch_packages(root, packages)
+            val done = fetch_packages(dir, packages)
 
             for i in 0..<done.notes.len()
                 say(done.notes.at(i))
@@ -192,6 +195,148 @@ private fetch_command(dir: string, say: string -> unit) -> int
 
             Fine
 end fetch_command
+
+// `slate add <package>[@<version>] [directory]` -- write a dependency into `package.sl`.
+//
+// **The manifest is written last, and only where everything else worked.** A version that does not
+// exist is a 404 from GitHub, and a manifest edited before that answer arrives names a dependency
+// the project cannot have -- so the rewrite is held in memory, read back, resolved and fetched, and
+// put on the disk only once all of that has succeeded.
+private add_command(args: []string, say: string -> unit) -> int
+    if args.len < 3
+        say("usage: slate add <package>[@<version>] [directory]")
+        say("       slate add github.com/sysl-lang/parsing")
+        say("       slate add github.com/sysl-lang/parsing@0.5.0")
+
+        return Misused
+    end if
+
+    val dir = if args.len > 3 then args[3] else "."
+    val path = if dir == "." then ManifestFile else s"${dir}/${ManifestFile}"
+
+    val c = read_coordinate(args[2]) match
+        Err(e) ->
+            say(s"slate: ${e}")
+
+            return Misused
+        Ok(v) -> v
+
+    read_bytes(path) match
+        Err(e) ->
+            say(s"slate: cannot read ${path}: ${e}")
+
+            Failed
+        Ok(bytes) -> added_to(dir, path, bytes, c, say)
+end add_command
+
+// The whole of `slate add` once the manifest has been read off the disk.
+private added_to(dir: string, path: string, bytes: []u8, c: Coordinate, say: string -> unit) -> int
+    val src = source(path, bytes)
+    val f = read_project(src)
+
+    if !f.report.is_empty() then say_lines(f.report.render(src), "", say)
+    if !f.ok() then return Failed
+
+    val version = wanted_version(c) match
+        Err(e) ->
+            say(s"slate: ${e}")
+
+            return Failed
+        Ok(v) -> v
+
+    val text = from_utf8_unchecked(bytes)
+
+    val rewrite = plan_addition(text, read_manifest(src), c, version) match
+        Err(e) ->
+            say(s"slate: ${e}")
+
+            return Failed
+        Ok(r) -> r
+
+    // Nothing to change: the dependency is already written at the version asked for.
+    if rewrite.patches.is_empty()
+        say(rewrite.news)
+
+        return Fine
+    end if
+
+    val updated = patched_text(text, rewrite.patches)
+    val again = source_of(path, updated)
+    val after = read_project(again)
+
+    // **The rewritten manifest is read back before it is written.** A surgical edit is only as good
+    // as the spans it trusted, and a file this tool has broken is a file the reader did not break --
+    // so the check is here, where the original is still on the disk untouched.
+    if !after.ok()
+        say(s"slate: rewriting ${path} produced something slate cannot read, so it has been left alone")
+        say_lines(after.report.render(again), "", say)
+
+        return Failed
+    end if
+
+    val packages = resolve_packages(dir, after.project)
+
+    for i in 0..<packages.notes.len()
+        say(s"note: ${packages.notes.at(i)}")
+
+    val done = fetch_packages(dir, packages)
+
+    for i in 0..<done.notes.len()
+        say(done.notes.at(i))
+
+    if done.failed then return Failed
+
+    write_text(path, updated) match
+        Err(e) ->
+            say(s"slate: cannot write ${path}: ${e}")
+
+            Failed
+        Ok(_) ->
+            say(rewrite.news)
+
+            Fine
+end added_to
+
+// The version to write: the one that was asked for, or the newest tag GitHub has.
+private wanted_version(c: Coordinate) -> Result[string, string] =
+    if c.version != "" then Ok(c.version) else latest_version(c.git)
+
+// `slate vendor [directory]` -- keep a copy of everything the project depends on inside it.
+//
+// **The whole graph, not the direct dependencies**, since what a program compiles against is the
+// resolved set -- vendoring the manifest's own list would leave every transitive package still
+// coming from the cache, which is a project that only builds on a machine that has one.
+private vendor_command(dir: string, say: string -> unit) -> int
+    val path = if dir == "." then ManifestFile else s"${dir}/${ManifestFile}"
+
+    read_bytes(path) match
+        Err(e) ->
+            say(s"slate: cannot read ${path}: ${e}")
+
+            Failed
+        Ok(bytes) ->
+            val src = source(path, bytes)
+            val f = read_project(src)
+
+            if !f.report.is_empty() then say_lines(f.report.render(src), "", say)
+            if !f.ok() then return Failed
+
+            val packages = resolve_packages(dir, f.project)
+
+            for i in 0..<packages.notes.len()
+                say(s"note: ${packages.notes.at(i)}")
+
+            val v = vendor_packages(dir, packages)
+
+            for i in 0..<v.notes.len()
+                say(v.notes.at(i))
+
+            if v.failed then return Failed
+
+            say(s"${v.copied} vendored, ${v.already} already there")
+
+            Fine
+end vendor_command
 
 // -- slate test ------------------------------------------------------------------------------------
 

@@ -1,0 +1,398 @@
+module dev.slatelang.slate
+
+import sh.sysl.json
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{from_utf8_unchecked, split, str_builder, Search}
+
+// Putting a dependency into a `package.sl`, and asking GitHub which version that is.
+//
+// **THE MANIFEST IS REWRITTEN TEXTUALLY, ONE SPAN AT A TIME, AND THAT IS THE WHOLE DESIGN.** A
+// manifest is data with spans, so the obvious rewrite -- read it, add a member, print it back -- is
+// available and is wrong: printing back a parsed value emits the value and nothing else, and a
+// manifest is about three fifths comment. Every blank line, every `//` explaining why a dependency
+// is there, and the author's own choice of layout would be lost the first time a tool touched the
+// file. So nothing here re-renders anything. It works out the smallest run of bytes that has to
+// change, leaves every other byte where it was, and re-reads the result before writing it.
+//
+// **The file's own style is followed rather than imposed.** The indent a new entry gets is the one
+// its siblings have; a trailing comma is written where the last entry already had one and not where
+// it did not; an object written on one line stays on one line. A tool that reformats what it edits
+// is a tool people stop running.
+
+// A package coordinate as a person typed it, with the version they asked for if they asked for one.
+struct Coordinate
+    git: string
+
+    // `""` where none was written, which means "whatever the newest tag is".
+    version: string
+
+    // The key the dependency goes under, which is what an `import ... from <name>` will say.
+    name: string
+end Coordinate
+
+// One run of bytes to replace with another. **A zero-width span is an insertion**, which is most of
+// what this file does -- there is no separate notion of inserting.
+struct Patch
+    at: Span
+    text: string
+end Patch
+
+// What a rewrite came to: the bytes to change, and the sentence to say afterwards.
+struct Rewrite
+    patches: Buf[Patch]
+    news: string
+end Rewrite
+
+// -- reading what was asked for --------------------------------------------------------------------
+
+// `github.com/owner/repo`, or `github.com/owner/repo@1.2.3`.
+//
+// **A leading `v` on the version is taken and dropped.** A tag is `v1.2.3` and a manifest writes
+// `1.2.3`, so both spellings arrive from people reading the same repository page, and refusing one
+// of them would be refusing a version that is right.
+read_coordinate(spec: string) -> Result[Coordinate, string]
+    val parts = split(spec, "@")
+
+    if parts.len > 2
+        return Err(s"`${spec}` writes `@` more than once -- a package is `github.com/<owner>/<repo>@<version>`")
+
+    val git = parts[0]
+    val asked = if parts.len == 2 then parts[1] else ""
+
+    if parts.len == 2 && asked == ""
+        return Err(s"`${spec}` ends in `@` with no version after it -- leave the `@` off to take the newest tag")
+
+    val version = if asked.starts_with("v") then from_utf8_unchecked(asked.bytes[1..<asked.bytes.len]) else asked
+    val seg = split(git, "/")
+
+    if seg.len == 2
+        return Err(s"`${git}` names no host -- write `github.com/${git}`")
+
+    if seg.len != 3 || seg[0] != "github.com"
+        return Err(s"`${git}` is not a coordinate slate knows how to fetch -- it fetches `github.com/<owner>/<repo>`")
+
+    if seg[1] == "" || seg[2] == ""
+        return Err(s"`${git}` is missing the owner or the repository")
+
+    val name = importable(seg[2])
+
+    if name == ""
+        return Err(s"`${seg[2]}` cannot be a name a program imports, so slate cannot choose a key for it -- add it to `dependencies` by hand under a key of your own")
+
+    Ok(Coordinate(git, version, name))
+end read_coordinate
+
+// A repository name as a key a program can write in an `import`.
+//
+// **A `-` becomes a `_` rather than being refused.** Hyphens are ordinary in repository names and
+// illegal in every language's identifiers, so a package manager that refused them would refuse most
+// of GitHub; npm quotes the key instead, which slate could do -- and then nothing could `import`
+// from it, the import naming a package being a bare name by design. `""` where no substitution
+// makes it a name, which is a digit at the front or a word the lexer has its own meaning for.
+importable(repo: string) -> string
+    var out = str_builder()
+
+    for i in 0..<repo.bytes.len
+        val c = repo.bytes[i]
+        val ok = if i == 0 then is_ident_start(c) else is_ident_cont(c)
+
+        out.push_char(if ok then char(u32(c)) else '_')
+
+    val name = out.finish()
+
+    if plain_name(name) then name else ""
+end importable
+
+// -- asking GitHub what the newest version is --------------------------------------------------------
+
+// The newest tag a repository has, as a version.
+//
+// **This is the blocking `http.sysl` and not the program-facing `fetch`, and that is not an
+// oversight.** A command line has no event loop running and nothing to suspend -- the same reason
+// the fetcher is blocking. The asynchronous one exists for a slate program, which has a loop.
+//
+// **Only `v`-prefixed tags count, because only they can be fetched.** `tarball_url` asks GitHub for
+// `refs/tags/v<version>`, so a repository tagged `1.2.3` would resolve to a version that then fails
+// to download -- and a wrong answer that fails later is worse than a refusal now.
+latest_version(git: string) -> Result[string, string]
+    val seg = split(git, "/")
+
+    if seg.len != 3 then return Err(s"`${git}` is not a coordinate slate knows how to ask about")
+
+    val url = s"https://api.github.com/repos/${seg[1]}/${seg[2]}/tags?per_page=100"
+    val reply = get(url)?
+
+    if reply.status == 404
+        return Err(s"${git} is not a repository slate can see -- if it is private, write the version yourself as `@1.2.3`")
+
+    // **Rate limiting is named as itself.** Unauthenticated GitHub allows sixty requests an hour, and
+    // a reader who is told only that something answered 403 will go looking for a permissions
+    // problem that is not there.
+    if reply.status == 403 || reply.status == 429
+        return Err(s"GitHub is rate-limiting this machine, so slate cannot ask what the newest version of ${git} is -- write it yourself as `@1.2.3`")
+
+    if reply.status != 200
+        return Err(s"${url} answered ${reply.status}")
+
+    val tags = json.parse(source("tags.json", reply.body)) match
+        Err(d) -> return Err(s"GitHub's answer about ${git} is not JSON slate can read: ${d.message}")
+        Ok(j) -> j
+
+    var best = ""
+
+    for i in 0..<tags.len()
+        val tag = tags.at(i) match
+            None -> continue
+            Some(t) -> t
+
+        val name = tag.get("name") match
+            None -> continue
+            Some(n) -> n.as_str() match
+                None -> continue
+                Some(t) -> t
+
+        if !name.starts_with("v") then continue
+
+        val v = from_utf8_unchecked(name.bytes[1..<name.bytes.len])
+
+        if best == "" || newer_version(v, best) then best = v
+
+    if best == ""
+        return Err(s"${git} has no `v`-prefixed tags, so there is no version for slate to pin -- write one yourself as `@1.2.3`")
+
+    Ok(best)
+end latest_version
+
+// -- planning the rewrite -----------------------------------------------------------------------------
+
+// What has to change in a manifest for it to depend on this package.
+//
+// **A name already there at another version is MOVED rather than refused**, because that is what
+// asking for a version means; a name already there from another repository is refused, because that
+// is two packages wanting one import name and no edit can settle it.
+plan_addition(src: string, m: Manifest, c: Coordinate, version: string) -> Result[Rewrite, string]
+    val root = m.doc
+    val multiline = doc_is_multiline(src, root.span)
+    val entry = dependency_entry(c.name, c.git, version)
+
+    val top = object_members(root) match
+        None -> return Err("a project is one object, and this manifest is not")
+        Some(ms) -> ms
+
+    root.get("dependencies") match
+        None ->
+            val indent = member_indent(src, root, top)
+            val unit = indent_unit(src, root, top)
+            val block = if multiline
+                s"dependencies: {\n${indent}${unit}${entry},\n${indent}}"
+            else
+                s"dependencies: { ${entry} }"
+
+            Ok(Rewrite(added_member(src, root, top, block, multiline), s"added ${c.name} ${version}"))
+        Some(dm) ->
+            val deps = dm.value
+            val members = object_members(deps) match
+                None -> return Err("`dependencies` is an object of one entry per package, and this one is not")
+                Some(ms) -> ms
+
+            for i in 0..<members.len()
+                val have = members.at(i)
+                val where = have.value.get("git") match
+                    None -> ""
+                    Some(g) -> g.value.text() match
+                        None -> ""
+                        Some(t) -> t
+
+                if have.key == c.name
+                    if where != c.git
+                        return Err(s"`${c.name}` already comes from ${where} -- two packages cannot share one import name, so one of them has to go under a key of its own")
+
+                    return Ok(moved_to(have, version, c.name))
+
+                if where == c.git
+                    return Err(s"${c.git} is already there under the key `${have.key}` -- rename it in ${ManifestFile} if `${c.name}` is what it should be called")
+
+            Ok(Rewrite(added_member(src, deps, members, entry, multiline), s"added ${c.name} ${version}"))
+end plan_addition
+
+// A dependency that is already written, at a version that may or may not be the one asked for.
+private moved_to(have: DocMember, version: string, name: string) -> Rewrite
+    var out: Buf[Patch] = buf()
+
+    have.value.get("version") match
+        None -> ()
+        Some(v) ->
+            v.value.text() match
+                Some(t) ->
+                    if t == version then return Rewrite(out, s"${name} ${version} is already there")
+
+                    out.push(Patch(v.value.span, s"\"${version}\""))
+
+                    return Rewrite(out, s"${name} ${t} -> ${version}")
+                None -> ()
+
+    Rewrite(out, s"${name} is already there, and its `version` is not something slate can rewrite")
+end moved_to
+
+// One `dependencies` entry, written the way the fixtures write one.
+dependency_entry(name: string, git: string, version: string) -> string =
+    s"${name}: { git: \"${git}\", version: \"${version}\" }"
+
+// -- editing the text ---------------------------------------------------------------------------------
+
+// The patches that add one member to an object a manifest wrote.
+//
+// **Nothing between the last member and the `}` is assumed.** A trailing comma may be there or not,
+// a comment may follow the last entry, and the whole object may be on one line -- so the position to
+// write at is found by looking rather than by counting, and the comma goes immediately after the
+// last value where a comment cannot get between them.
+private added_member(src: string, obj: Doc, members: Buf[DocMember], entry: string, multiline: bool) -> Buf[Patch]
+    var out: Buf[Patch] = buf()
+    val close = if obj.span.end > obj.span.start then obj.span.end - 1 else obj.span.start
+    val indent = member_indent(src, obj, members)
+
+    if members.is_empty()
+        val outer = line_indent_at(src, obj.span.start)
+
+        if multiline
+            out.push(Patch(obj.span, s"{\n${indent}${entry},\n${outer}}"))
+        else
+            out.push(Patch(obj.span, s"{ ${entry} }"))
+
+        return out
+    end if
+
+    val last = members.at(members.len() - 1)
+    val ends = last.value.span.end
+    var after = ends
+    var had_comma = false
+
+    loop
+        if after >= close then break
+
+        val c = src.bytes[after]
+
+        if c == u8(',')
+            had_comma = true
+            after += 1
+            break
+        end if
+
+        if c != u8(' ') && c != u8('\t') then break
+
+        after += 1
+
+    // **A line to write on, or none.** An object whose `}` shares a line with its last member has no
+    // line of its own to put an entry on, however many lines the file has -- so it is extended the
+    // way a one-line object is, which is also what makes `{ a: 1 }` come out as `{ a: 1, b: 2 }`.
+    val eol = if multiline then line_end_within(src, after, close) else None
+
+    eol match
+        None -> out.push(Patch(Span(ends, close), s", ${entry} "))
+        Some(at) ->
+            if !had_comma then out.push(Patch(Span(ends, ends), ","))
+
+            val tail = if had_comma then "," else ""
+
+            out.push(Patch(Span(at, at), s"\n${indent}${entry}${tail}"))
+
+    out
+end added_member
+
+// The text with every patch applied. **The patches arrive in order and none overlaps another**,
+// which is what lets this be one walk rather than a repeated splice.
+patched_text(src: string, patches: Buf[Patch]) -> string
+    var out = str_builder()
+    var i: usize = 0
+
+    for k in 0..<patches.len()
+        val p = patches.at(k)
+
+        if p.at.start > i then out.push(from_utf8_unchecked(src.bytes[i..<p.at.start]))
+
+        out.push(p.text)
+        i = p.at.end
+
+    if i < src.bytes.len then out.push(from_utf8_unchecked(src.bytes[i..<src.bytes.len]))
+
+    out.finish()
+end patched_text
+
+// -- reading the file's own layout ---------------------------------------------------------------------
+
+// The members of an object, where this is one.
+object_members(d: Doc) -> Option[Buf[DocMember]]
+    *d.kind match
+        Obj(members) -> Some(members)
+        other -> None
+end object_members
+
+// Whether anything inside a span is written on a second line.
+private doc_is_multiline(src: string, at: Span) -> bool
+    val stop = if at.end > src.bytes.len then src.bytes.len else at.end
+
+    for i in at.start..<stop
+        if src.bytes[i] == u8('\n') then return true
+
+    false
+end doc_is_multiline
+
+// The whitespace the line holding an offset begins with.
+private line_indent_at(src: string, at: usize) -> string
+    var start = if at > src.bytes.len then src.bytes.len else at
+
+    loop
+        if start == 0 then break
+        if src.bytes[start - 1] == u8('\n') then break
+
+        start -= 1
+
+    var out = str_builder()
+    var i = start
+
+    loop
+        if i >= src.bytes.len then break
+
+        val c = src.bytes[i]
+
+        if c != u8(' ') && c != u8('\t') then break
+
+        out.push_char(char(u32(c)))
+        i += 1
+
+    out.finish()
+end line_indent_at
+
+// Where the line holding an offset ends, if it ends before a limit.
+private line_end_within(src: string, at: usize, limit: usize) -> Option[usize]
+    var i = at
+
+    loop
+        if i >= limit || i >= src.bytes.len then return None
+        if src.bytes[i] == u8('\n') then return Some(i)
+
+        i += 1
+end line_end_within
+
+// The indent a new member of this object should have: its siblings', or one step in from the object.
+private member_indent(src: string, obj: Doc, members: Buf[DocMember]) -> string
+    if !members.is_empty() then return line_indent_at(src, members.at(members.len() - 1).at.start)
+
+    s"${line_indent_at(src, obj.span.start)}${indent_unit(src, obj, members)}"
+end member_indent
+
+// One step of indentation, as the file itself writes it.
+//
+// **Read off the file rather than assumed**, because a manifest indented with two spaces or with a
+// tab should stay that way -- and four spaces is only the answer where the file has not said.
+private indent_unit(src: string, obj: Doc, members: Buf[DocMember]) -> string
+    if members.is_empty() then return "    "
+
+    val outer = line_indent_at(src, obj.span.start)
+    val inner = line_indent_at(src, members.at(0).at.start)
+
+    if inner.bytes.len <= outer.bytes.len then return "    "
+
+    from_utf8_unchecked(inner.bytes[outer.bytes.len..<inner.bytes.len])
+end indent_unit
