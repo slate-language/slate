@@ -498,6 +498,109 @@ fetch_REFUSES_WHAT_IT_CANNOT_TAKE()
     // waiting for -- so the module written in slate raises where a native would have.
     assert(http_fails("serve(8199, 42)").contains("`serve` needs a function to call with each request"))
 
+// -- a connection that carries more than one request ----------------------------------------------
+
+// **These tests hold the socket themselves, and they have to.** `fetch` says `Connection: close` on
+// every request it makes, so nothing reached through it can say what a *kept* connection does. What
+// is asserted is the whole exchange with `\r\n` written as `|`, because a protocol is exactly the
+// bytes on the wire: the status lines, the lengths, the `Connection` each response admits to, and
+// the order the answers came back in are one string and are checked as one.
+
+@test
+A_CONNECTION_CARRIES_AS_MANY_REQUESTS_AS_THE_CLIENT_WANTS()
+    // Two requests are written in a single `send` and the third only after the first answers, so this
+    // covers both shapes at once: a client that pipelines, and one that waits its turn.
+    val body = "val server = serve(0, req -> \"<\" + req.path + \">\")\n" +
+        "ask(path, conn) = \"GET \" + path + \" HTTP/1.1\\r\\nHost: h\\r\\nConnection: \" + conn + \"\\r\\n\\r\\n\"\n" +
+        "async main()\n" + "    val c = (await connect(\"127.0.0.1\", localPort(server))).value\n" +
+        "    var got = \"\"\n" + "    heard(chunk)\n" + "        if chunk == null\n" +
+        "            print(join(split(got, \"\\r\\n\"), \"|\"))\n" + "            shutSocket(c)\n" +
+        "            close(server)\n" + "            done()\n" + "        else\n" +
+        "            got = got + chunk\n" + "    onData(c, heard)\n" +
+        "    await send(c, ask(\"/one\", \"keep-alive\") + ask(\"/two\", \"keep-alive\"))\n" +
+        "    await sleep(60)\n" + "    await send(c, ask(\"/three\", \"close\"))\n" + "main()\n"
+
+    assert_eq(wire_out(body),
+        "HTTP/1.1 200 OK|Content-Length: 6|Connection: keep-alive||</one>" +
+            "HTTP/1.1 200 OK|Content-Length: 6|Connection: keep-alive||</two>" +
+            "HTTP/1.1 200 OK|Content-Length: 8|Connection: close||</three>")
+
+@test
+THE_CLIENT_DECIDES_WHETHER_A_CONNECTION_IS_KEPT_AND_THE_VERSION_SETS_THE_DEFAULT()
+    // HTTP's own rule and not a preference of this server's: `HTTP/1.1` keeps the connection unless
+    // the request says `close`, anything older closes it unless the request asks. The last line is a
+    // `Connection` header naming two things, which is read for the word rather than matched whole.
+    val body = "val server = serve(0, req -> \"ok\")\n" + "async once(line)\n" +
+        "    val c = (await connect(\"127.0.0.1\", localPort(server))).value\n" + "    var got = \"\"\n" +
+        "    heard(chunk)\n" + "        if chunk != null then got = got + chunk\n" +
+        "    onData(c, heard)\n" + "    await send(c, line + \"\\r\\nHost: h\\r\\n\\r\\n\")\n" +
+        "    await sleep(60)\n" + "    shutSocket(c)\n" + "    val at = indexOf(got, \"Connection: \")\n" +
+        "    got[(at + 12)..<indexOf(got, \"\\r\\n\\r\\n\")]\n" + "async main()\n" +
+        "    print(await once(\"GET / HTTP/1.1\"))\n" + "    print(await once(\"GET / HTTP/1.0\"))\n" +
+        "    print(await once(\"GET / HTTP/1.0\\r\\nConnection: keep-alive\"))\n" +
+        "    print(await once(\"GET / HTTP/1.1\\r\\nConnection: close\"))\n" +
+        "    print(await once(\"GET / HTTP/1.1\\r\\nConnection: keep-alive, Upgrade\"))\n" +
+        "    close(server)\n" + "    done()\n" + "main()\n"
+
+    assert_eq(wire_out(body), "keep-alive\nclose\nkeep-alive\nclose\nkeep-alive")
+
+@test
+A_REQUEST_WITH_A_BODY_LEAVES_THE_STREAM_WHERE_THE_NEXT_REQUEST_STARTS()
+    // **The arithmetic keep-alive actually costs.** Answering one request and closing needs only to
+    // find where a request ENDS; keeping the connection needs the bytes after it to still be there
+    // and still be aligned, so a body of five characters followed immediately by another request is
+    // the case that says whether the cut is in the right place.
+    val body = "val server = serve(0, req -> req.method + req.path + \"[\" + req.body + \"]\")\n" + "async main()\n" +
+        "    val c = (await connect(\"127.0.0.1\", localPort(server))).value\n" + "    var got = \"\"\n" +
+        "    heard(chunk)\n" + "        if chunk == null\n" +
+        "            print(join(split(got, \"\\r\\n\"), \"|\"))\n" + "            shutSocket(c)\n" +
+        "            close(server)\n" + "            done()\n" + "        else\n" +
+        "            got = got + chunk\n" + "    onData(c, heard)\n" +
+        "    await send(c, \"POST /a HTTP/1.1\\r\\nHost: h\\r\\nContent-Length: 5\\r\\n\\r\\nhello\" +\n" +
+        "        \"GET /b HTTP/1.1\\r\\nHost: h\\r\\n\\r\\n\" +\n" +
+        "        \"PUT /c HTTP/1.1\\r\\nHost: h\\r\\nConnection: close\\r\\nContent-Length: 2\\r\\n\\r\\nhi\")\n" +
+        "main()\n"
+
+    assert_eq(wire_out(body),
+        "HTTP/1.1 200 OK|Content-Length: 13|Connection: keep-alive||POST/a[hello]" +
+            "HTTP/1.1 200 OK|Content-Length: 7|Connection: keep-alive||GET/b[]" +
+            "HTTP/1.1 200 OK|Content-Length: 9|Connection: close||PUT/c[hi]")
+
+@test
+A_REQUEST_THIS_SERVER_CANNOT_READ_ENDS_THE_CONNECTION()
+    // **A malformed request is the one case where keeping the connection would be wrong**, and the
+    // reason is not tidiness: this server no longer knows where in the stream it is, so the bytes
+    // after the mistake are not a request -- they are whatever was left of one. The follow-up here is
+    // a perfectly good `GET` and it is never answered, which is the assertion.
+    val body = "val server = serve(0, req -> \"never\")\n" + "async main()\n" +
+        "    val c = (await connect(\"127.0.0.1\", localPort(server))).value\n" + "    var got = \"\"\n" +
+        "    heard(chunk)\n" + "        if chunk == null\n" +
+        "            print(join(split(got, \"\\r\\n\"), \"|\"))\n" + "            shutSocket(c)\n" +
+        "            close(server)\n" + "            done()\n" + "        else\n" +
+        "            got = got + chunk\n" + "    onData(c, heard)\n" +
+        "    await send(c, \"\\r\\nHost: h\\r\\n\\r\\nGET /after HTTP/1.1\\r\\nHost: h\\r\\n\\r\\n\")\n" +
+        "main()\n"
+
+    assert_eq(wire_out(body),
+        "HTTP/1.1 400 Bad Request|Content-Length: 27|Connection: close||the request line is missing")
+
+@test
+A_CONNECTION_NOBODY_IS_USING_IS_CLOSED_AFTER_ITS_IDLE_TIME()
+    // **This is the cost of keep-alive and there is no avoiding it.** A client may keep a connection
+    // and then simply go away; without a clock that socket is held for as long as the program runs.
+    // The wait is the server's own five seconds, so this test carries a longer watchdog than the
+    // others -- a fuse shorter than what is being measured would report the measurement as a hang.
+    val body = "val server = serve(0, req -> \"ok\")\n" + "async main()\n" +
+        "    val c = (await connect(\"127.0.0.1\", localPort(server))).value\n" + "    heard(chunk)\n" +
+        "        if chunk == null\n" +
+        "            print(\"the server hung up on a connection nobody was using\")\n" +
+        "            shutSocket(c)\n" + "            close(server)\n" + "            done()\n" +
+        "    onData(c, heard)\n" + "    await send(c, \"GET / HTTP/1.1\\r\\nHost: h\\r\\n\\r\\n\")\n" +
+        "main()\n"
+
+    assert_eq(out(HttpImport + WireImport + fused(9000, body)),
+        "the server hung up on a connection nobody was using")
+
 @test
 A_URL_IS_READ_THE_SAME_WAY_FOR_A_PACKAGE_AND_FOR_A_PROGRAM()
     // **The cleartext refusal moved to the FETCHER when `fetch` arrived**, which is the layering the
