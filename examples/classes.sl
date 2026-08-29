@@ -27,8 +27,8 @@ class Square from Shape
     val sides = 4
 
     // **`var` declares a field each OBJECT gets**, where `val` above declares one the class holds. A
-    // class that declares fields and writes no constructor is given one, taking those fields in the
-    // order they were written -- so `Square.new(4)` needs no `new` of its own.
+    // class that declares fields and writes no constructor is given one, taking every declared field
+    // in the order they were written -- so `Square.new(4)` needs no `new` of its own.
     var side
 
     name(self) = "square"
@@ -81,6 +81,23 @@ val two = Circle.new(1)
 one.marks.push("here")
 
 print(one.marks, two.marks)
+
+// -- a field the class gives a value, which a call may still say otherwise about ---------------------
+
+// A declared field with an initialiser is an OPTIONAL parameter of the constructor, and that
+// initialiser is its default. A default is worked out at the call, so leaving it out still gives
+// every object its own array -- and an initialised field comes after the ones without, whatever
+// order they were written in, because a default has to be trailing.
+class Note
+    var text
+    var tags = []
+
+val plain = Note.new("hello")
+val tagged = Note.new("hello", ["urgent"])
+
+plain.tags.push("mine")
+
+print(plain.tags, tagged.tags, Note.new("x").tags)
 
 // -- a constructor with something to do -------------------------------------------------------------
 

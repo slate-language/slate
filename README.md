@@ -695,22 +695,24 @@ like TS's. So **a mutable literal under `val` is refused**, and the message name
 Only a *literal* is refused: an object bound outside the class and named here is sharing somebody
 asked for, and still compiles.
 
-**A class that declares fields and writes no constructor is given one**, taking the fields that have
-no initialiser, in the order they were written:
+**A class that declares fields and writes no constructor is given one**, taking all of them — the
+fields with no initialiser first, and then the initialised ones, each optional with its initialiser
+as its default:
 
 ```
 class Square
     var side
     var tags = []
 
-Square.new(4)            // side = 4, tags = a fresh []
+Square.new(4)               // side = 4, tags = a fresh []
+Square.new(4, ["red"])      // and tags said otherwise
 ```
 
-An initialised field is not a parameter of the `new` a class gets for free: its value comes from its
-own declaration, so adding an initialiser changes what `new` takes. (A `new` you write yourself may
-take a default parameter like any other function; only the generated one is fixed this way.) **A
-class that declares nothing gets no `new` at all**, rather than one answering an object with nothing
-in it; `{ side: 4, proto: Square }` still works and is how such a class is made.
+A default is worked out at the call, so leaving `tags` out still gives every square its own array.
+**An initialised field comes after an uninitialised one whatever order they were written in**, since
+a default has to be trailing: `var kind = "plain"` above `var side` gives `new(side, kind =
+"plain")`. **A class that declares nothing gets no `new` at all**, rather than one answering an
+object with nothing in it; `{ side: 4, proto: Square }` still works and is how such a class is made.
 
 **Write your own `new` when it has something to do.** `var` in its parameter list declares the field
 and assigns it — TypeScript's parameter property — and `self` is the object being made. The body runs
