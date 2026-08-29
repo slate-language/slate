@@ -1,0 +1,120 @@
+module dev.slatelang.slate
+
+import sh.sysl.brotli
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// Brotli, which is the encoding a browser asks for first.
+//
+// **Every browser sends `Accept-Encoding: br` before `gzip`**, and on text brotli is worth roughly a
+// sixth over gzip in the same speed class. `slate:http` reaches for these two directly -- a response
+// large enough to be worth it goes out compressed with nothing asked of the handler -- and they are
+// a module of their own besides, for the program that compresses something to store rather than to
+// send.
+//
+// ## The two failure channels, exactly as JSON draws them
+//
+// **`compress` faults and `decompress` answers a result**, which is `toJSON` against `parseJSON` and
+// for the same reason: compressing cannot fail on input a program already holds, and decompressing
+// is reading bytes that came from somewhere else. A request body that is not a brotli stream is an
+// ordinary thing to be sent and a `400` to answer, not a defect in the program reading it.
+//
+// ## The limit is not optional, and that is the whole safety story
+//
+// A brotli stream carries no length, and a crafted one of a few hundred bytes expands without bound
+// -- so `decompress` is told how large an answer the caller is prepared to hold, and there is no
+// form that omits it. `sh.sysl.brotli` makes the same decision one layer down.
+
+// The quality range brotli accepts. **The scale is not linear**: 0-4 are fast enough to compress a
+// response on the way out, 5 is the usual on-the-fly choice, and 9-11 are for something compressed
+// once and served many times -- quality 11 on a megabyte of text costs about half a second and 60 MB
+// of working memory, which is why it is not what a request handler should reach for.
+private const min_quality: long = 0
+private const max_quality: long = 11
+
+private byte_source(v: Value, at: Span, name: string) -> Result[Buf[u8], Signal]
+    v match
+        // **Text crosses as its UTF-8**, which is what `toBytes` would have made of it and what goes
+        // on a wire either way. A program compressing a page has a string, not an array.
+        Str(p) ->
+            var out: Buf[u8] = buf()
+
+            for i in 0..<p.s.bytes.len
+                out.push(p.s.bytes[i])
+
+            Ok(out)
+        Array(a) -> bytes_of(a, at, name)
+        other -> Err(failure(at, s"`${name}` takes text or bytes, and this is ${other.type_name()}"))
+
+private whole(v: Value, at: Span, name: string, what: string) -> Result[long, Signal]
+    v match
+        Int(n) -> Ok(n)
+        other -> Err(failure(at, s"`${name}` takes ${what} as a whole number, and this is ${other.type_name()}"))
+
+private as_bytes(bytes: Buf[u8]) -> Value
+    var items: Buf[Value] = buf()
+
+    for i in 0..<bytes.len()
+        items.push(Int(long(bytes.at(i))))
+
+    Array(new_array(items))
+end as_bytes
+
+// `compress(data, quality)` -- the compressed bytes.
+//
+// **The quality is written at every call because slate has no default arguments**, and it is the one
+// number here that a caller has to think about: 5 for something being sent now, 11 for something
+// built ahead of time.
+do_brotli_compress(args: Buf[Value], at: Span) -> Step
+    if args.len() != 2
+        return fault(at, s"`compress` takes what to compress and a quality from 0 to 11, and was given ${counted(args.len(), "argument")}")
+
+    val source = byte_source(args.at(0), at, "compress")?
+    val quality = whole(args.at(1), at, "compress", "the quality")?
+
+    if quality < min_quality || quality > max_quality
+        return fault(at, s"a brotli quality runs from 0 to 11 and this is ${quality}")
+
+    brotli.compress(source.view(), int(quality)) match
+        Ok(small) ->
+            val mark = root_mark()
+            val made = as_bytes(small)
+
+            hold(made)
+            release(mark)
+            Ok(made)
+        Err(_) -> fault(at, "this could not be compressed, the encoder having refused to allocate its state")
+end do_brotli_compress
+
+// `decompress(data, limit)` -- a result carrying the bytes, or the sentence saying why not.
+do_brotli_decompress(args: Buf[Value], at: Span) -> Step
+    if args.len() != 2
+        return fault(at, s"`decompress` takes what to decompress and the most it may become, and was given ${counted(args.len(), "argument")}")
+
+    val source = byte_source(args.at(0), at, "decompress")?
+    val limit = whole(args.at(1), at, "decompress", "the limit")?
+
+    if limit < 0
+        return fault(at, s"a limit is a number of bytes and this is ${limit}")
+
+    brotli.decompress(source.view(), usize(limit)) match
+        Ok(whole_thing) ->
+            val mark = root_mark()
+            val made = ok_value(as_bytes(whole_thing))
+
+            hold(made)
+            release(mark)
+            Ok(made)
+
+        // **Which failure it was is worth saying**, since the three mean three different things to
+        // whoever sent the bytes: too large is a body that would not fit, truncated is a download
+        // that stopped, and corrupt is not brotli at all.
+        Err(e) -> Ok(err_value(why_not(e, limit)))
+end do_brotli_decompress
+
+private why_not(e: brotli.Error, limit: long) -> string = e match
+    brotli.Error.TooLarge(n) -> s"this expands past the ${n} bytes it was allowed"
+    brotli.Error.Truncated -> "this brotli stream ends in the middle"
+    brotli.Error.Corrupt(code, why) -> s"this is not a brotli stream: ${why}"
+    brotli.Error.NoMemory -> "the decoder could not allocate its state"
+    other -> "this brotli stream could not be read"

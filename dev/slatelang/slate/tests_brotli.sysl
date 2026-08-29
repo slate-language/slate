@@ -1,0 +1,158 @@
+module dev.slatelang.slate
+@tests
+
+import sysl.text.Search
+
+// `slate:brotli`, and the `Content-Encoding: br` `slate:http` writes without being asked.
+//
+// **The wire tests read the socket as BYTES**, `onBytes` rather than `onData`, because a compressed
+// body is not UTF-8 and a test reading it as text would be asserting on whatever the decoder made of
+// the bytes rather than on the bytes.
+
+// A body long enough to be worth compressing and repetitive enough to compress well. Nine hundred
+// characters, so it is comfortably over `slate:http`'s kilobyte threshold once it is UTF-8.
+private val ARepetitiveBody: string = "repeat(\"the quick brown fox jumps over the lazy dog, \", 25)"
+
+// The head of a response, `|`-joined, and whatever the body turned out to be. `<ask>` is replaced
+// with the `Accept-Encoding` line the test wants, and `<answer>` with what the handler says.
+private wire_probe(ask: string, answer: string) -> string =
+    "val server = serve(0, req -> (" + answer + "))\n" +
+    "cut(bs) =\n" +
+    "    var i = 0\n" +
+    "    while i + 3 < len(bs)\n" +
+    "        if bs[i] == 13 && bs[i + 1] == 10 && bs[i + 2] == 13 && bs[i + 3] == 10 then return i\n" +
+    "        i = i + 1\n" +
+    "    0 - 1\n" +
+    "async main()\n" +
+    "    val c = (await connect(\"127.0.0.1\", localPort(server))).value\n" +
+    "    var got = []\n" +
+    "    heard(chunk)\n" +
+    "        if chunk == null\n" +
+    "            val at = cut(got)\n" +
+    "            val head = fromBytes(got[0..<at]).value\n" +
+    "            val body = got[(at + 4)..<len(got)]\n" +
+    "            print(join(split(head, \"\\r\\n\"), \"|\"))\n" +
+    "            if contains(head, \"Content-Encoding: br\")\n" +
+    "                print(fromBytes(decompress(body, 65536).value).value)\n" +
+    "            else\n" +
+    "                print(fromBytes(body).value)\n" +
+    "            shutSocket(c)\n" +
+    "            close(server)\n" +
+    "            done()\n" +
+    "        else\n" +
+    "            got = concat(got, chunk)\n" +
+    "    onBytes(c, heard)\n" +
+    "    await send(c, \"GET / HTTP/1.1\\r\\nHost: h\\r\\nConnection: close\\r\\n" + ask + "\\r\\n\\r\\n\")\n" +
+    "main()\n"
+
+@test
+WHAT_compress_MADE_IS_WHAT_decompress_GIVES_BACK()
+    // The round trip, which is the whole of what a compressor owes.
+
+    val text = "val text = " + ARepetitiveBody + "\nval small = compress(text, 5)\nprint(fromBytes(decompress(small, 65536).value).value == text)\nprint(len(small) < len(toBytes(text)) / 10)\n"
+
+    assert_eq(br_out(text), "true\ntrue")
+
+@test
+TEXT_AND_ITS_BYTES_ARE_THE_SAME_INPUT()
+    // **Text crosses as its UTF-8**, which is what `toBytes` would have made of it and what goes on
+    // a wire either way -- so a program with a string need not convert it first.
+
+    val text = "print(compress(\"a page of text\", 5) == compress(toBytes(\"a page of text\"), 5))\n"
+
+    assert_eq(br_out(text), "true")
+
+@test
+RUBBISH_A_TRUNCATION_AND_AN_OVERLONG_ANSWER_ARE_THREE_DIFFERENT_SENTENCES()
+    // **`decompress` answers a result and `compress` faults**, which is `parseJSON` against `toJSON`
+    // and for the same reason: what is being decompressed came from somewhere else. And which
+    // failure it was is worth saying, because the three mean three different things to whoever sent
+    // the bytes -- a body that would not fit, a download that stopped, and something that is not
+    // brotli at all.
+
+    val text = "val text = " + ARepetitiveBody + "\nval small = compress(text, 5)\n" +
+        "print(decompress(toBytes(\"not brotli at all\"), 1024).error)\n" +
+        "print(decompress(small[0..<(len(small) / 2)], 65536).error)\n" +
+        "print(decompress(small, 100).error)\n"
+
+    val said = br_out(text)
+
+    assert(said.contains("this is not a brotli stream"))
+    assert(said.contains("this brotli stream ends in the middle"))
+    assert(said.contains("this expands past the 100 bytes it was allowed"))
+
+@test
+A_QUALITY_OUTSIDE_WHAT_BROTLI_ACCEPTS_IS_REFUSED()
+    // 0 to 11, and the scale is not linear: 5 is the on-the-fly choice and 11 is for something built
+    // ahead of time.
+
+    assert(br_fails("compress(\"x\", 12)").contains("a brotli quality runs from 0 to 11 and this is 12"))
+    assert(br_fails("compress(\"x\", 0 - 1)").contains("a brotli quality runs from 0 to 11 and this is -1"))
+
+@test
+THE_TWO_NAMES_SAY_WHAT_THEY_TAKE()
+    assert(br_fails("compress(\"x\")").contains("`compress` takes what to compress and a quality from 0 to 11, and was given 1 argument"))
+    assert(br_fails("compress(42, 5)").contains("`compress` takes text or bytes, and this is an integer"))
+    assert(br_fails("compress(\"x\", \"high\")").contains("`compress` takes the quality as a whole number, and this is a string"))
+    assert(br_fails("decompress(\"x\")").contains("`decompress` takes what to decompress and the most it may become, and was given 1 argument"))
+
+@test
+A_BODY_WORTH_COMPRESSING_GOES_OUT_COMPRESSED_AND_THE_HANDLER_IS_NOT_ASKED()
+    // **Every browser sends `Accept-Encoding: br` before `gzip`**, so a server that made this a
+    // decision would be making everybody write the same three lines. `Vary` goes with it, because
+    // what a cache must not do is hand a compressed body to a client that did not ask for one.
+
+    val said = br_wire_out(wire_probe("Accept-Encoding: br, gzip", ARepetitiveBody))
+
+    assert(said.contains("Content-Encoding: br"))
+    assert(said.contains("Vary: Accept-Encoding"))
+    assert(said.contains("the quick brown fox jumps over the lazy dog, the quick"))
+
+    // The body actually went out smaller, which is the point of doing it at all.
+    assert(!said.contains("Content-Length: 1125"))
+
+@test
+A_CLIENT_THAT_DID_NOT_ASK_GETS_THE_BODY_AS_IT_WAS()
+    // `gzip, deflate` names no brotli, and neither does a request with no `Accept-Encoding` at all.
+
+    val said = br_wire_out(wire_probe("Accept-Encoding: gzip, deflate", ARepetitiveBody))
+
+    assert(!said.contains("Content-Encoding"))
+    assert(said.contains("Content-Length: 1125"))
+
+@test
+br_WITH_A_QUALITY_OF_ZERO_IS_A_CLIENT_SAYING_IT_WOULD_RATHER_NOT()
+    // **Which is not the same as not mentioning it**, and is the reason the field is split into its
+    // tokens rather than searched for two letters. `q=0.5` is still an ask.
+
+    val refused = br_wire_out(wire_probe("Accept-Encoding: br;q=0, gzip", ARepetitiveBody))
+    val wanted = br_wire_out(wire_probe("Accept-Encoding: br;q=0.5", ARepetitiveBody))
+
+    assert(!refused.contains("Content-Encoding"))
+    assert(wanted.contains("Content-Encoding: br"))
+
+@test
+A_BODY_TOO_SHORT_TO_BE_WORTH_IT_IS_SENT_AS_IT_IS()
+    // **Below a kilobyte brotli usually makes a body larger**, having a frame to write, and the
+    // round trip costs a client more than the bytes save it. Nothing is compressed and nothing
+    // varies, so a cache has one answer to hold rather than two.
+
+    val said = br_wire_out(wire_probe("Accept-Encoding: br", "\"a short answer\""))
+
+    assert(!said.contains("Content-Encoding"))
+    assert(!said.contains("Vary"))
+    assert(said.contains("Content-Length: 14"))
+
+@test
+A_HANDLER_THAT_SAID_Content_Encoding_ITSELF_IS_LEFT_ALONE()
+    // **The escape hatch, and the only one there is.** A handler serving something it compressed
+    // itself -- an asset built ahead of time, a body it is passing through -- says so, and this
+    // server does not compress it again.
+
+    val answer = "{ headers: { \"Content-Encoding\": \"identity\" }, body: " + ARepetitiveBody + " }"
+    val said = br_wire_out(wire_probe("Accept-Encoding: br", answer))
+
+    assert(said.contains("Content-Encoding: identity"))
+    assert(!said.contains("Content-Encoding: br"))
+    assert(!said.contains("Vary"))
+    assert(said.contains("Content-Length: 1125"))
