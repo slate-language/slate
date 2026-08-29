@@ -4,6 +4,8 @@
 // quantifiers, lookaround, backreferences and named groups all mean what they mean in Perl, Python,
 // Ruby and a browser.
 
+import { regex } from slate:regex
+
 val words = regex("\\w+")
 
 print(words.findAll("one two three").map((m) -> m.text).join(", "))
