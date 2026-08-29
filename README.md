@@ -1,14 +1,18 @@
 # slate
 
-A small indentation-structured language, written in [sysl](https://sysl.sh) to find out what sysl is
-like to write a real front end in.
+A small indentation-structured, garbage-collected language, written in [sysl](https://sysl.sh).
 
-**The language is a means rather than an end.** What is being tested is sysl. A tree-walking
-interpreter is one of the few programs that reaches for nearly everything a language has — recursive
-data through references, payload-carrying enums, traits with associated types, generics over a
-container, closures that outlive the frame that made them, and an error path that has to carry a
-position from the byte that caused it all the way to the sentence a person reads. Where sysl makes
-one of those awkward, that is the finding, and the finding is the point.
+Dynamically typed with a gradual checker, `async`/`await` on a real event loop, generators, modules,
+pattern matching, classes over prototypes, and a package manager. It is aimed first at what an API
+server needs — HTTP over node's own llhttp, TCP, TLS, a file system, processes, regular expressions
+and JSON.
+
+It began as a way of finding out what sysl is like to write a real front end in: a tree-walking
+interpreter reaches for nearly everything a language has — recursive data through references,
+payload-carrying enums, traits with associated types, generics over a container, closures that
+outlive the frame that made them, and an error path carrying a position from the byte that caused it
+to the sentence a person reads. It turned out to be a language worth having on its own, and that is
+what it is built as now.
 
 ```
 dev/slatelang/slate/
