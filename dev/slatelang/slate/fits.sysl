@@ -1,0 +1,262 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// What one type fits, and what is known about a name.
+//
+// **The lattice the check is made of, split out of `check.sysl`, which is the walk over it.** Four
+// names here are not `private` because that walk asks them: `is_kind_of`, `has_name`, `may_narrow`
+// and `narrow_by`.
+
+// The static check: what the compiler can say about a program without running it.
+//
+// **THE RULE THIS PASS IS BUILT ON: IT MAY ONLY REPORT WHAT THE MACHINE WOULD ALSO REFUSE.** slate is
+// dynamically typed and stays that way -- the checker's job is to move a fault from the run that
+// finds it to the compile that could have, and never to invent one. So every relation here mirrors
+// the run-time test exactly (`fits` against `is_kind`), and anything the walk is not sure of is
+// `Any`, which fits everything. A checker that is sometimes wrong is worse than no checker, because
+// a program then has to be written around it.
+//
+// **That is also what makes it gradual rather than optional.** An unannotated parameter is `Any` and
+// says nothing; an annotated one says everything it can. TypeScript's bargain, and the reason
+// `types.sysl` starts from `Any` rather than from a lattice.
+//
+// What it checks today: **a call's arity and its arguments**, against a function whose parameters
+// were annotated, and a **binary operator** whose two sides cannot meet. What it does not yet check
+// is written down at the end of this file.
+
+// -- what fits where -------------------------------------------------------------------------------
+
+// Whether a value known to be `got` may stand where `want` is asked for.
+//
+// **`Any` fits in both directions and that is not a hole**, it is the whole of gradual typing: a
+// value nothing is known about may go anywhere, and anything may go where nothing is asked. Every
+// unknown in the walk becomes `Any`, so this is what keeps the pass from reporting a program it
+// merely failed to understand.
+fits(got: Type, want: Type) -> bool
+    *want.kind match
+        Any -> return true
+        _ -> ()
+
+    *got.kind match
+        Any -> return true
+
+        // **Every alternative must fit, since the value is one of them and nobody knows which.**
+        OneOf(alts) ->
+            for i in 0..<alts.len()
+                if !fits(alts.at(i), want) then return false
+
+            return true
+        _ -> ()
+
+    *want.kind match
+        // One that accepts is enough on this side.
+        OneOf(alts) ->
+            for i in 0..<alts.len()
+                if fits(got, alts.at(i)) then return true
+
+            false
+        NullType -> is_kind_of(got, NullType)
+        BooleanType -> is_kind_of(got, BooleanType)
+        StringType -> is_kind_of(got, StringType)
+
+        // **An integer does NOT fit a `real`, and that mirrors `is_kind`.** Arithmetic promotes one
+        // to the other and a type test does not, so `f(x: real)` given `1` faults at run time --
+        // and a checker that let it through would be describing a different language.
+        // **A `number` on THIS side fits both, because it may be either.** Refusing it would be
+        // refusing a program on the strength of not knowing which one it is, which is the one thing
+        // this pass may not do.
+        IntegerType -> is_kind_of(got, IntegerType) || is_kind_of(got, NumberType)
+        RealType -> is_kind_of(got, RealType) || is_kind_of(got, NumberType)
+        NumberType -> is_kind_of(got, IntegerType) || is_kind_of(got, RealType) || is_kind_of(got, NumberType)
+        ArrayOf(want_element) -> *got.kind match
+            ArrayOf(got_element) -> fits(got_element, want_element)
+            _ -> false
+        ObjectWith(want_keys, want_values) -> *got.kind match
+            // **At least these fields**, which is the object pattern's rule and has to be the type's
+            // too, or one annotation would mean two things.
+            ObjectWith(got_keys, got_values) ->
+                for i in 0..<want_keys.len()
+                    var found = false
+
+                    for j in 0..<got_keys.len()
+                        if got_keys.at(j) == want_keys.at(i) && fits(got_values.at(j), want_values.at(i))
+                            found = true
+
+                    if !found then return false
+
+                true
+            _ -> false
+        // **A named kind fits its own word and nothing else**, which mirrors `is_kind` exactly: each
+        // of them tests one variant of `Value` and no two overlap. There is no promotion here as
+        // there is between an integer and a real -- a date is a date.
+        NamedType(want_name) -> *got.kind match
+            NamedType(got_name) -> got_name == want_name
+            _ -> false
+
+        // A regular expression fits a regular expression and nothing else, which mirrors `is_kind`.
+        RegexType -> is_kind_of(got, RegexType)
+        FunctionType(want_params, _) -> *got.kind match
+            // **Arity only, for now.** A parameter's type is contravariant and slate has no syntax
+            // for writing a function type down, so every function type the walk builds has `Any`
+            // parameters -- a check over them would be a check of `Any` against `Any`.
+            FunctionType(got_params, _) -> got_params.len() == want_params.len() || want_params.is_empty()
+            _ -> false
+        _ -> true
+end fits
+
+is_kind_of(t: Type, k: TypeKind) -> bool
+    *t.kind match
+        NullType -> k match
+            NullType -> true
+            _ -> false
+        BooleanType -> k match
+            BooleanType -> true
+            _ -> false
+        IntegerType -> k match
+            IntegerType -> true
+            _ -> false
+        RealType -> k match
+            RealType -> true
+            _ -> false
+        NumberType -> k match
+            NumberType -> true
+            _ -> false
+        StringType -> k match
+            StringType -> true
+            _ -> false
+        _ -> false
+end is_kind_of
+
+// -- what is known about a name ----------------------------------------------------------------
+
+// The names in scope and what is known about each.
+//
+// **A flat stack with marks rather than a chain of tables**, because this is compile-time and short:
+// a lookup walks backwards to the first match, which is shadowing for free, and leaving a scope is
+// one `truncate`. A chain would need a counted box per scope for a structure that never outlives the
+// walk.
+struct TypeEnv
+    names: Buf[string]
+    types: Buf[Type]
+
+    // **Whether a name may be written to, which only NARROWING needs.** A `var` reassigned inside
+    // the branch that narrowed it makes the narrowed type stale, and a stale type here is too narrow
+    // -- which refuses a program that runs. So a mutable name is never narrowed.
+    settled: Buf[bool]
+    marks: Buf[usize]
+end TypeEnv
+
+type_env() -> TypeEnv = TypeEnv(buf(), buf(), buf(), buf())
+
+enter_scope(e: *TypeEnv)
+    e.marks.push(e.names.len())
+
+leave_scope(e: *TypeEnv)
+    e.marks.pop() match
+        Some(mark) ->
+            e.names.truncate(mark)
+            e.types.truncate(mark)
+            e.settled.truncate(mark)
+        None -> ()
+
+// **AN OBJECT'S SHAPE IS NOT CARRIED BY A NAME, AND THAT IS THE CONSERVATIVE BOUNDARY OF THIS
+// PASS.** An object is mutable and a field may be added to it anywhere -- by the next line, by a
+// function it was passed to, through a second name for the same object -- so a shape recorded when
+// it was built is a claim that goes out of date without anything local saying so. A stale shape is
+// too NARROW, which makes the check refuse a program that runs, and that is the one mistake this
+// pass may not make.
+//
+// **So a shape is checked only where the argument is an object LITERAL written at the call**, which
+// cannot have been touched between being built and being handed over. That is the case the mistake
+// is actually made in -- `distance(here, { x: 0 })` -- and it costs nothing to be sure about.
+// Carrying one through a name wants either immutable records or an escape analysis, and is the next
+// piece of work rather than a thing to guess at.
+note_type(e: *TypeEnv, name: string, t: Type)
+    note_binding(e, name, t, true)
+
+// The same, saying whether the name may later be written to.
+note_binding(e: *TypeEnv, name: string, t: Type, settled: bool)
+    e.names.push(name)
+    e.types.push(unshaped(t))
+    e.settled.push(settled)
+
+private unshaped(t: Type) -> Type
+    *t.kind match
+        ObjectWith(_, _) -> type_of(Any)
+        _ -> t
+
+// **Backwards, so the innermost binding of a name is the one found.**
+known_type(e: *TypeEnv, name: string) -> Type
+    var i = e.names.len()
+
+    loop
+        if i == 0 then return type_of(Any)
+
+        i -= 1
+
+        if e.names.at(i) == name then return e.types.at(i)
+end known_type
+
+// Whether this environment has heard of a name at all.
+//
+// **The same walk `known_type` makes, answering presence rather than a type**, which is the question
+// an undefined name asks: `known_type` answers `Any` for a name it has never seen and for a name it
+// has seen and knows nothing about, and those two are the same answer to a different question.
+has_name(e: *TypeEnv, name: string) -> bool
+    var i = e.names.len()
+
+    loop
+        if i == 0 then return false
+
+        i -= 1
+
+        if e.names.at(i) == name then return true
+
+// Whether a name is one narrowing may say anything about.
+may_narrow(e: *TypeEnv, name: string) -> bool
+    var i = e.names.len()
+
+    loop
+        if i == 0 then return false
+
+        i -= 1
+
+        if e.names.at(i) == name then return e.settled.at(i)
+end may_narrow
+
+// **`x is string` makes `x` a string for as long as the test held.** The feature a reader coming
+// from TypeScript looks for first, and the reason it is safe here is the flag above: a name that may
+// be written to is left alone, so a branch that reassigns what it narrowed cannot leave a stale
+// claim behind.
+//
+// **Only a bare name is narrowed.** `o.f is string` would need to say something about `o` that the
+// next line could undo by writing to the field, and this pass says nothing about an object's fields
+// in the first place.
+narrow_by(cond: Expr, want_true: bool, env: *TypeEnv)
+    *cond.kind match
+        IsPattern(subject, pat, negated) ->
+            // A negated test narrows the OTHER branch, which is the same rule read backwards.
+            if negated == want_true then return
+
+            *subject.kind match
+                Name(name) ->
+                    if !may_narrow(env, name) then return
+
+                    val narrowed = type_from_pattern(resolve_pattern(pat, 0))
+
+                    // A pattern that binds tells us nothing; one that tests tells us everything.
+                    first_binding(pat) match
+                        Some(_) -> ()
+                        None -> note_binding(env, name, narrowed, true)
+                _ -> ()
+
+        // **`a && b` narrows by both**, which is what makes `if x is string && len(x) > 0` work --
+        // the second operand is already inside the first's narrowing when the machine evaluates it.
+        Binary(op, lhs, rhs) ->
+            if op == AndAnd && want_true
+                narrow_by(lhs, true, env)
+                narrow_by(rhs, true, env)
+        _ -> ()
+end narrow_by

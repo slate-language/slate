@@ -1,0 +1,324 @@
+module dev.slatelang.slate
+
+import sh.sysl.libuv
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.str_builder
+
+// Loading a program, running it, and running the tests a file declared.
+//
+// **`prepare` is `run` without the tests, and the two must not drift**: a change to how a program is
+// loaded, compiled or started belongs in both. They are separate rather than factored because `run`
+// answers a `Ran` and `prepare` answers a sentence.
+
+// -- the entry point --------------------------------------------------------------------------------
+
+// Compile a source and everything it imports, and run the lot.
+run(src: Source) -> Ran
+    reset_heap()
+    reset_vm()
+    reset_events()
+    reset_async()
+    reset_types()
+    output.clear()
+
+    val loaded = load_program(src)
+
+    // **Nothing is compiled while anything is wrong with any file**, which is what makes a
+    // diagnostic about a missing export a diagnostic rather than a fault at run time.
+    if !loaded.ok() then return Ran(Null, loaded.report, loaded.srcs, loaded.sources, output)
+
+    current_unit = new_unit()
+    current_unit.packages = loaded.packages
+
+    // **The unit is told about every file before anything is compiled from any of them**, because a
+    // chunk is stamped with an index into this list and a fault carries the same index out.
+    for i in 0..<loaded.sources.len()
+        current_unit.sources.push(loaded.sources.at(i))
+
+    // Post-order, so a module is compiled -- and later run -- only once everything it imports has
+    // been. The entry is the last of them.
+    for i in 0..<loaded.order.len()
+        val which = loaded.order.at(i)
+
+        compile_module(&current_unit, loaded.programs.at(which), which, loaded.sources.at(which).name, which == 0)
+
+    // **The compiler has complaints of its own, and they stop the program exactly as the parser's
+    // do.** A name in a pattern that turned out to be a binding where a type was wanted is knowable
+    // only once the types are resolved, which is here rather than while parsing.
+    if compile_went_wrong()
+        var found = loaded.report
+        var found_srcs = loaded.srcs
+
+        found.absorb(compile_report())
+
+        val more = compile_report_srcs()
+
+        for i in 0..<more.len()
+            found_srcs.push(more.at(i))
+
+        return Ran(Null, found, found_srcs, loaded.sources, output)
+    end if
+
+    // **TWO scopes, because a built-in module sees names a program does not.** `natives` holds every
+    // builtin and is what `slate:time`'s own chunk is run against -- it is a `LoadName` per export and
+    // has to find them. `core` holds the ones no module has taken, and is what a program's own files
+    // run against, so `date(...)` without an import is the run-time fault it should be.
+    var natives = new_env(null)
+    var core = new_env(null)
+
+    hold_env(natives)
+    hold_env(core)
+    install_builtins(natives)
+    install_core(core)
+
+    var rep = loaded.report
+
+    // **The report and the file list are copied out of `loaded` because a fault appends to both.**
+    // The signal the program stopped with carries the file its span belongs to, so the pair stays in
+    // step exactly as the parse-time ones did.
+    var srcs = loaded.srcs
+
+    // **The program runs, and then the loop drains.** A slate program with a timer or a pending
+    // `await` in it does not exit when its last statement does, which is node's rule and the whole
+    // point of having a loop.
+    //
+    // **A failure nothing was waiting for is the program's failure**, checked once everything has
+    // settled: until then there is no telling a promise that will be awaited on the next line from
+    // one that never will be.
+    val answer: Step = run_modules(natives, core) match
+        Ok(v) -> drain_events() match
+            Ok(_) -> unhandled_rejection() match
+                Some(s) -> Err(s)
+                None -> Ok(v)
+            Err(s) -> Err(s)
+        Err(s) -> Err(s)
+
+    answer match
+        Ok(v) -> Ran(v, rep, srcs, loaded.sources, output)
+        Err(s) ->
+            rep.add(error(signal_span(s), signal_message(s)))
+            srcs.push(signal_source(s))
+            Ran(Null, rep, srcs, loaded.sources, output)
+end run
+
+// -- running the tests a file declared -------------------------------------------------------------
+
+// How one `@test` went.
+struct TestRan
+    name: string
+    ok: bool
+
+    // The failure, rendered against the file that raised it. Empty where it passed.
+    said: string
+
+    // What the test printed, which is worth showing only when it did not pass.
+    printed: string
+
+    // How long it took, in milliseconds.
+    ms: u64
+end TestRan
+
+// Everything `slate test` found in one file.
+struct Tested
+    // Empty unless the file would not load or would not compile, in which case no test ran.
+    report: string
+
+    results: Buf[TestRan]
+
+    passed(self) -> usize
+        var n: usize = 0
+
+        for i in 0..<self.results.len()
+            if self.results.at(i).ok then n += 1
+
+        n
+    end passed
+
+    failed(self) -> usize = self.results.len() - self.passed()
+end Tested
+
+// Load a file, run its top level, and then run every `@test` it declared.
+//
+// **The top level runs first and its faults are the file's, not any test's.** A file whose module
+// body fails has no working tests to speak of, so that is reported as the file failing to load
+// rather than as every test failing for the same reason.
+run_tests(src: Source) -> Tested
+    val started = prepare(src)
+
+    if started != "" then return Tested(started, buf())
+
+    // The tests were registered as the entry module ran, and the closures in `registered_tests` are
+    // what keep their module's scope -- and everything they can see -- alive.
+    var results: Buf[TestRan] = buf()
+
+    for i in 0..<registered_tests.len()
+        results.push(run_one_test(registered_tests.at(i)))
+
+    Tested("", results)
+end run_tests
+
+// Everything `run` does up to and including the modules, answering a rendered complaint or nothing.
+private prepare(src: Source) -> string
+    reset_heap()
+    reset_vm()
+    reset_events()
+    reset_async()
+    reset_types()
+    output.clear()
+
+    val loaded = load_program(src)
+
+    if !loaded.ok() then return Ran(Null, loaded.report, loaded.srcs, loaded.sources, output).render()
+
+    current_unit = new_unit()
+    current_unit.packages = loaded.packages
+
+    for i in 0..<loaded.sources.len()
+        current_unit.sources.push(loaded.sources.at(i))
+
+    for i in 0..<loaded.order.len()
+        val which = loaded.order.at(i)
+
+        compile_module(&current_unit, loaded.programs.at(which), which, loaded.sources.at(which).name, which == 0)
+
+    if compile_went_wrong()
+        var found = loaded.report
+        var found_srcs = loaded.srcs
+
+        found.absorb(compile_report())
+
+        val more = compile_report_srcs()
+
+        for i in 0..<more.len()
+            found_srcs.push(more.at(i))
+
+        return Ran(Null, found, found_srcs, loaded.sources, output).render()
+    end if
+
+    var natives = new_env(null)
+    var core = new_env(null)
+
+    hold_env(natives)
+    hold_env(core)
+    install_builtins(natives)
+    install_core(core)
+
+    run_modules(natives, core) match
+        Err(sig) -> return complaint(sig)
+        Ok(_) -> ()
+
+    drain_events() match
+        Err(sig) -> return complaint(sig)
+        Ok(_) -> ()
+
+    unhandled_rejection() match
+        Some(sig) -> complaint(sig)
+        None -> ""
+end prepare
+
+// One signal, drawn against the file it came from.
+private complaint(sig: Signal) -> string
+    var rep = report()
+    var srcs: Buf[usize] = buf()
+
+    rep.add(error(signal_span(sig), signal_message(sig)))
+    srcs.push(signal_source(sig))
+    Ran(Null, rep, srcs, current_unit.sources, output).render()
+end complaint
+
+// One test: call it, let the loop settle, and read the verdict.
+//
+// **An `async` test is waited for rather than refused.** Calling one starts a coroutine and hands
+// back a promise that has not settled, so a runner that read the answer straight away would call
+// every asynchronous test a pass. The promise is marked handled first, so that a failure is reported
+// here as this test's rather than at the end of the drain as the file's.
+private run_one_test(t: TestCase) -> TestRan
+    val began = libuv.hrtime()
+    var args: Buf[Value] = buf()
+
+    output.clear()
+
+    val outcome = apply(t.fn, args, point(0))
+
+    outcome match
+        Ok(v) ->
+            v match
+                Promise(pr) -> pr.handled = true
+                _ -> ()
+
+            val after = drain_events() match
+                Err(sig) -> complaint(sig)
+                Ok(_) -> unhandled_rejection() match
+                    Some(sig) -> complaint(sig)
+                    None -> awaited_verdict(v)
+
+            finished(t, after, began)
+        Err(sig) -> finished(t, complaint(sig), began)
+end run_one_test
+
+// What an `async` test's promise came to, once the loop has run it to the end.
+private awaited_verdict(v: Value) -> string
+    v match
+        Promise(pr) ->
+            if !pr.settled
+                return "this test never finished -- something it awaited was never going to settle"
+
+            if pr.failed then said_at(pr.message, pr.at) else ""
+        _ -> ""
+end awaited_verdict
+
+// A message and a place, drawn against the file the machine was last in.
+private said_at(message: string, at: Span) -> string
+    var rep = report()
+    var srcs: Buf[usize] = buf()
+
+    rep.add(error(at, message))
+    srcs.push(current_source)
+    Ran(Null, rep, srcs, current_unit.sources, output).render()
+end said_at
+
+private finished(t: TestCase, said: string, began: u64) -> TestRan
+    var out = str_builder()
+
+    for i in 0..<output.len()
+        if i > 0 then out.push_char('\n')
+
+        out.push(output.at(i))
+
+    TestRan(t.name, said == "", said, out.finish(), (libuv.hrtime() - began) / 1000000)
+end finished
+
+// Every module in turn, each in a scope of its own under the builtins.
+//
+// **A module gets its own scope and not a shared one**, which is the whole of what makes a file's
+// top-level `val` private to it: nothing but what the file exported can be reached from outside, and
+// two files may each call something `helper` without either knowing.
+//
+// The value answered is the entry module's exports, the entry being the last to run.
+private run_modules(natives: *EnvObj, core: *EnvObj) -> Step
+    var last: Value = Null
+
+    for i in 0..<current_unit.modules.len()
+        // **One of slate's own modules is compiled against every builtin; a program's file is not.**
+        // The module's chunk is a `LoadName` per export and nothing else, so it has to be able to see
+        // what it exports -- and a program that has not imported a name must not.
+        val scope = new_env(if is_slate_module(current_unit.module_paths.at(i)) then natives else core)
+        val mark = env_mark()
+
+        hold_env(scope)
+
+        val answer = run_chunk(&current_unit, current_unit.modules.at(i), scope)
+
+        release_env(mark)
+
+        answer match
+            Ok(v) ->
+                // **Pushed with nothing allocated in between**, so the object cannot be swept
+                // between being answered and becoming a root.
+                module_values.push(v)
+                last = v
+            Err(s) -> return Err(s)
+
+    Ok(last)
+end run_modules

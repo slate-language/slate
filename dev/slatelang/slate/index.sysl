@@ -1,0 +1,395 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// Reading out of a container and writing into one, and the ranges that slice it.
+//
+// **Split out of `runtime.sysl`.** A slate string is counted in characters and never in bytes, so
+// every offset that leaves here has crossed through `text.sysl` first.
+
+// -- ranges ---------------------------------------------------------------------------------------
+
+// How many whole numbers a range covers. A `for` walks exactly this many.
+//
+// Not `private`: `builtin.sysl` answers `len` of one.
+range_count(lo: long, hi: long, inclusive: bool) -> usize
+    val last = if inclusive then hi else hi - 1
+
+    if last < lo then 0 else usize(last - lo + 1)
+
+// The half-open pair a range picks out of something `n` long, with the ends it did not name taken
+// from that length and every end held inside it.
+//
+// Not `private`: the machine slices with it too.
+range_within(r: Value, n: usize, at: Span) -> Result[(usize, usize), Signal]
+    r match
+        RangeVal(lo, hi, inclusive, has_lo, has_hi) ->
+            val start = if has_lo then lo else 0
+            val stop = if has_hi then (if inclusive then hi + 1 else hi) else long(n)
+
+            if start < 0 || stop < start || usize(stop) > n
+                return Err(failure(at, s"this slice runs from ${start} to ${stop}, which is outside something ${n} long"))
+
+            Ok((usize(start), usize(stop)))
+        other -> Err(failure(at, s"a slice is taken with a range, and this is ${other.type_name()}"))
+end range_within
+
+// -- reading ------------------------------------------------------------------------------------
+
+read_at(container: Value, k: Value, at: Span) -> Step
+    container match
+        Array(items) ->
+            k match
+                Int(i) ->
+                    if i < 0 || usize(i) >= items.items.len()
+                        return fault(at, s"the index ${i} is outside an array of ${items.items.len()}")
+
+                    Ok(items.items.at(usize(i)))
+
+                // **A range subscript is a slice, and it is what an open end is FOR.** `xs[2..]`
+                // takes an end from the array, which is the reading that makes a range with a side
+                // missing mean something rather than being syntax with nowhere to go.
+                RangeVal(_, _, _, _, _) ->
+                    val bounds = range_within(k, items.items.len(), at)?
+                    var out: Buf[Value] = buf()
+                    var i = bounds.0
+
+                    while i < bounds.1
+                        out.push(items.items.at(i))
+                        i += 1
+
+                    Ok(Array(new_array(out)))
+                other -> fault(at, s"an array is indexed by an integer, and this is ${other.type_name()}")
+        Object(fields) ->
+            k match
+                _ -> Ok(obj_get(fields, k, at)?.unwrap_or(Undefined))
+                other -> fault(at, s"an object is indexed by a string, and this is ${other.type_name()}")
+        Str(sv) ->
+            // **Both of these count CHARACTERS.** A string is a sequence of characters in slate and
+            // never of bytes, so a position here is one a person would count -- and an index into
+            // the bytes would hand back half of one wherever the text was not ASCII.
+            val n = char_count(sv.s)
+
+            k match
+                // **A character is a string of one**, there being no character type -- which is
+                // Python's answer and is what lets `s[i]`, `chars(s)` and `split` all hand back the
+                // same kind of thing.
+                Int(i) ->
+                    if i < 0 || usize(i) >= n
+                        return fault(at, s"the index ${i} is outside a string of ${n} characters")
+
+                    Ok(str_value(char_slice(sv.s, usize(i), usize(i) + 1)))
+                RangeVal(_, _, _, _, _) ->
+                    val bounds = range_within(k, n, at)?
+
+                    Ok(str_value(char_slice(sv.s, bounds.0, bounds.1)))
+                other -> fault(at, s"a string is not indexed by ${other.type_name()}")
+        other -> fault(at, s"${other.type_name()} cannot be indexed")
+end read_at
+
+// **A field that is not there reads as `null` rather than faulting**, which is the choice every
+// dynamically typed language with objects makes: a record grows fields over its life, and `o.maybe`
+// is how a program asks whether this one has.
+read_field(target: Value, name: string, at: Span) -> Step
+    target match
+        Object(fields) ->
+            val found = field_from(fields, name, at)?
+
+            Ok(found.0)
+
+        // **A builtin type has methods and no fields**, so `xs.map` hands back the plain builtin --
+        // the same thing `o.m` hands back for an object, and called the same way. Anything that is
+        // not a method of this kind is a fault rather than the `undefined` an object answers with,
+        // because a builtin's set of names is closed and a missing one is a mistake.
+        other ->
+            builtin_method(other, name) match
+                Some(f) -> Ok(Native(f))
+                None -> fault(at, no_such_method(other, name))
+
+// How far a chain of prototypes may go before slate decides it is a circle.
+//
+// **A `proto` is an ordinary field, so a program can make one point at itself** -- and a lookup that
+// misses would then walk forever with nothing to report. The limit is generous enough that no honest
+// arrangement reaches it and small enough that the mistake is a sentence rather than a hang.
+private const MaxProtoDepth: usize = 64
+
+// A field, and whether it came from a PROTO rather than from the object itself.
+//
+// **That second answer is the whole of slate's receiver rule.** A method stored on the object has
+// already captured what it needs -- `p.equals = o -> o.x == p.x` is the shape slate has always
+// written -- and one shared through a proto demonstrably cannot have, there being one of it for
+// every instance. So the shared kind is handed the object and the captured kind is not, and the
+// difference is not a special case but the actual distinction between the two.
+//
+// Absent everywhere is `Undefined`, which is what a missing field has always been.
+field_from(o: *ObjectObj, name: string, at: Span) -> Result[(Value, bool), Signal]
+    obj_get_name(o, name) match
+        Some(v) -> return Ok((v, false))
+        None -> ()
+
+    var up = o
+    var depth: usize = 0
+
+    loop
+        val next = obj_get_name(up, "proto") match
+            Some(Object(p)) -> p
+            _ -> return Ok((Undefined, false))
+
+        obj_get_name(next, name) match
+            Some(v) -> return Ok((v, true))
+            None -> ()
+
+        depth += 1
+
+        if depth >= MaxProtoDepth
+            return Err(failure(at, s"this object's `proto` chain is more than ${MaxProtoDepth} deep, which means it is a circle -- looking up `${name}` would never finish"))
+
+        up = next
+end field_from
+
+// A builtin method and the receiver rule's answer for it, in the shape `field_from` uses.
+//
+// **A builtin method is always delegated to**, which is what the `true` says: it is the free
+// function of that name and the receiver is its first argument, so it is exactly the case a proto
+// method is -- one implementation shared by every value of the kind, which therefore has to be told
+// which one it is working on.
+builtin_receiver(target: Value, name: string, at: Span) -> Result[(Value, bool), Signal] =
+    builtin_method(target, name) match
+        Some(f) -> Ok((Native(f), true))
+        None -> Err(failure(at, no_such_method(target, name)))
+
+// Call a value with arguments already evaluated.
+//
+// **No calling scope is passed, and that is what a closure means.** The body runs in a child of the
+// scope the closure *captured*, so nothing about where the call was written matters -- which is also
+// what lets `==` call a user-supplied `equals` from inside a table lookup, where there is no
+// interpreter scope to hand over.
+apply(f: Value, vals: Buf[Value], at: Span) -> Step
+    f match
+        Native(f) -> call_native(f, vals, at)
+        Fn(c) ->
+            if vals.len() != c.params.len()
+                return fault(at, s"this function takes ${c.params.len()} arguments and was given ${vals.len()}")
+
+            // **An `async` function starts a coroutine wherever it is called from**, including from a
+            // native -- a timer callback, a user `equals`. Running its body here instead would put an
+            // `await` under a sysl frame that cannot be captured, which is the one thing the machine
+            // exists to avoid.
+            if current_unit.chunks.at(c.body).is_async
+                return start_async(c, vals, at)
+
+            // **And a generator is PREPARED here too, for the same reason.** `invoke` routes both,
+            // and this is the other call path -- a function reached from a native, a callback, a
+            // `map`. Missing it would run a generator's body under a sysl frame that cannot be set
+            // aside, which is the one thing the machine exists to avoid.
+            if current_unit.chunks.at(c.body).is_gen
+                return start_generator(c, vals, at)
+
+            val emark = env_mark()
+            val scope = new_env(c.scope)
+
+            hold_env(scope)
+
+            for i in 0..<c.params.len()
+                declare(scope, c.params.at(i), vals.at(i), true)
+
+            // The annotation is the one the compiler asks for: a bare `Ok`/`Err` pair in a `match`
+            // used as a value has nothing on the line to say what the other half is.
+            val answer = run_chunk(&current_unit, c.body, scope)
+
+            release_env(emark)
+            answer
+        other -> fault(at, s"${other.type_name()} is not something that can be called")
+end apply
+
+// What to say when a destructuring binding does not fit.
+//
+// **A `match` arm that does not fit needs no sentence and a binding does**, there being no next arm
+// to try -- so this is the one place a pattern's failure has to be explained. `write_pattern`'s
+// s-expression form is for reading a parse and would send the reader to the wrong thing here; what
+// they need is which of the two halves is wrong, so each arm names the shape it wanted and the
+// thing that arrived.
+unpack_complaint(pat: Pattern, v: Value) -> string
+    *pat.kind match
+        ArrayPat(items, open, _) ->
+            v match
+                Array(a) ->
+                    val least = if open then "at least " else ""
+
+                    if a.items.len() == items.len()
+                        return "this array has the right number of elements, and one of them does not fit the binding"
+
+                    s"this binding takes ${least}${items.len()} elements out of an array, and this one has ${a.items.len()}"
+                other -> s"this binding takes an array apart, and this is ${other.type_name()}"
+        ObjectPat(keys, _) ->
+            v match
+                Object(o) ->
+                    for i in 0..<keys.len()
+                        if obj_get_name(o, keys.at(i)).is_none()
+                            return s"this object has no field called `${keys.at(i)}`, which this binding takes out of it"
+
+                    "every field this binding names is there, and one of them does not fit"
+                other -> s"this binding takes an object apart, and this is ${other.type_name()}"
+        _ -> s"this value does not fit the binding -- it is ${show_value(v)}"
+end unpack_complaint
+
+// Whether a pattern matches a value, binding its names into `scope` as it goes.
+//
+// **`assignable` is what a destructuring `var` needs and nothing else uses.** A name a `match` arm
+// or an `is` introduces is a `val` -- it is the arm's reading of the subject and there is nothing to
+// write it back to -- so every caller but `Unpack` passes false.
+//
+// **It answers a bare `bool` rather than a `Step`, and that is deliberate**: nothing a pattern does
+// can fail at runtime. There is no arithmetic in one, no call, and no index that could be out of
+// range -- a pattern that does not fit simply does not fit, which is an answer and not a fault.
+match_pattern(pat: Pattern, v: Value, scope: *EnvObj, assignable: bool) -> bool
+    *pat.kind match
+        Wild -> true
+        Bind(name) ->
+            // Bound as a `val`: a name a pattern introduced is not a place to write to.
+            declare(scope, name, v, assignable)
+            true
+        TypePat(test) -> is_kind(v, test)
+        At(name, inner) ->
+            // **The sub-pattern runs first, and the whole value is bound only if it took.** The
+            // other order would leave the name bound after a failed arm -- which the arm's own
+            // scope would throw away anyway, but only by accident rather than by rule.
+            if !match_pattern(inner, v, scope, assignable) then return false
+
+            declare(scope, name, v, assignable)
+            true
+        IntPat(want) -> same_literal(v, Int(want))
+        RealPat(want) -> same_literal(v, Real(want))
+        StrPat(want) -> v match
+            // Compared against the sysl `string` directly, so a pattern never boxes one onto the
+            // collected heap just to throw it away.
+            Str(p) -> p.s == want
+            _ -> false
+        BoolPat(want) -> same_literal(v, Bool(want))
+        NullPat -> v match
+            Null -> true
+            _ -> false
+        ArrayPat(items, open, rest) -> match_array(items, open, rest, v, scope, assignable)
+        ObjectPat(keys, values) -> match_object(keys, values, v, scope, assignable)
+        OrPat(alts) ->
+            for i in 0..<alts.len()
+                if match_pattern(alts.at(i), v, scope, assignable) then return true
+
+            false
+end match_pattern
+
+// `[a, b]` and `[first, ...rest]`.
+private match_array(items: Buf[Pattern], open: bool, rest: Option[string], v: Value, scope: *EnvObj, assignable: bool) -> bool
+    v match
+        Array(xs) ->
+            // A closed pattern must agree on length exactly; an open one treats the fixed patterns
+            // as a floor.
+            val fixed = items.len()
+
+            if open
+                if xs.items.len() < fixed then return false
+            else
+                if xs.items.len() != fixed then return false
+
+            for i in 0..<fixed
+                if !match_pattern(items.at(i), xs.items.at(i), scope, assignable) then return false
+
+            // The tail is only gathered where it is named. `[a, ...]` allocates nothing.
+            rest match
+                Some(name) ->
+                    var tail: Buf[Value] = buf()
+
+                    for i in fixed..<xs.items.len()
+                        tail.push(xs.items.at(i))
+
+                    declare(scope, name, Array(new_array(tail)), assignable)
+                None -> ()
+
+            true
+        _ -> false
+end match_array
+
+// `{ name: n }`.
+//
+// **An object pattern matches an object with *at least* these fields.** A record grows fields over
+// its life, so a pattern that broke whenever one was added would be a pattern nobody could keep
+// working -- and a program that wants exactness can ask `len(o)`.
+private match_object(keys: Buf[string], values: Buf[Pattern], v: Value, scope: *EnvObj, assignable: bool) -> bool
+    v match
+        Object(fields) ->
+            for i in 0..<keys.len()
+                obj_get_name(fields, keys.at(i)) match
+                    None -> return false
+                    Some(field) -> if !match_pattern(values.at(i), field, scope, assignable) then return false
+
+            true
+        _ -> false
+end match_object
+
+// Whether a value is of a kind.
+//
+// **`num` is the only one that is not a single variant**, being the union of `int` and `real` --
+// which is what a pattern guarding arithmetic wants, and is why it is in the list at all.
+private is_kind(v: Value, test: TypeTest) -> bool
+    test match
+        IsNull -> v match
+            Null -> true
+            _ -> false
+        IsBool -> v match
+            Bool(_) -> true
+            _ -> false
+        IsInt -> v match
+            Int(_) -> true
+            _ -> false
+        IsReal -> v match
+            Real(_) -> true
+            _ -> false
+        IsNum -> v match
+            Int(_) -> true
+            Real(_) -> true
+            _ -> false
+        IsStr -> v match
+            Str(_) -> true
+            _ -> false
+        IsArray -> v match
+            Array(_) -> true
+            _ -> false
+        IsObject -> v match
+            Object(_) -> true
+            _ -> false
+        IsFn -> v match
+            Fn(_) -> true
+            Native(_) -> true
+            _ -> false
+        IsInstant -> v match
+            InstantVal(_) -> true
+            _ -> false
+        IsDuration -> v match
+            DurationVal(_) -> true
+            _ -> false
+        IsDate -> v match
+            DateVal(_) -> true
+            _ -> false
+        IsTime -> v match
+            TimeVal(_) -> true
+            _ -> false
+        IsDateTime -> v match
+            DateTimeVal(_, _) -> true
+            _ -> false
+        IsZone -> v match
+            ZoneVal(_) -> true
+            _ -> false
+        IsZoned -> v match
+            ZonedVal(_, _) -> true
+            _ -> false
+        IsPeriod -> v match
+            PeriodVal(_, _) -> true
+            _ -> false
+        IsGen -> v match
+            Gen(_, _) -> true
+            _ -> false
+        IsRegex -> v match
+            RegexVal(_) -> true
+            _ -> false
+end is_kind

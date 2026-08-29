@@ -1,0 +1,465 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// An expression to instructions.
+//
+// **`compile.sysl` is the other half** -- the entry, the types, and the statements -- and the two
+// are one pass split at the seam a reader already reads them at. Everything shared is either
+// `emit.sysl`'s or one of the eight names `compile.sysl` leaves public for this file, each of which
+// says so where it is declared.
+
+// -- expressions ----------------------------------------------------------------------------------
+
+compile_expr(u: *Unit, e: *Emit, x: Expr)
+    val at = x.span
+
+    *x.kind match
+        IntLit(v) -> push_n(e, PushInt(v), at, 0, 1)
+        RealLit(v) -> push_n(e, PushReal(v), at, 0, 1)
+        BoolLit(v) -> push_n(e, PushBool(v), at, 0, 1)
+        StrLit(v) -> push_n(e, PushStr(intern_str(u, v)), at, 0, 1)
+        NullLit -> push_n(e, PushNil, at, 0, 1)
+        UndefinedLit -> push_n(e, PushUndefined, at, 0, 1)
+        Name(n) -> push_n(e, LoadName(intern_str(u, n)), at, 0, 1)
+
+        // **Nothing reaches this arm today and it is not dead code.** The parser builds a `Spread`
+        // in a call's argument list and nowhere else, so `val a = ...xs` is refused by the parser as
+        // an expression it cannot start; the arm is here because the match is exhaustive, and it
+        // says the useful thing rather than `unreachable` in case a later grammar lets one through.
+        Spread(_) -> complain_here(at, "`...` spreads an argument list, and may only be written inside a call's brackets")
+        Unary(op, rhs) ->
+            compile_expr(u, e, rhs)
+            push_n(e, UnaryOp(op), at, 1, 1)
+        Binary(op, lhs, rhs) -> compile_binary(u, e, op, lhs, rhs, at)
+        Compare(operands, ops) -> compile_compare(u, e, operands, ops, at)
+        Range(lo, hi, inclusive) ->
+            lo match
+                Some(x) -> compile_expr(u, e, x)
+                None -> ()
+
+            hi match
+                Some(x) -> compile_expr(u, e, x)
+                None -> ()
+
+            val ends: usize = (if lo.is_some() then 1 else 0) + (if hi.is_some() then 1 else 0)
+
+            push_n(e, MakeRange(inclusive, lo.is_some(), hi.is_some()), at, ends, 1)
+        IsPattern(subject, pat, negated) ->
+            compile_expr(u, e, subject)
+            push_n(e, IsPat(intern_resolved(u, pat), negated), at, 1, 1)
+        IncDec(target, up, before) -> compile_inc_dec(u, e, target, up, before, at)
+        Call(callee, args) ->
+            // **`o.m(a)` is compiled as one thing, because that is the only form a receiver is
+            // passed for.** Everything else -- a name, a call answering a function, an element of an
+            // array -- is an ordinary call of whatever it evaluated to.
+            *callee.kind match
+                Field(target, name, optional) ->
+                    compile_expr(u, e, target)
+
+                    // `o?.m(a)` does not evaluate its arguments where there is nothing to call the
+                    // method on, which is what makes the guard worth having over a test afterwards.
+                    val short = if optional then Some(push_n(e, JumpIfAbsentKeep(0), at, 0, 0)) else None
+
+                    if has_spread(args)
+                        compile_spread_args(u, e, args, at)
+                        push_n(e, CallMethodSpread(intern_str(u, name)), at, 2, 1)
+                    else
+                        for i in 0..<args.len()
+                            compile_expr(u, e, args.at(i))
+
+                        push_n(e, CallMethod(intern_str(u, name), args.len()), at, args.len() + 1, 1)
+
+                    short match
+                        Some(where) ->
+                            val done = put(e, Jump(0), at)
+
+                            patch(e, where, here(e))
+                            push_n(e, Pop, at, 1, 0)
+                            push_n(e, PushNil, at, 0, 1)
+                            patch(e, done, here(e))
+                        None -> ()
+                _ ->
+                    compile_expr(u, e, callee)
+
+                    if has_spread(args)
+                        compile_spread_args(u, e, args, at)
+                        push_n(e, CallSpread, at, 2, 1)
+                    else
+                        for i in 0..<args.len()
+                            compile_expr(u, e, args.at(i))
+
+                        push_n(e, CallFn(args.len()), at, args.len() + 1, 1)
+        Index(t, key) ->
+            compile_expr(u, e, t)
+            compile_expr(u, e, key)
+            push_n(e, GetIndex, at, 2, 1)
+        Field(t, name, optional) ->
+            compile_expr(u, e, t)
+
+            if !optional
+                push_n(e, GetField(intern_str(u, name)), at, 1, 1)
+            else
+                // **The two paths leave one value where one stood**, so the counter needs no
+                // correction: `GetField` takes one and gives one, and the other arm drops the
+                // nullish subject and pushes `null` in its place.
+                val short = push_n(e, JumpIfAbsentKeep(0), at, 0, 0)
+
+                push_n(e, GetField(intern_str(u, name)), at, 1, 1)
+
+                val done = put(e, Jump(0), at)
+
+                patch(e, short, here(e))
+                push_n(e, Pop, at, 1, 0)
+                push_n(e, PushNil, at, 0, 1)
+                patch(e, done, here(e))
+        Interp(pieces) ->
+            for i in 0..<pieces.len()
+                compile_expr(u, e, pieces.at(i))
+
+            push_n(e, Join(pieces.len()), at, pieces.len(), 1)
+        ArrayRepeat(value, count) ->
+            compile_expr(u, e, value)
+            compile_expr(u, e, count)
+            push_n(e, Repeat, at, 2, 1)
+        WithFields(base, keys, values) ->
+            compile_expr(u, e, base)
+
+            for i in 0..<keys.len()
+                push_n(e, PushStr(intern_str(u, keys.at(i))), at, 0, 1)
+                compile_expr(u, e, values.at(i))
+
+            push_n(e, WithObject(keys.len()), at, keys.len() * 2 + 1, 1)
+        ArrayLit(items) ->
+            for i in 0..<items.len()
+                compile_expr(u, e, items.at(i))
+
+            push_n(e, MakeArray(items.len()), at, items.len(), 1)
+        ObjectLit(keys, _, values) ->
+            for i in 0..<keys.len()
+                push_n(e, PushStr(intern_str(u, keys.at(i))), at, 0, 1)
+                compile_expr(u, e, values.at(i))
+
+            push_n(e, MakeObject(keys.len()), at, keys.len() * 2, 1)
+        Lambda(params, body, is_async) ->
+            val c = compile_chunk(u, params, body_at(body), "a function", is_async, body_is_gen(body))
+
+            push_n(e, MakeClosure(c), at, 0, 1)
+        Yield(inner) ->
+            compile_expr(u, e, inner)
+
+            // Refused the way `await` outside an `async` function is, and for its reason: the tree is
+            // compiled with no report to write into, so the refusal is an instruction that faults
+            // where it stands. It is only reachable at the top level of a file -- a `yield` anywhere
+            // inside a function has made that function a generator by being there.
+            // **An `async` function may not yield, and the refusal is here rather than nowhere.**
+            // The two are the same machinery pointed in different directions -- a coroutine resumed
+            // by the scheduler against one resumed by its caller -- and a body that did both would
+            // have two things entitled to put it back and no answer for which. An async generator is
+            // a real feature in other languages and would be its own piece of work.
+            if e.is_async
+                push_n(e, FailWith(intern_str(u, "an `async` function may not `yield` -- an async generator is not slate")), at, 1, 1)
+            elif e.is_gen
+                push_n(e, Op.Yield, at, 1, 1)
+            else
+                push_n(e, FailWith(intern_str(u, "`yield` belongs inside a function")), at, 1, 1)
+        Await(inner) ->
+            compile_expr(u, e, inner)
+
+            // **Refused the way `break` outside a loop is**, with an instruction that faults where it
+            // stands: the tree is compiled without a report to write into, and a fault carrying this
+            // span points at the same character a parse error would have.
+            if e.is_async
+                push_n(e, Op.Await, at, 1, 1)
+            else
+                push_n(e, FailWith(intern_str(u, "`await` belongs in an `async` function")), at, 1, 1)
+        Block(stmts) ->
+            push_n(e, PushScope, at, 0, 0)
+            e.scopes += 1
+            compile_stmts(u, e, stmts, at)
+            push_n(e, PopScope, at, 0, 0)
+            e.scopes -= 1
+        Ensures(value, declared, pat) ->
+            compile_expr(u, e, value)
+
+            val shape = resolve_pattern(pat, 0)
+
+            // **Pointed at the ANNOTATION and not at the body.** `at` here is the wrapped
+            // expression, which is the whole function; the pattern's own span is the `-> Nope` a
+            // reader has to change.
+            first_binding(shape) match
+                Some(loose) -> complain_here(pat.span, s"`${loose}` is not a type, so `-> ${loose}` would check nothing${instead_of(loose)}")
+                None -> ()
+
+            push_n(e, CheckResult(intern_str(u, declared), intern_pattern(u, shape)), at, 0, 0)
+        TryCatch(body, name, handler) -> compile_try(u, e, body, name, handler, at)
+        IfExpr(cond, then_branch, else_branch) -> compile_if(u, e, cond, then_branch, else_branch, at)
+        MatchExpr(subject, arms) -> compile_match(u, e, subject, arms, at)
+        While(label, cond, body, otherwise) -> compile_while(u, e, label, cond, body, otherwise, at)
+        For(label, binding, iter, body, otherwise) -> compile_for(u, e, label, binding, iter, body, otherwise, at)
+        Loop(label, body) -> compile_loop(u, e, label, body, at)
+        DoWhile(label, body, cond, otherwise) -> compile_do_while(u, e, label, body, cond, otherwise, at)
+
+        // A program with one of these in it is never run: `parse` reports first.
+        Bad -> push_n(e, FailWith(intern_str(u, "this expression did not parse")), at, 0, 1)
+end compile_expr
+
+// A chain of comparisons, which is one comparison.
+//
+// **The middle operand is evaluated once and kept on the stack**, which is the whole difference from
+// `a < b && b < c` written out: `a < f() < c` calls `f` a single time. Each step keeps a copy of the
+// right operand to be the next step's left, and a step that answers false jumps to a common exit
+// where whatever is still standing is dropped.
+private compile_compare(u: *Unit, e: *Emit, operands: Buf[Expr], ops: Buf[Tok], at: Span)
+    compile_expr(u, e, operands.at(0))
+
+    var short: Buf[usize] = buf()
+    val last = ops.len() - 1
+
+    for i in 0..<ops.len()
+        compile_expr(u, e, operands.at(i + 1))
+
+        if i == last
+            push_n(e, BinaryOp(ops.at(i)), at, 2, 1)
+        else
+            // Keep the right operand: it is the next step's left.
+            push_n(e, Dup, at, 0, 1)
+            push_n(e, RotUp(2), at, 0, 0)
+            push_n(e, BinaryOp(ops.at(i)), at, 2, 1)
+            short.push(push_n(e, JumpIfFalse(0), at, 1, 0))
+
+    val done = put(e, Jump(0), at)
+
+    // Reached with one value on the stack -- the operand the failing step had kept -- so the height
+    // is the same on both paths and the counter needs no correction.
+    val fail = here(e)
+
+    for i in 0..<short.len()
+        patch(e, short.at(i), fail)
+
+    push_n(e, Pop, at, 1, 0)
+    push_n(e, PushBool(false), at, 0, 1)
+    patch(e, done, here(e))
+end compile_compare
+
+// `++x`, `x++`, and the two decrements.
+//
+// **Prefix and postfix differ only in WHICH value is kept**, so both are the same four moves: read
+// the old value, put the one to keep out of the way underneath, copy it back to be written, write.
+// Whether any of these arguments was written `...xs`.
+private has_spread(args: Buf[Expr]) -> bool
+    for i in 0..<args.len()
+        *args.at(i).kind match
+            Spread(_) -> return true
+            _ -> ()
+
+    false
+
+// An argument list that is not known until it runs, left on the stack as one array.
+//
+// **A run of written arguments becomes an array and each spread is already one**, and `JoinArrays`
+// makes one list of them -- so `f(a, ...xs, b)` works and the written and the spread arguments may
+// be in any order. Building it element by element would have needed an append instruction and a
+// place to keep the array between elements; this way the machine's array is built by the instruction
+// that already builds arrays.
+private compile_spread_args(u: *Unit, e: *Emit, args: Buf[Expr], at: Span)
+    var groups: usize = 0
+    var run: usize = 0
+
+    for i in 0..<args.len()
+        *args.at(i).kind match
+            Spread(inner) ->
+                if run > 0
+                    push_n(e, MakeArray(run), at, run, 1)
+                    groups += 1
+                    run = 0
+
+                compile_expr(u, e, inner)
+                groups += 1
+            _ ->
+                compile_expr(u, e, args.at(i))
+                run += 1
+
+    if run > 0
+        push_n(e, MakeArray(run), at, run, 1)
+        groups += 1
+
+    // **`JoinArrays` runs even for a single group, and the reason is the diagnostic.** One spread on
+    // its own is already an array and joining it is a copy that changes nothing -- except that
+    // `JoinArrays` is where a spread of something that is not an array is caught, and skipping it
+    // sent `f(...42)` into the call with a value nothing had checked.
+    if groups == 0
+        push_n(e, MakeArray(0), at, 0, 1)
+    else
+        push_n(e, JoinArrays(groups), at, groups, 1)
+end compile_spread_args
+
+private compile_inc_dec(u: *Unit, e: *Emit, target: Expr, up: bool, before: bool, at: Span)
+    val op: Tok = if up then Plus else Minus
+
+    *target.kind match
+        Name(n) ->
+            val k = intern_str(u, n)
+
+            push_n(e, LoadName(k), target.span, 0, 1)
+
+            if before
+                push_n(e, PushInt(1), at, 0, 1)
+                push_n(e, BinaryOp(op), at, 2, 1)
+                push_n(e, Dup, at, 0, 1)
+            else
+                push_n(e, Dup, at, 0, 1)
+                push_n(e, PushInt(1), at, 0, 1)
+                push_n(e, BinaryOp(op), at, 2, 1)
+
+            push_n(e, StoreName(k), target.span, 1, 0)
+        Field(obj, name, _) ->
+            val k = intern_str(u, name)
+
+            compile_expr(u, e, obj)
+            push_n(e, Dup, target.span, 0, 1)
+            push_n(e, GetField(k), target.span, 1, 1)
+
+            if before
+                push_n(e, PushInt(1), at, 0, 1)
+                push_n(e, BinaryOp(op), at, 2, 1)
+
+            // The value to keep goes under the receiver, and a copy of it comes back up to be stored.
+            push_n(e, RotUp(1), at, 0, 0)
+            push_n(e, DupAt(1), at, 0, 1)
+
+            if !before
+                push_n(e, PushInt(1), at, 0, 1)
+                push_n(e, BinaryOp(op), at, 2, 1)
+
+            push_n(e, SetField(k), target.span, 2, 0)
+        Index(t, key) ->
+            compile_expr(u, e, t)
+            compile_expr(u, e, key)
+            push_n(e, DupAt(1), target.span, 0, 1)
+            push_n(e, DupAt(1), target.span, 0, 1)
+            push_n(e, GetIndex, target.span, 2, 1)
+
+            if before
+                push_n(e, PushInt(1), at, 0, 1)
+                push_n(e, BinaryOp(op), at, 2, 1)
+
+            push_n(e, RotUp(2), at, 0, 0)
+            push_n(e, DupAt(2), at, 0, 1)
+
+            if !before
+                push_n(e, PushInt(1), at, 0, 1)
+                push_n(e, BinaryOp(op), at, 2, 1)
+
+            push_n(e, SetIndex, target.span, 3, 0)
+        _ ->
+            push_n(e, FailWith(intern_str(u, "only a name, a field or an element may be stepped")), at, 0, 1)
+end compile_inc_dec
+
+// **`&&` and `||` answer the operand that decided**, which is slate's rule and not sysl's -- so the
+// jump keeps what it tested rather than popping it.
+private compile_binary(u: *Unit, e: *Emit, op: Tok, lhs: Expr, rhs: Expr, at: Span)
+    if op == AndAnd || op == OrOr || op == QQ
+        compile_expr(u, e, lhs)
+
+        val skip = if op == AndAnd
+            push_n(e, JumpIfFalseKeep(0), at, 0, 0)
+        elif op == OrOr
+            push_n(e, JumpIfTrueKeep(0), at, 0, 0)
+        else
+            // `??` asks a different question from `||`: `0 ?? 1` is `0`, because zero is not absent.
+            push_n(e, JumpIfPresentKeep(0), at, 0, 0)
+
+        push_n(e, Pop, at, 1, 0)
+        compile_expr(u, e, rhs)
+        patch(e, skip, here(e))
+        return
+
+    compile_expr(u, e, lhs)
+    compile_expr(u, e, rhs)
+    push_n(e, BinaryOp(op), at, 2, 1)
+end compile_binary
+
+private compile_if(u: *Unit, e: *Emit, cond: Expr, then_branch: Expr, else_branch: Option[Expr], at: Span)
+    compile_expr(u, e, cond)
+
+    val otherwise = push_n(e, JumpIfFalse(0), at, 1, 0)
+    val before = e.sp
+
+    push_n(e, PushScope, at, 0, 0)
+    e.scopes += 1
+    compile_expr(u, e, then_branch)
+    push_n(e, PopScope, at, 0, 0)
+    e.scopes -= 1
+
+    val done = put(e, Jump(0), at)
+
+    patch(e, otherwise, here(e))
+    e.sp = before
+
+    push_n(e, PushScope, at, 0, 0)
+    e.scopes += 1
+
+    else_branch match
+        Some(x) -> compile_expr(u, e, x)
+        None -> push_n(e, PushNil, at, 0, 1)
+
+    push_n(e, PopScope, at, 0, 0)
+    e.scopes -= 1
+    patch(e, done, here(e))
+end compile_if
+
+// **An arm gets a scope of its own, thrown away when it does not take.** A pattern binds as it goes,
+// so a failed arm has already written names, and the only thing keeping them out of the next arm is
+// somewhere separate to write them.
+private compile_match(u: *Unit, e: *Emit, subject: Expr, arms: Buf[Arm], at: Span)
+    compile_expr(u, e, subject)
+
+    val subject_sp = e.sp
+    var leaves: Buf[usize] = buf()
+
+    for i in 0..<arms.len()
+        val arm = arms.at(i)
+
+        push_n(e, PushScope, at, 0, 0)
+        e.scopes += 1
+
+        // Reads the subject where it lies and answers whether it took; the subject stays, because the
+        // arm after this one wants it.
+        push_n(e, TestPat(intern_resolved(u, arm.pattern)), at, 0, 1)
+
+        val missed = push_n(e, JumpIfFalse(0), at, 1, 0)
+        var guard_missed: usize = 0
+        var guarded = false
+
+        arm.guard match
+            Some(g) ->
+                compile_expr(u, e, g)
+                guard_missed = push_n(e, JumpIfFalse(0), at, 1, 0)
+                guarded = true
+            None -> ()
+
+        // It took: the subject is finished with, and the body's value takes its place.
+        push_n(e, Pop, at, 1, 0)
+        compile_expr(u, e, arm.body)
+        push_n(e, PopScope, at, 0, 0)
+        e.scopes -= 1
+        leaves.push(put(e, Jump(0), at))
+
+        // It did not: give the scope back and try the next one, with the subject still in place.
+        patch(e, missed, here(e))
+
+        if guarded then patch(e, guard_missed, here(e))
+
+        push_n(e, PopScope, at, 0, 0)
+        e.scopes += 1
+        e.scopes -= 1
+        e.sp = subject_sp
+
+    push_n(e, FailNoArm, at, 0, 0)
+    e.sp = subject_sp
+
+    for i in 0..<leaves.len()
+        patch(e, leaves.at(i), here(e))
+end compile_match

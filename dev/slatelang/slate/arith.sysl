@@ -1,0 +1,369 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// What an operator means over two values, and what makes two values equal.
+//
+// **Split out of `runtime.sysl`**, whose header says why any of this is shared rather than written
+// into the machine. `arith` and `same_literal` are not `private` because `runtime.sysl` dispatches
+// to the first and `index.sysl` compares keys with the second.
+
+// -- arithmetic and comparison ------------------------------------------------------------------
+
+// **A real and an integer meet as reals**, which is the promotion every language with both takes,
+// and `+` on two strings joins them. Everything else is a fault naming both sides.
+arith(op: Tok, a: Value, b: Value, at: Span) -> Step
+    if op == Plus
+        a match
+            Str(x) ->
+                b match
+                    Str(y) -> return Ok(str_value(x.s + y.s))
+                    _ -> ()
+            _ -> ()
+    end if
+
+    if is_number(a) && is_number(b)
+        if is_int(a) && is_int(b) then return int_arith(op, as_int(a), as_int(b), at)
+
+        return real_arith(op, as_real(a), as_real(b), at)
+    end if
+
+    // Ordering strings is worth having and is not arithmetic, so it is tested after the numbers.
+    a match
+        Str(x) ->
+            b match
+                Str(y) -> return compare_str(op, x.s, y.s, at)
+                _ -> ()
+        _ -> ()
+
+    // **Dates and times are last and answer for themselves**, in `time.sysl`. They are tried here
+    // rather than folded into the arms above because what an operator means over them depends on
+    // both sides: `zoned - zoned` is a length, `zoned - duration` is a moment, and `zoned - period`
+    // is a moment worked out through a calendar. A pair it has nothing to say about falls through to
+    // the one sentence below, which is the whole reason it answers an `Option`.
+    temporal_arith(op, a, b, at) match
+        Some(answer) -> return answer
+        None -> ()
+
+    fault(at, s"`${op_text(op)}` does not apply to ${a.type_name()} and ${b.type_name()}")
+end arith
+
+private int_arith(op: Tok, x: long, y: long, at: Span) -> Step
+    op match
+        Plus -> Ok(Int(x + y))
+        Minus -> Ok(Int(x - y))
+        Star -> Ok(Int(x * y))
+        Slash ->
+            if y == 0 then fault(at, "this divides by zero") else Ok(Int(x / y))
+        Percent ->
+            if y == 0 then fault(at, "this takes a remainder by zero") else Ok(Int(x % y))
+        Lt -> Ok(Bool(x < y))
+        LtEq -> Ok(Bool(x <= y))
+        Gt -> Ok(Bool(x > y))
+        GtEq -> Ok(Bool(x >= y))
+
+        // **The bitwise operators are integers only**, which needs no rule of its own: they are here
+        // and nowhere else, so a real reaching one falls through to the sentence naming both sides.
+        Amp -> Ok(Int(x & y))
+        Pipe -> Ok(Int(x | y))
+        Caret -> Ok(Int(x ^ y))
+        Shl ->
+            if y < 0 || y > 63 then fault(at, s"a shift is by 0 to 63 places, and this is by ${y}") else Ok(Int(x << y))
+        Shr ->
+            if y < 0 || y > 63 then fault(at, s"a shift is by 0 to 63 places, and this is by ${y}") else Ok(Int(x >> y))
+        _ -> fault(at, "this is not an arithmetic operator")
+end int_arith
+
+private real_arith(op: Tok, x: real, y: real, at: Span) -> Step
+    op match
+        Plus -> Ok(Real(x + y))
+        Minus -> Ok(Real(x - y))
+        Star -> Ok(Real(x * y))
+        Slash -> Ok(Real(x / y))
+        Percent -> fault(at, "a remainder is taken of integers")
+        Lt -> Ok(Bool(x < y))
+        LtEq -> Ok(Bool(x <= y))
+        Gt -> Ok(Bool(x > y))
+        GtEq -> Ok(Bool(x >= y))
+
+        // **The bitwise operators reach here only with a real in hand**, and saying they are not
+        // arithmetic would be a true sentence about the wrong thing: the operator is fine and the
+        // operand is not.
+        Amp -> not_whole(op, at)
+        Pipe -> not_whole(op, at)
+        Caret -> not_whole(op, at)
+        Shl -> not_whole(op, at)
+        Shr -> not_whole(op, at)
+        _ -> fault(at, "this is not an arithmetic operator")
+end real_arith
+
+private not_whole(op: Tok, at: Span) -> Step =
+    fault(at, s"`${op_text(op)}` works on whole numbers, and a real is not one")
+
+private compare_str(op: Tok, x: string, y: string, at: Span) -> Step
+    op match
+        Lt -> Ok(Bool(x < y))
+        LtEq -> Ok(Bool(x <= y))
+        Gt -> Ok(Bool(x > y))
+        GtEq -> Ok(Bool(x >= y))
+        _ -> fault(at, s"`${op_text(op)}` does not apply to two strings")
+end compare_str
+
+private is_number(v: Value) -> bool = v match
+    Int(_) -> true
+    Real(_) -> true
+    _ -> false
+
+private is_int(v: Value) -> bool = v match
+    Int(_) -> true
+    _ -> false
+
+private as_int(v: Value) -> long = v match
+    Int(n) -> n
+    _ -> 0
+
+private as_real(v: Value) -> real = v match
+    Int(n) -> real(n)
+    Real(n) -> n
+    _ -> 0.0
+
+// Two containers whose comparison is already underway, one frame or more above.
+struct SeenPair
+    a: *u8
+    b: *u8
+
+// Whether this exact pairing is already being compared further up the walk.
+private in_progress(seen: *Buf[SeenPair], a: *u8, b: *u8) -> bool
+    for i in 0..<seen.len()
+        val p = seen.at(i)
+
+        if p.a == a && p.b == b then return true
+
+    false
+end in_progress
+
+// Whether a value equals a literal written in a pattern.
+//
+// **A pattern does not consult an object's `equals`, and that is deliberate.** A literal pattern is a
+// shape test: `5 -> ...` asks whether the subject *is* five, not whether something has been persuaded
+// to say it is. Keeping hooks out of it also keeps `match_pattern` infallible, so an arm cannot fault
+// halfway through binding.
+same_literal(v: Value, lit: Value) -> bool = v match
+    Null -> lit match
+        Null -> true
+        _ -> false
+    Bool(x) -> lit match
+        Bool(y) -> x == y
+        _ -> false
+    Int(x) -> lit match
+        Int(y) -> x == y
+        Real(y) -> real(x) == y
+        _ -> false
+    Real(x) -> lit match
+        Int(y) -> x == real(y)
+        Real(y) -> x == y
+        _ -> false
+    _ -> false
+
+// Whether two values are the same.
+//
+// **Deep for arrays and objects rather than by identity**, which is the choice Python makes and
+// JavaScript does not. It is the one a person expects of `[1, 2] == [1, 2]`.
+//
+// **A cyclic pair answers `true` on re-entry rather than descending forever**, which is the
+// coinductive rule: assume the pairing holds unless something below it proves otherwise. A set of
+// single values cannot express that, because what is being asked is whether *this* value equals
+// *that* one -- so the record is of pairs. Without it `b == c` over two self-referential arrays
+// descends until the stack is gone, and sysl reports that as a bare SIGSEGV (card 0299).
+same(a: Value, b: Value, at: Span) -> Result[bool, Signal]
+    var seen: Buf[SeenPair] = buf()
+
+    same_in(a, b, &seen, at)
+
+// **The left side's `equals` decides, and only the left side's**, which is Java's rule for
+// `a.equals(b)`. Consulting both and disagreeing has no answer, and consulting the right side when
+// the left declined would make `==` non-obvious to read.
+//
+// A hook makes `==` run arbitrary slate code, so a lookup re-enters the interpreter and a bad
+// `equals` can fault or loop. Java lives with exactly this.
+private same_in(a: Value, b: Value, seen: *Buf[SeenPair], at: Span) -> Result[bool, Signal]
+    hook_of(a, "equals") match
+        Some(f) ->
+            var args: Buf[Value] = buf()
+
+            args.push(b)
+            return Ok(apply(f, args, at)?.truthy())
+        None -> ()
+
+    same_plain(a, b, seen, at)
+end same_in
+
+private same_plain(a: Value, b: Value, seen: *Buf[SeenPair], at: Span) -> Result[bool, Signal]
+    a match
+        Null -> b match
+            Null -> Ok(true)
+            _ -> Ok(false)
+        Undefined -> b match
+            Undefined -> Ok(true)
+            _ -> Ok(false)
+        Bool(x) -> b match
+            Bool(y) -> Ok(x == y)
+            _ -> Ok(false)
+        Str(x) -> b match
+            // **`x == y` here would compare the two `*StrObj` POINTERS**, which is identity and not
+            // equality -- and it compiles, because pointers do compare. Moving a string from a value
+            // into the collected heap turned a structural comparison into an identity one silently,
+            // and fourteen tests caught it. Go has the same distinction and answers it the same way.
+            Str(y) -> Ok(x.s == y.s)
+            _ -> Ok(false)
+        Int(x) -> b match
+            Int(y) -> Ok(x == y)
+            Real(y) -> Ok(real(x) == y)
+            _ -> Ok(false)
+        Real(x) -> b match
+            Int(y) -> Ok(x == real(y))
+            Real(y) -> Ok(x == y)
+            _ -> Ok(false)
+        Array(xs) -> b match
+            Array(ys) -> same_array(xs, ys, seen, at)
+            _ -> Ok(false)
+        Object(xs) -> b match
+            Object(ys) -> same_object(xs, ys, seen, at)
+            _ -> Ok(false)
+        Fn(_) -> Ok(false)
+
+        // Two ranges are equal when they cover the same numbers, which is what `..` and `..<` written
+        // two ways can do: `1..3` and `1..<4` are the same three.
+        RangeVal(alo, ahi, ainc, ahl, ahh) -> b match
+            RangeVal(blo, bhi, binc, bhl, bhh) ->
+                if ahl != bhl || ahh != bhh then return Ok(false)
+
+                val ax = if ainc then ahi else ahi - 1
+                val bx = if binc then bhi else bhi - 1
+
+                Ok(alo == blo && ax == bx)
+            _ -> Ok(false)
+
+        // **A promise compares by identity, as a function does.** Two promises that will settle to
+        // the same value are not the same promise, and asking whether they are equal before either
+        // has settled has no answer that stays true.
+        Promise(x) -> b match
+            Promise(y) -> Ok(x == y)
+            _ -> Ok(false)
+        Native(x) -> b match
+            Native(y) -> Ok(x == y)
+            _ -> Ok(false)
+
+        // **A socket is its slot**, so two names for one socket are equal and two sockets never are.
+        // That is identity again, arrived at from the other direction: the id *is* what the value is.
+        Socket(x, xg) -> b match
+            Socket(y, yg) -> Ok(x == y && xg == yg)
+            _ -> Ok(false)
+
+        // **Two regular expressions written the same way ARE the same one**, because the table is
+        // keyed by the pattern and its flags -- so `regex("a") == regex("a")` where two arrays
+        // written the same way are not. That follows from compiling once rather than being a
+        // decision about equality: there is only one slot for a pattern, so there is only one value.
+        RegexVal(x) -> b match
+            RegexVal(y) -> Ok(x == y)
+            _ -> Ok(false)
+
+        // Every temporal value is equal to one of its own kind naming the same thing, and to nothing
+        // else. **A date and a dateTime at midnight are not equal**, for the reason an integer and a
+        // string of digits are not: they are different kinds of answer, and a program that means to
+        // compare them says which one it meant.
+        InstantVal(x) -> b match
+            InstantVal(y) -> Ok(x == y)
+            _ -> Ok(false)
+        DurationVal(x) -> b match
+            DurationVal(y) -> Ok(x == y)
+            _ -> Ok(false)
+        DateVal(x) -> b match
+            DateVal(y) -> Ok(x == y)
+            _ -> Ok(false)
+        TimeVal(x) -> b match
+            TimeVal(y) -> Ok(x == y)
+            _ -> Ok(false)
+        DateTimeVal(xd, xu) -> b match
+            DateTimeVal(yd, yu) -> Ok(xd == yd && xu == yu)
+            _ -> Ok(false)
+
+        // **A zone is its slot**, which is identity and is also equality: a zone is interned by name
+        // and never released, so one name is one slot for the life of the program.
+        ZoneVal(x) -> b match
+            ZoneVal(y) -> Ok(x == y)
+            _ -> Ok(false)
+
+        // **A zoned reading is equal on the instant AND the zone, where `<` compares only the
+        // instant.** 09:00 in Toronto and 09:00 in Tokyo are different readings and neither is
+        // before the other, so the two questions genuinely have different answers. Java's
+        // `ZonedDateTime` draws the line in the same place.
+        ZonedVal(xu, xz) -> b match
+            ZonedVal(yu, yz) -> Ok(xu == yu && xz == yz)
+            _ -> Ok(false)
+
+        // **A period compares on its two scales and does not normalise between them**, since it
+        // cannot: `months(1)` and `days(30)` are not equal, and no arithmetic could make them so
+        // without naming a month.
+        PeriodVal(xm, xd) -> b match
+            PeriodVal(ym, yd) -> Ok(xm == ym && xd == yd)
+            _ -> Ok(false)
+
+        // **A generator compares by identity, as a function and a promise do.** It is a line of
+        // execution rather than a value: two generators made from one definition have run different
+        // amounts and are not interchangeable, and asking whether they will yield the same things has
+        // no answer that stays true.
+        Gen(x, xg) -> b match
+            Gen(y, yg) -> Ok(x == y && xg == yg)
+            _ -> Ok(false)
+end same_plain
+
+// **Identity first, and it is not only an optimisation.** `a == a` over a structure that reaches
+// itself is the commonest way to meet a cycle, and answering it by walking would visit every node
+// to prove what the address already settled.
+//
+// **A pairing left on `seen` by a failing comparison is never consulted again**, which is why only
+// the true path pops: a `false` propagates straight out of every frame above it, so the walk that
+// would have read a stale entry does not happen.
+private same_array(xs: *ArrayObj, ys: *ArrayObj, seen: *Buf[SeenPair], at: Span) -> Result[bool, Signal]
+    val ax: *u8 = ptr_cast(xs)
+    val ay: *u8 = ptr_cast(ys)
+
+    if ax == ay then return Ok(true)
+    if in_progress(seen, ax, ay) then return Ok(true)
+    if xs.items.len() != ys.items.len() then return Ok(false)
+
+    seen.push(SeenPair(ax, ay))
+
+    for i in 0..<xs.items.len()
+        if !same_in(xs.items.at(i), ys.items.at(i), seen, at)? then return Ok(false)
+
+    seen.truncate(seen.len() - 1)
+    Ok(true)
+end same_array
+
+private same_object(xs: *ObjectObj, ys: *ObjectObj, seen: *Buf[SeenPair], at: Span) -> Result[bool, Signal]
+    val ax: *u8 = ptr_cast(xs)
+    val ay: *u8 = ptr_cast(ys)
+
+    if ax == ay then return Ok(true)
+    if in_progress(seen, ax, ay) then return Ok(true)
+    if xs.live != ys.live then return Ok(false)
+
+    seen.push(SeenPair(ax, ay))
+
+    // **Order is not compared, only contents** -- an object that gained its fields in another order
+    // is the same object. `hash_object` sums its fields for exactly this reason: an order-sensitive
+    // mix would hash these two differently and lose one of them in its own table.
+    for i in 0..<xs.entries.len()
+        val e = xs.entries.at(i)
+
+        if !e.dead
+            obj_get(ys, e.key, at)? match
+                Some(v) -> if !same_in(e.value, v, seen, at)? then return Ok(false)
+                None -> return Ok(false)
+
+    seen.truncate(seen.len() - 1)
+    Ok(true)
+end same_object

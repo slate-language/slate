@@ -1,0 +1,131 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// Emitting an instruction, and the two counters that make a jump correct.
+//
+// **Split out of `compile.sysl`, and it is the file the other two both talk to**: `compile.sysl`
+// turns statements into instructions and `compile_expr.sysl` turns expressions into them, and
+// neither can do anything without `put`, `here` and `patch`. So NOTHING HERE IS `private` -- these
+// are the emitter's API rather than its internals, and `private` in sysl is private to the FILE.
+//
+// The tree to instructions.
+//
+// **Two counters make this whole file work, and both are compile-time.** `sp` is how many values will
+// be on the operand stack when this instruction runs, and `scopes` is how deep the scope chain will
+// be. Neither is needed at run time, and knowing both here is what lets `break` emit exactly the
+// right number of `Pop`s and `PopScope`s to leave the loop balanced -- rather than the machine
+// carrying unwind tables to work it out again.
+//
+// **Every statement leaves exactly one value on the stack**, and the statement after it begins by
+// popping that. A block's value is therefore whatever the last statement left, which is slate's rule,
+// and an empty block pushes `null` so the rule holds with nothing in it.
+
+// What one chunk's compilation is carrying.
+struct Emit
+    code: Buf[Ins]
+
+    // How tall the operand stack will be here.
+    sp: usize
+
+    // How deep the scope chain will be here.
+    scopes: usize
+
+    // The loops enclosing this point, innermost last.
+    loops: Buf[LoopFrame]
+
+    // How many `try` handlers will be owed here.
+    //
+    // **The third counter, and it exists for the same reason the other two do**: a `break` out of a
+    // `try` body has to leave the machine balanced, and the only place the number of handlers to
+    // drop is known is here.
+    handlers: usize
+
+    // Whether the chunk being compiled is an `async` one, which is what says whether `await` is
+    // allowed in it. **A compile-time question rather than a run-time one**: a machine that reached an
+    // `await` it could not honour would have to decide what to do with a half-evaluated expression,
+    // and there is no good answer -- so the code is never emitted.
+    is_async: bool
+
+    // Whether the chunk being emitted is a generator's, which is what tells a `yield` that belongs
+    // here from one written where there is nothing to yield to.
+    is_gen: bool
+
+// Where `break` and `continue` have to get back to, and what they have to tidy on the way.
+struct LoopFrame
+    sp: usize
+    scopes: usize
+
+    // How many handlers were owed when the loop began, so a `break` out of a `try` drops its own.
+    handlers: usize
+
+    // The name this loop was given, or the empty string. A `break` with no label takes the innermost
+    // frame whatever its name; one with a label walks outward until the names agree.
+    label: string
+
+    // Instruction positions to patch once the two destinations are known.
+    breaks: Buf[usize]
+    continues: Buf[usize]
+
+fresh_emit(is_async: bool, is_gen: bool) -> Emit = Emit(buf(), 0, 0, buf(), 0, is_async, is_gen)
+
+// Put one instruction down and answer where it went.
+put(e: *Emit, op: Op, at: Span) -> usize
+    e.code.push(Ins(op, at))
+    e.code.len() - 1
+
+// Put an instruction down and account for what it does to the stack.
+push_n(e: *Emit, op: Op, at: Span, takes: usize, gives: usize) -> usize
+    e.sp = e.sp - takes + gives
+    put(e, op, at)
+
+here(e: *Emit) -> usize = e.code.len()
+
+// Aim a jump that was emitted before its destination was known.
+patch(e: *Emit, at: usize, to: usize)
+    val old = e.code.at(at)
+
+    val aimed: Op = old.op match
+        Jump(_) -> Jump(to)
+        JumpIfFalse(_) -> JumpIfFalse(to)
+        JumpIfTrueKeep(_) -> JumpIfTrueKeep(to)
+        JumpIfPresentKeep(_) -> JumpIfPresentKeep(to)
+        JumpIfAbsentKeep(_) -> JumpIfAbsentKeep(to)
+        JumpIfFalseKeep(_) -> JumpIfFalseKeep(to)
+        IterNext(_) -> IterNext(to)
+
+        // **A handler's target is patched exactly as a jump's is**, and leaving it out of this list
+        // was silent: `PushHandler(0)` is a perfectly good instruction naming instruction zero, so a
+        // caught fault re-entered the chunk at its first instruction and the program looped until the
+        // heap ran out. The `other -> other` arm below is what made it silent.
+        PushHandler(_) -> PushHandler(to)
+        other -> other
+
+    e.code.set(at, Ins(aimed, old.at))
+end patch
+
+// Drop back to a stack height, a scope depth and a handler depth, which is what leaving a block
+// means.
+unwind_to(e: *Emit, sp: usize, scopes: usize, handlers: usize, at: Span)
+    var n = e.sp
+
+    while n > sp
+        put(e, Pop, at)
+        n -= 1
+
+    var d = e.scopes
+
+    while d > scopes
+        put(e, PopScope, at)
+        d -= 1
+
+    // **A `break` out of a `try` body drops its handler on the way.** Left behind, it would name an
+    // instruction in a block nothing is running any more, and the next fault anywhere in the program
+    // would be restored into it.
+    var k = e.handlers
+
+    while k > handlers
+        put(e, PopHandler, at)
+        k -= 1
+end unwind_to

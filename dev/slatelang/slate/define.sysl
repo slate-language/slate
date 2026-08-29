@@ -1,0 +1,524 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// Definitions, assignment, and the body of either.
+//
+// **Split out of `parse.sysl` at the point the grammar stops being local.** Everything up to here
+// reads a construct its first token names; a definition is told from a call only by looking ahead
+// past the whole parameter list, which is what the first function below does and what taking sysl's
+// keyword-free function form costs.
+//
+// Four names here are not `private` because `parse.sysl` reaches them, and two of its own are not
+// because this file reaches back: `parse_stmts` and `parse_stmt`, a body being made of statements.
+
+// Whether the cursor is on a function definition rather than on a call.
+//
+// **This is the one place slate's grammar needs to look ahead, and it is what taking sysl's
+// keyword-free function form costs.** `add(a, b)` is a definition when a body follows it and a call
+// when one does not, and the two are identical up to that point. So the shape is checked without
+// committing: a name, a parenthesised list of nothing but names, and then `=` or an indented block.
+//
+// Reading it as a *call* first and reinterpreting on seeing the body was the alternative, and it is
+// worse in the one way that matters -- `f(a.b)` would parse and then have to be un-parsed, and the
+// complaint about it would come from a function that no longer knows a definition was expected.
+// **`start` is where the name would be**, which is one further along after an `async`.
+at_definition_from(p: *Parser, start: usize) -> bool
+    if p.peek_kind_at(start) != Ident then return false
+    if p.peek_kind_at(start + 1) != LParen then return false
+
+    var i = start + 2
+
+    // An empty list is a definition of a function of no arguments.
+    if p.peek_kind_at(i) == RParen
+        return body_follows(p, i + 1)
+
+    loop
+        // **A parameter may be a pattern**, and a `{` or a `[` can begin no name -- the same first
+        // token that tells `val { a }` from `val a`. The group is stepped over with its brackets
+        // balanced, exactly as an annotation is, since what tells a definition from a call is still
+        // only what follows the `)`.
+        if p.peek_kind_at(i) == LBrace || p.peek_kind_at(i) == LBracket
+            var nest: usize = 0
+
+            loop
+                val k = p.peek_kind_at(i)
+
+                if k == Eof then return false
+
+                if k == LBrace || k == LBracket || k == LParen
+                    nest += 1
+                elif k == RBrace || k == RBracket || k == RParen
+                    nest -= 1
+
+                    if nest == 0
+                        i += 1
+                        break
+
+                i += 1
+        elif p.peek_kind_at(i) != Ident
+            return false
+        else
+            i += 1
+
+        // **`p: Point` still leaves a definition told from a call by what follows the `)`**, so all
+        // this has to do is find the end of the list. The annotation is a pattern and a pattern may
+        // hold brackets of its own, which is why the skip counts them rather than looking for the
+        // first `,` it meets.
+        if p.peek_kind_at(i) == Colon
+            i += 1
+
+            var depth: usize = 0
+
+            loop
+                val k = p.peek_kind_at(i)
+
+                if k == Eof then return false
+
+                if k == LBrace || k == LBracket || k == LParen
+                    depth += 1
+                elif k == RBrace || k == RBracket
+                    if depth == 0 then return false
+
+                    depth -= 1
+                elif k == RParen
+                    if depth == 0 then break
+
+                    depth -= 1
+                elif k == Comma && depth == 0
+                    break
+
+                i += 1
+            end loop
+        end if
+
+        p.peek_kind_at(i) match
+            Comma ->
+                i += 1
+
+                // A trailing comma still closes the list, so the `)` after one is a definition.
+                if p.peek_kind_at(i) == RParen then return body_follows(p, i + 1)
+            RParen -> return body_follows(p, i + 1)
+            _ -> return false
+    end loop
+end at_definition_from
+
+// Whether what sits at `i` is a function body.
+//
+// **A result annotation stands between the `)` and the body**, so it is stepped over the way a
+// parameter's is -- with brackets balanced, since `-> { a: number }` is a shape like any other.
+private body_follows(p: *Parser, i: usize) -> bool
+    var at = i
+
+    if p.peek_kind_at(at) == Arrow
+        at += 1
+
+        var depth: usize = 0
+
+        loop
+            val k = p.peek_kind_at(at)
+
+            if k == Eof then return false
+
+            if k == LBrace || k == LBracket || k == LParen
+                depth += 1
+            elif k == RBrace || k == RBracket || k == RParen
+                if depth == 0 then return false
+
+                depth -= 1
+            elif depth == 0 && (k == Assign || k == Indent)
+                break
+
+            at += 1
+        end loop
+    end if
+
+    val k = p.peek_kind_at(at)
+
+    k == Assign || k == Indent
+
+// `name(a, b)` with a body.
+parse_def(p: *Parser) -> Stmt
+    val start = p.here()
+    val is_async = p.accept(Async)
+    val name = parse_name(p, "a name for the function")
+
+    p.expect(LParen, "`(`")
+
+    var params: Buf[string] = buf()
+    var checks: Buf[Stmt] = buf()
+
+    if !p.at(RParen)
+        loop
+            if p.at(LBrace) || p.at(LBracket)
+                params.push(unpacked_param(p, &checks, params.len()))
+
+                if !p.accept(Comma) then break
+                if p.at(RParen) then break
+
+                continue
+            end if
+
+            val pname = parse_name(p, "a parameter name")
+
+            params.push(pname)
+
+            // **`p: Point` becomes a statement at the top of the body**, which is what keeps
+            // annotations off `Def` and `Lambda` and off everything downstream that reads them. What
+            // it buys is the whole point of writing one: the complaint arrives where the value was
+            // handed over rather than wherever it was first used wrongly.
+            if p.accept(Colon)
+                val tname = if p.at(Ident) then p.text(p.here()) else ""
+                val tat = p.here()
+                val tpat = parse_pattern(p)
+
+                checks.push(stmt(tat.to(p.just_taken()), CheckType(pname, tname, tpat)))
+
+            if !p.accept(Comma) then break
+            if p.at(RParen) then break
+
+    p.expect(RParen, "`)`")
+
+    // **`-> type` says what a call answers, and nothing downstream of a call can be checked without
+    // it.** It is read here rather than being a field on `Def` for the reason a parameter's is: the
+    // body is wrapped, and the tree keeps one shape.
+    val result = if p.accept(Arrow)
+        val rname = if p.at(Ident) then p.text(p.here()) else ""
+        val rat = p.here()
+
+        Some((rname, rat, parse_pattern(p)))
+    else
+        None
+
+    // Two body forms, and the `=` is what tells them apart: `double(x) = x * 2` puts the result on
+    // the line, and an indented block puts it in a run of statements. sysl has both for the same
+    // reason -- a body should not have to change shape when it outgrows a line -- and `=` may open
+    // an indented block too, which needs nothing here because `parse_body` looks for the `Indent`.
+    p.accept(Assign)
+
+    // **The count is put back to zero for this body and restored after it**, which is what makes the
+    // question "did *this* body yield" rather than "has anything yielded yet".
+    val outer_yields = p.yields
+
+    val checked = with_checks(checks, parse_body(p))
+
+    val body = result match
+        Some(r) -> expr(checked.span, Ensures(checked, r.0, r.2))
+        None -> checked
+
+    accept_end_named(p, name)
+    // **Restored, not merely compared**, so that a lambda written inside this body has already put
+    // the count back and cannot make its enclosing definition look like a generator.
+    val yielded = p.yields > outer_yields
+
+    p.yields = outer_yields
+    stmt(start.to(p.just_taken()), Def(name, params, intern_body(body, yielded), is_async))
+end parse_def
+
+// A parameter written as a pattern: a name nothing can collide with, and the statement that takes
+// the argument apart under it.
+//
+// Not `private`: `expr.sysl` reads a lambda's parameters and wants the same desugar.
+//
+// **The desugar is the annotation's, and taking it was the whole of the work.** `p: Point` already
+// becomes a `CheckType` at the top of the body, so `Def` and `Lambda` carry names and nothing else;
+// a destructuring parameter becomes an `Unpack` in the same place, and the machine, the arity check,
+// the checker and every pass downstream learn nothing. Reading it as a real pattern parameter would
+// have meant a `Buf[Pattern]` on two nodes and a new case in everything that walks one.
+//
+// **The hidden name is unspellable on purpose.** A parameter list is a scope a program's own names
+// go into, and a synthetic one that could be written would shadow -- or be shadowed by -- something
+// a person wrote. `(0)` is not an identifier, so nothing can name it and nothing has to be reserved.
+unpacked_param(p: *Parser, checks: *Buf[Stmt], index: usize) -> string
+    val at = p.here()
+    val pat = parse_pattern(p)
+    val name = s"(${index})"
+
+    checks.push(stmt(at.to(p.just_taken()), Unpack(pat, expr(at, Name(name)), true)))
+    name
+end unpacked_param
+
+// A body with its parameters' checks run before it.
+//
+// **The body is left alone where nothing was annotated**, so an unannotated function is the same
+// tree it always was and costs not one instruction more.
+//
+// Not `private`: a lambda's parameters may be patterns too, and `expr.sysl` wraps its body the same
+// way.
+with_checks(checks: Buf[Stmt], body: Expr) -> Expr
+    if checks.len() == 0 then return body
+
+    var stmts: Buf[Stmt] = buf()
+
+    for i in 0..<checks.len()
+        stmts.push(checks.at(i))
+
+    // The body's own value is the function's, so it goes last and the checks are only statements.
+    stmts.push(stmt(body.span, Eval(body)))
+    expr(body.span, Block(stmts))
+end with_checks
+
+// An expression on its own, or an assignment to one -- to one place, or to several.
+parse_expr_stmt(p: *Parser) -> Stmt
+    val start = p.here()
+    val target = parse_expr(p)
+
+    // **A comma here can only be a multi-assignment**, since nothing below a statement admits a bare
+    // comma. One target would be an ordinary assignment written the long way, so two is what commits.
+    if p.at(Comma) then return parse_multi_assign(p, start, target)
+
+    val op = assign_op(p)
+
+    if op == Eof
+        return stmt(start.to(p.just_taken()), Eval(target))
+
+    val value = parse_body(p)
+
+    if !assignable(target)
+        p.fault(target.span, "this cannot be assigned to")
+
+    stmt(start.to(p.just_taken()), Assign(op, target, value))
+end parse_expr_stmt
+
+// `a, b = b, a`, and the compound forms of it.
+private parse_multi_assign(p: *Parser, start: Span, first: Expr) -> Stmt
+    // **Read speculatively, and commit only on the `=`.** A comma after an expression is a
+    // multi-assignment far more often than not, but it is also what a `match` written as a
+    // non-final argument leaves behind -- and a rule that committed here would answer that with a
+    // sentence about assignment, replacing the one diagnostic that says what is actually wrong.
+    val m = p.toks.mark()
+    var targets: Buf[Expr] = buf()
+
+    targets.push(first)
+
+    loop
+        if !p.accept(Comma) then break
+
+        targets.push(parse_expr(p))
+
+    val op = assign_op(p)
+
+    if op == Eof
+        p.toks.reset(m)
+        return stmt(start.to(p.just_taken()), Eval(first))
+
+    var values: Buf[Expr] = buf()
+
+    loop
+        values.push(parse_expr(p))
+
+        if !p.accept(Comma) then break
+
+    for i in 0..<targets.len()
+        if !assignable(targets.at(i))
+            p.fault(targets.at(i).span, "this cannot be assigned to")
+
+    if targets.len() != values.len()
+        p.fault(start.to(p.just_taken()),
+            s"this writes ${targets.len()} places and was given ${values.len()} values")
+
+    stmt(start.to(p.just_taken()), MultiAssign(op, targets, values))
+end parse_multi_assign
+
+// The assignment operator at the cursor, consumed -- or `Eof` where there is not one.
+//
+// **`Assign` stands for the plain form and the arithmetic operator for a compound one**, so that
+// `x += e` reaches the compiler as the operator it is rather than as a rewritten `x = x + e`. The
+// difference that makes is that the place is evaluated once.
+//
+// `Eof` as the "none" answer rather than an `Option`, because every caller immediately compares.
+private assign_op(p: *Parser) -> Tok
+    if p.accept(Assign) then return Assign
+    if p.accept(PlusEq) then return Plus
+    if p.accept(MinusEq) then return Minus
+    if p.accept(StarEq) then return Star
+    if p.accept(SlashEq) then return Slash
+    if p.accept(PercentEq) then return Percent
+    if p.accept(AmpEq) then return Amp
+    if p.accept(PipeEq) then return Pipe
+    if p.accept(CaretEq) then return Caret
+    if p.accept(ShlEq) then return Shl
+    if p.accept(ShrEq) then return Shr
+
+    Eof
+end assign_op
+
+// What may stand on the left of an `=`.
+//
+// The check is here rather than in the interpreter so that the tree handed on is one whose targets
+// are known good, and so that the complaint points at the expression rather than at the moment it
+// was evaluated.
+private assignable(e: Expr) -> bool
+    *e.kind match
+        Name(_) -> true
+        // **`o?.f = v` is refused**, there being no answer to what it should do when `o` is
+        // nothing -- writing into absence is not a thing to do quietly, and JavaScript agrees.
+        Field(_, _, optional) -> !optional
+        Index(_, _) -> true
+        _ -> false
+end assignable
+
+// -- bodies -------------------------------------------------------------------------------------
+
+// A **value's** body: an indented block, or a single expression on the same line.
+//
+// **`=` is not consumed here.** A binding writes its own, and a construct whose body is a block has
+// none, so the two are kept apart by their callers.
+//
+// This is what a binding and a function take. A *control-flow* body is the one below, and the
+// difference is that it takes a statement.
+parse_body(p: *Parser) -> Expr
+    if p.at(Indent) then parse_block(p) else parse_expr(p)
+
+// A control-flow construct's body: an indented block, or one statement after the introducer.
+//
+// **The one-line body is a STATEMENT, not an expression, and that is the whole reason this exists.**
+// `if n > 2 then break` is the shape a loop is written in, and a `then` taking only an expression
+// refuses it -- along with `then return x` and `then continue`. sysl's `body(keyword)` is
+// `suite | inlineBody` where `inlineBody` is one statement, and this is that rule.
+//
+// **The introducer is required for a one-line body and optional before a block**, which is again
+// sysl's: a following newline and indent already say unambiguously where the body is, so `while c`
+// needs no `do` -- but `while c n = n + 1` would have nothing marking where the header stopped.
+//
+// Not `private`: `expr.sysl` gives `elif` its body.
+parse_control_body(p: *Parser, intro: Tok) -> Expr
+    if !p.accept(intro) then return parse_block(p)
+
+    if p.at(Indent) then parse_block(p) else inline_stmt_body(p)
+
+// One statement standing where a block would, wrapped as the block of one it is.
+//
+// Not `private`: `expr.sysl` gives `if`'s branches their one-line forms.
+inline_stmt_body(p: *Parser) -> Expr
+    p.depth += 1
+
+    val s = parse_stmt(p)
+
+    p.depth -= 1
+
+    var one: Buf[Stmt] = buf()
+
+    one.push(s)
+    expr(s.span, Block(one))
+end inline_stmt_body
+
+// `end if`, `end while`, `end for`, `end loop` -- optional, and only where the construct's own word
+// follows.
+//
+// **`end` stays a SOFT word**, which is what this shape is for: it is looked at rather than consumed
+// until both tokens are known, so a program that names a variable `end` is untouched. Newlines are
+// skipped over on the same terms -- looked past, and only stepped over once the marker is certain.
+//
+// Not `private`: `expr.sysl` closes an `if`.
+accept_end(p: *Parser, word: Tok) -> bool
+    var i: usize = 0
+
+    while p.peek_kind_at(i) == Newline
+        i += 1
+
+    if p.peek_kind_at(i) != Ident then return false
+    if p.peek_kind_at(i + 1) != word then return false
+    if p.text_at(i) != "end" then return false
+
+    for _ in 0..<(i + 2)
+        p.bump()
+
+    true
+end accept_end
+
+// A word that continues a construct from the line below it -- `elif`, `else`, and `while` closing a
+// `do`. **Newlines are looked past and only stepped over once the word is certain**, so the newline
+// that ends a statement is left alone where the construct really has ended. This is sysl's
+// `onNextLine`.
+//
+// Not `private`: `expr.sysl` reads `elif` and `else` with it.
+accept_on_next_line(p: *Parser, k: Tok) -> bool
+    var i: usize = 0
+
+    while p.peek_kind_at(i) == Newline
+        i += 1
+
+    if p.peek_kind_at(i) != k then return false
+
+    for _ in 0..<(i + 1)
+        p.bump()
+
+    true
+end accept_on_next_line
+
+// `end <name>` after a function, which is the marker a declaration carries instead of a keyword.
+private accept_end_named(p: *Parser, name: string) -> bool
+    var i: usize = 0
+
+    while p.peek_kind_at(i) == Newline
+        i += 1
+
+    if p.peek_kind_at(i) != Ident then return false
+    if p.peek_kind_at(i + 1) != Ident then return false
+    if p.text_at(i) != "end" then return false
+
+    // **The name has to match**, so that a function ending with `end` and the next declaration's
+    // name on the following line is not read as a marker.
+    if p.text_at(i + 1) != name then return false
+
+    for _ in 0..<(i + 2)
+        p.bump()
+
+    true
+end accept_end_named
+
+// An indented run of statements, whose value is its trailing expression.
+//
+// Not `private`, because `private` in sysl is private to the *file*: `expr.sysl` reads this to give
+// a lambda and an `if` their indented forms.
+parse_block(p: *Parser) -> Expr
+    val start = p.here()
+
+    if !p.expect(Indent, "an indented block")
+        return expr(start, Bad)
+
+    p.depth += 1
+
+    val stmts = parse_stmts(p, true)
+
+    p.depth -= 1
+
+    p.expect(Dedent, "the end of the block")
+
+    expr(start.to(p.just_taken()), Block(stmts))
+end parse_block
+
+// One identifier, or a complaint and an empty name.
+// A key in an object literal, an object pattern or a `with`.
+//
+// **A key is a name, or a string where the key is not a name**, which is JavaScript's rule and
+// Python's and JSON's. It is not two spellings of one thing: slate objects are keyed by any value at
+// all, so `"a.b"`, `"if"` and `""` are perfectly ordinary keys that the literal syntax simply had no
+// way to write. The printer has always emitted them quoted, so before this the printer could produce
+// text the parser refused -- `print` of an object built by `parseJSON` being the ordinary way to see
+// it.
+//
+// **A field ACCESS is deliberately not included.** `o."a.b"` is not accepted anywhere; a key that is
+// not a name is reached with `o["a.b"]`, which slate has always had and which every language with
+// this distinction uses.
+parse_key(p: *Parser, want: string) -> string
+    val at = p.here()
+
+    if !p.at(StrLit) then return parse_name(p, want)
+
+    p.bump()
+    read_str_at(p, at)
+end parse_key
+
+parse_name(p: *Parser, want: string) -> string
+    val at = p.here()
+
+    if !p.at(Ident)
+        p.report.add(expected(at, want, p.found(at)))
+        return ""
+
+    p.bump()
+    p.text(at)
+end parse_name

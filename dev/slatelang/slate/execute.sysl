@@ -1,0 +1,794 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.str_builder
+
+// The instruction loop, and the wrapper that decides whether a `catch` gets a fault.
+//
+// **`vm.sysl` owns the `Machine` and this file runs it**, which is the seam the two were already
+// written across: everything here reads and writes `vm`, and nothing here defines what a `Machine`
+// is. `run.sysl` is what starts one. All three want reading together -- see `vm.sysl`'s header for
+// how a coroutine works, which is the arrangement they exist to serve.
+
+// -- running ---------------------------------------------------------------------------------------
+
+private pop() -> Value
+    val v = vm.stack.at(vm.stack.len() - 1)
+
+    vm.stack.truncate(vm.stack.len() - 1)
+    v
+
+private peek(back: usize) -> Value = vm.stack.at(vm.stack.len() - 1 - back)
+
+// Run a chunk to completion and answer what it left.
+run_chunk(u: *Unit, start: usize, scope0: *EnvObj) -> Step
+    // **Where this call stops unwinding.** A native can call back into slate -- a user `equals` does
+    // exactly that -- so a nested run must hand back at its own depth rather than at an empty stack.
+    val floor = vm.frames.len()
+    val outer_scope = vm.scope
+
+    // **The file has to be put back, and forgetting to was a diagnostic that named the wrong file
+    // entirely.** `execute` sets `current_source` from the chunk it is starting, and a nested run --
+    // an `async` call routed through `start_async`, a user `equals` reached from inside a table --
+    // returns into the middle of an outer `execute` whose own `chunk_ix` never changed. So the outer
+    // chunk carried on stamping its faults with the callee's file: a fault three lines after
+    // `await slowly(1)` was reported against `waits.sl`, at a line number that happened to exist and
+    // was blank. Nothing about that message says it is pointing at the wrong file.
+    val outer_source = current_source
+
+    vm.scope = scope0
+
+    // A fresh run: the handlers standing here are somebody else's and stay theirs.
+    val answer = execute(u, start, 0, vm.stack.len(), floor, outer_scope, vm.handlers.len())
+
+    current_source = outer_source
+    answer
+end run_chunk
+
+// Carry on from where an `await` left off.
+//
+// **The frame on top says where.** `Await` writes the frame it was standing in back before it parks,
+// which is the one thing `execute` never does for itself -- so putting a machine back is popping that
+// frame and starting the loop at the numbers in it.
+//
+// The floor is zero and the outer scope is null because a coroutine's machine is its own: it was
+// created empty by the call that started it, so there is nothing underneath to hand back to.
+//
+// Not `private`: `private` in sysl is private to the *file*, and the scheduler in `async.sysl` is
+// what puts a machine back.
+resume_chunk(u: *Unit) -> Step
+    val back = vm.frames.at(vm.frames.len() - 1)
+    val outer_source = current_source
+
+    vm.frames.truncate(vm.frames.len() - 1)
+    vm.scope = back.scope
+
+    // **Everything this machine has is its own**, which is the same sentence `resume_failed` says
+    // when it hands a fault to `guarded` with a floor of zero. A resumed coroutine's `try` blocks
+    // came back from `parked` with it and every one of them is allowed the faults that follow.
+    val answer = execute(u, back.chunk, back.pc, back.base, 0, null, 0)
+
+    current_source = outer_source
+    answer
+end resume_chunk
+
+// Carry on from an `await` whose promise FAILED, raising the fault where the `await` was written.
+//
+// **The machine is put back before the fault is raised, and that ordering is the whole point.** A
+// coroutine's `try` blocks are its own and went into `parked` with it, so a fault made into an `Err`
+// without restoring the machine would be offered to whatever happened to be running instead -- which
+// is the scheduler, which has no handlers and is not the code that wrote the `await`.
+resume_failed(u: *Unit, at: Span, message: string) -> Step
+    val back = vm.frames.at(vm.frames.len() - 1)
+    val outer_source = current_source
+
+    vm.frames.truncate(vm.frames.len() - 1)
+    vm.scope = back.scope
+    current_source = u.chunks.at(back.chunk).source
+
+    // Everything this machine has is its own, so every handler in it is allowed the fault.
+    val answer = guarded(u, Err(failure(at, message)), 0, null, 0)
+
+    current_source = outer_source
+    answer
+end resume_failed
+
+// What calling a value came to.
+//
+// **The two instructions that call share everything but six lines.** Arity, the `async` detour, the
+// depth limit and building the callee's scope are the same whether the function was named or reached
+// through a field; what differs is only that a method may be handed the object it was found on. The
+// six lines that stay behind write back the frame, which needs `run_frames`'s own locals.
+private enum Called
+    // A native, or an `async` function -- there is a value already and no chunk to enter.
+    Answered(v: Value)
+
+    // An ordinary slate function: the chunk to run and the scope to run it in.
+    Enter(chunk: usize, scope: *EnvObj)
+
+private invoke(u: *Unit, callee: Value, args: Buf[Value], at: Span, depth: usize) -> Result[Called, Signal]
+    callee match
+        Native(f) -> Ok(Answered(call_native(f, args, at)?))
+        Fn(c) ->
+            if args.len() != c.params.len()
+                return Err(failure(at, s"this function takes ${c.params.len()} arguments and was given ${args.len()}"))
+
+            // **An `async` function is not called, it is STARTED**, on a machine of its own, and what
+            // the caller gets back is a promise rather than a result.
+            if u.chunks.at(c.body).is_async then return Ok(Answered(start_async(c, args, at)?))
+
+            // **A generator function is not called either -- it is PREPARED.** The body does not run
+            // until something asks it for a value, so what the caller gets back is the generator and
+            // not whatever the first statement would have computed. Read here, beside `is_async`,
+            // because they are the same question asked twice: does calling this enter it?
+            if u.chunks.at(c.body).is_gen then return Ok(Answered(start_generator(c, args, at)?))
+
+            if depth >= MaxCallDepth
+                return Err(failure(at, s"this call is ${MaxCallDepth} deep, which is farther than slate will go -- a recursion this deep is usually one that never ends"))
+
+            // **The arguments are held while the scope is built.** They are off the operand stack by
+            // now and live only in a sysl local, which the mark phase cannot see -- and a full heap
+            // collects inside `new_env`. `start_async` has always guarded them for this reason; the
+            // ordinary path was relying on the heap not being full at that instant.
+            val mark = root_mark()
+
+            for i in 0..<args.len()
+                hold(args.at(i))
+
+            val called = new_env(c.scope)
+
+            for i in 0..<c.params.len()
+                declare(called, c.params.at(i), args.at(i), true)
+
+            release(mark)
+            Ok(Enter(c.body, called))
+        other -> Err(failure(at, s"${other.type_name()} is not something that can be called"))
+end invoke
+
+// The instruction loop, with any `catch` this call owns given first refusal on a fault.
+//
+// **The loop itself is untouched and keeps returning `Err` the way it always has**, which is the
+// whole reason this is a wrapper rather than a rewrite. A fault leaves `run_frames` from about
+// thirty-five places, every one of them a `?` or a bare `return fault(...)`; threading a handler
+// check through all of them would have been thirty-five chances to get it wrong. Catching a fault is
+// instead re-entering the loop somewhere else, which is exactly what resuming an `await` already is.
+// **`handler_floor` IS THE CALLER'S ANSWER AND MAY NOT BE READ HERE, WHICH COST A `catch` THAT NEVER
+// FIRED.** Reading `vm.handlers.len()` at entry is right for a *fresh* run -- handlers already owed
+// belong to whoever called the native, and a `try` in that function must not catch a fault raised
+// inside a callback it never wrote. It is exactly wrong for a *resumed* one: a coroutine's handlers
+// went into `parked` with it, so they are standing here on entry and a floor above them makes every
+// one of them unreachable. The effect was silent and specific -- a fault raised after an `await`
+// inside a `try` was not caught by that `try`, and turned up as an unhandled rejection naming a line
+// three inside a block that was guarding it. It predates generators; driving one is what found it.
+private execute(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, outer_scope: *EnvObj,
+                handler_floor: usize) -> Step
+    val floor_of_handlers = handler_floor
+    val answer = guarded(u, run_frames(u, start, from, base0, floor, outer_scope), floor, outer_scope, floor_of_handlers)
+
+    // **Not on a park.** `Await` swaps `vm` for a fresh machine before it raises `Wait`, so the
+    // handlers standing here are the new machine's and the count means nothing against them. The
+    // suspended machine took its own away with it, which is the point.
+    answer match
+        Err(Wait) -> ()
+        _ -> vm.handlers.truncate(floor_of_handlers)
+
+    answer
+end execute
+
+// Give a fault to the nearest `catch` that is allowed to have it, and run on from there.
+//
+// Not `private`: `async.sysl` hands a failed promise's fault to the machine that awaited it, and
+// that machine's handlers are the ones owed it.
+guarded(u: *Unit, first: Step, floor: usize, outer_scope: *EnvObj, floor_of_handlers: usize) -> Step
+    var outcome = first
+
+    loop
+        val caught = outcome match
+            Err(Fail(at, src, message)) -> (at, src, message)
+            _ -> return outcome
+
+        if vm.handlers.len() <= floor_of_handlers then return outcome
+
+        val (at, src, message) = caught
+        val h = vm.handlers.at(vm.handlers.len() - 1)
+
+        vm.handlers.truncate(vm.handlers.len() - 1)
+
+        // **The value is built before the stack is cut back, and held while it is built.** It is an
+        // object, so making it allocates, and allocating collects -- and everything the program still
+        // owns is on the very stack about to be truncated.
+        val mark = root_mark()
+        val v = fault_value(u, at, src, message)
+
+        hold(v)
+        vm.stack.truncate(h.sp)
+        vm.frames.truncate(h.frames)
+        vm.scope = h.scope
+        vm.stack.push(v)
+        release(mark)
+
+        outcome = run_frames(u, h.chunk, h.pc, h.base, floor, outer_scope)
+end guarded
+
+// What a `catch` binds: the sentence, and where it was raised.
+//
+// **An ordinary object, which is the same answer modules got.** A fault is a value a program reads,
+// sorts on, prints and puts in an array, and slate objects already do all of that -- so there is no
+// new kind of value here and nothing new for the collector to trace.
+private fault_value(u: *Unit, at: Span, src: usize, message: string) -> Value
+    val o = new_object()
+    val mark = root_mark()
+
+    hold(Object(o))
+
+    val where = u.sources.at(src)
+
+    obj_put_name(o, "message", str_value(message))
+    obj_put_name(o, "line", Int(long(where.locate(at.start).line)))
+    obj_put_name(o, "file", str_value(where.name))
+    release(mark)
+    Object(o)
+end fault_value
+
+// The instruction loop.
+//
+// **The instruction pointer and the scope are sysl locals rather than fields of the top frame**, and
+// written back only when a call pushes or pops one -- or when an `await` suspends. Reading them out of
+// a `Buf` on every instruction would copy a whole frame per step.
+private run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, outer_scope: *EnvObj) -> Step
+    var chunk_ix = start
+
+    // **The machine keeps `current_source` in step with the chunk it is running**, which is what
+    // lets `failure` stamp a fault with the file its span belongs to. It is set here and at every
+    // point below that changes `chunk_ix`; there are three, and they are the only three.
+    current_source = u.chunks.at(chunk_ix).source
+    var pc = from
+    var base = base0
+    var code = u.chunks.at(chunk_ix).code
+
+    loop
+        if pc >= code.len()
+            // A chunk that ran off its end answers null, which only happens for an empty body.
+            vm.stack.push(Null)
+            pc = code.len()
+
+        val ins = code.at(pc)
+        val at = ins.at
+
+        pc += 1
+
+        ins.op match
+            PushNil -> vm.stack.push(Null)
+            PushUndefined -> vm.stack.push(Undefined)
+            PushBool(v) -> vm.stack.push(Bool(v))
+            PushInt(v) -> vm.stack.push(Int(v))
+            PushReal(v) -> vm.stack.push(Real(v))
+            PushStr(k) -> vm.stack.push(str_value(u.strings.at(k)))
+            PushModule(m) -> vm.stack.push(module_values.at(m))
+
+            CheckType(k, t, pk) ->
+                val name = u.strings.at(k)
+
+                val v = lookup(vm.scope, name) match
+                    Some(found) -> found
+                    None -> return fault(at, s"`${name}` is not defined")
+
+                if !match_pattern(u.patterns.at(pk), v, vm.scope, false)
+                    return fault(at, s"`${name}` was declared ${u.strings.at(t)}, and was given ${show_value(v)}")
+
+            CheckResult(t, pk) ->
+                if !match_pattern(u.patterns.at(pk), peek(0), vm.scope, false)
+                    return fault(at, s"this answers ${u.strings.at(t)}, and gave back ${show_value(peek(0))}")
+
+            DefineTest(k) -> registered_tests.push(TestCase(u.strings.at(k), u.chunks.at(chunk_ix).source, pop()))
+
+            PushHandler(to) -> vm.handlers.push(Handler(chunk_ix, to, vm.stack.len(), vm.frames.len(), vm.scope, base))
+            PopHandler -> vm.handlers.truncate(vm.handlers.len() - 1)
+
+            LoadName(k) ->
+                val name = u.strings.at(k)
+
+                lookup(vm.scope, name) match
+                    Some(v) -> vm.stack.push(v)
+                    None -> return fault(at, s"`${name}` is not defined")
+            DeclareVal(k) ->
+                val v = pop()
+
+                keepable(v, at, s"bound to `${u.strings.at(k)}`")?
+                declare(vm.scope, u.strings.at(k), v, false)
+            DeclareVar(k) ->
+                val v = pop()
+
+                keepable(v, at, s"bound to `${u.strings.at(k)}`")?
+                declare(vm.scope, u.strings.at(k), v, true)
+            StoreName(k) ->
+                val name = u.strings.at(k)
+
+                val stored = pop()
+
+                keepable(stored, at, s"written to `${name}`")?
+
+                assign_name(vm.scope, name, stored) match
+                    Written -> ()
+                    Immutable -> return fault(at, s"`${name}` is a `val`, so it is written once")
+                    Unknown -> return fault(at, s"`${name}` is not defined")
+
+            UnaryOp(op) ->
+                val v = pop()
+
+                vm.stack.push(unary(op, v, at)?)
+            BinaryOp(op) ->
+                val b = pop()
+                val a = pop()
+
+                vm.stack.push(on_values(op, a, b, at)?)
+
+            MakeArray(n) ->
+                var items: Buf[Value] = buf()
+
+                for i in 0..<n
+                    keepable(peek(n - 1 - i), at, "put in an array")?
+                    items.push(peek(n - 1 - i))
+
+                // **Allocated before the stack shrinks.** Between the truncate and the alloc the
+                // elements would live only in `items`, which the mark phase cannot see -- and `alloc`
+                // collects when the heap is full.
+                val made = Array(new_array(items))
+
+                vm.stack.truncate(vm.stack.len() - n)
+                vm.stack.push(made)
+            MakeObject(n) ->
+                val o = new_object()
+                val mark = root_mark()
+
+                hold(Object(o))
+
+                for i in 0..<n
+                    val key = peek((n - 1 - i) * 2 + 1)
+                    val value = peek((n - 1 - i) * 2)
+
+                    keepable(value, at, "put in an object")?
+
+                    obj_put(o, key, value, at)?
+
+                release(mark)
+                vm.stack.truncate(vm.stack.len() - n * 2)
+                vm.stack.push(Object(o))
+
+            GetIndex ->
+                val k = pop()
+                val target = pop()
+
+                vm.stack.push(read_at(target, k, at)?)
+            SetIndex ->
+                val v = pop()
+                val k = pop()
+                val target = pop()
+
+                keepable(v, at, "stored")?
+                keepable(k, at, "used as a key")?
+
+                store_at(target, k, v, at)?
+            GetField(k) ->
+                val target = pop()
+
+                vm.stack.push(read_field(target, u.strings.at(k), at)?)
+            SetField(k) ->
+                val v = pop()
+
+                keepable(v, at, s"stored in `${u.strings.at(k)}`")?
+
+                pop() match
+                    Object(o) -> obj_put_name(o, u.strings.at(k), v)
+                    other -> return fault(at, s"a field belongs to an object, and this is ${other.type_name()}")
+
+            Jump(to) -> pc = to
+            JumpIfFalse(to) -> if !pop().truthy() then pc = to
+            JumpIfTrueKeep(to) -> if peek(0).truthy() then pc = to
+            JumpIfPresentKeep(to) -> if !is_nullish(peek(0)) then pc = to
+            JumpIfAbsentKeep(to) -> if is_nullish(peek(0)) then pc = to
+            JumpIfFalseKeep(to) -> if !peek(0).truthy() then pc = to
+
+            Pop -> vm.stack.truncate(vm.stack.len() - 1)
+            Dup -> vm.stack.push(peek(0))
+            DupAt(n) -> vm.stack.push(peek(n))
+            RotUp(n) ->
+                // `[a, b, c]` with an `n` of two becomes `[c, a, b]`: the top slides down and
+                // everything it passed shifts up one.
+                val top = vm.stack.len() - 1
+                val v = vm.stack.at(top)
+                var i = top
+
+                while i > top - n
+                    vm.stack.set(i, vm.stack.at(i - 1))
+                    i -= 1
+
+                vm.stack.set(top - n, v)
+
+            Join(n) ->
+                var out = str_builder()
+
+                for i in 0..<n
+                    keepable(peek(n - 1 - i), at, "put in a string")?
+                    out.push(value_text(peek(n - 1 - i)))
+
+                val joined = str_value(out.finish())
+
+                vm.stack.truncate(vm.stack.len() - n)
+                vm.stack.push(joined)
+            Repeat ->
+                val n = pop() match
+                    Int(k) ->
+                        if k < 0 then return fault(at, s"an array of ${k} copies is not something to make") else usize(k)
+                    other -> return fault(at, s"a repeat count is a whole number, and this is ${other.type_name()}")
+
+                keepable(peek(0), at, "put in an array")?
+
+                var items: Buf[Value] = buf()
+
+                for i in 0..<n
+                    items.push(peek(0))
+
+                // Allocated before the stack shrinks, for the reason `MakeArray` gives.
+                val made = Array(new_array(items))
+
+                vm.stack.truncate(vm.stack.len() - 1)
+                vm.stack.push(made)
+            WithObject(n) ->
+                val base = peek(n * 2)
+
+                val fields = base match
+                    Object(o) -> o
+                    other -> return fault(at, s"`with` copies an object, and this is ${other.type_name()}")
+
+                val o = new_object()
+                val mark = root_mark()
+
+                hold(Object(o))
+
+                // The base's own fields first, in the order it holds them, so that the copy keeps
+                // the order and a changed field keeps the place it already had.
+                for i in 0..<fields.entries.len()
+                    val entry = fields.entries.at(i)
+
+                    if !entry.dead then obj_put(o, entry.key, entry.value, at)?
+
+                for i in 0..<n
+                    val key = peek((n - 1 - i) * 2 + 1)
+                    val value = peek((n - 1 - i) * 2)
+
+                    keepable(value, at, "put in an object")?
+                    obj_put(o, key, value, at)?
+
+                release(mark)
+                vm.stack.truncate(vm.stack.len() - n * 2 - 1)
+                vm.stack.push(Object(o))
+
+            MakeRange(inclusive, has_lo, has_hi) ->
+                val hi = if has_hi then range_end(pop(), at, "the end")? else 0
+                val lo = if has_lo then range_end(pop(), at, "the start")? else 0
+
+                vm.stack.push(RangeVal(lo, hi, inclusive, has_lo, has_hi))
+            Unpack(k, immutable) ->
+                val subject = pop()
+
+                // **A binding has no next arm, so a shape that does not fit is a fault**, where a
+                // `match` would simply let the next pattern try. The message says the pattern back
+                // and says what arrived, both being things the reader needs and neither being on
+                // the line by itself.
+                if !match_pattern(u.patterns.at(k), subject, vm.scope, !immutable)
+                    return fault(at, unpack_complaint(u.patterns.at(k), subject))
+
+            IsPat(k, negated) ->
+                val took = match_pattern(u.patterns.at(k), pop(), vm.scope, false)
+
+                vm.stack.push(Bool(if negated then !took else took))
+
+            PushScope -> vm.scope = new_env(vm.scope)
+            PopScope -> vm.scope = vm.scope.parent
+
+            MakeClosure(c) -> vm.stack.push(Fn(new_closure(u.chunks.at(c).params, c, vm.scope)))
+            DefineFn(k, c) ->
+                val name = u.strings.at(k)
+
+                // Bound before the closure is built, so the body can see its own name -- which is the
+                // whole of what makes a named function recursive.
+                declare(vm.scope, name, Null, false)
+                declare(vm.scope, name, Fn(new_closure(u.chunks.at(c).params, c, vm.scope)), false)
+
+            TestPat(k) ->
+                val took = match_pattern(u.patterns.at(k), peek(0), vm.scope, false)
+
+                vm.stack.push(Bool(took))
+
+            IterInit ->
+                peek(0) match
+                    Array(_) -> vm.stack.push(Int(0))
+
+                    // **A range with an end left out is refused rather than walked**, because the
+                    // walk would not stop: an end taken from what the range is used on has nothing to
+                    // take it from here.
+                    RangeVal(_, _, _, has_lo, has_hi) ->
+                        if !has_lo || !has_hi
+                            return fault(at, "`for` needs a range with both ends, since one left out would never finish")
+
+                        vm.stack.push(Int(0))
+                    // A generator has no counter to initialise, but the loop pushes one anyway so
+                    // that `IterNext` is one shape: the integer is kept beside the generator and
+                    // ignored, which costs nothing and keeps the instruction from needing to know
+                    // which kind of subject it has before it asks.
+                    Gen(_, _) -> vm.stack.push(Int(0))
+                    other -> return fault(at, s"`for` walks an array, a range or a generator, and this is ${other.type_name()}")
+            IterNext(to) ->
+                val i = peek(0) match
+                    Int(n) -> usize(n)
+                    _ -> 0
+
+                val step = peek(1) match
+                    Array(p) ->
+                        if i >= p.items.len() then None else Some(p.items.at(i))
+                    RangeVal(lo, hi, inclusive, _, _) ->
+                        if i >= range_count(lo, hi, inclusive) then None else Some(Int(lo + long(i)))
+
+                    // **A generator ignores the counter and is asked instead.** The loop keeps
+                    // counting beside it, which costs an integer and keeps this instruction one
+                    // shape; what says whether there is another value is the generator, and only it
+                    // can know. This runs slate code from inside the instruction loop, which is what
+                    // a native calling back already does.
+                    Gen(id, gen) -> gen_iter_next(id, gen, at)?
+                    _ -> return fault(at, "`for` walks an array, a range or a generator")
+
+                step match
+                    None -> pc = to
+                    Some(v) ->
+                        vm.stack.set(vm.stack.len() - 1, Int(long(i + 1)))
+                        vm.stack.push(v)
+
+            FailWith(k) -> return fault(at, u.strings.at(k))
+            FailNoArm -> return fault(at, s"no arm of this match applies to ${value_text(peek(0))}")
+
+            Tick ->
+                maybe_collect()
+
+                // A full heap is reported where there is a line to point at; the allocator has no
+                // idea which statement it was serving.
+                if heap_exhausted then return fault(at, "this program has run out of memory")
+
+            CallFn(argc) ->
+                var args: Buf[Value] = buf()
+
+                for i in 0..<argc
+                    keepable(peek(argc - 1 - i), at, "passed to a function")?
+                    args.push(peek(argc - 1 - i))
+
+                val callee = peek(argc)
+
+                vm.stack.truncate(vm.stack.len() - argc - 1)
+
+                invoke(u, callee, args, at, vm.frames.len())? match
+                    Answered(v) -> vm.stack.push(v)
+                    Enter(body, called) ->
+                        // The frame this call is leaving is written back only here, which is what
+                        // makes the ordinary instruction cheap.
+                        vm.frames.push(Frame(chunk_ix, pc, vm.scope, base, vm.handlers.len()))
+                        chunk_ix = body
+                        code = u.chunks.at(chunk_ix).code
+                        current_source = u.chunks.at(chunk_ix).source
+                        pc = 0
+                        vm.scope = called
+                        base = vm.stack.len()
+
+            // `f(...xs)` -- the arguments are an array the instruction above it built.
+            //
+            // **The only difference from `CallFn` is where the count comes from**, which is the
+            // whole point: everything after that -- the keepable check, the truncate, `invoke` and
+            // the two ways a call can go -- is the same code doing the same thing.
+            CallSpread ->
+                val given = pop()
+                val callee = pop()
+
+                var args: Buf[Value] = buf()
+
+                given match
+                    Array(a) ->
+                        for i in 0..<a.items.len()
+                            keepable(a.items.at(i), at, "passed to a function")?
+                            args.push(a.items.at(i))
+                    _ -> return fault(at, "unreachable")
+
+                invoke(u, callee, args, at, vm.frames.len())? match
+                    Answered(v) -> vm.stack.push(v)
+                    Enter(body, called) ->
+                        vm.frames.push(Frame(chunk_ix, pc, vm.scope, base, vm.handlers.len()))
+                        chunk_ix = body
+                        code = u.chunks.at(chunk_ix).code
+                        current_source = u.chunks.at(chunk_ix).source
+                        pc = 0
+                        vm.scope = called
+                        base = vm.stack.len()
+
+            // The top `n` arrays, made into one. What builds a spread argument list.
+            JoinArrays(n) ->
+                var items: Buf[Value] = buf()
+
+                for i in 0..<n
+                    peek(n - 1 - i) match
+                        Array(a) ->
+                            for j in 0..<a.items.len()
+                                items.push(a.items.at(j))
+
+                        // **The complaint names the spread and not the call**, because that is where
+                        // the reader has to look: `f(...42)` is a mistake about what may be spread.
+                        other -> return fault(at, s"`...` spreads an array, and this is ${other.type_name()}")
+
+                // Allocated before the stack shrinks, for `MakeArray`'s reason.
+                val made = Array(new_array(items))
+
+                vm.stack.truncate(vm.stack.len() - n)
+                vm.stack.push(made)
+
+            // `o.m(a)`, which is where the receiver rule lives.
+            //
+            // **The lookup and the call are one instruction because the rule needs both.** By the
+            // time a `GetField` has handed a function to a `CallFn`, the fact that decides whether
+            // an object is passed -- was it the object's own, or a shared one reached through a
+            // proto -- has been thrown away.
+            CallMethod(k, argc) ->
+                val name = u.strings.at(k)
+                val target = peek(argc)
+
+                // **A builtin type answers a method by TABLE and an object answers by field.** An
+                // object is not in the table at all -- its names are the program's, and `proto` is
+                // already the mechanism by which one gets methods. `method.sysl` says why.
+                val found = target match
+                    Object(fields) -> field_from(fields, name, at)?
+                    other -> builtin_receiver(target, name, at)?
+
+                var args: Buf[Value] = buf()
+
+                // **The object goes in front of the written arguments where it was delegated to.**
+                // A method the object carries itself has already captured what it needs; a shared
+                // one cannot have, there being one of it for every instance. A builtin method is
+                // delegated to by the same rule -- it is the free function of that name, and the
+                // receiver is its first argument.
+                if found.1 then args.push(target)
+
+                for i in 0..<argc
+                    keepable(peek(argc - 1 - i), at, "passed to a function")?
+                    args.push(peek(argc - 1 - i))
+
+                vm.stack.truncate(vm.stack.len() - argc - 1)
+
+                if is_absent(found.0)
+                    return fault(at, s"`${name}` is not a field of this object, so there is nothing to call")
+
+                invoke(u, found.0, args, at, vm.frames.len())? match
+                    Answered(v) -> vm.stack.push(v)
+                    Enter(body, called) ->
+                        vm.frames.push(Frame(chunk_ix, pc, vm.scope, base, vm.handlers.len()))
+                        chunk_ix = body
+                        code = u.chunks.at(chunk_ix).code
+                        current_source = u.chunks.at(chunk_ix).source
+                        pc = 0
+                        vm.scope = called
+                        base = vm.stack.len()
+
+            // `o.m(...xs)`. The receiver rule is `CallMethod`'s and is not restated: what differs is
+            // that the arguments arrive as an array, and the receiver goes in front of them where
+            // the method was delegated to.
+            CallMethodSpread(k) ->
+                val name = u.strings.at(k)
+                val given = pop()
+                val target = peek(0)
+
+                val found = target match
+                    Object(fields) -> field_from(fields, name, at)?
+                    other -> builtin_receiver(target, name, at)?
+
+                var args: Buf[Value] = buf()
+
+                if found.1 then args.push(target)
+
+                given match
+                    Array(a) ->
+                        for i in 0..<a.items.len()
+                            keepable(a.items.at(i), at, "passed to a function")?
+                            args.push(a.items.at(i))
+                    _ -> return fault(at, "unreachable")
+
+                vm.stack.truncate(vm.stack.len() - 1)
+
+                if is_absent(found.0)
+                    return fault(at, s"`${name}` is not a field of this object, so there is nothing to call")
+
+                invoke(u, found.0, args, at, vm.frames.len())? match
+                    Answered(v) -> vm.stack.push(v)
+                    Enter(body, called) ->
+                        vm.frames.push(Frame(chunk_ix, pc, vm.scope, base, vm.handlers.len()))
+                        chunk_ix = body
+                        code = u.chunks.at(chunk_ix).code
+                        current_source = u.chunks.at(chunk_ix).source
+                        pc = 0
+                        vm.scope = called
+                        base = vm.stack.len()
+
+            // `yield e` -- stand still and let whoever is driving take the value.
+            //
+            // **The frame is written back and the machine is NOT parked**, which is where this parts
+            // company with `Await`. An `await` is resumed by the scheduler, so it has to be in
+            // `parked` before it lets go; a generator is resumed by `gen_step`, which is the very
+            // function this `Err(Wait)` is about to return to -- so parking is that function's move,
+            // and doing it here as well would park twice and lose the machine.
+            //
+            // **The value stays on the stack for `Await`'s reason**: the machine's own stack is a
+            // root the tracer walks, and the sysl local this arm could have kept it in is not.
+            Op.Yield ->
+                vm.frames.push(Frame(chunk_ix, pc, vm.scope, base, vm.handlers.len()))
+
+                return Err(Wait)
+
+            Op.Await ->
+                // **A machine that is not a coroutine has nowhere to come back from.** The compiler
+                // refuses `await` outside an `async` function, so this is only reachable if a chunk
+                // were started the ordinary way -- and suspending the main program would leave `run`
+                // with nothing to return.
+                if vm.promise == null || floor != 0
+                    return fault(at, "`await` cannot suspend this call")
+
+                // **The awaited value stays on the stack while the machine is parked**, which is what
+                // keeps a pending promise reachable: the shadow stack cannot hold it across the park,
+                // and the machine's own operand stack is a root the tracer already walks. The answer
+                // is written over it when the machine comes back.
+                val awaited = peek(0)
+
+                // What `resume_chunk` will pick the loop up from.
+                vm.frames.push(Frame(chunk_ix, pc, vm.scope, base, vm.handlers.len()))
+
+                val id = park()
+
+                awaited match
+                    Promise(pr) ->
+                        pr.handled = true
+
+                        // **A settled promise still goes round the queue.** Continuing here instead
+                        // would make `await` on a finished promise run the rest of the function before
+                        // anything else queued ahead of it -- which is the ordering bug every async
+                        // runtime that took the shortcut has had to undo. JavaScript resolves this
+                        // case through a microtask for the same reason.
+                        if pr.settled
+                            ready.push(Resumption(id, pr.value, pr.failed, pr.message, pr.at))
+                        else
+                            pr.waiters.push(id)
+                    other ->
+                        // `await 5` is 5, as in JavaScript -- and it still yields, so that a program
+                        // cannot tell which of the two it was given by watching what runs next.
+                        ready.push(Resumption(id, other, false, "", at))
+
+                return Err(Wait)
+
+            Ret ->
+                val v = pop()
+
+                vm.stack.truncate(base)
+
+                if vm.frames.len() == floor
+                    vm.scope = outer_scope
+                    return Ok(v)
+
+                val back = vm.frames.at(vm.frames.len() - 1)
+
+                vm.frames.truncate(vm.frames.len() - 1)
+
+                // **Anything the returning call was inside goes with it.** A `return` written in a
+                // `try` body skips its `PopHandler`, and a handler outliving the frame it was
+                // established in names an instruction nobody is standing at.
+                vm.handlers.truncate(back.handlers)
+                chunk_ix = back.chunk
+                code = u.chunks.at(chunk_ix).code
+                current_source = u.chunks.at(chunk_ix).source
+                pc = back.pc
+                vm.scope = back.scope
+                base = back.base
+                vm.stack.push(v)
+end run_frames
