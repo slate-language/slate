@@ -11,7 +11,7 @@ val n = 10 / 0 catch e -> -1
 print(n)
 
 // The handler may be a block, because `->` opens one where it ends the line.
-val parsed = someUndefinedName catch e ->
+val parsed = 1 / 0 catch e ->
     print("falling back, because:", e.message)
     0
 
@@ -30,7 +30,7 @@ var trouble = []
 
 for i in 1..4
     try
-        if i == 2 then boom
+        if i == 2 then 1 / 0
         print("turn", i, "was fine")
     catch e
         push(trouble, e.message)
@@ -38,7 +38,7 @@ for i in 1..4
 print(trouble)
 
 // It carries across calls, however deep.
-deep(k) = if k == 0 then thisIsTheBottom else deep(k - 1)
+deep(k) = if k == 0 then 1 / 0 else deep(k - 1)
 
 print(deep(6) catch e -> "came back from " + string(6) + " frames down")
 

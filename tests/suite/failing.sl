@@ -9,7 +9,7 @@ triple_trouble() = 6
 
 @test
 a_fault_rather_than_an_assertion() =
-    val v = no_such_name
+    val v = 1 / 0
     assert(true)
 
 @test

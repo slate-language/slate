@@ -193,6 +193,21 @@ known_type(e: *TypeEnv, name: string) -> Type
         if e.names.at(i) == name then return e.types.at(i)
 end known_type
 
+// Whether this environment has heard of a name at all.
+//
+// **The same walk `known_type` makes, answering presence rather than a type**, which is the question
+// an undefined name asks: `known_type` answers `Any` for a name it has never seen and for a name it
+// has seen and knows nothing about, and those two are the same answer to a different question.
+private has_name(e: *TypeEnv, name: string) -> bool
+    var i = e.names.len()
+
+    loop
+        if i == 0 then return false
+
+        i -= 1
+
+        if e.names.at(i) == name then return true
+
 // Whether a name is one narrowing may say anything about.
 private may_narrow(e: *TypeEnv, name: string) -> bool
     var i = e.names.len()
@@ -247,11 +262,31 @@ end narrow_by
 check_program(prog: Program)
     var env = type_env()
 
+    // **THE BUILTINS ARE ASKED OF THE INSTALLER RATHER THAN LISTED AGAIN.** An undefined-name check
+    // needs to know every name a program starts with, and `install_builtin_types` below carries only
+    // the ones whose *type* is worth stating -- `print`, `assert`, `min` and five others deliberately
+    // say nothing and would have looked undefined. A second list of 140 names would drift the first
+    // time one was added; this builds a real scope with the real installer and asks it.
+    builtin_scope = new_env(null)
+
+    install_builtins(builtin_scope)
     enter_scope(&env)
     install_builtin_types(&env)
     check_stmts(prog.stmts, &env)
     leave_scope(&env)
 end check_program
+
+// The scope every program starts in, built once per check. **Module storage because the walk reaches
+// it from everywhere**, and a root nothing else refers to -- it is thrown away when the next program
+// is checked.
+var builtin_scope: *EnvObj = null
+
+// Whether a program could find this name at all: something it wrote, or something it was given.
+private defined(env: *TypeEnv, name: string) -> bool
+    if has_name(env, name) then return true
+    if builtin_scope == null then return true
+
+    knows(builtin_scope, name)
 
 // What the builtins take and answer, as far as it can be said without qualification.
 //
@@ -445,6 +480,24 @@ private check_stmts(stmts: Buf[Stmt], env: *TypeEnv)
     for i in 0..<stmts.len()
         *stmts.at(i).kind match
             Def(name, params, body, is_async) -> note_type(env, name, signature_of(params, body_at(body), is_async))
+
+            // **EVERY name this block binds is noted before any body is walked, not only the
+            // definitions.** A closure may name something declared later in the block it sits in --
+            //
+            //     val probe = { equals: o -> clear(xs) }
+            //     val xs = [probe]
+            //
+            // -- which runs, because the body runs after `xs` exists. Checking that body against the
+            // scope as it stood where the closure was *written* would refuse it, and refusing a
+            // program that runs is the one thing this pass may not do. The type is `Any` here and the
+            // real one is noted in the walk below, which shadows this by being nearer.
+            Val(name, _) -> note_type(env, name, type_of(Any))
+            Var(name, _) -> note_binding(env, name, type_of(Any), false)
+            Unpack(pat, _, _) -> note_bindings(pat, env)
+            ImportNames(_, _, _, _, locals) ->
+                for j in 0..<locals.len()
+                    note_type(env, locals.at(j), type_of(Any))
+            ImportAll(_, _, _, alias) -> note_type(env, alias, type_of(Any))
             _ -> ()
 
     for i in 0..<stmts.len()
@@ -724,8 +777,84 @@ private check_expr(x: Expr, env: *TypeEnv)
             check_expr(handler, env)
             leave_scope(env)
         Lambda(params, body, _) -> check_body(params, body_at(body), env)
+
+        // **A NAME NOTHING HAS BOUND IS REFUSED BEFORE IT RUNS**, which is the most common mistake
+        // there is in any language and the one a dynamic language usually finds last -- a typo on a
+        // branch nobody took until a customer took it.
+        //
+        // **It is sound because the machine would refuse the same program**: a name is bound by a
+        // `val`, a `var`, a definition, a parameter, a pattern, an import or the builtins, and this
+        // pass tracks every one of those. A name used before the `val` that binds it in the same
+        // block faults at run time too -- the scope has nothing in it yet -- so refusing it early is
+        // the same answer sooner.
+        Name(name) ->
+            if !defined(env, name)
+                complain_here(x.span, s"`${name}` is not defined${nearest(env, name)}")
+
+        // **An `is` BINDS INTO THE SURROUNDING SCOPE**, which is the machine's rule -- `if x is
+        // { n }` leaves `n` standing after it. Nothing here checked the subject or noted the
+        // bindings before, which was harmless while every unknown name was `Any` and is not once a
+        // name nothing bound is a complaint.
+        IsPattern(subject, pat, _) ->
+            check_expr(subject, env)
+            note_bindings(pat, env)
         _ -> ()
 end check_expr
+
+// The nearest name the program does know, where one is close enough to be worth naming.
+//
+// **A suggestion is only offered where it is nearly right.** "Did you mean" is the most annoying
+// thing a compiler does when it guesses badly, so the distance has to be one edit for a short name
+// and two for a long one, and nothing else is offered at all.
+private nearest(env: *TypeEnv, name: string) -> string
+    var best = ""
+    var best_at: usize = 3
+
+    for i in 0..<env.names.len()
+        val d = distance(name, env.names.at(i))
+
+        if d < best_at
+            best = env.names.at(i)
+            best_at = d
+
+    val limit: usize = if name.bytes.len <= 4 then 1 else 2
+
+    if best == "" || best_at > limit then "" else s" -- did you mean `${best}`?"
+
+// How many single-character edits apart two names are, up to the point where nobody cares.
+private distance(a: string, b: string) -> usize
+    val x = a.bytes
+    val y = b.bytes
+
+    if x.len == 0 then return y.len
+    if y.len == 0 then return x.len
+
+    var previous: Buf[usize] = buf()
+    var current: Buf[usize] = buf()
+
+    for j in 0..<(y.len + 1)
+        previous.push(j)
+        current.push(0)
+
+    for i in 0..<x.len
+        current.set(0, i + 1)
+
+        for j in 0..<y.len
+            val substitute = previous.at(j) + (if x[i] == y[j] then 0 else 1)
+            val insert = current.at(j) + 1
+            val remove = previous.at(j + 1) + 1
+            var least = substitute
+
+            if insert < least then least = insert
+            if remove < least then least = remove
+
+            current.set(j + 1, least)
+
+        for j in 0..<(y.len + 1)
+            previous.set(j, current.at(j))
+
+    previous.at(y.len)
+end distance
 
 // **An arm narrows its subject the way an `is` narrows its operand**, and for the same reason: the
 // arm only runs where the pattern took. `note_bindings` has already put the arm's own names in, so

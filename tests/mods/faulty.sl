@@ -1,1 +1,1 @@
-export boom() = missing_name + 1
+export boom() = 1 / 0
