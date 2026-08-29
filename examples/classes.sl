@@ -18,17 +18,22 @@ class Shape
 class Square from Shape
     val sides = 4
 
-    // `new` is the constructor. It takes no receiver, there being no object yet, and whatever it
-    // answers is given the class as its proto -- which is the `proto:` line you would otherwise have
-    // to remember on every path that makes one.
-    new(side) = { side: side }
+    // **`var` declares a field each OBJECT gets**, where `val` above declares one the class holds. A
+    // class that declares fields and writes no constructor is given one, taking those fields in the
+    // order they were written -- so `Square.new(4)` needs no `new` of its own.
+    var side
 
     name(self) = "square"
 
     area(self) = self.side * self.side
 
 class Circle from Shape
-    new(radius) = { radius: radius }
+    var radius
+
+    // A field with an initialiser is not a parameter of the generated constructor, and the
+    // initialiser runs **once per object** -- which is the whole difference between `var` and `val`.
+    // Under `val` every circle would share one array and push into it together.
+    var marks = []
 
     name(self) = "circle"
 
@@ -57,12 +62,44 @@ biggest(a: Shape, b: Shape) = if a.area() > b.area() then a else b
 
 print(biggest(Square.new(2), Circle.new(2)).describe())
 
+// One array each, not one between them.
+val one = Circle.new(1)
+val two = Circle.new(1)
+
+one.marks.push("here")
+
+print(one.marks, two.marks)
+
+// -- a constructor with something to do -------------------------------------------------------------
+
+// Where a constructor has to check or compute, `var` in its parameter list declares the field and
+// assigns it in one place, and `self` is the object being made. The body runs for its effect; the
+// object is what comes back.
+class Rect
+    var area = 0
+
+    new(var w, var h)
+        if w < 0 || h < 0 then throw "a side cannot be negative"
+
+        self.area = w * h
+
+    describe(self) = s"${self.w}x${self.h} = ${self.area}"
+
+print(Rect.new(3, 4).describe())
+
+try
+    Rect.new(-1, 2)
+catch e
+    print("refused: " + e.message)
+
 // -- overriding, and reaching what was overridden --------------------------------------------------
 
 // There is no `super`, and none is needed: a base class is an ordinary value in scope, and a method
 // stored on it directly is handed no receiver -- so passing one is how you call it.
+// **A field declaration is the class's own, not its base's.** `Square` declares `side`, and `Loud`
+// declares it again to get a constructor of its own -- there being no `super` to pass it up to.
 class Loud from Square
-    new(side) = { side: side }
+    var side
 
     describe(self) = upper(Shape.describe(self)) + "!"
 

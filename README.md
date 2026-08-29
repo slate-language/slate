@@ -645,8 +645,7 @@ class Shape
 
 class Square from Shape
     val sides = 4
-
-    new(side) = { side: side }
+    var side
 
     name(self) = "square"
 
@@ -661,13 +660,55 @@ after `->`. A definition's body may be an indented run of statements, take annot
 parameters, be `async`, or `yield`. A class of twenty methods reads like twenty functions rather than
 like twenty fields.
 
-`val` inside a class body is a value the class itself carries — one of it, shared by everything made
-from the class. A `var` there is refused, because it would be a single mutable value standing behind
-every instance, which is the thing nobody writing it means.
+**`val` is the class's and `var` is each object's**, and that distinction is the one that bites. A
+`val` is one value however many objects there are; a `var` declares a field each object gets, and its
+initialiser runs **once per object**:
 
-**`new` is the constructor.** It is handed no receiver, there being no object yet, and whatever it
-answers is given the class as its proto — which is the `proto:` line you would otherwise have to
-remember on every path that makes one. It writes to the object rather than copying it.
+```
+class Bag
+    var items = []       // a NEW array for every bag
+    val kind = "bag"     // one string, shared
+```
+
+TypeScript spells the per-instance one `items = []`, so a reader coming from TS will write `val` and
+get one array every instance pushes into — Python's oldest trap arriving through a door that looks
+like TS's. So **a mutable literal under `val` is refused**, and the message names `var` as the fix.
+Only a *literal* is refused: an object bound outside the class and named here is sharing somebody
+asked for, and still compiles.
+
+**A class that declares fields and writes no constructor is given one**, taking the fields that have
+no initialiser, in the order they were written:
+
+```
+class Square
+    var side
+    var tags = []
+
+Square.new(4)            // side = 4, tags = a fresh []
+```
+
+An initialised field is not a parameter — slate has no default arguments to make it optional with, so
+adding an initialiser changes what `new` takes. **A class that declares nothing gets no `new` at
+all**, rather than one answering an object with nothing in it; `{ side: 4, proto: Square }` still
+works and is how such a class is made.
+
+**Write your own `new` when it has something to do.** `var` in its parameter list declares the field
+and assigns it — TypeScript's parameter property — and `self` is the object being made. The body runs
+for its effect and the object is what comes back:
+
+```
+class Rect
+    var area = 0
+
+    new(var w, var h)
+        if w < 0 || h < 0 then throw "a side cannot be negative"
+
+        self.area = w * h
+```
+
+A class with no declared fields keeps the plain form, where the body's value *is* the object:
+`new(v) = { v: v }`. It is given the class as its proto on the way out, by writing rather than
+copying.
 
 **`is` asks which class a value was made from**, and walks the whole chain:
 
