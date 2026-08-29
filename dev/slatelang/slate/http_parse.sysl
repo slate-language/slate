@@ -1,6 +1,6 @@
 module dev.slatelang.slate
 
-import sh.sysl.llhttp.{requests, Header, Limits, Request, Requests}
+import sh.sysl.llhttp.{requests, stream, Head, Header, Limits, Part, Request, Requests, Stream}
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.text.{from_utf8, to_lower, Search}
@@ -70,14 +70,59 @@ private hold_request(r: &Request) -> Held
     Held(r.method, r.target, r.keep_alive, names, values, body)
 end hold_request
 
-// Where a parser puts the requests it has finished, until slate asks for them.
+// The same, for a request whose body is not going to be held. The head is bounded and is copied for
+// exactly the reason a whole request is; the body is not here at all.
+private hold_head(h: &Head) -> Held
+    var names: Buf[string] = buf()
+    var values: Buf[string] = buf()
+
+    for i in 0..<h.headers.len()
+        names.push(h.headers.at(i).name)
+        values.push(h.headers.at(i).value)
+
+    Held(h.method, h.target, h.keep_alive, names, values, buf())
+end hold_head
+
+// One thing a streaming parser has ready: a head, some bytes of a body, or the end of one.
+//
+// **The bytes are copied here too**, and for the harder version of the same reason. A whole request
+// is handed over once; a chunk is handed over from inside `execute`, over the read buffer slate
+// passed in, and that buffer is gone by the time the program is looking at anything. What the copy
+// costs is one read's worth of bytes held between `httpFeed` and the pump that drains it -- not the
+// body, which is the whole point.
+private enum Piece
+    HeldHead(h: Held)
+    HeldChunk(bytes: Buf[u8])
+    HeldEnd
+end Piece
+
+private copy_bytes(b: []const u8) -> Buf[u8]
+    var out: Buf[u8] = buf()
+
+    for i in 0..<b.len
+        out.push(b[i])
+
+    out
+end copy_bytes
+
+private hold_part(p: Part) -> Piece = p match
+    Headers(h) -> HeldHead(hold_head(h))
+    Chunk(b) -> HeldChunk(copy_bytes(b))
+    End -> HeldEnd
+
+// Where a parser puts what it has finished, until slate asks for it. A parser fills one of the two
+// and never both.
 private struct Arrived
     done: Buf[Held]
+    parts: Buf[Piece]
 end Arrived
 
-// One parser, and what it has ready.
+// One parser, and what it has ready. **`reader` accumulates and `flow` streams**, and a slot holds
+// exactly one of them -- which of the two it is was decided when the connection opened and cannot
+// change, a parser having no way to start holding a body it has already handed out.
 private struct Slot
     reader: Option[&Requests]
+    flow: Option[&Stream]
     arrived: &Arrived
 end Slot
 
@@ -94,12 +139,26 @@ forget_parsers()
 // bookkeeping about bytes that have already arrived, so it can never be the reason a program is
 // still running.
 new_parser(head: usize, body: usize) -> usize
-    val arrived: &Arrived = Arrived(buf())
+    val arrived: &Arrived = Arrived(buf(), buf())
     val reader = requests((r) -> arrived.done.push(hold_request(r)), Limits(head, body))
 
-    slots.push(Slot(Some(reader), arrived))
+    slots.push(Slot(Some(reader), None, arrived))
     slots.len() - 1
 end new_parser
+
+// A new parser that will not hold a body, answering the id slate holds it by.
+//
+// **There is no body limit and that is the point.** The head is bounded because a head has to be held
+// to be useful; a body nobody holds needs no limit to be safe, so the ceiling that makes the
+// accumulating parser safe -- and that refuses the upload along with the attack -- simply is not
+// there.
+new_stream(head: usize) -> usize
+    val arrived: &Arrived = Arrived(buf(), buf())
+    val flow = stream((p) -> arrived.parts.push(hold_part(p)), head)
+
+    slots.push(Slot(None, Some(flow), arrived))
+    slots.len() - 1
+end new_stream
 
 // Give a parser bytes. Answers nothing where they were taken, and why where they were not.
 //
@@ -109,14 +168,20 @@ end new_parser
 feed_parser(id: usize, bytes: []const u8) -> Result[unit, (long, string)]
     if id >= slots.len() then return Ok(())
 
-    slots.at(id).reader match
-        Some(r) -> r.feed(bytes) match
-            Ok(_) -> Ok(())
-            Err(why) -> why match
-                Malformed(f) -> Err((400, f.reason))
-                HeadTooLarge(n) -> Err((431, s"the headers are larger than ${n} bytes"))
-                BodyTooLarge(n) -> Err((413, "the body is larger than " + str(n) + " bytes"))
-        None -> Ok(())
+    val slot = slots.at(id)
+
+    val outcome = slot.reader match
+        Some(r) -> r.feed(bytes)
+        None -> slot.flow match
+            Some(f) -> f.feed(bytes)
+            None -> return Ok(())
+
+    outcome match
+        Ok(_) -> Ok(())
+        Err(why) -> why match
+            Malformed(f) -> Err((400, f.reason))
+            HeadTooLarge(n) -> Err((431, s"the headers are larger than ${n} bytes"))
+            BodyTooLarge(n) -> Err((413, "the body is larger than " + str(n) + " bytes"))
 end feed_parser
 
 // How many whole requests are waiting.
@@ -143,6 +208,14 @@ take_request(id: usize) -> Option[Value]
 
     ready.done.remove(0)
 
+    val o = request_object(r, true)
+
+    Some(Object(o))
+end take_request
+
+// The head of a request as the object a handler is given -- shared by both parsers, since a streamed
+// request and a whole one differ in one field and not in what a program calls them.
+private request_object(r: Held, with_body: bool) -> *ObjectObj
     val headers = new_object()
 
     hold(Object(headers))
@@ -164,21 +237,81 @@ take_request(id: usize) -> Option[Value]
     obj_put_name(o, "path", Str(new_str(if cut == len then target else target[0..<cut])))
     obj_put_name(o, "query", Str(new_str(if cut == len then "" else target[(cut + 1)..<len])))
     obj_put_name(o, "headers", Object(headers))
-    obj_put_name(o, "body", Str(new_str(from_utf8(r.body.view()).unwrap_or(""))))
-    obj_put_name(o, "keepAlive", Bool(r.keep_alive))
 
-    Some(Object(o))
-end take_request
+    if with_body then obj_put_name(o, "body", Str(new_str(from_utf8(r.body.view()).unwrap_or(""))))
+
+    obj_put_name(o, "keepAlive", Bool(r.keep_alive))
+    o
+end request_object
+
+// The oldest piece a streaming parser has ready, as the object `slate:http` pumps.
+//
+// **Three shapes rather than three natives**, because what a caller does with them is one loop: pull
+// until there is nothing, and act on the `kind`. A head carries everything a whole request carries
+// but its body; a body chunk carries the bytes, as an array, which is what `slate:net` hands over and
+// what `httpFeed` takes back.
+take_part(id: usize) -> Option[Value]
+    if id >= slots.len() then return None
+
+    val ready = slots.at(id).arrived
+
+    if ready.parts.len() == 0 then return None
+
+    val piece = ready.parts.at(0)
+
+    ready.parts.remove(0)
+
+    piece match
+        HeldHead(h) ->
+            val o = request_object(h, false)
+
+            obj_put_name(o, "kind", Str(new_str("head")))
+            Some(Object(o))
+
+        HeldChunk(bytes) ->
+            var items: Buf[Value] = buf()
+
+            for i in 0..<bytes.len()
+                items.push(Int(long(bytes.at(i))))
+
+            val chunk = new_array(items)
+
+            hold(Array(chunk))
+
+            val o = new_object()
+
+            hold(Object(o))
+
+            obj_put_name(o, "kind", Str(new_str("body")))
+            obj_put_name(o, "chunk", Array(chunk))
+            Some(Object(o))
+
+        HeldEnd ->
+            val o = new_object()
+
+            hold(Object(o))
+
+            obj_put_name(o, "kind", Str(new_str("end")))
+            Some(Object(o))
+end take_part
 
 // Tell a parser the connection closed, so a request ending at end-of-file completes.
 finish_parser(id: usize)
     if id >= slots.len() then return
 
-    slots.at(id).reader match
-        Some(r) -> r.finish() match
-            Ok(_) -> ()
-            Err(_) -> ()
-        None -> ()
+    val slot = slots.at(id)
+
+    slot.reader match
+        Some(r) ->
+            r.finish() match
+                Ok(_) -> ()
+                Err(_) -> ()
+        None -> slot.flow match
+            Some(f) ->
+                f.finish() match
+                    Ok(_) -> ()
+                    Err(_) -> ()
+            None -> ()
 end finish_parser
 
 // Give a parser back. A connection that has closed will never be fed again.
@@ -188,8 +321,10 @@ close_parser(id: usize)
     var slot = slots.at(id)
 
     slot.reader = None
+    slot.flow = None
     slots.set(id, slot)
     slot.arrived.done.clear()
+    slot.arrived.parts.clear()
 end close_parser
 
 // -- what `slate:http` calls -----------------------------------------------------------------------
@@ -204,7 +339,7 @@ private parser_of(v: Value, at: Span, name: string) -> Result[usize, Signal]
 private limit_of(v: Value, at: Span, name: string) -> Result[usize, Signal]
     v match
         Int(n) -> Ok(usize(n))
-        other -> Err(failure(at, s"`${name}` takes two byte counts, and one of them is ${other.type_name()}"))
+        other -> Err(failure(at, s"`${name}` takes its limits as numbers of bytes, and one of them is ${other.type_name()}"))
 
 // `httpParser(headLimit, bodyLimit)`.
 do_http_parser(args: Buf[Value], at: Span) -> Step
@@ -250,6 +385,22 @@ do_http_take(args: Buf[Value], at: Span) -> Step
         Some(v) -> Ok(v)
         None -> Ok(Null)
 end do_http_take
+
+// `httpStream(headLimit)` -- a parser that hands the head over and then the body as it arrives.
+do_http_stream(args: Buf[Value], at: Span) -> Step
+    if args.len() != 1 then return fault(at, s"`httpStream` takes a head limit, and was given ${counted(args.len(), "argument")}")
+
+    Ok(Int(long(new_stream(limit_of(args.at(0), at, "httpStream")?))))
+end do_http_stream
+
+// `httpTakePart(p)` -- the oldest piece a streaming parser has ready, or null where none is.
+do_http_take_part(args: Buf[Value], at: Span) -> Step
+    if args.len() != 1 then return fault(at, s"`httpTakePart` takes a parser, and was given ${counted(args.len(), "argument")}")
+
+    take_part(parser_of(args.at(0), at, "httpTakePart")?) match
+        Some(v) -> Ok(v)
+        None -> Ok(Null)
+end do_http_take_part
 
 // `httpFinish(p)` -- the peer has stopped sending, so a request ending at end-of-file completes.
 do_http_finish(args: Buf[Value], at: Span) -> Step

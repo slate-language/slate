@@ -1,0 +1,124 @@
+module dev.slatelang.slate
+@tests
+
+// `serveStream` -- the server that hands a handler the head as soon as it is complete and the
+// body as it arrives.
+//
+// **Every one of these is asserted on the wire**, over a real socket the test writes the requests
+// into itself, because what is being tested is the protocol rather than a function: whether the
+// head really goes out before the body, whether two pipelined bodies stay apart, and what a
+// client hanging up mid-upload does to the handler waiting for the rest of it. `fetch` cannot
+// reach any of that -- it says `Connection: close` on every request and hands back an answer.
+
+@test
+A_STREAMED_BODY_REACHES_THE_HANDLER_AND_each_ANSWERS_ITS_SIZE()
+    // **The whole feature in one exchange.** A handler is called, asks for the body, and answers with
+    // what arrived -- and `each` answers how many bytes that was, which is the one number a handler
+    // reading an upload actually needs.
+    //
+    // **The sink is a named function rather than a lambda** because an assignment is a statement in
+    // slate and a one-line `->` takes an expression. That is the idiom for a sink that accumulates,
+    // and it reads better than the lambda would have.
+
+    val text = "async handle(req)\n    var got = \"\"\n\n    take(c)\n        got = got + fromBytes(c).value\n\n    val n = await req.each(take)\n\n    req.method + req.path + \"[\" + got + \"]\" + string(n)\nval server = serveStream(0, handle)\n\nasync main()\n    val c = (await connect(\"127.0.0.1\", localPort(server))).value\n    var acc = \"\"\n\n    heard(chunk)\n        if chunk == null\n            print(join(split(acc, \"\\r\\n\"), \"|\"))\n            shutSocket(c)\n            close(server)\n            done()\n        else\n            acc = acc + chunk\n\n    onData(c, heard)\n    await send(c, \"POST /a HTTP/1.1\\r\\nHost: h\\r\\nConnection: close\\r\\nContent-Length: 5\\r\\n\\r\\nhello\")\n\nmain()\n"
+
+    assert_eq(streamed_out(text),
+        "HTTP/1.1 200 OK|Content-Length: 14|Connection: close||POST/a[hello]5")
+
+@test
+THE_HEAD_REACHES_THE_HANDLER_BEFORE_A_BYTE_OF_THE_BODY_DOES()
+    // **THE ASSERTION THE WHOLE TIER EXISTS FOR.** The head is printed before either chunk, and the
+    // chunks are printed as they arrive rather than as one -- so the handler ran while the body was
+    // still on the wire, which is exactly what `serve` cannot do. The two sends are separated by a
+    // sleep so that the arrival really is in two pieces and not one buffer the kernel joined up.
+
+    val text = "async handle(req)\n    print(\"head \" + req.path)\n\n    await req.each((c) -> print(\"chunk \" + string(len(c))))\n\n    print(\"end\")\n    \"ok\"\nval server = serveStream(0, handle)\n\nasync main()\n    val c = (await connect(\"127.0.0.1\", localPort(server))).value\n    var acc = \"\"\n\n    heard(chunk)\n        if chunk == null\n            print(join(split(acc, \"\\r\\n\"), \"|\"))\n            shutSocket(c)\n            close(server)\n            done()\n        else\n            acc = acc + chunk\n\n    onData(c, heard)\n    await send(c, \"POST /up HTTP/1.1\\r\\nHost: h\\r\\nConnection: close\\r\\nContent-Length: 7\\r\\n\\r\\n\")\n    await sleep(80)\n    await send(c, \"abc\")\n    await sleep(80)\n    await send(c, \"defg\")\n\nmain()\n"
+
+    assert_eq(streamed_out(text),
+        "head /up\nchunk 3\nchunk 4\nend\n" +
+            "HTTP/1.1 200 OK|Content-Length: 2|Connection: close||ok")
+
+@test
+PIPELINED_STREAMED_REQUESTS_KEEP_THEIR_BODIES_APART()
+    // **The bug that produced `hillo` for `hello`, in the streaming path.** Two requests arriving in
+    // one read are answered in order and their bodies do not run together -- which is the case where
+    // a chunk borrowed from the parser's buffer, rather than copied out of it, shows up as the next
+    // request's bytes written through the first one's.
+
+    val text = "async handle(req)\n    var got = \"\"\n\n    take(c)\n        got = got + fromBytes(c).value\n\n    await req.each(take)\n\n    req.path + \"[\" + got + \"]\"\nval server = serveStream(0, handle)\n\nasync main()\n    val c = (await connect(\"127.0.0.1\", localPort(server))).value\n    var acc = \"\"\n\n    heard(chunk)\n        if chunk == null\n            print(join(split(acc, \"\\r\\n\"), \"|\"))\n            shutSocket(c)\n            close(server)\n            done()\n        else\n            acc = acc + chunk\n\n    onData(c, heard)\n    await send(c, \"POST /a HTTP/1.1\\r\\nHost: h\\r\\nContent-Length: 5\\r\\n\\r\\nhello\" +\n        \"POST /b HTTP/1.1\\r\\nHost: h\\r\\nConnection: close\\r\\nContent-Length: 5\\r\\n\\r\\nworld\")\n\nmain()\n"
+
+    assert_eq(streamed_out(text),
+        "HTTP/1.1 200 OK|Content-Length: 9|Connection: keep-alive||/a[hello]" +
+            "HTTP/1.1 200 OK|Content-Length: 9|Connection: close||/b[world]")
+
+@test
+A_STREAMED_REQUEST_HAS_NO_body_FIELD()
+    // **A streamed request has no `body`, and its absence is the honest answer.** A field holding the
+    // empty string would say the upload was empty; a field missing says the body is somewhere else,
+    // which is what `??` and `has` are for.
+
+    val text = "handle(req) = if has(req, \"body\") then \"yes\" else \"no\"\nval server = serveStream(0, handle)\n\nasync main()\n    val c = (await connect(\"127.0.0.1\", localPort(server))).value\n    var acc = \"\"\n\n    heard(chunk)\n        if chunk == null\n            print(join(split(acc, \"\\r\\n\"), \"|\"))\n            shutSocket(c)\n            close(server)\n            done()\n        else\n            acc = acc + chunk\n\n    onData(c, heard)\n    await send(c, \"POST /a HTTP/1.1\\r\\nHost: h\\r\\nConnection: close\\r\\nContent-Length: 2\\r\\n\\r\\nhi\")\n\nmain()\n"
+
+    assert_eq(streamed_out(text),
+        "HTTP/1.1 200 OK|Content-Length: 2|Connection: close||no")
+
+@test
+A_BODY_THE_ACCUMULATING_SERVER_REFUSES_STREAMS_THROUGH_THIS_ONE()
+    // **The point of the tier, on the wire.** `serve` refuses this exact request with `413` -- the
+    // test in `tests_lang.sysl` that sends it says so -- and `serveStream` takes every byte of it,
+    // because nothing holds them.
+
+    val text = "async handle(req)\n    var n = 0\n\n    count(c)\n        n = n + len(c)\n\n    await req.each(count)\n\n    \"took \" + string(n)\nval server = serveStream(0, handle)\n\nasync main()\n    val c = (await connect(\"127.0.0.1\", localPort(server))).value\n    var acc = \"\"\n\n    heard(chunk)\n        if chunk == null\n            print(join(split(acc, \"\\r\\n\"), \"|\"))\n            shutSocket(c)\n            close(server)\n            done()\n        else\n            acc = acc + chunk\n\n    onData(c, heard)\n    await send(c, \"POST /up HTTP/1.1\\r\\nHost: h\\r\\nConnection: close\\r\\nContent-Length: 1100000\\r\\n\\r\\n\" +\n        repeat(\"z\", 1100000))\n\nmain()\n"
+
+    assert_eq(streamed_out(text),
+        "HTTP/1.1 200 OK|Content-Length: 12|Connection: close||took 1100000")
+
+@test
+A_HANDLER_THAT_ANSWERS_WITHOUT_READING_THE_BODY_HOLDS_NONE_OF_IT()
+    // **A HANDLER MAY ANSWER WITHOUT READING THE BODY, AND THEN NOTHING IS HELD AT ALL.** This is the
+    // ordinary shape of a rejection -- an upload to a path that does not take one, a request whose
+    // headers already say no -- and it is where streaming beats the accumulating server outright:
+    // `serve` would have held a megabyte to reach a decision it could make from the head. The rest
+    // of the body is read off the wire and dropped.
+    //
+    // **The client stops the moment it has the whole answer**, because the server closes while the
+    // rest of the megabyte is still going out -- a client still reading then gets a reset rather
+    // than an end of stream, and slate reports a read error against the whole program.
+
+    val text = "handle(req) = \"never asked\"\n\nval server = serveStream(0, handle)\n\nasync main()\n    val c = (await connect(\"127.0.0.1\", localPort(server))).value\n    var acc = \"\"\n    var answered = false\n\n    heard(chunk)\n        if chunk == null then return\n\n        acc = acc + chunk\n\n        if !answered && indexOf(acc, \"never asked\") != null\n            answered = true\n\n            print(join(split(acc, \"\\r\\n\"), \"|\"))\n            shutSocket(c)\n            close(server)\n            done()\n\n    onData(c, heard)\n    send(c, \"POST /up HTTP/1.1\\r\\nHost: h\\r\\nConnection: close\\r\\nContent-Length: 1100000\\r\\n\\r\\n\" +\n        repeat(\"z\", 1100000))\n\nmain()\n"
+
+    assert_eq(streamed_out(text),
+        "HTTP/1.1 200 OK|Content-Length: 11|Connection: close||never asked")
+
+@test
+A_HANDLER_STILL_RUNNING_THAT_NEVER_ASKS_IS_BOUNDED_LIKE_THE_OTHER_SERVER()
+    // **A handler that is STILL RUNNING and has not asked for the body is a handler holding all of
+    // it**, so it is bounded by exactly the limit that bounds `serve`. That is the one case with
+    // anywhere to put the bytes: an `each` may still be coming, so they are kept for it. Streaming
+    // is what a handler opts into by asking, and one that never asks gets the server it had before,
+    // refusal and all.
+    //
+    // The `sleep` is what holds the handler open while the megabyte arrives; without it the handler
+    // answers first and the test above is what happens instead.
+
+    val text = "async handle(req)\n    await sleep(400)\n\n    \"never asked\"\n\nval server = serveStream(0, handle)\n\nasync main()\n    val c = (await connect(\"127.0.0.1\", localPort(server))).value\n    var acc = \"\"\n    var answered = false\n\n    heard(chunk)\n        if chunk == null then return\n\n        acc = acc + chunk\n\n        if !answered && indexOf(acc, \"1048576 bytes\") != null\n            answered = true\n\n            print(join(split(acc, \"\\r\\n\"), \"|\"))\n            shutSocket(c)\n            close(server)\n            done()\n\n    onData(c, heard)\n    send(c, \"POST /up HTTP/1.1\\r\\nHost: h\\r\\nConnection: close\\r\\nContent-Length: 1100000\\r\\n\\r\\n\" +\n        repeat(\"z\", 1100000))\n\nmain()\n"
+
+    assert_eq(streamed_out(text),
+        "HTTP/1.1 413 Content Too Large|Content-Length: 37|Connection: close||" +
+            "the body is larger than 1048576 bytes")
+
+@test
+A_CLIENT_THAT_HANGS_UP_MID_BODY_LETS_THE_HANDLER_GO_WITH_A_SHORT_COUNT()
+    // **A client that hangs up mid-upload lets the handler go rather than leaving it there.** The
+    // promise `each` answered is settled with what did arrive, which is short of the `Content-Length`
+    // the client promised -- and that difference is how a handler tells the two apart. Failing the
+    // promise instead would be put back by `answer` and would stop the server over an ordinary client
+    // going away.
+    //
+    // **And the response this handler goes on to write has nowhere to go**, which is the other half:
+    // a write to a connection that has gone ends the connection and nothing else.
+
+    val text = "async handle(req)\n    var seen = 0\n\n    count(c)\n        seen = seen + 1\n\n    val n = await req.each(count)\n\n    print(\"got \" + string(n) + \" in \" + string(seen))\n    \"ok\"\n\nval server = serveStream(0, handle)\n\nasync main()\n    val c = (await connect(\"127.0.0.1\", localPort(server))).value\n\n    ignored(chunk) = chunk\n\n    onData(c, ignored)\n    await send(c, \"POST /u HTTP/1.1\\r\\nHost: h\\r\\nContent-Length: 10\\r\\n\\r\\nabcd\")\n    await sleep(80)\n    shutSocket(c)\n    await sleep(160)\n    close(server)\n    done()\n\nmain()\n"
+
+    assert_eq(streamed_out(text),
+        "got 4 in 1")
