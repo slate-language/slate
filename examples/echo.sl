@@ -4,6 +4,8 @@
 // `onData` take callbacks, because a listener does not have one connection and a connection does not
 // have one chunk.
 
+import { listen, connect, onData, send, close, localPort } from slate:net
+
 // A port of `0` asks the kernel for one, and `localPort` says which it gave.
 val server = listen(0, conn ->
     onData(conn, chunk ->

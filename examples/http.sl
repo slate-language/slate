@@ -3,6 +3,10 @@
 // A handler is a function from a request to a response. A string is a whole response; an object says
 // more. Nothing here is a framework: routing is `if req.path == ...`, because slate can already do
 // that and a router that only ever called `startsWith` would be a thing to learn for nothing.
+//
+// A server is a socket, so shutting one down is the network's `close` and comes from `slate:net`.
+
+import { close } from slate:net
 
 val server = serve(8080, async req ->
     if req.path == "/"
