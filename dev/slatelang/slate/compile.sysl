@@ -41,6 +41,10 @@ struct Emit
     // and there is no good answer -- so the code is never emitted.
     is_async: bool
 
+    // Whether the chunk being emitted is a generator's, which is what tells a `yield` that belongs
+    // here from one written where there is nothing to yield to.
+    is_gen: bool
+
 // Where `break` and `continue` have to get back to, and what they have to tidy on the way.
 struct LoopFrame
     sp: usize
@@ -57,7 +61,7 @@ struct LoopFrame
     breaks: Buf[usize]
     continues: Buf[usize]
 
-private fresh_emit(is_async: bool) -> Emit = Emit(buf(), 0, 0, buf(), 0, is_async)
+private fresh_emit(is_async: bool, is_gen: bool) -> Emit = Emit(buf(), 0, 0, buf(), 0, is_async, is_gen)
 
 // Put one instruction down and answer where it went.
 private put(e: *Emit, op: Op, at: Span) -> usize
@@ -319,12 +323,12 @@ compile_module(u: *Unit, prog: Program, src: usize, name: string, is_entry: bool
     // exactly as a parse error does -- and it has to be after `open_types` because an annotation
     // naming a declared type cannot be read until that type is registered.
     check_program(prog)
-    u.chunks.push(Chunk(buf(), params, name, false, src))
+    u.chunks.push(Chunk(buf(), params, name, false, false, src))
 
     // **The top level is not async, so top-level `await` is refused.** node draws the same line for a
     // script, and lifting it would mean the whole program becoming a coroutine -- which is a real
     // design, and one to make on purpose rather than by leaving a flag `true` here.
-    var e = fresh_emit(false)
+    var e = fresh_emit(false, false)
 
     compile_stmts(u, &e, prog.stmts, point(0))
     push_n(&e, Pop, point(0), 1, 0)
@@ -358,16 +362,16 @@ compile_module(u: *Unit, prog: Program, src: usize, name: string, is_entry: bool
 end compile_module
 
 // A function body to a chunk of its own, answering where it landed.
-private compile_chunk(u: *Unit, params: Buf[string], body: Expr, name: string, is_async: bool) -> usize
+private compile_chunk(u: *Unit, params: Buf[string], body: Expr, name: string, is_async: bool, is_gen: bool) -> usize
     // The slot is claimed before the body is compiled, so a function that calls itself finds a chunk
     // index that already exists.
     val at = u.chunks.len()
 
     // Every chunk a compilation makes belongs to the file being compiled, which `compile_module`
     // named before it started.
-    u.chunks.push(Chunk(buf(), params, name, is_async, compiling_source))
+    u.chunks.push(Chunk(buf(), params, name, is_async, is_gen, compiling_source))
 
-    var e = fresh_emit(is_async)
+    var e = fresh_emit(is_async, is_gen)
 
     compile_expr(u, &e, body)
     put(&e, Ret, body.span)
@@ -411,7 +415,7 @@ private compile_stmt(u: *Unit, e: *Emit, s: Stmt)
             push_n(e, Unpack(intern_resolved(u, pat), immutable), at, 1, 0)
             push_n(e, PushNil, at, 0, 1)
         Def(name, params, body, is_async) ->
-            val c = compile_chunk(u, params, body_at(body), name, is_async)
+            val c = compile_chunk(u, params, body_at(body), name, is_async, body_is_gen(body))
 
             push_n(e, DefineFn(intern_str(u, name), c), at, 0, 0)
             push_n(e, PushNil, at, 0, 1)
@@ -1093,9 +1097,27 @@ compile_expr(u: *Unit, e: *Emit, x: Expr)
 
             push_n(e, MakeObject(keys.len()), at, keys.len() * 2, 1)
         Lambda(params, body, is_async) ->
-            val c = compile_chunk(u, params, body_at(body), "a function", is_async)
+            val c = compile_chunk(u, params, body_at(body), "a function", is_async, body_is_gen(body))
 
             push_n(e, MakeClosure(c), at, 0, 1)
+        Yield(inner) ->
+            compile_expr(u, e, inner)
+
+            // Refused the way `await` outside an `async` function is, and for its reason: the tree is
+            // compiled with no report to write into, so the refusal is an instruction that faults
+            // where it stands. It is only reachable at the top level of a file -- a `yield` anywhere
+            // inside a function has made that function a generator by being there.
+            // **An `async` function may not yield, and the refusal is here rather than nowhere.**
+            // The two are the same machinery pointed in different directions -- a coroutine resumed
+            // by the scheduler against one resumed by its caller -- and a body that did both would
+            // have two things entitled to put it back and no answer for which. An async generator is
+            // a real feature in other languages and would be its own piece of work.
+            if e.is_async
+                push_n(e, FailWith(intern_str(u, "an `async` function may not `yield` -- an async generator is not slate")), at, 1, 1)
+            elif e.is_gen
+                push_n(e, Op.Yield, at, 1, 1)
+            else
+                push_n(e, FailWith(intern_str(u, "`yield` belongs inside a function")), at, 1, 1)
         Await(inner) ->
             compile_expr(u, e, inner)
 

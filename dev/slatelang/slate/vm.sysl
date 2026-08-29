@@ -237,7 +237,8 @@ run_chunk(u: *Unit, start: usize, scope0: *EnvObj) -> Step
 
     vm.scope = scope0
 
-    val answer = execute(u, start, 0, vm.stack.len(), floor, outer_scope)
+    // A fresh run: the handlers standing here are somebody else's and stay theirs.
+    val answer = execute(u, start, 0, vm.stack.len(), floor, outer_scope, vm.handlers.len())
 
     current_source = outer_source
     answer
@@ -260,7 +261,10 @@ resume_chunk(u: *Unit) -> Step
     vm.frames.truncate(vm.frames.len() - 1)
     vm.scope = back.scope
 
-    val answer = execute(u, back.chunk, back.pc, back.base, 0, null)
+    // **Everything this machine has is its own**, which is the same sentence `resume_failed` says
+    // when it hands a fault to `guarded` with a floor of zero. A resumed coroutine's `try` blocks
+    // came back from `parked` with it and every one of them is allowed the faults that follow.
+    val answer = execute(u, back.chunk, back.pc, back.base, 0, null, 0)
 
     current_source = outer_source
     answer
@@ -311,6 +315,12 @@ private invoke(u: *Unit, callee: Value, args: Buf[Value], at: Span, depth: usize
             // the caller gets back is a promise rather than a result.
             if u.chunks.at(c.body).is_async then return Ok(Answered(start_async(c, args, at)?))
 
+            // **A generator function is not called either -- it is PREPARED.** The body does not run
+            // until something asks it for a value, so what the caller gets back is the generator and
+            // not whatever the first statement would have computed. Read here, beside `is_async`,
+            // because they are the same question asked twice: does calling this enter it?
+            if u.chunks.at(c.body).is_gen then return Ok(Answered(start_generator(c, args, at)?))
+
             if depth >= MaxCallDepth
                 return Err(failure(at, s"this call is ${MaxCallDepth} deep, which is farther than slate will go -- a recursion this deep is usually one that never ends"))
 
@@ -340,12 +350,17 @@ end invoke
 // thirty-five places, every one of them a `?` or a bare `return fault(...)`; threading a handler
 // check through all of them would have been thirty-five chances to get it wrong. Catching a fault is
 // instead re-entering the loop somewhere else, which is exactly what resuming an `await` already is.
-private execute(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, outer_scope: *EnvObj) -> Step
-    // **Handlers that were already owed are not this call's to answer**, which is what keeps a
-    // native's callback -- a user `equals` reached from inside a table lookup -- from being caught by
-    // a `try` in the function that called the native. The fault leaves here as an `Err`, unwinds the
-    // native, and is caught by the outer loop's wrapper instead, which is where it belongs.
-    val floor_of_handlers = vm.handlers.len()
+// **`handler_floor` IS THE CALLER'S ANSWER AND MAY NOT BE READ HERE, WHICH COST A `catch` THAT NEVER
+// FIRED.** Reading `vm.handlers.len()` at entry is right for a *fresh* run -- handlers already owed
+// belong to whoever called the native, and a `try` in that function must not catch a fault raised
+// inside a callback it never wrote. It is exactly wrong for a *resumed* one: a coroutine's handlers
+// went into `parked` with it, so they are standing here on entry and a floor above them makes every
+// one of them unreachable. The effect was silent and specific -- a fault raised after an `await`
+// inside a `try` was not caught by that `try`, and turned up as an unhandled rejection naming a line
+// three inside a block that was guarding it. It predates generators; driving one is what found it.
+private execute(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, outer_scope: *EnvObj,
+                handler_floor: usize) -> Step
+    val floor_of_handlers = handler_floor
     val answer = guarded(u, run_frames(u, start, from, base0, floor, outer_scope), floor, outer_scope, floor_of_handlers)
 
     // **Not on a park.** `Await` swaps `vm` for a fresh machine before it raises `Wait`, so the
@@ -696,7 +711,12 @@ private run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usi
                             return fault(at, "`for` needs a range with both ends, since one left out would never finish")
 
                         vm.stack.push(Int(0))
-                    other -> return fault(at, s"`for` walks an array or a range, and this is ${other.type_name()}")
+                    // A generator has no counter to initialise, but the loop pushes one anyway so
+                    // that `IterNext` is one shape: the integer is kept beside the generator and
+                    // ignored, which costs nothing and keeps the instruction from needing to know
+                    // which kind of subject it has before it asks.
+                    Gen(_, _) -> vm.stack.push(Int(0))
+                    other -> return fault(at, s"`for` walks an array, a range or a generator, and this is ${other.type_name()}")
             IterNext(to) ->
                 val i = peek(0) match
                     Int(n) -> usize(n)
@@ -707,7 +727,14 @@ private run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usi
                         if i >= p.items.len() then None else Some(p.items.at(i))
                     RangeVal(lo, hi, inclusive, _, _) ->
                         if i >= range_count(lo, hi, inclusive) then None else Some(Int(lo + long(i)))
-                    _ -> return fault(at, "`for` walks an array or a range")
+
+                    // **A generator ignores the counter and is asked instead.** The loop keeps
+                    // counting beside it, which costs an integer and keeps this instruction one
+                    // shape; what says whether there is another value is the generator, and only it
+                    // can know. This runs slate code from inside the instruction loop, which is what
+                    // a native calling back already does.
+                    Gen(id, gen) -> gen_iter_next(id, gen, at)?
+                    _ -> return fault(at, "`for` walks an array, a range or a generator")
 
                 step match
                     None -> pc = to
@@ -882,6 +909,21 @@ private run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usi
                         pc = 0
                         vm.scope = called
                         base = vm.stack.len()
+
+            // `yield e` -- stand still and let whoever is driving take the value.
+            //
+            // **The frame is written back and the machine is NOT parked**, which is where this parts
+            // company with `Await`. An `await` is resumed by the scheduler, so it has to be in
+            // `parked` before it lets go; a generator is resumed by `gen_step`, which is the very
+            // function this `Err(Wait)` is about to return to -- so parking is that function's move,
+            // and doing it here as well would park twice and lose the machine.
+            //
+            // **The value stays on the stack for `Await`'s reason**: the machine's own stack is a
+            // root the tracer walks, and the sysl local this arm could have kept it in is not.
+            Op.Yield ->
+                vm.frames.push(Frame(chunk_ix, pc, vm.scope, base, vm.handlers.len()))
+
+                return Err(Wait)
 
             Op.Await ->
                 // **A machine that is not a coroutine has nowhere to come back from.** The compiler

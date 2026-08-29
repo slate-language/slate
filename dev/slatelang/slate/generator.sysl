@@ -1,0 +1,239 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// A generator: a function that hands values back one at a time and stands still in between.
+//
+// **A function is a generator because it holds a `yield`**, which is Python's rule. There is no word
+// on the definition: a second marker would be a thing to forget, and the `yield` is already the most
+// visible line in the body. `is_gen` on the chunk is what the parser worked out, and `invoke` reads
+// it exactly where it reads `is_async`.
+//
+// **This is `await`'s machinery driven by the program instead of by the loop.** A coroutine's state
+// is a `Machine` -- stack, frames, scope, handlers -- and setting one aside is `park`, which already
+// existed. What is new is only who puts it back: an `await` is resumed by the scheduler when a
+// promise settles, and a generator is resumed by whoever asks it for the next value. That is the
+// whole difference, and it is why this file is short.
+//
+// **A generator is NOT a promise and does not touch the event loop.** `g.next()` runs the body then
+// and there, on the caller's own turn, so a generator works in a program that has no loop running at
+// all -- and a `for` over one is an ordinary loop rather than something that has to be awaited.
+//
+// **What a program gets from `next` is `{ value, done }`**, which is JavaScript's shape and is the
+// honest one: `null` is a value a generator may yield, so a bare answer could not say whether the
+// generator was finished. The value on the last step is what the body `return`ed.
+//
+// `for x in g` drives the same machinery without the object -- `IterNext` asks this file for the next
+// value exactly as it asks an array for its next element.
+
+// One generator: where its machine went, and what it has done so far.
+struct GenSlot
+    live: bool
+
+    // Which entry of `parked` holds the suspended body. Meaningless once `done`.
+    machine: usize
+
+    // Whether the body has been entered at all. **The first step must not write a sent value over
+    // the stack**, there being no `yield` yet whose slot to write it into.
+    started: bool
+    done: bool
+
+    // Which occupant of this slot this is. See `Value.Gen`: a finished generator gives its slot back,
+    // so an id on its own would come to name whatever took it next.
+    gen: usize
+
+// Every generator a program is holding, and every one it has abandoned half-finished.
+//
+// **Module storage, for the reason the event table is**: a `Machine` holds counted buffers and may
+// not live in the collected heap, so what a `Value` carries is a slot number and the machine lives
+// here. Nothing here needs marking of its own -- the suspended machine is in `parked`, which
+// `mark_vm` already walks, and that is what keeps a half-run generator's locals alive.
+var generators: Buf[GenSlot] = buf()
+
+// The number the next claim stamps its slot with. Never reused and never reset within a run.
+var gen_stamp: usize = 0
+
+reset_generators()
+    generators = buf()
+    gen_stamp = 0
+
+// Whether this pair names a generator that is still there.
+gen_holds(id: usize, gen: usize) -> bool
+    if id >= generators.len() then return false
+
+    val g = generators.at(id)
+
+    g.live && g.gen == gen
+
+// Take a slot for a machine that has been parked.
+private claim_gen(machine: usize) -> Value
+    gen_stamp += 1
+
+    val slot = GenSlot(true, machine, false, false, gen_stamp)
+
+    for i in 0..<generators.len()
+        if !generators.at(i).live
+            generators.set(i, slot)
+            return Gen(i, gen_stamp)
+
+    generators.push(slot)
+    Gen(generators.len() - 1, gen_stamp)
+
+// Calling a generator function: a machine set up at the top of the body, and nothing run.
+//
+// **This is `start_async` with the running left out.** That one parks the caller, gives the body a
+// machine of its own, and runs it until it finishes or awaits; this one parks the caller, gives the
+// body a machine, and parks *that* without entering it. The frame it leaves behind is what
+// `resume_chunk` reads to know where to begin -- the same frame an `await` writes before it parks,
+// built by hand because nothing has run yet to write one.
+start_generator(c: *ClosureObj, args: Buf[Value], at: Span) -> Step
+    val mark = root_mark()
+    val emark = env_mark()
+
+    // The arguments live only in this sysl local, which the mark phase cannot see, and `new_env`
+    // allocates.
+    for i in 0..<args.len()
+        hold(args.at(i))
+
+    val scope = new_env(c.scope)
+
+    hold_env(scope)
+
+    for i in 0..<c.params.len()
+        declare(scope, c.params.at(i), args.at(i), true)
+
+    // From here the caller is set aside and `vm` is the generator's own.
+    val here = park()
+
+    vm.scope = scope
+    vm.frames.push(Frame(c.body, 0, scope, 0, 0))
+
+    val machine = park()
+    val g = claim_gen(machine)
+
+    unpark(here)
+    release_env(emark)
+    release(mark)
+    Ok(g)
+end start_generator
+
+// What one step of a generator came to.
+enum Step2
+    // A value it yielded.
+    Yielded(v: Value)
+
+    // It finished, and this is what its body answered.
+    Ended(v: Value)
+
+// Run a generator to its next `yield`, or to the end.
+//
+// **The machine is put back, run, and set aside again, all on the caller's turn.** That is the same
+// three moves `resume_one` makes for a settled promise; what differs is that the caller is a running
+// slate program rather than the scheduler, so the answer goes back to it rather than into a promise.
+//
+// **`sent` is written over the yielded value's slot**, which is the other half of the bargain `Yield`
+// makes by not popping: the value stayed reachable while the machine was aside, and the slot it sat
+// in is where the answer to `yield` belongs.
+gen_step(id: usize, gen: usize, sent: Value, at: Span) -> Result[Step2, Signal]
+    if !gen_holds(id, gen)
+        return Err(failure(at, "this generator has finished, and a finished one has nothing left to give"))
+
+    val mark = root_mark()
+
+    hold(sent)
+
+    val here = park()
+    var slot = generators.at(id)
+
+    unpark(slot.machine)
+
+    if slot.started
+        vm.stack.set(vm.stack.len() - 1, sent)
+
+    val outcome = resume_chunk(&current_unit)
+
+    // **A yield leaves the machine in `vm` rather than parking it**, unlike an `await`: the driver is
+    // right here, so parking is this function's move and doing it in the instruction would have been
+    // doing it twice.
+    val answer: Result[Step2, Signal] = outcome match
+        Err(Wait) ->
+            val v = vm.stack.at(vm.stack.len() - 1)
+
+            slot.machine = park()
+            slot.started = true
+            generators.set(id, slot)
+            Ok(Yielded(v))
+        Ok(v) ->
+            retire(id)
+            Ok(Ended(v))
+
+        // **A fault ends the generator and is raised where `next` was written.** It has already been
+        // offered to the body's own `catch` blocks -- they went into `parked` with the machine and
+        // `resume_chunk` runs them -- so anything still travelling is the caller's to handle.
+        Err(sig) ->
+            retire(id)
+            Err(sig)
+
+    unpark(here)
+    release(mark)
+    answer
+end gen_step
+
+// Give a spent generator's slot back. The machine is in `vm` at this point and goes when the caller
+// is put back over it.
+private retire(id: usize)
+    var slot = generators.at(id)
+
+    slot.live = false
+    slot.done = true
+    slot.started = true
+    generators.set(id, slot)
+
+// The next value a `for` gets, or nothing where the generator is finished.
+//
+// **A `for` sends nothing in**, there being nowhere in `for x in g` to write what would be sent -- so
+// `yield` answers `null` inside a loop-driven generator, and a program that wants two-way traffic
+// drives it with `next` instead.
+gen_iter_next(id: usize, gen: usize, at: Span) -> Result[Option[Value], Signal]
+    if !gen_holds(id, gen) then return Ok(None)
+
+    gen_step(id, gen, Value.Null, at)? match
+        Yielded(v) -> Ok(Some(v))
+
+        // **What the body returned is not an element.** `for x in g` walks what a generator yields;
+        // the return value is the answer to "and then what", which only `next` asks.
+        Ended(_) -> Ok(None)
+
+// `g.next()` and `g.next(v)` -- one step, as `{ value, done }`.
+do_gen_next(args: Buf[Value], at: Span) -> Step
+    if args.len() != 1 && args.len() != 2
+        return fault(at, s"`next` takes a generator and optionally a value to send it, and was given ${args.len()} arguments")
+
+    val sent = if args.len() == 2 then args.at(1) else Value.Null
+
+    args.at(0) match
+        Gen(id, gen) ->
+            // **A finished generator answers rather than faulting.** Asking one for another value is
+            // what every loop written over a generator does on its last turn, so it is an ordinary
+            // state and not a mistake -- where asking one that has been *reused* would be a stale
+            // value, which `gen_holds` is what catches.
+            if !gen_holds(id, gen) then return Ok(step_value(Value.Null, true))
+
+            gen_step(id, gen, sent, at)? match
+                Yielded(v) -> Ok(step_value(v, false))
+                Ended(v) -> Ok(step_value(v, true))
+        other -> fault(at, s"`next` takes a generator, and this is ${other.type_name()}")
+end do_gen_next
+
+// `{ value, done }`, held while it is built.
+private step_value(v: Value, done: bool) -> Value
+    val mark = root_mark()
+    val o = new_object()
+
+    hold(Object(o))
+    hold(v)
+    obj_put_name(o, "value", v)
+    obj_put_name(o, "done", Bool(done))
+    release(mark)
+    Object(o)
