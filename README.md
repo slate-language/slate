@@ -623,12 +623,84 @@ exactly that second kind.
 Only `o.m(...)` passes a receiver. `o.m` on its own hands back the bare function, so taking a method
 off an object and calling it later is allowed and gives you what you took.
 
-**The proto is the identity.** `p.proto == Point` is an ordinary expression and says what
-`instanceof` says; `p is Point` cannot mean it, a bare name in pattern position being a binding.
+**The proto is the identity**, and `class` below is what lets `is` ask about it. Written by hand,
+`p.proto == Point` is the closest an object literal gets — and it is not quite `instanceof`: `==` on
+objects is deep, so it answers true for anything holding the same fields, and it looks exactly one
+link up the chain.
 
 **And it is what makes objects affordable.** Three methods written as captured closures cost three
 closures *per instance*; on a proto they cost three once. On slate's 4 MiB heap that is four thousand
 objects against eight.
+
+### Classes
+
+A class is the object above with a word in front of it. `class` binds a name to an object literal and
+`from` is that object's `proto`, so what runs is what the previous section described:
+
+```
+class Shape
+    val sides = 0
+
+    describe(self) = s"a ${self.name()} of area ${self.area()}"
+
+class Square from Shape
+    val sides = 4
+
+    new(side) = { side: side }
+
+    name(self) = "square"
+
+    area(self) = self.side * self.side
+
+print(Square.new(4).describe())      // a square of area 16
+```
+
+**A method is written in the ordinary definition syntax, and that is the point of the word.** A
+field's value is an expression, so a method in a literal is a lambda and its body is whatever fits
+after `->`. A definition's body may be an indented run of statements, take annotated or destructured
+parameters, be `async`, or `yield`. A class of twenty methods reads like twenty functions rather than
+like twenty fields.
+
+`val` inside a class body is a value the class itself carries — one of it, shared by everything made
+from the class. A `var` there is refused, because it would be a single mutable value standing behind
+every instance, which is the thing nobody writing it means.
+
+**`new` is the constructor.** It is handed no receiver, there being no object yet, and whatever it
+answers is given the class as its proto — which is the `proto:` line you would otherwise have to
+remember on every path that makes one. It writes to the object rather than copying it.
+
+**`is` asks which class a value was made from**, and walks the whole chain:
+
+```
+val sq = Square.new(1)
+
+print(sq is Square, sq is Shape)                    // true true
+print({ side: 1, proto: Square } is Square)         // true
+print({ side: 1 } is Square)                        // false
+print(Square is Square)                             // false
+```
+
+This is the one thing `class` adds that a hand-written proto could not have. A bare name in pattern
+position is a binding unless something has declared it, and a class declaration is what declares it —
+so the name works everywhere a type does: in `is`, in a `match` arm, and in a parameter's annotation.
+A class crosses a file under `export` as both halves at once, the value and the type.
+
+**There is no `super`, and none is needed.** A base class is an ordinary value in scope, and a method
+stored on it directly is handed no receiver — so passing one is how you call it:
+
+```
+class Loud from Square
+    new(side) = { side: side }
+
+    describe(self) = upper(Shape.describe(self)) + "!"
+```
+
+`Shape.describe(self)` names the class the call was written in, which is what a super call means.
+Counting links from whatever object turned up — `self.proto.proto` — is a different and wrong thing.
+
+A class belongs to the top level of a file, as a `type` does and for the same reason: its name is
+resolved while compiling. `class` is a soft word, so a program already using it as a variable name is
+untouched.
 
 ### Tests
 

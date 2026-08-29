@@ -512,6 +512,196 @@ parse_key(p: *Parser, want: string) -> string
     read_str_at(p, at)
 end parse_key
 
+// -- classes ---------------------------------------------------------------------------------------
+
+// Whether what stands at `i` is `class Name`.
+//
+// **`class` is a SOFT word**, as `type` and `end` are, so a program may still call a variable
+// `class`. Two tokens settle it: a bare name followed by another bare name begins nothing else in
+// slate, there being no juxtaposition anywhere in the grammar.
+at_class_decl(p: *Parser, i: usize) -> bool
+    if p.peek_kind_at(i) != Ident then return false
+    if p.text_at(i) != "class" then return false
+
+    p.peek_kind_at(i + 1) == Ident
+end at_class_decl
+
+// `class Square from Shape`, and the members written under it.
+//
+// **The whole of it is sugar over the object a program could already write.** `class` binds a `val`
+// to an object literal, `from` is the `proto` field, and a method is a field holding a function --
+// so nothing downstream of the parser learns that classes exist. The checker, the compiler, the
+// machine and `show_program` are handed the object, and the receiver rule that was already there
+// does the dispatch.
+//
+// **What the sugar buys is the one thing an object literal cannot give: a method written in slate's
+// ordinary definition syntax.** A field's value is an expression, so a method in a literal is a
+// lambda and its body is whatever fits after `->`; a definition's body may be an indented block of
+// statements. That is the difference between a class of twenty methods reading like twenty functions
+// and reading like twenty fields, and it is the whole reason to have the word.
+//
+// **A class also gives slate its one NOMINAL identity**, which is why the name is registered as a
+// type: `p is Square` asks whether this object was made from that class, which no structural pattern
+// can ask and which `p.proto == Square` gets wrong twice over -- `==` on objects is deep, so it
+// answers true for any class holding the same fields, and it looks only one link up the chain.
+parse_class_decl(p: *Parser, public: bool) -> Stmt
+    val start = p.here()
+    val top = p.depth == 0
+
+    p.bump()
+
+    val name = parse_name(p, "a name for the class")
+
+    var keys: Buf[string] = buf()
+    var key_spans: Buf[Span] = buf()
+    var values: Buf[Expr] = buf()
+
+    // **`from` takes an EXPRESSION rather than a name**, because the field it becomes takes one: a
+    // base may arrive under an import alias, out of a module object, or be chosen at run time. The
+    // word is soft here too -- it is the same `from` an import already reads.
+    if p.at(Ident) && p.text(p.here()) == "from"
+        val at = p.here()
+
+        p.bump()
+        keys.push("proto")
+        key_spans.push(at)
+        values.push(parse_expr(p))
+
+    if p.at(Indent) then class_members(p, name, &keys, &key_spans, &values)
+
+    accept_end_named(p, name)
+
+    val span = start.to(p.just_taken())
+
+    if !top
+        p.fault(start, "a class belongs to the top level of a file -- its name is a type as well as a value, and one declared inside a block would not be there for `is` to resolve against")
+    else
+        p.type_names.push(name)
+        p.type_pats.push(pattern(span, ProtoPat(name)))
+        p.type_public.push(public)
+
+    stmt(span, Val(name, expr(span, ObjectLit(keys, key_spans, values))))
+end parse_class_decl
+
+// The members under a class, which are slate's ordinary declarations and become the object's fields.
+private class_members(p: *Parser, cls: string, keys: *Buf[string], key_spans: *Buf[Span], values: *Buf[Expr])
+    p.expect(Indent, "an indented block")
+
+    p.depth += 1
+    p.skip_newlines()
+
+    loop
+        if p.at(Eof) then break
+        if p.at(Dedent) then break
+
+        one_member(p, cls) match
+            Some(m) ->
+                var seen = false
+
+                for i in 0..<keys.len()
+                    if keys.at(i) == m.0 then seen = true
+
+                // **A member written twice is refused rather than won by the last one.** An object
+                // literal lets a later key win, which is right for data assembled from parts; a class
+                // body is one declaration a person sat down and wrote, and two methods of one name in
+                // it are a mistake nobody meant and that nothing else would ever report.
+                if seen && m.0 == "proto"
+                    p.fault(m.1, s"class `${cls}` says `from` and also gives a `proto`, and those are the same field -- keep whichever says it better")
+                elif seen
+                    p.fault(m.1, s"`${m.0}` is given twice in class `${cls}`")
+                else
+                    keys.push(m.0)
+                    key_spans.push(m.1)
+                    values.push(m.2)
+            None -> ()
+
+        if !p.end_of_statement()
+            p.fault(p.here(), "this is where the member should have ended")
+            p.bump()
+
+        p.skip_newlines()
+    end loop
+
+    p.depth -= 1
+    p.expect(Dedent, "the end of the class")
+end class_members
+
+// One member: a definition, or a `val`.
+private one_member(p: *Parser, cls: string) -> Option[(string, Span, Expr)]
+    val at = p.here()
+
+    // **A `var` member is refused with what it would have meant.** There is one of each member for
+    // every object made from the class, so a mutable one is a single value behind all of them -- the
+    // thing a person writing `var` here is least likely to want, and a silent `val` would have hidden
+    // the misunderstanding rather than answered it.
+    if p.at(Var)
+        p.fault(at, s"a member of class `${cls}` is shared by every object made from it, so a `var` would be one value standing behind all of them -- write `val` for what the class itself holds, and put what differs from object to object on the object")
+        p.bump()
+
+        return member_val(p)
+
+    if p.at(Val)
+        p.bump()
+
+        return member_val(p)
+
+    if !(p.at(Async) && at_definition_from(p, 1) || at_definition_from(p, 0))
+        p.fault(at, "a class body holds definitions and `val`s -- a method is written `area(self) = self.side * self.side`, and a value the class itself carries `val kind = \"square\"`")
+        parse_expr_stmt(p)
+
+        return None
+    end if
+
+    val s = parse_def(p)
+
+    *s.kind match
+        Def(name, params, body, is_async) -> Some((name, s.span, member_function(p, cls, name, params, body, is_async, s.span)))
+        _ -> None
+end one_member
+
+// `val kind = "square"` under a class.
+private member_val(p: *Parser) -> Option[(string, Span, Expr)]
+    val at = p.here()
+    val name = parse_name(p, "a name for the member")
+    val named = at.to(p.just_taken())
+
+    p.expect(Assign, "`=` and a value")
+
+    Some((name, named, parse_body(p)))
+end member_val
+
+// A member definition's value: the function, or -- for `new` -- the function with the class attached
+// to whatever it answers.
+private member_function(p: *Parser, cls: string, name: string, params: Buf[string], body: usize, is_async: bool, at: Span) -> Expr
+    if name != "new" then return expr(at, Lambda(params, body, is_async))
+
+    if is_async
+        p.fault(at, s"a constructor cannot be `async` -- `new` answers the object, and an `async` one would answer a promise with the object still to come. Give class `${cls}` an ordinary `new` and let a caller await whatever it needs")
+
+    // **The constructor is the one piece of sugar with anything behind it, and this is all of it**:
+    // whatever the body answers is given the class as its `proto` before it is handed back. Written
+    // out, `new(x, y) = { x: x, y: y }` is the object literal plus the `proto: Point` a program
+    // writes today -- and leaving that line out is the mistake this exists to make unmakeable.
+    //
+    // **The object is written to rather than copied.** `with` would have said the same thing in one
+    // node and allocated a second object for every instance, on the one path where allocation is
+    // measured: `p.proto == p2.proto` costing an extra table per point is what protos were built to
+    // avoid in the first place.
+    //
+    // The name is `(new)`, which no program can spell, for the reason a destructured parameter's is:
+    // the names in a body are the program's, and a synthetic one that could be written would shadow
+    // something a person wrote or be shadowed by it.
+    val hidden = "(new)"
+
+    var stmts: Buf[Stmt] = buf()
+
+    stmts.push(stmt(at, Val(hidden, body_at(body))))
+    stmts.push(stmt(at, Assign(Tok.Assign, expr(at, Field(expr(at, Name(hidden)), "proto", false)), expr(at, Name(cls)))))
+    stmts.push(stmt(at, Eval(expr(at, Name(hidden)))))
+
+    expr(at, Lambda(params, intern_body(expr(at, Block(stmts)), body_is_gen(body)), is_async))
+end member_function
+
 parse_name(p: *Parser, want: string) -> string
     val at = p.here()
 
