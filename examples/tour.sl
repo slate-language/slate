@@ -44,6 +44,15 @@ val c = counter()
 
 print(c(), c(), c())
 
+// A parameter may say what it is when nobody gives one. The default is worked out at the call, so it
+// can read the parameters to its left -- and an array written there is a fresh one every time.
+greet(who, greeting = "hello") = greeting + ", " + who
+
+between(xs, from, to = len(xs)) = xs[from..<to]
+
+print(greet("ada"), greet("ada", "good day"))
+print(between([1, 2, 3, 4], 1), between([1, 2, 3, 4], 1, 3))
+
 // Functions are values.
 apply_twice(f, v) = f(f(v))
 

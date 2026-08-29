@@ -187,6 +187,21 @@ multiplication rather than like C's.
 `s"a ${b} c"` interpolates, `[v; n]` is an array of copies, `base with { f: v }` is a copy with a
 field changed, and every comma list takes a trailing comma.
 
+**A parameter may carry what it is when nobody gives one**, on a definition, a lambda, a method or a
+class's `new`:
+
+```
+greet(name, greeting = "hello") = greeting + ", " + name
+
+log(message, level = "info", at = now()) = ...
+```
+
+The default is worked out **at the call**, not where the function was written, so `f(xs = [])` gives
+every call an array of its own — the mistake Python has spent thirty years explaining — and a default
+may read the parameters to its left: `slice(xs, from, to = len(xs))`. A parameter that may be left out
+has to come last, or leaving it out would slide every later argument one place left; the parser says
+so where it is written. An arity complaint then names the range rather than only its upper end.
+
 **A lambda's body may be a block, written where the lambda is passed.** A newline inside brackets
 normally means nothing — that is what lets an argument list be split over lines — so a callback would
 otherwise have to be lifted out and named before the call that wanted it:
