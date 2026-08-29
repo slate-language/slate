@@ -69,35 +69,18 @@ at_definition_from(p: *Parser, start: usize) -> bool
             i += 1
 
         // **`p: Point` still leaves a definition told from a call by what follows the `)`**, so all
-        // this has to do is find the end of the list. The annotation is a pattern and a pattern may
-        // hold brackets of its own, which is why the skip counts them rather than looking for the
-        // first `,` it meets.
+        // this has to do is find the end of the list.
         if p.peek_kind_at(i) == Colon
-            i += 1
+            past_group(p, i + 1) match
+                Some(at) -> i = at
+                None -> return false
 
-            var depth: usize = 0
-
-            loop
-                val k = p.peek_kind_at(i)
-
-                if k == Eof then return false
-
-                if k == LBrace || k == LBracket || k == LParen
-                    depth += 1
-                elif k == RBrace || k == RBracket
-                    if depth == 0 then return false
-
-                    depth -= 1
-                elif k == RParen
-                    if depth == 0 then break
-
-                    depth -= 1
-                elif k == Comma && depth == 0
-                    break
-
-                i += 1
-            end loop
-        end if
+        // **And `n = 0` is stepped over the same way**, for the same reason: a default is an
+        // expression, and what tells a definition from a call is still only what follows the `)`.
+        if p.peek_kind_at(i) == Assign
+            past_group(p, i + 1) match
+                Some(at) -> i = at
+                None -> return false
 
         p.peek_kind_at(i) match
             Comma ->
@@ -109,6 +92,37 @@ at_definition_from(p: *Parser, start: usize) -> bool
             _ -> return false
     end loop
 end at_definition_from
+
+// Where a parameter's annotation or default ends: the `,` or the `)` that closes it.
+//
+// **Brackets are counted rather than scanning for the first `,`**, because both a pattern and an
+// expression may hold one of their own -- `p: { a: int, b: int }` and `n = f(1, 2)` each hide a
+// comma from a scan that does not count. `None` is text that runs out first, which is not a
+// definition and not anything else either.
+private past_group(p: *Parser, from: usize) -> Option[usize]
+    var i = from
+    var depth: usize = 0
+
+    loop
+        val k = p.peek_kind_at(i)
+
+        if k == Eof then return None
+
+        if k == LBrace || k == LBracket || k == LParen
+            depth += 1
+        elif k == RBrace || k == RBracket
+            if depth == 0 then return None
+
+            depth -= 1
+        elif k == RParen
+            if depth == 0 then return Some(i)
+
+            depth -= 1
+        elif k == Comma && depth == 0
+            return Some(i)
+
+        i += 1
+end past_group
 
 // Whether what sits at `i` is a function body.
 //
@@ -169,12 +183,14 @@ parse_def(p: *Parser) -> Stmt
     var params: Buf[string] = buf()
     var declares: Buf[bool] = buf()
     var checks: Buf[Stmt] = buf()
+    var defaults: Buf[Expr] = buf()
 
     if !p.at(RParen)
         loop
             if p.at(LBrace) || p.at(LBracket)
                 params.push(unpacked_param(p, &checks, params.len()))
                 declares.push(false)
+                read_default(p, &defaults, "this parameter")
 
                 if !p.accept(Comma) then break
                 if p.at(RParen) then break
@@ -207,6 +223,10 @@ parse_def(p: *Parser) -> Stmt
                 val tpat = parse_pattern(p)
 
                 checks.push(stmt(tat.to(p.just_taken()), CheckType(pname, tname, tpat)))
+
+            // **The default is read AFTER the annotation**, so `n: int = 0` reads left to right the
+            // way it is said aloud: what it is, then what it is when nobody says.
+            read_default(p, &defaults, s"`${pname}`")
 
             if !p.accept(Comma) then break
             if p.at(RParen) then break
@@ -247,8 +267,28 @@ parse_def(p: *Parser) -> Stmt
 
     p.yields = outer_yields
     param_declares = declares
-    stmt(start.to(p.just_taken()), Def(name, params, intern_body(body, yielded), is_async))
+    stmt(start.to(p.just_taken()), Def(name, params, defaults, intern_body(body, yielded), is_async))
 end parse_def
+
+// `= expr` after a parameter, if it is there, and the refusal that keeps `defaults` trailing.
+//
+// **What is being kept true is that ONE number says how many arguments must be given.** A parameter
+// with a default standing before one without could never actually be left out -- leaving it out
+// would slide every later argument one place left -- so a language that allowed it would either
+// have to say so at every call or quietly mean something other than what it reads as. Refusing it
+// where it is written is the only answer that costs nobody anything.
+//
+// Not `private`: `expr.sysl` reads a lambda's parameters and wants the same rule.
+read_default(p: *Parser, defaults: *Buf[Expr], named: string)
+    val at = p.here()
+
+    if p.accept(Assign)
+        defaults.push(parse_expr(p))
+        return
+
+    if defaults.len() != 0
+        p.fault(at, s"${named} has no default and comes after one that has -- a parameter that may be left out has to come last, or leaving it out would leave a gap the arguments after it cannot fill")
+end read_default
 
 // A parameter written as a pattern: a name nothing can collide with, and the statement that takes
 // the argument apart under it.
@@ -579,6 +619,7 @@ private struct ClassBody
     // field below the constructor that reads it.
     maker_at: Span
     maker_params: Buf[string]
+    maker_defaults: Buf[Expr]
     maker_declares: Buf[bool]
     maker_body: usize
     has_maker: bool
@@ -619,7 +660,7 @@ parse_class_decl(p: *Parser, public: bool) -> Stmt
 
     val name = parse_name(p, "a name for the class")
 
-    var b = ClassBody(buf(), buf(), buf(), buf(), buf(), buf(), buf(), start, buf(), buf(), 0, false)
+    var b = ClassBody(buf(), buf(), buf(), buf(), buf(), buf(), buf(), start, buf(), buf(), buf(), 0, false)
 
     // **`from` takes an EXPRESSION rather than a name**, because the field it becomes takes one: a
     // base may arrive under an import alias, out of a module object, or be chosen at run time. The
@@ -795,7 +836,7 @@ private one_member(p: *Parser, cls: string, b: *ClassBody)
     allow_declaring_params = outer
 
     *s.kind match
-        Def(name, params, body, is_async) ->
+        Def(name, params, defaults, body, is_async) ->
             if taken_name(b, name)
                 p.fault(s.span, s"`${name}` is given twice in class `${cls}`")
                 return
@@ -804,7 +845,7 @@ private one_member(p: *Parser, cls: string, b: *ClassBody)
             if name != "new"
                 b.keys.push(name)
                 b.key_spans.push(s.span)
-                b.values.push(expr(s.span, Lambda(params, body, is_async)))
+                b.values.push(expr(s.span, Lambda(params, defaults, body, is_async)))
                 return
             end if
 
@@ -813,6 +854,7 @@ private one_member(p: *Parser, cls: string, b: *ClassBody)
 
             b.maker_at = s.span
             b.maker_params = params
+            b.maker_defaults = defaults
             b.maker_declares = declares
             b.maker_body = body
             b.has_maker = true
@@ -889,15 +931,16 @@ private make_constructor(p: *Parser, cls: string, b: *ClassBody, at: Span)
         if b.fields.len() == 0 then return
 
         // **The parameters are the fields with no initialiser, in the order they were declared.** An
-        // initialised field is not a parameter, slate having no default arguments to make it optional
-        // with -- so adding an initialiser changes what `new` takes, which an arity fault says at the
-        // call.
+        // initialised field is not a parameter of the constructor a class gets for free: its value
+        // comes from its own declaration, and adding an initialiser therefore changes what `new`
+        // takes -- which an arity fault says at the call. A written `new` may take a default
+        // parameter like any other function; only the generated one is fixed this way.
         var params: Buf[string] = buf()
 
         for i in 0..<b.fields.len()
             if !b.has_init.at(i) then params.push(b.fields.at(i))
 
-        add_maker(b, at, params, expr(at, Lambda(params, intern_body(instance_of(cls, b, params, at), false), false)))
+        add_maker(b, at, params, expr(at, Lambda(params, buf(), intern_body(instance_of(cls, b, params, at), false), false)))
         return
     end if
 
@@ -918,7 +961,7 @@ private make_constructor(p: *Parser, cls: string, b: *ClassBody, at: Span)
         stmts.push(stmt(b.maker_at, Eval(body_at(b.maker_body))))
         stmts.push(stmt(b.maker_at, Eval(expr(b.maker_at, Name(Made)))))
 
-        add_maker(b, b.maker_at, b.maker_params, expr(b.maker_at, Lambda(b.maker_params, intern_body(expr(b.maker_at, Block(stmts)), false), false)))
+        add_maker(b, b.maker_at, b.maker_params, expr(b.maker_at, Lambda(b.maker_params, b.maker_defaults, intern_body(expr(b.maker_at, Block(stmts)), false), false)))
         return
     end if
 
@@ -935,7 +978,7 @@ private make_constructor(p: *Parser, cls: string, b: *ClassBody, at: Span)
     stmts.push(stmt(b.maker_at, Assign(Tok.Assign, expr(b.maker_at, Field(expr(b.maker_at, Name(Made)), "proto", false)), expr(b.maker_at, Name(cls)))))
     stmts.push(stmt(b.maker_at, Eval(expr(b.maker_at, Name(Made)))))
 
-    add_maker(b, b.maker_at, b.maker_params, expr(b.maker_at, Lambda(b.maker_params, intern_body(expr(b.maker_at, Block(stmts)), false), false)))
+    add_maker(b, b.maker_at, b.maker_params, expr(b.maker_at, Lambda(b.maker_params, b.maker_defaults, intern_body(expr(b.maker_at, Block(stmts)), false), false)))
 end make_constructor
 
 private add_maker(b: *ClassBody, at: Span, params: Buf[string], value: Expr)
