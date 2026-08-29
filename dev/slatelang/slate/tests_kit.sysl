@@ -1,0 +1,536 @@
+module dev.slatelang.slate
+@tests
+
+import sh.sysl.libuv
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{entries, read_bytes, write_text}
+import sysl.text.{from_utf8_unchecked, replace_all, str_builder}
+
+// What every one of slate's test files runs its programs through.
+//
+// **The tests are twelve files and the harness is this one**, `tests.sysl` having reached 7,160
+// lines. Which file a test lives in is the subject it is about: `tests_syntax` for the lexer, the
+// layout pass and the parser, `tests_eval` for running a program, `tests_async` for the machine and
+// the loop, and so on down to `tests_pkgcmd` for `slate add`. Every one of them is `@tests` and
+// `sysl test .` runs the lot.
+//
+// **NOTHING HERE IS `private`, AND IT MAY NOT BECOME PRIVATE AGAIN.** `private` in sysl is private
+// to the FILE, so a helper marked private here is a name the other twelve files cannot say -- which
+// is the whole reason this file exists. That makes every name below a module-wide name, so a helper
+// added here has to be one that will not collide with the interpreter's own: `out`, `fails` and
+// `kinds` are safe today because nothing in `dev/slatelang/slate/` declares them, and that was
+// checked rather than assumed.
+//
+// **A helper used by ONE file could stay in that file**, and none of them do. Keeping the harness
+// in one place is worth more than the smaller public surface: a test moved between files then needs
+// no helper moved with it, and there is one place to look for "how does a test run a program".
+
+// The token kinds a snippet lexes to, as one space-separated line.
+//
+// **Spans are dropped here and asserted separately.** A test that pins both says nothing clearly
+// when it fails: the whole list is printed and the reader has to find which half moved. The shape
+// of the token stream is what nearly every one of these is about, so that is what they compare.
+//
+// **A string rather than the `Buf[Tok]` this naturally wants to be.** That began as a workaround --
+// neither `Buf[T]` nor `[]T` was `Eq` before 0.0.82, so a failure could print which assertion broke
+// and not what the two sides were. Both are `Eq` now, and a sequence is `Display` too, so the
+// workaround is no longer forced; it stays because `"Val Newline Eof"` is a shorter thing to write
+// forty times than a sequence literal is. The typed form would catch a typo in the expectation that
+// this one cannot, which is the trade being made.
+kinds(text: string) -> string
+    val r = lex(source_of("t", text))
+    var out = str_builder()
+    var t = r.tokens
+    var first = true
+
+    loop
+        t.advance() match
+            None -> break
+            Some(x) ->
+                if !first then out.push_char(' ')
+
+                out.push(s"${x.value}")
+                first = false
+
+    out.finish()
+end kinds
+
+// Whether a snippet lexes with nothing to complain about.
+clean(text: string) -> bool = lex(source_of("t", text)).ok()
+
+// The first complaint a snippet draws, rendered as the sentence a person would read.
+first_fault(text: string) -> string
+    val src = source_of("t", text)
+    val r = lex(src)
+
+    if r.report.is_empty() then "" else r.report.render(src)
+end first_fault
+
+// A snippet's tree, in parenthesised prefix notation -- and the rendered complaint instead, where
+// there was one.
+//
+// **Handing back the complaint is what stops a test passing on a tree built out of error nodes.**
+// Rendering the tree regardless would print `<bad>`, which compares equal to an expectation that
+// said `<bad>` -- a test asserting the parser failed the way it failed last time. A test that wants
+// the error path asserts on `parse` directly, and several below do.
+good_tree(text: string) -> string
+    val src = source_of("t", text)
+    val r = parse(src)
+
+    if !r.ok() then return r.report.render(src)
+
+    show_program(r.program)
+end good_tree
+
+// A program with `slate:time` imported, which is what a test about dates and times needs now that
+// the temporal names are a module rather than globals.
+//
+// **A fixed line prepended to the source, rather than each test spelling out which names it uses.**
+// What every one of these is about is the temporal semantics; making each list its own imports would
+// bury that under bookkeeping, and the import is not what any of them is testing. A test that IS
+// about the import says so and writes its own.
+timed(text: string) -> string = s"${TimeImport}${text}"
+
+time_out(text: string) -> string = out(timed(text))
+
+time_fails(text: string) -> string = fails(timed(text))
+
+val TimeImport: string = "import { now, monotonic, instant, date, time, dateTime, zone, localZone, utc, epochSeconds, epochMillis, epochMicros, micros, millis, seconds, minutes, hours, days, weeks, months, years, year, month, day, hour, minute, second, weekday, monthName, dayOfYear, daysInMonth, isLeapYear, at, offset, isDST, abbrev, startOf, onOrAfter, format, parseDate, parseTime, parseDateTime, parseTimestamp } from slate:time\n"
+
+// What a program printed, joined by newlines -- or its complaint, where it had one.
+out(text: string) -> string
+    val src = source_of("t", text)
+    val r = run(src)
+
+    if !r.ok() then return r.render()
+
+    r.printed()
+end out
+
+// The complaint a program draws, rendered.
+fails(text: string) -> string
+    val src = source_of("t", text)
+    val r = run(src)
+
+    if r.ok() then "" else r.render()
+end fails
+
+// **These are the only tests that touch a real disk**, so each of them gets a directory of its own
+// and gives it back afterwards. A shared one would make two tests read each other's files, and
+// inventing a path rather than asking for one is the race `mkdtemp` exists to avoid.
+//
+// `<dir>` anywhere in the program text is the directory that was made.
+in_scratch(text: string) -> string
+    val dir = libuv.mkdtemp_sync("/tmp/slate-fs-XXXXXX").unwrap()
+    val said = fs_out(replace_all(text, "<dir>", dir))
+
+    scrub(dir)
+    said
+end in_scratch
+
+// The same, for a program expected to fail.
+fails_in_scratch(text: string) -> string
+    val dir = libuv.mkdtemp_sync("/tmp/slate-fs-XXXXXX").unwrap()
+    val said = fs_fails(replace_all(text, "<dir>", dir))
+
+    scrub(dir)
+    said
+end fails_in_scratch
+
+// What one file-system call said went wrong, awaited and read off the result.
+//
+// **A call that fails is a call that ANSWERS now**, so this reads `.error` rather than reaching for
+// the program's diagnostic -- which is the whole of what the retrofit changed.
+said_error(call: string) -> string =
+    fs_out(s"async main()\n    print((await ${call}).error)\nmain()")
+
+// A program with `slate:fs` imported, which is what a test about the file system needs now that the
+// twenty file-system names are a module rather than globals.
+//
+// **A fixed line prepended to the source**, for the reason `timed` is: what every one of these is
+// about is what a file-system call answers, and making each of them list its own imports would bury
+// that under bookkeeping. A test that IS about the import writes its own.
+filed(text: string) -> string = s"${FsImport}${text}"
+
+fs_out(text: string) -> string = out(filed(text))
+
+fs_fails(text: string) -> string = fails(filed(text))
+
+val FsImport: string = "import { readFile, readBytes, writeFile, readDir, stat, exists, remove, mkdir, rmdir, rename, readFileSync, readBytesSync, writeFileSync, readDirSync, statSync, existsSync, removeSync, mkdirSync, rmdirSync, renameSync } from slate:fs\n"
+
+// Everything a program left behind, and the directory with it.
+scrub(dir: string)
+    libuv.scandir_sync(dir) match
+        Ok(entries) ->
+            for i in 0..<entries.len
+                val path = s"${dir}/${entries[i].name}"
+
+                // A directory refuses `unlink`, and telling the two apart that way costs nothing --
+                // there is no shape of these tests where a second `stat` would be worth making.
+                if libuv.unlink_sync(path).is_err() then scrub(path)
+        Err(_) -> ()
+
+    libuv.rmdir_sync(dir)
+end scrub
+
+// **The examples are reading material, and reading material rots.** Every one of them is a slate
+// program the suite otherwise never runs, so a change to the language leaves them saying something
+// that no longer compiles and nothing notices until somebody opens the file. A stale
+// `person.missing` survived the `undefined` change exactly that way and had to be found by hand.
+//
+// **The path is relative to the project root**, which is where `sysl test .` runs.
+ran_clean(path: string) -> string
+    read_bytes(path) match
+        // **The diagnostic names the CAUSE and not the artifact**, which costs a line and saved
+        // somebody an hour. These paths are relative, so the suite is only valid run from the
+        // project root -- and invoked from anywhere else the failure was `cannot read
+        // examples/tour.sl: no such file or directory`, which reads as a missing example. It is not:
+        // the file is there and the working directory is wrong. An org sweep running
+        // `sysl test <abs-dir>` from outside the tree hit exactly this and reported slate broken.
+        Err(e) -> s"cannot read ${path}: ${e} -- this suite reads its examples by relative path, so it must be run from the project root (`sysl test .` there), not at it"
+        Ok(bytes) ->
+            val src = source(path, bytes)
+            val r = run(src)
+
+            if r.ok() then "" else r.render()
+end ran_clean
+
+// **A socket keeps the program alive, so a test that forgets to close one hangs the whole suite
+// forever with nothing printed.** That is a bad enough failure to be worth three lines of insurance:
+// every program here gets a watchdog timer that stops it with a complaint, and a `done()` to cancel
+// the watchdog where the program is expected to finish. A test that stops finishing therefore fails
+// in three seconds saying so, rather than never returning.
+//
+// The watchdog is cancelled and not merely ignored, because an uncancelled timer is itself a handle
+// the loop would wait three seconds for.
+//
+// **It stops the program by naming something that does not exist**, so that its complaint cannot be
+// mistaken for the one a test was looking for. A watchdog that divided by zero would have satisfied
+// the assertion in `a_fault_in_a_socket_callback_stops_the_program` without the fault under test
+// ever happening.
+// **The watchdog stops the program by asking an integer to do something it cannot**, and it used to
+// do it by naming something undefined. That stopped compiling when an undefined name became a
+// complaint the compiler makes -- and the requirement is unchanged: the fault has to carry a word no
+// test could be asserting on, so that a stalled program cannot be mistaken for the failure under
+// test. `anything` is what hides the receiver from the checker, which is the same trick every other
+// deliberate run-time fault in this file uses.
+netted(body: string) -> string =
+    "anything(v) = v\nstalled() = anything(1).theProgramDidNotFinish()\n" +
+        "val theGuard = setTimeout(stalled, 3000)\ndone() = clearTimeout(theGuard)\n" + body
+
+// What a networked program printed.
+net_out(body: string) -> string = out(netted(body))
+
+// The complaint a networked program drew.
+net_fails(body: string) -> string = fails(netted(body))
+
+// An echo server, and the port it ended up on. Every test below opens with some version of this.
+const Echo: string = "serve(conn)\n    heard(chunk)\n        if chunk == null\n            close(conn)\n        else\n            send(conn, \"echo: \" + chunk)\n    onData(conn, heard)\nval server = listen(0, serve)\nval port = localPort(server)\n"
+
+// A program run against a heap small enough to fill quickly, and the complaint it drew.
+//
+// **The limit is put back afterwards**, so nothing after this runs in a megabyte by accident -- which
+// would turn an unrelated failure into a mystery about memory.
+in_small_heap(text: string) -> string
+    set_heap_limit(1048576)
+
+    val said = fails(text)
+
+    set_heap_limit(268435456)
+    said
+end in_small_heap
+
+// What a program on disk printed.
+ran_out(path: string) -> string
+    read_bytes(path) match
+        Err(e) -> s"cannot read ${path}: ${e} -- this suite reads its fixtures by relative path, so it must be run from the project root (`sysl test .` there), not at it"
+        Ok(bytes) ->
+            val r = run(source(path, bytes))
+
+            if r.ok() then r.printed() else r.render()
+end ran_out
+
+// The complaint a program on disk drew, and the empty string where it drew none.
+ran_fault(path: string) -> string
+    read_bytes(path) match
+        Err(e) -> s"cannot read ${path}: ${e} -- this suite reads its fixtures by relative path, so it must be run from the project root (`sysl test .` there), not at it"
+        Ok(bytes) ->
+            val r = run(source(path, bytes))
+
+            if r.ok() then "" else r.render()
+end ran_fault
+
+tested(path: string) -> Tested
+    read_bytes(path) match
+        Err(e) ->
+            var none: Buf[TestRan] = buf()
+
+            Tested(s"cannot read ${path}: ${e} -- this suite reads its fixtures by relative path, so it must be run from the project root", none)
+        Ok(bytes) -> run_tests(source(path, bytes))
+end tested
+
+// What one named test in a file had to say, or a sentence saying it was not there.
+verdict(t: Tested, name: string) -> string
+    for i in 0..<t.results.len()
+        if t.results.at(i).name == name then return t.results.at(i).said
+
+    s"no test called `${name}` ran"
+end verdict
+
+const Pointish: string = "val Point = {\n    dist: self -> self.x * self.x + self.y * self.y,\n    kind: \"a point\"\n}\npoint(x, y) = { x: x, y: y, proto: Point }\n"
+
+const Shapes: string = "type Point = { x: number, y: number }\ntype Named = { name: string }\n"
+
+// A value handed over through something the CHECKER cannot see the type of.
+//
+// **A run-time check exists for the values that arrive from outside the program**, and once the
+// static pass reports the ones it can see, a test of the run-time check has to hand over one it
+// cannot. An unannotated function answers `any` by design and permanently, so this is a stable way
+// to say "a value whose type nobody wrote down" rather than a trick played on a limitation.
+const Opaque: string = "anything(v) = v\n"
+
+// A fault to raise on purpose, from a name the program HAS bound.
+//
+// **These tests used to raise by naming something undefined, and that stopped compiling** when an
+// undefined name became a complaint the compiler makes. What they want is the cheapest possible
+// run-time fault; a division by zero is that, and putting it behind a name keeps the programs
+// reading as they did.
+const Boom: string = "boom() = 1 / 0\n"
+
+// The type an annotation describes, read through the parser the way a definition's would be.
+type_text(annotation: string) -> string
+    val src = source_of("t", s"f(x: ${annotation}) = x")
+    val r = parse(src)
+
+    if !r.ok() then return r.report.render(src)
+
+    for i in 0..<r.program.stmts.len()
+        *r.program.stmts.at(i).kind match
+            Def(_, _, body, _) -> return first_annotation(body_at(body))
+            _ -> ()
+
+    "no definition"
+end type_text
+
+first_annotation(body: Expr) -> string
+    *body.kind match
+        Block(stmts) ->
+            for i in 0..<stmts.len()
+                *stmts.at(i).kind match
+                    CheckType(_, _, pat) -> return show_type(type_from_pattern(pat))
+                    _ -> ()
+
+            "no annotation"
+        _ -> "no block"
+end first_annotation
+
+// A manifest's value, rendered as JSON so that one string says the whole shape.
+conf(text: string) -> string
+    val src = source_of("package.sl", text)
+    val m = read_manifest(src)
+
+    if !m.ok() then return s"REFUSED: ${m.report.render(src)}"
+
+    s"${m.value()}"
+end conf
+
+// What a manifest that is refused says. Empty where it was accepted, so that a test asserting a
+// refusal cannot pass by the file being fine.
+conf_error(text: string) -> string
+    val src = source_of("package.sl", text)
+    val m = read_manifest(src)
+
+    if m.ok() then "" else m.report.render(src)
+end conf_error
+
+// What a value prints as, and then what THAT prints as. The two have to agree, which is the whole of
+// the round-trip claim: slate's printed form of an object is a slate expression.
+reprint(text: string) -> string = out(s"print(${out(s"print(${text})")})")
+
+// The driver, run with its report collected rather than printed.
+//
+// **This is what `run_cli` taking somewhere to say things buys.** The status a shell would have seen
+// is asserted here, in-process, with nothing reaching the terminal -- where before the driver
+// printed straight out and answered nothing, so neither half of it could be pinned by a test at all.
+//
+// **THE `sink` IS NOT CEREMONY: a sysl closure captures BY VALUE.** Written the obvious way, as
+// `line -> lines.push(line)`, the closure carries its own copy of the buffer and every push lands in
+// it -- so the calls all succeed, nothing is reported, and `lines` is empty at the end. A pointer is
+// captured by value too, and that is the whole difference: what it points at is the one buffer.
+cli_status(args: []string) -> int
+    var lines: Buf[string] = buf()
+    val sink = &lines
+
+    run_cli(args, (line: string) -> sink.push(line))
+end cli_status
+
+// The same run, read for what it said.
+cli_said(args: []string) -> string
+    var lines: Buf[string] = buf()
+    val sink = &lines
+
+    run_cli(args, (line: string) -> sink.push(line))
+
+    var out = str_builder()
+
+    for i in 0..<lines.len()
+        if i > 0 then out.push("\n")
+
+        out.push(lines.at(i))
+
+    out.finish()
+end cli_said
+
+// A project, flattened to one line so that a test says the whole of what was read.
+proj(text: string) -> string
+    val f = read_project_text("package.sl", text)
+
+    if !f.ok() then return s"REFUSED: ${proj_said(text)}"
+
+    val p = f.project
+    var out = str_builder()
+
+    out.push(s"${p.name} ${p.version}")
+
+    if p.main != "" then out.push(s" main=${p.main}")
+
+    for i in 0..<p.dependencies.len()
+        val d = p.dependencies.at(i)
+
+        out.push(s" ${d.name}@${d.version}<-${d.git}")
+
+    out.finish()
+end proj
+
+// Everything the reader had to say about a project, warnings included -- so a test asserting a
+// warning cannot pass by the file having been refused outright.
+proj_said(text: string) -> string
+    val src = source_of("package.sl", text)
+    val f = read_project(src)
+
+    if f.report.is_empty() then "" else f.report.render(src)
+end proj_said
+
+// A program run with the package cache pointed at the fixture tree.
+//
+// **The cache is a setting for the same reason the heap size is**: the behaviour under test is
+// identical whatever directory it reads, and a suite that read the real `~/.slate/pkg` would pass or
+// fail on what a previous run had happened to download. `tests/cache/` is a package cache checked in.
+with_packages(path: string) -> string
+    set_package_cache("tests/cache")
+
+    val said = ran_out(path)
+
+    set_package_cache("")
+    said
+end with_packages
+
+// The same, for a program expected to be refused.
+// `slate deps`, run against the fixture cache rather than whatever is in `~/.slate/pkg`.
+deps_said(dir: string) -> string
+    set_package_cache("tests/cache")
+
+    val said = cli_said(["slate", "deps", dir])
+
+    set_package_cache("")
+    said
+end deps_said
+
+deps_status(dir: string) -> int
+    set_package_cache("tests/cache")
+
+    val code = cli_status(["slate", "deps", dir])
+
+    set_package_cache("")
+    code
+end deps_status
+
+packages_fault(path: string) -> string
+    set_package_cache("tests/cache")
+
+    val said = ran_fault(path)
+
+    set_package_cache("")
+    said
+end packages_fault
+
+// A one-file project written into a scratch directory, run against the fixture cache.
+scratch_project(manifest: string, program: string) -> string
+    val dir = libuv.mkdtemp_sync("/tmp/slate-proj-XXXXXX").unwrap()
+
+    write_text(s"${dir}/package.sl", manifest).unwrap()
+    write_text(s"${dir}/app.sl", program).unwrap()
+    set_package_cache("tests/cache")
+
+    val said = ran_fault(s"${dir}/app.sl")
+
+    set_package_cache("")
+    scrub(dir)
+    said
+end scratch_project
+
+// A directory holding the named files, for hashing.
+tree_of(names: []const string, bodies: []const string) -> string
+    val dir = libuv.mkdtemp_sync("/tmp/slate-tree-XXXXXX").unwrap()
+
+    for i in 0..<names.len
+        write_text(s"${dir}/${names[i]}", bodies[i]).unwrap()
+
+    dir
+end tree_of
+
+hash_of(names: []const string, bodies: []const string) -> string
+    val dir = tree_of(names, bodies)
+    val h = tree_hash(dir).unwrap()
+
+    scrub(dir)
+    h
+end hash_of
+
+// **The fixtures are made by `git archive`, which is what GitHub serves.** An archive written by
+// this repo's own idea of the format would prove nothing about the one a fetch will actually meet --
+// the global pax header carrying the commit id is there because git puts it there, and it is the
+// first thing in the file.
+tar_bytes(name: string) -> []const u8
+    read_bytes(s"tests/tar/${name}") match
+        Err(e) -> panic(s"cannot read tests/tar/${name}: ${e} -- this suite reads its fixtures by relative path, so it must be run from the project root")
+        Ok(b) -> b
+end tar_bytes
+
+// A project in a scratch directory, holding the manifest text given.
+project_at(text: string) -> string
+    val dir = libuv.mkdtemp_sync("/tmp/slate-add-XXXXXX").unwrap()
+
+    write_text(s"${dir}/package.sl", text).unwrap()
+    dir
+end project_at
+
+// What a scratch project's manifest holds now.
+manifest_now(dir: string) -> string =
+    from_utf8_unchecked(read_bytes(s"${dir}/package.sl").unwrap())
+
+// One command run against the fixture cache, answering the status and what it said.
+//
+// **Run ONCE, where `cli_status` and `cli_said` each run their own.** A command that writes a file
+// is not the same command the second time -- the second `slate add` would find what the first one
+// wrote and report that instead.
+cache_run(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+
+    set_package_cache("tests/cache")
+
+    val status = run_cli(args, (line: string) -> sink.push(line))
+
+    set_package_cache("")
+
+    var out = str_builder()
+
+    for i in 0..<lines.len()
+        if i > 0 then out.push("\n")
+
+        out.push(lines.at(i))
+
+    (status, out.finish())
+end cache_run

@@ -1,0 +1,539 @@
+module dev.slatelang.slate
+@tests
+
+import sh.sysl.gc
+import sh.sysl.parsing.*
+import sysl.text.Search
+
+// The machine, the event loop, absence, and coroutines.
+//
+// **The tests that pin the drain have no timer in them on purpose** -- a live handle keeps libuv
+// claiming work, so a test with a timer cannot see a request-counting bug. The heap is here too,
+// its tests being the ones that reproduce a real SIGSEGV.
+
+// -- the machine ----------------------------------------------------------------------------------
+
+@test
+a_hook_that_is_not_a_function_is_ignored()
+    // A field called `hash` holding a number is data, not an override.
+    assert_eq(out("var a = { hash: 7 }\nvar b = { hash: 7 }\nprint(a == b)"), "true")
+
+//
+// **These were differential tests against the tree-walker until the walker was deleted.** Every one
+// of them agreed on both before it went, and the expectations here are written out by hand rather
+// than snapshotted -- a machine compared against its own output proves nothing.
+
+@test
+the_machine_runs_arithmetic_and_names()
+    assert_eq(out("print(1 + 2 * 3)"), "7")
+    assert_eq(out("val x = 4\nvar y = 5\ny = y + x\nprint(y)"), "9")
+    assert_eq(out("print(7 / 2, 7.0 / 2, \"a\" + \"b\")"), "3 3.5 ab")
+
+@test
+the_machine_short_circuits_and_keeps_the_deciding_operand()
+    // Compiled as a jump that does not pop, which is what makes `||` answer `1` rather than `true`.
+    assert_eq(out(Boom + "print(false && boom())"), "false")
+    assert_eq(out(Boom + "print(1 || boom())"), "1")
+    assert_eq(out("print(null || \"fallback\")"), "fallback")
+
+@test
+the_machine_builds_containers()
+    assert_eq(out("print([1, 2, 3])"), "[1, 2, 3]")
+    assert_eq(out("val o = { a: 1, b: [2, 3] }\nprint(o.b[1], o.a, keys(o))"), "3 1 [\"a\", \"b\"]")
+    assert_eq(out("var t = {}\nt[[1,2]] = \"k\"\nprint(t[[1,2]])"), "k")
+
+@test
+the_machine_runs_control_flow()
+    assert_eq(out("var n = 0\nwhile n < 5\n    n = n + 1\nprint(n)"), "5")
+    assert_eq(out("var s = 0\nfor x in [1,2,3,4]\n    s = s + x\nprint(s)"), "10")
+    assert_eq(out("var n = 0\nloop\n    n = n + 1\n    if n > 3\n        break\nprint(n)"), "4")
+    assert_eq(out("var s = 0\nfor x in [1,2,3,4]\n    if x == 2\n        continue\n    s = s + x\nprint(s)"), "8")
+
+@test
+the_machine_runs_functions_and_closures()
+    assert_eq(out("double(x) = x * 2\nprint(double(21))"), "42")
+    assert_eq(out("add(a, b)\n    a + b\nprint(add(1, 2))"), "3")
+    assert_eq(out("counter()\n    var c = 0\n    bump()\n        c = c + 1\n        c\n    bump\nval f = counter()\nprint(f(), f(), f())"), "1 2 3")
+
+@test
+the_machine_runs_match()
+    assert_eq(out("print(2 match\n    1 -> \"one\"\n    2 -> \"two\"\n    _ -> \"other\")"), "two")
+    assert_eq(out("print([1, 2] match\n    [a, b] if a < b -> \"rising\"\n    _ -> \"no\")"), "rising")
+    assert_eq(out("print({ k: 1 } match\n    { k: n } -> n\n    _ -> 0)"), "1")
+    assert_eq(out("print(9 match\n    n @ number -> n * 2\n    _ -> 0)"), "18")
+    assert_eq(out("print([1,2,3] match\n    [a, ...rest] -> a\n    _ -> 0)"), "1")
+
+// -- the event loop -------------------------------------------------------------------------------
+
+@test
+the_machine_returns_early_from_inside_a_loop()
+    assert_eq(out("first_even(xs)\n    for x in xs\n        if x % 2 == 0\n            return x\n    null\nprint(first_even([1,3,4,5]))"), "4")
+
+//
+// **A callback needs nothing from the machine.** It runs *from* the loop rather than from inside a
+// half-evaluated expression, which is why all of this would have worked on the tree-walker too --
+// `await` is the one that needed a machine.
+
+@test
+a_program_does_not_end_while_a_timer_is_pending()
+    // node's rule: the process lives as long as something is scheduled.
+    assert_eq(out("print(\"before\")\nsetTimeout(() -> print(\"after\"), 1)\nprint(\"last statement\")"),
+              "before\nlast statement\nafter")
+
+@test
+timers_fire_in_the_order_their_delays_say()
+    assert_eq(out("setTimeout(() -> print(\"late\"), 20)\nsetTimeout(() -> print(\"early\"), 1)"),
+              "early\nlate")
+
+@test
+an_interval_repeats_until_it_is_cancelled()
+    val prog = "var n = 0\nvar id = null\nbump()\n    n = n + 1\n    print(n)\n    if n == 3\n        clearInterval(id)\nid = setInterval(bump, 1)"
+
+    assert_eq(out(prog), "1\n2\n3")
+
+@test
+a_timer_cancelled_before_it_fires_never_runs()
+    assert_eq(out("val id = setTimeout(() -> print(\"never\"), 5)\nclearTimeout(id)\nprint(\"done\")"), "done")
+
+@test
+a_callback_sees_the_scope_it_was_written_in()
+    // The whole of what makes it a closure, across a suspension of the program itself.
+    assert_eq(out("val greeting = \"hello\"\nsetTimeout(() -> print(greeting), 1)"), "hello")
+
+@test
+a_callback_may_schedule_another_one()
+    val prog = "var n = 0\nstep()\n    n = n + 1\n    print(n)\n    if n < 3\n        setTimeout(step, 1)\nsetTimeout(step, 1)"
+
+    assert_eq(out(prog), "1\n2\n3")
+
+@test
+a_pending_callback_survives_a_collection()
+    // **The reason `event.sysl` keeps a rooted table at all.** The only reference to this closure is
+    // the one libuv holds, and the mark phase cannot see through an ARC box -- so without the table
+    // the collector frees it and the timer calls into swept memory. The allocation between the two
+    // is what forces a collection in the gap.
+    val prog = "val message = \"survived\"\nsetTimeout(() -> print(message), 5)\nvar n = 0\nwhile n < 20000\n    val junk = [1, 2, 3, 4, 5]\n    n = n + 1\nprint(\"allocated\")"
+
+    assert_eq(out(prog), "allocated\nsurvived")
+
+@test
+a_timer_needs_a_function_and_says_so()
+    assert(fails("setTimeout(42, 1)").contains("a timer needs a function to call"))
+    assert(fails("setTimeout(() -> 1, \"soon\")").contains("a delay is a number of milliseconds"))
+
+@test
+a_fault_inside_a_callback_is_reported()
+    assert(fails("setTimeout(() -> nope, 1)").contains("`nope` is not defined"))
+
+// -- telling absence from null ---------------------------------------------------------------------
+
+@test
+has_tells_an_absent_field_from_one_holding_null()
+    // Absence and `null` are now different answers, so reading tells them apart -- but `has` is still
+    // the way to ask without having to default first.
+    assert_eq(out("val a = {}\nval b = { x: null }\nprint(has(a, \"x\"), has(b, \"x\"))"), "false true")
+    assert_eq(out("val a = {}\nval b = { x: null }\nprint(has(a, \"x\"), has(b, \"x\"))"), "false true")
+
+@test
+has_works_for_any_kind_of_key()
+    assert_eq(out("var t = {}\nt[[1,2]] = 1\nprint(has(t, [1,2]), has(t, [1,3]))"), "true false")
+    assert_eq(out("var t = {}\nt[1] = 1\nprint(has(t, 1.0), has(t, 2))"), "true false")
+
+@test
+has_agrees_with_keys_and_survives_removal_of_a_value()
+    assert_eq(out("var o = { a: 1 }\no.a = null\nprint(has(o, \"a\"), keys(o))"), "true [\"a\"]")
+
+@test
+has_needs_an_object_and_says_so()
+    assert(fails(Opaque + "has(anything([1,2]), 0)").contains("`has` needs an object"))
+    assert(fails(Opaque + "anything(has)({})").contains("`has` takes an object and a key"))
+
+// -- absence is second class ----------------------------------------------------------------------
+
+@test
+nil_is_an_ordinary_name_now_that_nothing_takes_it()
+    // The soft-word rule `end` already had: a word the grammar does not need belongs to the program.
+    assert_eq(out("val nil = \"just a variable\"\nprint(nil)"), "just a variable")
+
+//
+// **`undefined` may be produced, compared and defaulted -- and kept nowhere.** The problem with
+// JavaScript's is not that it exists but that it *travels*: an ordinary value flows into a field,
+// through three layers, and is observed a long way from the lookup that made it, by which time
+// nothing knows what was missing. Refusing to keep it means a program says what absence means where
+// it arose, which is the one place it still knows.
+
+@test
+a_missing_field_is_absent_and_a_present_null_is_not()
+    assert_eq(out("val o = { b: null }\nprint(o.nope == undefined, o.b == undefined, o.b == null)"), "true false true")
+
+@test
+absence_may_not_be_bound_to_a_name()
+    assert(fails("val o = {}\nval x = o.nope").contains("cannot be bound to `x`"))
+    assert(fails("val o = {}\nvar x = o.nope").contains("cannot be bound to `x`"))
+
+@test
+absence_may_not_be_written_to_anything()
+    assert(fails("val o = {}\nvar p = {}\np.x = o.nope").contains("cannot be stored in `x`"))
+    assert(fails("val o = {}\nvar xs = [1]\nxs[0] = o.nope").contains("cannot be stored"))
+    assert(fails("val o = {}\nvar n = 1\nn = o.nope").contains("cannot be written to `n`"))
+
+@test
+absence_may_not_be_put_in_a_container_or_used_as_a_key()
+    assert(fails("val o = {}\nval xs = [o.nope]").contains("cannot be put in an array"))
+    assert(fails("val o = {}\nval p = { x: o.nope }").contains("cannot be put in an object"))
+    assert(fails("val o = {}\nvar t = {}\nt[o.nope] = 1").contains("cannot be used as a key"))
+
+@test
+absence_may_not_be_passed_to_a_function()
+    // The rule that makes the others hold: a parameter is a name, so passing it is binding it.
+    assert(fails("val o = {}\nprint(o.nope)").contains("cannot be passed to a function"))
+
+@test
+absence_may_be_compared_and_defaulted_and_tested()
+    // The three things left, and they are enough: ask what it is, say what it should be, or branch.
+    assert_eq(out("val o = {}\nprint(o.nope == undefined)"), "true")
+    assert_eq(out("val o = {}\nprint(o.nope ?? \"fallback\")"), "fallback")
+    assert_eq(out("val o = {}\nif o.nope\n    print(\"yes\")\nelse\n    print(\"absent is false\")"), "absent is false")
+
+@test
+the_default_operator_asks_about_absence_and_not_truth()
+    // **`??` is not `||`**, and this is the whole difference: zero and the empty string are values.
+    assert_eq(out("val o = { z: 0, s: \"\" }\nprint(o.z ?? \"gone\", o.s ?? \"gone\", o.q ?? \"gone\")"), "0  gone")
+    assert_eq(out("val o = { z: 0 }\nprint(o.z || \"gone\")"), "0")
+
+@test
+a_default_replaces_a_present_null_as_well_as_an_absent_field()
+    // **JavaScript's rule, taken deliberately.** In theory a `null` a program chose should survive,
+    // and slate can still say so with `has` or `== undefined`; in practice "missing or empty, use
+    // that" is what the operator is reached for, and one that handled half of it would be a trap.
+    assert_eq(out("val o = { x: null }\nprint(o.x ?? \"replaced\")"), "replaced")
+    assert_eq(out("val o = {}\nprint(o.x ?? \"replaced\")"), "replaced")
+
+    // And the distinction is still askable, which is where it earns its keep.
+    assert_eq(out("val o = { x: null }\nprint(has(o, \"x\"), o.x == undefined)"), "true false")
+
+@test
+the_default_operator_binds_looser_than_or()
+    assert_eq(good_tree("a ?? b || c"), "(?? a (|| b c))")
+
+@test
+a_runaway_recursion_is_reported_rather_than_crashing()
+    // **A machine has to impose this, where a tree-walker got it imposed on it.** The walker recursed
+    // in sysl, so this exhausted the host stack and died with no diagnostic and none of the output the
+    // program had already produced. Frames are an array here, so slate owns the limit -- and a limit
+    // slate owns is one slate can report, pointing at the call that went too deep.
+    val r = fails("f()\n    f()\nf()")
+
+    assert(r.contains("farther than slate will go"))
+
+@test
+output_printed_before_a_runaway_recursion_survives_it()
+    // The half of the problem that cost the most: a crash used to take the evidence with it.
+    val src = source_of("t", "print(\"before\")\nf()\n    f()\nf()")
+    val r = run(src)
+
+    assert(!r.ok())
+    assert_eq(r.printed(), "before")
+end output_printed_before_a_runaway_recursion_survives_it
+
+// -- setting a line of execution aside --------------------------------------------------------------
+
+@test
+recursion_far_deeper_than_a_host_stack_still_works()
+    // Frames are heap-allocated, so honest deep recursion is cheap -- this is far past where the
+    // tree-walker would have died.
+    assert_eq(out("down(n)\n    if n == 0\n        0\n    else\n        down(n - 1)\nprint(down(5000))"), "0")
+
+//
+// **The mechanism `await` will be built on, tested before there is anything to build.** A coroutine
+// is possible only because a call's state is data here rather than sysl's own call stack, which is the
+// whole reason the tree-walker was replaced.
+
+@test
+parking_and_unparking_round_trips_the_machine()
+    reset_heap()
+    reset_vm()
+
+    vm.stack.push(Int(7))
+    vm.stack.push(str_value("carried"))
+
+    val id = park()
+
+    assert_eq(vm.stack.len(), 0, "the caller gets a clean machine")
+
+    unpark(id)
+
+    assert_eq(vm.stack.len(), 2)
+    assert_eq(value_text(vm.stack.at(1)), "carried")
+end parking_and_unparking_round_trips_the_machine
+
+@test
+a_parked_machine_is_a_collector_root_like_a_running_one()
+    // **The claim the whole design rests on.** A suspended call is not running and is not therefore
+    // any less alive: everything it will touch when it resumes has to survive until then. After the
+    // park, the only thing referring to this string is the parked machine -- so if `mark_vm` did not
+    // walk `parked`, the collection below would free it and the read after would be of swept memory.
+    reset_heap()
+    reset_vm()
+
+    vm.stack.push(str_value("still here"))
+
+    val id = park()
+
+    collect_now()
+
+    unpark(id)
+
+    assert_eq(value_text(vm.stack.at(0)), "still here")
+end a_parked_machine_is_a_collector_root_like_a_running_one
+
+@test
+two_parked_machines_do_not_share_anything()
+    reset_heap()
+    reset_vm()
+
+    vm.stack.push(str_value("first"))
+
+    val a = park()
+
+    vm.stack.push(str_value("second"))
+
+    val b = park()
+
+    collect_now()
+    unpark(a)
+
+    assert_eq(value_text(vm.stack.at(0)), "first")
+    reset_vm()
+end two_parked_machines_do_not_share_anything
+
+// -- async and await --------------------------------------------------------------------------------
+
+@test
+async_and_await_are_words_of_their_own()
+    assert_eq(kinds("async"), "Async Newline Eof")
+    assert_eq(kinds("await"), "Await Newline Eof")
+
+    // Neither is a soft word, so neither may be a name. `asynchronous` still is one, which is what
+    // says the lexer compares whole runs rather than prefixes.
+    assert_eq(kinds("asynchronous"), "Ident Newline Eof")
+
+@test
+the_tree_says_which_functions_are_async()
+    assert_eq(good_tree("f(x) = x"), "(def f(x) x)")
+    assert_eq(good_tree("async f(x) = x"), "(async-def f(x) x)")
+    assert_eq(good_tree("async x -> x"), "(async-fn(x) x)")
+
+@test
+await_binds_like_the_other_prefix_operators()
+    // At the same power as `-`, so it takes the call and not the sum: `await f() + 1` adds to what
+    // was waited for. JavaScript groups it the same way.
+    assert_eq(good_tree("async f() = await g() + 1"), "(async-def f() (+ (await (call g)) 1))")
+    assert_eq(good_tree("async f() = await g(1)"), "(async-def f() (await (call g 1)))")
+
+@test
+async_in_front_of_something_that_is_not_a_function_is_refused()
+    assert(fails("val x = async 5").contains("`async` goes in front of a function"))
+
+@test
+await_outside_an_async_function_is_refused()
+    assert(fails("print(await 5)").contains("`await` belongs in an `async` function"))
+
+    // Including in an ordinary function nested inside an async one -- `await` belongs to the function
+    // it is written in, not to the one that called it.
+    assert(fails("async outer()\n    inner() = await 5\n    inner()\nouter()").contains("`await` belongs in an `async` function"))
+
+@test
+an_async_function_answers_a_promise_and_its_caller_carries_on()
+    // **The ordering node produces, and the whole point of the machine.** Everything above the first
+    // `await` runs before the caller sees the promise; everything below it runs after the caller has
+    // moved on.
+    val prog = "async greet(name)\n    print(\"start\", name)\n    await sleep(2)\n    print(\"done\", name)\n    \"hello \" + name\nasync main()\n    print(await greet(\"ada\"))\nprint(\"before\")\nmain()\nprint(\"after\")"
+
+    assert_eq(out(prog), "before\nstart ada\nafter\ndone ada\nhello ada")
+
+@test
+an_async_function_that_never_awaits_still_answers_a_promise()
+    assert_eq(out("async f() = 7\nasync main()\n    print(await f())\nmain()"), "7")
+
+@test
+two_async_functions_run_at_the_same_time()
+    // Two coroutines, each on a timer of its own, interleaving by when their sleeps come up.
+    val prog = "async worker(name, ms, turns)\n    var i = 0\n    while i < turns\n        await sleep(ms)\n        print(name, i)\n        i = i + 1\n    name\nasync main()\n    val a = worker(\"a\", 8, 3)\n    val b = worker(\"b\", 20, 2)\n    print(\"both started\")\n    print(await a, await b)\nmain()"
+
+    // `a` comes up at 8, 16 and 24 milliseconds and `b` at 20 and 40, so the two threads of output
+    // cross with four milliseconds to spare on either side of every step.
+    assert_eq(out(prog), "both started\na 0\na 1\nb 0\na 2\nb 1\na b")
+
+@test
+a_timer_and_an_await_interleave_by_time()
+    val prog = "async work()\n    await sleep(10)\n    print(\"work done\")\nsetTimeout(() -> print(\"timer 5\"), 5)\nwork()\nsetTimeout(() -> print(\"timer 20\"), 20)\nprint(\"sync\")"
+
+    assert_eq(out(prog), "sync\ntimer 5\nwork done\ntimer 20")
+
+@test
+await_of_a_plain_value_answers_it()
+    assert_eq(out("async f() = await 7\nasync main()\n    print(await f())\nmain()"), "7")
+
+@test
+await_on_a_settled_promise_still_yields()
+    // **A settled promise goes round the queue like any other**, so what was scheduled first runs
+    // first. Continuing straight through would print `after` last, which is the ordering bug every
+    // runtime that took the shortcut has had to undo.
+    val prog = "async f()\n    await resolve(1)\n    print(\"resumed\")\nf()\nsetTimeout(() -> print(\"timer\"), 0)\nprint(\"sync\")"
+
+    assert_eq(out(prog), "sync\nresumed\ntimer")
+
+@test
+an_async_lambda_may_be_written_with_the_arrow()
+    assert_eq(out("val double = async x -> (await x) * 2\nasync main()\n    print(await double(21))\nmain()"), "42")
+    assert_eq(out("val pair = async (a, b) -> (await a) + (await b)\nasync main()\n    print(await pair(1, 2))\nmain()"), "3")
+
+@test
+a_deep_chain_of_awaits_carries_a_value_back()
+    val prog = "async down(n)\n    if n == 0\n        await sleep(1)\n        \"bottom\"\n    else\n        await down(n - 1)\nasync main()\n    print(await down(30))\nmain()"
+
+    assert_eq(out(prog), "bottom")
+
+@test
+resolve_and_reject_make_a_promise_that_has_already_settled()
+    assert_eq(out("async main()\n    print(await resolve(\"plain\"))\nmain()"), "plain")
+    assert(fails("async main()\n    print(await reject(\"nope\"))\nasync top()\n    await main()\ntop()").contains("nope"))
+
+@test
+a_promise_prints_as_pending_and_then_as_its_value()
+    val prog = "async main()\n    val p = sleep(2)\n    print(p)\n    await p\n    print(p)\nmain()"
+
+    assert_eq(out(prog), "<promise pending>\n<promise null>")
+
+    assert_eq(out("async main()\n    print(resolve(5))\nmain()"), "<promise 5>")
+
+@test
+a_promise_compares_by_identity()
+    // Two promises that will settle to the same value are not the same promise, so `==` answers what
+    // the addresses say -- which is the bargain a function already has.
+    assert_eq(out("async main()\n    val a = resolve(1)\n    val b = resolve(1)\n    print(a == a, a == b)\nmain()"), "true false")
+
+@test
+a_fault_in_an_async_function_reaches_whoever_awaits_it()
+    // With no `catch` in the language a failed promise ends the call that awaited it, and that call's
+    // own promise fails in turn -- which is what a language with exceptions gets from unwinding.
+    val prog = "async risky()\n    await sleep(1)\n    1 / 0\nasync middle()\n    await risky()\n    print(\"never\")\nasync top()\n    await middle()\ntop()"
+
+    assert(fails(prog).contains("this divides by zero"))
+    assert(!out(prog).contains("never"))
+
+@test
+a_failure_nothing_awaits_is_reported_rather_than_dropped()
+    // **The one thing node gets wrong by default.** A promise that fails with nothing waiting on it
+    // has nowhere to report to, so slate makes it the program's fault.
+    val prog = "async risky()\n    await sleep(1)\n    print(\"about to fail\")\n    1 / 0\nrisky()\nprint(\"started\")"
+    val said = fails(prog)
+
+    assert(said.contains("nothing awaited"))
+    assert(said.contains("this divides by zero"))
+
+    // What the program printed before it went wrong survives the report, which `out` cannot show --
+    // it answers the complaint once there is one.
+    val r = run(source_of("t", prog))
+
+    assert(!r.ok())
+    assert_eq(r.printed(), "started\nabout to fail")
+
+@test
+a_failure_that_was_awaited_is_not_reported_twice()
+    // The chain here ends in an `await`, so nothing is unhandled and the only complaint is the fault
+    // itself -- once.
+    val prog = "async risky()\n    await sleep(1)\n    1 / 0\nasync top()\n    await risky()\ntop()"
+    val said = fails(prog)
+
+    assert(said.contains("this divides by zero"))
+
+@test
+many_coroutines_parked_at_once_survive_a_collection()
+    // **The claim `mark_vm` walking `parked` exists for.** Sixty lines of execution are suspended at
+    // the same moment, each holding the only reference to sixty objects, and the allocation forces
+    // collections while they are all set aside.
+    val prog = "async one(i)\n    var junk = []\n    var k = 0\n    while k < 60\n        push(junk, { n: k + i, s: string(k) })\n        k = k + 1\n    await sleep(2)\n    len(junk) + junk[0].n\nasync main()\n    var started = []\n    var i = 0\n    while i < 60\n        push(started, one(i))\n        i = i + 1\n    var total = 0\n    var j = 0\n    while j < 60\n        total = total + await started[j]\n        j = j + 1\n    print(total)\nmain()"
+
+    assert_eq(out(prog), "5370")
+
+@test
+sleeping_and_settling_check_what_they_are_given()
+    assert(fails("async main()\n    await sleep(\"soon\")\nasync top()\n    await main()\ntop()").contains("`sleep` takes a number of milliseconds"))
+    assert(fails("async main()\n    await sleep()\nasync top()\n    await main()\ntop()").contains("was given 0 arguments"))
+    assert(fails("async main()\n    await resolve(1, 2)\nasync top()\n    await main()\ntop()").contains("`resolve` takes one argument"))
+
+@test
+a_promise_may_not_be_awaited_by_two_calls_and_see_different_answers()
+    // One promise, two waiters: both are queued with what it held when it settled, so nothing that
+    // happens afterwards can change what either sees.
+    val prog = "async main()\n    val p = sleep(2)\n    val a = async () -> \"a:\" + string(await p)\n    val b = async () -> \"b:\" + string(await p)\n    print(await a(), await b())\nmain()"
+
+    assert_eq(out(prog), "a:null b:null")
+
+// -- the heap -------------------------------------------------------------------------------------
+
+@test
+a_program_that_outruns_the_heap_is_told_rather_than_crashed()
+    // **This was a bare SIGSEGV, with no diagnostic and none of the output the program had already
+    // produced.** A full heap answers `null`, and every constructor wrote straight through it --
+    // `alloc_or_collect` set `heap_exhausted` and returned null, and `new_str` did `o.s = s`. The
+    // flag is read at the *next* statement boundary, which the process never reached.
+    //
+    // A reserve object of each kind, taken while the heap is empty and rooted for the life of the
+    // program, is what a full heap is answered with now: somewhere real to write, so that the
+    // statement finishes and the boundary reports it against the line that asked.
+    // **The heap is shrunk for this rather than the program made bigger.** Filling 256 MiB to find
+    // out what happens at the end of it takes five seconds; filling one megabyte takes no time, and
+    // the behaviour under test is the same. `HeapBytes` is the ceiling and `heap_limit` is the
+    // setting, which is what makes that possible.
+    val prog = "var kept = []\nfor i in 0..<40000\n    push(kept, { a: i, b: [i, i, i], c: \"x\" + string(i) })\nprint(\"never got here\")"
+    val said = in_small_heap(prog)
+
+    assert(said.contains("this program has run out of memory"))
+
+    // And it names the statement, which is the whole reason the flag is read where it is.
+    assert(said.contains("push(kept,"))
+
+@test
+the_heap_is_usable_again_after_a_program_has_exhausted_it()
+    // The reserves are taken back after every `dispose`, so a program that ran out of memory does
+    // not leave the next one without an answer to a full heap -- which, before the reserves existed,
+    // is what running two programs in one process would have meant.
+    assert(in_small_heap("var kept = []\nfor i in 0..<40000\n    push(kept, { a: i, b: [i, i, i], c: \"x\" + string(i) })").contains("run out of memory"))
+    assert_eq(out("print(\"fine\")"), "fine")
+    assert_eq(out("var xs = []\nfor i in 0..<500\n    push(xs, { a: i })\nprint(len(xs))"), "500")
+
+@test
+collecting_costs_what_the_garbage_costs_and_not_what_the_program_does()
+    // **The threshold read the wrong number, and then compared it against a fixed one.** `gc.used`
+    // is the bump high-water mark and never falls, so `used > 256KiB` asks "has this heap EVER grown
+    // that far" -- true forever once true. The interpreter then ran a full mark-sweep at *every
+    // statement* for the rest of the program, reclaiming almost nothing each time.
+    //
+    // Reading `gc.live_size` fixes half of it. A fixed threshold is the other half: a program whose
+    // genuine live set sits above the constant goes straight back into the same loop. So the
+    // threshold is raised to a multiple of what survived each collection.
+    //
+    // This program holds a stable live set and then does fifty thousand statements that allocate
+    // nothing at all, so a correct collector has nothing to do for the whole second half of it.
+    val prog = "var kept = []\nfor i in 0..<3000\n    push(kept, { a: i })\nvar t = 0\nfor i in 0..<50000\n    t = t + i\nprint(t, len(kept))"
+
+    assert_eq(out(prog), "1249975000 3000")
+
+    // The old rule collected once per statement, which is upwards of fifty thousand times here. The
+    // bound is loose on purpose -- what is being pinned is the *shape*, that collecting tracks
+    // allocation rather than execution, and not a particular count.
+    assert(collections < 100, s"collected ${collections} times for a program that allocates 3000 objects")
+
+@test
+a_live_set_that_keeps_growing_is_still_collected()
+    // The other side of the same rule: a raised threshold must not become a licence to stop
+    // collecting. This one drops everything it makes, so the live set stays small and the collector
+    // has to keep giving the storage back -- a program that allocates 60,000 objects into a heap
+    // that holds far fewer only finishes if it is being collected throughout.
+    val prog = "var last = null\nfor i in 0..<60000\n    last = { a: i, b: [i, i, i] }\nprint(last.a)"
+
+    assert_eq(out(prog), "59999")
+    assert(collections > 0, "a program that allocates sixty thousand objects has to have collected")

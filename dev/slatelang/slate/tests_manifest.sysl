@@ -1,0 +1,574 @@
+module dev.slatelang.slate
+@tests
+
+import sh.sysl.gc
+import sh.sysl.libuv
+import sh.sysl.parsing.*
+import sysl.fs.{write_text}
+import sysl.text.Search
+
+// `package.sl` read as data, read as a project, and the command line that reads it.
+//
+// **A manifest is parsed and never run**, which is the whole design: a resolver working out what to
+// fetch is reading a file that arrived with the thing it is deciding whether to fetch.
+
+// -- the manifest ----------------------------------------------------------------------------------
+
+@test
+A_MANIFEST_IS_slate_SYNTAX_READ_AS_DATA()
+    // The seven things slate's value model has, which are the seven JSON has, which is the whole
+    // reason the manifest is written in slate rather than in a format brought in from outside.
+    assert_eq(conf("{}"), "{}")
+    assert_eq(conf("{ name: \"slate\", version: \"0.0.1\" }"), "{\"name\":\"slate\",\"version\":\"0.0.1\"}")
+    assert_eq(conf("{ on: true, off: false, missing: null }"), "{\"on\":true,\"off\":false,\"missing\":null}")
+    assert_eq(conf("{ n: 1, x: 1.5 }"), "{\"n\":1,\"x\":1.5}")
+    assert_eq(conf("{ xs: [1, \"two\", [3]] }"), "{\"xs\":[1,\"two\",[3]]}")
+
+    // Nesting is the shape a dependency table wants, and it costs nothing.
+    assert_eq(conf("{ deps: { parsing: { version: \"0.4.0\" } } }"),
+        "{\"deps\":{\"parsing\":{\"version\":\"0.4.0\"}}}")
+
+@test
+A_MANIFEST_MAY_BE_COMMENTED_WHICH_IS_MOST_OF_WHY_IT_IS_NOT_JSON()
+    // slate's own `package.hocon` is about three fifths comment. A manifest format a person cannot
+    // annotate would have been the wrong trade whatever else it got right, and JSON -- which is
+    // otherwise free here, `json.sysl` being already in the tree -- fails on this alone.
+    val m = "// what this project is\n" +
+        "{\n" +
+        "    name: \"slate\",  // the package, and the executable\n" +
+        "    version: \"0.0.1\"\n" +
+        "}\n"
+
+    assert_eq(conf(m), "{\"name\":\"slate\",\"version\":\"0.0.1\"}")
+
+@test
+A_NUMBER_WRITTEN_NEGATIVE_IS_ONE_NUMBER()
+    // `-1` is a `Unary` in the tree, the lexer having no signed literal, so a pass that refused
+    // every operator would refuse a number a person wrote as a number.
+    assert_eq(conf("{ a: -1, b: -1.5 }"), "{\"a\":-1,\"b\":-1.5}")
+
+    // And the gate is narrow: the operand has to be a literal itself.
+    assert(conf_error("{ a: -(1 + 1) }").contains("in front of a number and nothing else"))
+    assert(conf_error("{ a: !true }").contains("the only operator a manifest may use"))
+
+@test
+A_MANIFEST_IS_PARSED_AND_NEVER_RUN_SO_IT_REFUSES_CODE()
+    // **Each refusal names what the thing IS.** "not a literal" is true of every one of these and
+    // sends the reader to stare at a line whose problem it has not named.
+    assert(conf_error("{ a: b }").contains("the name `b`"))
+    assert(conf_error("{ a: f(1) }").contains("this is a call"))
+    assert(conf_error("{ a: () -> 1 }").contains("a function"))
+    assert(conf_error("{ a: 1 + 1 }").contains("a `+` between two things"))
+    assert(conf_error("{ a: s\"v${1}\" }").contains("an interpolated string"))
+    assert(conf_error("{ a: o.f }").contains("a field being read off something"))
+    assert(conf_error("{ a: if true then 1 else 2 }").contains("an `if`"))
+    assert(conf_error("{ a: undefined }").contains("no written form"))
+
+    // The note says why, once, rather than each message carrying the whole rationale.
+    assert(conf_error("{ a: b }").contains("parsed and never run"))
+
+@test
+A_MANIFEST_IS_ONE_OBJECT_AND_THE_CARET_GOES_WHERE_THE_READER_MUST_LOOK()
+    assert(conf_error("").contains("this file is empty"))
+    assert(conf_error("").contains("`{}`"))
+
+    // **The second statement, not the first.** A file with two things in it is nearly always one
+    // object closed too early, and the object itself is fine to look at.
+    val two = "{ a: 1 }\n{ b: 2 }\n"
+
+    assert(conf_error(two).contains("a second statement after it"))
+    assert(conf_error(two).contains("closed it sooner than it looks"))
+    assert(conf_error(two).contains("2 | { b: 2 }"))
+
+    // A statement that is not an expression at all is named for what it is.
+    assert(conf_error("val name = \"slate\"").contains("a `val` binding `name`"))
+    assert(conf_error("f() = 1").contains("a definition of `f`"))
+
+@test
+A_REPEATED_KEY_IS_REFUSED_RATHER_THAN_QUIETLY_RESOLVED()
+    // First-wins and last-wins both discard something a person wrote. JSON leaves this undefined and
+    // every reader picks differently, which is the outcome a manifest most needs to avoid.
+    val said = conf_error("{ a: 1, a: 2 }")
+
+    assert(said.contains("`a` is written twice"))
+    assert(said.contains("rather than choosing one of them"))
+
+    // **The caret is on the second KEY, and which of the two it sits under is the whole point.** A
+    // complaint about a key that pointed at its value would send the reader to look at `2`, which is
+    // a perfectly good value -- so the position is asserted rather than merely the presence of a
+    // caret, which was true before the spans were carried and said nothing.
+    assert(said.contains("package.sl:1:9"))
+    assert(said.contains("  |         ^"))
+
+@test
+A_FILE_THAT_WILL_NOT_PARSE_REPORTS_THE_PARSERS_COMPLAINT_AND_NOT_THE_PASSES()
+    // Reporting "this is not data" about wreckage would send the reader one level in from where the
+    // problem is, which is the failure mode this repo's diagnostic rule is written against.
+    val said = conf_error("{ a: }")
+
+    assert(said.contains("expected an expression"))
+    assert(!said.contains("a manifest is data"))
+
+@test
+EVERY_MANIFEST_THE_READER_ACCEPTS_IS_ALSO_A_slate_EXPRESSION()
+    // **This is the forward-compatibility claim, run rather than asserted.** The restriction is a
+    // pass over slate's own tree, so a manifest is a slate expression that happens to be data --
+    // which is what lets the file later be allowed to compute without any manifest written today
+    // having to change. If the two ever disagreed there would be a format to migrate after all.
+    val cases = ["{}", "{ a: 1 }", "{ a: -1, b: -1.5 }", "{ xs: [1, \"two\", [3]] }",
+        "{ on: true, off: false, missing: null }", "{ deps: { p: { version: \"0.4.0\" } } }"]
+
+    for i in 0..<cases.len
+        val text = cases[i]
+
+        // `toJSON` renders what the machine built; `conf` renders what the reader built. They are
+        // two independent walks of the same source and they have to agree.
+        assert_eq(conf(text), out(s"print(toJSON(${text}))"))
+
+@test
+A_MANIFEST_WITH_SEVERAL_MISTAKES_IN_IT_REPORTS_SEVERAL()
+    // **The walk carries on after a refusal**, so a person editing a manifest is told everything
+    // wrong with it in one go rather than being handed the first fault and coming back for the rest.
+    // That is what the `Null` a failed item leaves behind is for: it is never read, `ok` being what
+    // the caller checks.
+    val said = conf_error("{ a: b, c: f(1), d: 1 + 1 }")
+
+    assert(said.contains("the name `b`"))
+    assert(said.contains("a call"))
+    assert(said.contains("a `+` between two things"))
+
+@test
+THE_RESTRICTION_HOLDS_AT_EVERY_DEPTH_AND_NOT_ONLY_THE_TOP()
+    // A pass that checked only the outermost object would let a manifest smuggle a call in three
+    // levels down, which is exactly where nobody would look for it.
+    assert(conf_error("{ a: { b: { c: f() } } }").contains("a call"))
+    assert(conf_error("{ a: [1, [2, [g]]] }").contains("the name `g`"))
+
+    // The same for a repeated key, which is a per-object question asked at every object.
+    assert(conf_error("{ outer: { k: 1, k: 2 } }").contains("`k` is written twice"))
+
+@test
+A_MANIFEST_TAKES_slates_WHOLE_LITERAL_SYNTAX_INCLUDING_THE_PARTS_JSON_HAS_NOT()
+    // Every one of these is a thing a person writing a version or a size would reach for, and JSON
+    // has none of them. They arrive free, the reader being slate's own.
+    assert_eq(conf("{ big: 1_000_000 }"), "{\"big\":1000000}")
+    assert_eq(conf("{ mask: 0x10 }"), "{\"mask\":16}")
+    assert_eq(conf("{ xs: [1, 2,], o: { a: 1, } }"), "{\"xs\":[1,2],\"o\":{\"a\":1}}")
+    assert_eq(conf("{ empty_list: [], empty_obj: {} }"), "{\"empty_list\":[],\"empty_obj\":{}}")
+
+@test
+A_FILE_HOLDING_ONLY_COMMENTS_IS_AN_EMPTY_MANIFEST_AND_SAYS_SO()
+    // The reading a person takes from silence here is "my file was ignored", so the message has to
+    // be the same one an empty file gets rather than nothing at all.
+    assert(conf_error("// nothing here yet\n").contains("this file is empty"))
+    assert(conf_error("\n\n   \n").contains("this file is empty"))
+
+@test
+A_MANIFEST_KEY_IS_A_NAME_OR_A_STRING_WHICH_MAKES_IT_A_SUPERSET_OF_JSON()
+    // The bare form is what a manifest writes nearly every time, and reads like a record.
+    assert_eq(conf("{ parsing: { git: \"github.com/sysl-lang/parsing\" } }"),
+        "{\"parsing\":{\"git\":\"github.com/sysl-lang/parsing\"}}")
+
+    // **The quoted form is the only way to write the keys slate objects have always held.** A key
+    // with a dot in it, a key that is a reserved word, the empty key: every one of them is an
+    // ordinary key at run time, and before this the literal syntax had no way to say any of them.
+    assert_eq(conf("{ \"a.b\": 1, \"if\": 2, \"\": 3 }"), "{\"a.b\":1,\"if\":2,\"\":3}")
+
+    // **So a JSON document is a manifest.** That is what lets a machine-written file -- a lockfile,
+    // or whatever `slate add` rewrites -- be read back by the reader that reads a hand-written one,
+    // rather than the package system growing a second reader for its own output.
+    assert_eq(conf("{\"name\": \"slate\", \"deps\": [{\"v\": \"0.4.0\"}], \"ok\": true, \"n\": null}"),
+        "{\"name\":\"slate\",\"deps\":[{\"v\":\"0.4.0\"}],\"ok\":true,\"n\":null}")
+
+    // JSON's number and string forms are slate's too, which is the rest of the superset claim and
+    // was checked rather than assumed.
+    assert_eq(conf("{\"a\": 1e2, \"b\": 1.5e-3, \"c\": \"x\\u0041y\", \"d\": \"p\\/q\"}"),
+        "{\"a\":100.0,\"b\":0.0015,\"c\":\"xAy\",\"d\":\"p/q\"}")
+
+    // **THE TWO READERS DISAGREE ABOUT `1e2`, AND THAT IS PINNED RATHER THAN PAPERED OVER.** slate
+    // reads it as a REAL, exponent notation being how a real is written; `sh.sysl.json` reads it as
+    // an INTEGER, its own note preferring exactness for an integral value. JSON has one numeric
+    // production and says nothing about storage, so neither is unfaithful -- but a consumer that
+    // switches on integer-versus-real gets a different answer depending on which reader saw the
+    // file, and that is worth knowing before something depends on it.
+    assert_eq(conf("{ \"a\": 1e2 }"), "{\"a\":100.0}")
+    assert_eq(out("print(parseJSON(\"{\\\"a\\\": 1e2}\").value)"), "{a: 100}")
+
+    // JSON's top level is any value at all, and the reader takes one.
+    assert_eq(conf("[1, 2]"), "[1,2]")
+    assert_eq(conf("42"), "42")
+
+    // **The one place it is deliberately NOT a superset.** JSON permits a repeated name and leaves
+    // the outcome undefined, which is why every JSON reader picks differently. A manifest refuses.
+    assert(conf_error("{\"a\": 1, \"a\": 2}").contains("written twice"))
+
+@test
+A_REALISTIC_MANIFEST_READS_TO_WHAT_IT_LOOKS_LIKE()
+    // slate's own dependencies, written as the manifest this reader is for. The point of the test is
+    // that the file below is what a person would actually type -- comments, nesting, a trailing
+    // comma -- and it needs nothing said about it beyond what is here.
+    val m = "// slate -- a language stressor written in sysl.\n" +
+        "{\n" +
+        "    name: \"slate\",\n" +
+        "    version: \"0.0.1\",\n" +
+        "\n" +
+        "    // The oldest compiler this builds with, not the newest available.\n" +
+        "    sysl: \"0.0.82\",\n" +
+        "\n" +
+        "    dependencies: {\n" +
+        "        parsing: { git: \"github.com/sysl-lang/parsing\", version: \"0.4.0\" },\n" +
+        "        gc: { git: \"github.com/sysl-lang/gc\", version: \"0.2.2\" },\n" +
+        "    },\n" +
+        "\n" +
+        "    requires: { heap: true },\n" +
+        "}\n"
+
+    assert_eq(conf(m), "{\"name\":\"slate\",\"version\":\"0.0.1\",\"sysl\":\"0.0.82\"," +
+        "\"dependencies\":{\"parsing\":{\"git\":\"github.com/sysl-lang/parsing\",\"version\":\"0.4.0\"}," +
+        "\"gc\":{\"git\":\"github.com/sysl-lang/gc\",\"version\":\"0.2.2\"}},\"requires\":{\"heap\":true}}")
+
+@test
+READING_A_MANIFEST_TOUCHES_NOTHING_OF_THE_MACHINE()
+    // **The claim `manifest.sysl` makes, run rather than argued.** A manifest is read by tools that
+    // have not chosen to trust it -- a resolver working out what to fetch is reading a file that
+    // arrived with the thing it is deciding whether to fetch -- so the reader has to be the lexer,
+    // the parser and a walk, and nothing else. `gc.used` is the heap's bump high-water mark and
+    // never falls, so it is exactly the witness: if the reader built one collected object, it moves.
+    val before = gc.used(&slate_heap)
+
+    assert_eq(conf("{ name: \"slate\", deps: { p: { version: \"0.4.0\" } }, xs: [1, 2, 3] }"),
+        "{\"name\":\"slate\",\"deps\":{\"p\":{\"version\":\"0.4.0\"}},\"xs\":[1,2,3]}")
+
+    // A refusal walks the same tree and renders a diagnostic, which is the other path through.
+    assert(conf_error("{ a: f(1) }").contains("a call"))
+
+    assert_eq(gc.used(&slate_heap), before,
+        "reading a manifest allocated on the collected heap, so it is not free of the machine")
+
+// -- string keys ------------------------------------------------------------------------------------
+
+@test
+A_KEY_IS_A_NAME_OR_A_STRING_AND_THE_QUOTED_FORM_REACHES_KEYS_THE_BARE_ONE_CANNOT()
+    // **slate objects have always been keyed by any value at all** -- `table.sysl` says so and
+    // `o["a.b"] = 1` has always worked. What was missing was a way to WRITE those keys in a literal,
+    // which is what this adds. It is not a second spelling of a name: it is the only spelling for a
+    // key that is not one.
+    assert_eq(out("print({ \"a.b\": 1, \"if\": 2, \"\": 3, plain: 4 })"),
+        "{\"a.b\": 1, \"if\": 2, \"\": 3, plain: 4}")
+
+    // Read back with the accessor that has always reached them.
+    assert_eq(out("val o = { \"a.b\": 1, \"if\": 2, \"\": 3 }\nprint(o[\"a.b\"], o[\"if\"], o[\"\"])"), "1 2 3")
+
+    // A quoted key that IS a name is the same key as the bare one, not a second entry beside it.
+    assert_eq(out("print({ \"a\": 1 })"), "{a: 1}")
+    assert_eq(out("val o = { \"a\": 1 }\nprint(o.a)"), "1")
+
+@test
+A_KEY_THAT_IS_A_RESERVED_WORD_PRINTS_QUOTED_WHICH_IT_DID_NOT_BEFORE()
+    // **The printer emitted a form the parser refused.** `plain_name` asked only whether the key was
+    // name-SHAPED, so `if` printed bare -- and `{if: 2}` is not a program. It now asks the lexer what
+    // it would do with the word, which is the only answer that cannot drift from the lexer itself.
+    assert_eq(out("var o = {}\no[\"if\"] = 1\no[\"while\"] = 2\no[\"true\"] = 3\nprint(o)"),
+        "{\"if\": 1, \"while\": 2, \"true\": 3}")
+
+    // `end` is a SOFT word -- it reaches the parser as an `Ident` -- so it prints bare and reads
+    // back, which is the case that says the check is asking the lexer rather than a list of its own.
+    assert_eq(out("var o = {}\no[\"end\"] = 1\nprint(o)"), "{end: 1}")
+
+@test
+AN_OBJECT_OF_STRING_KEYS_PRINTS_AS_TEXT_slate_READS_BACK()
+    // **The claim, run rather than asserted.** Printing is not a debugging convenience if what comes
+    // out cannot be read back; this is what makes an object's printed form a value again.
+    assert_eq(reprint("{ \"a.b\": 1, \"if\": 2, \"\": 3, plain: 4 }"),
+        "{\"a.b\": 1, \"if\": 2, \"\": 3, plain: 4}")
+    assert_eq(reprint("parseJSON(\"{\\\"a.b\\\": 1, \\\"if\\\": 2}\").value"), "{\"a.b\": 1, \"if\": 2}")
+    assert_eq(reprint("{ a: [1, { \"x.y\": true }], b: null }"), "{a: [1, {\"x.y\": true}], b: null}")
+
+@test
+A_KEY_THAT_IS_NOT_A_STRING_AT_ALL_CANNOT_ROUND_TRIP_AND_IS_NOT_PRETENDED_TO()
+    // **A number key prints bare and stays bare**, because quoting it would be a lie: `{ "42": 1 }`
+    // is a different object from the one with the integer 42 as its key. `json.sysl` refuses the
+    // same case for the same reason -- rendering the key as text would make two documents one.
+    // So the round-trip claim above is about objects whose keys are strings, and this is the edge.
+    assert_eq(out("var o = {}\no[42] = 1\nprint(o)"), "{42: 1}")
+    assert_eq(fails("print({ 42: 1 })"), fails("print({ 42: 1 })"))
+    assert(fails("print({ 42: 1 })").contains("expected a field name"))
+
+@test
+A_QUOTED_KEY_WORKS_WHEREVER_A_BARE_ONE_DOES_EXCEPT_AFTER_A_DOT()
+    // `with` copies an object with fields changed, and takes the same keys a literal does.
+    assert_eq(out("print({ a: 1 } with { \"b.c\": 2 })"), "{a: 1, \"b.c\": 2}")
+
+    // A pattern takes them too, so a value with such a key can be taken apart.
+    assert_eq(out("val { \"a.b\": ab, plain } = { \"a.b\": 1, plain: 2 }\nprint(ab, plain)"), "1 2")
+
+    // **A FIELD ACCESS deliberately does NOT.** `o."a.b"` is refused; such a key is reached with
+    // `o["a.b"]`, which slate has always had. Every language with this distinction draws it here,
+    // and a dot that took a string would be a second way to write an index and nothing more.
+    assert(fails("val o = { \"a.b\": 1 }\nprint(o.\"a.b\")").contains("a field name"))
+
+@test
+A_QUOTED_KEY_IN_A_PATTERN_HAS_NO_SHORTHAND_AND_SAYS_WHAT_TO_WRITE()
+    // `{ name }` binds `name`. `{ "a.b" }` has no name in it to bind, so it is refused where it is
+    // written rather than at the point where an invented name turned out not to exist.
+    val said = fails("val { \"a.b\" } = { \"a.b\": 1 }\nprint(1)")
+
+    assert(said.contains("is not a name, so this has to say what to bind it to"))
+    assert(said.contains("\"a.b\": some_name"))
+
+@test
+A_PRINTED_STRING_IS_ESCAPED_SO_THAT_WHAT_COMES_OUT_CAN_BE_READ_BACK()
+    // **Two defects that predate quoted keys and are the same one.** A `"` inside a string was
+    // emitted raw, so `["a"b"]` came out and is not a program; a backslash was emitted raw, so a
+    // string holding `\` and `f` printed as `"e\f"` and reads back as a formfeed. Printing is not a
+    // debugging convenience if what comes out means something else when read.
+    assert_eq(out("print([\"a\\\"b\", \"c\\nd\", \"e\\\\f\", \"g\\th\"])"),
+        "[\"a\\\"b\", \"c\\nd\", \"e\\\\f\", \"g\\th\"]")
+
+    // A control byte with no short escape takes the `\xHH` form, which slate's lexer reads.
+    assert_eq(out("print([\"\\x01\"])"), "[\"\\x01\"]")
+
+    // **A string prints bare at the top level**, where there is nothing to be ambiguous with, so
+    // escaping is a quoted-position rule and not a property of the string.
+    assert_eq(out("print(\"a\\\"b\")"), "a\"b")
+
+    // Text outside ASCII is copied through as bytes rather than rebuilt as characters -- rebuilding
+    // is how accented text turns into mojibake.
+    assert_eq(out("print([\"café\"])"), "[\"café\"]")
+    assert_eq(reprint("[\"café\", \"a\\\"b\", \"c\\nd\"]"), "[\"café\", \"a\\\"b\", \"c\\nd\"]")
+
+    // The same holds of a key, which is what makes the round-trip claim hold for every string key
+    // and not only the tidy ones.
+    assert_eq(reprint("{ \"a\\nb\": 1, \"q\\\"r\": 2, \"café\": 3 }"),
+        "{\"a\\nb\": 1, \"q\\\"r\": 2, \"café\": 3}")
+
+@test
+A_KEY_WRITTEN_TWICE_IN_ONE_LITERAL_KEEPS_THE_LAST_AND_THE_TWO_SPELLINGS_ARE_ONE_KEY()
+    // **A quoted key that is a name IS the bare key**, not a second entry beside it, which is the
+    // thing that would make the superset claim false if it were otherwise.
+    assert_eq(out("print({ a: 1, \"a\": 2 })"), "{a: 2}")
+    assert_eq(out("print(len({ a: 1, \"a\": 2 }))"), "1")
+
+    // The manifest reader refuses what the literal quietly resolves, which is the difference between
+    // a program -- where last-wins is the ordinary rule for a thing written twice -- and a file a
+    // tool has to believe.
+    assert(conf_error("{ a: 1, \"a\": 2 }").contains("written twice"))
+
+// -- the command line ------------------------------------------------------------------------------
+
+@test
+A_SHELL_CAN_TELL_WHETHER_slate_SUCCEEDED()
+    // **slate used to exit 0 on every failure** -- a syntax error, a missing file, a run-time fault
+    // and a failing test alike -- so a shell, a `make` rule or a CI step could not tell a program
+    // that ran from one that did not. Nothing here is about the wording of a diagnostic; it is about
+    // the one number the rest of the world reads.
+    val dir = libuv.mkdtemp_sync("/tmp/slate-cli-XXXXXX").unwrap()
+
+    write_text(s"${dir}/ok.sl", "print(\"hi\")\n").unwrap()
+    write_text(s"${dir}/bad.sl", "print(\n").unwrap()
+    write_text(s"${dir}/faults.sl", "val xs = []\nxs[3]\n").unwrap()
+
+    // Asked for nothing at all. **A distinct status from a program that failed**: this one is the
+    // caller's own bug rather than news about a program.
+    assert_eq(cli_status(["slate"]), 2)
+    assert(cli_said(["slate"]).contains("usage: slate <program.sl>"))
+
+    assert_eq(cli_status(["slate", s"${dir}/ok.sl"]), 0)
+    assert_eq(cli_said(["slate", s"${dir}/ok.sl"]), "hi")
+
+    assert_eq(cli_status(["slate", s"${dir}/bad.sl"]), 1)
+    assert_eq(cli_status(["slate", s"${dir}/faults.sl"]), 1)
+
+    // A file that is not there is the driver's own failure, and it still has to be one.
+    assert_eq(cli_status(["slate", s"${dir}/nope.sl"]), 1)
+    assert(cli_said(["slate", s"${dir}/nope.sl"]).contains("cannot read"))
+
+    scrub(dir)
+
+@test
+A_TEST_RUN_TELLS_THE_SHELL_WHETHER_IT_PASSED()
+    val dir = libuv.mkdtemp_sync("/tmp/slate-cli-XXXXXX").unwrap()
+
+    write_text(s"${dir}/pass.sl", "@test\nholds()\n    assert(true)\n").unwrap()
+
+    assert_eq(cli_status(["slate", "test", dir]), 0)
+
+    write_text(s"${dir}/fail.sl", "@test\ndoes_not()\n    assert(false)\n").unwrap()
+
+    assert_eq(cli_status(["slate", "test", dir]), 1)
+
+    scrub(dir)
+
+    // **A file the runner could not even load counts as a failure**, and it is a separate count from
+    // a test that ran and said no -- a test step that reported success because the suite would not
+    // compile is the worst answer available to it.
+    val broken = libuv.mkdtemp_sync("/tmp/slate-cli-XXXXXX").unwrap()
+
+    write_text(s"${broken}/bad.sl", "@test\nholds(\n").unwrap()
+
+    assert_eq(cli_status(["slate", "test", broken]), 1)
+
+    scrub(broken)
+
+    // **And finding nothing to run is a failure too.** The usual cause is a path that is wrong, and
+    // a green test step that tested nothing is worse than a red one.
+    val empty = libuv.mkdtemp_sync("/tmp/slate-cli-XXXXXX").unwrap()
+
+    assert_eq(cli_status(["slate", "test", empty]), 1)
+    assert(cli_said(["slate", "test", empty]).contains("no .sl files"))
+
+    scrub(empty)
+
+// -- the manifest read as a project ----------------------------------------------------------------
+
+@test
+A_MANIFEST_IS_READ_AS_A_PROJECT_AND_NOT_ONLY_AS_DATA()
+    assert_eq(proj("{ name: \"a\", version: \"0.1.0\" }"), "a 0.1.0")
+    assert_eq(proj("{ name: \"a\", version: \"0.1.0\", main: \"go.sl\" }"), "a 0.1.0 main=go.sl")
+
+    val full = "{ name: \"a\", version: \"0.1.0\", dependencies: {\n" +
+        "    parsing: { git: \"github.com/sysl-lang/parsing\", version: \"0.4.0\" },\n" +
+        "    gc: { git: \"github.com/sysl-lang/gc\", version: \"0.2.2\" },\n" +
+        "} }"
+
+    assert_eq(proj(full),
+        "a 0.1.0 parsing@0.4.0<-github.com/sysl-lang/parsing gc@0.2.2<-github.com/sysl-lang/gc")
+
+    // **`dependencies` left out is no dependencies, not a mistake.** A project that depends on
+    // nothing is the ordinary starting state and writing an empty object to say so is ceremony.
+    assert_eq(proj("{ name: \"a\", version: \"0.1.0\", dependencies: {} }"), "a 0.1.0")
+
+@test
+A_COMPLAINT_ABOUT_A_PROJECT_POINTS_AT_A_KEY_RATHER_THAN_NAMING_ONE()
+    // **This is what the spans in `Doc` are carried for.** A schema layer over a plain `Json` could
+    // say which key was wrong and could not point at it, and a misspelt key and a value of the wrong
+    // kind are the mistakes people actually make in a config file -- so the carets matter most
+    // exactly here, at the layer that would have been cheapest to leave without them.
+    val said = proj_said("{ name: \"a\", version: \"0.1.0\", main: 3 }")
+
+    assert(said.contains("`main` is a string, and this one is a whole number"))
+    assert(said.contains("write it in quotes"))
+    assert(said.contains("package.sl:1:32"))
+
+    // The caret sits on the KEY and not on the value, which is the value that is fine.
+    assert(said.contains("| { name: \"a\", version: \"0.1.0\", main: 3 }"))
+    assert(said.contains("  |                                ^^^^ write it in quotes"))
+
+@test
+A_MISSING_KEY_NAMES_THE_OBJECT_IT_IS_MISSING_FROM()
+    // **There is nothing in the file to put a caret under for a key nobody wrote**, so the caret
+    // goes on the object that should have held it and the sentence says which kind of object that
+    // is. `every project says one` under a caret sitting on a dependency would send the reader to
+    // the wrong object entirely.
+    val missing = proj_said("{ name: \"a\" }")
+
+    assert(missing.contains("`version` is missing, and every project says one"))
+
+    // One character wide, on the brace: the object's own span is the whole object, and underlining
+    // a forty-line manifest to say something is absent from it names nothing.
+    assert(missing.contains("package.sl:1:1"))
+    assert(missing.contains("  | ^ nothing here writes `version`"))
+    assert(proj_said("{ version: \"0.1.0\" }").contains("`name` is missing, and every project says one"))
+
+    val dep = proj_said("{ name: \"a\", version: \"0.1.0\", dependencies: { p: { git: \"g\" } } }")
+
+    assert(dep.contains("`version` is missing, and every dependency says one"))
+    assert(!dep.contains("every project says one"))
+
+@test
+A_KEY_NOTHING_KNOWS_IS_A_WARNING_SO_A_MANIFEST_MAY_OUTLIVE_THE_slate_READING_IT()
+    // **The asymmetry is deliberate.** A manifest written for a later slate, or carrying a key some
+    // other tool reads, would otherwise stop working on an older one -- and a package system whose
+    // files only ever read forwards cannot be upgraded halfway. The typo is still said out loud.
+    val said = proj_said("{ name: \"a\", version: \"0.1.0\", versoin: \"0.2.0\" }")
+
+    assert(said.contains("warning: a project says nothing about `versoin`"))
+    assert(said.contains("a later slate may give it a meaning"))
+    assert(!said.contains("error:"))
+
+    // A warning alone is a file that read, so the project is still there and still answers.
+    assert_eq(proj("{ name: \"a\", version: \"0.1.0\", versoin: \"0.2.0\" }"), "a 0.1.0")
+
+    // The same rule one level down.
+    val dep = proj_said("{ name: \"a\", version: \"0.1.0\", dependencies: { p: { git: \"g\", version: \"1\", brunch: \"x\" } } }")
+
+    assert(dep.contains("the dependency `p` says nothing about `brunch`"))
+    assert(!dep.contains("error:"))
+
+@test
+A_PROJECT_THAT_IS_THE_WRONG_SHAPE_SAYS_WHAT_SHAPE_IT_IS()
+    assert(proj_said("[1, 2]").contains("a project is an object, and this is a list"))
+    assert(proj_said("42").contains("a project is an object, and this is a whole number"))
+    assert(proj_said("\"hello\"").contains("a project is an object, and this is a string"))
+
+    val deps = proj_said("{ name: \"a\", version: \"0.1.0\", dependencies: [1] }")
+
+    assert(deps.contains("`dependencies` is an object of one entry per package, and this is a list"))
+
+    val one = proj_said("{ name: \"a\", version: \"0.1.0\", dependencies: { gc: \"0.2.2\" } }")
+
+    assert(one.contains("and `gc` is a string"))
+    assert(one.contains("write `{ git: \"github.com/owner/repo\", version: \"0.1.0\" }`"))
+
+@test
+A_FILE_THAT_IS_NOT_DATA_IS_NOT_ALSO_COMPLAINED_ABOUT_AS_A_PROJECT()
+    // One mistake, one complaint. `manifest.sysl` has already said what is wrong in the words that
+    // fit it, and adding "and it is not a project either" would be the second message this repo's
+    // diagnostic rule is written against.
+    val said = proj_said("{ name: f(1) }")
+
+    assert(said.contains("a manifest is data, and this is a call"))
+    assert(!said.contains("a project is an object"))
+    assert(!said.contains("is missing"))
+
+@test
+A_PROJECT_REPORTS_EVERYTHING_WRONG_WITH_IT_AND_NOT_THE_FIRST_THING()
+    // A person editing a config file wants the whole list, having to go back to the same file for
+    // each one being the thing that makes a strict format tiresome.
+    val said = proj_said("{ versoin: \"0.1.0\", main: 3, dependencies: { p: { git: \"g\" }, q: \"1\" } }")
+
+    assert(said.contains("`name` is missing"))
+    assert(said.contains("`version` is missing, and every project says one"))
+    assert(said.contains("`main` is a string"))
+    assert(said.contains("`version` is missing, and every dependency says one"))
+    assert(said.contains("says nothing about `versoin`"))
+
+    // **Six of them, and the report prints five.** That is `Report.limit`, the organisation's own
+    // convention, and a manifest is not the place to argue with it -- what matters is that the count
+    // is said, so a reader knows to look again rather than believing the list is complete.
+    assert(said.contains("showing the first 5 of 6"))
+
+@test
+slate_deps_READS_A_PROJECT_OFF_THE_DISK_AND_SAYS_WHAT_IT_FOUND()
+    // **The fixture is a real file read by relative path**, as `tests/mods/` and `examples/` are,
+    // because the thing being tested is what a person gets by pointing slate at a directory.
+    assert_eq(cli_status(["slate", "deps", "tests/pkg"]), 0)
+    // **`-- not fetched` on both, and that is the honest state**: nothing downloads packages yet,
+    // so a coordinate that resolves is a coordinate and not a directory of code.
+    assert_eq(cli_said(["slate", "deps", "tests/pkg"]),
+        "example 0.1.0\n  main: main.sl\n" +
+        "  parsing 0.4.0 (github.com/sysl-lang/parsing) -- not fetched\n" +
+        "  gc 0.2.2 (github.com/sysl-lang/gc) -- not fetched")
+
+    // A directory with no manifest in it is a failure, and the message names the file it wanted.
+    assert_eq(cli_status(["slate", "deps", "tests/mods"]), 1)
+    assert(cli_said(["slate", "deps", "tests/mods"]).contains("tests/mods/package.sl"))
+
+@test
+slate_deps_FAILS_ON_A_MANIFEST_THAT_IS_WRONG_AND_PASSES_ONE_THAT_ONLY_WARNS()
+    val dir = libuv.mkdtemp_sync("/tmp/slate-pkg-XXXXXX").unwrap()
+
+    write_text(s"${dir}/package.sl", "{ name: \"a\" }\n").unwrap()
+
+    assert_eq(cli_status(["slate", "deps", dir]), 1)
+    assert(cli_said(["slate", "deps", dir]).contains("`version` is missing"))
+
+    // **A report of warnings alone is a successful run**, which is the rule `Report.has_errors`
+    // exists to state and the reason a forward-compatible key does not break a build.
+    write_text(s"${dir}/package.sl", "{ name: \"a\", version: \"1\", nobody_knows: 1 }\n").unwrap()
+
+    assert_eq(cli_status(["slate", "deps", dir]), 0)
+    assert(cli_said(["slate", "deps", dir]).contains("says nothing about `nobody_knows`"))
+    assert(cli_said(["slate", "deps", dir]).contains("a 1"))
+
+    scrub(dir)

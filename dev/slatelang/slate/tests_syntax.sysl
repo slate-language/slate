@@ -1,0 +1,633 @@
+module dev.slatelang.slate
+@tests
+
+import sh.sysl.parsing.*
+import sysl.text.Search
+
+// The lexer, the layout pass and the parser -- what slate's syntax IS.
+//
+// **The layout pass is what slate exists to exercise**, `sh.sysl.parsing`'s `layout.sysl` having
+// had no other consumer in the org. Blocks, dedents, brackets suspending the off-side rule and the
+// `Ragged` case are all reached from here.
+
+// -- words and operators ----------------------------------------------------------------------
+
+@test
+a_word_the_grammar_took_is_not_an_identifier()
+    assert_eq(kinds("val"), "Val Newline Eof")
+    assert_eq(kinds("var"), "Var Newline Eof")
+    assert_eq(kinds("null"), "Null Newline Eof")
+
+@test
+a_word_the_grammar_did_not_take_is_an_identifier()
+    assert_eq(kinds("value"), "Ident Newline Eof")
+    assert_eq(kinds("iffy"), "Ident Newline Eof")
+    assert_eq(kinds("_x1"), "Ident Newline Eof")
+
+@test
+end_is_a_soft_word_and_stays_an_identifier()
+    // Taking `end` as a keyword would take the name away from every program that wanted it. The
+    // parser decides what it means by what follows.
+    assert_eq(kinds("end"), "Ident Newline Eof")
+
+@test
+a_two_byte_operator_is_read_before_its_first_byte()
+    assert_eq(kinds("=="), "EqEq Newline Eof")
+    assert_eq(kinds("="), "Assign Newline Eof")
+    assert_eq(kinds("->"), "Arrow Newline Eof")
+    assert_eq(kinds("-"), "Minus Newline Eof")
+    assert_eq(kinds("<="), "LtEq Newline Eof")
+    assert_eq(kinds("<"), "Lt Newline Eof")
+    assert_eq(kinds("!="), "BangEq Newline Eof")
+    assert_eq(kinds("!"), "Bang Newline Eof")
+end a_two_byte_operator_is_read_before_its_first_byte
+
+// -- literals ---------------------------------------------------------------------------------
+
+@test
+an_integer_and_a_real_are_told_apart()
+    assert_eq(kinds("42"), "IntLit Newline Eof")
+    assert_eq(kinds("4.2"), "RealLit Newline Eof")
+    assert_eq(kinds("0x2a"), "IntLit Newline Eof")
+
+@test
+a_string_keeps_its_quotes_in_its_span()
+    val r = lex(source_of("t", "\"hi\""))
+
+    assert_eq(r.tokens.peek().unwrap().span, Span(0, 4))
+
+@test
+a_malformed_literal_is_reported_and_does_not_stop_the_line()
+    assert(!clean("\"unclosed"))
+    assert(!clean("\"\\q\""))
+
+// -- layout -----------------------------------------------------------------------------------
+
+@test
+an_indented_run_opens_and_closes_one_block()
+    assert_eq(kinds("a\n    b\n"), "Ident Indent Ident Newline Dedent Eof")
+
+@test
+two_lines_at_one_depth_are_separated_by_a_newline()
+    assert_eq(kinds("a\nb\n"), "Ident Newline Ident Newline Eof")
+
+@test
+one_line_closes_as_many_blocks_as_it_dedents_past()
+    assert_eq(kinds("a\n    b\n        c\nd\n"), "Ident Indent Ident Indent Ident Newline Dedent Dedent Ident Newline Eof")
+end one_line_closes_as_many_blocks_as_it_dedents_past
+
+@test
+everything_still_open_closes_at_the_end_of_the_file()
+    assert_eq(kinds("a\n    b\n        c\n"), "Ident Indent Ident Indent Ident Newline Dedent Dedent Eof")
+
+@test
+a_blank_line_is_not_a_line()
+    // Neither a statement separator nor a block: there is nothing on it to separate.
+    assert_eq(kinds("a\n\n\nb\n"), "Ident Newline Ident Newline Eof")
+
+@test
+a_comment_only_line_is_not_a_line_whatever_its_indentation()
+    // A person who indents a comment to line up with the code below it did not mean to open a block.
+    assert_eq(kinds("a\n        // note\nb\n"), "Ident Newline Ident Newline Eof")
+
+@test
+a_trailing_comment_ends_the_line_and_nothing_else()
+    assert_eq(kinds("a // note\nb\n"), "Ident Newline Ident Newline Eof")
+
+@test
+a_newline_inside_brackets_is_not_a_line_ending()
+    // The rule every language with both features implements the same way: count the brackets in the
+    // lexer, and ignore line structure while the count is above zero.
+    assert_eq(kinds("f(a,\n    b)\n"), "Ident LParen Ident Comma Ident RParen Newline Eof")
+end a_newline_inside_brackets_is_not_a_line_ending
+
+@test
+a_line_lining_up_with_nothing_is_reported_rather_than_quietly_closed()
+    // The one indentation mistake a person actually makes: a body pulled back to a column between
+    // two open ones. Closing the nearest level quietly would turn it into a parse error elsewhere.
+    val text = "a\n        b\n    c\n"
+
+    assert(!clean(text))
+    assert(first_fault(text).contains("lines up with no block"))
+end a_line_lining_up_with_nothing_is_reported_rather_than_quietly_closed
+
+@test
+mixing_tabs_and_spaces_on_one_line_is_reported()
+    assert(!clean("a\n \tb\n"))
+
+@test
+an_empty_file_has_no_structure_to_report()
+    assert_eq(kinds(""), "Eof")
+    assert_eq(kinds("\n\n"), "Eof")
+    assert(clean(""))
+
+// -- the parser -------------------------------------------------------------------------------
+
+@test
+precedence_comes_out_of_the_binding_powers()
+    assert_eq(good_tree("1 + 2 * 3"), "(+ 1 (* 2 3))")
+    assert_eq(good_tree("1 * 2 + 3"), "(+ (* 1 2) 3)")
+    assert_eq(good_tree("a < b && c < d"), "(&& (< a b) (< c d))")
+    assert_eq(good_tree("a || b && c"), "(|| a (&& b c))")
+end precedence_comes_out_of_the_binding_powers
+
+@test
+arithmetic_groups_to_the_left()
+    // Two numbers apart in the table is the whole of associativity: equal powers stop the inner
+    // loop, so the second operator cannot take the first one's right-hand side.
+    assert_eq(good_tree("8 - 4 - 2"), "(- (- 8 4) 2)")
+
+@test
+the_lambda_arrow_groups_to_the_right()
+    // A function returning a function, rather than a parse error.
+    assert_eq(good_tree("x -> y -> x + y"), "(fn(x) (fn(y) (+ x y)))")
+
+@test
+a_prefix_operator_binds_tighter_than_arithmetic_and_looser_than_a_field()
+    assert_eq(good_tree("-a * b"), "(* (- a) b)")
+    assert_eq(good_tree("-a.b"), "(- (. a b))")
+    assert_eq(good_tree("!ok"), "(! ok)")
+
+@test
+calls_indexing_and_fields_chain()
+    assert_eq(good_tree("f(1)(2)"), "(call (call f 1) 2)")
+    assert_eq(good_tree("o.a.b"), "(. (. o a) b)")
+    assert_eq(good_tree("xs[0][1]"), "(index (index xs 0) 1)")
+    assert_eq(good_tree("o.f(1)"), "(call (. o f) 1)")
+
+@test
+a_grouping_changes_the_shape_and_leaves_no_node()
+    assert_eq(good_tree("(1 + 2) * 3"), "(* (+ 1 2) 3)")
+
+// -- literals and containers --------------------------------------------------------------------
+
+@test
+a_literal_is_decoded_from_the_span_the_lexer_proved()
+    assert_eq(good_tree("42"), "42")
+    assert_eq(good_tree("0x2a"), "42")
+    assert_eq(good_tree("1_000"), "1000")
+    assert_eq(good_tree("true"), "true")
+    assert_eq(good_tree("null"), "null")
+
+@test
+a_string_arrives_with_its_escapes_decoded()
+    assert_eq(good_tree("\"a\\tb\""), "\"a\tb\"")
+
+@test
+an_array_and_an_object_read_as_literals()
+    assert_eq(good_tree("[1, 2, 3]"), "(array 1 2 3)")
+    assert_eq(good_tree("[]"), "(array)")
+    assert_eq(good_tree("{ a: 1, b: 2 }"), "(object a:1 b:2)")
+
+@test
+an_argument_list_may_be_broken_across_lines()
+    // Not a rule of the grammar: the bracket depth made those newlines insignificant before the
+    // parser saw anything.
+    assert_eq(good_tree("f(1,\n  2)"), "(call f 1 2)")
+
+// -- statements ---------------------------------------------------------------------------------
+
+@test
+the_two_bindings_are_told_apart()
+    assert_eq(good_tree("val x = 1"), "(val x 1)")
+    assert_eq(good_tree("var x = 1"), "(var x 1)")
+
+@test
+a_definition_is_told_from_a_call_by_what_follows_it()
+    // The one place slate's grammar looks ahead, and what taking sysl's keyword-free function form
+    // costs: the two are identical until the body.
+    assert_eq(good_tree("add(a, b)\n    a + b"), "(def add(a b) (block (+ a b)))")
+    assert_eq(good_tree("add(a, b)"), "(call add a b)")
+    assert_eq(good_tree("double(x) = x * 2"), "(def double(x) (* x 2))")
+
+@test
+a_call_whose_arguments_are_not_names_is_never_a_definition()
+    assert_eq(good_tree("f(a.b)"), "(call f (. a b))")
+    assert_eq(good_tree("f(1)"), "(call f 1)")
+
+@test
+a_function_of_no_arguments_is_still_a_definition()
+    assert_eq(good_tree("go()\n    1"), "(def go() (block 1))")
+
+@test
+a_block_is_a_run_of_statements_and_its_value_is_the_last()
+    assert_eq(good_tree("f()\n    val a = 1\n    a + 1"), "(def f() (block (val a 1) (+ a 1)))")
+
+@test
+the_loops_read()
+    assert_eq(good_tree("while a < 10\n    b"), "(while (< a 10) (block b))")
+    assert_eq(good_tree("for x in xs\n    x"), "(for x xs (block x))")
+    assert_eq(good_tree("loop\n    break"), "(loop (block (break)))")
+
+@test
+return_is_for_leaving_early_and_takes_a_value_or_not()
+    assert_eq(good_tree("f()\n    return\n"), "(def f() (block (return)))")
+    assert_eq(good_tree("f()\n    return 1\n"), "(def f() (block (return 1)))")
+
+@test
+assignment_is_a_statement_and_not_an_expression()
+    assert_eq(good_tree("x = 1"), "(= x 1)")
+    assert_eq(good_tree("o.f = 1"), "(= (. o f) 1)")
+    assert_eq(good_tree("xs[0] = 1"), "(= (index xs 0) 1)")
+
+@test
+what_cannot_be_assigned_to_is_refused_where_it_is_written()
+    val src = source_of("t", "1 + 1 = 2")
+    val r = parse(src)
+
+    assert(!r.ok())
+    assert(r.report.render(src).contains("cannot be assigned to"))
+
+// -- if ------------------------------------------------------------------------------------------
+
+@test
+if_has_an_inline_form_and_an_indented_one()
+    // **A one-line branch is a block of one statement**, which is what lets it *be* a statement --
+    // `if c then break`. The two forms therefore have the same shape, which is the point rather than
+    // an artefact: one line and an indented block differ in how they are written and in nothing else.
+    assert_eq(good_tree("if a then 1 else 2"), "(if a (block 1) (block 2))")
+    assert_eq(good_tree("if a\n    1\nelse\n    2"), "(if a (block 1) (block 2))")
+
+@test
+elif_is_sugar_and_nests_into_the_else_of_the_one_before()
+    // No node exists for it, so nothing downstream has to learn a rule about it.
+    assert_eq(good_tree("if a\n    1\nelif b\n    2\nelse\n    3"),
+        "(if a (block 1) (if b (block 2) (block 3)))")
+end elif_is_sugar_and_nests_into_the_else_of_the_one_before
+
+@test
+an_if_without_an_else_has_no_second_branch()
+    assert_eq(good_tree("if a\n    1"), "(if a (block 1))")
+
+@test
+a_statement_after_a_block_is_a_statement_and_not_a_continuation()
+    // The case that is easy to leave out: a block closing ends the statement that contained it, the
+    // newline having been spent inside the block.
+    assert_eq(good_tree("if a\n    1\nb"), "(if a (block 1)) b")
+
+// -- lambdas --------------------------------------------------------------------------------------
+
+@test
+a_lambda_takes_one_bare_parameter_or_a_parenthesised_list()
+    assert_eq(good_tree("x -> x * 2"), "(fn(x) (* x 2))")
+    assert_eq(good_tree("(a, b) -> a + b"), "(fn(a b) (+ a b))")
+    assert_eq(good_tree("() -> 1"), "(fn() 1)")
+
+@test
+a_parenthesised_expression_is_not_mistaken_for_a_parameter_list()
+    // The two are told apart by trying, because no single token distinguishes them.
+    assert_eq(good_tree("(a + b) * 2"), "(* (+ a b) 2)")
+    assert_eq(good_tree("(a)"), "a")
+
+@test
+a_lambda_may_have_an_indented_body()
+    assert_eq(good_tree("val f = x ->\n    x + 1"), "(val f (fn(x) (block (+ x 1))))")
+
+// -- recovery ---------------------------------------------------------------------------------
+
+@test
+a_parse_error_leaves_a_node_so_that_one_pass_reports_everything()
+    val src = source_of("t", "val = 1\nval y = ")
+    val r = parse(src)
+
+    assert(!r.ok())
+
+    // Both mistakes, from one run.
+    assert(r.report.len() >= 2)
+end a_parse_error_leaves_a_node_so_that_one_pass_reports_everything
+
+// -- the syntax sysl has ----------------------------------------------------------------------------
+
+@test
+a_for_loop_leaves_the_stack_where_it_found_it()
+    // **`IterInit` keeps its subject and pushes a counter beside it**, and the compiler once believed
+    // it consumed the subject -- so every `for` a program ran stranded one value on the operand stack
+    // for the rest of the enclosing chunk. Nothing was ever *wrong*, which is why no test caught it:
+    // the stack simply grew, until fifty thousand turns of a loop containing one segfaulted the
+    // process with no output at all.
+    //
+    // A `while` around it is what makes the leak accumulate; the top-level `Ret` truncates to zero, so
+    // measuring the depth after a run cannot see it.
+    assert_eq(out("var n = 0\nwhile n < 50000\n    for x in [1]\n        n = n + 1\nprint(n)"), "50000")
+
+    // The value the statement leaves is its own and not the subject it walked.
+    assert_eq(out("val v =\n    for x in [1, 2]\n        x\nprint(v)"), "null")
+
+//
+// **Everything below is measured against sysl's own grammar**, which is where it came from: slate's
+// syntax should be sysl's minus what a dynamically typed language with no pointers has no use for.
+
+@test
+a_one_line_body_is_a_statement_and_not_only_an_expression()
+    // **The gap that was worth the most.** sysl's `body(keyword)` is `suite | inlineBody` where the
+    // inline form is one statement, so `if n > 2 then break` is a line a person writes -- and a
+    // `then` taking only an expression refuses it along with `then return` and `then continue`.
+    assert_eq(out("var n = 0\nloop\n    n += 1\n    if n > 2 then break\nprint(n)"), "3")
+    assert_eq(out("f(n)\n    if n > 2 then return \"big\"\n    \"small\"\nprint(f(5), f(1))"), "big small")
+    assert_eq(out("var n = 0\nfor x in [1, 2, 3]\n    if x == 2 then continue\n    n += x\nprint(n)"), "4")
+
+    // An arm's body follows the same rule, for the same reason.
+    assert_eq(out("val v = for x in [1, 2, 3]\n    x match\n        2 -> break \"two\"\n        _ -> null\nprint(v)"), "two")
+
+@test
+do_introduces_a_one_line_loop_body()
+    assert_eq(out("var n = 0\nwhile n < 3 do n += 1\nprint(n)"), "3")
+    assert_eq(out("for x in [1, 2] do print(x)"), "1\n2")
+    assert_eq(out("var n = 0\nloop do\n    n += 1\n    if n > 1 then break\nprint(n)"), "2")
+
+@test
+an_end_marker_closes_a_block_and_end_is_still_a_name()
+    assert_eq(out("if true\n    print(\"y\")\nend if"), "y")
+    assert_eq(out("var n = 0\nwhile n < 2\n    n += 1\nend while\nprint(n)"), "2")
+    assert_eq(out("for x in [1]\n    print(x)\nend for"), "1")
+    assert_eq(out("var n = 0\nloop\n    n += 1\n    if n > 0 then break\nend loop\nprint(n)"), "1")
+    assert_eq(out("f(x)\n    x + 1\nend f\nprint(f(1))"), "2")
+
+    // **`end` is a soft word**, matched only immediately before the construct it closes -- so a
+    // program may still call something `end`, which is sysl's rule and the reason for the shape.
+    assert_eq(out("val end = 5\nprint(end)"), "5")
+
+@test
+do_while_runs_its_body_before_it_tests()
+    assert_eq(out("var n = 0\ndo n += 1 while n < 3\nprint(n)"), "3")
+    assert_eq(out("var n = 0\ndo\n    n += 1\nwhile n < 3\nprint(n)"), "3")
+
+    // The difference from a `while`: the body runs once whatever the condition says.
+    assert_eq(out("var n = 10\ndo n += 1 while n < 3\nprint(n)"), "11")
+
+    // `continue` goes to the test rather than to the top, which is why it is not desugared.
+    assert_eq(out("var n = 0\nvar seen = 0\ndo\n    n += 1\n    if n < 3 then continue\n    seen += 1\nwhile n < 5\nprint(n, seen)"), "5 3")
+
+@test
+a_compound_assignment_evaluates_its_place_once()
+    assert_eq(out("var n = 10\nn += 5\nn -= 1\nn *= 2\nn /= 7\nn %= 3\nprint(n)"), "1")
+    assert_eq(out("var n = 6\nn &= 3\nn |= 8\nn ^= 1\nn <<= 2\nn >>= 1\nprint(n)"), "22")
+    assert_eq(out("val o = { n: 1 }\no.n += 2\nprint(o.n)"), "3")
+    assert_eq(out("val xs = [1, 2]\nxs[0] += 5\nprint(xs)"), "[6, 2]")
+
+    // **The reason it is not desugared into `x = x + e`.** That rewriting evaluates the place twice,
+    // so a place with a call in it would be reached twice.
+    assert_eq(out("var calls = 0\nnext()\n    calls += 1\n    0\nval xs = [10]\nxs[next()] += 1\nprint(xs, calls)"), "[11] 1")
+
+@test
+several_places_are_written_at_once()
+    // Every value is computed before any place is written, which is what makes a swap a swap.
+    assert_eq(out("var a = 1\nvar b = 2\na, b = b, a\nprint(a, b)"), "2 1")
+    assert_eq(out("val o = { x: 1, y: 2 }\no.x, o.y = o.y, o.x\nprint(o)"), "{x: 2, y: 1}")
+    assert_eq(out("var a = 1\nvar b = 2\na, b += 10, 20\nprint(a, b)"), "11 22")
+
+    assert(fails("var a = 1\nvar b = 2\na, b = 1").contains("writes 2 places and was given 1"))
+
+@test
+a_comma_after_an_expression_does_not_commit_to_an_assignment()
+    // **It is read speculatively and commits only on the `=`.** A `match` written as a non-final
+    // argument leaves a comma behind too, and a rule that committed here would answer that with a
+    // sentence about assignment -- replacing the one diagnostic that says what is actually wrong.
+    assert(fails("f(x match\n    1 -> 2, 9)").contains("has to be the last argument"))
+
+@test
+a_name_a_field_or_an_element_may_be_stepped()
+    assert_eq(out("var n = 1\nprint(n++, n)"), "1 2")
+    assert_eq(out("var n = 1\nprint(++n, n)"), "2 2")
+    assert_eq(out("var n = 1\nprint(n--, n)"), "1 0")
+    assert_eq(out("val o = { n: 5 }\nprint(o.n++, o.n)"), "5 6")
+    assert_eq(out("val xs = [5]\nprint(--xs[0], xs)"), "4 [4]")
+
+@test
+the_bitwise_operators_bind_the_way_sysl_says()
+    assert_eq(out("print(6 & 3, 6 | 3, 6 ^ 3, ~0)"), "2 7 5 -1")
+    assert_eq(out("print(1 << 4, 32 >> 2)"), "16 8")
+
+    // **A shift binds like a multiplication**, which is sysl's deliberate correction to C -- where
+    // `1 << 2 + 3` groups in the way nobody predicts.
+    assert_eq(out("print(1 << 2 + 3)"), "7")
+
+    assert(fails("print(1.5 & 2)").contains("works on whole numbers"))
+    assert(fails("print(1 << 99)").contains("a shift is by 0 to 63 places"))
+
+@test
+a_run_of_comparisons_is_one_comparison()
+    assert_eq(out("print(1 < 2 < 3, 1 < 3 < 2, 3 == 3 < 5)"), "true false true")
+
+    // **The middle operand is evaluated once**, which is the whole difference from writing the
+    // conjunction out by hand.
+    assert_eq(out("var calls = 0\nmid()\n    calls += 1\n    2\nprint(1 < mid() < 3, calls)"), "true 1")
+
+@test
+is_asks_a_pattern_where_a_condition_is_wanted()
+    assert_eq(out("val v = [1, 2]\nprint(if v is array then \"arr\" else \"no\")"), "arr")
+    assert_eq(out("print(3 is not string)"), "true")
+    assert_eq(out("print(2 is 1 | 2 | 3, 9 is 1 | 2)"), "true false")
+    assert_eq(out("print({ name: \"ada\" } is { name })"), "true")
+
+    // **It sits between `&&` and the comparisons**, so this is two terms rather than an `is` against
+    // a conjunction.
+    assert_eq(out("val v = 5\nprint(v is number && v > 1)"), "true")
+
+@test
+a_range_is_a_value_and_a_for_walks_one()
+    assert_eq(out("for i in 0..<3\n    print(i)"), "0\n1\n2")
+    assert_eq(out("for i in 1..3 do print(i)"), "1\n2\n3")
+    assert_eq(out("val r = 1..<4\nprint(r, len(r))"), "1..<4 3")
+
+    // `1..3` and `1..<4` cover the same numbers, so they are equal -- and therefore hash alike, which
+    // is what lets one find the other in a table.
+    assert_eq(out("print(1..3 == 1..<4)"), "true")
+    assert_eq(out("val o = {}\no[1..3] = \"a\"\nprint(o[1..<4])"), "a")
+
+@test
+an_end_left_out_of_a_range_is_taken_from_what_it_is_used_on()
+    assert_eq(out("val xs = [1, 2, 3, 4, 5]\nprint(xs[1..<3], xs[2..], xs[..2], xs[..])"), "[2, 3] [3, 4, 5] [1, 2, 3] [1, 2, 3, 4, 5]")
+    assert_eq(out("print(\"hello\"[1..<3])"), "el")
+
+    // **A `for` refuses one**, since a walk with an end taken from nothing would never finish.
+    assert(fails("for i in 1..\n    print(i)").contains("both ends"))
+    assert(fails("print(len(1..))").contains("no length until it is used"))
+    assert(fails("val xs = [1]\nprint(xs[0..<9])").contains("outside something 1 long"))
+
+@test
+an_inclusive_range_written_rusts_way_is_refused_by_name()
+    // What the ordinary grammar would answer is a sentence about the open-ended range that parsed --
+    // true about something else, and never mentioning the `=` that caused it.
+    val said = fails("for i in 1..=3\n    print(i)")
+
+    assert(said.contains("`..=` is not a range"))
+    assert(said.contains("`a..<b`"))
+
+@test
+a_loop_is_an_expression_and_a_break_gives_it_its_value()
+    assert_eq(out("val found = for x in [1, 5, 9] do if x > 3 then break x\nprint(found)"), "5")
+    assert_eq(out("val v = for x in [1, 2] do x\nprint(v)"), "null")
+    assert_eq(out("var n = 0\nval v = loop\n    n += 1\n    if n > 2 then break n * 10\nprint(v)"), "30")
+    assert_eq(out("var n = 0\nval v = while true\n    n += 1\n    if n > 3 then break n\nprint(v)"), "4")
+
+    // **The value is compiled before anything is unwound**, because the scopes about to close are the
+    // ones holding the names it may use.
+    assert_eq(out("val v = for x in [1, 2, 3]\n    if x == 2\n        val extra = x * 100\n        break extra\nprint(v)"), "200")
+
+@test
+a_loops_else_runs_when_it_finished_on_its_own()
+    assert_eq(out("for x in [1, 2]\n    print(x)\nelse\n    print(\"all\")"), "1\n2\nall")
+    assert_eq(out("for x in [1, 2, 3]\n    if x == 2 then break\nelse\n    print(\"never\")\nprint(\"after\")"), "after")
+    assert_eq(out("var n = 0\nwhile n < 2 do n += 1\nelse\n    print(\"done\")\nprint(n)"), "done\n2")
+
+@test
+the_value_of_a_loops_else_is_the_loops_value()
+    // **Checked against sysl rather than assumed.** The same two loops written in sysl answer `3` and
+    // `-1`, so an `else` supplies a value rather than running for effect -- which is what makes the
+    // search idiom read: `break` gives the answer that was found and `else` the one for none.
+    val find = "find(xs, w)\n    for i in 0..<len(xs) do\n        if xs[i] == w then break i\n    else\n        -1\n"
+
+    assert_eq(out(find + "print(find([1, 2, 3], 2), find([1], 9))"), "1 -1")
+    assert_eq(out("var n = 0\nval v = while n < 2 do n += 1\nelse\n    \"done\"\nprint(v)"), "done")
+    assert_eq(out("var n = 0\nval v = do n += 1 while n < 2\nelse\n    \"ended\"\nprint(v, n)"), "ended 2")
+
+    // A loop with no `else` answers null, and one that broke answers what the `break` carried.
+    assert_eq(out("print(for x in [1] do x)"), "null")
+    assert_eq(out("val v = for x in [1, 2]\n    break \"broke\"\nelse\n    \"finished\"\nprint(v)"), "broke")
+
+@test
+a_label_says_which_loop_a_break_leaves()
+    val prog = "var hits = 0\nval r = 'outer for x in [1, 2, 3]\n    for y in [1, 2, 3]\n        hits += 1\n        if x * y > 3 then break 'outer x * y\nprint(r, hits)"
+
+    assert_eq(out(prog), "4 5")
+
+    // A `continue` may name one too, and takes the next turn of *that* loop.
+    assert_eq(out("var n = 0\n'outer for x in [1, 2]\n    for y in [1, 2]\n        if y == 1 then continue 'outer\n        n += 100\n    n += 1\nprint(n)"), "0")
+
+    assert(fails("for x in [1]\n    break 'nope").contains("no enclosing loop is called `'nope`"))
+    assert(fails("'here print(1)").contains("a loop for this label to name"))
+
+@test
+an_array_may_be_written_as_copies_of_one_value()
+    assert_eq(out("print([0; 4], [1; 0])"), "[0, 0, 0, 0] []")
+    assert(fails("print([0; -1])").contains("is not something to make"))
+    assert(fails("print([0; \"x\"])").contains("a repeat count is a whole number"))
+
+@test
+with_answers_a_copy_rather_than_changing_what_it_was_given()
+    assert_eq(out("val base = { a: 1, b: 2 }\nval next = base with { b: 20, c: 3 }\nprint(base, next)"),
+              "{a: 1, b: 2} {a: 1, b: 20, c: 3}")
+
+    // **A tail rather than a binary operator**, so it binds as tightly as a field selection does.
+    assert_eq(out("val o = { n: 1 }\nprint(o with { n: 9 })"), "{n: 9}")
+    assert(fails("print(5 with { a: 1 })").contains("`with` copies an object"))
+
+@test
+a_trailing_comma_is_allowed_in_every_list()
+    assert_eq(out("f(a, b,) = a + b\nprint([1, 2,], { x: 1, }, f(1, 2,))"), "[1, 2] {x: 1} 3")
+    assert_eq(out("val g = (a, b,) -> a + b\nprint(g(1, 2))"), "3")
+    assert_eq(out("[1, 2,] match\n    [a, b,] -> print(a + b)"), "3")
+
+@test
+a_string_may_carry_the_values_written_into_it()
+    assert_eq(out("val n = 5\nprint(s\"n is ${n}\")"), "n is 5")
+    assert_eq(out("val a = 1\nval b = 2\nprint(s\"${a} and ${b} make ${a + b}\")"), "1 and 2 make 3")
+    assert_eq(out("print(s\"plain\", s\"\")"), "plain ")
+
+    // A hole renders as `print` would, so a container shows its contents.
+    assert_eq(out("print(s\"${[1, 2]} ${null}\")"), "[1, 2] null")
+
+    // **`s` is only a prefix where a quote follows**, so it stays an ordinary name.
+    assert_eq(out("val s = 5\nprint(s)"), "5")
+
+    // A doubled sigil is a literal one, which is the only way to write a `${` where a hole would
+    // otherwise open. `sh.sysl.parsing` owns that rule, which is why it is Scala's spelling.
+    assert_eq(out("print(s\"a $${x} b\")"), "a ${x} b")
+
+    assert(fails("print(s\"unclosed ${x\")").contains("without closing"))
+
+@test
+a_hole_may_hold_anything_an_expression_may()
+    assert_eq(out("print(s\"got ${ \"a}b\" } end\")"), "got a}b end")
+    assert_eq(out("print(s\"o = ${ { a: 1 } }\")"), "o = {a: 1}")
+    assert_eq(out("val n = 2\nprint(s\"outer ${ s\"inner ${n}\" }\")"), "outer inner 2")
+    assert_eq(out("print(s\"${ if true then \"yes\" else \"no\" }\")"), "yes")
+
+@test
+a_complaint_inside_a_hole_points_at_the_hole()
+    // **The reason a hole is parsed against a source padded out to its own offset.** Lexing its text
+    // on its own would give spans measured from the hole, so every diagnostic in an interpolation
+    // would name a column nobody could find.
+    val said = fails("val a = 1\nprint(s\"x ${nope} y\")")
+
+    assert(said.contains("`nope` is not defined"))
+    assert(said.contains("2 | print(s\"x ${nope} y\")"))
+
+@test
+a_hole_with_nothing_in_it_complains_about_itself()
+    // **It used to complain about the end of the file.** The sub-source a hole is parsed against is
+    // the whole input with everything outside the hole blanked, so an empty hole lexes to one `Eof`
+    // at the end of the *file* -- and the complaint pointed there, which for a string on line one
+    // was `found the end of the file` at line three, under a blank line. True, and nowhere useful.
+    val spaced = fails("val greeting = s\"hello ${ }\"")
+
+    assert(spaced.contains("this interpolation has nothing in it"))
+    assert(spaced.contains("1 | val greeting = s\"hello ${ }\""))
+    assert(!spaced.contains("the end of the file"))
+
+    // And with no space in it at all, which lexes to a different token stream.
+    assert(fails("print(s\"a${}b\")").contains("this interpolation has nothing in it"))
+
+// -- a block as a lambda's body, where the lambda is written ---------------------------------------
+
+@test
+an_arrow_at_the_end_of_a_line_opens_a_block_inside_brackets()
+    // **A newline inside a bracket pair means nothing**, which is what makes `f(a,\n b)` work and is
+    // also what stopped a callback from being written where it is passed. `->` is nominated to the
+    // layout the way `match` is, so the line after it counts and the block opens.
+    val prog = "each(items, f)\n    for x in items\n        f(x)\neach([1, 2, 3], x ->\n    val doubled = x * 2\n    print(x, doubled))"
+
+    assert_eq(out(prog), "1 2\n2 4\n3 6")
+
+    // Nested, which is the shape a server's connection handler has.
+    val nested = "each(items, f)\n    for x in items\n        f(x)\neach([1, 2], a ->\n    each([10, 20], b ->\n        print(a, b)))"
+
+    assert_eq(out(nested), "1 10\n1 20\n2 10\n2 20")
+
+@test
+a_one_line_lambda_is_unchanged()
+    assert_eq(out("apply(f, v) = f(v)\nprint(apply(x -> x * 3, 2))"), "6")
+    assert_eq(out("val f = x -> x + 1\nprint(f(1))"), "2")
+
+@test
+an_arrow_written_mid_line_does_not_open_a_block_on_a_later_one()
+    // **The reason `->` is nominated only at the end of a line.** `opens_block` means "the next
+    // newline counts", and the flag survives until a newline is actually met -- so an arrow written
+    // mid-line would hand it to whatever line came next, opening a block at that line's column which
+    // the closing bracket would then have to close.
+    val prog = "apply(f, v) = f(v)\nprint(apply(x -> x, 1),\n      apply(x -> x + 1, 1))"
+
+    assert_eq(out(prog), "1 2")
+
+    // The same for `match`, which is nominated on the same condition.
+    assert_eq(out("print(1,\n      2)"), "1 2")
+
+@test
+an_arrow_still_ends_the_line_when_a_comment_follows_it()
+    val prog = "each(items, f)\n    for x in items\n        f(x)\neach([1], x -> // what to do with each\n    print(x))"
+
+    assert_eq(out(prog), "1")
+
+@test
+a_block_lambda_has_to_be_the_last_argument()
+    // **Inherent rather than a gap in the layout**: the block runs to the end of its last line, and
+    // in `setTimeout(() ->\n    ...\n    print(x), 1)` that line ends `, 1)`. A bracket closes the
+    // blocks opened inside it, but the `,` arrives first and there is nothing sensible for it to
+    // mean. Every callback slate itself takes -- `listen`, `onData`, `onBytes`, `each` -- takes the
+    // function last, so this is only reachable with node's `setTimeout(fn, ms)` order.
+    val said = fails("setTimeout(() ->\n    print(\"a\")\n    print(\"b\"), 1)")
+
+    assert(said.contains("this is where the statement should have ended"))
+
+    // Written on one line it is fine, which is the answer for that argument order.
+    assert_eq(out("setTimeout(() -> print(\"late\"), 1)\nprint(\"first\")"), "first\nlate")
+
+@test
+a_match_arms_arrow_does_not_open_a_block_of_its_own()
+    // `match` opens the block the arms live in, and each arm's `->` is followed by its body on the
+    // same line -- so the end-of-line condition keeps the arrow from opening a second one.
+    assert_eq(out("print(2 match\n    1 -> \"one\"\n    2 -> \"two\"\n    _ -> \"many\")"), "two")
+
+    // An arm whose body IS a block still works, which is that arrow legitimately ending its line.
+    assert_eq(out("2 match\n    2 ->\n        val a = 1\n        print(a + 1)\n    _ -> print(\"no\")"), "2")

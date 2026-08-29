@@ -1,0 +1,642 @@
+module dev.slatelang.slate
+@tests
+
+import sh.sysl.libuv
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{entries, is_dir, read_bytes, write_text}
+import sysl.text.{Search, from_utf8_unchecked}
+
+// Resolving, hashing, unpacking and fetching a package.
+//
+// **The fixtures are made by `git archive`, which is what GitHub serves.** An archive written to
+// this repo's own idea of the format would prove nothing.
+
+// -- packages ---------------------------------------------------------------------------------------
+
+@test
+A_PACKAGE_IS_AN_UNQUOTED_NAME_AND_A_FILE_IS_A_QUOTED_PATH()
+    // **The two are different syntax rather than two readings of one string.** That is further from
+    // node's rule than a `./` prefix would have been, and it is the point: nothing already written
+    // changes meaning, and no reader has to work out whether a leading `./` was optional.
+    assert_eq(kinds("import { a } from pkg"), "Import LBrace Ident RBrace Ident Ident Newline Eof")
+
+    // A quoted name with no `./` is still a file, and still refused -- but the message now offers
+    // both ways out, because which was meant is exactly what is unclear.
+    val said = ran_fault("tests/mods/bare.sl")
+
+    assert(said.contains("has to be written `\"./util.sl\"`"))
+    assert(said.contains("an unquoted `util.sl` is how a package is named"))
+
+@test
+A_PACKAGE_IMPORT_RESOLVES_THROUGH_THE_PROJECTS_OWN_MANIFEST()
+    // `tests/proj/` is a project; `tests/cache/` is a package cache. Neither existed until packages
+    // did, and between them they are the whole of what a fetch will eventually fill in.
+    assert_eq(with_packages("tests/proj/app.sl"), "hello world (greet 2)\nHELLO WORLD (GREET 2)")
+
+@test
+THE_PROJECT_IS_FOUND_BY_WALKING_UP_FROM_THE_FILE()
+    // A program works wherever it sits in its tree and wherever it is run from, which is the rule
+    // every tool with a project file uses. `deep.sl` is two directories below the `package.sl`.
+    assert_eq(with_packages("tests/proj/one/two/deep.sl"), "hello world (greet 2)")
+
+@test
+A_FILE_UNDER_NO_PROJECT_DEPENDS_ON_NOTHING_AND_THE_MESSAGE_SAYS_SO()
+    // **Not an error in itself** -- a single file that imports nothing is a perfectly good slate
+    // program, and nearly every test in this suite is one. It is an error only when such a file
+    // names a package, and then the useful thing to say is why there is nothing to look in.
+    val dir = libuv.mkdtemp_sync("/tmp/slate-lone-XXXXXX").unwrap()
+
+    write_text(s"${dir}/lone.sl", "import { x } from parsing\n").unwrap()
+    set_package_cache("tests/cache")
+
+    val said = ran_fault(s"${dir}/lone.sl")
+
+    set_package_cache("")
+    scrub(dir)
+
+    assert(said.contains("nothing this project depends on is called `parsing`"))
+    assert(said.contains("there is no `package.sl` above this file"))
+
+@test
+A_PACKAGE_NOBODY_DECLARED_IS_NAMED_ALONGSIDE_THE_ONES_THAT_WERE()
+    // The mistyped-name case, and the one thing a reader wants next: what there was to choose from.
+    val said = scratch_project(
+        "{ name: \"p\", version: \"1\", dependencies: { greet: { git: \"github.com/example/greet\", version: \"1.0.0\" } } }\n",
+        "import { hello } from greeet\n")
+
+    assert(said.contains("nothing this project depends on is called `greeet`"))
+    assert(said.contains("It depends on `greet`"))
+
+@test
+A_PROJECT_THAT_DECLARES_NOTHING_SAYS_THAT_RATHER_THAN_LISTING_NOTHING()
+    val said = scratch_project("{ name: \"p\", version: \"1\" }\n", "import { hello } from greet\n")
+
+    assert(said.contains("declares no dependencies"))
+
+@test
+A_PACKAGE_THAT_IS_NOT_IN_THE_CACHE_SAYS_SO_RATHER_THAN_LOOKING_UNKNOWN()
+    // **Two different failures that would otherwise read alike.** A name nothing declared is a typo
+    // in the manifest; a declared name with no directory behind it is a fetch that has not happened
+    // -- so the message says which of the two it is, and names the command that fixes the second.
+    val said = scratch_project(
+        "{ name: \"p\", version: \"1\", dependencies: { ghost: { git: \"github.com/example/ghost\", version: \"9.9.9\" } } }\n",
+        "import { x } from ghost\n")
+
+    assert(said.contains("`ghost` 9.9.9 is not in tests/cache/github.com/example/ghost/@v9.9.9"))
+    assert(said.contains("run `slate fetch`"))
+
+@test
+TWO_VERSIONS_OF_ONE_PACKAGE_TAKE_THE_NEWER_AND_SAY_SO()
+    // **The one case exact pinning does not settle.** `tests/proj` asks for greet 1.0.0 and `loud`
+    // asks for 2.0.0, and what the program actually gets is 2 -- which the run above proves by
+    // printing it, so this is not a claim about the resolver made only by the resolver.
+    val said = deps_said("tests/proj")
+
+    assert(said.contains("greet 2.0.0 (github.com/example/greet)"))
+    assert(said.contains("`greet` is wanted at 1.0.0 and at 2.0.0 -- using 2.0.0, which is the newer"))
+
+    // **The warning says what it costs, not only what it did.** The action is to bump the older
+    // dependency; a warning a reader cannot act on is worse than none.
+    assert(said.contains("has not been tried against it"))
+
+    // A conflict is not a failure -- that was the choice made over a hard error.
+    assert_eq(deps_status("tests/proj"), 0)
+
+@test
+A_PACKAGE_WITH_NO_main_HAS_NOTHING_TO_IMPORT_AND_SAYS_WHICH_FILE_TO_FIX()
+    // `main` is optional for a project, since an application may simply be run by naming its file.
+    // **It is not optional for something being imported**, there being nothing else that says which
+    // of a package's files is the package -- and the complaint names the manifest to add it to.
+    val said = scratch_project(
+        "{ name: \"p\", version: \"1\", dependencies: { quiet: { git: \"github.com/example/quiet\", version: \"1.0.0\" } } }\n",
+        "import { x } from quiet\n")
+
+    assert(said.contains("`quiet` does not say `main` in its `package.sl`"))
+    assert(said.contains("nothing to import from it"))
+
+@test
+A_PACKAGE_MAY_BE_IMPORTED_WHOLE_AS_WELL_AS_BY_NAME()
+    // `import * as g from greet` -- the same resolution, through the other half of the syntax, which
+    // is the half a change like this is most likely to leave behind.
+    assert_eq(with_packages("tests/proj/whole.sl"), "hello world (greet 2)")
+
+@test
+A_VERSION_IS_COMPARED_AS_NUMBERS_AND_NOT_AS_TEXT()
+    // `0.10.0` is later than `0.9.0`, which comparing the text gets backwards -- and getting it
+    // backwards would silently hand a program the older of two packages.
+    assert(newer_version("0.10.0", "0.9.0"))
+    assert(!newer_version("0.9.0", "0.10.0"))
+
+    assert(newer_version("1.0.0", "0.99.99"))
+    assert(newer_version("1.2.3", "1.2.2"))
+    assert(!newer_version("1.2.3", "1.2.3"))
+
+    // A missing part counts as zero, so `1.2` and `1.2.0` are the same version.
+    assert(!newer_version("1.2", "1.2.0"))
+    assert(!newer_version("1.2.0", "1.2"))
+    assert(newer_version("1.2.1", "1.2"))
+
+    // **A part that is not a number is compared as TEXT, which is not semver's rule** -- semver
+    // sorts `1.0.0-rc1` before `1.0.0` and this sorts it after. Nothing writes a prerelease today
+    // and versions are exact, so all this decides is which of two exact versions a conflict keeps.
+    // It is the first thing to replace if ranges ever arrive.
+    assert(newer_version("1.0.0-rc1", "1.0.0"))
+
+@test
+slate_deps_SHOWS_THE_RESOLVED_GRAPH_AND_NOT_THE_MANIFESTS_OWN_LIST()
+    // What a program gets includes everything its dependencies drag in, so printing the manifest
+    // back would be printing the question rather than the answer. `loud` was never written in
+    // `tests/proj/package.sl`'s own dependencies at the version shown -- it brought `greet 2` with it.
+    val said = deps_said("tests/proj")
+
+    assert(said.contains("app 0.1.0"))
+    assert(said.contains("loud 1.0.0 (github.com/example/loud)"))
+    assert(!said.contains("greet 1.0.0"))
+
+// -- slate.sum ---------------------------------------------------------------------------------------
+
+@test
+A_TREE_HASH_IS_THE_SAME_ANSWER_TWICE_AND_A_DIFFERENT_ONE_FOR_DIFFERENT_CONTENTS()
+    val a = hash_of(["one.sl", "two.sl"], ["export x = 1\n", "export y = 2\n"])
+    val again = hash_of(["one.sl", "two.sl"], ["export x = 1\n", "export y = 2\n"])
+
+    assert_eq(a, again)
+
+    // **The order the file system hands entries back is not the order they are hashed in**, or two
+    // machines would disagree about identical trees. Written the other way round, same answer.
+    assert_eq(hash_of(["two.sl", "one.sl"], ["export y = 2\n", "export x = 1\n"]), a)
+
+    assert(hash_of(["one.sl", "two.sl"], ["export x = 1\n", "export y = 3\n"]) != a,
+        "changing a file did not change the hash")
+
+    assert(a.contains("sha256:"))
+
+@test
+A_TREE_HASH_COVERS_THE_PATHS_AND_NOT_ONLY_THE_BYTES()
+    // **Renaming a file has to change the answer.** A hash over contents alone would say a package
+    // whose entry point had been moved was the package it used to be.
+    val a = hash_of(["one.sl"], ["export x = 1\n"])
+    val b = hash_of(["other.sl"], ["export x = 1\n"])
+
+    assert(a != b, "renaming a file did not change the hash")
+
+@test
+A_TREE_HASH_FRAMES_EVERY_PIECE_SO_TWO_TREES_CANNOT_BE_MADE_TO_AGREE()
+    // **The attack a naive concatenation allows.** `{"ab", "c"}` and `{"a", "bc"}` are the same
+    // stream of bytes, so a hash that ran them together would call two different trees identical --
+    // which is exactly the claim a sum file must never get wrong. The length and the NUL are what
+    // stop it.
+    val a = hash_of(["f", "g"], ["ab", "c"])
+    val b = hash_of(["f", "g"], ["a", "bc"])
+
+    assert(a != b, "two different trees hashed the same, so the framing is not doing its job")
+
+@test
+A_DIRECTORY_THAT_IS_NOT_THERE_HAS_NO_HASH_RATHER_THAN_AN_EMPTY_ONE()
+    // Nothing fetches yet, so an absent package is the ordinary state -- and answering the hash of
+    // nothing would make an unfetched package look like one whose contents were empty.
+    assert(tree_hash("/tmp/there-is-no-such-directory-here").is_none())
+
+@test
+A_SUM_FILE_IS_READ_LINE_BY_LINE_AND_A_LINE_IT_CANNOT_READ_IS_SKIPPED()
+    val dir = libuv.mkdtemp_sync("/tmp/slate-sum-XXXXXX").unwrap()
+
+    write_text(s"${dir}/slate.sum",
+        "github.com/example/greet v1.0.0 sha256:aaaa\n" +
+        "\n" +
+        "this line is not three fields\n" +
+        "github.com/example/loud v2.3.4 sha256:bbbb\n").unwrap()
+
+    val sums = read_sums(dir)
+
+    assert_eq(sums.entries.len(), 2)
+
+    // **The `v` belongs to the tag and not to the version**, which is the same distinction the
+    // cache directory draws with its `@v`.
+    assert_eq(sums.at("github.com/example/greet", "1.0.0").unwrap().hash, "sha256:aaaa")
+    assert_eq(sums.at("github.com/example/loud", "2.3.4").unwrap().hash, "sha256:bbbb")
+
+    assert(sums.at("github.com/example/greet", "9.9.9").is_none())
+
+    // **A line it cannot read is skipped rather than refused**, so a later slate adding a column
+    // does not break an older one reading the same file.
+    assert_eq(read_sums("/tmp/there-is-no-such-directory-here").entries.len(), 0)
+
+    scrub(dir)
+
+@test
+A_SUM_FILE_IS_WRITTEN_SORTED_SO_TWO_MACHINES_PRODUCE_THE_SAME_FILE()
+    var es: Buf[SumEntry] = buf()
+
+    es.push(SumEntry("github.com/example/loud", "1.0.0", "sha256:bbbb"))
+    es.push(SumEntry("github.com/example/greet", "2.0.0", "sha256:cccc"))
+    es.push(SumEntry("github.com/example/greet", "1.0.0", "sha256:aaaa"))
+
+    assert_eq(render_sums(Sums(es)),
+        "github.com/example/greet v1.0.0 sha256:aaaa\n" +
+        "github.com/example/greet v2.0.0 sha256:cccc\n" +
+        "github.com/example/loud v1.0.0 sha256:bbbb\n")
+
+@test
+A_PACKAGE_IS_CHECKED_AGAINST_WHAT_WAS_RECORDED_AND_ONLY_A_CHANGE_IS_A_FAILURE()
+    val dir = tree_of(["a.sl"], ["export x = 1\n"])
+    val hash = tree_hash(dir).unwrap()
+    val pkg = Package("thing", "1.0.0", "github.com/example/thing", dir)
+
+    var recorded: Buf[SumEntry] = buf()
+
+    recorded.push(SumEntry("github.com/example/thing", "1.0.0", hash))
+
+    check_package(Sums(recorded), pkg) match
+        Same -> ()
+        other -> assert(false, "a package matching its record did not check out")
+
+    // **Not in the file is not a failure**: it is what every package looks like before anything has
+    // recorded it, and the hash comes back so a caller can offer to.
+    var empty: Buf[SumEntry] = buf()
+
+    check_package(Sums(empty), pkg) match
+        Unrecorded(h) -> assert_eq(h, hash)
+        other -> assert(false, "an unrecorded package was not reported as unrecorded")
+
+    // **A change IS the failure this file exists for.**
+    var wrong: Buf[SumEntry] = buf()
+
+    wrong.push(SumEntry("github.com/example/thing", "1.0.0", "sha256:something-else"))
+
+    check_package(Sums(wrong), pkg) match
+        Changed(was, now) ->
+            assert_eq(was, "sha256:something-else")
+            assert_eq(now, hash)
+        other -> assert(false, "a package that had changed was not reported as changed")
+
+    scrub(dir)
+
+    // Nothing in the cache to hash. Not a failure either -- nothing fetches yet.
+    check_package(Sums(empty), pkg) match
+        Absent -> ()
+        other -> assert(false, "a package that is not there was not reported as absent")
+
+@test
+slate_deps_SAYS_NOTHING_WHEN_EVERY_PACKAGE_MATCHES_ITS_RECORD()
+    // `tests/proj/slate.sum` holds the fixture cache's real hashes, so a clean check is silent.
+    val said = deps_said("tests/proj")
+
+    assert(!said.contains("slate.sum"))
+    assert_eq(deps_status("tests/proj"), 0)
+
+    // **The file keeps `greet` at 1.0.0, which nothing depends on any more.** That is the
+    // append-only property, and it is the whole reason a sum file catches a version that changed
+    // under you after you have moved off it -- a lockfile holds only the current answer and has
+    // nothing to compare against.
+    val sums = read_sums("tests/proj")
+
+    assert(sums.at("github.com/example/greet", "1.0.0").is_some())
+    assert(sums.at("github.com/example/greet", "2.0.0").is_some())
+
+@test
+A_PACKAGE_WHOSE_CONTENTS_CHANGED_FAILS_THE_COMMAND_AND_NAMES_BOTH_HASHES()
+    // **The one thing in the whole package system that fails a command.** Built in a scratch tree
+    // rather than by editing the checked-in fixture, so a failure here cannot leave the repo dirty.
+    val cache = libuv.mkdtemp_sync("/tmp/slate-cache-XXXXXX").unwrap()
+    val home = s"${cache}/github.com/example/thing/@v1.0.0"
+
+    libuv.mkdir_sync(s"${cache}/github.com", 493).unwrap()
+    libuv.mkdir_sync(s"${cache}/github.com/example", 493).unwrap()
+    libuv.mkdir_sync(s"${cache}/github.com/example/thing", 493).unwrap()
+    libuv.mkdir_sync(home, 493).unwrap()
+
+    write_text(s"${home}/package.sl", "{ name: \"thing\", version: \"1.0.0\", main: \"t.sl\" }\n").unwrap()
+    write_text(s"${home}/t.sl", "export x = 1\n").unwrap()
+
+    val proj = libuv.mkdtemp_sync("/tmp/slate-proj-XXXXXX").unwrap()
+
+    write_text(s"${proj}/package.sl",
+        "{ name: \"p\", version: \"1\", dependencies: { thing: { git: \"github.com/example/thing\", version: \"1.0.0\" } } }\n").unwrap()
+
+    set_package_cache(cache)
+
+    // Record what is there now.
+    write_text(s"${proj}/slate.sum", s"github.com/example/thing v1.0.0 ${tree_hash(home).unwrap()}\n").unwrap()
+
+    assert_eq(cli_status(["slate", "deps", proj]), 0)
+
+    // Then change it under the record.
+    write_text(s"${home}/t.sl", "export x = 2\n").unwrap()
+
+    val said = cli_said(["slate", "deps", proj])
+
+    assert_eq(cli_status(["slate", "deps", proj]), 1)
+    assert(said.contains("DOES NOT MATCH slate.sum"))
+    assert(said.contains("it was recorded as"))
+    assert(said.contains("and is now"))
+
+    // **The message says both readings of what happened**, because a reader cannot tell them apart
+    // and the two want opposite responses.
+    assert(said.contains("changed after it was first fetched"))
+    assert(said.contains("the copy in the cache has been edited"))
+
+    set_package_cache("")
+    scrub(proj)
+    scrub(cache)
+
+// -- tar -------------------------------------------------------------------------------------------
+
+@test
+A_REAL_git_archive_TARBALL_READS_TO_WHAT_IS_IN_IT()
+    val entries = read_tar(tar_bytes("greet-1.0.0.tar")).unwrap()
+
+    // Two directories and three files. **The `pax_global_header` git writes first is consumed rather
+    // than reported**, being a property of the archive and not a thing in it.
+    assert_eq(entries.len(), 5)
+
+    assert_eq(entries.at(0).path, "greet-1.0.0/")
+    assert(entries.at(0).is_dir)
+
+    assert_eq(entries.at(1).path, "greet-1.0.0/greet.sl")
+    assert(!entries.at(1).is_dir)
+    assert_eq(from_utf8_unchecked(entries.at(1).body), "export hello(name) = \"hello \" + name\n")
+
+    assert_eq(entries.at(3).path, "greet-1.0.0/lib/helper.sl")
+    assert_eq(from_utf8_unchecked(entries.at(3).body), "export helper() = 42\n")
+
+@test
+EXTRACTING_STRIPS_THE_DIRECTORY_GITHUB_WRAPS_A_PACKAGE_IN()
+    // **An archive from GitHub holds everything under one directory named for the repository and the
+    // tag.** That is not part of the package -- a manifest naming `main: "greet.sl"` means the file
+    // at the root of the package, not `greet-1.0.0/greet.sl` -- so the first component comes off.
+    val dir = libuv.mkdtemp_sync("/tmp/slate-tar-XXXXXX").unwrap()
+    val entries = read_tar(tar_bytes("greet-1.0.0.tar")).unwrap()
+
+    assert_eq(extract_tar(entries, dir, 1).unwrap(), 3)
+
+    assert_eq(from_utf8_unchecked(read_bytes(s"${dir}/greet.sl").unwrap()),
+        "export hello(name) = \"hello \" + name\n")
+    assert_eq(from_utf8_unchecked(read_bytes(s"${dir}/lib/helper.sl").unwrap()),
+        "export helper() = 42\n")
+    assert_eq(from_utf8_unchecked(read_bytes(s"${dir}/package.sl").unwrap()),
+        "{ name: \"greet\", version: \"1.0.0\", main: \"greet.sl\" }\n")
+
+    // A package extracted this way is one `read_project` can read, which is the whole point of the
+    // strip -- so the two halves are checked together rather than separately.
+    val f = read_project_text("package.sl", from_utf8_unchecked(read_bytes(s"${dir}/package.sl").unwrap()))
+
+    assert(f.ok())
+    assert_eq(f.project.main, "greet.sl")
+
+    scrub(dir)
+
+@test
+AN_ARCHIVE_THAT_POINTS_OUTSIDE_THE_PACKAGE_IS_REFUSED()
+    // **The oldest bug in every archive-extracting program ever written.** It has a name --
+    // tar-slip -- and it is still found in shipping software every year. A package arrives from the
+    // network, so an entry named `../../.ssh/authorized_keys` would be written exactly where it says
+    // unless something refuses it.
+    val dir = libuv.mkdtemp_sync("/tmp/slate-tar-XXXXXX").unwrap()
+    val entries = read_tar(tar_bytes("escape.tar")).unwrap()
+    val said = extract_tar(entries, dir, 1).unwrap_err()
+
+    assert(said.contains("points outside the package"))
+    assert(said.contains(".."))
+
+    // **Refused rather than sanitised.** An archive with such a path in it is not a package with a
+    // mistake in it, and quietly rewriting the name would hide what was attempted.
+    val absolute = read_tar(tar_bytes("absolute.tar")).unwrap()
+
+    assert(extract_tar(absolute, dir, 0).unwrap_err().contains("absolute path"))
+
+    scrub(dir)
+
+@test
+AN_ARCHIVE_THAT_STOPS_HALFWAY_IS_A_COMPLAINT_AND_NOT_A_SHORTER_PACKAGE()
+    // A truncated download is the ordinary network failure, and the one answer it must not get is a
+    // package that reads as complete with a file missing from it.
+    //
+    // **Cutting the TAIL off a tar truncates nothing**, which is worth knowing before writing a test
+    // like this: tar pads an archive out to a multiple of its block factor, so this fixture's real
+    // content ends at 5120 of its 10240 bytes and the rest is zeros. A cut has to land inside a
+    // file's own bytes to be a truncation at all.
+    val whole = tar_bytes("greet-1.0.0.tar")
+
+    // The last entry's header sits at 4096 and its 54 bytes begin at 4608, so 4620 is ten bytes into
+    // a file -- the only kind of cut that is a truncation rather than a shorter archive.
+    assert(read_tar(whole[0..<4620]).unwrap_err().contains("ends in the middle of a file"))
+
+    // And a cut that only takes the padding is not a truncation, which is the other half of the
+    // same fact and is why the archive still reads.
+    assert(read_tar(whole[0..<5120]).is_ok())
+
+// -- gzip, and the whole chain a fetch will run ------------------------------------------------------
+
+@test
+A_GZIP_FILE_UNWRAPS_TO_EXACTLY_WHAT_WENT_INTO_IT()
+    val packed = tar_bytes("greet-1.0.0.tar.gz")
+    val plain = tar_bytes("greet-1.0.0.tar")
+    val out = gunzip(packed).unwrap()
+
+    // **Byte for byte, which is the only claim worth making about a decompressor.** The two fixtures
+    // are the same archive, one of them run through `gzip`.
+    assert_eq(out.len, plain.len)
+
+    for i in 0..<out.len
+        if out[i] != plain[i] then assert(false, s"the unpacked bytes differ at ${i}")
+
+@test
+A_FILE_THAT_IS_NOT_GZIP_SAYS_SO_RATHER_THAN_FAILING_LATER()
+    // **The message has to name the format**, because the next thing along the chain is the tar
+    // reader, and letting a non-gzip file reach it produces a complaint about a malformed archive --
+    // which sends the reader to look at the wrong thing entirely.
+    assert(gunzip("this is not compressed at all, it is just text".bytes)
+        .unwrap_err().contains("not a gzip file"))
+
+    assert(gunzip("short".bytes).unwrap_err().contains("too short"))
+
+@test
+A_DAMAGED_DOWNLOAD_IS_CAUGHT_BY_THE_CHECKSUM_THE_FORMAT_ALREADY_CARRIES()
+    // **Worth the pass even though a `slate.sum` hash is coming.** The two catch different things at
+    // different moments: this one catches a download that arrived damaged, in those words, where the
+    // same corruption reaching the tar reader complains that an archive is malformed.
+    val packed = tar_bytes("greet-1.0.0.tar.gz")
+    var damaged: []u8 = [u8(0); packed.len]
+
+    for i in 0..<packed.len
+        damaged[i] = packed[i]
+
+    // A byte well inside the deflate stream, past the header.
+    damaged[40] = damaged[40] ^ u8(0xff)
+
+    val said = gunzip(damaged).unwrap_err()
+
+    assert(said.contains("damaged") || said.contains("checksum") || said.contains("incomplete"),
+        s"a corrupted gzip file said only `${said}`")
+
+    // And a stream that simply stops.
+    assert(gunzip(packed[0..<(packed.len - 40)]).unwrap_err() != "")
+
+@test
+THE_WHOLE_CHAIN_A_FETCH_WILL_RUN_WORKS_WITH_ONLY_THE_DOWNLOAD_MISSING()
+    // **This is `slate fetch` with the socket taken out.** A `.tar.gz` exactly as GitHub serves one,
+    // unwrapped, unpacked, stripped of the directory GitHub wraps a package in, read as a project,
+    // and hashed for `slate.sum` -- every step the fetcher will do once there is something to
+    // download, run against a real `git archive` tarball.
+    val dir = libuv.mkdtemp_sync("/tmp/slate-chain-XXXXXX").unwrap()
+
+    val unpacked = gunzip(tar_bytes("greet-1.0.0.tar.gz")).unwrap()
+    val entries = read_tar(unpacked).unwrap()
+
+    assert_eq(extract_tar(entries, dir, 1).unwrap(), 3)
+
+    // It is a project, and it says what to import from it.
+    val manifest = from_utf8_unchecked(read_bytes(s"${dir}/package.sl").unwrap())
+    val f = read_project_text("package.sl", manifest)
+
+    assert(f.ok())
+    assert_eq(f.project.name, "greet")
+    assert_eq(f.project.version, "1.0.0")
+    assert_eq(f.project.main, "greet.sl")
+
+    // And it hashes, which is what would be written into `slate.sum`.
+    val hash = tree_hash(dir).unwrap()
+
+    assert(hash.contains("sha256:"))
+
+    // **Unpacking it twice gives the same hash**, which is the property the whole sum file rests on
+    // and the one a fetch would break first if extraction were not deterministic.
+    val second = libuv.mkdtemp_sync("/tmp/slate-chain-XXXXXX").unwrap()
+
+    extract_tar(read_tar(gunzip(tar_bytes("greet-1.0.0.tar.gz")).unwrap()).unwrap(), second, 1).unwrap()
+
+    assert_eq(tree_hash(second).unwrap(), hash)
+
+    scrub(second)
+    scrub(dir)
+
+// -- fetching ------------------------------------------------------------------------------------
+
+// **Everything here runs without a network.** The parts of a fetch that can be wrong in an
+// interesting way are the URL a coordinate maps to, what a redirect means, and how a reply is read
+// -- none of which needs a peer. The download itself is verified by hand against GitHub, because a
+// unit suite that needs the internet fails on a train.
+
+@test
+A_COORDINATE_MAPS_TO_THE_URL_ITS_HOST_SERVES_TARBALLS_FROM()
+    assert_eq(tarball_url("github.com/sysl-lang/parsing", "0.4.0").unwrap(),
+        "https://github.com/sysl-lang/parsing/archive/refs/tags/v0.4.0.tar.gz")
+
+    // **An unknown host is refused rather than guessed at.** GitLab, Codeberg and a bare git server
+    // each spell this differently, and guessing would produce a 404 reported as a missing version --
+    // which sends the reader to check a tag that is fine.
+    assert(tarball_url("gitlab.com/o/r", "1.0.0").unwrap_err().contains("not a coordinate slate knows how to fetch"))
+    assert(tarball_url("github.com/only-two-parts", "1.0.0").is_err())
+
+@test
+A_URL_IS_BROKEN_INTO_THE_THREE_PARTS_A_REQUEST_NEEDS()
+    val u = parse_url("https://github.com/sysl-lang/parsing/archive/v1.tar.gz").unwrap()
+
+    assert_eq(u.host, "github.com")
+    assert_eq(u.port, 443)
+    assert_eq(u.path, "/sysl-lang/parsing/archive/v1.tar.gz")
+
+    // A host with no path at all still has one.
+    assert_eq(parse_url("https://example.com").unwrap().path, "/")
+
+    // A port written in the authority is taken.
+    val p = parse_url("https://example.com:8443/x").unwrap()
+
+    assert_eq(p.host, "example.com")
+    assert_eq(p.port, 8443)
+
+    assert(parse_url("https://").unwrap_err().contains("names no host"))
+    assert(parse_url("ftp://example.com/x").unwrap_err().contains("not an http or https URL"))
+
+@test
+A_PACKAGE_MAY_NOT_ARRIVE_OVER_CLEARTEXT_EVEN_IF_A_REDIRECT_ASKS()
+    // **The attacker who can redirect you can also serve you the package**, so a fetcher that could
+    // be talked down to plain HTTP by a response it was told to follow would have no security at
+    // all.
+    //
+    // **THE RULE MOVED WHEN A PROGRAM-FACING `fetch` ARRIVED, AND IT IS THE SAME RULE.** `parse_url`
+    // used to refuse `http://` outright and `absolute` used to spell `https://` into every answer;
+    // both are now purely about reading a URL, and the *policy* is asked where a policy belongs --
+    // in `get`, which is the package manager's. `client.sysl` asks its own version of it, refusing a
+    // redirect that leaves `https` for `http`.
+    assert(parse_url("http://example.com/x").unwrap().host == "example.com")
+    assert_eq(absolute("https://a.example/x", "http://b.example/y").unwrap(), "http://b.example/y")
+
+    // What a program sees is the refusal itself, from the fetcher.
+    assert(get("http://example.com/p.tar.gz").unwrap_err().contains("cleartext"))
+
+@test
+A_REDIRECT_MAY_BE_A_WHOLE_URL_OR_A_PATH_ON_THE_SAME_HOST()
+    // GitHub's archive URLs always redirect -- `github.com/<o>/<r>/archive/...` sends you to
+    // `codeload.github.com` -- so a fetcher that stopped at a 302 would work for nothing anybody
+    // actually publishes.
+    assert_eq(absolute("https://github.com/o/r/archive/v1.tar.gz",
+        "https://codeload.github.com/o/r/tar.gz/refs/tags/v1").unwrap(),
+        "https://codeload.github.com/o/r/tar.gz/refs/tags/v1")
+
+    assert_eq(absolute("https://example.com/a/b", "/c/d").unwrap(), "https://example.com/c/d")
+    assert_eq(absolute("https://example.com/a/b", "c/d").unwrap(), "https://example.com/c/d")
+
+    // **The base's scheme and port come with it**, which the hardcoded `https://` version dropped: a
+    // redirect from a server listening anywhere but 443 went to 443, and nothing refused it.
+    assert_eq(absolute("http://example.com/a", "/b").unwrap(), "http://example.com/b")
+    assert_eq(absolute("http://127.0.0.1:8188/a", "/b").unwrap(), "http://127.0.0.1:8188/b")
+    assert_eq(absolute("https://example.com:8443/a", "/b").unwrap(), "https://example.com:8443/b")
+
+@test
+A_REPLY_IS_READ_FOR_ITS_STATUS_ITS_LOCATION_AND_ITS_BODY()
+    val raw = "HTTP/1.1 200 OK\r\nContent-Type: application/gzip\r\nContent-Length: 5\r\n\r\nhello"
+    val r = parse_response(raw.bytes).unwrap()
+
+    assert_eq(r.status, 200)
+    assert_eq(r.location, "")
+    assert_eq(from_utf8_unchecked(r.body), "hello")
+
+    // **Header names are case-insensitive, and that is not a nicety**: `Location` and `location` are
+    // both sent in the wild, so matching one would follow some redirects and not others.
+    val moved = parse_response("HTTP/1.1 302 Found\r\nlocation: https://elsewhere.example/x\r\n\r\n".bytes).unwrap()
+
+    assert_eq(moved.status, 302)
+    assert_eq(moved.location, "https://elsewhere.example/x")
+
+    assert(parse_response("not http at all".bytes).unwrap_err().contains("no end to its headers"))
+
+@test
+A_CHUNKED_REPLY_IS_REASSEMBLED_BECAUSE_GITHUBS_IS()
+    // **Both framings have to be understood even though the request says `Connection: close`.** A
+    // server may chunk anyway and GitHub's does -- taking the bytes as they came would leave the hex
+    // lengths in the middle of the tarball, which reaches the gzip reader as a corrupt file and
+    // complains about the wrong thing entirely.
+    val raw = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" +
+        "5\r\nhello\r\n" +
+        "6\r\n world\r\n" +
+        "0\r\n\r\n"
+
+    assert_eq(from_utf8_unchecked(parse_response(raw.bytes).unwrap().body), "hello world")
+
+    // A chunk length may carry a `;` extension after it, which is skipped.
+    val extended = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n"
+
+    assert_eq(from_utf8_unchecked(parse_response(extended.bytes).unwrap().body), "abc")
+
+    // A reply that stops mid-chunk is a complaint, not a shorter body -- the truncated-download case.
+    val cut = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n9\r\nshort"
+
+    assert(parse_response(cut.bytes).unwrap_err().contains("stops in the middle of a chunk"))
+
+@test
+A_DIRECTORY_ALREADY_IN_THE_CACHE_IS_NOT_FETCHED_AGAIN()
+    // **"Is it here" and "is it a slate package" are two questions**, and `is_fetched` asks the
+    // first. It asked the second until it was caught: a coordinate holding a *sysl* package, whose
+    // manifest is a `package.hocon`, was reported as never fetched, downloaded again on every run,
+    // and then failed to move into place over itself with `directory not empty`.
+    val dir = libuv.mkdtemp_sync("/tmp/slate-here-XXXXXX").unwrap()
+
+    write_text(s"${dir}/package.hocon", "package { name = \"other\" }\n").unwrap()
+
+    assert(is_fetched(Package("other", "1.0.0", "github.com/example/other", dir)))
+    assert(!is_fetched(Package("gone", "1.0.0", "github.com/example/gone", s"${dir}/nope")))
+
+    scrub(dir)

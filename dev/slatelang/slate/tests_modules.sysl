@@ -1,0 +1,580 @@
+module dev.slatelang.slate
+@tests
+
+import sh.sysl.parsing.*
+import sysl.fs.{read_bytes}
+import sysl.text.Search
+
+// A program of several files, and what `try` and `@test` needed from it.
+//
+// **The fixtures under `tests/mods/` and `tests/suite/` are real files read by relative path**,
+// because the resolution being tested is the one a person gets.
+
+// -- modules ---------------------------------------------------------------------------------------
+
+@test
+the_blocking_calls_do_not_keep_the_program_alive()
+    // A promise-shaped call claims a slot that the loop counts; a blocking one has nothing
+    // outstanding when it returns, so a program made only of these ends at its last statement.
+    assert_eq(in_scratch("writeFileSync(\"<dir>/a.txt\", \"x\")\nprint(\"done\")"), "done")
+
+// **A program is as many files as it imports, and these are the tests that can tell.** Everything
+// about a fault carrying its file is invisible while a program is one file -- the answer is always
+// source zero and always right -- so the whole of that machinery is unchecked until something here
+// runs. `a_fault_in_an_imported_file_is_reported_against_that_file` is the one that pins it.
+//
+// **The fixtures are real files under `tests/mods/`**, read by relative path exactly as the examples
+// are, so what runs is the resolution a person gets: a path relative to the importing file, a
+// directory walked with `..`, a file that is genuinely not there.
+
+@test
+a_file_may_use_what_another_one_exports()
+    // `greeting as hi` renames on the way in, which is the half of the syntax a plain import hides.
+    assert_eq(ran_out("tests/mods/main.sl"), "hello\n42")
+
+@test
+a_star_import_is_an_ordinary_object()
+    // **No new `Value` variant and nothing new for the collector**: a module is an `ObjectObj`, so
+    // `util.double` is the field selection a program writes for itself.
+    assert_eq(ran_out("tests/mods/star.sl"), "hello\n8\ngo!")
+
+@test
+a_path_is_relative_to_the_importing_file_and_not_the_working_directory()
+    // `uses_deep.sl` imports `deep/nested.sl`, which imports `../util.sl` -- so the `..` is resolved
+    // against the file the import is written in. Resolved against the working directory it would
+    // have looked for `util.sl` one level above the project.
+    assert_eq(ran_out("tests/mods/uses_deep.sl"), "12")
+
+@test
+what_a_module_did_not_export_is_not_visible()
+    // A module runs in a scope of its own under the builtins, so its top-level `val` is its own.
+    // Without that the files would share one scope and every name would leak into every other file.
+    val said = ran_fault("tests/mods/private.sl")
+
+    assert(said.contains("`greeting` is not defined"))
+
+@test
+asking_for_a_name_a_module_does_not_export_is_a_diagnostic()
+    // **Caught while compiling, which is the whole reason the message can be this good.** Left to
+    // run time it arrives as an absent field, so the complaint would be about `undefined` being
+    // bound to a name -- true, and about the wrong thing.
+    val said = ran_fault("tests/mods/no_such_export.sl")
+
+    assert(said.contains("does not export `secret`"))
+    assert(said.contains("`greeting`"))
+    assert(said.contains("`double`"))
+
+@test
+a_fault_in_an_imported_file_is_reported_against_that_file()
+    // **THE test the source-carrying fault exists for.** `uses_faulty.sl` line 1 is its import and
+    // `faulty.sl` line 1 is the definition that goes wrong, so a fault stamped with the wrong file
+    // would quote the import statement at the same line number and read as perfectly plausible.
+    // What makes this able to fail is the second file's own text appearing under the caret.
+    val said = ran_fault("tests/mods/uses_faulty.sl")
+
+    assert(said.contains("this divides by zero"))
+    assert(said.contains("tests/mods/faulty.sl"))
+    assert(said.contains("export boom() = 1 / 0"))
+    assert(!said.contains("import { boom }"))
+
+@test
+what_a_program_printed_before_a_fault_in_an_imported_file_survives()
+    // The import runs the other file's top level, so the entry has already printed by the time the
+    // call into it goes wrong.
+    read_bytes("tests/mods/uses_faulty.sl") match
+        Err(e) -> assert(false, s"cannot read the fixture: ${e}")
+        Ok(bytes) ->
+            val r = run(source("tests/mods/uses_faulty.sl", bytes))
+
+            assert(!r.ok())
+            assert_eq(r.printed(), "before")
+
+@test
+a_parse_error_in_an_imported_file_is_reported_against_that_file()
+    val said = ran_fault("tests/mods/uses_hole.sl")
+
+    assert(said.contains("tests/mods/syntax_hole.sl"))
+    assert(said.contains("expected an expression"))
+
+@test
+a_circle_of_imports_is_refused_and_names_the_chain()
+    // **Refused rather than allowed with partial initialisation**, which is node's answer and a
+    // famous source of confusion. Refusing can be relaxed later; half-built modules cannot be
+    // un-shipped.
+    val said = ran_fault("tests/mods/cycle_a.sl")
+
+    assert(said.contains("closes a circle"))
+    assert(said.contains("tests/mods/cycle_a.sl"))
+    assert(said.contains("tests/mods/cycle_b.sl"))
+
+@test
+a_file_importing_itself_closes_the_smallest_circle()
+    assert(ran_fault("tests/mods/self.sl").contains("closes a circle"))
+
+@test
+a_module_path_says_where_it_starts()
+    // **A quoted string is a file and an unquoted word is a package**, so a quoted name with no
+    // `./` in front of it is a file path that does not say where it starts -- and the message says
+    // both ways out, since which one was meant is exactly what is unclear.
+    val said = ran_fault("tests/mods/bare.sl")
+
+    assert(said.contains("has to be written `\"./util.sl\"`"))
+    assert(said.contains("an unquoted `util.sl` is how a package is named"))
+
+@test
+a_module_that_is_not_there_is_named_by_the_import_that_wanted_it()
+    val said = ran_fault("tests/mods/absent.sl")
+
+    assert(said.contains("cannot read `tests/mods/not_here.sl`"))
+    assert(said.contains("tests/mods/absent.sl"))
+
+@test
+a_module_two_files_import_runs_once()
+    // The diamond: `diamond.sl` imports `left.sl` and `right.sl`, and both import `base.sl`, whose
+    // top level prints. A loader that read by import rather than by file would print twice.
+    assert_eq(ran_out("tests/mods/diamond.sl"), "base ran\nleft sees base\nright sees base")
+
+@test
+export_and_import_belong_to_the_top_level_of_a_file()
+    val said = ran_fault("tests/mods/in_block.sl")
+
+    assert(said.contains("`export` belongs to the top level"))
+    assert(said.contains("`import` belongs to the top level"))
+
+@test
+export_goes_in_front_of_something_with_a_name()
+    // `export left_name = ...` is an assignment and not a binding, and this is the message it draws.
+    // It was written by accident while these fixtures were being made, which is the best argument
+    // for the message being a clear one.
+    assert(fails("export val x = 1\nexport y = 2").contains("`export` goes in front of a `val`"))
+
+@test
+a_closure_a_module_exports_keeps_its_own_modules_state()
+    // `bump` closes over a `var` its module never exported, so the count is the module's and the
+    // importing file cannot reach it except by calling.
+    assert_eq(ran_out("tests/mods/uses_counter.sl"), "1\n2")
+
+@test
+an_async_function_may_be_awaited_across_a_module_boundary()
+    assert_eq(ran_out("tests/mods/uses_waits.sl"), "42")
+
+@test
+what_a_module_exports_is_a_snapshot_taken_when_it_finishes()
+    // **Where slate parts company with TypeScript's live bindings, deliberately.** A module's
+    // exports are an ordinary object built as the file ends, so a `var` the module changes
+    // afterwards is not seen changing from outside: `m.count` stays 0 while the module's own
+    // `count` becomes 1. Pinned rather than left to be discovered.
+    assert_eq(ran_out("tests/mods/uses_snapshot.sl"), "0\n1\n0")
+
+@test
+a_module_object_survives_a_collection()
+    // `module_values` is a root the tracer walks, and nothing else refers to a module's exports --
+    // so without it the object would be swept out from under the program that imported it.
+    val printed = ran_out("tests/mods/gc_main.sl")
+
+    assert(collections > 0, "a program that allocates eighty thousand strings has to have collected")
+    assert_eq(printed, "kept across a collection\n[\"item 0\", \"item 1\", \"item 2\"]")
+
+// -- lexical paths ---------------------------------------------------------------------------------
+
+@test
+a_path_is_normalised_without_asking_the_filesystem_anything()
+    assert_eq(normalize_path("./util.sl"), "util.sl")
+    assert_eq(normalize_path("a/./b/../c.sl"), "a/c.sl")
+    assert_eq(normalize_path("a//b.sl"), "a/b.sl")
+    assert_eq(normalize_path("a/b/../../c.sl"), "c.sl")
+
+    // A leading `..` cannot be simplified without knowing where the path starts from, so it stays.
+    assert_eq(normalize_path("../a.sl"), "../a.sl")
+    assert_eq(normalize_path("../../a.sl"), "../../a.sl")
+    assert_eq(normalize_path("a/../../b.sl"), "../b.sl")
+
+    // The root has no parent, which is the one case where a leading `..` does go away.
+    assert_eq(normalize_path("/../a.sl"), "/a.sl")
+    assert_eq(normalize_path("/a/b/../c.sl"), "/a/c.sl")
+
+    // A path that normalises to nothing is the working directory rather than the empty string.
+    assert_eq(normalize_path("a/.."), ".")
+
+// -- a fault's file, once there are several -------------------------------------------------------
+
+@test
+an_import_resolves_against_the_file_it_was_written_in()
+    assert_eq(resolve_import("tests/mods/main.sl", "./util.sl"), "tests/mods/util.sl")
+    assert_eq(resolve_import("tests/mods/deep/nested.sl", "../util.sl"), "tests/mods/util.sl")
+
+    // A file in the working directory has no directory part, and an import from it is bare.
+    assert_eq(resolve_import("main.sl", "./util.sl"), "util.sl")
+
+    // An absolute path ignores where it was written.
+    assert_eq(resolve_import("tests/mods/main.sl", "/tmp/util.sl"), "/tmp/util.sl")
+
+// **These are the edge-case pass, and one of them found a real bug.** A fault carries the file its
+// span belongs to, and the machine keeps that in step with the chunk it is running -- but a *nested*
+// run returns into the middle of an outer chunk whose own `chunk_ix` never changed, so the outer one
+// carried on stamping its faults with the callee's file. Every one of these runs a fault through a
+// different path back into a caller.
+
+@test
+a_fault_after_a_nested_run_belongs_to_the_file_that_raised_it()
+    // **The regression test for the bug the edge-case pass found.** An `async` call is routed
+    // through `start_async`, which runs a chunk of its own -- and afterwards a fault in the *entry*
+    // was reported against `waits.sl`, at a line number that happened to exist and was blank.
+    // Nothing about that message says it is pointing at the wrong file, which is why it is pinned
+    // by the text of the line and not only by the name.
+    val said = ran_fault("tests/mods/after_call.sl")
+
+    assert(said.contains("`missing_in_the_entry` is not defined"))
+    assert(said.contains("tests/mods/after_call.sl"))
+    assert(!said.contains("tests/mods/waits.sl"))
+
+@test
+a_fault_after_a_hook_ran_belongs_to_the_calling_file()
+    // The other way a nested run happens: a user `hash` is slate code called from inside a table
+    // lookup, which is a native. The fault afterwards is the entry's.
+    val said = ran_fault("tests/mods/uses_hook.sl")
+
+    assert(said.contains("`another_missing_name` is not defined"))
+    assert(said.contains("tests/mods/uses_hook.sl"))
+    assert(!said.contains("tests/mods/hooked.sl"))
+
+@test
+a_fault_inside_a_hook_a_module_defined_names_that_module()
+    val said = ran_fault("tests/mods/uses_bad_hook.sl")
+
+    assert(said.contains("`not_a_name_here` is not defined"))
+    assert(said.contains("tests/mods/bad_hook.sl"))
+
+@test
+an_error_inside_an_interpolation_in_an_imported_file_names_that_file()
+    // A hole is parsed over a `sub_source`, which carries the enclosing file's name and offsets --
+    // so the only thing that can put this in the right file is the loader recording which file the
+    // report came from.
+    assert(ran_fault("tests/mods/uses_interp.sl").contains("tests/mods/interp_hole.sl"))
+
+@test
+a_fault_in_a_modules_top_level_stops_the_program_before_the_entry_runs()
+    read_bytes("tests/mods/uses_toplevel_fault.sl") match
+        Err(e) -> assert(false, s"cannot read the fixture: ${e}")
+        Ok(bytes) ->
+            val r = run(source("tests/mods/uses_toplevel_fault.sl", bytes))
+
+            assert(!r.ok())
+            assert(r.render().contains("tests/mods/toplevel_fault.sl"))
+
+            // The entry never ran at all: its first statement is a `print`.
+            assert_eq(r.printed(), "")
+
+@test
+a_report_across_several_files_is_still_cut_at_five()
+    // `Ran.render` does its own sorting and its own truncation, because `Report.render` renders
+    // everything against one `Source` and there is no longer one.
+    assert(ran_fault("tests/mods/many_faults.sl").contains("showing the first 5 of 6"))
+
+// -- what modules do NOT change -------------------------------------------------------------------
+
+@test
+a_module_with_no_exports_is_an_empty_object()
+    // `import {}` is legal and takes nothing, which is how a file is run for its effect alone.
+    assert_eq(ran_out("tests/mods/uses_empty.sl"), "{}\n0")
+
+@test
+imports_may_chain()
+    // A imports B imports C. Post-order is what makes C's exports exist by the time B is compiled.
+    assert_eq(ran_out("tests/mods/chain_a.sl"), "B over C")
+
+@test
+an_import_list_may_span_lines_and_end_with_a_comma()
+    // The brackets suspend the off-side rule, which is `sh.sysl.parsing`'s layout doing its job and
+    // costs the grammar nothing here.
+    assert_eq(ran_out("tests/mods/trailing.sl"), "6 hello")
+
+@test
+an_import_binds_where_it_is_written()
+    // **slate hoists nothing, and an import is no exception.** A function called above its own
+    // definition is `not defined` in exactly the same way, so this is one rule rather than two --
+    // and the alternative, hoisting imports alone, would be the surprising one.
+    assert(ran_fault("tests/mods/late_import.sl").contains("`double` is not defined"))
+
+@test
+an_imported_name_is_an_ordinary_binding()
+    // Redeclaring shadows it, and importing the same name twice is not an error, because slate
+    // already allows both of those for any binding. The module system adds no rule of its own.
+    assert_eq(ran_out("tests/mods/collide.sl"), "5")
+    assert_eq(ran_out("tests/mods/twice_imported.sl"), "4")
+    assert_eq(ran_out("tests/mods/uses_twice_exported.sl"), "2")
+
+@test
+a_module_may_pass_on_what_it_imported()
+    assert_eq(ran_out("tests/mods/uses_reexport.sl"), "14 mine")
+
+@test
+a_timer_a_module_starts_is_run_by_the_same_loop()
+    // The loop drains once, after every module has run -- so a module's own timer is not a special
+    // case and does not need one.
+    assert_eq(ran_out("tests/mods/uses_timer.sl"), "loaded\nfrom the module's own timer")
+
+// -- try and catch ---------------------------------------------------------------------------------
+
+// **Unwinding already existed; what `try` adds is a place to stop it.** A fault has left the
+// instruction loop as an `Err` since the machine was written, so catching one is not a new mechanism
+// -- it is a record of what the world looked like where the `try` began, and re-entering the loop
+// there. The tests that matter most are the ones where something ELSE leaves the body: a `return`, a
+// `break`, an `await`. Each of those is a way for a handler to be left behind, and a handler left
+// behind is worse than a missing one.
+
+@test
+a_catch_answers_where_the_body_faulted()
+    assert_eq(out("print(1 catch e -> 2)"), "1")
+    assert_eq(out(Boom + "print(boom() catch e -> 2)"), "2")
+    assert_eq(out("print(1 / 0 catch e -> -1)"), "-1")
+
+@test
+the_block_form_and_the_postfix_form_are_one_thing()
+    // Both build a `TryCatch`, so nothing downstream learns there are two -- which is what slate
+    // already does for `if`'s one-line and indented forms.
+    assert_eq(good_tree("x catch e -> 0"), "(try x catch e 0)")
+    assert_eq(good_tree("try\n    x\ncatch e\n    0"), "(try (block x) catch e (block 0))")
+
+@test
+a_fault_is_an_ordinary_object_saying_where_it_was()
+    // **No new kind of value**, which is the same answer modules got: slate objects already sort,
+    // print and go in arrays, so a fault is one.
+    // **A division by zero rather than an undefined name**, which is what these raised with until
+    // an undefined name became something the compiler refuses. The line stays 1 because the fault is
+    // still written on the first line -- which is the whole of what the second assertion is about.
+    assert_eq(out("val e = 1 / 0 catch e -> e\nprint(e.message)"), "this divides by zero")
+    assert_eq(out("val e = 1 / 0 catch e -> e\nprint(e.line)"), "1")
+    assert_eq(out("val e = 1 / 0 catch e -> e\nprint(e.file)"), "t")
+
+@test
+a_fault_raised_several_calls_deep_is_caught_at_the_top()
+    val prog = "deep(n) = if n == 0 then 1 / 0 else deep(n - 1)\nprint(deep(5) catch e -> e.message)"
+
+    assert_eq(out(prog), "this divides by zero")
+
+@test
+the_name_a_catch_binds_is_its_own()
+    // `PushScope`/`PopScope` around the handler, so nothing leaks past it.
+    assert(fails("val v = boom catch e -> 1\nprint(e)").contains("`e` is not defined"))
+
+@test
+a_try_that_does_not_fault_leaves_nothing_owed()
+    // **The silent one.** A `return` written inside a `try` skips its `PopHandler`, and a handler
+    // outliving the frame it was made in names an instruction nobody is standing at -- so the next
+    // fault anywhere in the program would be restored into a function that has already returned.
+    // `Frame.handlers` is what stops it, and this is what would notice.
+    val prog = "f() =\n    try\n        return 1\n    catch e\n        2\nprint(f())\nafterwards"
+    val said = fails(prog)
+
+    assert(said.contains("`afterwards` is not defined"))
+    assert(!said.contains("2"))
+
+@test
+breaking_out_of_a_try_drops_its_handler()
+    // The same hazard by the other route: `break` leaves the body without running `PopHandler`, and
+    // `unwind_to` is what emits them.
+    val prog = "g() =\n    for i in 1..5\n        try\n            break\n        catch e\n            0\n    \"done\"\nprint(g())\nafterwards"
+    val said = fails(prog)
+
+    assert(said.contains("`afterwards` is not defined"))
+
+@test
+a_try_in_a_loop_catches_each_turn_of_it()
+    val prog = "var out = []\nfor i in 1..4\n    try\n        if i == 2 then 1 / 0\n        push(out, i)\n    catch e\n        push(out, \"caught\")\nprint(out)"
+
+    assert_eq(out(prog), "[1, \"caught\", 3, 4]")
+
+@test
+a_break_out_of_a_try_still_leaves_the_loop()
+    val prog = "var out = []\nfor i in 1..5\n    try\n        if i == 3 then break\n        push(out, i)\n    catch e\n        push(out, \"caught\")\nprint(out)"
+
+    assert_eq(out(prog), "[1, 2]")
+
+@test
+a_fault_in_a_handler_reaches_the_one_outside_it()
+    val prog = Boom + "val v = try\n    try\n        boom()\n    catch inner\n        1 / 0\ncatch outer\n    outer.message\nprint(v)"
+
+    assert_eq(out(prog), "this divides by zero")
+
+@test
+a_try_may_be_written_where_a_value_is_wanted()
+    // **The layout pass again.** Brackets suspend the off-side rule, so `try` and a `catch`'s name
+    // are nominated to `opens_block` exactly as `match` is -- otherwise the arms of a `try` written
+    // as an argument would be inside a bracket pair where a newline means nothing.
+    assert_eq(out("print(try\n    1 / 0\ncatch e\n    \"caught\")"), "caught")
+    assert_eq(out("var xs = []\npush(xs, try\n    1 / 0\ncatch e\n    -1)\nprint(xs)"), "[-1]")
+
+@test
+a_try_with_nothing_to_handle_the_fault_is_refused()
+    assert(fails("try\n    boom").contains("a `try` needs a `catch`"))
+
+@test
+a_fault_in_a_callback_is_not_caught_by_the_call_that_scheduled_it()
+    // **A callback runs from the loop, long after the `try` around `setTimeout` has finished.** That
+    // is inherent rather than a gap: there is no statement of the program's to attach the fault to,
+    // which is why the loop reports it against the line that wrote the callback.
+    val said = fails("try\n    setTimeout(() -> nope, 1)\ncatch e\n    print(\"not this\")\nprint(\"scheduled\")")
+
+    assert(said.contains("`nope` is not defined"))
+    assert(!said.contains("not this"))
+
+@test
+a_caught_fault_costs_nothing_the_collector_cannot_give_back()
+    // A fault is an object, so catching twenty thousand of them allocates twenty thousand -- and the
+    // handler's own scope is a root only while it is owed.
+    assert_eq(out("var n = 0\nvar i = 0\nwhile i < 20000\n    n += 1 / 0 catch e -> 1\n    i += 1\nprint(n)"), "20000")
+
+// -- catching across a suspension and across a file ------------------------------------------------
+
+@test
+a_failed_promise_is_caught_by_the_call_that_awaited_it()
+    // **The case the whole arrangement is for.** A coroutine's handlers went into `parked` with it,
+    // so the fault has to be given to the machine after it is put back -- not made into an `Err` by
+    // the scheduler, which has no handlers and did not write the `await`.
+    // **`reject` is how a promise is made to fail now**, the file system having stopped doing it:
+    // an expected failure is a result, and a rejection is for the ones that are not.
+    val prog = "async main() =\n    val t = await reject(\"deliberate\") catch e -> s\"recovered from ${e.message}\"\n    print(t)\nmain()"
+
+    assert_eq(out(prog), "recovered from deliberate")
+
+@test
+the_block_form_catches_across_an_await_too()
+    val prog = "async main() =\n    try\n        await reject(\"deliberate\")\n        print(\"never\")\n    catch e\n        print(\"caught\")\nmain()"
+
+    assert_eq(out(prog), "caught")
+
+@test
+a_caught_rejection_is_not_also_an_unhandled_one()
+    // Awaiting a promise marks it handled, and catching what it raised settles the matter -- so the
+    // drain has nothing left to report at the end.
+    val prog = "async main() =\n    val t = await reject(\"deliberate\") catch e -> \"fine\"\n    print(t)\nmain()"
+    val r = run(source_of("t", prog))
+
+    assert(r.ok(), s"a caught rejection was still reported: ${r.render()}")
+
+// -- @test ------------------------------------------------------------------------------------------
+
+@test
+a_fault_caught_from_another_file_says_which_file_raised_it()
+    // The fault carries its own source, so unwinding across a module boundary does not lose it.
+    assert_eq(ran_out("tests/mods/catches.sl"), "tests/mods/raises.sl:1 this divides by zero")
+
+// **A test runner needs a fault to be survivable, which is why this could not have been built
+// first.** Before `catch` there was no way to run a second test after the first one failed: a fault
+// stopped the machine and took the run with it. The runner is that mechanism used from sysl rather
+// than from slate -- `apply` the test, read the `Err`, report it, carry on.
+//
+// The fixtures are real files under `tests/suite/`, because what is being tested includes discovery
+// and the way one file's tests do not become another's.
+
+@test
+a_test_beside_the_code_reaches_what_that_file_kept_private()
+    // The reason `@test` is allowed in an ordinary file at all: slate's module is a *file*, so a
+    // separate test file could never see a private name. sysl's `tests.sysl` is inside the module
+    // directory for the same reason.
+    val t = tested("tests/suite/lib.sl")
+
+    assert_eq(t.report, "")
+    assert_eq(t.passed(), 2)
+    assert_eq(t.failed(), 0)
+
+@test
+a_test_file_reaches_what_the_module_exported()
+    val t = tested("tests/suite/lib_test.sl")
+
+    assert_eq(t.report, "")
+    assert_eq(t.passed(), 2)
+
+@test
+an_imported_modules_tests_do_not_run_again_for_the_file_importing_it()
+    // **The claim `is_entry` exists for.** `lib_test.sl` imports `lib.sl`, which has two tests of
+    // its own -- so a runner that registered every module's would report four here, and walking a
+    // directory would run `lib.sl`'s twice over.
+    val t = tested("tests/suite/lib_test.sl")
+
+    assert_eq(t.results.len(), 2)
+    assert_eq(verdict(t, "it_multiplies_by_the_factor"), "no test called `it_multiplies_by_the_factor` ran")
+
+@test
+a_failing_assertion_names_both_sides_and_where_it_was()
+    val t = tested("tests/suite/failing.sl")
+    val said = verdict(t, "an_assertion_that_does_not_hold")
+
+    assert(said.contains("got 6, wanted 7"))
+    assert(said.contains("tests/suite/failing.sl:6"))
+
+@test
+a_test_that_faults_rather_than_asserting_is_a_failure_like_any_other()
+    // Nothing about the runner is specific to assertions: it reads the `Err` the machine hands back,
+    // and an assertion is only a native that raises one.
+    val said = verdict(tested("tests/suite/failing.sl"), "a_fault_rather_than_an_assertion")
+
+    assert(said.contains("this divides by zero"))
+
+@test
+what_a_failing_test_printed_is_kept_and_shown()
+    val t = tested("tests/suite/failing.sl")
+    var printed = ""
+
+    for i in 0..<t.results.len()
+        if t.results.at(i).name == "one_that_prints_before_it_fails" then printed = t.results.at(i).printed
+
+    assert_eq(printed, "context the reader wants")
+
+@test
+an_async_test_is_waited_for_rather_than_called_a_pass()
+    // **Calling an `async` test hands back a promise that has not settled**, so a runner that read
+    // the answer straight away would call every asynchronous test a pass whatever it did. The loop
+    // is drained and the promise is read afterwards.
+    val said = verdict(tested("tests/suite/failing.sl"), "an_async_one_that_fails")
+
+    assert(said.contains("got 1, wanted 2"))
+
+@test
+one_file_of_the_run_failing_to_load_does_not_stop_the_others()
+    // A file that will not compile has no working tests to speak of, so it is reported as the file
+    // failing rather than as every test in it failing for the same reason.
+    val t = tested("tests/suite/unloadable.sl")
+
+    assert(t.report != "")
+    assert_eq(t.results.len(), 0)
+
+@test
+a_run_reports_the_passes_beside_the_failures()
+    val t = tested("tests/suite/failing.sl")
+
+    assert_eq(t.passed(), 1)
+    assert_eq(t.failed(), 4)
+
+@test
+an_assertion_says_what_it_was_given_when_it_does_not_hold()
+    assert(fails("assert(false)").contains("this assertion does not hold"))
+    assert(fails("assert(1 == 2, \"the numbers differ\")").contains("the numbers differ"))
+    assert(fails("assert()").contains("`assert` takes a condition"))
+
+    // A string is quoted where a number is not, which is what says the two are different kinds.
+    assert(fails("assertEq(\"6\", 6)").contains("got \"6\", wanted 6"))
+    assert(fails("assertEq([1], [2])").contains("got [1], wanted [2]"))
+    assert(fails("assertEq(1, 2, \"the counts\")").contains("the counts: got 1, wanted 2"))
+    assert(fails("assertEq(1)").contains("`assertEq` takes what was got"))
+
+    // And one that holds answers nothing and carries on.
+    assert_eq(out("assert(true)\nassertEq(2, 2)\nprint(\"through\")"), "through")
+
+@test
+a_test_annotation_is_refused_where_it_cannot_be_honoured()
+    assert(fails("@test\nnot_a_definition").contains("`@test` goes in front of a definition"))
+    assert(fails("@test\nwith_args(x) = 1").contains("a test takes no arguments, and `with_args` takes 1"))
+    assert(fails("@bench\nf() = 1").contains("`@bench` is not an annotation slate knows"))
+    assert(fails("if true\n    @test\n    f() = 1").contains("`@test` belongs to the top level"))
+
+@test
+every_test_in_the_testing_example_passes()
+    // **The example is reading material and reading material rots**, exactly as the others do -- and
+    // this one rots in a way running it plainly would not notice, since a plain run calls no test.
+    val t = tested("examples/testing.sl")
+
+    assert_eq(t.report, "")
+    assert_eq(t.failed(), 0, s"the testing example has a failing test: ${verdict(t, "widen_clamps_every_element")}")
+    assert_eq(t.passed(), 6)
