@@ -1,0 +1,173 @@
+module dev.slatelang.slate
+
+import sh.sysl.openssl
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.crypto.{hmac256, hmac384, hmac512}
+
+// The signing a JWT needs, and deliberately nothing above it.
+//
+// **A token is three base64url pieces, a JSON header and a set of claims to check against a clock**,
+// all of which slate can already do -- so `slate:jwt` is written in slate and this is the seam it
+// stands on. What could not be done in slate at all is deciding whether a signature over
+// `header.payload` was made by a given key, and that is these two functions.
+//
+// **THE ALGORITHM IS AN ARGUMENT BECAUSE THE `alg` HEADER IS NOT TO BE TRUSTED.** A verifier that
+// read the algorithm out of the token it is checking accepts whatever an attacker wrote there, which
+// is how `alg: none` and the RS256-public-key-used-as-an-HMAC-secret confusion both work. The caller
+// says what it expects and the token gets no vote; `sh.sysl.openssl` draws the same line and this is
+// that line reaching the language.
+//
+// **HMAC is the standard library's and the rest is OpenSSL's**, which is the division of labour each
+// is best at: `sysl.crypto` has SHA-2 and HMAC and needs no binding, and nobody would want a second
+// RSA in sysl.
+
+// The algorithms this understands, as JOSE spells them.
+private symmetric(alg: string) -> bool = alg == "HS256" || alg == "HS384" || alg == "HS512"
+
+private asymmetric(alg: string) -> Option[openssl.Algorithm]
+    if alg == "RS256" then return Some(openssl.Algorithm.Rs256)
+    if alg == "RS384" then return Some(openssl.Algorithm.Rs384)
+    if alg == "RS512" then return Some(openssl.Algorithm.Rs512)
+    if alg == "PS256" then return Some(openssl.Algorithm.Ps256)
+    if alg == "PS384" then return Some(openssl.Algorithm.Ps384)
+    if alg == "PS512" then return Some(openssl.Algorithm.Ps512)
+    if alg == "ES256" then return Some(openssl.Algorithm.Es256)
+    if alg == "ES384" then return Some(openssl.Algorithm.Es384)
+    if alg == "ES512" then return Some(openssl.Algorithm.Es512)
+
+    None
+end asymmetric
+
+// What every algorithm this knows about is called, for a message that has to list them.
+private algorithms() -> string =
+    "HS256, HS384, HS512, RS256, RS384, RS512, PS256, PS384, PS512, ES256, ES384 and ES512"
+
+// Text or bytes, since a key is a secret in one case and PEM in the other and a program has both.
+private bytes_arg(v: Value, at: Span, name: string, what: string) -> Result[Buf[u8], Signal]
+    v match
+        Str(p) ->
+            var out: Buf[u8] = buf()
+
+            for i in 0..<p.s.bytes.len
+                out.push(p.s.bytes[i])
+
+            Ok(out)
+        Array(a) -> bytes_of(a, at, name)
+        other -> Err(failure(at, s"`${name}` takes ${what} as text or bytes, and this is ${other.type_name()}"))
+
+private text_arg(v: Value, at: Span, name: string, what: string) -> Result[string, Signal]
+    v match
+        Str(p) -> Ok(p.s)
+        other -> Err(failure(at, s"`${name}` takes ${what} as text, and this is ${other.type_name()}"))
+
+private hmac_of(alg: string, key: []const u8, message: []const u8) -> Buf[u8]
+    var out: Buf[u8] = buf()
+
+    if alg == "HS256"
+        val tag = hmac256(key, message)
+
+        for i in 0..<tag.len
+            out.push(tag[i])
+    elif alg == "HS384"
+        val tag = hmac384(key, message)
+
+        for i in 0..<tag.len
+            out.push(tag[i])
+    else
+        val tag = hmac512(key, message)
+
+        for i in 0..<tag.len
+            out.push(tag[i])
+
+    out
+end hmac_of
+
+// **Compared in constant time, which is not superstition here.** A comparison that stops at the
+// first byte that differs tells an attacker how much of a forged tag was right, and a tag can be
+// guessed a byte at a time from that. The asymmetric algorithms need no such care -- verifying a
+// signature is not a comparison -- which is why this is the only place it appears.
+private same_tag(a: []const u8, b: []const u8) -> bool
+    if a.len != b.len then return false
+
+    var differs: u8 = 0
+
+    for i in 0..<a.len
+        differs = differs | (a[i] ^ b[i])
+
+    differs == 0
+end same_tag
+
+private as_array(bytes: Buf[u8]) -> Value
+    var items: Buf[Value] = buf()
+
+    for i in 0..<bytes.len()
+        items.push(Int(long(bytes.at(i))))
+
+    Array(new_array(items))
+end as_array
+
+// `jwsSign(alg, key, message)` -- the signature over `message`, as a byte array.
+do_jws_sign(args: Buf[Value], at: Span) -> Step
+    if args.len() != 3 then return fault(at, s"`jwsSign` takes an algorithm, a key and a message, and was given ${counted(args.len(), "argument")}")
+
+    val alg = text_arg(args.at(0), at, "jwsSign", "the algorithm")?
+    val key = bytes_arg(args.at(1), at, "jwsSign", "the key")?
+    val message = bytes_arg(args.at(2), at, "jwsSign", "the message")?
+
+    if symmetric(alg)
+        val mark = root_mark()
+        val made = as_array(hmac_of(alg, key.view(), message.view()))
+
+        hold(made)
+        release(mark)
+        return Ok(made)
+
+    val which = asymmetric(alg) match
+        Some(a) -> a
+        None -> return fault(at, s"`${alg}` is not an algorithm this understands -- there are ${algorithms()}")
+
+    val signer = openssl.private_key(key.view()) match
+        Err(e) -> return fault(at, s"this private key could not be read: ${e}")
+        Ok(k) -> k
+
+    openssl.sign(signer, which, message.view()) match
+        Err(e) -> fault(at, s"this could not be signed: ${e}")
+        Ok(signature) ->
+            val mark = root_mark()
+            val made = as_array(signature)
+
+            hold(made)
+            release(mark)
+            Ok(made)
+end do_jws_sign
+
+// `jwsVerify(alg, key, message, signature)` -- whether the signature is that key's over that message.
+//
+// **A signature that does not check out is `false`, and a question that could not be asked is a
+// fault.** A key of the wrong kind, an ECDSA signature of the wrong length, a PEM that is not a key:
+// none of those is an attacker, and collapsing them into `false` would make a misconfiguration look
+// like one.
+do_jws_verify(args: Buf[Value], at: Span) -> Step
+    if args.len() != 4 then return fault(at, s"`jwsVerify` takes an algorithm, a key, a message and a signature, and was given ${counted(args.len(), "argument")}")
+
+    val alg = text_arg(args.at(0), at, "jwsVerify", "the algorithm")?
+    val key = bytes_arg(args.at(1), at, "jwsVerify", "the key")?
+    val message = bytes_arg(args.at(2), at, "jwsVerify", "the message")?
+    val signature = bytes_arg(args.at(3), at, "jwsVerify", "the signature")?
+
+    if symmetric(alg)
+        return Ok(Bool(same_tag(hmac_of(alg, key.view(), message.view()).view(), signature.view())))
+
+    val which = asymmetric(alg) match
+        Some(a) -> a
+        None -> return fault(at, s"`${alg}` is not an algorithm this understands -- there are ${algorithms()}")
+
+    val checker = openssl.public_key(key.view()) match
+        Err(e) -> return fault(at, s"this public key could not be read: ${e}")
+        Ok(k) -> k
+
+    openssl.verify(checker, which, message.view(), signature.view()) match
+        Err(e) -> fault(at, s"this signature could not be checked: ${e}")
+        Ok(good) -> Ok(Bool(good))
+end do_jws_verify
