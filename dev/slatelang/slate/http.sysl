@@ -26,6 +26,11 @@ struct Response
 
     // Where a `3xx` points, empty otherwise.
     location: string
+
+    // Every header line as it arrived, `Name: value`. **The fetcher reads none of them and the
+    // program-facing `fetch` hands them all back**, which is why they are kept rather than dropped
+    // after `location` has been picked out of them.
+    headers: []const string
 end Response
 
 // A URL broken into the three parts a request needs.
@@ -36,6 +41,11 @@ struct Url
     host: string
     port: int
     path: string
+
+    // Whether the scheme was `https`. **The parser reads it and the POLICY is the caller's**: a
+    // package must not arrive over cleartext, and that refusal belongs to the fetcher rather than to
+    // the reading of a URL -- a program's own `fetch` takes both schemes.
+    secure: bool
 end Url
 
 private val MaxRedirects: usize = 5
@@ -66,29 +76,43 @@ get(url: string) -> Result[Response, string]
 
         left -= 1
         here = absolute(here, r.location)?
+
+        // **The cleartext rule is asked here, where the package manager's policy lives.** `absolute`
+        // used to enforce it and cannot any more -- it is also the program-facing `fetch`'s, whose
+        // plain-HTTP redirects are ordinary.
+        if !here.starts_with("https://")
+            return Err(s"a redirect to `${here}` would drop to plain HTTP, and a package must not arrive over cleartext")
 end get
 
 // A `Location` may be a whole URL or a path on the same host.
+//
+// **Purely lexical, and the downgrade rule belongs to the CALLER.** This used to spell `https://`
+// into every answer and refuse an `http://` location outright, which was right while the package
+// fetcher was the only caller and wrong the moment a program's own `fetch` arrived: a redirect
+// within a plain-HTTP site is ordinary, and one that leaves `https` for `http` is refused where the
+// scheme being left is known. **The port comes with the host**, which the hardcoded version dropped
+// -- a redirect on a server listening anywhere but 443 went to 443 and was refused by nothing.
 absolute(from: string, location: string) -> Result[string, string]
-    if location.starts_with("https://") then return Ok(location)
-
-    if location.starts_with("http://")
-        return Err(s"a redirect to `${location}` would drop to plain HTTP, and a package must not arrive over cleartext")
+    if location.starts_with("https://") || location.starts_with("http://") then return Ok(location)
 
     val base = parse_url(from)?
+    val scheme = if base.secure then "https" else "http"
+    val standard = if base.secure then 443 else 80
+    val origin = if base.port == standard then s"${scheme}://${base.host}" else s"${scheme}://${base.host}:${base.port}"
 
-    if location.starts_with("/") then return Ok(s"https://${base.host}${location}")
+    if location.starts_with("/") then return Ok(s"${origin}${location}")
 
-    Ok(s"https://${base.host}/${location}")
+    Ok(s"${origin}/${location}")
 end absolute
 
 parse_url(url: string) -> Result[Url, string]
-    if url.starts_with("http://")
-        return Err(s"`${url}` is plain HTTP, and a package must not arrive over cleartext")
+    val secure = url.starts_with("https://")
 
-    if !url.starts_with("https://") then return Err(s"`${url}` is not an https URL")
+    if !secure && !url.starts_with("http://")
+        return Err(s"`${url}` is not an http or https URL")
 
-    val rest = from_utf8_unchecked(url.bytes[8..])
+    val skip: usize = if secure then 8 else 7
+    val rest = from_utf8_unchecked(url.bytes[skip..<url.bytes.len])
     var cut = rest.bytes.len
 
     for i in 0..<rest.bytes.len
@@ -109,9 +133,9 @@ parse_url(url: string) -> Result[Url, string]
             val host = from_utf8_unchecked(authority.bytes[0..<i])
             val port_text = from_utf8_unchecked(authority.bytes[(i + 1)..])
 
-            return Ok(Url(host, number_or(port_text, 443), path))
+            return Ok(Url(host, number_or(port_text, if secure then 443 else 80), path, secure))
 
-    Ok(Url(authority, 443, path))
+    Ok(Url(authority, if secure then 443 else 80, path, secure))
 end parse_url
 
 private number_or(text: string, fallback: int) -> int
@@ -129,8 +153,15 @@ end number_or
 
 // -- one request ------------------------------------------------------------------------------------
 
+// **The cleartext refusal lives here rather than in the parser**, which is the layering the program
+// -facing `fetch` made necessary: reading a URL and deciding what a *package* may arrive over are
+// two questions, and only the second one is the package manager's.
 private get_once(url: string) -> Result[Response, string]
     val target = parse_url(url)?
+
+    if !target.secure
+        return Err(s"`${url}` is plain HTTP, and a package must not arrive over cleartext")
+
     val addresses = resolve(target.host, target.port) match
         Err(e) -> return Err(s"cannot find `${target.host}`: ${e}")
         Ok(found) -> found
@@ -299,7 +330,7 @@ parse_response(raw: []const u8) -> Result[Response, string]
 
     val body = body_of(raw[split_at..], lines)?
 
-    Ok(Response(status, body, location))
+    Ok(Response(status, body, location, lines[1..<lines.len]))
 end parse_response
 
 // A chunked body is reassembled; anything else is taken as it stands.
@@ -361,7 +392,7 @@ end status_of
 
 // **Header names are case-insensitive**, which is not a nicety: `Location` and `location` are both
 // sent in the wild and a fetcher that matched one would follow some redirects and not others.
-private header_is(line: string, name: string) -> bool
+header_is(line: string, name: string) -> bool
     if line.bytes.len < name.bytes.len + 1 then return false
 
     for i in 0..<name.bytes.len
@@ -370,7 +401,7 @@ private header_is(line: string, name: string) -> bool
     line.bytes[name.bytes.len] == u8(':')
 end header_is
 
-private header_value(line: string) -> string
+header_value(line: string) -> string
     for i in 0..<line.bytes.len
         if line.bytes[i] == u8(':')
             var start = i + 1
@@ -388,7 +419,9 @@ end header_value
 
 private lower(c: u8) -> u8 = if c >= u8('A') && c <= u8('Z') then c + 32 else c
 
-private header_end(raw: []const u8) -> usize
+// Not `private`: `server.sysl` reads a request's headers with the same three functions that read a
+// response's. The two directions differ in their first line and in nothing else.
+header_end(raw: []const u8) -> usize
     if raw.len < 4 then return 0
 
     for i in 0..<(raw.len - 3)

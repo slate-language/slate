@@ -1,0 +1,549 @@
+module dev.slatelang.slate
+
+import sh.sysl.libuv
+import sh.sysl.libuv.Handle
+import sh.sysl.libuv.Stream
+import sh.sysl.openssl
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, from_utf8, str_builder}
+
+// `fetch(url)` -- an HTTP request a program makes, on the loop.
+//
+// **This is the fetcher's HTTP asked for again asynchronously**, and the two are deliberately
+// separate. `http.sysl` is *blocking* and belongs to the package manager: `slate fetch` runs before
+// any program starts, with no loop turning and nothing to yield to, and a blocking read there is the
+// simple right answer. A program's `fetch` may not block for a second and a half in the middle of a
+// server answering requests, so this one is a state machine over libuv's resolver, libuv's sockets,
+// and OpenSSL driven as a byte-stream transformer.
+//
+// **The parsing is shared and only the transport differs**: `parse_url`, `parse_response` and
+// `absolute` are `http.sysl`'s, so a header this understands and one the fetcher understands cannot
+// drift apart.
+//
+// ## How TLS runs without a loop of its own
+//
+// `sh.sysl.openssl`'s `Stream` touches no socket. It has an incoming side and an outgoing side --
+// `incoming(bytes)` feeds it what arrived, `outgoing(out)` takes what it wants sent -- so it composes
+// with any transport at all, and this file is what that design was for. **ASK BEFORE YOU DRAIN**:
+// nothing is in the outgoing buffer until something has been asked to produce it, so the handshake is
+// `handshake()` and *then* drain, every time. Draining first sends no ClientHello and both ends block
+// reading each other, which looks exactly like a network fault.
+
+// How many redirects are followed before the answer is that there are too many.
+private const MaxRedirects: usize = 5
+
+// One request in flight.
+struct Fetch
+    live: bool
+
+    // The request slot in `event.sysl` whose promise this settles.
+    request: usize
+    at: Span
+
+    // Where it is going, re-read from the URL after every redirect.
+    url: string
+    host: string
+    port: int
+    target: string
+    secure: bool
+
+    // What to send.
+    method: string
+    body: string
+    extra: Buf[string]
+
+    // The connection. `id` is a slot in `event.sysl`'s table, as every other socket here is.
+    id: usize
+    gen: usize
+    connected: bool
+
+    // The TLS stream, for an `https` request and nothing else.
+    tls: Option[&openssl.Stream]
+
+    // Whether the handshake has finished and the request has gone.
+    ready: bool
+
+    // The response as it arrives, in plaintext -- so after TLS rather than before it.
+    got: Buf[u8]
+
+    redirects: usize
+
+var fetches: Buf[Fetch] = buf()
+
+reset_fetches()
+    fetches = buf()
+
+// `fetch(url)` and `fetch(url, options)` -- a promise of what the server said.
+//
+// The answer is a result, as every other promise from a host call here is: `{ status, headers, body }`
+// where the server answered, and an error where it could not be reached. **A 404 is a success**, the
+// same way a child that exits 1 is: the server answered, and what it said is the answer.
+do_fetch(args: Buf[Value], at: Span) -> Step
+    if args.len() != 1 && args.len() != 2
+        return fault(at, s"`fetch` takes a URL and optionally some options, and was given ${args.len()} arguments")
+
+    val url = text_argument(args.at(0), at, "fetch", "a URL")?
+    val options = if args.len() == 2 then args.at(1) else Value.Null
+    val method = fetch_option(options, "method", at)?
+    val body = fetch_option(options, "body", at)?
+    val extra = fetch_headers(options, at)?
+    val waiting = begin_request()
+    val promised = awaited_request(waiting)
+    val fi = claim_fetch(waiting, at, if method == "" then "GET" else method, body, extra)
+
+    start_fetch(fi, url)
+    Ok(promised)
+end do_fetch
+
+private claim_fetch(request: usize, at: Span, method: string, body: string, extra: Buf[string]) -> usize
+    val f = Fetch(true, request, at, "", "", 80, "/", false, method, body, extra, 0, 0, false, None,
+                  false, buf(), 0)
+
+    for i in 0..<fetches.len()
+        if !fetches.at(i).live
+            fetches.set(i, f)
+            return i
+
+    fetches.push(f)
+    fetches.len() - 1
+
+// Point a fetch at a URL and set it going. Called again for each redirect, which is what makes a
+// redirect the same code as the first request rather than a copy of it.
+private start_fetch(fi: usize, url: string)
+    var f = fetches.at(fi)
+
+    parse_url(url) match
+        Err(why) ->
+            fetches.set(fi, f)
+            fetch_failed(fi, why)
+            return
+        Ok(u) ->
+            f.url = url
+            f.host = u.host
+            f.port = u.port
+            f.target = u.path
+            f.secure = u.secure
+            f.connected = false
+            f.ready = false
+            f.tls = None
+            f.got = buf()
+            fetches.set(fi, f)
+
+    val host = fetches.at(fi).host
+
+    // **The port is asked for as the SERVICE**, which is what puts it in the address libuv answers
+    // with -- there is no way to set one on an `Address` after the fact, and this is how the C
+    // interface expects to be told anyway.
+    libuv.resolve(host, s"${fetches.at(fi).port}", (r) ->
+        r match
+            Ok(found) -> fetch_resolved(fi, found)
+            Err(e) -> fetch_failed(fi, s"cannot find ${host}: ${e}")) match
+        Err(e) -> fetch_failed(fi, s"cannot find ${host}: ${e}")
+        Ok(_) -> ()
+
+// The name resolved. **The first answer is taken and the rest are not tried**, which is what a
+// browser does not do -- it walks the list on a refused connection. A retry loop is the next thing to
+// add here and would change nothing else.
+private fetch_resolved(fi: usize, found: []libuv.AddrInfo)
+    if !fetch_live(fi) then return
+
+    if found.len == 0
+        fetch_failed(fi, s"there is no address for ${fetches.at(fi).host}")
+        return
+
+    val sock = libuv.tcp() match
+        Err(e) ->
+            fetch_failed(fi, s"this socket could not be made: ${e}")
+            return
+        Ok(t) -> t
+
+    var f = fetches.at(fi)
+    val (id, gen) = socket_slot(hold_socket(sock, Value.Null))
+
+    f.id = id
+    f.gen = gen
+    fetches.set(fi, f)
+
+    sock.connect(found[0].address, (r) ->
+        r match
+            Ok(_) -> fetch_connected(fi)
+            Err(e) -> fetch_failed(fi, s"cannot connect to ${fetches.at(fi).host}: ${e}")) match
+        Err(e) -> fetch_failed(fi, s"cannot connect to ${fetches.at(fi).host}: ${e}")
+        Ok(_) -> ()
+
+// The socket is up. A plain request goes now; a secure one starts a handshake and goes when it ends.
+private fetch_connected(fi: usize)
+    if !fetch_live(fi) then return
+
+    var f = fetches.at(fi)
+
+    f.connected = true
+
+    if f.secure
+        openssl.client() match
+            Err(e) ->
+                fetches.set(fi, f)
+                fetch_failed(fi, s"TLS could not be set up: ${e}")
+                return
+            Ok(c) ->
+                openssl.connect(c, f.host) match
+                    Err(e) ->
+                        fetches.set(fi, f)
+                        fetch_failed(fi, s"TLS could not be set up: ${e}")
+                        return
+                    Ok(stream) -> f.tls = Some(stream)
+
+    fetches.set(fi, f)
+
+    socket_at(f.id, f.gen) match
+        None -> fetch_failed(fi, "this connection was closed")
+        Some(sock) ->
+            sock.read_start((r) ->
+                r match
+                    Data(bytes) -> fetch_read(fi, bytes)
+
+                    // **The end of the socket is the end of the answer**, since this asks for
+                    // `Connection: close` -- so what has arrived is what there is, and it is parsed
+                    // rather than complained about.
+                    End -> fetch_ended(fi)
+                    Failed(e) -> fetch_failed(fi, s"this connection failed: ${e}")) match
+                Err(e) -> fetch_failed(fi, s"cannot read the answer: ${e}")
+                Ok(_) -> ()
+
+            if f.secure then step_handshake(fi) else send_request(fi)
+
+// One turn of the handshake: **ask, then drain**. See the header.
+private step_handshake(fi: usize)
+    if !fetch_live(fi) then return
+
+    val f = fetches.at(fi)
+
+    f.tls match
+        None -> ()
+        Some(stream) ->
+            stream.handshake() match
+                Err(e) ->
+                    fetch_failed(fi, s"the TLS handshake failed: ${e}")
+                    return
+                Ok(step) ->
+                    push_tls(fi, stream)
+
+                    step match
+                        Done ->
+                            var g = fetches.at(fi)
+
+                            g.ready = true
+                            fetches.set(fi, g)
+                            send_request(fi)
+                        More -> ()
+
+// Everything OpenSSL wants sent, written to the socket.
+private push_tls(fi: usize, stream: &openssl.Stream)
+    val f = fetches.at(fi)
+
+    loop
+        val n = stream.waiting()
+
+        if n == 0 then break
+
+        var wire: []u8 = [u8(0); n]
+        val took = stream.outgoing(wire)
+
+        if took == 0 then break
+
+        write_wire(fi, wire[0..<took])
+
+// The request line, the headers and the body, encrypted where the connection is.
+private send_request(fi: usize)
+    val f = fetches.at(fi)
+    var out = str_builder()
+
+    out.push(s"${f.method} ${f.target} HTTP/1.1\r\n")
+    out.push(s"Host: ${f.host}\r\n")
+
+    for i in 0..<f.extra.len()
+        out.push(f.extra.at(i))
+        out.push("\r\n")
+
+    // **`Connection: close` is what makes the end of the socket the end of the answer**, which is
+    // the whole of this client's framing. A keep-alive client has to know how long a body is before
+    // it has read it, and that is a second reader for no gain here.
+    out.push("Connection: close\r\n")
+    out.push("Accept: */*\r\n")
+
+    if f.body != "" then out.push(s"Content-Length: ${f.body.bytes.len}\r\n")
+
+    out.push("\r\n")
+    out.push(f.body)
+
+    val text = out.finish()
+
+    f.tls match
+        None -> write_wire(fi, text.bytes)
+        Some(stream) ->
+            stream.send(text.bytes) match
+                Err(e) -> fetch_failed(fi, s"the request could not be encrypted: ${e}")
+                Ok(_) -> push_tls(fi, stream)
+
+// Bytes onto the wire, whatever they are.
+private write_wire(fi: usize, bytes: []const u8)
+    val f = fetches.at(fi)
+
+    socket_at(f.id, f.gen) match
+        None -> ()
+        Some(sock) ->
+            sock.write(bytes, (r) ->
+                r match
+                    Ok(_) -> ()
+                    Err(e) -> fetch_failed(fi, s"the request could not be sent: ${e}")) match
+                Err(e) -> fetch_failed(fi, s"the request could not be sent: ${e}")
+                Ok(_) -> ()
+
+// Bytes off the wire. **Plaintext goes straight into the answer and ciphertext goes through
+// OpenSSL**, which is the only place in this file that knows which kind of connection it is on.
+private fetch_read(fi: usize, bytes: []const u8)
+    if !fetch_live(fi) then return
+
+    var f = fetches.at(fi)
+
+    f.tls match
+        None ->
+            for b in bytes
+                f.got.push(b)
+
+            fetches.set(fi, f)
+        Some(stream) ->
+            stream.incoming(bytes) match
+                Err(e) ->
+                    fetches.set(fi, f)
+                    fetch_failed(fi, s"the answer could not be decrypted: ${e}")
+                    return
+                Ok(_) -> ()
+
+            fetches.set(fi, f)
+
+            if !f.ready
+                step_handshake(fi)
+                return
+
+            drain_tls(fi, stream)
+
+    try_answer(fi)
+
+// Everything OpenSSL has decrypted, into the answer.
+private drain_tls(fi: usize, stream: &openssl.Stream)
+    var plain: []u8 = [u8(0); 16384]
+
+    loop
+        stream.receive(plain) match
+            Err(e) ->
+                fetch_failed(fi, s"the answer could not be decrypted: ${e}")
+                return
+            Ok(got) -> got match
+                Data(n) ->
+                    var f = fetches.at(fi)
+
+                    for i in 0..<n
+                        f.got.push(plain[i])
+
+                    fetches.set(fi, f)
+                Closed -> return
+                Wants -> return
+
+// Whether what has arrived is a whole response yet.
+//
+// **Asked after every chunk, because there is no other way to know**: a response may be split
+// anywhere, and a server that answers and keeps the socket open is answered before it closes.
+private try_answer(fi: usize)
+    val f = fetches.at(fi)
+
+    if header_end(f.got.view()) == 0 then return
+
+    parse_response(f.got.view()) match
+        Err(_) -> ()
+        Ok(r) -> deliver_response(fi, r)
+
+// The socket ended. Whatever arrived is the answer, and a response that will not parse says so here
+// rather than waiting for more that is not coming.
+private fetch_ended(fi: usize)
+    if !fetch_live(fi) then return
+
+    val f = fetches.at(fi)
+
+    if f.got.len() == 0
+        fetch_failed(fi, s"${f.host} closed the connection without answering")
+        return
+
+    parse_response(f.got.view()) match
+        Err(why) -> fetch_failed(fi, why)
+        Ok(r) -> deliver_response(fi, r)
+
+// A whole response: either the answer, or one more request where it is a redirect.
+private deliver_response(fi: usize, r: Response)
+    var f = fetches.at(fi)
+
+    if !f.live then return
+
+    if r.status >= 300 && r.status < 400
+        val location = header_named(r.headers, "location")
+
+        if location != ""
+            if f.redirects >= MaxRedirects
+                fetch_failed(fi, s"${f.url} redirected more than ${MaxRedirects} times")
+                return
+
+            absolute(f.url, location) match
+                Err(why) ->
+                    fetch_failed(fi, why)
+                    return
+                Ok(next) ->
+                    // **A redirect from `https` to `http` is refused rather than followed.** The
+                    // attacker who can redirect you is the one who wanted the connection in the
+                    // clear; `http.sysl` refuses it for the same reason.
+                    if f.secure && !next.starts_with("https:")
+                        fetch_failed(fi, s"${f.url} redirected to ${next}, which is not encrypted")
+                        return
+
+                    f.redirects += 1
+                    fetches.set(fi, f)
+                    close_fetch_socket(fi)
+                    start_fetch(fi, next)
+                    return
+
+    val mark = root_mark()
+    val o = new_object()
+
+    hold(Object(o))
+    obj_put_name(o, "status", Int(long(r.status)))
+
+    val headers = new_object()
+
+    hold(Object(headers))
+
+    for i in 0..<r.headers.len
+        val line = r.headers[i]
+        val colon = colon_at(line)
+
+        if colon > 0
+            obj_put_name(headers, header_name_of(line, colon), str_value(header_value(line)))
+
+    obj_put_name(o, "headers", Object(headers))
+
+    // **A body that is not text is empty rather than mangled**, which is the same answer `run` gives
+    // and for the same reason: slate has no byte value for it to be.
+    val text = from_utf8(r.body) match
+        Ok(t) -> t
+        Err(_) -> ""
+
+    obj_put_name(o, "body", str_value(text))
+    release(mark)
+
+    val request = f.request
+
+    finish_fetch(fi)
+    answer_request(request, Object(o))
+
+// -- the small parts -----------------------------------------------------------------------------
+
+private fetch_live(fi: usize) -> bool
+    if fi >= fetches.len() then return false
+
+    fetches.at(fi).live
+
+private close_fetch_socket(fi: usize)
+    var f = fetches.at(fi)
+
+    if f.connected || f.id != 0
+        surrender(f.id)
+
+    f.connected = false
+    f.tls = None
+    f.id = 0
+    fetches.set(fi, f)
+
+private finish_fetch(fi: usize)
+    close_fetch_socket(fi)
+
+    var f = fetches.at(fi)
+
+    f.live = false
+    f.got = buf()
+    f.extra = buf()
+    fetches.set(fi, f)
+
+// Give the failure back as a result, and stop.
+private fetch_failed(fi: usize, why: string)
+    if !fetch_live(fi) then return
+
+    val f = fetches.at(fi)
+    val request = f.request
+    val at = f.at
+
+    finish_fetch(fi)
+    deny_request(request, at, why)
+
+// One option out of the object a caller passed.
+private fetch_option(options: Value, key: string, at: Span) -> Result[string, Signal]
+    options match
+        Value.Null -> Ok("")
+        Object(o) ->
+            val (v, _) = field_from(o, key, at)?
+
+            v match
+                Undefined -> Ok("")
+                Str(p) -> Ok(p.s)
+                other -> Err(failure(at, s"`${key}` is a string, and this is ${other.type_name()}"))
+        other -> Err(failure(at, s"`fetch` takes its options as an object, and this is ${other.type_name()}"))
+
+// The headers a caller wants sent, as the lines they will be written as.
+private fetch_headers(options: Value, at: Span) -> Result[Buf[string], Signal]
+    var out: Buf[string] = buf()
+
+    options match
+        Value.Null -> return Ok(out)
+        Object(o) ->
+            val (v, _) = field_from(o, "headers", at)?
+
+            v match
+                Undefined -> return Ok(out)
+                Object(h) ->
+                    for i in 0..<h.entries.len()
+                        val e = h.entries.at(i)
+
+                        if !e.dead
+                            e.key match
+                                Str(k) -> out.push(s"${k.s}: ${value_text(e.value)}")
+                                other -> return Err(failure(at, s"a header is named by a string, and this is ${other.type_name()}"))
+
+                    return Ok(out)
+                other -> return Err(failure(at, s"`headers` is an object of names and values, and this is ${other.type_name()}"))
+        other -> return Err(failure(at, s"`fetch` takes its options as an object, and this is ${other.type_name()}"))
+
+private colon_at(line: string) -> usize
+    val b = line.bytes
+
+    for i in 0..<b.len
+        if b[i] == u8(':') then return i
+
+    0
+
+// A header's name, lower-cased for the reason a request's are: HTTP names are case-insensitive and a
+// program reading one should not have to guess which spelling the server chose.
+private header_name_of(line: string, colon: usize) -> string
+    val b = line.bytes
+    var out = str_builder()
+
+    for i in 0..<colon
+        val c = b[i]
+
+        out.push_char(char(u32(if c >= u8('A') && c <= u8('Z') then c + 32 else c)))
+
+    out.finish()
+
+// The value of the first header with this name, or `""`.
+private header_named(headers: []const string, name: string) -> string
+    for i in 0..<headers.len
+        if header_is(headers[i], name) then return header_value(headers[i])
+
+    ""

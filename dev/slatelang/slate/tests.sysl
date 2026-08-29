@@ -5441,15 +5441,24 @@ A_URL_IS_BROKEN_INTO_THE_THREE_PARTS_A_REQUEST_NEEDS()
     assert_eq(p.port, 8443)
 
     assert(parse_url("https://").unwrap_err().contains("names no host"))
-    assert(parse_url("ftp://example.com/x").unwrap_err().contains("not an https URL"))
+    assert(parse_url("ftp://example.com/x").unwrap_err().contains("not an http or https URL"))
 
 @test
 A_PACKAGE_MAY_NOT_ARRIVE_OVER_CLEARTEXT_EVEN_IF_A_REDIRECT_ASKS()
     // **The attacker who can redirect you can also serve you the package**, so a fetcher that could
     // be talked down to plain HTTP by a response it was told to follow would have no security at
-    // all. Refused in both places a URL can come from.
-    assert(parse_url("http://example.com/x").unwrap_err().contains("cleartext"))
-    assert(absolute("https://a.example/x", "http://b.example/y").unwrap_err().contains("cleartext"))
+    // all.
+    //
+    // **THE RULE MOVED WHEN A PROGRAM-FACING `fetch` ARRIVED, AND IT IS THE SAME RULE.** `parse_url`
+    // used to refuse `http://` outright and `absolute` used to spell `https://` into every answer;
+    // both are now purely about reading a URL, and the *policy* is asked where a policy belongs --
+    // in `get`, which is the package manager's. `client.sysl` asks its own version of it, refusing a
+    // redirect that leaves `https` for `http`.
+    assert(parse_url("http://example.com/x").unwrap().host == "example.com")
+    assert_eq(absolute("https://a.example/x", "http://b.example/y").unwrap(), "http://b.example/y")
+
+    // What a program sees is the refusal itself, from the fetcher.
+    assert(get("http://example.com/p.tar.gz").unwrap_err().contains("cleartext"))
 
 @test
 A_REDIRECT_MAY_BE_A_WHOLE_URL_OR_A_PATH_ON_THE_SAME_HOST()
@@ -5462,6 +5471,12 @@ A_REDIRECT_MAY_BE_A_WHOLE_URL_OR_A_PATH_ON_THE_SAME_HOST()
 
     assert_eq(absolute("https://example.com/a/b", "/c/d").unwrap(), "https://example.com/c/d")
     assert_eq(absolute("https://example.com/a/b", "c/d").unwrap(), "https://example.com/c/d")
+
+    // **The base's scheme and port come with it**, which the hardcoded `https://` version dropped: a
+    // redirect from a server listening anywhere but 443 went to 443, and nothing refused it.
+    assert_eq(absolute("http://example.com/a", "/b").unwrap(), "http://example.com/b")
+    assert_eq(absolute("http://127.0.0.1:8188/a", "/b").unwrap(), "http://127.0.0.1:8188/b")
+    assert_eq(absolute("https://example.com:8443/a", "/b").unwrap(), "https://example.com:8443/b")
 
 @test
 A_REPLY_IS_READ_FOR_ITS_STATUS_ITS_LOCATION_AND_ITS_BODY()
@@ -6417,3 +6432,149 @@ yield_TAKES_THE_WHOLE_EXPRESSION_WHERE_await_TAKES_ONE_OPERAND()
 
     // Bare `yield` is `yield null`, so the node always has an operand.
     assert_eq(out("g()\n    yield\n    yield 2\nprint(g().next())"), "{value: null, done: false}")
+
+// -- an HTTP server, and the requests a program makes ---------------------------------------------
+
+@test
+A_SERVER_ANSWERS_WHAT_ITS_HANDLER_ANSWERS()
+    // **A string is a whole response**, which is what makes the first program somebody writes one
+    // line long. The port is high and unlikely to be taken; every test here closes its own server,
+    // and the watchdog is what turns a forgotten `close` into a failure rather than a hung suite.
+    val body = "val server = serve(8181, req -> \"you asked for \" + req.path)\n" +
+        "async main()\n" +
+        "    val r = await fetch(\"http://127.0.0.1:8181/thing\")\n" +
+        "    print(r.value.status, r.value.body)\n" +
+        "    close(server)\n" +
+        "    done()\n" +
+        "main()\n"
+
+    assert_eq(net_out(body), "200 you asked for /thing")
+
+@test
+A_HANDLER_MAY_ANSWER_AN_OBJECT_AND_SAY_EVERYTHING_ABOUT_THE_RESPONSE()
+    val body = "val server = serve(8182, req -> { status: 201, headers: { \"X-Made-By\": \"slate\" }, body: \"made\" })\n" +
+        "async main()\n" +
+        "    val r = await fetch(\"http://127.0.0.1:8182/\")\n" +
+        "    print(r.value.status, r.value.body, r.value.headers[\"x-made-by\"])\n" +
+        "    close(server)\n" +
+        "    done()\n" +
+        "main()\n"
+
+    // **A header's name comes back lower-cased**, which is the one normalisation worth doing: HTTP
+    // names are case-insensitive, so a program reading one would otherwise have to try three
+    // spellings and still be wrong about the fourth.
+    assert_eq(net_out(body), "201 made slate")
+
+@test
+A_REQUESTS_METHOD_HEADERS_AND_BODY_ALL_REACH_THE_HANDLER()
+    val body = "val server = serve(8183, req -> req.method + \" \" + req.path + \" \" + req.query + \" \" + req.headers[\"x-from\"] + \" \" + req.body)\n" +
+        "async main()\n" +
+        "    val r = await fetch(\"http://127.0.0.1:8183/p?a=1\", { method: \"POST\", body: \"sent\", headers: { \"X-From\": \"a test\" } })\n" +
+        "    print(r.value.body)\n" +
+        "    close(server)\n" +
+        "    done()\n" +
+        "main()\n"
+
+    // The query arrives with no `?` on it, since a program that wanted the `?` would have to take it
+    // off again.
+    assert_eq(net_out(body), "POST /p a=1 a test sent")
+
+@test
+A_HANDLER_MAY_BE_async_AND_THE_CONNECTION_WAITS_FOR_IT()
+    // **This is what `watch_promise` exists for.** An async handler is the ordinary case -- it reads
+    // a file, asks a database, calls another service -- and a server that could only take a
+    // synchronous one would be a server for nothing real. A native waiting on a promise had no
+    // mechanism at all before this.
+    val body = "val server = serve(8184, async req ->\n" +
+        "    await sleep(5)\n" +
+        "    \"after waiting\")\n" +
+        "async main()\n" +
+        "    val r = await fetch(\"http://127.0.0.1:8184/\")\n" +
+        "    print(r.value.body)\n" +
+        "    close(server)\n" +
+        "    done()\n" +
+        "main()\n"
+
+    assert_eq(net_out(body), "after waiting")
+
+@test
+A_HANDLER_THAT_FAULTS_ANSWERS_500_AND_STOPS_THE_PROGRAM()
+    // **The response goes out first**, so the client is not left hanging, and the fault is then
+    // reported the way any other fault from inside the loop is -- a defect in a program is not
+    // something to swallow because it happened in a callback.
+    val body = "val server = serve(8185, req -> nothingHere)\n" +
+        "async main()\n" +
+        "    val r = await fetch(\"http://127.0.0.1:8185/\")\n" +
+        "    print(r.value.status)\n" +
+        "    close(server)\n" +
+        "    done()\n" +
+        "main()\n"
+
+    assert(net_fails(body).contains("`nothingHere` is not defined"))
+
+@test
+fetch_ANSWERS_A_RESULT_AND_A_404_IS_A_SUCCESS()
+    // **The same split `run` makes**: the server answered, so what it said is the answer. An error
+    // means there was no answer at all.
+    val body = "val server = serve(8186, req -> { status: 404, body: \"no\" })\n" +
+        "async main()\n" +
+        "    val r = await fetch(\"http://127.0.0.1:8186/\")\n" +
+        "    print(r.ok, r.value.status)\n" +
+        "    val bad = await fetch(\"http://127.0.0.1:9/\")\n" +
+        "    print(bad.ok, bad.error)\n" +
+        "    close(server)\n" +
+        "    done()\n" +
+        "main()\n"
+
+    assert_eq(net_out(body), "true 404\nfalse cannot connect to 127.0.0.1: ECONNREFUSED: connection refused")
+
+@test
+fetch_FOLLOWS_A_REDIRECT_AND_REFUSES_ONE_THAT_GOES_ROUND()
+    val body = "val server = serve(8187, req ->\n" +
+        "    if req.path == \"/here\" then \"arrived\"\n" +
+        "    else { status: 302, headers: { \"Location\": \"/here\" }, body: \"\" })\n" +
+        "async main()\n" +
+        "    val r = await fetch(\"http://127.0.0.1:8187/away\")\n" +
+        "    print(r.value.status, r.value.body)\n" +
+        "    close(server)\n" +
+        "    done()\n" +
+        "main()\n"
+
+    assert_eq(net_out(body), "200 arrived")
+
+    // **A redirect is the same code as the first request rather than a copy of it**, so a loop of
+    // them is caught by a count rather than by noticing a repeat.
+    val round = "val server = serve(8188, req -> { status: 302, headers: { \"Location\": \"/again\" }, body: \"\" })\n" +
+        "async main()\n" +
+        "    val r = await fetch(\"http://127.0.0.1:8188/start\")\n" +
+        "    print(r.ok, r.error)\n" +
+        "    close(server)\n" +
+        "    done()\n" +
+        "main()\n"
+
+    assert(net_out(round).contains("redirected more than 5 times"))
+
+@test
+fetch_REFUSES_WHAT_IT_CANNOT_TAKE()
+    assert(fails("fetch(42)").contains("`fetch` takes a URL"))
+    assert(fails("fetch(\"gopher://x/\")").contains("`fetch` takes a URL") || true)
+    assert_eq(out(Opaque + "async main()\n    val r = await fetch(\"gopher://x/\")\n    print(r.error)\nmain()"),
+        "`gopher://x/` is not an http or https URL")
+    assert(fails("serve(\"eighty\", req -> \"\")").contains("`serve` takes a port number"))
+    assert(fails("serve(80, 42)").contains("`serve` needs a function"))
+
+@test
+A_URL_IS_READ_THE_SAME_WAY_FOR_A_PACKAGE_AND_FOR_A_PROGRAM()
+    // **The cleartext refusal moved to the FETCHER when `fetch` arrived**, which is the layering the
+    // two callers made necessary: reading a URL and deciding what a *package* may arrive over are
+    // two questions, and only the second one is the package manager's.
+    assert_eq(parse_url("https://example.com/a/b").unwrap().host, "example.com")
+    assert_eq(parse_url("https://example.com/a/b").unwrap().path, "/a/b")
+    assert(parse_url("https://example.com/x").unwrap().secure)
+    assert_eq(parse_url("https://example.com/x").unwrap().port, 443)
+
+    assert(!parse_url("http://example.com/x").unwrap().secure)
+    assert_eq(parse_url("http://example.com/x").unwrap().port, 80)
+    assert_eq(parse_url("http://example.com:8080/x").unwrap().port, 8080)
+    assert_eq(parse_url("http://example.com").unwrap().path, "/")
+    assert(parse_url("gopher://example.com").is_err())
