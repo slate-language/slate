@@ -4,6 +4,10 @@
 // it -- so the same program says one thing on your machine and another on the server, and nothing in
 // it names a zone. Here an instant has no year at all until you say where you are standing.
 
+// The temporal names are a module rather than globals, so a program says which of them it wants.
+// `at`, `offset`, `format`, `day` and `second` are words a program has every right to for itself.
+import { now, monotonic, instant, date, time, dateTime, zone, hours, days, weeks, months, year, month, day, hour, second, at, offset, format, parseDate } from slate:time
+
 val t = now()
 
 print("a point on the timeline:", t.string())

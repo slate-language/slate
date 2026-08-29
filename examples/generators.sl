@@ -62,7 +62,7 @@ print(chat.next("well").value)
 fragile()
     try
         yield "fine"
-        print(missing)
+        print(1 / 0)
     catch e
         yield "recovered from: " + e.message
 
