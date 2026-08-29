@@ -576,7 +576,7 @@ path executes.
 
 An interface, in the sense of a set of operations, needs nothing further — functions are values, so
 `type Drawable = { draw: function }` is one. And a trait's other half, the default methods, is what a proto
-already is.
+already is. A class promises one with `is`, below.
 
 ### Objects that share their behaviour
 
@@ -725,6 +725,24 @@ This is the one thing `class` adds that a hand-written proto could not have. A b
 position is a binding unless something has declared it, and a class declaration is what declares it —
 so the name works everywhere a type does: in `is`, in a `match` arm, and in a parameter's annotation.
 A class crosses a file under `export` as both halves at once, the value and the type.
+
+**`is` in a class header is TypeScript's `implements`** — a promise, checked where the class is
+written:
+
+```
+type Drawable = { draw: function }
+
+class Pen is Drawable
+    draw(self) = "pen"
+```
+
+It inherits nothing; `from` does that. What it buys is *when* you find out: leave `draw` out and the
+fault names the class rather than arriving wherever something first wanted to draw one. A class may
+promise several types (`is Drawable, Named`) and descend from one.
+
+A promise is kept by a method a base supplies, because **an object pattern counts a field a proto
+supplies** — a pattern asks whether the value *has* the field, which is the question `.` answers.
+(JavaScript splits the same seam and puts `in` on this side of it.)
 
 **There is no `super`, and none is needed.** A base class is an ordinary value in scope, and a method
 stored on it directly is handed no receiver — so passing one is how you call it:

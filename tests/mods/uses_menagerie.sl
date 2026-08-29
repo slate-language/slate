@@ -1,4 +1,4 @@
-import { Animal, Bird as Tweeter, haunt, isGhost } from "./menagerie.sl"
+import { Animal, Bird as Tweeter, Speaker, haunt, isGhost } from "./menagerie.sl"
 
 val b = Tweeter.new("robin")
 
@@ -19,3 +19,7 @@ print(haunt() match
     _ -> "tested")
 
 print(isGhost(haunt()), isGhost(b))
+
+// The interface crosses as an ordinary `export type`, and `Bird` keeps its promise with a method
+// `Animal` supplies -- one link up the chain.
+print(if b is Speaker then "speaks" else "silent")

@@ -6,10 +6,18 @@
 // whatever fits after `->`; and a **nominal identity**, so `v is Square` can ask which class a value
 // was made from.
 
-class Shape
+// An interface is a `type` over function fields -- nothing further is needed, functions being values.
+type Drawable = { draw: function }
+
+// `is Drawable` is a promise, not an inheritance: it gives the class nothing and only checks that it
+// has what the type names. Leave `draw` out and the fault lands here, on the class that got it wrong,
+// rather than wherever something first wanted to draw one.
+class Shape is Drawable
     // A value the class itself carries. Every object made from it reads this one unless something
     // nearer says otherwise.
     val sides = 0
+
+    draw(self) = s"<${self.name()}>"
 
     // `self` is the object the method was reached from. It is an ordinary parameter, and a method
     // reached through a proto is handed the object -- which is the rule protos already had.
@@ -47,6 +55,10 @@ for s in shapes
 // `describe` lives on `Shape` and calls `area`, which only the two below it have -- so the call goes
 // back down to whichever object it started from. That is dispatch, and no keyword arranges it.
 print(Square.new(3).sides, Circle.new(3).sides)
+
+// A subclass keeps the promise with a method its base supplies -- a pattern asks whether the value
+// HAS the field, which is the question `.` answers, so it looks up the chain like everything else.
+print(Square.new(1).draw(), Square.new(1) is Drawable)
 
 // `is` asks which class an object was made from, and it walks the whole chain.
 val sq = Square.new(1)
