@@ -601,6 +601,90 @@ A_CONNECTION_NOBODY_IS_USING_IS_CLOSED_AFTER_ITS_IDLE_TIME()
     assert_eq(out(HttpImport + WireImport + fused(9000, body)),
         "the server hung up on a connection nobody was using")
 
+// -- a request that does not know its own length ---------------------------------------------------
+
+@test
+A_CHUNKED_REQUEST_IS_PUT_BACK_TOGETHER_BEFORE_THE_HANDLER_SEES_IT()
+    // **The framing a client uses when it does not know the length yet**, which is every client
+    // streaming a file or generating what it sends. What the handler is given is the reassembled
+    // body and nothing about how it arrived -- a handler is written once, for both framings.
+    //
+    // The second request is a plain `GET` behind the chunked one, and it is the assertion that
+    // matters most: finding where a chunked body ENDS is a walk rather than a subtraction, so a
+    // walk that stopped a byte early or late would leave the next request unreadable. The third
+    // carries a `;name=value` extension on its size and a trailer header after its last chunk,
+    // both of which are read past.
+    val body = "val server = serve(0, req -> req.method + req.path + \"[\" + req.body + \"]\")\n" + "async main()\n" +
+        "    val c = (await connect(\"127.0.0.1\", localPort(server))).value\n" + "    var got = \"\"\n" +
+        "    heard(chunk)\n" + "        if chunk == null\n" +
+        "            print(join(split(got, \"\\r\\n\"), \"|\"))\n" + "            shutSocket(c)\n" +
+        "            close(server)\n" + "            done()\n" + "        else\n" +
+        "            got = got + chunk\n" + "    onData(c, heard)\n" +
+        "    await send(c, \"POST /a HTTP/1.1\\r\\nHost: h\\r\\nTransfer-Encoding: chunked\\r\\n\\r\\n\" +\n" +
+        "        \"5\\r\\nhello\\r\\n6\\r\\n world\\r\\n0\\r\\n\\r\\n\" +\n" +
+        "        \"GET /b HTTP/1.1\\r\\nHost: h\\r\\n\\r\\n\" +\n" +
+        "        \"PUT /c HTTP/1.1\\r\\nHost: h\\r\\nConnection: close\\r\\nTransfer-Encoding: chunked\\r\\n\\r\\n\" +\n" +
+        "        \"3;name=value\\r\\nabc\\r\\n0\\r\\nX-After: 1\\r\\n\\r\\n\")\n" + "main()\n"
+
+    assert_eq(wire_out(body),
+        "HTTP/1.1 200 OK|Content-Length: 19|Connection: keep-alive||POST/a[hello world]" +
+            "HTTP/1.1 200 OK|Content-Length: 7|Connection: keep-alive||GET/b[]" +
+            "HTTP/1.1 200 OK|Content-Length: 10|Connection: close||PUT/c[abc]")
+
+@test
+A_CHUNKED_BODY_ARRIVING_ONE_BYTE_AT_A_TIME_IS_STILL_ONE_REQUEST()
+    // **The strongest form of the only question a chunked reader has to answer**: is what has
+    // arrived so far the whole body? Sending the request a byte at a time asks that question at
+    // every position there is -- inside a size, inside a chunk, between the `\r` and the `\n`, and
+    // in the middle of the blank line that closes the whole thing. A reader that answered "yes"
+    // one byte early anywhere would answer a truncated request here.
+    val body = "val server = serve(0, req -> \"<\" + req.body + \">\")\n" + "async main()\n" +
+        "    val c = (await connect(\"127.0.0.1\", localPort(server))).value\n" + "    var got = \"\"\n" +
+        "    heard(chunk)\n" + "        if chunk == null\n" +
+        "            print(join(split(got, \"\\r\\n\"), \"|\"))\n" + "            shutSocket(c)\n" +
+        "            close(server)\n" + "            done()\n" + "        else\n" +
+        "            got = got + chunk\n" + "    onData(c, heard)\n" +
+        "    val wire = (\"POST / HTTP/1.1\\r\\nHost: h\\r\\nTransfer-Encoding: chunked\\r\\nConnection: close\\r\\n\\r\\n\" +\n" +
+        "        \"5\\r\\nhello\\r\\n4\\r\\n why\\r\\n0\\r\\n\\r\\n\")\n" + "    for i in 0..<len(wire)\n" +
+        "        await send(c, wire[i..<(i + 1)])\n" + "main()\n"
+
+    assert_eq(wire_out(body), "HTTP/1.1 200 OK|Content-Length: 11|Connection: close||<hello why>")
+
+@test
+A_BODY_THIS_SERVER_CANNOT_FRAME_IS_ANSWERED_RATHER_THAN_MISREAD()
+    // Four requests, each on its own connection, and the last of them is the one worth reading
+    // twice.
+    //
+    // **A coding this server has not implemented is `501` and not `400`**, the request being well
+    // formed and this server the one that is short -- a difference the client can act on. A chunk
+    // size that is not a number is `400`, and so is a `Content-Length` that is not one.
+    //
+    // **A request carrying BOTH framings is read by its chunks, and the length it also gave is
+    // ignored.** That is HTTP's rule rather than a preference: the two disagreeing is exactly what
+    // request smuggling is made of, and a server reading the `99` here while a proxy in front of it
+    // read the chunks would be answering a request nobody sent. The body is `hi`.
+    val body = "val server = serve(0, req -> \"<\" + req.body + \">\")\n" + "async once(wire)\n" +
+        "    val c = (await connect(\"127.0.0.1\", localPort(server))).value\n" + "    var got = \"\"\n" +
+        "    heard(chunk)\n" + "        if chunk != null then got = got + chunk\n" +
+        "    onData(c, heard)\n" + "    await send(c, wire)\n" + "    await sleep(80)\n" +
+        "    shutSocket(c)\n" + "    join(split(got, \"\\r\\n\"), \"|\")\n" + "async main()\n" +
+        "    print(await once(\"POST / HTTP/1.1\\r\\nHost: h\\r\\nTransfer-Encoding: gzip\\r\\n\\r\\nxx\"))\n" +
+        "    print(await once(\"POST / HTTP/1.1\\r\\nHost: h\\r\\nTransfer-Encoding: chunked\\r\\n\\r\\nzz\\r\\nabc\\r\\n0\\r\\n\\r\\n\"))\n" +
+        "    print(await once(\"POST / HTTP/1.1\\r\\nHost: h\\r\\nContent-Length: apple\\r\\n\\r\\n\"))\n" +
+        "    print(await once(\"POST / HTTP/1.1\\r\\nHost: h\\r\\nTransfer-Encoding: chunked\\r\\nContent-Length: 99\\r\\n\\r\\n2\\r\\nhi\\r\\n0\\r\\n\\r\\n\"))\n" +
+        "    close(server)\n" + "    done()\n" + "main()\n"
+
+    assert_eq(wire_out(body),
+        "HTTP/1.1 501 Not Implemented|Content-Length: 66|Connection: close||" +
+            "this server reads `Transfer-Encoding: chunked` and no other coding\n" +
+            "HTTP/1.1 400 Bad Request|Content-Length: 50|Connection: close||" +
+            "this request's chunked body does not hold together\n" +
+            "HTTP/1.1 400 Bad Request|Content-Length: 47|Connection: close||" +
+            "this request's `Content-Length` is not a number\n" +
+            "HTTP/1.1 200 OK|Content-Length: 4|Connection: keep-alive||<hi>")
+
+// -- the url a request is made to ------------------------------------------------------------------
+
 @test
 A_URL_IS_READ_THE_SAME_WAY_FOR_A_PACKAGE_AND_FOR_A_PROGRAM()
     // **The cleartext refusal moved to the FETCHER when `fetch` arrived**, which is the layering the
