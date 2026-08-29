@@ -1,0 +1,354 @@
+module dev.slatelang.slate
+
+import sh.sysl.openssl
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// TLS for a slate socket, which is what makes `serve` an HTTPS server without `serve` learning
+// anything.
+//
+// **TLS IS A TRANSPORT AND NOT AN HTTP CONCERN**, so it goes under `listen` rather than beside
+// `serve`. A listener told a certificate hands out connections whose bytes are already decrypted, so
+// `slate:http` -- and any other protocol a program writes over `slate:net` -- works over TLS
+// unchanged. node splits it the other way, with an `https` module beside `http`; node's `https` is
+// literally `http` over a `tls.Server`, and putting the seam one layer down is that arrangement with
+// the duplication left out.
+//
+// **`sh.sysl.openssl`'s `Stream` touches no socket**, which is the whole reason this composes: it has
+// an incoming side and an outgoing side and never asks where the bytes came from. So the same binding
+// that drives the blocking fetcher drives this, on libuv, with no second implementation.
+//
+// **ASK BEFORE YOU DRAIN.** Nothing is in the outgoing buffer until something has been asked to
+// produce it, so it is `handshake()` or `send()` and *then* `pull`, every time. `client.sysl` says
+// the same thing about the other end.
+
+// What a listener holds, and what each connection accepted from it holds.
+//
+// **An `&openssl.Server` and an `&openssl.Stream` are counted boxes, so they may not live in the
+// collected heap** -- which is `Value.Socket`'s rule and `RegexVal`'s. They live here, in a table
+// beside the socket table and indexed by the same slot, and a slot's entry goes when the socket does.
+private struct Tls
+    // Set on a LISTENER. Its presence is the whole of what makes the connections under it encrypted.
+    server: Option[&openssl.Server]
+
+    // Set on a CONNECTION, one per accepted socket.
+    stream: Option[&openssl.Stream]
+
+    // Whether the handshake has finished. Nothing a program writes reaches the wire before it has.
+    ready: bool
+
+    // Plaintext a program asked to send before the handshake finished, and the requests waiting on
+    // it. **A server usually never has any** -- a program writes from inside its read callback, and
+    // by the time that runs the handshake is long done -- but a protocol whose server speaks first
+    // does, and dropping those bytes would be silent.
+    queued: Buf[u8]
+    waiting: Buf[usize]
+end Tls
+
+private var slots: Buf[Tls] = buf()
+
+private blank() -> Tls = Tls(None, None, false, buf(), buf())
+
+// Forget every connection's TLS. Called when a new program is run, exactly as the socket table is.
+forget_tls()
+    slots.clear()
+
+// Make room for a slot the socket table has just handed out. Slot numbers are dense and reused, so
+// this grows to the table's own size and no further.
+private room(id: usize)
+    loop
+        if slots.len() > id then break
+
+        slots.push(blank())
+
+// Whether this socket carries TLS at all -- which is the question every path in `net.sysl` asks
+// before doing anything different.
+tls_here(id: usize) -> bool
+    if id >= slots.len() then return false
+
+    slots.at(id).stream.is_some()
+
+// Whether this socket is a listener handing out encrypted connections.
+tls_listener(id: usize) -> bool
+    if id >= slots.len() then return false
+
+    slots.at(id).server.is_some()
+
+// Give a listener a certificate and a key, both PEM.
+//
+// **A key that does not go with the certificate is caught here and nowhere else**, which is the
+// binding's own note and is why this reports rather than waiting: both installs succeed on a
+// mismatched pair, and the handshake then fails at the *client* with a decrypt error that says
+// nothing about this end at all.
+tls_serve(id: usize, certificate: []const u8, key: []const u8, alpn: []const string) -> Result[unit, string]
+    room(id)
+
+    val sv = openssl.server(certificate, key) match
+        Err(e) -> return Err(s"this certificate and key could not be used: ${e}")
+        Ok(s) -> s
+
+    if alpn.len > 0
+        sv.offer(alpn) match
+            Err(e) -> return Err(s"these protocols could not be offered: ${e}")
+            Ok(_) -> ()
+
+    var slot = slots.at(id)
+
+    slot.server = Some(sv)
+    slots.set(id, slot)
+    Ok(())
+end tls_serve
+
+// A connection accepted from a TLS listener gets a stream of its own.
+tls_accepted(listener: usize, conn: usize) -> Result[unit, string]
+    room(conn)
+
+    val sv = slots.at(listener).server match
+        Some(s) -> s
+        None -> return Ok(())
+
+    val stream = openssl.accept(sv) match
+        Err(e) -> return Err(s"this connection could not be secured: ${e}")
+        Ok(s) -> s
+
+    var slot = slots.at(conn)
+
+    slot.stream = Some(stream)
+    slot.ready = false
+    slots.set(conn, slot)
+    Ok(())
+end tls_accepted
+
+// Everything OpenSSL wants sent, taken out of its outgoing buffer.
+//
+// **Answered rather than written**, so that this file never touches a socket: `net.sysl` owns the
+// handle and does the writing, and the two halves stay where they belong.
+tls_pull(id: usize) -> Buf[u8]
+    var out: Buf[u8] = buf()
+
+    if id >= slots.len() then return out
+
+    val stream = slots.at(id).stream match
+        Some(s) -> s
+        None -> return out
+
+    loop
+        val n = stream.waiting()
+
+        if n == 0 then break
+
+        var wire: []u8 = [u8(0); n]
+        val took = stream.outgoing(wire)
+
+        if took == 0 then break
+
+        for i in 0..<took
+            out.push(wire[i])
+
+    out
+end tls_pull
+
+// Bytes off the wire, turned into whatever plaintext they carried.
+//
+// **The handshake and the application data are one path**, because a TLS connection moves between
+// the two without the socket noticing: a renegotiation, a session ticket or a close-notify arrives
+// looking exactly like data, and `receive` answering `Wants` is what says there is nothing for the
+// program yet.
+tls_took(id: usize, cipher: []const u8) -> Result[Buf[u8], string]
+    var plain: Buf[u8] = buf()
+
+    if id >= slots.len() then return Ok(plain)
+
+    val stream = slots.at(id).stream match
+        Some(s) -> s
+        None -> return Ok(plain)
+
+    stream.incoming(cipher) match
+        Err(e) -> return Err(s"this connection could not be read: ${e}")
+        Ok(_) -> ()
+
+    if !slots.at(id).ready
+        stream.handshake() match
+            Err(e) -> return Err(s"the TLS handshake failed: ${e}")
+            Ok(step) ->
+                if step != openssl.Step.Done then return Ok(plain)
+
+        var slot = slots.at(id)
+
+        slot.ready = true
+        slots.set(id, slot)
+
+        // Whatever the program wrote while the handshake was still going now has somewhere to go.
+        push_queued(id)?
+
+    var out: []u8 = [u8(0); 16384]
+
+    loop
+        stream.receive(out) match
+            Err(e) -> return Err(s"this connection could not be decrypted: ${e}")
+            Ok(got) -> got match
+                Data(n) ->
+                    for i in 0..<n
+                        plain.push(out[i])
+                Closed -> break
+                Wants -> break
+
+    Ok(plain)
+end tls_took
+
+// Plaintext a program is sending, encrypted. **Queued rather than refused where the handshake has
+// not finished**, since a program has no way to ask whether it has.
+//
+// The request id is what settles the program's promise: where the bytes went straight into OpenSSL
+// the caller writes the ciphertext itself and settles it then, and where they were queued it is
+// answered here, when they finally do.
+tls_send(id: usize, plain: []const u8, request: usize) -> Result[bool, string]
+    if id >= slots.len() then return Ok(false)
+
+    val slot = slots.at(id)
+
+    val stream = slot.stream match
+        Some(s) -> s
+        None -> return Ok(false)
+
+    if !slot.ready
+        var held = slots.at(id)
+
+        for i in 0..<plain.len
+            held.queued.push(plain[i])
+
+        held.waiting.push(request)
+        slots.set(id, held)
+        return Ok(false)
+
+    encrypt(stream, plain)?
+    Ok(true)
+end tls_send
+
+private encrypt(stream: &openssl.Stream, plain: []const u8) -> Result[unit, string]
+    var from: usize = 0
+
+    loop
+        if from >= plain.len then break
+
+        stream.send(plain[from..<plain.len]) match
+            Err(e) -> return Err(s"this connection could not be written to: ${e}")
+            Ok(sent) -> sent match
+                Took(n) ->
+                    if n == 0 then break
+
+                    from += n
+
+                // OpenSSL wants more room in its own buffers, which it gets when the caller drains
+                // them -- so stopping here is right and the rest goes out on the next turn.
+                Wants -> break
+
+    Ok(())
+end encrypt
+
+// What the queue is owed once the handshake finishes, and who is waiting on it.
+private push_queued(id: usize) -> Result[unit, string]
+    val slot = slots.at(id)
+
+    if slot.queued.len() == 0 then return Ok(())
+
+    val stream = slot.stream match
+        Some(s) -> s
+        None -> return Ok(())
+
+    encrypt(stream, slot.queued.view())?
+
+    var cleared = slots.at(id)
+
+    cleared.queued.clear()
+    slots.set(id, cleared)
+    Ok(())
+end push_queued
+
+// The requests a queued write left waiting, taken out so the caller can settle them.
+tls_settled(id: usize) -> Buf[usize]
+    var out: Buf[usize] = buf()
+
+    if id >= slots.len() then return out
+
+    var slot = slots.at(id)
+
+    for i in 0..<slot.waiting.len()
+        out.push(slot.waiting.at(i))
+
+    slot.waiting.clear()
+    slots.set(id, slot)
+    out
+end tls_settled
+
+// Give a socket's TLS back. **A close-notify is deliberately not sent**: writing one needs a socket
+// this file does not have and a turn of the loop the close does not wait for, and HTTP/1.1 over a
+// framed body does not depend on it. A protocol that does needs this to grow a shutdown.
+tls_drop(id: usize)
+    if id >= slots.len() then return
+
+    slots.set(id, blank())
+
+// -- what `listen` was given -----------------------------------------------------------------------
+
+// How a listener is to be secured, read off the object a program wrote.
+struct Secure
+    certificate: Buf[u8]
+    key: Buf[u8]
+
+    // The protocols this server will speak, most preferred first. Empty means ALPN is not offered
+    // at all, which is an ordinary connection for a client that does not ask.
+    alpn: Buf[string]
+end Secure
+
+// `listen`'s first argument: a port, or an object saying how to secure it.
+//
+// **One argument reading two ways rather than a second function**, because the alternative is a name
+// per combination -- `listenTls` beside `listen`, and then `serveTls` and `serveStreamTls` beside
+// the two servers. slate has no default arguments to fold them back together with, and a number and
+// an object can never be mistaken for one another.
+//
+//     listen({ port: 8443, cert: pem, key: pem }, accept)
+listen_target(v: Value, at: Span) -> Result[(long, Option[Secure]), Signal]
+    v match
+        Int(n) -> Ok((n, None))
+        Object(o) ->
+            val port = obj_get_name(o, "port") match
+                Some(Int(n)) -> n
+                Some(other) -> return Err(failure(at, s"`listen` takes the port as a number, and this is ${other.type_name()}"))
+                None -> return Err(failure(at, "`listen` was given an object with no `port` in it -- a secured listener is `{ port, cert, key }`"))
+
+            val certificate = pem_of(o, "cert", at)?
+            val key = pem_of(o, "key", at)?
+            var alpn: Buf[string] = buf()
+
+            obj_get_name(o, "alpn") match
+                None -> ()
+                Some(Array(a)) ->
+                    for i in 0..<a.items.len()
+                        a.items.at(i) match
+                            Str(name) -> alpn.push(name.s)
+                            other -> return Err(failure(at, s"`alpn` is a list of protocol names, and one of them is ${other.type_name()}"))
+                Some(other) -> return Err(failure(at, s"`alpn` is a list of protocol names, and this is ${other.type_name()}"))
+
+            Ok((port, Some(Secure(certificate, key, alpn))))
+        other -> Err(failure(at, s"`listen` takes a port number, or an object saying how to secure one, and this is ${other.type_name()}"))
+end listen_target
+
+// A certificate or a key, **as PEM and never as a file name.** Where the bytes came from -- a file, a
+// secret store, an environment variable, a test's own string -- is the program's business, and a
+// listener that took a path would be asking for the filesystem to answer a question about
+// cryptography. The binding says the same thing one layer down.
+private pem_of(o: *ObjectObj, name: string, at: Span) -> Result[Buf[u8], Signal]
+    obj_get_name(o, name) match
+        None -> Err(failure(at, s"a secured listener needs `${name}`, as PEM text -- `{ port, cert, key }`"))
+        Some(Str(p)) ->
+            var out: Buf[u8] = buf()
+
+            for i in 0..<p.s.bytes.len
+                out.push(p.s.bytes[i])
+
+            Ok(out)
+        Some(Array(a)) -> bytes_of(a, at, name)
+        Some(other) -> Err(failure(at, s"`${name}` is PEM text or its bytes, and this is ${other.type_name()}"))
+end pem_of

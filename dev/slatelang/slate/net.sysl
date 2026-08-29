@@ -118,7 +118,11 @@ loop_fails(message: string)
 //
 // **A port of `0` asks the kernel for one**, which is what `localPort` is for and what lets a test
 // run without choosing a number no other program is using.
-listen_socket(port: long, cb: Value, at: Span) -> Step
+//
+// **`secure` is what makes it HTTPS**, and it is here rather than beside `serve` because TLS is a
+// transport: a listener told a certificate hands out connections whose bytes are already decrypted,
+// so `slate:http` and anything else written over these sockets works over TLS unchanged.
+listen_socket(port: long, secure: Option[Secure], cb: Value, at: Span) -> Step
     cb match
         Fn(_) -> ()
         Native(_) -> ()
@@ -130,16 +134,38 @@ listen_socket(port: long, cb: Value, at: Span) -> Step
         Err(e) -> return fault(at, s"this socket could not be made: ${e}")
         Ok(t) -> t
 
-    val addr = libuv.ip4("0.0.0.0", int(port)) match
-        Err(e) -> return fault(at, s"this address could not be read: ${e}")
-        Ok(a) -> a
+    // **`::` RATHER THAN `0.0.0.0`, WHICH IS WHAT MAKES `localhost` REACH THIS SERVER.** A dual-stack
+    // socket accepts IPv4 connections as mapped addresses, so `127.0.0.1` still arrives -- and
+    // `localhost` resolves to `::1` first on every machine that follows RFC 6724, which is all of
+    // them. Bound to IPv4 alone, a slate server was simply not there for a client that asked for it
+    // by name, and the failure was `ECONNREFUSED` -- which reads as nothing listening.
+    //
+    // **A host with no IPv6 at all falls back**, since the bind is what says so and there is nothing
+    // to be gained by refusing to serve.
+    val bound = libuv.ip6("::", int(port)) match
+        Err(_) -> false
+        Ok(a) -> server.bind(a).is_ok()
 
-    server.bind(addr) match
-        Err(e) -> return fault(at, s"cannot listen on port ${port}: ${e}")
-        Ok(_) -> ()
+    if !bound
+        val addr = libuv.ip4("0.0.0.0", int(port)) match
+            Err(e) -> return fault(at, s"this address could not be read: ${e}")
+            Ok(a) -> a
+
+        server.bind(addr) match
+            Err(e) -> return fault(at, s"cannot listen on port ${port}: ${e}")
+            Ok(_) -> ()
 
     val held = hold_socket(server, cb)
     val (id, gen) = socket_slot(held)
+
+    secure match
+        None -> ()
+        Some(how) ->
+            tls_serve(id, how.certificate.view(), how.key.view(), how.alpn.view()) match
+                Err(e) ->
+                    surrender(id)
+                    return fault(at, e)
+                Ok(_) -> ()
 
     server.listen(128, () -> accepted(id, gen)) match
         Err(e) ->
@@ -166,7 +192,21 @@ private accepted(id: usize, gen: usize)
                     // **The connection gets a slot of its own with no callback yet.** It is the
                     // program's to read from, write to and close, and until it calls `onData` there
                     // is nothing to deliver anything to.
-                    deliver(id, gen, hold_socket(conn, Null))
+                    val made = hold_socket(conn, Null)
+                    val (cid, cgen) = socket_slot(made)
+
+                    // **The handshake is not driven here**, and could not be: nothing has been read
+                    // yet and nothing will be until the program calls `onData`. This only gives the
+                    // connection a stream; `arrived` is where the two ends talk.
+                    if tls_listener(id)
+                        tls_accepted(id, cid) match
+                            Err(e) ->
+                                surrender(cid)
+                                loop_fails(e)
+                                return
+                            Ok(_) -> ()
+
+                    deliver(id, gen, made)
 
 // `connect(host, port)` -- a promise of a connected socket.
 //
@@ -246,24 +286,77 @@ private arrived(id: usize, gen: usize, r: libuv.Read, as_text: bool)
         End -> deliver(id, gen, Null)
         Failed(e) -> loop_fails(s"this connection failed: ${e}")
         Data(bytes) ->
-            if as_text
-                // **A chunk is a chunk and not a message**, so this can split a character in half
-                // where a peer sends one across two packets. `onBytes` is the reader that cannot.
-                from_utf8(bytes) match
-                    Ok(text) -> deliver(id, gen, str_value(text))
-                    Err(_) -> loop_fails("this chunk is not text -- `onBytes` reads a socket that carries something else")
+            if tls_here(id)
+                secured(id, gen, bytes, as_text)
             else
-                var items: Buf[Value] = buf()
+                plainly_arrived(id, gen, bytes, as_text)
 
-                for i in 0..<bytes.len
-                    items.push(Int(long(bytes[i])))
+// What arrived on a TLS connection: fed to OpenSSL, whatever it wants sent written back, and
+// whatever it decrypted handed on. **A handshake turn produces no plaintext and is not nothing** --
+// it is the whole of the first few round trips, and the program sees none of them.
+private secured(id: usize, gen: usize, cipher: []const u8, as_text: bool)
+    val plain = tls_took(id, cipher) match
+        // **A HANDSHAKE THAT FAILS ENDS THE CONNECTION AND NOTHING ELSE.** It is the ordinary answer
+        // to a client that is not speaking TLS -- a browser sent to `http://` on this port, a probe,
+        // a scanner -- and stopping the program over one would make any server trivially killable
+        // from outside. The program is told what it would be told for any other end of stream, which
+        // is what lets `slate:http` close its side without knowing why.
+        Err(_) ->
+            deliver(id, gen, Null)
+            tls_drop(id)
 
-                val mark = root_mark()
-                val a = new_array(items)
+            if socket_at(id, gen).is_some() then surrender(id)
 
-                hold(Array(a))
-                deliver(id, gen, Array(a))
-                release(mark)
+            return
+        Ok(p) -> p
+
+    push_wire(id, gen)
+
+    if plain.len() > 0 then plainly_arrived(id, gen, plain.view(), as_text)
+
+// Everything OpenSSL wants sent, written to the socket. **Nothing awaits it**: the program's own
+// `send` answers a promise for its own bytes, and a handshake record belongs to nobody.
+private push_wire(id: usize, gen: usize)
+    val out = tls_pull(id)
+
+    if out.len() == 0 then return
+
+    socket_at(id, gen) match
+        None -> ()
+        Some(sock) ->
+            sock.write(out.view(), (r) ->
+                r match
+                    Ok(_) -> ()
+                    Err(e) -> loop_fails(s"this connection could not be written to: ${e}")) match
+                Err(e) -> loop_fails(s"this connection could not be written to: ${e}")
+                Ok(_) -> ()
+
+    // **Read once**: taking the list is what clears it, so asking twice would answer the second
+    // question with nothing and leave those promises pending forever.
+    val settled = tls_settled(id)
+
+    for i in 0..<settled.len()
+        answer_request(settled.at(i), Null)
+
+private plainly_arrived(id: usize, gen: usize, bytes: []const u8, as_text: bool)
+    if as_text
+        // **A chunk is a chunk and not a message**, so this can split a character in half
+        // where a peer sends one across two packets. `onBytes` is the reader that cannot.
+        from_utf8(bytes) match
+            Ok(text) -> deliver(id, gen, str_value(text))
+            Err(_) -> loop_fails("this chunk is not text -- `onBytes` reads a socket that carries something else")
+    else
+        var items: Buf[Value] = buf()
+
+        for i in 0..<bytes.len
+            items.push(Int(long(bytes[i])))
+
+        val mark = root_mark()
+        val a = new_array(items)
+
+        hold(Array(a))
+        deliver(id, gen, Array(a))
+        release(mark)
 
 // `send(sock, data)` -- a promise that settles when the bytes have gone.
 //
@@ -280,6 +373,29 @@ send_bytes(v: Value, payload: []const u8, at: Span) -> Step
     val sock = socket_at(id, gen).unwrap()
     val waiting = begin_request()
     val promised = awaited_request(waiting)
+
+    // **On a TLS connection the bytes that reach the socket are not the bytes the program wrote**,
+    // so the write below is of the ciphertext OpenSSL produced. Where the handshake has not finished
+    // the plaintext is queued instead and this request is settled when it finally goes out, which is
+    // what `tls_settled` is for.
+    if tls_here(id)
+        tls_send(id, payload, waiting) match
+            Err(e) ->
+                deny_request(waiting, at, e)
+                return Ok(promised)
+            Ok(went) ->
+                if !went then return Ok(promised)
+
+        val cipher = tls_pull(id)
+
+        sock.write(cipher.view(), (r) ->
+            r match
+                Ok(_) -> answer_request(waiting, Null)
+                Err(e) -> refuse_request(waiting, at, "cannot send", e)) match
+            Err(e) -> refuse_request(waiting, at, "cannot send", e)
+            Ok(_) -> ()
+
+        return Ok(promised)
 
     sock.write(payload, (r) ->
         r match
@@ -298,7 +414,9 @@ close_socket(v: Value, at: Span) -> Step
             // **Closing a socket twice is not an error.** A server closing its connections and a
             // read callback closing its own on end-of-stream is the ordinary way to write this, and
             // making the second one a failure would make the ordinary way wrong.
-            if socket_at(id, gen).is_some() then surrender(id)
+            if socket_at(id, gen).is_some()
+                tls_drop(id)
+                surrender(id)
 
             Ok(Null)
         other -> fault(at, s"`close` takes a socket, and this is ${other.type_name()}")
