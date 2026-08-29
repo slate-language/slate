@@ -1,0 +1,268 @@
+module dev.slatelang.slate
+
+import sh.sysl.llhttp.{requests, Header, Limits, Request, Requests}
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{from_utf8, to_lower, Search}
+
+// HTTP request parsing, which is node's llhttp and is not written in slate.
+//
+// **`slate:http` owns the server and this owns the parse, which is node's own layering.** The slate
+// module keeps everything a server decides -- keep-alive and the client's `Connection` rule, the idle
+// clock, `busy` and the order answers go back in, the request and response shapes, the
+// 500-and-put-the-fault-back path. What moved down here is only the recognising of bytes, and it
+// moved for two reasons that are not preferences:
+//
+// - **A byte-at-a-time scan is the worst thing an interpreted language can be asked to do**, and it
+//   runs over every byte of every request. Worse, the scan restarted from the front of the buffer on
+//   each arrival, so a large body cost the interpreter O(n^2).
+// - **The malformed request is the whole problem, and it is malformed on purpose.** Two
+//   `Content-Length` headers, or one beside a `Transfer-Encoding`, is a request-smuggling primitive:
+//   one hop reads a body where the next reads two requests. llhttp is generated from a state machine
+//   and refuses those by construction; the slate parser refused the second and did not know about
+//   the first.
+//
+// **It also had no limits at all.** A connection that dribbled bytes and never finished a request
+// grew a buffer until the process died, which took no attacker -- an upload sent to a JSON endpoint
+// does it. `Limits` is the fix and is the reason this tier of the binding rather than the one below.
+//
+// ## What a slot holds, and why nothing in it is a slate value
+//
+// **The collector cannot see through an ARC box**, which is `net.sysl`'s rule and binds here for the
+// same reason: a completed request parked in a sysl `Buf` would be invisible to the mark phase. So a
+// slot holds llhttp's own `Request` -- sysl strings and buffers -- and the slate object is built in
+// `take_request`, at the moment a program asks for one and can root it.
+//
+// **The callback cannot name the parser it belongs to**, a sysl closure capturing by value and the
+// parser not existing yet when the handler is written. A box both of them hold is how that knot is
+// untied, which is `Arrived` below.
+
+// One finished request, copied out of the parser's own buffers.
+//
+// **THE COPY IS NOT OPTIONAL AND ITS ABSENCE IS SILENT.** `Requests` hands the callback a `Request`
+// built over its OWN `headers` and `body` buffers, and it reuses those for the next message on the
+// connection -- so a queued `&Request` is a window onto storage that the next request writes
+// through. Keeping the reference made a pipelined `POST /a` with body `hello` arrive as `hillo`,
+// the `hi` of the third request on that connection having been written over the front of the first.
+// Nothing failed; the bytes were simply wrong, which is the worst way for this to go wrong.
+private struct Held
+    method: string
+    target: string
+    keep_alive: bool
+    names: Buf[string]
+    values: Buf[string]
+    body: Buf[u8]
+end Held
+
+// Everything a finished request holds, taken out of the parser's buffers while it is still ours.
+private hold_request(r: &Request) -> Held
+    var names: Buf[string] = buf()
+    var values: Buf[string] = buf()
+    var body: Buf[u8] = buf()
+
+    for i in 0..<r.headers.len()
+        names.push(r.headers.at(i).name)
+        values.push(r.headers.at(i).value)
+
+    for i in 0..<r.body.len()
+        body.push(r.body.at(i))
+
+    Held(r.method, r.target, r.keep_alive, names, values, body)
+end hold_request
+
+// Where a parser puts the requests it has finished, until slate asks for them.
+private struct Arrived
+    done: Buf[Held]
+end Arrived
+
+// One parser, and what it has ready.
+private struct Slot
+    reader: Option[&Requests]
+    arrived: &Arrived
+end Slot
+
+private var slots: Buf[Slot] = buf()
+
+// Forget every parser. Called when a new program is run, exactly as the socket table is.
+forget_parsers()
+    slots.clear()
+
+// A new parser, answering the id slate holds it by.
+//
+// **The id is an index and is never reused**, so a program holding a stale one gets nothing rather
+// than somebody else's connection. A parser is not counted in `outstanding`: it is a piece of
+// bookkeeping about bytes that have already arrived, so it can never be the reason a program is
+// still running.
+new_parser(head: usize, body: usize) -> usize
+    val arrived: &Arrived = Arrived(buf())
+    val reader = requests((r) -> arrived.done.push(hold_request(r)), Limits(head, body))
+
+    slots.push(Slot(Some(reader), arrived))
+    slots.len() - 1
+end new_parser
+
+// Give a parser bytes. Answers nothing where they were taken, and why where they were not.
+//
+// **A refusal names the status it deserves**, which is the one piece of judgement this file makes:
+// 400 for bytes that were not HTTP, 431 and 413 for HTTP this server has decided not to hold. A
+// server that answered 400 to all three would be telling a client its upload was malformed.
+feed_parser(id: usize, bytes: []const u8) -> Result[unit, (long, string)]
+    if id >= slots.len() then return Ok(())
+
+    slots.at(id).reader match
+        Some(r) -> r.feed(bytes) match
+            Ok(_) -> Ok(())
+            Err(why) -> why match
+                Malformed(f) -> Err((400, f.reason))
+                HeadTooLarge(n) -> Err((431, s"the headers are larger than ${n} bytes"))
+                BodyTooLarge(n) -> Err((413, "the body is larger than " + str(n) + " bytes"))
+        None -> Ok(())
+end feed_parser
+
+// How many whole requests are waiting.
+parser_ready(id: usize) -> usize
+    if id >= slots.len() then return 0
+
+    slots.at(id).arrived.done.len()
+end parser_ready
+
+// The oldest whole request, as the object a handler is given.
+//
+// **Built here rather than as it arrived**, so that no slate value is ever parked where the collector
+// cannot see it. The shape is the one `slate:http` has always handed a handler, plus the keep-alive
+// answer -- which llhttp has already worked out from the version and the `Connection` header, and
+// which the slate module used to compute for itself.
+take_request(id: usize) -> Option[Value]
+    if id >= slots.len() then return None
+
+    val ready = slots.at(id).arrived
+
+    if ready.done.len() == 0 then return None
+
+    val r = ready.done.at(0)
+
+    ready.done.remove(0)
+
+    val headers = new_object()
+
+    hold(Object(headers))
+
+    for i in 0..<r.names.len()
+        obj_put_name(headers, to_lower(r.names.at(i)), Str(new_str(r.values.at(i))))
+
+    val target = r.target
+    val len = target.bytes.len
+    val cut = target.index_of("?") match
+        Some(i) -> i
+        None -> len
+
+    val o = new_object()
+
+    hold(Object(o))
+
+    obj_put_name(o, "method", Str(new_str(r.method)))
+    obj_put_name(o, "path", Str(new_str(if cut == len then target else target[0..<cut])))
+    obj_put_name(o, "query", Str(new_str(if cut == len then "" else target[(cut + 1)..<len])))
+    obj_put_name(o, "headers", Object(headers))
+    obj_put_name(o, "body", Str(new_str(from_utf8(r.body.view()).unwrap_or(""))))
+    obj_put_name(o, "keepAlive", Bool(r.keep_alive))
+
+    Some(Object(o))
+end take_request
+
+// Tell a parser the connection closed, so a request ending at end-of-file completes.
+finish_parser(id: usize)
+    if id >= slots.len() then return
+
+    slots.at(id).reader match
+        Some(r) -> r.finish() match
+            Ok(_) -> ()
+            Err(_) -> ()
+        None -> ()
+end finish_parser
+
+// Give a parser back. A connection that has closed will never be fed again.
+close_parser(id: usize)
+    if id >= slots.len() then return
+
+    var slot = slots.at(id)
+
+    slot.reader = None
+    slots.set(id, slot)
+    slot.arrived.done.clear()
+end close_parser
+
+// -- what `slate:http` calls -----------------------------------------------------------------------
+
+// The id of a parser, checked.
+private parser_of(v: Value, at: Span, name: string) -> Result[usize, Signal]
+    v match
+        Int(n) -> Ok(usize(n))
+        other -> Err(failure(at, s"`${name}` takes a parser, and this is ${other.type_name()}"))
+
+// A limit, which a program writes as a number of bytes.
+private limit_of(v: Value, at: Span, name: string) -> Result[usize, Signal]
+    v match
+        Int(n) -> Ok(usize(n))
+        other -> Err(failure(at, s"`${name}` takes two byte counts, and one of them is ${other.type_name()}"))
+
+// `httpParser(headLimit, bodyLimit)`.
+do_http_parser(args: Buf[Value], at: Span) -> Step
+    if args.len() != 2 then return fault(at, s"`httpParser` takes a head limit and a body limit, and was given ${counted(args.len(), "argument")}")
+
+    val head = limit_of(args.at(0), at, "httpParser")?
+    val body = limit_of(args.at(1), at, "httpParser")?
+
+    Ok(Int(long(new_parser(head, body))))
+end do_http_parser
+
+// `httpFeed(p, bytes)` -- nothing where the bytes were taken, and `{ status, message }` where they
+// were refused.
+//
+// **A refusal is an ANSWER rather than a fault**, because it is the ordinary thing a server does
+// about a bad client: the connection writes the status back and closes. A fault would take the
+// server down with the request.
+do_http_feed(args: Buf[Value], at: Span) -> Step
+    if args.len() != 2 then return fault(at, s"`httpFeed` takes a parser and some bytes, and was given ${counted(args.len(), "argument")}")
+
+    val id = parser_of(args.at(0), at, "httpFeed")?
+
+    val payload = args.at(1) match
+        Array(p) -> bytes_of(p, at, "httpFeed")?
+        other -> return fault(at, s"`httpFeed` takes the bytes as an array, and this is ${other.type_name()}")
+
+    feed_parser(id, payload.view()) match
+        Ok(_) -> Ok(Null)
+        Err(why) ->
+            val o = new_object()
+
+            hold(Object(o))
+            obj_put_name(o, "status", Int(why.0))
+            obj_put_name(o, "message", Str(new_str(why.1)))
+            Ok(Object(o))
+end do_http_feed
+
+// `httpTake(p)` -- the oldest whole request, or null where none is ready.
+do_http_take(args: Buf[Value], at: Span) -> Step
+    if args.len() != 1 then return fault(at, s"`httpTake` takes a parser, and was given ${counted(args.len(), "argument")}")
+
+    take_request(parser_of(args.at(0), at, "httpTake")?) match
+        Some(v) -> Ok(v)
+        None -> Ok(Null)
+end do_http_take
+
+// `httpFinish(p)` -- the peer has stopped sending, so a request ending at end-of-file completes.
+do_http_finish(args: Buf[Value], at: Span) -> Step
+    if args.len() != 1 then return fault(at, s"`httpFinish` takes a parser, and was given ${counted(args.len(), "argument")}")
+
+    finish_parser(parser_of(args.at(0), at, "httpFinish")?)
+    Ok(Null)
+end do_http_finish
+
+// `httpClose(p)` -- the connection has gone and the parser with it.
+do_http_close(args: Buf[Value], at: Span) -> Step
+    if args.len() != 1 then return fault(at, s"`httpClose` takes a parser, and was given ${counted(args.len(), "argument")}")
+
+    close_parser(parser_of(args.at(0), at, "httpClose")?)
+    Ok(Null)
+end do_http_close
