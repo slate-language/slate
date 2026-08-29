@@ -706,10 +706,11 @@ class Square
 Square.new(4)            // side = 4, tags = a fresh []
 ```
 
-An initialised field is not a parameter — slate has no default arguments to make it optional with, so
-adding an initialiser changes what `new` takes. **A class that declares nothing gets no `new` at
-all**, rather than one answering an object with nothing in it; `{ side: 4, proto: Square }` still
-works and is how such a class is made.
+An initialised field is not a parameter of the `new` a class gets for free: its value comes from its
+own declaration, so adding an initialiser changes what `new` takes. (A `new` you write yourself may
+take a default parameter like any other function; only the generated one is fixed this way.) **A
+class that declares nothing gets no `new` at all**, rather than one answering an object with nothing
+in it; `{ side: 4, proto: Square }` still works and is how such a class is made.
 
 **Write your own `new` when it has something to do.** `var` in its parameter list declares the field
 and assigns it — TypeScript's parameter property — and `self` is the object being made. The body runs
