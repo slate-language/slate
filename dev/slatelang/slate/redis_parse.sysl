@@ -1,0 +1,333 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sh.sysl.redis
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8
+
+// RESP, which is hiredis's reader and is not written in slate.
+//
+// **`slate:redis` owns the connection and this owns the parse**, which is the layering `slate:http`
+// already has and for the same two reasons: a byte-at-a-time scan is the worst thing an interpreted
+// language can be asked to do, and a protocol a client and a server can disagree about is worth
+// having somebody else's thirty years of edge cases behind.
+//
+// **The binding has no socket in it at all, and that is what makes this the right tier.** hiredis's
+// `redisReader` is fed bytes and answers replies and never opens, reads or writes a connection -- so
+// the transport stays slate's, on the same libuv loop everything else runs on, and a Redis client
+// cannot stop the server it is part of. Binding the blocking `redisCommand` would have made that
+// impossible rather than merely difficult.
+//
+// ## What a slot holds
+//
+// **The collector cannot see through an ARC box**, so a `&Reader` cannot be parked in a slate value
+// and the table is module storage indexed by a small integer, exactly as `http_parse.sysl` does it.
+//
+// **A `Reply` is valid only until its reader's next `next()`**, the arena being reused, so the
+// conversion copies everything on the way out and hands back no view.
+
+private struct RedisSlot
+    reader: Option[&redis.Reader]
+
+    // hiredis's own sentence about a stream that stopped being RESP, kept until the program asks.
+    //
+    // **A protocol failure is sticky.** A reader that has seen one cannot be trusted with the rest of
+    // the stream -- the two ends disagree about where a reply begins -- so the slot answers the same
+    // complaint from then on rather than trying to resynchronise.
+    broken: string
+end RedisSlot
+
+private var redis_slots: Buf[RedisSlot] = buf()
+
+private new_redis_reader() -> usize
+    redis.reader() match
+        Ok(r) -> redis_slots.push(RedisSlot(Some(r), ""))
+        Err(_) -> redis_slots.push(RedisSlot(None, "the redis reader could not be created"))
+
+    redis_slots.len() - 1
+end new_redis_reader
+
+private feed_redis(id: usize, bytes: []const u8)
+    if id >= redis_slots.len() then return
+
+    var slot = redis_slots.at(id)
+
+    if slot.broken != "" then return
+
+    slot.reader match
+        None -> ()
+        Some(r) ->
+            var reader = r
+
+            if reader.feed(bytes).is_err()
+                slot.broken = "the redis reader ran out of memory"
+
+                redis_slots.set(id, slot)
+end feed_redis
+
+private why_broken(e: redis.Error) -> string = e match
+    redis.Error.Protocol(why) -> s"this is not a redis stream: ${why}"
+    redis.Error.NoMemory -> "the redis reader ran out of memory"
+    other -> "this redis reply is larger than the reader allows"
+
+// One reply, as the object `slate:redis` reads.
+//
+// **Three kinds rather than three natives, and the envelope is the point.** A `-ERR` reply and a
+// pub/sub push are not values a program can tell from an ordinary reply once they are slate values --
+// `-ERR unknown command` is a string like any other -- so the kind travels beside the value, and
+// turning it into a result or a callback is the slate module's business.
+private taken(id: usize) -> Option[Value]
+    if id >= redis_slots.len() then return None
+
+    var slot = redis_slots.at(id)
+
+    if slot.broken != ""
+        val mark = root_mark()
+        val said = envelope("broken", str_value(slot.broken))
+
+        release(mark)
+        return Some(said)
+
+    var reader = slot.reader match
+        None -> return None
+        Some(r) -> r
+
+    reader.next() match
+        Err(e) ->
+            slot.broken = why_broken(e)
+
+            redis_slots.set(id, slot)
+
+            val mark = root_mark()
+            val said = envelope("broken", str_value(slot.broken))
+
+            release(mark)
+            Some(said)
+        Ok(None) -> None
+        Ok(Some(reply)) ->
+            val kind = reply.kind() match
+                redis.Kind.Failure -> "error"
+                redis.Kind.Push -> "push"
+                other -> "reply"
+
+            val mark = root_mark()
+            val made = envelope(kind, as_value(reply))
+
+            release(mark)
+            Some(made)
+end taken
+
+private envelope(kind: string, v: Value) -> Value
+    hold(v)
+
+    val o = new_object()
+
+    hold(Object(o))
+    obj_put_name(o, "kind", str_value(kind))
+    obj_put_name(o, "value", v)
+    Object(o)
+end envelope
+
+// A reply as slate values, copied out of the arena.
+//
+// **A bulk string comes back as TEXT where it is UTF-8 and as BYTES where it is not**, which is
+// lossless and needs no mode flag: `GET` on a JSON document answers a string, `GET` on a JPEG
+// answers an array, and `v is string` says which. Substituting `""` for what will not decode --
+// which is what a request body does in `slate:http` -- would lose a value the program itself stored.
+private as_value(reply: redis.Reply) -> Value
+    reply.kind() match
+        redis.Kind.Nil -> Null
+        redis.Kind.Integer -> Int(reply.integer())
+        redis.Kind.Boolean -> Bool(reply.boolean())
+        redis.Kind.Double -> Real(reply.number())
+        redis.Kind.Status -> str_value(reply.text())
+
+        // **A `-ERR` nested inside an array is not the array's failure**, so it cannot be the
+        // envelope's either: `EXEC` answers one per queued command and a pipeline may fail partly.
+        // An object is what tells it from a string that happens to begin `ERR`.
+        redis.Kind.Failure -> failed_value(reply.text())
+
+        redis.Kind.Text -> bytes_or_text(reply)
+        redis.Kind.BigNumber -> str_value(reply.text())
+        redis.Kind.Verbatim -> str_value(reply.text())
+        redis.Kind.Map -> as_object(reply)
+        other -> as_list(reply)
+
+private failed_value(message: string) -> Value
+    val o = new_object()
+
+    hold(Object(o))
+    obj_put_name(o, "error", str_value(message))
+    Object(o)
+end failed_value
+
+private bytes_or_text(reply: redis.Reply) -> Value
+    val raw = reply.bytes()
+
+    from_utf8(raw) match
+        Ok(text) -> str_value(text)
+        Err(_) ->
+            var items: Buf[Value] = buf()
+
+            for i in 0..<raw.len
+                items.push(Int(long(raw[i])))
+
+            val made = Array(new_array(items))
+
+            hold(made)
+            made
+end bytes_or_text
+
+private as_list(reply: redis.Reply) -> Value
+    var items: Buf[Value] = buf()
+
+    for i in 0..<reply.len()
+        val child = as_value(reply.at(i))
+
+        hold(child)
+        items.push(child)
+
+    val made = Array(new_array(items))
+
+    hold(made)
+    made
+end as_list
+
+// A RESP3 map, whose children alternate key and value.
+//
+// **A key that is not text is rendered as text**, there being no other way to write it: a slate
+// object's keys are strings, and Redis has yet to answer a map keyed by anything else.
+private as_object(reply: redis.Reply) -> Value
+    val o = new_object()
+    val made = Object(o)
+
+    hold(made)
+
+    var i: usize = 0
+
+    while i + 1 < reply.len()
+        val key = as_value(reply.at(i))
+
+        hold(key)
+
+        val v = as_value(reply.at(i + 1))
+
+        hold(v)
+        obj_put_name(o, value_text(key), v)
+
+        i += 2
+
+    made
+end as_object
+
+private close_redis(id: usize)
+    if id >= redis_slots.len() then return
+
+    var slot = redis_slots.at(id)
+
+    slot.reader = None
+    redis_slots.set(id, slot)
+end close_redis
+
+// -- what `slate:redis` calls ----------------------------------------------------------------------
+
+private reader_of(v: Value, at: Span, name: string) -> Result[usize, Signal]
+    v match
+        Int(n) -> Ok(usize(n))
+        other -> Err(failure(at, s"`${name}` takes a reader, and this is ${other.type_name()}"))
+
+// `redisReader()` -- a reader for one connection.
+do_redis_reader(args: Buf[Value], at: Span) -> Step
+    if args.len() != 0
+        return fault(at, s"`redisReader` takes no arguments and was given ${counted(args.len(), "argument")}")
+
+    Ok(Int(long(new_redis_reader())))
+end do_redis_reader
+
+// `redisFeed(r, bytes)` -- bytes off the wire, copied.
+do_redis_feed(args: Buf[Value], at: Span) -> Step
+    if args.len() != 2
+        return fault(at, s"`redisFeed` takes a reader and some bytes, and was given ${counted(args.len(), "argument")}")
+
+    val id = reader_of(args.at(0), at, "redisFeed")?
+
+    val payload = args.at(1) match
+        Array(p) -> bytes_of(p, at, "redisFeed")?
+        other -> return fault(at, s"`redisFeed` takes the bytes as an array, and this is ${other.type_name()}")
+
+    feed_redis(id, payload.view())
+    Ok(Null)
+end do_redis_feed
+
+// `redisTake(r)` -- the next whole reply, or null where more bytes are needed.
+//
+// **Null is the ordinary answer on a socket** and is not a failure: a reply split across two packets
+// gives null once and then the reply. A client that treated a short read as a failure would break on
+// any reply larger than the path's MTU.
+do_redis_take(args: Buf[Value], at: Span) -> Step
+    if args.len() != 1
+        return fault(at, s"`redisTake` takes a reader, and was given ${counted(args.len(), "argument")}")
+
+    taken(reader_of(args.at(0), at, "redisTake")?) match
+        Some(v) -> Ok(v)
+        None -> Ok(Null)
+end do_redis_take
+
+// `redisCommand(parts)` -- an array of arguments, as the bytes to send.
+//
+// **Every argument crosses as a counted string**, so a value holding CRLF, a quote, a NUL or what
+// looks like a whole second command is still one argument. There is nothing to escape and no format
+// string to get wrong, which is the injection this protocol would otherwise be wide open to.
+do_redis_command(args: Buf[Value], at: Span) -> Step
+    if args.len() != 1
+        return fault(at, s"`redisCommand` takes an array of arguments, and was given ${counted(args.len(), "argument")}")
+
+    val parts = args.at(0) match
+        Array(p) -> p
+        other -> return fault(at, s"`redisCommand` takes the arguments as an array, and this is ${other.type_name()}")
+
+    var pieces: Buf[Buf[u8]] = buf()
+
+    for i in 0..<parts.items.len()
+        parts.items.at(i) match
+            Str(p) ->
+                var one: Buf[u8] = buf()
+
+                for j in 0..<p.s.bytes.len
+                    one.push(p.s.bytes[j])
+
+                pieces.push(one)
+            Array(a) -> pieces.push(bytes_of(a, at, "redisCommand")?)
+            other -> return fault(at, s"a redis argument is text or bytes, and this one is ${other.type_name()}")
+
+    if pieces.len() == 0
+        return fault(at, "`redisCommand` needs at least the command's own name")
+
+    var views: Buf[[]const u8] = buf()
+
+    for i in 0..<pieces.len()
+        views.push(pieces.at(i).view())
+
+    val wire = redis.command(views.view())
+
+    var items: Buf[Value] = buf()
+
+    for i in 0..<wire.len()
+        items.push(Int(long(wire.at(i))))
+
+    val mark = root_mark()
+    val made = Array(new_array(items))
+
+    hold(made)
+    release(mark)
+    Ok(made)
+end do_redis_command
+
+// `redisClose(r)` -- the connection has gone and the reader with it.
+do_redis_close(args: Buf[Value], at: Span) -> Step
+    if args.len() != 1
+        return fault(at, s"`redisClose` takes a reader, and was given ${counted(args.len(), "argument")}")
+
+    close_redis(reader_of(args.at(0), at, "redisClose")?)
+    Ok(Null)
+end do_redis_close
