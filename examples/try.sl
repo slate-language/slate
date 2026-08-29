@@ -5,6 +5,8 @@
 // is not defined raises, because nothing could have anticipated it. Rust and Swift draw the same
 // line. `files.sl` is the example for the first; this is the example for the second.
 
+import { readFile } from slate:fs
+
 // The postfix form is an expression, so it stands where a value is wanted.
 val n = 10 / 0 catch e -> -1
 

@@ -5,6 +5,8 @@
 // caller decides. What `catch` is for is the other kind -- the failures nothing could have
 // anticipated -- and `try.sl` is the example for those.
 
+import { mkdir, writeFile, readFile, readDir, stat, exists, readBytes, rename, readFileSync, remove, rmdir } from slate:fs
+
 async main()
     await mkdir("scratch")
     await writeFile("scratch/notes.txt", "one line")

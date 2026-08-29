@@ -1,6 +1,7 @@
 // The other arrangement: a test file that imports what it tests, and can reach only its exports.
 
 import { triple } from "./lib.sl"
+import { readFile } from slate:fs
 
 @test
 it_multiplies_from_outside() =

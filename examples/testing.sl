@@ -10,6 +10,8 @@
 // usual trade: a test beside the code can see what the file kept private, and one in its own file
 // can see only what was exported, which is the same thing a reader of your module can see.
 
+import { readFile } from slate:fs
+
 val floor = 2
 
 export clamp(x) = if x < floor then floor else x
