@@ -4,9 +4,11 @@
 // more. Nothing here is a framework: routing is `if req.path == ...`, because slate can already do
 // that and a router that only ever called `startsWith` would be a thing to learn for nothing.
 //
-// A server is a socket, so shutting one down is the network's `close` and comes from `slate:net`.
+// **`serve` is written in slate**, on the sockets `slate:net` has -- `slate:http` is a module carried
+// in the binary rather than a native, the way node's `http` is JavaScript over its own C sockets.
+// `fetch` is the half that is still native, https needing OpenSSL.
 
-import { close } from slate:net
+import { serve, close } from slate:http
 
 val server = serve(8080, async req ->
     if req.path == "/"
