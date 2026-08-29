@@ -39,6 +39,31 @@ for i in 1..4
 
 print(trouble)
 
+// A program raises its own with `throw`, which is what makes the two channels a choice rather than
+// a description of what the machine happens to do. A value the caller was always going to handle is
+// a result; a mistake in the program is a fault, and a library says so the same way the machine does.
+size(n) =
+    if n < 0 then throw "a size is not negative, and this is " + string(n)
+
+    n
+
+print(size(4))
+print(size(-1) catch e -> e.message)
+
+// **A `catch` that decides not to handle something puts it back**, which is why `throw e` matters as
+// much as `throw "..."`: the fault carries on to whoever else was listening, with its own words.
+noisy(k) =
+    try
+        k()
+    catch e
+        print("noticed:", e.message)
+        throw e
+
+try
+    noisy(() -> 1 / 0)
+catch e
+    print("and handled here:", e.message)
+
 // It carries across calls, however deep.
 deep(k) = if k == 0 then 1 / 0 else deep(k - 1)
 
