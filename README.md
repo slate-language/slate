@@ -372,7 +372,7 @@ which was written without checking anything. The two halves agree on everything 
 
 ### TCP
 
-Seven builtins over the same loop:
+Eight builtins over the same loop:
 
 ```
 val server = listen(0, conn ->
@@ -405,6 +405,18 @@ back as `{ ok: false, error: ... }` rather than stopping the program.
 of a stream is a value here rather than a failure, because a peer closing its half is how a request
 ordinarily ends. `onBytes` is the same reader for a socket carrying something that is not text, and
 calling either a second time replaces the function rather than adding one.
+
+**A socket that fails ends its stream — it does not stop the program.** A connection reset is
+something any peer can produce, deliberately or by being unplugged, and while it stopped the run
+every slate server was killable from outside by a client that hung up rudely. It now arrives as the
+same `null` a peer that finished sends, which is what the ordinary reader already copes with:
+`if chunk == null then close(c)` is right either way.
+
+`onError(sock, fn)` is how a program tells the two apart. `fn` is called with a sentence saying what
+went wrong, *instead of* that `null`, and a program that never registers one never hears about it.
+It is a registration of its own rather than a third argument to `onData` **because `onData` replaces
+its callback** — that replacement is the point of it, and a handler passed alongside the reader would
+be silently dropped by the next call.
 
 A port of `0` asks the kernel to pick one and `localPort` says which, so nothing has to guess at a
 number that is free. `connect` takes an address rather than a name — there is no resolver yet.

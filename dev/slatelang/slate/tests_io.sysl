@@ -312,6 +312,9 @@ a_socket_builtin_says_what_it_wanted_when_given_something_else()
     assert(net_fails("localPort(5)").contains("`localPort` takes a socket, and this is an integer"))
     assert(net_fails("onData(5, print)").contains("`onData` takes a socket, and this is an integer"))
     assert(net_fails("onBytes(5, print)").contains("`onBytes` takes a socket, and this is an integer"))
+    assert(net_fails("onError(5, print)").contains("`onError` takes a socket, and this is an integer"))
+    assert(net_fails("onError(5)").contains("`onError` takes a socket and a function, and was given 1 argument"))
+    assert(net_fails("val s = listen(0, print)\nonError(s, 5)").contains("`onError` needs a function to call with the reason, and this is an integer"))
 
 @test
 closing_a_socket_twice_is_not_an_error()
@@ -345,6 +348,59 @@ a_second_reader_replaces_the_first()
     val body = Echo + "async main()\n    val c = (await connect(\"127.0.0.1\", port)).value\n    second(chunk)\n        print(\"second:\", chunk)\n        close(c)\n        close(server)\n        done()\n    first(chunk)\n        print(\"never\")\n    onData(c, first)\n    onData(c, second)\n    await send(c, \"once\")\nmain()"
 
     assert_eq(net_out(body), "second: echo: once")
+
+@test
+A_CONNECTION_RESET_ENDS_THE_STREAM_RATHER_THAN_THE_PROGRAM()
+    // **A PEER COULD STOP THE PROGRAM, AND CANNOT NOW.** A read that fails reached `loop_fails` and
+    // ended the whole run, so every slate server was killable from outside by a client that hung up
+    // rudely -- and any client was killable by a server that did. It now arrives as the end of the
+    // stream, which is what the ordinary reader already copes with: `if chunk == null then close(c)`
+    // is the right thing to do whether the peer finished or vanished.
+    //
+    // **The server closes with the client's bytes still unread, which is what makes it a RESET** and
+    // not an ordinary end -- a socket closed with data in its receive queue sends an RST. The test
+    // below is the one that proves it is a reset; this one proves the run survives it.
+    val body = "serve(conn)\n    later()\n        close(conn)\n    setTimeout(later, 60)\nval server = listen(0, serve)\nasync main()\n    val c = (await connect(\"127.0.0.1\", localPort(server))).value\n    heard(chunk)\n        if chunk == null\n            print(\"ended\")\n            close(c)\n            close(server)\n            done()\n        else\n            print(\"chunk\")\n    onData(c, heard)\n    await send(c, repeat(\"x\", 4000))\nmain()\n"
+
+    assert_eq(net_out(body), "ended")
+
+@test
+onError_SAYS_WHY_THE_SOCKET_STOPPED()
+    // What a program gets for registering one: the reason, INSTEAD of the `null` that would
+    // otherwise end the stream. Without it a reset and a peer that finished are the same event.
+    val body = "serve(conn)\n    later()\n        close(conn)\n    setTimeout(later, 60)\nval server = listen(0, serve)\nasync main()\n    val c = (await connect(\"127.0.0.1\", localPort(server))).value\n    heard(chunk)\n        print(\"heard\")\n    failed(why)\n        print(why)\n        close(c)\n        close(server)\n        done()\n    onData(c, heard)\n    onError(c, failed)\n    await send(c, repeat(\"x\", 4000))\nmain()\n"
+    val said = net_out(body)
+
+    assert(said.contains("this connection failed"))
+    assert(said.contains("ECONNRESET"))
+
+@test
+AN_ERROR_HANDLER_SURVIVES_THE_NEXT_onData_WHICH_IS_WHY_IT_IS_A_REGISTRATION_OF_ITS_OWN()
+    // **The whole argument for `onError(sock, fn)` over a third argument to `onData`.** `onData`
+    // REPLACES its callback -- that is the point of it, and what makes a protocol that changes what
+    // it expects halfway through writable -- so a handler passed alongside the reader would be
+    // silently dropped by the second call. Here the second `onData` is the one that reads, and the
+    // handler registered before it is still the one that hears.
+    val body = "serve(conn)\n    later()\n        close(conn)\n    setTimeout(later, 60)\nval server = listen(0, serve)\nasync main()\n    val c = (await connect(\"127.0.0.1\", localPort(server))).value\n    first(chunk)\n        print(\"first\")\n    second(chunk)\n        print(\"second\")\n    failed(why)\n        print(\"still told\")\n        close(c)\n        close(server)\n        done()\n    onData(c, first)\n    onError(c, failed)\n    onData(c, second)\n    await send(c, repeat(\"x\", 4000))\nmain()\n"
+
+    assert_eq(net_out(body), "still told")
+
+    // A second `onError` replaces the first, as a second `onData` does, so an error channel can be
+    // moved as the reader is.
+    val moved = "serve(conn)\n    later()\n        close(conn)\n    setTimeout(later, 60)\nval server = listen(0, serve)\nasync main()\n    val c = (await connect(\"127.0.0.1\", localPort(server))).value\n    heard(chunk)\n        print(\"heard\")\n    never(why)\n        print(\"never\")\n    failed(why)\n        print(\"told:\", why)\n        close(c)\n        close(server)\n        done()\n    onData(c, heard)\n    onError(c, never)\n    onError(c, failed)\n    await send(c, repeat(\"x\", 4000))\nmain()\n"
+
+    assert(net_out(moved).contains("told:"))
+    assert(!net_out(moved).contains("never"))
+
+@test
+A_CHUNK_THAT_IS_NOT_TEXT_FAILS_THE_CONNECTION_AND_NOT_THE_RUN()
+    // Reading a binary stream with `onData` is the program's mistake, but the bytes are the PEER'S:
+    // a server sending one invalid sequence used to stop a client outright, which is the same
+    // killable-from-outside defect a reset was. It is this connection's failure and it says so
+    // through the same channel. `onBytes` is the reader that cannot have the problem.
+    val body = "serve(conn)\n    send(conn, [255, 254])\nval server = listen(0, serve)\nasync main()\n    val c = (await connect(\"127.0.0.1\", localPort(server))).value\n    heard(chunk)\n        print(\"heard\")\n    failed(why)\n        print(why)\n        close(c)\n        close(server)\n        done()\n    onData(c, heard)\n    onError(c, failed)\n    await send(c, \"go\")\nmain()\n"
+
+    assert(net_out(body).contains("this chunk is not text"))
 
 // -- the file system, blocking ---------------------------------------------------------------------
 

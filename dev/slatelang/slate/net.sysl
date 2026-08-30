@@ -57,7 +57,7 @@ private socket_of(v: Value, at: Span, name: string) -> Result[(usize, usize), Si
 // Not `private`: `server.sysl` holds its listening and accepted sockets in the same table, which is
 // what keeps the loop alive while a server is listening and closes the handle when the slot goes.
 hold_socket(sock: &libuv.Tcp, cb: Value) -> Value
-    val id = claim(Pending(cb, null, None, Some(sock), true, true, 0))
+    val id = claim(Pending(cb, Null, null, None, Some(sock), true, true, 0))
 
     Socket(id, gen_at(id))
 end hold_socket
@@ -79,13 +79,34 @@ private set_callback(id: usize, gen: usize, cb: Value)
     pending.set(id, slot)
 end set_callback
 
+// The function this socket's slot is holding for a failure, or `Null` where nobody registered one.
+private error_callback_of(id: usize, gen: usize) -> Value
+    if !holds(id, gen) then return Null
+
+    pending.at(id).on_error
+
+// Replace it, which is what a second `onError` on one socket does. **Separately from the reader**,
+// which is the whole reason it is a slot of its own -- see `error_socket`.
+private set_error_callback(id: usize, gen: usize, cb: Value)
+    if !holds(id, gen) then return
+
+    var slot = pending.at(id)
+
+    slot.on_error = cb
+    pending.set(id, slot)
+end set_error_callback
+
 // Call a socket's slate callback with one argument.
+private deliver(id: usize, gen: usize, v: Value)
+    call_slate(callback_of(id, gen), v)
+
+// The same call, given the function rather than the slot it came out of. `Null` is nobody to call
+// and not an error: a socket the program has not read from yet has no callback in it.
 //
 // **A fault inside it stops the program**, as it does for a timer and for the same reason: the loop
 // is not running a statement, so there is nothing to attach the complaint to but the whole run.
-private deliver(id: usize, gen: usize, v: Value)
-    val cb = callback_of(id, gen)
-
+// That is a fault in the program's OWN code, and is a different thing from the socket failing.
+private call_slate(cb: Value, v: Value)
     cb match
         Null -> return
         _ -> ()
@@ -102,7 +123,42 @@ private deliver(id: usize, gen: usize, v: Value)
         Err(s) -> loop_fault = Some(s)
 
     release(mark)
-end deliver
+end call_slate
+
+// Hand this socket's failure to the function the program registered, and say whether there was one.
+private failure_told(id: usize, gen: usize, message: string) -> bool
+    val fn = error_callback_of(id, gen)
+
+    fn match
+        Null -> return false
+        _ -> ()
+
+    // The mark is taken before the string is made, not after: everything allocated inside it is what
+    // `release` gives back, and a value made before it has nothing rooting it in between.
+    val mark = root_mark()
+    val said = str_value(message)
+
+    hold(said)
+    call_slate(fn, said)
+    release(mark)
+
+    true
+end failure_told
+
+// This socket has failed while the program was reading it.
+//
+// **A PEER MAY NOT STOP THE PROGRAM, AND BEFORE THIS ONE COULD.** A connection reset -- which any
+// client can produce, deliberately or by being unplugged -- reached `loop_fails` and ended the whole
+// run, so every slate server was killable from outside by a client that hung up rudely. It is the
+// same argument the failed handshake below is already decided by, and there was no reason for a
+// plain socket to be the exception.
+//
+// **Where the program registered no handler the failure arrives as the end of the stream**, which is
+// what the ordinary reader already copes with: `if chunk == null then close(c)` is right whether the
+// peer finished or vanished. What such a program cannot do is tell the two apart -- which is what
+// `onError` is for, and why not registering one has to mean something rather than being refused.
+private stream_failed(id: usize, gen: usize, message: string)
+    if !failure_told(id, gen, message) then deliver(id, gen, Null)
 
 // Stop the program with a sentence of slate's own, from inside a callback.
 //
@@ -277,6 +333,35 @@ read_socket(v: Value, cb: Value, as_text: bool, at: Span) -> Step
         Ok(_) -> Ok(Null)
 end read_socket
 
+// `onError(sock, fn)` -- what to call if this socket fails.
+//
+// `fn` is called with a sentence saying what went wrong, INSTEAD of the `null` that would otherwise
+// end the stream, so a program that wants to tell a reset from a peer that finished registers one
+// and a program that does not need never hear about it.
+//
+// **A REGISTRATION OF ITS OWN, RATHER THAN A THIRD ARGUMENT TO `onData`, BECAUSE `onData` REPLACES
+// ITS CALLBACK.** That replacement is the point of it -- a protocol that changes what it expects
+// halfway through calls `onData` again -- and a handler passed alongside the reader would be
+// silently dropped by that second call, which is the worst way for an error channel to fail. Making
+// an omitted third argument mean "keep the one you have" only moves the problem: there would then be
+// no way to say "and stop telling me", the given-and-empty against never-given ambiguity that slate
+// does not have anywhere else.
+//
+// **A failure only arrives on a socket somebody is reading**, since reading is what finds one. So
+// this on its own starts nothing, and an `onError` without an `onData` is a handler that waits.
+error_socket(v: Value, cb: Value, at: Span) -> Step
+    cb match
+        Fn(_) -> ()
+        Native(_) -> ()
+        other -> return fault(at, s"`onError` needs a function to call with the reason, and this is ${other.type_name()}")
+
+    val (id, gen) = socket_of(v, at, "onError")?
+
+    set_error_callback(id, gen, cb)
+
+    Ok(Null)
+end error_socket
+
 // Something came off the wire.
 //
 // **The end of the stream is `null` and not a failure**, which is libuv's own distinction and the
@@ -284,7 +369,7 @@ end read_socket
 private arrived(id: usize, gen: usize, r: libuv.Read, as_text: bool)
     r match
         End -> deliver(id, gen, Null)
-        Failed(e) -> loop_fails(s"this connection failed: ${e}")
+        Failed(e) -> stream_failed(id, gen, s"this connection failed: ${e}")
         Data(bytes) ->
             if tls_here(id)
                 secured(id, gen, bytes, as_text)
@@ -300,9 +385,10 @@ private secured(id: usize, gen: usize, cipher: []const u8, as_text: bool)
         // to a client that is not speaking TLS -- a browser sent to `http://` on this port, a probe,
         // a scanner -- and stopping the program over one would make any server trivially killable
         // from outside. The program is told what it would be told for any other end of stream, which
-        // is what lets `slate:http` close its side without knowing why.
+        // is what lets `slate:http` close its side without knowing why -- or told the reason, where
+        // it registered an `onError` and wants to know how many of these it is getting.
         Err(_) ->
-            deliver(id, gen, Null)
+            stream_failed(id, gen, "this connection could not be secured")
             tls_drop(id)
 
             if socket_at(id, gen).is_some() then surrender(id)
@@ -327,8 +413,8 @@ private push_wire(id: usize, gen: usize)
             sock.write(out.view(), (r) ->
                 r match
                     Ok(_) -> ()
-                    Err(e) -> loop_fails(s"this connection could not be written to: ${e}")) match
-                Err(e) -> loop_fails(s"this connection could not be written to: ${e}")
+                    Err(e) -> stream_failed(id, gen, s"this connection could not be written to: ${e}")) match
+                Err(e) -> stream_failed(id, gen, s"this connection could not be written to: ${e}")
                 Ok(_) -> ()
 
     // **Read once**: taking the list is what clears it, so asking twice would answer the second
@@ -344,7 +430,7 @@ private plainly_arrived(id: usize, gen: usize, bytes: []const u8, as_text: bool)
         // where a peer sends one across two packets. `onBytes` is the reader that cannot.
         from_utf8(bytes) match
             Ok(text) -> deliver(id, gen, str_value(text))
-            Err(_) -> loop_fails("this chunk is not text -- `onBytes` reads a socket that carries something else")
+            Err(_) -> stream_failed(id, gen, "this chunk is not text -- `onBytes` reads a socket that carries something else")
     else
         var items: Buf[Value] = buf()
 
