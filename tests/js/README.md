@@ -26,7 +26,13 @@ Until then they are run by hand, and every one of them was: `wide.sl` is the fix
 test and the six numbered ones cover, in order, arithmetic and printing; patterns, `match`,
 labelled loops, closures and `try`/`catch`; classes, generators, `with`, defaults and spread
 arguments; the `...` literals; the annotations, which are checked while a program runs; defaults
-inside a pattern; and the event loop.
+inside a pattern; the event loop; and the file system and the environment.
+
+**`p8.sl` writes into `tests/js/scratch/` and takes it away again**, so that running it twice says
+the same thing and running it leaves nothing behind — the directory is git-ignored for the run that
+does not reach the end. It needs node: a file system is the one thing quickjs has none of that node
+brings, and under `qjs` every call in it answers *"`existsSync` needs a file system, and this
+JavaScript host has none"*.
 
 **`p7.sl` runs its phases one after another, and that is the test's own correctness rather than
 slate's.** Two timers due at the same instant fire in an order neither loop promises, and a repeating

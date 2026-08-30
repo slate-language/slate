@@ -892,19 +892,255 @@ js_runtime_builtins() -> string = raw"""
         B.settle = (...args) => answerPromise(args, "settle", false)
         B.fail = (...args) => answerPromise(args, "fail", true)
 
+        // -- the file system --------------------------------------------------------------------------
+        //
+        // **Twenty functions and one shape: ten operations, each in a promise-shaped and a blocking
+        // form.** A blocking one answers `{ok: true, value}` or `{ok: false, error}`, a promise-shaped
+        // one answers a promise that settles or raises a fault with the same sentence, and `exists`
+        // is the exception both ways round -- a plain boolean, a path that is not there being an
+        // answer rather than a failure.
+
+        const fsOf = (name) => {
+            if ($.host.fs === null)
+                fault("`" + name + "` needs a file system, and this JavaScript host has none")
+
+            return $.host.fs
+        }
+
+        // libuv's sentence for what went wrong, which is what the interpreter's message carries.
+        //
+        // **node says the same thing and then some**: `ENOENT: no such file or directory, open 'x'`
+        // where libuv says `ENOENT: no such file or directory`. The syscall and the path are node's
+        // addition, and cutting at the comma leaves libuv's own text -- which is the whole of making
+        // the two back ends say one thing about a file that is not there.
+        const uvText = (e) => {
+            const said = String(e !== null && e !== undefined && e.message !== undefined ? e.message : e)
+            const cut = said.indexOf(", ")
+
+            return cut === -1 ? said : said.slice(0, cut)
+        }
+
+        let decoder = null
+
+        // A file's bytes as text, or null where they are not text at all.
+        //
+        // **`fatal` is the whole point**: the ordinary decoder answers replacement characters, which
+        // would make `readFile` of a JPEG a string of nonsense rather than the sentence the
+        // interpreter gives.
+        //
+        // **Made when it is first wanted and not when the prelude loads**, which is the rule for
+        // everything here that an engine might not have: quickjs has no `TextDecoder`, and building
+        // one at the top of this file stopped every program under it -- including the ones that never
+        // go near a file.
+        const asText = (bytes) => {
+            if (decoder === null) {
+                if (typeof TextDecoder !== "function")
+                    fault("this JavaScript host cannot tell whether a file is text -- it has no `TextDecoder`")
+
+                decoder = new TextDecoder("utf-8", { fatal: true })
+            }
+
+            try {
+                return decoder.decode(bytes)
+            } catch (e) {
+                return null
+            }
+        }
+
+        const onePath = (args, name) => {
+            if (args.length !== 1)
+                fault("`" + name + "` takes one path and was given " + args.length +
+                    (args.length === 1 ? " argument" : " arguments"))
+
+            if (!$.isStr(args[0])) fault("`" + name + "` takes a path, and this is " + typeName(args[0]))
+
+            return args[0]
+        }
+
+        const ok = (v) => $.obj([["ok", true], ["value", v]])
+        const bad = (message) => $.obj([["ok", false], ["error", message]])
+
+        const asBytes = (raw) => Array.from(raw, (b) => BigInt(b))
+        const asStat = (st) => $.obj([["size", BigInt(st.size)], ["isFile", st.isFile()], ["isDir", st.isDirectory()]])
+
+        // The ten blocking ones. Each is its node call, its answer shape, and the sentence for a
+        // failure -- and nothing else, which is what the pairing is worth.
+        const syncing = (name, what, go) => {
+            B[name] = (...args) => {
+                const path = onePath(args, name)
+                const fs = fsOf(name)
+
+                try {
+                    return ok(go(fs, path))
+                } catch (e) {
+                    if (e instanceof $.Fault) return bad(e.reason)
+
+                    return bad(what + " " + path + ": " + uvText(e))
+                }
+            }
+        }
+
+        // The promise-shaped ten, which answer the same shape.
+        //
+        // **A file that is not there settles the promise rather than failing it**, which is the
+        // interpreter's rule and is the point of the shape: reaching the disk is expected to fail,
+        // so a program that does not want to think about it is not made to write a `try` -- and one
+        // that does reads `r.ok`. The pair differ in WHEN the answer arrives and in nothing else.
+        const promising = (name, what, go) => {
+            B[name] = (...args) => {
+                const path = onePath(args, name)
+                const fs = fsOf(name)
+
+                return Promise.resolve()
+                    .then(() => go(fs.promises, path))
+                    .then(ok, (e) => bad(e instanceof $.Fault ? e.reason : what + " " + path + ": " + uvText(e)))
+            }
+        }
+
+        // **A file that is not text is a sentence and not a decoding**, and the sentence names the
+        // builtin that would have read it.
+        const textOf = (raw, path, other) => {
+            const said = asText(raw)
+
+            if (said === null) fault(path + " is not text -- `" + other + "` reads a file that is not")
+
+            return said
+        }
+
+        syncing("readFileSync", "cannot read", (fs, p) => textOf(fs.readFileSync(p), p, "readBytesSync"))
+        syncing("readBytesSync", "cannot read", (fs, p) => asBytes(fs.readFileSync(p)))
+        syncing("readDirSync", "cannot list", (fs, p) => fs.readdirSync(p))
+        syncing("statSync", "cannot stat", (fs, p) => asStat(fs.statSync(p)))
+        syncing("removeSync", "cannot remove", (fs, p) => { fs.unlinkSync(p); return null })
+        syncing("mkdirSync", "cannot make", (fs, p) => { fs.mkdirSync(p); return null })
+        syncing("rmdirSync", "cannot remove", (fs, p) => { fs.rmdirSync(p); return null })
+
+        promising("readFile", "cannot read", (fs, p) => fs.readFile(p).then((raw) => textOf(raw, p, "readBytes")))
+        promising("readBytes", "cannot read", (fs, p) => fs.readFile(p).then(asBytes))
+        promising("readDir", "cannot list", (fs, p) => fs.readdir(p))
+        promising("stat", "cannot stat", (fs, p) => fs.stat(p).then(asStat))
+        promising("remove", "cannot remove", (fs, p) => fs.unlink(p).then(() => null))
+        promising("mkdir", "cannot make", (fs, p) => fs.mkdir(p).then(() => null))
+        promising("rmdir", "cannot remove", (fs, p) => fs.rmdir(p).then(() => null))
+
+        // **`exists` answers a boolean either way round**, which is the one place the pair breaks the
+        // shape: a path that is not there is what the question was about.
+        B.existsSync = (...args) => {
+            const path = onePath(args, "existsSync")
+            const fs = fsOf("existsSync")
+
+            try {
+                fs.accessSync(path)
+
+                return true
+            } catch (e) {
+                return false
+            }
+        }
+
+        B.exists = (...args) => {
+            const path = onePath(args, "exists")
+            const fs = fsOf("exists")
+
+            return fs.promises.access(path).then(() => true, () => false)
+        }
+
+        // **What is written is rendered as `print` would render it**, which is what a program writing
+        // a number or an array to a file expects -- and refusing everything but a string would make
+        // `writeFile(path, string(x))` the only spelling anybody ever wrote.
+        const contentsOf = (args, name) => {
+            if (args.length !== 2)
+                fault("`" + name + "` takes a path and its contents, and was given " + args.length +
+                    (args.length === 1 ? " argument" : " arguments"))
+
+            if (!$.isStr(args[0])) fault("`" + name + "` takes a path, and this is " + typeName(args[0]))
+
+            return $.isStr(args[1]) ? args[1] : text(args[1])
+        }
+
+        B.writeFileSync = (...args) => {
+            const said = contentsOf(args, "writeFileSync")
+            const fs = fsOf("writeFileSync")
+
+            try {
+                fs.writeFileSync(args[0], said)
+
+                return ok(null)
+            } catch (e) {
+                return bad("cannot write " + args[0] + ": " + uvText(e))
+            }
+        }
+
+        B.writeFile = (...args) => {
+            const said = contentsOf(args, "writeFile")
+            const fs = fsOf("writeFile")
+
+            return fs.promises.writeFile(args[0], said).then(
+                () => ok(null),
+                (e) => bad("cannot write " + args[0] + ": " + uvText(e)))
+        }
+
+        const twoPaths = (args, name) => {
+            if (args.length !== 2)
+                fault("`" + name + "` takes two paths and was given " + args.length +
+                    (args.length === 1 ? " argument" : " arguments"))
+
+            for (const p of args)
+                if (!$.isStr(p)) fault("`" + name + "` takes a path, and this is " + typeName(p))
+        }
+
+        B.renameSync = (...args) => {
+            twoPaths(args, "renameSync")
+
+            const fs = fsOf("renameSync")
+
+            try {
+                fs.renameSync(args[0], args[1])
+
+                return ok(null)
+            } catch (e) {
+                return bad("cannot rename " + args[0] + ": " + uvText(e))
+            }
+        }
+
+        B.rename = (...args) => {
+            twoPaths(args, "rename")
+
+            const fs = fsOf("rename")
+
+            return fs.promises.rename(args[0], args[1]).then(
+                () => ok(null),
+                (e) => bad("cannot rename " + args[0] + ": " + uvText(e)))
+        }
+
+        // -- this program's own environment ------------------------------------------------------------
+        //
+        // **A host with no environment answers every variable unset**, rather than complaining: an
+        // environment with nothing in it is a thing that can be true, and a browser's is exactly that.
+        B.env = (...args) => {
+            if (args.length !== 1)
+                fault("`env` takes one variable name and was given " + args.length +
+                    (args.length === 1 ? " argument" : " arguments"))
+
+            if (!$.isStr(args[0])) fault("`env` takes a variable name, and this is " + typeName(args[0]))
+
+            if ($.host.env === null) return null
+
+            const said = $.host.env[args[0]]
+
+            return said === undefined ? null : said
+        }
+
         // Every name the interpreter declares, so that a program reaching one this back end has not
         // built yet is told so rather than failing as an undefined name.
-        const OWED = ["readFile", "readBytes", "writeFile", "readDir",
-            "stat", "exists", "remove", "mkdir", "rmdir", "rename", "readFileSync", "readBytesSync",
-            "writeFileSync", "readDirSync", "statSync", "existsSync", "removeSync", "mkdirSync",
-            "rmdirSync", "renameSync", "listen", "connect", "onData", "onBytes", "onError", "send",
+        const OWED = ["listen", "connect", "onData", "onBytes", "onError", "send",
             "close", "localPort", "now", "monotonic", "date", "time", "dateTime", "zone", "localZone",
             "instant", "epochSeconds", "epochMillis", "epochMicros", "utc", "micros", "millis",
             "seconds", "minutes", "hours", "days", "weeks", "months", "years", "year", "month", "day",
             "hour", "minute", "second", "weekday", "monthName", "dayOfYear", "daysInMonth", "isLeapYear",
             "at", "offset", "isDST", "abbrev", "startOf", "onOrAfter", "format", "parseDate", "parseTime",
             "parseDateTime", "parseTimestamp", "regex", "hash", "hashStrong", "check", "needsRehash",
-            "compress", "decompress", "run", "env", "fetch",
+            "compress", "decompress", "run", "fetch",
             "httpParser", "httpStream", "httpFeed", "httpTake", "httpTakePart", "httpFinish",
             "httpClose", "httpUpgraded"]
 
