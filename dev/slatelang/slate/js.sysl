@@ -38,6 +38,18 @@ struct Js
     // The file being emitted, for the line a fault names.
     src: Source
 
+    // Which file that is, as an index into the program's own list of them -- the number a marker
+    // carries and `$.files` is indexed by.
+    file: usize
+
+    // Whether a marker names the file as well as the line.
+    //
+    // **A program of several files stamps every marker and a program of one file stamps none.** A
+    // function defined in one module and called from another has to say where it was written, and
+    // the caller's next marker has to put the caller's file back -- so once there are two files,
+    // every marker has to carry one. Where there is only one file there is nothing to put back.
+    stamp: bool
+
     // The line the emitted code last said it was on, so that a marker is written only where it
     // changed.
     last_line: usize
@@ -59,7 +71,31 @@ struct Js
     // stands for. A type has no runtime existence, exactly as in the interpreter.
     type_names: Buf[string]
     type_pats: Buf[Pattern]
+
+    // The names the run of statements being emitted declares MORE THAN ONCE, and every name already
+    // declared in the JavaScript block being written.
+    //
+    // **slate rebinds where JavaScript refuses to redeclare.** `val a = 1` and then `val a = 2` in
+    // one scope is one slot rebound rather than two bindings -- a function written between the two
+    // answers the second value -- and slate allows it for any binding, an import included. `const`
+    // twice is a JavaScript *SyntaxError*, so the program would not start at all; and renaming the
+    // second would be wrong for the function in the middle. So a name that is declared again is
+    // introduced with `let` and every declaration after the first is an assignment.
+    rebound: Buf[string]
+    bound: Buf[string]
+
+    // Names a binder has just declared into the block that is about to open: a `match` arm's
+    // pattern, a `for`'s. **They are written outside the run of statements and land inside the same
+    // JavaScript block**, since a slate scope that holds only a binding needs no block of its own --
+    // so a body that declares one of them again is redeclaring, and has to be told so.
+    pending: Buf[string]
 end Js
+
+// What a block being emitted knows, kept while a block inside it is written.
+struct JsBlock
+    rebound: Buf[string]
+    bound: Buf[string]
+end JsBlock
 
 // One loop being emitted: what a `break` inside it has to know.
 //
@@ -85,6 +121,11 @@ struct Emitted
     code: string
     report: Report
 
+    // Which file each complaint is about, in step with the report's own items -- the same parallel
+    // list `Ran` carries and for the same reason. A program is as many files as it imports, so a
+    // complaint has to be drawn against the one it came from.
+    srcs: Buf[usize]
+
     ok(self) -> bool = !self.report.has_errors()
 end Emitted
 
@@ -95,16 +136,20 @@ end Emitted
 // **The runtime is not part of this, which is what makes the output readable and testable.** A test
 // pins what a program compiles to; prepending nine hundred lines of runtime to every expectation
 // would pin nothing but the runtime.
-emit_module(prog: Program, src: Source) -> Emitted
-    var j = Js(str_builder(), src, 0, 0, 0, report(), buf(), buf(), buf())
+emit_module(prog: Program, src: Source) -> Emitted = emit_one(prog, src, 0, false)
+
+// One module of a program, told which file it is and whether the markers name it.
+private emit_one(prog: Program, src: Source, file: usize, stamp: bool) -> Emitted
+    var j = Js(str_builder(), src, file, stamp, 0, 0, 0, report(), buf(), buf(), buf(), buf(), buf(), buf())
 
     for i in 0..<prog.type_names.len()
         j.type_names.push(prog.type_names.at(i))
         j.type_pats.push(prog.type_pats.at(i))
 
-    // What `Point` stands for, for the patterns emitted below. `resolve_pattern` is the compiler's
-    // own, and this is what it reads.
-    open_own_types(prog)
+    // What `Point` stands for, for the patterns emitted below -- this file's own types and the ones
+    // it imported, exactly as the module was compiled. `resolve_pattern` is the compiler's own, and
+    // this is what it reads.
+    open_module_types(&current_unit, prog, file)
     emit_stmts(&j, prog.stmts)
 
     for i in 0..<prog.exports.len()
@@ -112,32 +157,87 @@ emit_module(prog: Program, src: Source) -> Emitted
 
         line(&j, s"$$exports.fields.set(${quoted_js(name)}, ${js_name(name)});")
 
-    Emitted(j.out.finish(), j.report)
-end emit_module
+    var srcs: Buf[usize] = buf()
 
-// A whole program: the runtime, then the file's own statements inside a function of their own.
+    for i in 0..<j.report.len()
+        srcs.push(file)
+
+    Emitted(j.out.finish(), j.report, srcs)
+end emit_one
+
+// A whole program: the runtime, then every module it is made of, the entry last.
 //
 // **The module body is a function rather than the top level**, so that a program declaring `print`
 // shadows the builtin of that name instead of colliding with it. The builtins are `const`s in the
 // scope above, which is exactly the relationship the interpreter's scope chain gives them.
-emit_program(prog: Program, src: Source) -> Emitted
-    val body = emit_module(prog, src)
+//
+// **A module is a function that answers its exports**, bound to `$mN` where `N` is the file's index
+// -- which is what an import in another module then takes a field out of. They are emitted in
+// `Loaded.order`, every file before any file that imports it, so a `const` is always in place before
+// the module that names it. That is the loader's order and not a second one worked out here.
+//
+// **EVERY module is a function of its own, the entry included, and that is not tidiness.** A name a
+// module binds -- an import, a `val`, a definition -- would otherwise sit in the scope the other
+// modules' functions are written in and shadow the builtin of that name for all of them. `import
+// { now } from slate:time` did exactly that: the `const now` the entry bound was what `slate:time`
+// itself found when it went looking for the builtin, and a `const` is in its dead zone until the
+// line that fills it, so a program that imported the clock could not start.
+//
+// **A program of one file skips the wrapper**, since a scope shared with nobody cannot shadow
+// anything, and a program of one file is then the same text it was before there were modules at all.
+emit_program(l: Loaded) -> Emitted
     var out = str_builder()
+    var rep = report()
+    var srcs: Buf[usize] = buf()
+
+    // **Whether the file is stamped on a marker is decided for the whole program**, not per module,
+    // so that a function's line table reads the same wherever it was written.
+    val many = l.order.len() > 1
 
     out.push(js_runtime())
 
-    // **The semicolon in front of the module is load-bearing.** JavaScript inserts one only where
+    // **The semicolon in front of the program is load-bearing.** JavaScript inserts one only where
     // the next line cannot continue the last, and `(` can: without this the prelude's final
-    // statement reads the module's own function as an argument and calls it, which is a
+    // statement reads the program's own function as an argument and calls it, which is a
     // `TypeError` a long way from its cause.
     out.push("\n;(() => {\n")
-    out.push(s"    $$.at(0, ${quoted_js(src.name)});\n")
-    out.push("    const $exports = $.obj([]);\n\n")
-    out.push(indented(body.code))
+    out.push(s"    $$.files([${files_text(l)}]);\n")
+
+    for i in 0..<l.order.len()
+        val which = l.order.at(i)
+        val body = emit_one(l.programs.at(which), l.sources.at(which), which, many)
+
+        rep.absorb(body.report)
+
+        for k in 0..<body.srcs.len()
+            srcs.push(body.srcs.at(k))
+
+        if many
+            out.push(s"\n    const $$m${which} = (() => {\n")
+            out.push(s"        $$.at(0, ${which});\n")
+            out.push("        const $exports = $.obj([]);\n\n")
+            out.push(indented(indented(body.code)))
+            out.push("\n        return $exports;\n    })();\n")
+        else
+            out.push("\n    const $exports = $.obj([]);\n\n")
+            out.push(indented(body.code))
+
     out.push("})();\n")
 
-    Emitted(out.finish(), body.report)
+    Emitted(out.finish(), rep, srcs)
 end emit_program
+
+// The files, in the order a marker names them by.
+private files_text(l: Loaded) -> string
+    var out = str_builder()
+
+    for i in 0..<l.sources.len()
+        if i > 0 then out.push(", ")
+
+        out.push(quoted_js(l.sources.at(i).name))
+
+    out.finish()
+end files_text
 
 // Every line of a block, moved in by one step.
 //
@@ -215,7 +315,38 @@ end is_bare_name
 // **Only JavaScript's own words are touched, and the escape is a `$`.** A slate identifier is letters,
 // digits and `_` -- `is_ident_start` and `is_ident_cont` say so -- so a trailing `$` names something
 // no program can write, and two slate names can never mangle to one.
-js_name(name: string) -> string = if reserved_in_js(name) then name + "$" else name
+js_name(name: string) -> string
+    // **The parser makes names a program cannot write, and they are not JavaScript names either.**
+    // `(new)` is the object a constructor is building and `(0)` is a destructured parameter, both
+    // unspellable on purpose so that nothing a person wrote can shadow them. A slate identifier
+    // holds no `$`, so `$` in front of the letters is a name nothing can collide with either.
+    if !spellable(name) then return "$" + letters_of(name)
+
+    if reserved_in_js(name) then return name + "$"
+
+    name
+end js_name
+
+// Whether a name is one a program could have written, which is what makes it a JavaScript name too.
+private spellable(name: string) -> bool
+    for i in 0..<name.bytes.len
+        val c = name.bytes[i]
+
+        if !(c == u8('_') || is_alpha(c) || (i > 0 && is_digit(c))) then return false
+
+    name.bytes.len > 0
+end spellable
+
+private letters_of(name: string) -> string
+    var out = str_builder()
+
+    for i in 0..<name.bytes.len
+        val c = name.bytes[i]
+
+        if c == u8('_') || is_alpha(c) || is_digit(c) then out.bytes.push(c)
+
+    out.finish()
+end letters_of
 
 // Whether JavaScript would refuse this as a name. The list is JavaScript's reserved words together
 // with the two words that are not reserved but cannot be declared in strict mode.
@@ -274,8 +405,96 @@ private reserved_in_js(name: string) -> bool = name match
 
 // A run of statements, for effect.
 emit_stmts(j: *Js, stmts: Buf[Stmt])
+    val outer = open_block(j, stmts)
+
     for i in 0..<stmts.len()
         emit_stmt(j, stmts.at(i))
+
+    close_block(j, outer)
+
+// Begin a JavaScript block, working out what the run of statements in it declares twice.
+//
+// **A block is where a redeclaration is illegal, so it is what has to be counted.** What the block
+// around it declared is neither here nor there -- a name declared again inside a nested one is
+// shadowing, which JavaScript is happy with -- so the outer block's answer is put aside and given
+// back when this one ends.
+private open_block(j: *Js, stmts: Buf[Stmt]) -> JsBlock
+    val outer = JsBlock(j.rebound, j.bound)
+
+    j.rebound = declared_twice(stmts, j.pending)
+    j.bound = j.pending
+    j.pending = buf()
+    outer
+end open_block
+
+private close_block(j: *Js, outer: JsBlock)
+    j.rebound = outer.rebound
+    j.bound = outer.bound
+    j.pending = buf()
+
+// The names this run declares more than once, which are the ones a `const` cannot hold.
+private declared_twice(stmts: Buf[Stmt], already: Buf[string]) -> Buf[string]
+    var seen = already
+    var twice: Buf[string] = buf()
+
+    for i in 0..<stmts.len()
+        var here: Buf[string] = buf()
+
+        *stmts.at(i).kind match
+            Val(name, _) -> here.push(name)
+            Var(name, _) -> here.push(name)
+            Def(name, _, _, _, _) -> here.push(name)
+            Unpack(pat, _, _) -> pattern_names(resolve_pattern(pat, 0), &here)
+            ImportNames(_, _, _, _, locals) ->
+                for k in 0..<locals.len()
+                    if !is_imported_type(locals.at(k)) then here.push(locals.at(k))
+            ImportAll(_, _, _, alias) -> here.push(alias)
+            _ -> ()
+
+        for k in 0..<here.len()
+            val name = here.at(k)
+
+            if holds(seen, name)
+                if !holds(twice, name) then twice.push(name)
+            else
+                seen.push(name)
+
+    twice
+end declared_twice
+
+holds(names: Buf[string], name: string) -> bool
+    for i in 0..<names.len()
+        if names.at(i) == name then return true
+
+    false
+end holds
+
+// How a name is introduced here: `const `, `let `, or nothing at all where it is being declared a
+// second time in one block.
+//
+// **A name is `let` from the start where the block declares it again**, since the second one is an
+// assignment and assigning to a `const` is a fault rather than a refusal to start.
+declaring(j: *Js, name: string, immutable: bool) -> string
+    if holds(j.bound, name) then return ""
+
+    j.bound.push(name)
+
+    if holds(j.rebound, name) then return "let "
+
+    if immutable then "const " else "let "
+end declaring
+
+// A name a binder declares into the block that is about to open.
+//
+// **Always `let`, because whether the body declares it again is not known here** -- the binding is
+// written before the run of statements that would say so. A `for` over a name whose body binds the
+// same name is the case, and it is an ordinary thing to write.
+declaring_into_block(j: *Js, name: string) -> string
+    if holds(j.pending, name) then return ""
+
+    j.pending.push(name)
+    "let "
+end declaring_into_block
 
 // A run of statements whose last value is wanted, assigned into `into`.
 //
@@ -286,6 +505,9 @@ emit_stmts_into(j: *Js, stmts: Buf[Stmt], into: string)
     if stmts.len() == 0
         line(j, s"${into} = null;")
         return
+    end if
+
+    val outer = open_block(j, stmts)
 
     for i in 0..<stmts.len() - 1
         emit_stmt(j, stmts.at(i))
@@ -304,6 +526,8 @@ emit_stmts_into(j: *Js, stmts: Buf[Stmt], into: string)
         _ ->
             emit_stmt(j, last)
             line(j, s"${into} = null;")
+
+    close_block(j, outer)
 end emit_stmts_into
 
 // Say which line the program is on, where it has changed since the last thing emitted said so.
@@ -316,6 +540,17 @@ end emit_stmts_into
 // statements on one line cost one marker.
 private mark(j: *Js, at: Span)
     val here = j.src.locate(at.start).line
+
+    // **Where the file travels too, every statement gets a marker whether or not the line moved.**
+    // A call that returned a moment ago left the callee's file behind it, and the next statement is
+    // what puts this one back -- so a marker skipped for saying the same line as the one before it
+    // would leave a fault naming the file it was raised in the last time somebody was called.
+    if j.stamp
+        j.last_line = here
+        line(j, s"$$.at(${here}, ${j.file});")
+
+        return
+    end if
 
     if here == j.last_line then return
 
@@ -333,11 +568,11 @@ emit_stmt(j: *Js, s: Stmt)
         Val(name, init) ->
             val v = emit_expr(j, init)
 
-            line(j, s"const ${js_name(name)} = ${v};")
+            line(j, s"${declaring(j, name, true)}${js_name(name)} = ${v};")
         Var(name, init) ->
             val v = emit_expr(j, init)
 
-            line(j, s"let ${js_name(name)} = ${v};")
+            line(j, s"${declaring(j, name, false)}${js_name(name)} = ${v};")
         Unpack(pat, init, immutable) ->
             val v = emit_expr(j, init)
             val subject = fresh(j)
@@ -347,7 +582,16 @@ emit_stmt(j: *Js, s: Stmt)
         Assign(op, target, value) -> emit_assign(j, op, target, value, at)
         MultiAssign(op, targets, values) -> emit_multi_assign(j, op, targets, values, at)
         Def(name, params, defaults, body, is_async) ->
-            emit_function(j, "", js_name(name), params, defaults, body, is_async, "", at)
+            // **A definition is a JavaScript function declaration where it can be**, which is what
+            // makes the emitted code read like the program. One that is defined again in the same
+            // run is bound to a name instead: two `function f` in one block are legal JavaScript and
+            // mean the wrong thing, the second winning even for a call written between them.
+            val how = declaring(j, name, true)
+
+            if how == "const "
+                emit_function(j, "", js_name(name), params, defaults, body, is_async, "", at)
+            else
+                emit_function(j, s"${how}${js_name(name)} = ", "", params, defaults, body, is_async, ";", at)
         Eval(e) ->
             val v = emit_expr(j, e)
 
@@ -373,13 +617,51 @@ emit_stmt(j: *Js, s: Stmt)
         // **A type has no runtime existence**, so a declaration emits nothing at all. `x is Shape`
         // is emitted as the pattern the name stands for, which `js_pat.sysl` looks up.
         TypeDecl(_, _) -> ()
-        CheckType(_, _, _) -> ()
 
-        ImportNames(_, path_at, _, _, _) ->
-            complain(j, path_at, "the JavaScript back end does not emit imports yet, so this program has to be a single file")
-        ImportAll(_, path_at, _, _) ->
-            complain(j, path_at, "the JavaScript back end does not emit imports yet, so this program has to be a single file")
+        // `p: Point` -- what the parser leaves behind an annotated parameter, and the machine's
+        // `CheckType`. **The complaint names all three things a reader needs**: the parameter, the
+        // type it was declared as, and what arrived -- which is why it is written out here rather
+        // than left to `$.matches` to say something general.
+        CheckType(name, declared, pat) ->
+            val test = emit_test(j, pat, js_name(name))
+
+            line(j, s"if (!(${test})) $$.fault(\"`${name}` was declared ${declared}, and was given \" + $$.show(${js_name(name)}));")
+
+        // **An import is a field taken out of the module's object, which is what the module already
+        // is.** The file it names has been emitted above this one -- `Loaded.order` is what
+        // guarantees that -- so the `const` holding it is in scope and nothing has to be looked up
+        // at run time. Every path here resolved while loading, so a lookup that fails now is a
+        // compiler bug and is reported as one.
+        ImportNames(path, path_at, origin, names, locals) ->
+            module_of(j, path, origin) match
+                Some(m) ->
+                    for i in 0..<names.len()
+                        // A type came in when the file was opened and has nothing to bind: the
+                        // module has no field of that name, a type never having been a value.
+                        if !is_imported_type(locals.at(i))
+                            val local = locals.at(i)
+
+                            line(j, s"${declaring(j, local, true)}${js_name(local)} = $$.field($$m${m}, ${quoted_js(names.at(i))});")
+                None -> complain(j, path_at, s"the module `${path}` was never loaded")
+        ImportAll(path, path_at, origin, alias) ->
+            module_of(j, path, origin) match
+                Some(m) -> line(j, s"${declaring(j, alias, true)}${js_name(alias)} = $$m${m};")
+                None -> complain(j, path_at, s"the module `${path}` was never loaded")
 end emit_stmt
+
+// Which file an import written in this one names.
+//
+// **The path is resolved by the compiler's own resolver, from the unit the program was just
+// compiled into.** There is one rule for what a path means and it lives in `module.sysl`; asking it
+// through `module_want_from` is what keeps this from being a second answer to the same question.
+private module_of(j: *Js, raw: string, origin: Origin) -> Option[usize]
+    val want = module_want_from(&current_unit, j.file, raw, origin)
+
+    for i in 0..<current_unit.sources.len()
+        if current_unit.sources.at(i).name == want then return Some(i)
+
+    None
+end module_of
 
 // `x = e`, `x += e` and their neighbours, over a name, an index or a field.
 private emit_assign(j: *Js, op: Tok, target: Expr, value: Expr, at: Span)
@@ -493,7 +775,15 @@ emit_function(j: *Js, before: string, name: string, params: Buf[string], default
     val answer = fresh(j)
 
     line(j, s"let ${answer};")
+
+    // **A body runs at a different time from the text around it, so what the last marker said means
+    // nothing inside it.** A marker is written only where the line changed, and the line a function
+    // is defined on is the line its first statement is usually on -- so a body that trusted the
+    // count would begin with no marker at all, and a fault in it would be reported at whatever line
+    // the CALLER was on. Forgetting on the way in and again on the way out is the whole fix.
+    j.last_line = 0
     emit_body_into(j, body_at(body), answer)
+    j.last_line = 0
     line(j, s"return ${answer};")
     close(j)
     line(j, "}" + after)
