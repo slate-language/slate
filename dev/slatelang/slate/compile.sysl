@@ -106,20 +106,20 @@ resolve_pattern(pat: Pattern, depth: usize) -> Pattern
                 Some(found) -> resolve_pattern(found, depth + 1)
                 None -> pat
         At(name, inner) -> pattern(pat.span, PatKind.At(name, resolve_pattern(inner, depth)))
-        ArrayPat(items, open, rest) ->
+        ArrayPat(items, open, rest, defaults) ->
             var out: Buf[Pattern] = buf()
 
             for i in 0..<items.len()
                 out.push(resolve_pattern(items.at(i), depth))
 
-            pattern(pat.span, ArrayPat(out, open, rest))
-        ObjectPat(keys, values) ->
+            pattern(pat.span, ArrayPat(out, open, rest, defaults))
+        ObjectPat(keys, values, defaults) ->
             var out: Buf[Pattern] = buf()
 
             for i in 0..<values.len()
                 out.push(resolve_pattern(values.at(i), depth))
 
-            pattern(pat.span, ObjectPat(keys, out))
+            pattern(pat.span, ObjectPat(keys, out, defaults))
         OrPat(alts) ->
             var out: Buf[Pattern] = buf()
 
@@ -337,6 +337,71 @@ private compile_defaults(u: *Unit, e: *Emit, params: Buf[string], defaults: Buf[
         patch(e, over, here(e))
 end compile_defaults
 
+// The defaults a binding pattern carries, as one guarded binding each.
+//
+// **This is `compile_defaults` again, and deliberately so.** A parameter nobody gave and a field the
+// subject did not have are the same situation: slate refuses to store `undefined`, so a name that
+// was not supplied is simply *not bound*, and `JumpIfBound` is the question that separates the two
+// cases. The matcher leaves a defaulted name unbound and this fills it in.
+//
+// **The order is the order they were written**, so a default may read a name bound to its left --
+// `{ width, height = width }` -- which is the rule a parameter list already has.
+private emit_pattern_defaults(u: *Unit, e: *Emit, pat: Pattern, immutable: bool)
+    *pat.kind match
+        At(_, inner) -> emit_pattern_defaults(u, e, inner, immutable)
+        ArrayPat(items, _, _, defaults) ->
+            for i in 0..<items.len()
+                emit_pattern_defaults(u, e, items.at(i), immutable)
+                emit_one_default(u, e, items.at(i), defaults.at(i), immutable)
+        ObjectPat(_, values, defaults) ->
+            for i in 0..<values.len()
+                emit_pattern_defaults(u, e, values.at(i), immutable)
+                emit_one_default(u, e, values.at(i), defaults.at(i), immutable)
+        _ -> ()
+end emit_pattern_defaults
+
+private emit_one_default(u: *Unit, e: *Emit, target: Pattern, value: Option[Expr], immutable: bool)
+    val given = value match
+        Some(v) -> v
+        None -> return
+
+    // The parser has already refused a default on anything but a bare binding, so this is the name.
+    val name = *target.kind match
+        Bind(n) -> n
+        _ -> return
+
+    val k = intern_str(u, name)
+    val over = put(e, JumpIfBound(k, 0), given.span)
+
+    compile_expr(u, e, given)
+    push_n(e, if immutable then DeclareVal(k) else DeclareVar(k), given.span, 1, 0)
+    patch(e, over, here(e))
+end emit_one_default
+
+// Whether a pattern carries a default anywhere inside it.
+//
+// Not `private`: `compile_expr.sysl` refuses one where a pattern is a TEST rather than a binding.
+pattern_defaults(pat: Pattern) -> bool
+    *pat.kind match
+        At(_, inner) -> pattern_defaults(inner)
+        OrPat(alts) ->
+            for i in 0..<alts.len()
+                if pattern_defaults(alts.at(i)) then return true
+
+            false
+        ArrayPat(items, _, _, defaults) ->
+            for i in 0..<items.len()
+                if defaults.at(i).is_some() || pattern_defaults(items.at(i)) then return true
+
+            false
+        ObjectPat(_, values, defaults) ->
+            for i in 0..<values.len()
+                if defaults.at(i).is_some() || pattern_defaults(values.at(i)) then return true
+
+            false
+        _ -> false
+end pattern_defaults
+
 // -- statements -----------------------------------------------------------------------------------
 
 // A run of statements, leaving the last one's value.
@@ -367,6 +432,7 @@ private compile_stmt(u: *Unit, e: *Emit, s: Stmt)
             // Interned through `resolve_pattern` like every other pattern, so a declared type
             // stands in a destructuring binding exactly as it stands in a `match` arm.
             push_n(e, Unpack(intern_resolved(u, pat), immutable), at, 1, 0)
+            emit_pattern_defaults(u, e, pat, immutable)
             push_n(e, PushNil, at, 0, 1)
         Def(name, params, defaults, body, is_async) ->
             val c = compile_chunk(u, params, defaults, body_at(body), name, is_async, body_is_gen(body))
@@ -854,7 +920,9 @@ compile_for(u: *Unit, e: *Emit, label: string, binding: Pattern, iter: Expr, bod
     // apart pays for the pattern machinery, and a `for` that binds one name emits nothing new.
     *binding.kind match
         Bind(name) -> push_n(e, DeclareVal(intern_str(u, name)), at, 1, 0)
-        _ -> push_n(e, Unpack(intern_resolved(u, binding), true), at, 1, 0)
+        _ ->
+            push_n(e, Unpack(intern_resolved(u, binding), true), at, 1, 0)
+            emit_pattern_defaults(u, e, binding, true)
 
     compile_stmt_body(u, e, body)
 

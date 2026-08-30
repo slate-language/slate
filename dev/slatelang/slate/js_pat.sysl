@@ -85,10 +85,24 @@ private emit_bound(j: *Js, pat: Pattern, subject: string, immutable: bool, into_
 
     line(j, s"const ${got} = $$.unpacked(${subject}, ${pattern_js(j, resolved)});")
 
+    var defaults: Buf[Option[Expr]] = buf()
+
+    pattern_default_exprs(resolved, &defaults)
+
     for i in 0..<names.len()
         val name = names.at(i)
+        val has = i < defaults.len() && defaults.at(i).is_some()
 
-        line(j, s"${how(j, name, immutable, into_block)}${js_name(name)} = ${got}[${i}];")
+        // **A name with a default is never `const`**, because the line under it writes to it where
+        // the subject supplied nothing. Nothing can see the difference: that write is the only one
+        // there is and it happens before any of the program runs.
+        line(j, s"${how(j, name, if has then false else immutable, into_block)}${js_name(name)} = ${got}[${i}];")
+
+        if has
+            val given = defaults.at(i).unwrap()
+            val v = emit_expr(j, given)
+
+            line(j, s"if (${js_name(name)} === undefined) ${js_name(name)} = ${v};")
 end emit_bound
 
 private how(j: *Js, name: string, immutable: bool, into_block: bool) -> string =
@@ -140,13 +154,15 @@ private pattern_js(j: *Js, pat: Pattern) -> string
         StrPat(v) -> s"[\"v\", ${quoted_js(v)}]"
         BoolPat(v) -> s"[\"v\", ${if v then "true" else "false"}]"
         NullPat -> "[\"v\", null]"
-        ArrayPat(items, open, rest) ->
+        ArrayPat(items, open, rest, defaults) ->
             val tail = rest match
                 Some(_) -> "true"
                 None -> "false"
 
-            s"[\"arr\", [${pattern_list(j, items)}], ${if open then "true" else "false"}, ${tail}]"
-        ObjectPat(keys, values) -> s"[\"obj\", [${key_list(keys)}], [${pattern_list(j, values)}]]"
+            // **The count of elements that are NOT optional travels with the pattern**, so the
+            // runtime's length check asks the same question the machine's does.
+            s"[\"arr\", [${pattern_list(j, items)}], ${if open then "true" else "false"}, ${tail}, ${items.len() - optional_count(defaults)}]"
+        ObjectPat(keys, values, defaults) -> s"[\"obj\", [${key_list(keys)}], [${pattern_list(j, values)}], [${flag_list(defaults)}]]"
         OrPat(alts) -> s"[\"or\", [${pattern_list(j, alts)}]]"
 
         // **The class is named rather than described**, since what `is` asks is identity: the value's
@@ -188,17 +204,72 @@ pattern_names(pat: Pattern, into: *Buf[string])
         At(name, inner) ->
             into.push(name)
             pattern_names(inner, into)
-        ArrayPat(items, _, rest) ->
+        ArrayPat(items, _, rest, _) ->
             for i in 0..<items.len()
                 pattern_names(items.at(i), into)
 
             rest match
                 Some(name) -> into.push(name)
                 None -> ()
-        ObjectPat(_, values) ->
+        ObjectPat(_, values, _) ->
             for i in 0..<values.len()
                 pattern_names(values.at(i), into)
 
         // An alternative may not bind, so there is nothing to gather from one.
         _ -> ()
 end pattern_names
+
+// The default belonging to each name `pattern_names` gathers, in the same order.
+//
+// **Two walks that must stay in step**, which is why this one mirrors the other line for line rather
+// than being folded into it: a name and its default are read out of the same slot of `$.unpacked`'s
+// answer.
+private pattern_default_exprs(pat: Pattern, into: *Buf[Option[Expr]])
+    *pat.kind match
+        Bind(_) -> into.push(None)
+        At(_, inner) ->
+            into.push(None)
+            pattern_default_exprs(inner, into)
+        ArrayPat(items, _, rest, defaults) ->
+            for i in 0..<items.len()
+                val before = into.len()
+
+                pattern_default_exprs(items.at(i), into)
+
+                // A default belongs to a bare binding, which contributes exactly one name.
+                if into.len() == before + 1 && defaults.at(i).is_some()
+                    into.set(before, defaults.at(i))
+
+            rest match
+                Some(_) -> into.push(None)
+                None -> ()
+        ObjectPat(_, values, defaults) ->
+            for i in 0..<values.len()
+                val before = into.len()
+
+                pattern_default_exprs(values.at(i), into)
+
+                if into.len() == before + 1 && defaults.at(i).is_some()
+                    into.set(before, defaults.at(i))
+        _ -> ()
+end pattern_default_exprs
+
+// How many entries carry a default.
+private optional_count(defaults: Buf[Option[Expr]]) -> usize
+    var n: usize = 0
+
+    for i in 0..<defaults.len()
+        if defaults.at(i).is_some() then n += 1
+
+    n
+
+// `true, false, true` -- which of these entries is optional.
+private flag_list(defaults: Buf[Option[Expr]]) -> string
+    var out = str_builder()
+
+    for i in 0..<defaults.len()
+        if i > 0 then out.push(", ")
+
+        out.push(if defaults.at(i).is_some() then "true" else "false")
+
+    out.finish()

@@ -59,6 +59,17 @@ is.
   travel as an array literal and slate refuses `undefined` in an array. `<p>{props.title ?? null}</p>`
   is what a program writes, and `null` renders nothing.
 
+  **The better answer is to take the props apart with defaults**, which is what React code does
+  anyway and what slate's patterns learned in order to make this pleasant:
+
+  ```
+  Card({ title = "Untitled", size = 1, children }) =
+      <div class={"card s" + string(size)}><h2>{title}</h2>{children}</div>
+  ```
+
+  A default fires on **absence and nothing else** — a `title` of `0`, `false`, `""` or `null` is the
+  value that was given, where JavaScript's `||` would have replaced all four.
+
 ## Not here yet
 
 `useContext`, `memo`, error boundaries, portals, and a DOM host. The reconciler replaces a host node's

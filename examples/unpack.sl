@@ -37,6 +37,35 @@ var [head, tail] = [1, [2, 3]]
 head = head * 10
 print(head, tail)
 
+// **`= value` after a name is what to bind where the subject supplied nothing**, which makes that
+// part of the pattern optional. It is the same `=` a parameter's default uses and it means the same
+// thing.
+val { host, port = 80 } = { host: "example.com" }
+
+print(host, port)
+
+val [first, second = "none"] = ["a"]
+
+print(first, second)
+
+// **A default fires on ABSENCE and on nothing else.** JavaScript's `x || 80` would replace a `0`, a
+// `false` and an empty string as well, and even `x ?? 80` replaces a `null` the caller meant. Here
+// the question is about the binding rather than about the value: slate refuses to store `undefined`,
+// so a name nobody supplied is simply not bound, and that is what is asked.
+val { level = "warn" } = { level: null }
+
+print(level)
+
+// A default is worked out where the binding is, so it sees what was bound to its left -- and each
+// binding gets a value of its own rather than one made when the pattern was written.
+area({ width, height = width }) = width * height
+
+print(area({ width: 3 }), area({ width: 3, height: 2 }))
+
+// **A default belongs to a binding, so a `match` arm may not carry one.** An arm that supplies what
+// the value did not have would match everything, which is a trap rather than a shorthand; a binding
+// has no next arm to fall through to, which is why it is useful there and nowhere else.
+
 // A binding has no next arm to try, so a value that does not fit is a fault rather than an
 // `undefined` that travels. Each half of the mismatch gets its own sentence:
 //

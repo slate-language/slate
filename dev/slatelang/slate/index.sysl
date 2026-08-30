@@ -216,20 +216,25 @@ end apply
 // thing that arrived.
 unpack_complaint(pat: Pattern, v: Value) -> string
     *pat.kind match
-        ArrayPat(items, open, _) ->
+        ArrayPat(items, open, _, defaults) ->
             v match
                 Array(a) ->
-                    val least = if open then "at least " else ""
+                    // **What the binding needs is the elements with no default**, so a complaint about
+                    // `[a, b = 2]` given `[]` says one and not two.
+                    val needs = items.len() - trailing_defaults(defaults)
+                    val least = if open || needs != items.len() then "at least " else ""
 
-                    if a.items.len() == items.len()
+                    if a.items.len() >= needs && a.items.len() <= items.len()
                         return "this array has the right number of elements, and one of them does not fit the binding"
 
-                    s"this binding takes ${least}${items.len()} elements out of an array, and this one has ${a.items.len()}"
+                    s"this binding takes ${least}${needs} ${if needs == 1 then "element" else "elements"} out of an array, and this one has ${a.items.len()}"
                 other -> s"this binding takes an array apart, and this is ${other.type_name()}"
-        ObjectPat(keys, _) ->
+        ObjectPat(keys, _, defaults) ->
             v match
                 Object(o) ->
                     for i in 0..<keys.len()
+                        if defaults.at(i).is_some() then continue
+
                         if obj_get_name(o, keys.at(i)).is_none()
                             return s"this object has no field called `${keys.at(i)}`, which this binding takes out of it"
 
@@ -274,8 +279,8 @@ match_pattern(pat: Pattern, v: Value, scope: *EnvObj, assignable: bool) -> bool
         NullPat -> v match
             Null -> true
             _ -> false
-        ArrayPat(items, open, rest) -> match_array(items, open, rest, v, scope, assignable)
-        ObjectPat(keys, values) -> match_object(keys, values, v, scope, assignable)
+        ArrayPat(items, open, rest, defaults) -> match_array(items, open, rest, defaults, v, scope, assignable)
+        ObjectPat(keys, values, defaults) -> match_object(keys, values, defaults, v, scope, assignable)
         OrPat(alts) ->
             for i in 0..<alts.len()
                 if match_pattern(alts.at(i), v, scope, assignable) then return true
@@ -325,19 +330,28 @@ private match_proto(name: string, v: Value, scope: *EnvObj) -> bool
 end match_proto
 
 // `[a, b]` and `[first, ...rest]`.
-private match_array(items: Buf[Pattern], open: bool, rest: Option[string], v: Value, scope: *EnvObj, assignable: bool) -> bool
+private match_array(items: Buf[Pattern], open: bool, rest: Option[string], defaults: Buf[Option[Expr]], v: Value, scope: *EnvObj, assignable: bool) -> bool
     v match
         Array(xs) ->
             // A closed pattern must agree on length exactly; an open one treats the fixed patterns
             // as a floor.
             val fixed = items.len()
 
-            if open
-                if xs.items.len() < fixed then return false
-            else
-                if xs.items.len() != fixed then return false
+            // **A defaulted element is optional, so the floor is the elements WITHOUT one.** They are
+            // all at the end, which the parser has already seen to.
+            val least = fixed - trailing_defaults(defaults)
 
-            for i in 0..<fixed
+            if open
+                if xs.items.len() < least then return false
+            else
+                if xs.items.len() < least || xs.items.len() > fixed then return false
+
+            // **An element the array did not reach is left UNBOUND rather than matched**, and the
+            // instruction that follows the unpack is what gives it its default. That keeps the
+            // matcher infallible and keeps the default an expression worked out where the binding is.
+            val taken = if xs.items.len() < fixed then xs.items.len() else fixed
+
+            for i in 0..<taken
                 if !match_pattern(items.at(i), xs.items.at(i), scope, assignable) then return false
 
             // The tail is only gathered where it is named. `[a, ...]` allocates nothing.
@@ -345,7 +359,7 @@ private match_array(items: Buf[Pattern], open: bool, rest: Option[string], v: Va
                 Some(name) ->
                     var tail: Buf[Value] = buf()
 
-                    for i in fixed..<xs.items.len()
+                    for i in taken..<xs.items.len()
                         tail.push(xs.items.at(i))
 
                     declare(scope, name, Array(new_array(tail)), assignable)
@@ -354,6 +368,15 @@ private match_array(items: Buf[Pattern], open: bool, rest: Option[string], v: Va
             true
         _ -> false
 end match_array
+
+// How many of the last entries carry a default, the parser having made sure they are the last ones.
+private trailing_defaults(defaults: Buf[Option[Expr]]) -> usize
+    var n: usize = 0
+
+    for i in 0..<defaults.len()
+        if defaults.at(i).is_some() then n += 1
+
+    n
 
 // `{ name: n }`.
 //
@@ -366,12 +389,15 @@ end match_array
 // program writes after matching -- and every subclass failed the interface its base implements, which
 // is what `type Drawable = { draw: function }` is for. JavaScript splits the same seam and puts `in`
 // on this side of it; `hasOwnProperty` is the other question, and slate has never had syntax for it.
-private match_object(keys: Buf[string], values: Buf[Pattern], v: Value, scope: *EnvObj, assignable: bool) -> bool
+private match_object(keys: Buf[string], values: Buf[Pattern], defaults: Buf[Option[Expr]], v: Value, scope: *EnvObj, assignable: bool) -> bool
     v match
         Object(fields) ->
             for i in 0..<keys.len()
                 field_through(fields, keys.at(i)) match
-                    None -> return false
+                    // **A field with a default is optional and is left UNBOUND**, and the instruction
+                    // after the unpack is what gives it its value. A field without one is still the
+                    // fault it always was.
+                    None -> if defaults.at(i).is_none() then return false
                     Some(field) -> if !match_pattern(values.at(i), field, scope, assignable) then return false
 
             true

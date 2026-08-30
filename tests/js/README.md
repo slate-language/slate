@@ -14,9 +14,10 @@ floor to 0.0.93 and puts `--include-path quickjs=…` on every test run. When th
 the differential suite and the diff above becomes an assertion.
 
 Until then they are run by hand, and every one of them was: `wide.sl` is the fixture for a driver
-test and the five numbered ones cover, in order, arithmetic and printing; patterns, `match`,
+test and the six numbered ones cover, in order, arithmetic and printing; patterns, `match`,
 labelled loops, closures and `try`/`catch`; classes, generators, `with`, defaults and spread
-arguments; the `...` literals; and the annotations, which are checked while a program runs.
+arguments; the `...` literals; the annotations, which are checked while a program runs; and defaults
+inside a pattern.
 
 `mods/` holds the programs of **more than one file**, which are the same corpus with the same
 command — `slate js mods/two.sl -o two.js` writes every module of the program into one file, so
