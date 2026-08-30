@@ -1,0 +1,456 @@
+// slate's React -- elements, function components, hooks and a keyed reconciler.
+//
+// **React's model and React's mechanism, not a substitute for either.** A component is a function of
+// its props; state lives in hooks kept on call-order slots; a change re-renders the component that
+// owns it and the reconciler matches the new children against the old by key. That is what the
+// framework was asked for, and every departure from it below is marked and argued.
+//
+// **The host is behind an adapter, which is what lets the same components render twice.** Nothing
+// here knows what a node is: `stringHost` builds objects and serialises them, and a DOM host will
+// create real elements through the same six functions. So a page renders to HTML on a server and to
+// the document in a browser from one source -- which is the thing that makes this worth writing in
+// slate rather than reaching for React.
+
+// -- elements --------------------------------------------------------------------------------
+
+// What `<>...</>` is an element of. A string no tag can be, so it never collides with a host name.
+export val Fragment = "#fragment"
+
+// What every element in the source is desugared into.
+//
+// **The children go into `props.children`**, which is React's arrangement and is what lets a
+// component pass on what it was given without knowing it is doing so.
+export createElement(type, props, kids) =
+    { type: type, props: props with { children: kids }, key: props.key ?? null }
+
+// -- the render in progress ------------------------------------------------------------------
+
+// The instance being rendered, and which of its hooks the component is up to.
+//
+// **A hook is found by the ORDER it was called in**, which is React's implementation and needs
+// nothing slate lacks -- a counter reset at the top of each render and an array on the instance.
+// The cost is React's too: a hook may not be called inside a condition, because the slot it lands in
+// would move.
+var rendering = null
+var slot = 0
+
+// -- hooks -------------------------------------------------------------------------------------
+
+// A value the component keeps between renders, and the function that changes it.
+//
+// The pair is an array so that it comes apart the way it is written in React:
+//
+//     val [count, setCount] = useState(0)
+//
+// **The setter takes a value or a function of the old one**, and does nothing at all where the new
+// value equals the old -- so a component that sets its state to what it already holds does not
+// re-render, which is what stops an effect from looping.
+export useState(initial) =
+    val cell = hookCell({ value: initial })
+    val inst = rendering
+
+    [cell.value, next ->
+        val v = if next is function then next(cell.value) else next
+
+        if v != cell.value
+            cell.value = v
+            invalidate(inst)]
+
+// State changed by an action rather than by a value, which is `useState` with the reducer in front.
+export useReducer(reduce, initial) =
+    val [state, set] = useState(initial)
+
+    [state, action -> set(s -> reduce(s, action))]
+
+// A box the component keeps, whose `current` may be written without re-rendering anything.
+export useRef(initial) = hookCell({ current: initial })
+
+// A value worked out only when what it depends on changes.
+//
+// **The dependencies are compared with slate's `==`, which is STRUCTURAL, where React compares each
+// one by identity.** `[1, 2] == [1, 2]` is true in slate and false in JavaScript, so an object
+// rebuilt with the same fields does not count as a change here and does in React. That is a
+// deliberate divergence: it is the host language's own answer, it is the one a slate reader will
+// predict, and the surprising direction -- recomputing when nothing changed -- is the one it removes.
+export useMemo(make, deps) =
+    val cell = hookCell({ value: null, deps: null, first: true })
+
+    if cell.first || cell.deps != deps
+        cell.value = make()
+        cell.deps = deps
+        cell.first = false
+
+    cell.value
+
+// A function kept between renders, which is `useMemo` of the function itself.
+export useCallback(f, deps) = useMemo(() -> f, deps)
+
+// Work to do after the render has been committed, and how to undo it.
+//
+// **The cleanup runs before the next effect and again when the component goes**, which is what makes
+// an effect that subscribes to something safe to write. Leaving `deps` out runs it after every
+// render, which is React's rule read the same way.
+export useEffect(run, deps = null) =
+    val cell = hookCell({ deps: null, cleanup: null, first: true })
+
+    if cell.first || deps == null || cell.deps != deps
+        cell.deps = deps
+        cell.first = false
+
+        push(rendering.root.effects, { cell: cell, run: run })
+
+// The slot this hook call owns, made on the first render and found again on every one after.
+hookCell(fresh) =
+    val inst = rendering
+    val i = slot
+
+    slot = slot + 1
+
+    if i >= inst.hooks.len() then push(inst.hooks, fresh)
+
+    inst.hooks[i]
+
+// -- instances -------------------------------------------------------------------------------
+
+// **An instance is what an element BECAME, and it is what survives a re-render.** The element is a
+// description made fresh every time; the instance holds the hooks, the host node and the children it
+// was matched against, which is the whole reason a component's state does not go when its props
+// change.
+instance(root, parent, el, kind) =
+    { root: root, parent: parent, el: el, kind: kind, key: null, hooks: [], kids: [], node: null, gone: false }
+
+// What a child amounts to: nothing, a string, or an element.
+//
+// **`null`, `undefined` and the two booleans render nothing**, which is what makes `{cond && <a/>}`
+// the ordinary way to write a conditional child.
+flatten(kids, out) =
+    for kid in kids
+        if kid == null || kid == undefined || kid == true || kid == false
+            continue
+
+        if kid is array
+            flatten(kid, out)
+        else
+            push(out, kid)
+
+    out
+
+kindOf(el) =
+    if el is string || el is number then "text"
+    elif el.type == Fragment then "fragment"
+    elif el.type is function then "component"
+    else "host"
+
+// Whether an old instance may be updated by this element rather than replaced.
+//
+// **The key is asked first and the type second**, which is the whole of what a key is for: two
+// elements of the same type in the same position are the same thing unless their keys say otherwise.
+matches(old, el) =
+    if old == null then return false
+    if old.kind != kindOf(el) then return false
+
+    if old.kind == "text" then return true
+    if old.key != (el.key ?? null) then return false
+
+    old.el.type == el.type
+
+// -- reconciling -----------------------------------------------------------------------------
+
+// One child, matched against what stood there before.
+reconcile(root, parent, old, el) =
+    if !matches(old, el)
+        if old != null then unmount(old)
+
+        return build(root, parent, el)
+
+    old.el = el
+
+    update(old)
+
+    old
+
+build(root, parent, el) =
+    val kind = kindOf(el)
+    val inst = instance(root, parent, el, kind)
+
+    if kind == "text"
+        inst.node = root.host.text(string(el))
+
+        return inst
+
+    inst.key = el.key ?? null
+
+    if kind == "host" then inst.node = root.host.element(el.type)
+
+    update(inst)
+
+    inst
+
+update(inst) =
+    if inst.kind == "text"
+        inst.root.host.setText(inst.node, string(inst.el))
+
+        return null
+
+    if inst.kind == "component"
+        rendering = inst
+        slot = 0
+
+        val out = inst.el.type(inst.el.props)
+
+        rendering = null
+
+        reconcileKids(inst, [out])
+
+        return null
+
+    if inst.kind == "host"
+        inst.root.host.setProps(inst.node, inst.el.props)
+
+    reconcileKids(inst, inst.el.props.children)
+
+    if inst.kind == "host" then inst.root.host.setKids(inst.node, childNodes(inst))
+
+    null
+
+// The children, matched against the ones that stood there before.
+//
+// **A key is looked for among the old children before position is**, so a row inserted at the top of
+// a list moves the rows below it rather than rewriting every one of them.
+reconcileKids(inst, kids) =
+    val wanted = flatten(kids, [])
+    val old = inst.kids
+    var used = []
+    var next = []
+
+    for i in 0..<wanted.len()
+        val el = wanted[i]
+        val found = takeMatch(old, used, el, i)
+
+        push(next, reconcile(inst.root, inst, found, el))
+
+    // Whatever was not matched is gone, and its effects have to be undone.
+    for i in 0..<old.len()
+        if !contains(used, i) then unmount(old[i])
+
+    inst.kids = next
+
+    null
+
+// The old child this element should update, by key where it has one and by position otherwise.
+takeMatch(old, used, el, i) =
+    val key = if el is string || el is number then null else el.key ?? null
+
+    if key != null
+        for j in 0..<old.len()
+            if !contains(used, j) && old[j].key == key
+                push(used, j)
+
+                return old[j]
+
+        return null
+
+    if i < old.len() && !contains(used, i) && old[i].key == null
+        push(used, i)
+
+        return old[i]
+
+    null
+
+contains(xs, v) =
+    for x in xs
+        if x == v then return true
+
+    false
+
+// The host nodes an instance stands for, innermost first.
+//
+// **A component and a fragment have no node of their own**, so they answer with their children's --
+// which is what lets a component return several things without a tag around them.
+nodesOf(inst) =
+    if inst.kind == "text" || inst.kind == "host" then return [inst.node]
+
+    childNodes(inst)
+
+// The nodes an instance's CHILDREN stand for.
+//
+// **Not `nodesOf` of the instance itself, which for a host node is that node.** Setting a host node's
+// children to its own node makes the tree hold itself, and what comes back is a recursion 10,000
+// deep in the serialiser rather than anything that names the mistake.
+childNodes(inst) =
+    var out = []
+
+    for kid in inst.kids
+        for node in nodesOf(kid)
+            push(out, node)
+
+    out
+
+// A subtree that is no longer rendered: every effect it left behind is undone, deepest first.
+unmount(inst) =
+    inst.gone = true
+
+    for kid in inst.kids
+        unmount(kid)
+
+    for cell in inst.hooks
+        if cell.cleanup is function
+            cell.cleanup()
+            cell.cleanup = null
+
+    null
+
+// -- roots -----------------------------------------------------------------------------------
+
+// An element rendered, and kept so that it can be rendered again.
+export mount(el, host = null) =
+    val root = { host: host ?? stringHost(), inst: null, pending: [], effects: [], scheduled: false }
+
+    root.inst = reconcile(root, null, null, el)
+
+    commit(root)
+
+    root
+
+// The rendered tree as text, which is what the string host is for.
+export html(root) = root.host.serialise(nodesOf(root.inst))
+
+// Every state change since the last one, rendered.
+//
+// **A change does not render on the spot.** Two `setState` calls in one handler are one render, which
+// is React's batching and is what stops a handler from being able to see a half-updated tree.
+export flush(root) =
+    loop
+        if root.pending.len() == 0 then break
+
+        val waiting = root.pending
+
+        root.pending = []
+
+        for inst in waiting
+            if !inst.gone then update(inst)
+
+        // A component that re-rendered may have changed what its parent's host node holds.
+        refreshNodes(root.inst)
+
+    commit(root)
+
+    null
+
+// The effects the render queued, run outermost first, each after its own cleanup.
+commit(root) =
+    val queued = root.effects
+
+    root.effects = []
+
+    for e in queued
+        if e.cell.cleanup is function then e.cell.cleanup()
+
+        e.cell.cleanup = e.run()
+
+    null
+
+// A component re-rendered underneath a host node, so that node's children have changed.
+refreshNodes(inst) =
+    for kid in inst.kids
+        refreshNodes(kid)
+
+    if inst.kind == "host" then inst.root.host.setKids(inst.node, childNodes(inst))
+
+    null
+
+// A component whose state changed, wanting to be rendered again.
+invalidate(inst) =
+    if inst.gone then return null
+
+    val root = inst.root
+
+    for waiting in root.pending
+        if waiting == inst then return null
+
+    push(root.pending, inst)
+
+    if !root.scheduled
+        root.scheduled = true
+
+        // **A one-line lambda, because a block one has to be the LAST argument** -- a block runs to
+        // the end of its last line, and the `, 0)` here would arrive first.
+        setTimeout(() -> scheduled(root), 0)
+
+    null
+
+scheduled(root) =
+    root.scheduled = false
+
+    flush(root)
+
+// -- the string host -------------------------------------------------------------------------
+
+// **Six functions, and nothing above them knows what a node is.** A DOM host answers the same six
+// over real elements, which is what makes the components on both sides one set of components.
+export stringHost() =
+    { element: hostElement, text: hostText, setProps: hostSetProps, setKids: hostSetKids,
+      setText: hostSetText, serialise: serialiseNodes }
+
+hostElement(tag) = { tag: tag, props: {}, kids: [] }
+
+hostText(s) = { text: s }
+
+hostSetProps(node, props) =
+    node.props = props
+
+hostSetKids(node, kids) =
+    node.kids = kids
+
+hostSetText(node, s) =
+    node.text = s
+
+serialiseNodes(nodes) =
+    var out = ""
+
+    for node in nodes
+        out = out + serialiseNode(node)
+
+    out
+
+serialiseNode(node) =
+    if node.tag == undefined then return escapeText(node.text)
+
+    var out = "<" + node.tag + attributes(node.props) + ">"
+
+    if isVoid(node.tag) then return out
+
+    for kid in node.kids
+        out = out + serialiseNode(kid)
+
+    out + "</" + node.tag + ">"
+
+// **`children`, `key` and every handler are left out of the markup**, the first two being the
+// framework's own and a handler having nowhere to go in text. A `true` is a bare attribute and a
+// `false`, `null` or `undefined` is no attribute at all, which is HTML's own rule.
+attributes(props) =
+    var out = ""
+
+    for [name, value] in entries(props)
+        if name == "children" || name == "key" then continue
+        if isHandler(name) then continue
+        if value == false || value == null || value == undefined then continue
+
+        if value == true
+            out = out + " " + name
+        else
+            out = out + " " + name + "=\"" + escapeAttr(string(value)) + "\""
+
+    out
+
+isHandler(name) =
+    name.len() > 2 && name[0..<2] == "on" && name[2] == name[2].upper()
+
+isVoid(tag) =
+    ["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"].indexOf(tag) != null
+
+// **Text is escaped, and that is not a nicety.** A renderer that puts what it was given straight into
+// the markup hands whoever supplied the text control of the page.
+escapeText(s) = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+escapeAttr(s) = escapeText(s).replace("\"", "&quot;")
