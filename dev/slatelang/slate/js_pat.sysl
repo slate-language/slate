@@ -1,0 +1,186 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.str_builder
+
+// Patterns, as JavaScript.
+//
+// **A pattern is emitted as DATA and matched by the runtime, where every other form is emitted as
+// code.** Two things decide it. A pattern tests and binds in one walk, so code for it is a tree of
+// conditionals with the bindings threaded through the branches that succeeded -- and slate's `is`
+// binds names that outlive the test, which in JavaScript means a `let` before the condition and an
+// assignment inside it. Written as data, `$.matched` does that walk once and answers either the
+// values it bound, in the order the names were written, or null.
+//
+// The shapes, which `matchPattern` in the runtime reads:
+//
+// | `["_"]` | the wildcard, and a binding: both take whatever is there |
+// | `["t", "integer"]` | one of slate's kinds |
+// | `["v", 5n]` | a literal, compared as `same_literal` compares it -- no `equals` hook |
+// | `["@", inner]` | a name bound to what the inner pattern matched |
+// | `["arr", [...], open, rest]` | an array, `open` for a `...` tail and `rest` for a named one |
+// | `["obj", ["k"], [...]]` | an object, by its own fields |
+// | `["or", [...]]` | alternatives, none of which may bind |
+// | `["proto", Point]` | made from that class, or from one descended from it |
+//
+// **Every pattern is resolved before it is emitted**, by the compiler's own `resolve_pattern`, so a
+// bare name that turned out to be a type stands for what the type stands for. Resolving it here a
+// second way would be a second answer to a question that already has one.
+
+// Whether a pattern holds, as a JavaScript expression. For a pattern that binds nothing.
+emit_test(j: *Js, pat: Pattern, subject: string) -> string =
+    s"$$.matches(${subject}, ${pattern_js(j, resolve_pattern(pat, 0))})"
+
+// Try a pattern, keeping what it bound. Answers the name holding either the bound values or null.
+emit_attempt(j: *Js, pat: Pattern, subject: string) -> string
+    val got = fresh(j)
+
+    line(j, s"const ${got} = $$.matched(${subject}, ${pattern_js(j, resolve_pattern(pat, 0))});")
+    got
+end emit_attempt
+
+// The names a pattern bound, taken out of what `$.matched` answered.
+emit_bind_from(j: *Js, pat: Pattern, got: string, immutable: bool)
+    var names: Buf[string] = buf()
+
+    pattern_names(resolve_pattern(pat, 0), &names)
+
+    val keyword = if immutable then "const" else "let"
+
+    for i in 0..<names.len()
+        line(j, s"${keyword} ${js_name(names.at(i))} = ${got}[${i}];")
+end emit_bind_from
+
+// `val [a, b] = xs` and a `for` binding: a pattern that has to hold, so a failure is a fault.
+emit_binding(j: *Js, pat: Pattern, subject: string, immutable: bool, at: Span)
+    val resolved = resolve_pattern(pat, 0)
+
+    // **A bare name is the commonest binding there is** -- `for x in xs` -- and it cannot fail, so
+    // it is written as the assignment it is rather than as a walk over a pattern that always holds.
+    *resolved.kind match
+        Bind(name) ->
+            line(j, s"${if immutable then "const" else "let"} ${js_name(name)} = ${subject};")
+            return
+        Wild -> return
+        _ -> ()
+
+    var names: Buf[string] = buf()
+
+    pattern_names(resolved, &names)
+
+    if names.len() == 0
+        line(j, s"$$.unpacked(${subject}, ${pattern_js(j, resolved)});")
+        return
+
+    val got = fresh(j)
+
+    line(j, s"const ${got} = $$.unpacked(${subject}, ${pattern_js(j, resolved)});")
+
+    val keyword = if immutable then "const" else "let"
+
+    for i in 0..<names.len()
+        line(j, s"${keyword} ${js_name(names.at(i))} = ${got}[${i}];")
+end emit_binding
+
+// `x is Point p` used as an expression: the names it binds outlive the test, so they are declared
+// before it and filled in where it held.
+emit_is(j: *Js, pat: Pattern, subject: string) -> string
+    val resolved = resolve_pattern(pat, 0)
+    var names: Buf[string] = buf()
+
+    pattern_names(resolved, &names)
+
+    val got = fresh(j)
+
+    line(j, s"const ${got} = $$.matched(${subject}, ${pattern_js(j, resolved)});")
+
+    for i in 0..<names.len()
+        line(j, s"let ${js_name(names.at(i))};")
+
+    if names.len() > 0
+        line(j, s"if (${got} !== null) {")
+        open(j)
+
+        for i in 0..<names.len()
+            line(j, s"${js_name(names.at(i))} = ${got}[${i}];")
+
+        close(j)
+        line(j, "}")
+
+    s"(${got} !== null)"
+end emit_is
+
+// -- the descriptor ---------------------------------------------------------------------------------
+
+// One pattern, as the data the runtime walks.
+private pattern_js(j: *Js, pat: Pattern) -> string
+    *pat.kind match
+        Wild -> "[\"_\"]"
+        Bind(_) -> "[\"_\"]"
+        TypePat(t) -> s"[\"t\", ${quoted_js(type_test_text(t))}]"
+        At(_, inner) -> s"[\"@\", ${pattern_js(j, inner)}]"
+        IntPat(v) -> s"[\"v\", ${v}n]"
+        RealPat(v) -> s"[\"v\", ${real_literal(v)}]"
+        StrPat(v) -> s"[\"v\", ${quoted_js(v)}]"
+        BoolPat(v) -> s"[\"v\", ${if v then "true" else "false"}]"
+        NullPat -> "[\"v\", null]"
+        ArrayPat(items, open, rest) ->
+            val tail = rest match
+                Some(_) -> "true"
+                None -> "false"
+
+            s"[\"arr\", [${pattern_list(j, items)}], ${if open then "true" else "false"}, ${tail}]"
+        ObjectPat(keys, values) -> s"[\"obj\", [${key_list(keys)}], [${pattern_list(j, values)}]]"
+        OrPat(alts) -> s"[\"or\", [${pattern_list(j, alts)}]]"
+
+        // **The class is named rather than described**, since what `is` asks is identity: the value's
+        // `proto` chain either reaches this very object or it does not. A class that is not in scope
+        // is a name JavaScript would refuse, which the checker has already refused for us.
+        ProtoPat(name) -> s"[\"proto\", ${js_name(name)}]"
+end pattern_js
+
+private pattern_list(j: *Js, pats: Buf[Pattern]) -> string
+    var out = str_builder()
+
+    for i in 0..<pats.len()
+        if i > 0 then out.push(", ")
+
+        out.push(pattern_js(j, pats.at(i)))
+
+    out.finish()
+end pattern_list
+
+private key_list(keys: Buf[string]) -> string
+    var out = str_builder()
+
+    for i in 0..<keys.len()
+        if i > 0 then out.push(", ")
+
+        out.push(quoted_js(keys.at(i)))
+
+    out.finish()
+end key_list
+
+// The names a pattern binds, in the order the runtime hands their values back -- which is the order
+// they are written, outermost first.
+private pattern_names(pat: Pattern, into: *Buf[string])
+    *pat.kind match
+        Bind(name) -> into.push(name)
+        At(name, inner) ->
+            into.push(name)
+            pattern_names(inner, into)
+        ArrayPat(items, _, rest) ->
+            for i in 0..<items.len()
+                pattern_names(items.at(i), into)
+
+            rest match
+                Some(name) -> into.push(name)
+                None -> ()
+        ObjectPat(_, values) ->
+            for i in 0..<values.len()
+                pattern_names(values.at(i), into)
+
+        // An alternative may not bind, so there is nothing to gather from one.
+        _ -> ()
+end pattern_names

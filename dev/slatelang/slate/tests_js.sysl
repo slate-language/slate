@@ -1,0 +1,246 @@
+module dev.slatelang.slate
+@tests
+
+import sh.sysl.parsing.*
+import sysl.text.Search
+
+// The JavaScript back end -- what a program compiles to.
+//
+// **What is pinned here is the emitted TEXT**, which is the only thing this suite can see: running it
+// takes a JavaScript engine, and slate's tests have none until the `quickjs` binding is a dependency
+// of this repo. So these say what the shape of the output is, and the shape is where the decisions
+// are: which operators go through the runtime, where a temporary appears, what a pattern becomes.
+//
+// **`js` hands back the module's own statements without the runtime**, for the reason `good_tree`
+// hands back a tree rather than a program: nine hundred lines of prelude in front of every
+// expectation would pin the prelude instead. `emit_program` is asserted once, at the bottom, for the
+// two things only it does.
+
+// -- values ---------------------------------------------------------------------------------------
+
+@test
+an_integer_is_a_bigint_and_a_real_is_a_number()
+    // **The representation decision, and the one everything else follows from.** slate's integer is
+    // 64 bits, wraps and divides towards zero; a double does none of those and could not be told
+    // from a real afterwards.
+    assert_eq(js("val x = 1\nvar y = 2.5\n"), "$.at(1);\nconst x = 1n;\n$.at(2);\nlet y = 2.5;\n")
+
+@test
+a_real_keeps_every_digit_that_reads_back_the_same()
+    // `%g`'s six digits would be a different number, and the arithmetic downstream would answer
+    // differently from the interpreter's.
+    assert_eq(js("val pi = 3.141592653589793\n"), "$.at(1);\nconst pi = 3.141592653589793;\n")
+    assert_eq(js("val big = 1e300\n"), "$.at(1);\nconst big = 1e+300;\n")
+
+@test
+a_wide_string_survives_as_the_bytes_it_was()
+    // A slate string is UTF-8 and JavaScript source is too, so the bytes go straight through -- a
+    // literal copied character by character would be mojibake, which it was.
+    assert_eq(js("print(\"日本語\")\n"), "$.at(1);\n$.call(print, [\"日本語\"]);\n")
+
+@test
+a_javascript_word_a_program_used_gets_an_escape()
+    // A slate identifier holds no `$`, so a trailing one names something no program can write and
+    // two slate names can never mangle to one.
+    assert_eq(js("val class = 1\nprint(class)\n"),
+        "$.at(1);\nconst class$ = 1n;\n$.at(2);\n$.call(print, [class$]);\n")
+
+@test
+an_object_literal_keeps_its_keys_in_order()
+    assert_eq(js("val o = { a: 1, \"b c\": 2 }\n"),
+        "$.at(1);\nconst o = $.obj([[\"a\", 1n], [\"b c\", 2n]]);\n")
+
+// -- operators ------------------------------------------------------------------------------------
+
+@test
+every_operator_goes_through_the_runtime()
+    // **Not JavaScript's own, and the exceptions are not worth tracking**: `7 / 2` is 3 in slate and
+    // 3.5 there, `0` is true here and false there, `[1] == [1]` is true here and false there.
+    assert_eq(js("print(1 + 2 * 3)\n"),
+        "$.at(1);\n$.call(print, [$.arith(\"+\", 1n, $.arith(\"*\", 2n, 3n))]);\n")
+    assert_eq(js("val b = 1 < 2\n"), "$.at(1);\nconst b = $.compare(\"<\", 1n, 2n);\n")
+    assert_eq(js("val b = [1] == [1]\n"), "$.at(1);\nconst b = $.eq($.arr([1n]), $.arr([1n]));\n")
+
+@test
+a_chain_of_comparisons_reads_each_operand_once()
+    assert_eq(js("val b = 1 < 2 < 3\n"),
+        "$.at(1);\nconst $t1 = 1n;\nconst $t2 = 2n;\nconst $t3 = 3n;\nlet $t4 = true;\n" +
+        "if ($t4) {\n    $t4 = $.compare(\"<\", $t1, $t2);\n}\n" +
+        "if ($t4) {\n    $t4 = $.compare(\"<\", $t2, $t3);\n}\nconst b = $t4;\n")
+
+@test
+a_short_circuit_answers_the_operand_that_decided()
+    // slate's rule, not sysl's -- so neither side may be turned into a boolean, and `??` asks
+    // whether the left side is THERE where `||` asks whether it is true.
+    assert_eq(js("val v = null ?? 3\n"),
+        "$.at(1);\nlet $t1 = null;\nif (!$.present($t1)) {\n    $t1 = 3n;\n}\nconst v = $t1;\n")
+
+@test
+an_interpolation_renders_its_holes_as_a_program_prints_them()
+    assert_eq(js("val s = s\"a ${1 + 1} b\"\n"),
+        "$.at(1);\nconst s = $.interp([\"a \", $.arith(\"+\", 1n, 1n), \" b\"]);\n")
+
+@test
+an_element_assigned_to_holds_its_target_and_key()
+    assert_eq(js("val xs = [1, 2]\nxs[0] = 5\n"),
+        "$.at(1);\nconst xs = $.arr([1n, 2n]);\n$.at(2);\nconst $t1 = xs;\nconst $t2 = 0n;\n" +
+        "$.setIndex($t1, $t2, 5n);\n")
+
+@test
+a_method_call_is_not_a_call_of_a_field()
+    // The receiver rule is the runtime's: an object's own field is called as it stands, and one
+    // reached through a `proto` -- or answered by the builtin table -- takes the receiver in front.
+    assert_eq(js("print(\"ab\".upper())\n"),
+        "$.at(1);\n$.call(print, [$.method(\"ab\", \"upper\", [])]);\n")
+
+// -- the forms that become statements -----------------------------------------------------------
+
+@test
+an_if_used_for_its_value_becomes_a_temporary()
+    // **JavaScript has no block expression**, and an immediately-called function would take
+    // `return`, `break`, `await` and `yield` away from the enclosing function.
+    assert_eq(js("val v = if true then 1 else 2\n"),
+        "$.at(1);\nlet $t1;\nif ($.truthy(true)) {\n    $t1 = 1n;\n} else {\n    $t1 = 2n;\n}\n" +
+        "const v = $t1;\n")
+
+@test
+an_if_with_no_else_is_null_where_the_condition_failed()
+    assert_eq(js("val v = if true then 1\n"),
+        "$.at(1);\nlet $t1;\nif ($.truthy(true)) {\n    $t1 = 1n;\n} else {\n    $t1 = null;\n}\n" +
+        "const v = $t1;\n")
+
+@test
+a_loop_is_labelled_whether_or_not_the_program_named_one()
+    // `break 7` has to assign the loop's temporary and leave the right loop, and the two have to
+    // agree when loops are nested.
+    assert_eq(js("var i = 0\nwhile i < 3\n    i += 1\n"),
+        "$.at(1);\nlet i = 0n;\n$.at(2);\nlet $t1 = null;\nlet $t2 = false;\n" +
+        "$L3: while (true) {\n    if (!$.truthy($.compare(\"<\", i, 3n))) break $L3;\n" +
+        "    $.at(3);\n    i = $.arith(\"+\", i, 1n);\n}\n")
+
+@test
+a_loop_that_finished_on_its_own_takes_its_else()
+    assert_eq(js("var i = 0\nval v = while i < 3\n    i += 1\nelse\n    \"done\"\n"),
+        "$.at(1);\nlet i = 0n;\n$.at(2);\nlet $t1 = null;\nlet $t2 = false;\n" +
+        "$L3: while (true) {\n    if (!$.truthy($.compare(\"<\", i, 3n))) break $L3;\n" +
+        "    $.at(3);\n    i = $.arith(\"+\", i, 1n);\n}\n" +
+        "if (!$t2) {\n    $.at(5);\n    $t1 = \"done\";\n}\nconst v = $t1;\n")
+
+@test
+a_for_over_a_bare_name_binds_it_without_a_pattern()
+    // The commonest binding there is, and it cannot fail -- so it is the assignment it is rather
+    // than a walk over a pattern that always holds.
+    assert_eq(js("for x in 1..3\n    print(x)\n"),
+        "$.at(1);\nlet $t1 = null;\nlet $t2 = false;\n" +
+        "$L3: for (const $t4 of $.iter($.range(1n, 3n, true))) {\n    const x = $t4;\n" +
+        "    $.at(2);\n    $.call(print, [x]);\n}\n")
+
+@test
+a_match_is_one_labelled_block_however_many_arms_it_has()
+    // A chain of `else`s would put twelve arms twelve levels deep; breaking out of a labelled block
+    // keeps the output as flat as the program.
+    assert_eq(js("val v = 3 match\n    1 -> \"one\"\n    n -> n\n"),
+        "$.at(1);\nconst $t1 = 3n;\nlet $t2;\n$L3: {\n" +
+        "    const $t4 = $.matched($t1, [\"v\", 1n]);\n    if ($t4 !== null) {\n" +
+        "        $.at(2);\n        $t2 = \"one\";\n        break $L3;\n    }\n" +
+        "    const $t5 = $.matched($t1, [\"_\"]);\n    if ($t5 !== null) {\n" +
+        "        const n = $t5[0];\n        $.at(3);\n        $t2 = n;\n        break $L3;\n    }\n" +
+        "    $.noArm($t1);\n}\nconst v = $t2;\n")
+
+@test
+a_catch_binds_a_value_and_not_javascripts_exception()
+    assert_eq(js("val v = try\n    1\ncatch e\n    e\n"),
+        "$.at(1);\nlet $t1;\ntry {\n    $.at(2);\n    $t1 = 1n;\n} catch ($t2) {\n" +
+        "    const e = $.caught($t2);\n    $.at(4);\n    $t1 = e;\n}\nconst v = $t1;\n")
+
+@test
+an_is_pattern_declares_its_bindings_before_the_test()
+    // **The names `is` binds outlive the test**, so they are declared in front of it and filled in
+    // where it held -- which a conditional expression could not do.
+    assert_eq(js("val p = { x: 1 }\nval got = p is { x }\n"),
+        "$.at(1);\nconst p = $.obj([[\"x\", 1n]]);\n$.at(2);\nconst $t1 = p;\n" +
+        "const $t2 = $.matched($t1, [\"obj\", [\"x\"], [[\"_\"]]]);\nlet x;\n" +
+        "if ($t2 !== null) {\n    x = $t2[0];\n}\nconst got = ($t2 !== null);\n")
+
+// -- definitions ------------------------------------------------------------------------------------
+
+@test
+a_definition_is_a_function_and_a_generator_is_a_function_star()
+    assert_eq(js("double(x) = x * 2\n"),
+        "$.at(1);\nfunction double(x) {\n    let $t1;\n    $t1 = $.arith(\"*\", x, 2n);\n" +
+        "    return $t1;\n}\n")
+    assert_eq(js("counter()\n    yield 1\n"),
+        "$.at(1);\nfunction* counter() {\n    let $t1;\n    $.at(2);\n    $t1 = (yield 1n);\n" +
+        "    return $t1;\n}\n")
+    assert_eq(js("async later() = 1\n"),
+        "$.at(1);\nasync function later() {\n    let $t1;\n    $t1 = 1n;\n    return $t1;\n}\n")
+
+@test
+a_default_lands_on_the_parameter_it_belongs_to()
+    // **`defaults` covers the LAST of the parameters**, so reading the two lists in step gives every
+    // default to the wrong parameter -- silently, since only a call that leaves one out shows it.
+    assert_eq(js("greet(name, greeting = \"hello\") = greeting\n"),
+        "$.at(1);\nfunction greet(name, greeting = \"hello\") {\n    let $t1;\n    $t1 = greeting;\n" +
+        "    return $t1;\n}\n")
+
+@test
+a_default_that_needs_statements_stays_inside_the_parameter_list()
+    // **A default is worked out at the CALL**, so a `const` in front of the function would share one
+    // value between every call that left the argument out.
+    assert(js("f(xs = if true then [] else [1]) = xs\n").contains("(() => {"))
+    assert(!js("f(xs = if true then [] else [1]) = xs\n").contains("const $t1 = (() => {"))
+
+@test
+a_lambda_is_a_function_expression()
+    // An arrow cannot be a generator, and slate's `->` may hold a `yield`.
+    assert_eq(js("val f = x -> x + 1\n"),
+        "$.at(1);\nconst $t1 = function(x) {\n    let $t2;\n    $t2 = $.arith(\"+\", x, 1n);\n" +
+        "    return $t2;\n};\nconst f = $t1;\n")
+
+// -- the line table ----------------------------------------------------------------------------------
+
+@test
+the_line_is_said_only_where_it_changed()
+    // A caught fault is an object carrying `message`, `line` and `file`, and the line has to be
+    // slate's -- a `catch` reading the emitted JavaScript's line would be reading a file the
+    // programmer never saw. Two statements on one line cost one marker.
+    assert_eq(js("val a = 1\nval b = 2\n"), "$.at(1);\nconst a = 1n;\n$.at(2);\nconst b = 2n;\n")
+
+// -- what is not built yet -----------------------------------------------------------------------
+
+@test
+an_import_is_refused_with_a_sentence_rather_than_emitted_wrongly()
+    // **One of slate's own modules, because the complaint has to come from the BACK END** -- a file
+    // that is not there is refused by the loader long before anything is emitted, which would have
+    // been a test of the loader wearing this one's name.
+    assert(js("import { now } from slate:time\nprint(1)\n").contains("does not emit imports yet"))
+
+// -- the whole program ------------------------------------------------------------------------------
+
+@test
+a_whole_program_carries_the_runtime_and_a_scope_of_its_own()
+    val made = js_program("print(1)")
+
+    // **The module body is a function**, so a program declaring `print` shadows the builtin rather
+    // than colliding with it -- the relationship the interpreter's scope chain gives them.
+    assert(made.contains("const $ = (() => {"), "the runtime is part of the program")
+    assert(made.contains(";(() => {"), "the module has a scope of its own")
+
+    // **The semicolon in front of that is load-bearing**: JavaScript would otherwise read the
+    // module's function as an argument to the prelude's last statement.
+    assert(!made.contains("\n(() => {\n    $.at(0"), "the module opens with a semicolon")
+
+@test
+the_file_a_fault_names_is_said_once_at_the_top()
+    assert(js_program("print(1)").contains("$.at(0, \"t\");"), "the file is named for a fault to carry")
+
+// -- the driver ---------------------------------------------------------------------------------------
+
+@test
+what_slate_js_prints_is_the_program_it_wrote()
+    // **A regression test for `say_lines`**, which rebuilt every line character by character out of
+    // its bytes -- so a program with a wide string in it reached the terminal as mojibake while the
+    // same program written to a file was correct.
+    val said = cli_said(["slate", "js", "tests/js/wide.sl"])
+
+    assert(said.contains("$.call(print, [\"日本語\"]);"), "a wide string survives being printed")

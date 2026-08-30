@@ -1,0 +1,243 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// The expressions that are statements in JavaScript.
+//
+// **`if`, `match`, every loop and `try` are expressions in slate and statements in JavaScript**, and
+// that mismatch is the whole of this file: each one is emitted as a temporary, then the statement
+// that fills it, and the temporary's name is what stands where the expression was.
+//
+// **A loop is labelled whether or not the program named it**, because `break 7` has to assign the
+// temporary and leave the loop, and the two have to name the same loop when they are nested. The
+// label a program wrote is kept in `JsLoop.label` and JavaScript never sees it.
+
+// `if` used for its value.
+emit_if_value(j: *Js, cond: Expr, then_branch: Expr, else_branch: Option[Expr]) -> string
+    val answer = fresh(j)
+
+    line(j, s"let ${answer};")
+
+    val c = emit_expr(j, cond)
+
+    line(j, s"if ($$.truthy(${c})) {")
+    open(j)
+    emit_body_into(j, then_branch, answer)
+    close(j)
+
+    else_branch match
+        Some(e) ->
+            line(j, "} else {")
+            open(j)
+            emit_body_into(j, e, answer)
+            close(j)
+            line(j, "}")
+
+        // **An `if` with no `else` is null where the condition failed**, which is what the machine
+        // pushes: every expression has a value, and this is the one it has.
+        None ->
+            line(j, "} else {")
+            open(j)
+            line(j, s"${answer} = null;")
+            close(j)
+            line(j, "}")
+
+    answer
+end emit_if_value
+
+// A block used for its value.
+emit_block_value(j: *Js, stmts: Buf[Stmt]) -> string
+    val answer = fresh(j)
+
+    line(j, s"let ${answer};")
+    line(j, "{")
+    open(j)
+    emit_stmts_into(j, stmts, answer)
+    close(j)
+    line(j, "}")
+    answer
+end emit_block_value
+
+// `subject match` and its arms.
+//
+// **A labelled block rather than a chain of `else`s**, which keeps twelve arms twelve statements
+// deep in the source and one level deep in the output. `break` out of the block is how an arm that
+// matched stops the rest from being tried.
+emit_match_value(j: *Js, subject: Expr, arms: Buf[Arm], at: Span) -> string
+    val v = emit_expr(j, subject)
+    val held = fresh(j)
+    val answer = fresh(j)
+    val label = fresh_label(j)
+
+    line(j, s"const ${held} = ${v};")
+    line(j, s"let ${answer};")
+    line(j, s"${label}: {")
+    open(j)
+
+    for i in 0..<arms.len()
+        val arm = arms.at(i)
+        val got = emit_attempt(j, arm.pattern, held)
+
+        line(j, s"if (${got} !== null) {")
+        open(j)
+        emit_bind_from(j, arm.pattern, got, true)
+
+        // **The guard is read after the names are bound**, which is what lets it use them.
+        arm.guard match
+            Some(g) ->
+                val cond = emit_expr(j, g)
+
+                line(j, s"if ($$.truthy(${cond})) {")
+                open(j)
+                emit_body_into(j, arm.body, answer)
+                line(j, s"break ${label};")
+                close(j)
+                line(j, "}")
+            None ->
+                emit_body_into(j, arm.body, answer)
+                line(j, s"break ${label};")
+
+        close(j)
+        line(j, "}")
+
+    line(j, s"$$.noArm(${held});")
+    close(j)
+    line(j, "}")
+    answer
+end emit_match_value
+
+// `while`, and `do ... while`, which differ only in where the condition is asked.
+emit_while_value(j: *Js, label: string, cond: Expr, body: Expr, otherwise: Option[Expr], test_after: bool) -> string
+    val frame = open_loop(j, label)
+
+    line(j, s"${frame.js}: while (true) {")
+    open(j)
+
+    if test_after
+        emit_body_effect(j, body)
+
+        val c = emit_expr(j, cond)
+
+        line(j, s"if (!$$.truthy(${c})) break ${frame.js};")
+    else
+        val c = emit_expr(j, cond)
+
+        line(j, s"if (!$$.truthy(${c})) break ${frame.js};")
+        emit_body_effect(j, body)
+
+    close(j)
+    line(j, "}")
+    close_loop(j, frame, otherwise)
+    frame.value
+end emit_while_value
+
+// `loop`, which ends only by leaving it.
+emit_loop_value(j: *Js, label: string, body: Expr) -> string
+    val frame = open_loop(j, label)
+
+    line(j, s"${frame.js}: while (true) {")
+    open(j)
+    emit_body_effect(j, body)
+    close(j)
+    line(j, "}")
+    close_loop(j, frame, None)
+    frame.value
+end emit_loop_value
+
+// `for x in xs`, over an array, a string, a range or a generator.
+emit_for_value(j: *Js, label: string, binding: Pattern, iter: Expr, body: Expr, otherwise: Option[Expr]) -> string
+    val over = emit_expr(j, iter)
+    val frame = open_loop(j, label)
+    val each = fresh(j)
+
+    line(j, s"${frame.js}: for (const ${each} of $$.iter(${over})) {")
+    open(j)
+    emit_binding(j, binding, each, true, iter.span)
+    emit_body_effect(j, body)
+    close(j)
+    line(j, "}")
+    close_loop(j, frame, otherwise)
+    frame.value
+end emit_for_value
+
+// `try ... catch e ...`, and the postfix `x catch e -> y` the parser reads into the same node.
+emit_try_value(j: *Js, body: Expr, name: string, handler: Expr) -> string
+    val answer = fresh(j)
+    val caught = fresh(j)
+
+    line(j, s"let ${answer};")
+    line(j, "try {")
+    open(j)
+    emit_body_into(j, body, answer)
+    close(j)
+    line(j, s"} catch (${caught}) {")
+    open(j)
+
+    // **What a `catch` binds is a value, not JavaScript's exception**: a thrown slate value is
+    // itself, and a fault is the object the interpreter builds -- its sentence, its line and its
+    // file.
+    line(j, s"const ${js_name(name)} = $$.caught(${caught});")
+    emit_body_into(j, handler, answer)
+    close(j)
+    line(j, "}")
+    answer
+end emit_try_value
+
+// `x ensures Shape`, which answers what it was given and faults where the shape does not hold.
+emit_ensures(j: *Js, value: Expr, type_name: string, pat: Pattern, at: Span) -> string
+    val v = emit_expr(j, value)
+    val held = fresh(j)
+
+    line(j, s"const ${held} = ${v};")
+
+    val test = emit_test(j, pat, held)
+
+    line(j, s"if (!(${test})) $$.fault(\"this answered \" + $$.typeName(${held}) + \", and it was declared to answer ${type_name}\");")
+    held
+end emit_ensures
+
+// -- the shared parts ------------------------------------------------------------------------------
+
+// A body run for what it does rather than for what it answers.
+emit_body_effect(j: *Js, body: Expr)
+    *body.kind match
+        Block(stmts) -> emit_stmts(j, stmts)
+        _ ->
+            val v = emit_expr(j, body)
+
+            line(j, s"${v};")
+end emit_body_effect
+
+// A label nothing a program wrote can collide with, since a slate name holds no `$`.
+private fresh_label(j: *Js) -> string
+    j.tmp += 1
+    "$L" + s"${j.tmp}"
+end fresh_label
+
+// The temporaries a loop needs, declared before it and pushed where `break` will find them.
+private open_loop(j: *Js, label: string) -> JsLoop
+    val value = fresh(j)
+    val broke = fresh(j)
+    val frame = JsLoop(label, fresh_label(j), value, broke)
+
+    line(j, s"let ${value} = null;")
+    line(j, s"let ${broke} = false;")
+    j.loops.push(frame)
+    frame
+end open_loop
+
+// **An `else` runs where the loop finished on its own**, which is what the flag records: a `break`
+// gave the loop its value, and finishing means nobody did.
+private close_loop(j: *Js, frame: JsLoop, otherwise: Option[Expr])
+    j.loops.truncate(j.loops.len() - 1)
+
+    otherwise match
+        Some(e) ->
+            line(j, s"if (!${frame.broke}) {")
+            open(j)
+            emit_body_into(j, e, frame.value)
+            close(j)
+            line(j, "}")
+        None -> ()
+end close_loop

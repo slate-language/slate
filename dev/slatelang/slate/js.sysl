@@ -1,0 +1,585 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{split, str_builder, StrBuilder}
+
+// The tree as JavaScript.
+//
+// **A second back end beside the machine, taking the same tree the interpreter walks.** `compile.sysl`
+// turns a `Program` into instructions for `execute.sysl`; this turns the same `Program` into text a
+// JavaScript engine runs. Nothing is shared between the two but the tree, which is the point: a
+// second reading of the tree is what says whether the tree means one thing.
+//
+// **Every operator goes through the runtime rather than JavaScript's own, and that is not caution.**
+// The two languages disagree about the answer often enough that the exceptions are not worth
+// tracking: `7 / 2` is 3 in slate and 3.5 in JavaScript, `0` is true in slate and false in
+// JavaScript, `[1] == [1]` is true in slate and false in JavaScript, and `1 << 40` is 2^40 in slate
+// and 256 in JavaScript, whose shift is 32 bits wide. `$.arith`, `$.truthy`, `$.eq` and their
+// neighbours in `js_rt.sysl` are where slate's answers live.
+//
+// **An integer is a `BigInt` and a real is a `number`**, which is the one representation decision
+// everything else follows from. slate's integer is 64 bits, wraps, divides towards zero and shifts
+// to 63 places; a double does none of those and cannot be told from a real afterwards, so `2.5 is
+// integer` would answer whatever the value happened to look like. The cost is arithmetic through
+// `BigInt`, which is the honest price of answering the same as the interpreter.
+//
+// The three files: this one holds the writer, the statements and the definitions, `js_expr.sysl`
+// holds the expressions, and `js_pat.sysl` holds the patterns. `js_rt.sysl` holds the runtime the
+// emitted code calls into.
+
+// What one emission is carrying.
+//
+// **Nothing here is `private`, `private` in sysl being private to the FILE**: `js_expr.sysl` and
+// `js_pat.sysl` write through the same builder and take temporaries from the same counter.
+struct Js
+    out: StrBuilder
+
+    // The file being emitted, for the line a fault names.
+    src: Source
+
+    // The line the emitted code last said it was on, so that a marker is written only where it
+    // changed.
+    last_line: usize
+
+    // How deep the emitted code is indented.
+    depth: usize
+
+    // How many temporaries have been taken. A slate identifier cannot hold a `$`, so `$t1` can
+    // collide with nothing a program wrote.
+    tmp: usize
+
+    report: Report
+
+    // The loops enclosing this point, innermost last, so that a `break` finds the JavaScript label
+    // and the temporary belonging to the loop it names.
+    loops: Buf[JsLoop]
+
+    // The types this file declared, so that `x is Shape` can be emitted as the pattern the name
+    // stands for. A type has no runtime existence, exactly as in the interpreter.
+    type_names: Buf[string]
+    type_pats: Buf[Pattern]
+end Js
+
+// One loop being emitted: what a `break` inside it has to know.
+//
+// **A loop is a statement in JavaScript and an expression in slate**, so a loop that is used for its
+// value is emitted as a temporary plus a labelled statement. `break 7` assigns the temporary and
+// breaks the label; finishing without a break leaves whatever the `else` said, or null.
+struct JsLoop
+    // The label the program wrote, or the empty string.
+    label: string
+
+    // The label emitted for it, which every loop has whether or not the program named one.
+    js: string
+
+    // The temporary holding the loop's value.
+    value: string
+
+    // The temporary holding whether a `break` was taken, which is what an `else` asks.
+    broke: string
+end JsLoop
+
+// A program's JavaScript, and everything that was wrong with it.
+struct Emitted
+    code: string
+    report: Report
+
+    ok(self) -> bool = !self.report.has_errors()
+end Emitted
+
+// -- the entry points ---------------------------------------------------------------------------
+
+// One file's statements, as the body of a JavaScript function.
+//
+// **The runtime is not part of this, which is what makes the output readable and testable.** A test
+// pins what a program compiles to; prepending nine hundred lines of runtime to every expectation
+// would pin nothing but the runtime.
+emit_module(prog: Program, src: Source) -> Emitted
+    var j = Js(str_builder(), src, 0, 0, 0, report(), buf(), buf(), buf())
+
+    for i in 0..<prog.type_names.len()
+        j.type_names.push(prog.type_names.at(i))
+        j.type_pats.push(prog.type_pats.at(i))
+
+    // What `Point` stands for, for the patterns emitted below. `resolve_pattern` is the compiler's
+    // own, and this is what it reads.
+    open_own_types(prog)
+    emit_stmts(&j, prog.stmts)
+
+    for i in 0..<prog.exports.len()
+        val name = prog.exports.at(i)
+
+        line(&j, s"$$exports.fields.set(${quoted_js(name)}, ${js_name(name)});")
+
+    Emitted(j.out.finish(), j.report)
+end emit_module
+
+// A whole program: the runtime, then the file's own statements inside a function of their own.
+//
+// **The module body is a function rather than the top level**, so that a program declaring `print`
+// shadows the builtin of that name instead of colliding with it. The builtins are `const`s in the
+// scope above, which is exactly the relationship the interpreter's scope chain gives them.
+emit_program(prog: Program, src: Source) -> Emitted
+    val body = emit_module(prog, src)
+    var out = str_builder()
+
+    out.push(js_runtime())
+
+    // **The semicolon in front of the module is load-bearing.** JavaScript inserts one only where
+    // the next line cannot continue the last, and `(` can: without this the prelude's final
+    // statement reads the module's own function as an argument and calls it, which is a
+    // `TypeError` a long way from its cause.
+    out.push("\n;(() => {\n")
+    out.push(s"    $$.at(0, ${quoted_js(src.name)});\n")
+    out.push("    const $exports = $.obj([]);\n\n")
+    out.push(indented(body.code))
+    out.push("})();\n")
+
+    Emitted(out.finish(), body.report)
+end emit_program
+
+// Every line of a block, moved in by one step.
+//
+// **By line rather than by byte**, because a byte-by-byte copy would take a multi-byte character
+// apart: `char(b)` of a continuation byte is not the character it belongs to, and pushing it back
+// would encode it a second time.
+private indented(code: string) -> string
+    var out = str_builder()
+    val lines = split(code, "\n")
+
+    for i in 0..<lines.len
+        val text = lines[i]
+
+        // The last piece of a text ending in a newline is empty, and indenting it would leave
+        // trailing blanks.
+        if text != ""
+            out.push("    ")
+            out.push(text)
+
+        if i < lines.len - 1 then out.push_char('\n')
+
+    out.finish()
+end indented
+
+// -- the writer ---------------------------------------------------------------------------------
+
+// One line of JavaScript, at the depth being emitted at.
+line(j: *Js, text: string)
+    for i in 0..<j.depth
+        j.out.push("    ")
+
+    j.out.push(text)
+    j.out.push_char('\n')
+end line
+
+// A blank line, which is how the emitted code stays readable.
+blank(j: *Js) = j.out.push_char('\n')
+
+open(j: *Js) = j.depth += 1
+
+close(j: *Js) = j.depth -= 1
+
+// A name nothing a program wrote can collide with.
+fresh(j: *Js) -> string
+    j.tmp += 1
+    "$t" + s"${j.tmp}"
+end fresh
+
+// A complaint about something the back end cannot emit.
+//
+// **A diagnostic rather than a fault at run time**, which is the same choice `compile.sysl` makes:
+// what cannot be emitted is knowable here, and a program that would have failed halfway through is
+// worse than one that does not start.
+complain(j: *Js, at: Span, message: string) = j.report.add(error(at, message))
+
+// -- names ----------------------------------------------------------------------------------------
+
+// Whether emitted text is a name and nothing else, so that evaluating it does nothing.
+is_bare_name(text: string) -> bool
+    val b = text.bytes
+
+    if b.len == 0 then return false
+
+    for i in 0..<b.len
+        val c = b[i]
+        val ok = is_ident_cont(c) || c == u8('$')
+
+        if !ok then return false
+
+    true
+end is_bare_name
+
+// A slate name as a JavaScript one.
+//
+// **Only JavaScript's own words are touched, and the escape is a `$`.** A slate identifier is letters,
+// digits and `_` -- `is_ident_start` and `is_ident_cont` say so -- so a trailing `$` names something
+// no program can write, and two slate names can never mangle to one.
+js_name(name: string) -> string = if reserved_in_js(name) then name + "$" else name
+
+// Whether JavaScript would refuse this as a name. The list is JavaScript's reserved words together
+// with the two words that are not reserved but cannot be declared in strict mode.
+private reserved_in_js(name: string) -> bool = name match
+    "await" -> true
+    "arguments" -> true
+    "break" -> true
+    "case" -> true
+    "catch" -> true
+    "class" -> true
+    "const" -> true
+    "continue" -> true
+    "debugger" -> true
+    "default" -> true
+    "delete" -> true
+    "do" -> true
+    "else" -> true
+    "enum" -> true
+    "eval" -> true
+    "export" -> true
+    "extends" -> true
+    "false" -> true
+    "finally" -> true
+    "for" -> true
+    "function" -> true
+    "if" -> true
+    "implements" -> true
+    "import" -> true
+    "in" -> true
+    "instanceof" -> true
+    "interface" -> true
+    "let" -> true
+    "new" -> true
+    "null" -> true
+    "package" -> true
+    "private" -> true
+    "protected" -> true
+    "public" -> true
+    "return" -> true
+    "static" -> true
+    "super" -> true
+    "switch" -> true
+    "this" -> true
+    "throw" -> true
+    "true" -> true
+    "try" -> true
+    "typeof" -> true
+    "var" -> true
+    "void" -> true
+    "while" -> true
+    "with" -> true
+    "yield" -> true
+    _ -> false
+
+// -- statements -----------------------------------------------------------------------------------
+
+// A run of statements, for effect.
+emit_stmts(j: *Js, stmts: Buf[Stmt])
+    for i in 0..<stmts.len()
+        emit_stmt(j, stmts.at(i))
+
+// A run of statements whose last value is wanted, assigned into `into`.
+//
+// **A block's value is what its last statement left**, which is slate's rule, and only an expression
+// statement leaves anything: a `val` evaluates to null, as does a definition and an assignment. So
+// the last statement is emitted into the temporary and every other one for effect.
+emit_stmts_into(j: *Js, stmts: Buf[Stmt], into: string)
+    if stmts.len() == 0
+        line(j, s"${into} = null;")
+        return
+
+    for i in 0..<stmts.len() - 1
+        emit_stmt(j, stmts.at(i))
+
+    val last = stmts.at(stmts.len() - 1)
+
+    *last.kind match
+        Eval(e) ->
+            // The last statement is emitted here rather than through `emit_stmt`, so the line it is
+            // on has to be said here too.
+            mark(j, last.span)
+
+            val v = emit_expr(j, e)
+
+            line(j, s"${into} = ${v};")
+        _ ->
+            emit_stmt(j, last)
+            line(j, s"${into} = null;")
+end emit_stmts_into
+
+// Say which line the program is on, where it has changed since the last thing emitted said so.
+//
+// **A line table, which is what a fault needs and JavaScript cannot supply.** A caught fault is an
+// object carrying `message`, `line` and `file`, and the line has to be slate's -- a `catch` reading
+// the line of the emitted JavaScript would be reading a file the programmer never saw.
+//
+// **Per statement and only where it changed**, so a long expression costs nothing and two
+// statements on one line cost one marker.
+private mark(j: *Js, at: Span)
+    val here = j.src.locate(at.start).line
+
+    if here == j.last_line then return
+
+    j.last_line = here
+    line(j, s"$$.at(${here});")
+end mark
+
+// One statement, for effect.
+emit_stmt(j: *Js, s: Stmt)
+    val at = s.span
+
+    mark(j, at)
+
+    *s.kind match
+        Val(name, init) ->
+            val v = emit_expr(j, init)
+
+            line(j, s"const ${js_name(name)} = ${v};")
+        Var(name, init) ->
+            val v = emit_expr(j, init)
+
+            line(j, s"let ${js_name(name)} = ${v};")
+        Unpack(pat, init, immutable) ->
+            val v = emit_expr(j, init)
+            val subject = fresh(j)
+
+            line(j, s"const ${subject} = ${v};")
+            emit_binding(j, pat, subject, immutable, at)
+        Assign(op, target, value) -> emit_assign(j, op, target, value, at)
+        MultiAssign(op, targets, values) -> emit_multi_assign(j, op, targets, values, at)
+        Def(name, params, defaults, body, is_async) ->
+            emit_function(j, "", js_name(name), params, defaults, body, is_async, "", at)
+        Eval(e) ->
+            val v = emit_expr(j, e)
+
+            // **A statement that came out as a bare name is not written at all.** Every control form
+            // is emitted as a temporary plus the statements that fill it, so a loop written for its
+            // effect ends with the name of a temporary nobody reads -- which JavaScript is happy to
+            // evaluate and a reader has to work out is nothing.
+            if !is_bare_name(v) then line(j, s"${v};")
+        Return(value) ->
+            value match
+                Some(e) ->
+                    val v = emit_expr(j, e)
+
+                    line(j, s"return ${v};")
+                None -> line(j, "return null;")
+        Throw(value) ->
+            val v = emit_expr(j, value)
+
+            line(j, s"throw new $$.Thrown(${v});")
+        Break(label, value) -> emit_break(j, label, value, at)
+        Continue(label) -> emit_continue(j, label, at)
+
+        // **A type has no runtime existence**, so a declaration emits nothing at all. `x is Shape`
+        // is emitted as the pattern the name stands for, which `js_pat.sysl` looks up.
+        TypeDecl(_, _) -> ()
+        CheckType(_, _, _) -> ()
+
+        ImportNames(_, path_at, _, _, _) ->
+            complain(j, path_at, "the JavaScript back end does not emit imports yet, so this program has to be a single file")
+        ImportAll(_, path_at, _, _) ->
+            complain(j, path_at, "the JavaScript back end does not emit imports yet, so this program has to be a single file")
+end emit_stmt
+
+// `x = e`, `x += e` and their neighbours, over a name, an index or a field.
+private emit_assign(j: *Js, op: Tok, target: Expr, value: Expr, at: Span)
+    *target.kind match
+        Name(name) ->
+            val v = emit_operand(j, op, target, value, at)
+
+            line(j, s"${js_name(name)} = ${v};")
+        Index(t, k) ->
+            val obj = emit_expr(j, t)
+            val key = emit_expr(j, k)
+            val a = fresh(j)
+            val b = fresh(j)
+
+            line(j, s"const ${a} = ${obj};")
+            line(j, s"const ${b} = ${key};")
+
+            var v = ""
+
+            if op == Assign
+                v = emit_expr(j, value)
+            else
+                v = emit_arith(j, op, s"$$.index(${a}, ${b})", emit_expr(j, value))
+
+            line(j, s"$$.setIndex(${a}, ${b}, ${v});")
+        Field(t, name, _) ->
+            val obj = emit_expr(j, t)
+            val a = fresh(j)
+
+            line(j, s"const ${a} = ${obj};")
+
+            var v = ""
+
+            if op == Assign
+                v = emit_expr(j, value)
+            else
+                v = emit_arith(j, op, s"$$.field(${a}, ${quoted_js(name)})", emit_expr(j, value))
+
+            line(j, s"$$.setField(${a}, ${quoted_js(name)}, ${v});")
+        _ -> complain(j, at, "this cannot be assigned to")
+end emit_assign
+
+// The right-hand side of an assignment, which for `+=` is the operator applied to what is there.
+private emit_operand(j: *Js, op: Tok, target: Expr, value: Expr, at: Span) -> string
+    if op == Assign then return emit_expr(j, value)
+
+    val was = emit_expr(j, target)
+    val v = emit_expr(j, value)
+
+    emit_arith(j, op, was, v)
+end emit_operand
+
+// `a, b = b, a`: every value is worked out before any name is written.
+private emit_multi_assign(j: *Js, op: Tok, targets: Buf[Expr], values: Buf[Expr], at: Span)
+    var held: Buf[string] = buf()
+
+    for i in 0..<values.len()
+        val v = emit_expr(j, values.at(i))
+        val t = fresh(j)
+
+        line(j, s"const ${t} = ${v};")
+        held.push(t)
+
+    for i in 0..<targets.len()
+        if i < held.len()
+            emit_assign_to(j, op, targets.at(i), held.at(i), at)
+end emit_multi_assign
+
+// An assignment whose value is already in hand.
+private emit_assign_to(j: *Js, op: Tok, target: Expr, value: string, at: Span)
+    *target.kind match
+        Name(name) ->
+            val v = if op == Assign then value else emit_arith(j, op, js_name(name), value)
+
+            line(j, s"${js_name(name)} = ${v};")
+        Index(t, k) ->
+            val obj = emit_expr(j, t)
+            val key = emit_expr(j, k)
+
+            line(j, s"$$.setIndex(${obj}, ${key}, ${value});")
+        Field(t, name, _) ->
+            val obj = emit_expr(j, t)
+
+            line(j, s"$$.setField(${obj}, ${quoted_js(name)}, ${value});")
+        _ -> complain(j, at, "this cannot be assigned to")
+end emit_assign_to
+
+// -- functions --------------------------------------------------------------------------------------
+
+// A definition or a lambda, written as `<before>function <name>(params) { ... }<after>`.
+//
+// **`before` and `after` are what tell a definition from a lambda**: a definition is a statement and
+// stands on its own, and a lambda is bound to a temporary, so it arrives as `const $t1 = ` and ends
+// with a semicolon. Both are otherwise the same function, which is why there is one of these.
+//
+// **A default is a JavaScript default**, and the two mean the same thing here: slate works one out
+// in the callee when the argument was not given, and JavaScript does the same. That holds only
+// because `undefined` cannot be passed to a slate function -- the runtime's `keep` refuses it -- so
+// a default can never be triggered by a value the program meant to pass.
+//
+// **A generator is a `function*`, and a body knows whether it is one**: `body_is_gen` is what the
+// parser worked out from the `yield`s it read, which is the same question `compile_chunk` asks.
+emit_function(j: *Js, before: string, name: string, params: Buf[string], defaults: Buf[Expr], body: usize, is_async: bool, after: string, at: Span)
+    val star = if body_is_gen(body) then "*" else ""
+    val prefix = if is_async then "async " else ""
+    val called = if name == "" then "" else " " + name
+
+    line(j, s"${before}${prefix}function${star}${called}(${params_text(j, params, defaults)}) {")
+    open(j)
+
+    val answer = fresh(j)
+
+    line(j, s"let ${answer};")
+    emit_body_into(j, body_at(body), answer)
+    line(j, s"return ${answer};")
+    close(j)
+    line(j, "}" + after)
+end emit_function
+
+// The parameter list, with each default written where JavaScript wants it.
+//
+// **A default is emitted as an expression and never as hoisted statements**, which is what stops a
+// block from being written into a parameter list. A default that needs statements -- a `match`, a
+// loop -- is emitted as an immediately-called function instead, which is the one place this back end
+// uses one and is safe there: a default runs before the body, so there is no `return`, `break` or
+// `await` of the enclosing function to break.
+// **`defaults` covers the LAST of the parameters**, which the parser has already made sure of -- so
+// the first parameter with one is `params.len() - defaults.len()`, and reading the two lists in step
+// gives every default to the wrong parameter. That mistake is silent: the function still takes the
+// arguments it took, and only a call that leaves one out shows it.
+private params_text(j: *Js, params: Buf[string], defaults: Buf[Expr]) -> string
+    var out = str_builder()
+    val required = params.len() - defaults.len()
+
+    for i in 0..<params.len()
+        if i > 0 then out.push(", ")
+
+        out.push(js_name(params.at(i)))
+
+        if i >= required
+            out.push(" = ")
+            out.push(emit_inline(j, defaults.at(i - required)))
+
+    out.finish()
+end params_text
+
+// A function's body, whose value is the function's answer.
+emit_body_into(j: *Js, body: Expr, into: string)
+    *body.kind match
+        Block(stmts) -> emit_stmts_into(j, stmts, into)
+        _ ->
+            // **A body that is one expression says its line too.** Only statements are marked, and a
+            // branch written as `else "done"` holds no statement -- so a fault raised in it would
+            // have been reported against whatever line was marked last, which is the line above.
+            mark(j, body.span)
+
+            val v = emit_expr(j, body)
+
+            line(j, s"${into} = ${v};")
+end emit_body_into
+
+// -- break and continue -----------------------------------------------------------------------------
+
+// `break`, `break 7` and `break outer`.
+private emit_break(j: *Js, label: string, value: Option[Expr], at: Span)
+    which_loop(j, label) match
+        None -> complain(j, at, if label == "" then "`break` is only written inside a loop" else s"no loop here is called `${label}`")
+        Some(k) ->
+            val frame = j.loops.at(k)
+
+            value match
+                Some(e) ->
+                    val v = emit_expr(j, e)
+
+                    line(j, s"${frame.value} = ${v};")
+                None -> ()
+
+            line(j, s"${frame.broke} = true;")
+            line(j, s"break ${frame.js};")
+end emit_break
+
+private emit_continue(j: *Js, label: string, at: Span)
+    which_loop(j, label) match
+        None -> complain(j, at, if label == "" then "`continue` is only written inside a loop" else s"no loop here is called `${label}`")
+        Some(k) -> line(j, s"continue ${j.loops.at(k).js};")
+end emit_continue
+
+// The loop a `break` or a `continue` names: the innermost where no label was written, and the
+// innermost of that name where one was.
+private which_loop(j: *Js, label: string) -> Option[usize]
+    if j.loops.len() == 0 then return None
+
+    if label == "" then return Some(j.loops.len() - 1)
+
+    var i = j.loops.len()
+
+    while i > 0
+        i -= 1
+
+        if j.loops.at(i).label == label then return Some(i)
+
+    None
+end which_loop

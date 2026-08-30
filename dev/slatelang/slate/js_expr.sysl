@@ -1,0 +1,530 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf, byte_sink}
+import sysl.text.{from_utf8, str_builder}
+
+// Expressions, as JavaScript.
+//
+// **Split out of `js.sysl`**, which holds the writer and the statements; the control forms that
+// become statements -- `if` used for its value, `match`, every loop, `try` -- are in
+// `js_control.sysl`, because those are the ones that cannot be an expression at all.
+//
+// **An expression is emitted as a STRING and may leave statements behind it.** JavaScript has no
+// block expression, so `val x = if c then 1 else 2` has to become an `if` statement over a
+// temporary, and the temporary's name is what this hands back. An immediately-called function would
+// have been the other way and is wrong here: `return`, `break`, `await` and `yield` all mean the
+// enclosing function, and a wrapper takes every one of them away.
+//
+// **So evaluation ORDER is the thing to be careful about.** A string handed back is not yet
+// evaluated, and a sibling that hoists statements would run before it. `hoists` answers whether an
+// expression will leave statements behind, and any operand emitted before one that does is put in a
+// temporary of its own first, which puts the two back in the order the program wrote them.
+
+// -- literals -----------------------------------------------------------------------------------
+
+// A string as a JavaScript literal.
+quoted_js(s: string) -> string
+    var out = str_builder()
+
+    out.push_char('"')
+
+    for i in 0..<s.bytes.len
+        val c = s.bytes[i]
+
+        if c == u8('"') then out.push("\\\"")
+        elif c == u8('\\') then out.push("\\\\")
+        elif c == u8('\n') then out.push("\\n")
+        elif c == u8('\r') then out.push("\\r")
+        elif c == u8('\t') then out.push("\\t")
+        elif c < u8(' ') then out.push(s"\\u00${hex_byte(c)}")
+
+        // **The byte, not `push_char` of it.** A slate string is UTF-8 and a character above ASCII
+        // is several bytes; `char(c)` of one of them is a different character, which `push_char`
+        // would then encode again -- so `"日本語"` came out as six mojibake characters. JavaScript
+        // source is UTF-8 too, so the bytes go straight through.
+        else out.bytes.push(c)
+
+    out.push_char('"')
+    out.finish()
+end quoted_js
+
+private hex_byte(c: u8) -> string
+    var out = str_builder()
+
+    out.push_char(hex_digit(c / 16))
+    out.push_char(hex_digit(c % 16))
+    out.finish()
+end hex_byte
+
+private hex_digit(v: u8) -> char = if v < 10 then char(v + u8('0')) else char(v - 10 + u8('a'))
+
+// A real as a JavaScript literal, at the shortest precision that reads back as the same number.
+//
+// **`%g`'s six digits would be a different number**, which is what `sysl.render`'s shortest form
+// exists for: 3.141592653589793 is not 3.14159, and a back end that emitted the second would answer
+// differently from the interpreter on the first arithmetic that used it.
+real_literal(x: real) -> string
+    var sink = byte_sink()
+
+    display_real_shortest(x, &sink, FormatSpec(0, -1, false))
+
+    val text = from_utf8(sink.text()).unwrap()
+
+    // `%g` spells these three the way C does and JavaScript does not.
+    if text == "inf" then "Infinity"
+    elif text == "-inf" then "-Infinity"
+    elif text == "nan" then "NaN"
+    else text
+end real_literal
+
+// -- the dispatch -------------------------------------------------------------------------------
+
+// One expression, as a JavaScript expression -- leaving whatever statements it needs behind it.
+emit_expr(j: *Js, e: Expr) -> string
+    val at = e.span
+
+    *e.kind match
+        IntLit(v) -> s"${v}n"
+        RealLit(v) -> real_literal(v)
+        StrLit(v) -> quoted_js(v)
+        BoolLit(v) -> if v then "true" else "false"
+        NullLit -> "null"
+        UndefinedLit -> "undefined"
+        Name(name) -> js_name(name)
+
+        // A spread outside a call or a literal is not something the parser produces.
+        Spread(inner) -> s"...$$.spread(${emit_expr(j, inner)})"
+
+        Unary(op, rhs) -> emit_unary(j, op, rhs, at)
+        Binary(op, lhs, rhs) -> emit_binary(j, op, lhs, rhs, at)
+        Compare(operands, ops) -> emit_compare(j, operands, ops, at)
+        Call(callee, args) -> emit_call(j, callee, args, at)
+        Index(target, key) ->
+            val two = emit_pair(j, target, key)
+
+            s"$$.index(${two.0}, ${two.1})"
+        Field(target, name, optional) ->
+            val t = emit_expr(j, target)
+
+            if optional then s"$$.fieldOpt(${t}, ${quoted_js(name)})" else s"$$.field(${t}, ${quoted_js(name)})"
+        ArrayLit(items) -> s"$$.arr([${emit_list(j, items)}])"
+        ArrayRepeat(value, count) ->
+            val two = emit_pair(j, value, count)
+
+            s"$$.repeat(${two.0}, ${two.1})"
+        Interp(pieces) -> s"$$.interp([${emit_list(j, pieces)}])"
+        ObjectLit(keys, _, values) -> emit_object(j, keys, values)
+        WithFields(base, keys, values) ->
+            val b = emit_held(j, base, values)
+
+            s"$$.withFields(${b}, [${emit_entries(j, keys, values)}])"
+        WithAll(base, other) ->
+            val two = emit_pair(j, base, other)
+
+            s"$$.withAll(${two.0}, ${two.1})"
+        Lambda(params, defaults, body, is_async) -> emit_lambda(j, params, defaults, body, is_async, at)
+        Range(lo, hi, inclusive) -> emit_range(j, lo, hi, inclusive)
+        IsPattern(subject, pat, negated) ->
+            val v = emit_expr(j, subject)
+            val subject_name = fresh(j)
+
+            line(j, s"const ${subject_name} = ${v};")
+
+            val test = emit_is(j, pat, subject_name)
+
+            if negated then s"(!${test})" else test
+        IncDec(target, up, before) -> emit_inc_dec(j, target, up, before, at)
+        Await(inner) -> s"await $$.awaited(${emit_expr(j, inner)})"
+        Yield(inner) -> s"(yield ${emit_expr(j, inner)})"
+
+        // The forms that become statements.
+        IfExpr(cond, then_branch, else_branch) -> emit_if_value(j, cond, then_branch, else_branch)
+        MatchExpr(subject, arms) -> emit_match_value(j, subject, arms, at)
+        Block(stmts) -> emit_block_value(j, stmts)
+        While(label, cond, body, otherwise) -> emit_while_value(j, label, cond, body, otherwise, false)
+        DoWhile(label, body, cond, otherwise) -> emit_while_value(j, label, cond, body, otherwise, true)
+        Loop(label, body) -> emit_loop_value(j, label, body)
+        For(label, binding, iter, body, otherwise) -> emit_for_value(j, label, binding, iter, body, otherwise)
+        TryCatch(body, name, handler) -> emit_try_value(j, body, name, handler)
+        Ensures(value, type_name, pat) -> emit_ensures(j, value, type_name, pat, at)
+
+        Bad ->
+            complain(j, at, "this expression could not be read, so there is nothing to emit")
+            "null"
+end emit_expr
+
+// An expression that must stand alone -- a default parameter, where there is no statement position
+// to hoist into.
+//
+// **The one place this back end writes an immediately-called function**, and it is safe exactly
+// here: a default runs before the body, so there is no `return`, `break`, `await` or `yield` of the
+// enclosing function for a wrapper to take away.
+//
+// **It is an expression and not a hoisted temporary, and that is the whole point.** A default is
+// worked out at the CALL rather than at the definition -- `f(xs = [])` gives each call an array of
+// its own -- so a `const` in front of the function would share one array between every call that
+// left the argument out. Emitting into a writer of its own is what keeps the code inside the
+// parameter list.
+emit_inline(j: *Js, e: Expr) -> string
+    if !hoists(e) then return emit_expr(j, e)
+
+    var inner = Js(str_builder(), j.src, j.last_line, j.depth + 1, j.tmp, report(), buf(), buf(), buf())
+    val answer = fresh(&inner)
+
+    line(&inner, s"let ${answer};")
+    emit_body_into(&inner, e, answer)
+    line(&inner, s"return ${answer};")
+
+    // The temporaries it took are taken, and its complaints are the same emission's.
+    j.tmp = inner.tmp
+    j.report.absorb(inner.report)
+
+    var out = str_builder()
+
+    out.push("(() => {\n")
+    out.push(inner.out.finish())
+
+    for i in 0..<j.depth
+        out.push("    ")
+
+    out.push("})()")
+    out.finish()
+end emit_inline
+
+// -- operators ----------------------------------------------------------------------------------
+
+private emit_unary(j: *Js, op: Tok, rhs: Expr, at: Span) -> string
+    val v = emit_expr(j, rhs)
+
+    op match
+        Minus -> s"$$.neg(${v})"
+        Bang -> s"(!$$.truthy(${v}))"
+        Tilde -> s"$$.bitnot(${v})"
+        Plus -> v
+        _ ->
+            complain(j, at, "this is not a prefix operator")
+            "null"
+end emit_unary
+
+// The operator's own text, which is what the runtime dispatches on and what its complaints quote.
+js_op(op: Tok) -> string = op match
+    Plus -> "+"
+    Minus -> "-"
+    Star -> "*"
+    Slash -> "/"
+    Percent -> "%"
+    Amp -> "&"
+    Pipe -> "|"
+    Caret -> "^"
+    Shl -> "<<"
+    Shr -> ">>"
+    PlusEq -> "+"
+    MinusEq -> "-"
+    StarEq -> "*"
+    SlashEq -> "/"
+    PercentEq -> "%"
+    AmpEq -> "&"
+    PipeEq -> "|"
+    CaretEq -> "^"
+    ShlEq -> "<<"
+    ShrEq -> ">>"
+    Lt -> "<"
+    LtEq -> "<="
+    Gt -> ">"
+    GtEq -> ">="
+    _ -> "?"
+
+// An operator over two operands already in hand.
+emit_arith(j: *Js, op: Tok, a: string, b: string) -> string
+    op match
+        EqEq -> s"$$.eq(${a}, ${b})"
+        BangEq -> s"(!$$.eq(${a}, ${b}))"
+        Lt -> s"$$.compare(\"<\", ${a}, ${b})"
+        LtEq -> s"$$.compare(\"<=\", ${a}, ${b})"
+        Gt -> s"$$.compare(\">\", ${a}, ${b})"
+        GtEq -> s"$$.compare(\">=\", ${a}, ${b})"
+        _ -> s"$$.arith(${quoted_js(js_op(op))}, ${a}, ${b})"
+end emit_arith
+
+// **`&&`, `||` and `??` answer the operand that DECIDED**, which is slate's rule -- so neither side
+// can be turned into a boolean, and the left side is held in a temporary rather than written twice.
+private emit_binary(j: *Js, op: Tok, lhs: Expr, rhs: Expr, at: Span) -> string
+    if op == AndAnd || op == OrOr || op == QQ then return emit_short_circuit(j, op, lhs, rhs)
+
+    val two = emit_pair(j, lhs, rhs)
+
+    emit_arith(j, op, two.0, two.1)
+end emit_binary
+
+private emit_short_circuit(j: *Js, op: Tok, lhs: Expr, rhs: Expr) -> string
+    val a = emit_expr(j, lhs)
+    val held = fresh(j)
+
+    line(j, s"let ${held} = ${a};")
+
+    // `??` asks whether the left side is THERE where `||` asks whether it is true: `0 ?? 1` is zero,
+    // because zero is not absent.
+    val takes_right = op match
+        AndAnd -> s"$$.truthy(${held})"
+        OrOr -> s"!$$.truthy(${held})"
+        _ -> s"!$$.present(${held})"
+
+    line(j, s"if (${takes_right}) {")
+    open(j)
+
+    val b = emit_expr(j, rhs)
+
+    line(j, s"${held} = ${b};")
+    close(j)
+    line(j, "}")
+    held
+end emit_short_circuit
+
+// `a < b < c`, which is one test of each neighbouring pair and each operand evaluated once.
+private emit_compare(j: *Js, operands: Buf[Expr], ops: Buf[Tok], at: Span) -> string
+    var held: Buf[string] = buf()
+
+    for i in 0..<operands.len()
+        val v = emit_expr(j, operands.at(i))
+        val t = fresh(j)
+
+        line(j, s"const ${t} = ${v};")
+        held.push(t)
+
+    val answer = fresh(j)
+
+    line(j, s"let ${answer} = true;")
+
+    for i in 0..<ops.len()
+        line(j, s"if (${answer}) {")
+        open(j)
+        line(j, s"${answer} = ${emit_arith(j, ops.at(i), held.at(i), held.at(i + 1))};")
+        close(j)
+        line(j, "}")
+
+    answer
+end emit_compare
+
+// `x++` and `++x`: what it answers is what it was, or what it became.
+private emit_inc_dec(j: *Js, target: Expr, up: bool, before: bool, at: Span) -> string
+    val step = if up then "+" else "-"
+    val was = fresh(j)
+    val now = fresh(j)
+
+    *target.kind match
+        Name(name) ->
+            line(j, s"const ${was} = ${js_name(name)};")
+            line(j, s"const ${now} = $$.arith(\"${step}\", ${was}, 1n);")
+            line(j, s"${js_name(name)} = ${now};")
+        Index(t, k) ->
+            val two = emit_pair(j, t, k)
+            val holder = fresh(j)
+            val key = fresh(j)
+
+            line(j, s"const ${holder} = ${two.0};")
+            line(j, s"const ${key} = ${two.1};")
+            line(j, s"const ${was} = $$.index(${holder}, ${key});")
+            line(j, s"const ${now} = $$.arith(\"${step}\", ${was}, 1n);")
+            line(j, s"$$.setIndex(${holder}, ${key}, ${now});")
+        Field(t, name, _) ->
+            val holder = fresh(j)
+
+            line(j, s"const ${holder} = ${emit_expr(j, t)};")
+            line(j, s"const ${was} = $$.field(${holder}, ${quoted_js(name)});")
+            line(j, s"const ${now} = $$.arith(\"${step}\", ${was}, 1n);")
+            line(j, s"$$.setField(${holder}, ${quoted_js(name)}, ${now});")
+        _ ->
+            complain(j, at, "only a name, a field or an element may be stepped")
+            line(j, s"const ${was} = null;")
+            line(j, s"const ${now} = null;")
+
+    if before then now else was
+end emit_inc_dec
+
+// -- calls, literals and lambdas ------------------------------------------------------------------
+
+// `f(a)` and `o.m(a)`, which are different calls: a method takes its receiver where it was
+// delegated to, and only the runtime knows whether it was.
+private emit_call(j: *Js, callee: Expr, args: Buf[Expr], at: Span) -> string
+    *callee.kind match
+        Field(target, name, optional) ->
+            if optional
+                complain(j, at, "`?.` cannot be called through -- ask for the field first")
+
+            val recv = emit_held(j, target, args)
+
+            s"$$.method(${recv}, ${quoted_js(name)}, [${emit_list(j, args)}])"
+        _ ->
+            val f = emit_held(j, callee, args)
+
+            s"$$.call(${f}, [${emit_list(j, args)}])"
+end emit_call
+
+// An object literal, in the order its keys were written.
+private emit_object(j: *Js, keys: Buf[string], values: Buf[Expr]) -> string =
+    s"$$.obj([${emit_entries(j, keys, values)}])"
+
+private emit_entries(j: *Js, keys: Buf[string], values: Buf[Expr]) -> string
+    var out = str_builder()
+    var held: Buf[string] = buf()
+
+    for i in 0..<values.len()
+        held.push(emit_ordered(j, values, i))
+
+    for i in 0..<keys.len()
+        if i > 0 then out.push(", ")
+
+        out.push(s"[${quoted_js(keys.at(i))}, ${held.at(i)}]")
+
+    out.finish()
+end emit_entries
+
+// A comma-separated run of expressions, evaluated left to right.
+emit_list(j: *Js, items: Buf[Expr]) -> string
+    var out = str_builder()
+    var held: Buf[string] = buf()
+
+    for i in 0..<items.len()
+        held.push(emit_ordered(j, items, i))
+
+    for i in 0..<held.len()
+        if i > 0 then out.push(", ")
+
+        out.push(held.at(i))
+
+    out.finish()
+end emit_list
+
+// One item of a list, put in a temporary where a later item will leave statements behind it.
+//
+// **This is the whole of the evaluation-order rule.** A string handed back has not run yet, so an
+// item written first and a later one that hoists would come out in the other order; naming the
+// earlier one is what pins it where the program put it.
+private emit_ordered(j: *Js, items: Buf[Expr], i: usize) -> string
+    val item = items.at(i)
+
+    *item.kind match
+        Spread(inner) -> s"...$$.spread(${emit_expr(j, inner)})"
+        _ ->
+            val v = emit_expr(j, item)
+
+            if is_settled(item) || !any_hoists_after(items, i) then return v
+
+            val t = fresh(j)
+
+            line(j, s"const ${t} = ${v};")
+            t
+end emit_ordered
+
+// The same rule for a value emitted before a list: a receiver, or the base of a `with`.
+private emit_held(j: *Js, e: Expr, later: Buf[Expr]) -> string
+    val v = emit_expr(j, e)
+
+    if is_settled(e) || !any_hoists(later) then return v
+
+    val t = fresh(j)
+
+    line(j, s"const ${t} = ${v};")
+    t
+end emit_held
+
+// Two operands, in the order they were written.
+private emit_pair(j: *Js, a: Expr, b: Expr) -> (string, string)
+    val first = emit_expr(j, a)
+
+    if is_settled(a) || !hoists(b) then return (first, emit_expr(j, b))
+
+    val t = fresh(j)
+
+    line(j, s"const ${t} = ${first};")
+    (t, emit_expr(j, b))
+end emit_pair
+
+private any_hoists(items: Buf[Expr]) -> bool
+    for i in 0..<items.len()
+        if hoists(items.at(i)) then return true
+
+    false
+end any_hoists
+
+private any_hoists_after(items: Buf[Expr], i: usize) -> bool
+    for k in i + 1..<items.len()
+        if hoists(items.at(k)) then return true
+
+    false
+end any_hoists_after
+
+// A lambda, which is a function expression rather than an arrow: an arrow cannot be a generator, and
+// slate's `->` may hold a `yield`.
+private emit_lambda(j: *Js, params: Buf[string], defaults: Buf[Expr], body: usize, is_async: bool, at: Span) -> string
+    val name = fresh(j)
+
+    emit_function(j, s"const ${name} = ", "", params, defaults, body, is_async, ";", at)
+    name
+end emit_lambda
+
+private emit_range(j: *Js, lo: Option[Expr], hi: Option[Expr], inclusive: bool) -> string
+    val low = lo match
+        Some(e) -> emit_expr(j, e)
+        None -> "undefined"
+
+    val high = hi match
+        Some(e) -> emit_expr(j, e)
+        None -> "undefined"
+
+    s"$$.range(${low}, ${high}, ${if inclusive then "true" else "false"})"
+end emit_range
+
+// -- what leaves statements behind ------------------------------------------------------------------
+
+// Whether emitting this expression may leave statements behind it.
+//
+// **Conservative on purpose**: answering true where nothing is hoisted costs a temporary, and
+// answering false where something is costs the program's evaluation order.
+hoists(e: Expr) -> bool = *e.kind match
+    Block(_) -> true
+    IfExpr(_, _, _) -> true
+    MatchExpr(_, _) -> true
+    While(_, _, _, _) -> true
+    DoWhile(_, _, _, _) -> true
+    Loop(_, _) -> true
+    For(_, _, _, _, _) -> true
+    TryCatch(_, _, _) -> true
+    Ensures(_, _, _) -> true
+    IncDec(_, _, _) -> true
+    IsPattern(_, _, _) -> true
+    Compare(_, _) -> true
+    Lambda(_, _, _, _) -> true
+    Binary(op, lhs, rhs) -> op == AndAnd || op == OrOr || op == QQ || hoists(lhs) || hoists(rhs)
+    Unary(_, rhs) -> hoists(rhs)
+    Call(callee, args) -> hoists(callee) || any_hoists(args)
+    Index(target, key) -> hoists(target) || hoists(key)
+    Field(target, _, _) -> hoists(target)
+    ArrayLit(items) -> any_hoists(items)
+    ArrayRepeat(value, count) -> hoists(value) || hoists(count)
+    Interp(pieces) -> any_hoists(pieces)
+    ObjectLit(_, _, values) -> any_hoists(values)
+    WithFields(base, _, values) -> hoists(base) || any_hoists(values)
+    WithAll(base, other) -> hoists(base) || hoists(other)
+    Await(inner) -> hoists(inner)
+    Yield(inner) -> hoists(inner)
+    Spread(inner) -> hoists(inner)
+    Range(lo, hi, _) -> option_hoists(lo) || option_hoists(hi)
+    _ -> false
+
+private option_hoists(e: Option[Expr]) -> bool = e match
+    Some(x) -> hoists(x)
+    None -> false
+
+// Whether an expression has already happened by the time its text is read -- a literal, a name, or
+// anything else that cannot be moved by what is emitted after it.
+private is_settled(e: Expr) -> bool = *e.kind match
+    IntLit(_) -> true
+    RealLit(_) -> true
+    StrLit(_) -> true
+    BoolLit(_) -> true
+    NullLit -> true
+    UndefinedLit -> true
+    Name(_) -> true
+    _ -> false

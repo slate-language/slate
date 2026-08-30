@@ -1,0 +1,864 @@
+module dev.slatelang.slate
+
+// The runtime the emitted JavaScript calls into -- its core.
+//
+// **Carried as text in the binary rather than read from a file beside it**, so that `slate js`
+// answers one self-contained program: a `.js` that needs a second file next to it is not something
+// a person can hand to a browser or pipe into `qjs`.
+//
+// **A raw text block, so what is written here is what comes out.** `raw"""` takes no escapes and
+// strips only the incidental indentation, which is what lets a JavaScript program sit at the margin
+// of the sysl around it and still say byte for byte what it holds.
+//
+// The builtins -- `print`, `map`, `toJSON` and the rest of the names a program has without writing
+// them -- are in `js_rt_builtins.sysl`, and `js_runtime` is what puts the two together.
+
+// The whole prelude: the value model, then the functions built on it.
+js_runtime() -> string = js_runtime_core() + "\n" + js_runtime_builtins()
+
+// The value model: faults, objects, arithmetic, equality, indexing, patterns and printing.
+js_runtime_core() -> string = raw"""
+    "use strict";
+
+    // The slate runtime, as JavaScript.
+    //
+    // A slate value is a JavaScript one wherever the two agree, and the disagreements are what this
+    // file is: an integer is a BigInt, because slate's is 64 bits wide, wraps, divides towards zero and
+    // shifts to 63 places; an object is an `SObj`, because slate's keeps insertion order and delegates
+    // through a field called `proto`; and a string is counted in characters rather than in UTF-16 units.
+    const $ = (() => {
+        const i64 = (x) => BigInt.asIntN(64, x)
+
+        // How deep a `proto` chain may go before slate calls it a circle. The interpreter's ceiling.
+        const MaxProtoDepth = 64
+
+        // -- faults and throws -------------------------------------------------------------------
+
+        class Fault extends Error {
+            constructor(message) {
+                super(message)
+                this.slate = "fault"
+                this.reason = message
+                this.line = $line
+                this.file = $file
+            }
+        }
+
+        // `throw v`, which carries a slate value rather than a sentence.
+        //
+        // **Where it was thrown is stamped here and does not travel**, which is the interpreter's rule:
+        // a caught fault put back with `throw e` says the words of the original and points at the line
+        // that put it back.
+        class Thrown extends Error {
+            constructor(value) {
+                super("thrown")
+                this.slate = "thrown"
+                this.value = value
+                this.line = $line
+                this.file = $file
+            }
+        }
+
+        let $line = 0
+        let $file = ""
+
+        const fault = (message) => { throw new Fault(message) }
+
+        // -- objects ---------------------------------------------------------------------------------
+
+        // An object: insertion-ordered string keys, delegating through its own `proto` field.
+        //
+        // **`proto` is an ordinary field and not a slot of its own**, which is the interpreter's
+        // arrangement: a program reads it, writes it and prints it like any other, and `field_from`
+        // walks it. A `Map` holds the fields because a slate key may be any string at all, `__proto__`
+        // and `constructor` included, and none of JavaScript's inherited furniture should be reachable
+        // by writing a field name.
+        class SObj {
+            constructor(entries) {
+                this.fields = new Map(entries || [])
+            }
+
+            // What `name` is here or up the chain, and whether it was delegated to.
+            //
+            // The second half is the receiver rule: a method the object carries itself has captured what
+            // it needs already, and a shared one reached through `proto` has not.
+            lookup(name) {
+                if (this.fields.has(name)) return [this.fields.get(name), false]
+
+                let up = this
+                let depth = 0
+
+                for (;;) {
+                    const next = up.fields.get("proto")
+
+                    if (!(next instanceof SObj)) return [undefined, false]
+                    if (next.fields.has(name)) return [next.fields.get(name), true]
+
+                    depth += 1
+
+                    if (depth >= MaxProtoDepth)
+                        fault("this object's `proto` chain is more than " + MaxProtoDepth +
+                            " deep, which means it is a circle -- looking up `" + name + "` would never finish")
+
+                    up = next
+                }
+            }
+        }
+
+        // A range, which is a value in slate rather than a form of `for`.
+        class SRange {
+            constructor(lo, hi, inclusive, hasLo, hasHi) {
+                this.lo = lo
+                this.hi = hi
+                this.inclusive = inclusive
+                this.hasLo = hasLo
+                this.hasHi = hasHi
+            }
+        }
+
+        // -- what a value is ---------------------------------------------------------------------------
+
+        const isInt = (v) => typeof v === "bigint"
+        const isReal = (v) => typeof v === "number"
+        const isNum = (v) => typeof v === "bigint" || typeof v === "number"
+        const isStr = (v) => typeof v === "string"
+        const isGen = (v) => v !== null && typeof v === "object" && typeof v.next === "function" &&
+            typeof v.throw === "function"
+
+        const typeName = (v) => {
+            if (v === null) return "null"
+            if (v === undefined) return "undefined"
+            if (typeof v === "boolean") return "a boolean"
+            if (typeof v === "bigint") return "an integer"
+            if (typeof v === "number") return "a real"
+            if (typeof v === "string") return "a string"
+            if (Array.isArray(v)) return "an array"
+            if (v instanceof SObj) return "an object"
+            if (v instanceof SRange) return "a range"
+            if (v instanceof Promise) return "a promise"
+            if (isGen(v)) return "a generator"
+            if (typeof v === "function") return "a function"
+
+            return "a value"
+        }
+
+        // The word an annotation is written with, which is the word `is` tests.
+        const test = (v, kind) => {
+            if (kind === "null") return v === null
+            if (kind === "boolean") return typeof v === "boolean"
+            if (kind === "integer") return isInt(v)
+            if (kind === "real") return isReal(v)
+            if (kind === "number") return isNum(v)
+            if (kind === "string") return isStr(v)
+            if (kind === "array") return Array.isArray(v)
+            if (kind === "object") return v instanceof SObj
+            if (kind === "function") return typeof v === "function" && !isGen(v)
+            if (kind === "generator") return isGen(v)
+
+            return false
+        }
+
+        // **Only null, undefined and false are false.** An empty string and a zero are values a program
+        // has, so they are true -- which is where slate and JavaScript part company, and why no
+        // condition is ever emitted bare.
+        const truthy = (v) => v !== null && v !== undefined && v !== false
+
+        // What `??` asks, which is not what `||` asks: `0 ?? 1` is zero, because zero is not absent.
+        const present = (v) => v !== null && v !== undefined
+
+        // `undefined` is what a field that is not there answers, and it may not be stored or passed.
+        const keep = (v, where) => {
+            if (v === undefined)
+                fault("this field is not there, and `undefined` cannot be " + where +
+                    " -- give it a value with `??`, or ask `has` first")
+
+            return v
+        }
+
+        // -- printing -----------------------------------------------------------------------------------
+
+        // A real as `%g` writes it, which is what the interpreter's `push_real` does: six significant
+        // digits, an exponent of at least two digits, and no trailing zeros.
+        const realText = (x) => {
+            if (Number.isNaN(x)) return "nan"
+            if (x === Infinity) return "inf"
+            if (x === -Infinity) return "-inf"
+            if (x === 0) return Object.is(x, -0) ? "-0" : "0"
+
+            const exp = Math.floor(Math.log10(Math.abs(x)))
+
+            if (exp < -5 || exp >= 6) {
+                const [head, tail] = x.toExponential(5).split("e")
+                const sign = tail[0]
+
+                return trimZeros(head) + "e" + sign + tail.slice(1).padStart(2, "0")
+            }
+
+            return trimZeros(x.toPrecision(6))
+        }
+
+        const trimZeros = (s) => (s.indexOf(".") < 0 ? s : s.replace(/0+$/, "").replace(/\.$/, ""))
+
+        const escaped = (s) => {
+            let out = '"'
+
+            for (const c of s) {
+                if (c === '"') out += '\\"'
+                else if (c === "\\") out += "\\\\"
+                else if (c === "\n") out += "\\n"
+                else if (c === "\t") out += "\\t"
+                else if (c === "\r") out += "\\r"
+                else if (c < " ") out += "\\u" + c.codePointAt(0).toString(16).padStart(4, "0")
+                else out += c
+            }
+
+            return out + '"'
+        }
+
+        const plainName = (s) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(s) && !SLATE_WORDS.has(s)
+
+        // The words the lexer has its own meaning for, so a key spelled like one prints quoted: `{ if: 1 }`
+        // is not a program a reader could hand back to slate.
+        const SLATE_WORDS = new Set(["val", "var", "if", "then", "elif", "else", "while", "for", "in",
+            "loop", "do", "match", "break", "continue", "return", "true", "false", "null", "undefined",
+            "async", "await", "yield", "is", "with", "import", "export", "try", "catch", "throw"])
+
+        // A value as a program prints it: a string bare at the top level and quoted inside a container,
+        // and a container already on the path as `[...]` rather than descending forever.
+        const write = (v, quoted, path) => {
+            if (v === null) return "null"
+            if (v === undefined) return "undefined"
+            if (typeof v === "boolean") return v ? "true" : "false"
+            if (typeof v === "bigint") return v.toString()
+            if (typeof v === "number") return realText(v)
+            if (typeof v === "string") return quoted ? escaped(v) : v
+
+            if (Array.isArray(v)) {
+                if (path.indexOf(v) >= 0) return "[...]"
+
+                path.push(v)
+
+                const out = "[" + v.map((x) => write(x, true, path)).join(", ") + "]"
+
+                path.pop()
+
+                return out
+            }
+
+            if (v instanceof SObj) {
+                if (path.indexOf(v) >= 0) return "{...}"
+
+                path.push(v)
+
+                const parts = []
+
+                for (const [k, x] of v.fields)
+                    parts.push((plainName(k) ? k : escaped(k)) + ": " + write(x, true, path))
+
+                path.pop()
+
+                return "{" + parts.join(", ") + "}"
+            }
+
+            if (v instanceof SRange) {
+                const lo = v.hasLo ? v.lo.toString() : ""
+                const hi = v.hasHi ? v.hi.toString() : ""
+
+                return lo + (v.inclusive ? ".." : "..<") + hi
+            }
+
+            if (v instanceof Promise) return "<promise>"
+            if (isGen(v)) return "<generator>"
+            if (typeof v === "function") return "<function>"
+
+            return "<value>"
+        }
+
+        const text = (v) => write(v, false, [])
+        const show = (v) => write(v, true, [])
+
+        // The engine's own way of writing a line, taken NOW rather than when it is needed.
+        //
+        // **The builtins install themselves as globals, and one of them is called `print`** -- so a
+        // lookup deferred to write-time would find slate's `print` and call itself forever. What is
+        // wanted is whatever the host had before slate arrived.
+        const enginePrint = typeof globalThis.print === "function"
+            ? globalThis.print.bind(globalThis)
+            : (typeof console !== "undefined" ? (line) => console.log(line) : null)
+
+        // Where a program's output goes. A host -- the quickjs binding, a browser, node -- replaces
+        // `write`, and everything printed is kept so that a host with no console can read it back.
+        const host = {
+            lines: [],
+
+            write(line) {
+                host.lines.push(line)
+
+                if (host.echo && enginePrint !== null) enginePrint(line)
+            },
+
+            // Whether writing also reaches the engine's console. A host reading `lines` itself turns
+            // this off.
+            echo: true
+        }
+
+        // -- arithmetic -----------------------------------------------------------------------------------
+
+        const bothInt = (a, b) => isInt(a) && isInt(b)
+        const asReal = (v) => (isInt(v) ? Number(v) : v)
+
+        const arith = (op, a, b) => {
+            if (op === "+" && isStr(a) && isStr(b)) return a + b
+
+            if (isNum(a) && isNum(b)) {
+                if (bothInt(a, b)) {
+                    if (op === "+") return i64(a + b)
+                    if (op === "-") return i64(a - b)
+                    if (op === "*") return i64(a * b)
+                    if (op === "/") {
+                        if (b === 0n) fault("this divides by zero")
+
+                        return i64(a / b)
+                    }
+                    if (op === "%") {
+                        if (b === 0n) fault("this takes a remainder by zero")
+
+                        return i64(a % b)
+                    }
+                    if (op === "&") return i64(a & b)
+                    if (op === "|") return i64(a | b)
+                    if (op === "^") return i64(a ^ b)
+                    if (op === "<<" || op === ">>") {
+                        if (b < 0n || b > 63n) fault("a shift is by 0 to 63 places, and this is by " + b)
+
+                        return i64(op === "<<" ? a << b : a >> b)
+                    }
+                } else {
+                    const x = asReal(a)
+                    const y = asReal(b)
+
+                    if (op === "+") return x + y
+                    if (op === "-") return x - y
+                    if (op === "*") return x * y
+                    if (op === "/") return x / y
+                    if (op === "%") fault("a remainder is taken of integers")
+
+                    fault("`" + op + "` works on whole numbers, and a real is not one")
+                }
+            }
+
+            fault("`" + op + "` does not apply to " + typeName(a) + " and " + typeName(b))
+        }
+
+        const compare = (op, a, b) => {
+            const ordered = (x, y) => {
+                if (op === "<") return x < y
+                if (op === "<=") return x <= y
+                if (op === ">") return x > y
+
+                return x >= y
+            }
+
+            if (isNum(a) && isNum(b)) return bothInt(a, b) ? ordered(a, b) : ordered(asReal(a), asReal(b))
+            if (isStr(a) && isStr(b)) return ordered(a, b)
+
+            fault("`" + op + "` does not apply to " + typeName(a) + " and " + typeName(b))
+        }
+
+        const neg = (v) => {
+            if (isInt(v)) return i64(-v)
+            if (isReal(v)) return -v
+
+            fault("`-` needs a number, and this is " + typeName(v))
+        }
+
+        const bitnot = (v) => {
+            if (isInt(v)) return i64(~v)
+
+            fault("`~` needs a whole number, and this is " + typeName(v))
+        }
+
+        // -- equality --------------------------------------------------------------------------------------
+
+        // Deep for arrays and objects, and coinductive on a cycle: a pairing already being compared
+        // answers true, which is what stops `a == a` over a self-referential array from descending
+        // forever.
+        const same = (a, b, seen) => {
+            if (isNum(a) && isNum(b)) return bothInt(a, b) ? a === b : asReal(a) === asReal(b)
+            if (typeof a === "boolean" || typeof a === "string") return a === b
+            if (a === null || a === undefined) return a === b
+
+            if (Array.isArray(a)) {
+                if (!Array.isArray(b) || a.length !== b.length) return false
+                if (a === b) return true
+
+                for (const [x, y] of seen) if (x === a && y === b) return true
+
+                seen.push([a, b])
+
+                for (let i = 0; i < a.length; i++)
+                    if (!same(a[i], b[i], seen)) { seen.pop(); return false }
+
+                seen.pop()
+
+                return true
+            }
+
+            if (a instanceof SObj) {
+                if (!(b instanceof SObj) || a.fields.size !== b.fields.size) return false
+                if (a === b) return true
+
+                for (const [x, y] of seen) if (x === a && y === b) return true
+
+                seen.push([a, b])
+
+                for (const [k, v] of a.fields)
+                    if (!b.fields.has(k) || !same(v, b.fields.get(k), seen)) { seen.pop(); return false }
+
+                seen.pop()
+
+                return true
+            }
+
+            if (a instanceof SRange) {
+                if (!(b instanceof SRange)) return false
+                if (a.hasLo !== b.hasLo || a.hasHi !== b.hasHi) return false
+
+                const ax = a.inclusive ? a.hi : a.hi - 1n
+                const bx = b.inclusive ? b.hi : b.hi - 1n
+
+                return a.lo === b.lo && ax === bx
+            }
+
+            return a === b
+        }
+
+        // Whether a value equals a literal written in a pattern.
+        //
+        // **A pattern does not consult an object's `equals`**: a literal pattern is a shape test, asking
+        // whether the subject IS five rather than whether something has been persuaded to say it is.
+        const sameLiteral = (v, lit) => {
+            if (isNum(v) && isNum(lit)) return bothInt(v, lit) ? v === lit : asReal(v) === asReal(lit)
+
+            return v === lit
+        }
+
+        // **The left side's `equals` decides, and only the left side's** -- Java's rule for `a.equals(b)`.
+        const eq = (a, b) => {
+            if (a instanceof SObj) {
+                const [f, delegated] = a.lookup("equals")
+
+                if (typeof f === "function") return truthy(delegated ? f(a, b) : f(b))
+            }
+
+            return same(a, b, [])
+        }
+
+        // -- strings, counted in characters --------------------------------------------------------------
+
+        // The fast path is the common one: a string of nothing but ASCII is its own character array.
+        const wide = (s) => (/^[\x00-\x7f]*$/.test(s) ? null : Array.from(s))
+
+        const strLen = (s) => {
+            const cs = wide(s)
+
+            return cs === null ? s.length : cs.length
+        }
+
+        const strAt = (s, i) => {
+            const cs = wide(s)
+            const n = cs === null ? s.length : cs.length
+            const k = Number(i)
+
+            if (k < 0 || k >= n) fault("the index " + k + " is outside a string of " + n + " characters")
+
+            return cs === null ? s[k] : cs[k]
+        }
+
+        const strSlice = (s, lo, hi) => {
+            const cs = wide(s)
+
+            return cs === null ? s.slice(lo, hi) : cs.slice(lo, hi).join("")
+        }
+
+        // -- indexing ---------------------------------------------------------------------------------------
+
+        // The bounds a range covers over a container of `n` things, with the ends it did not name taken
+        // from that length.
+        const span = (r, n) => {
+            if (!(r instanceof SRange)) fault("a slice is taken with a range, and this is " + typeName(r))
+
+            const lo = r.hasLo ? Number(r.lo) : 0
+            let hi = r.hasHi ? (r.inclusive ? Number(r.hi) + 1 : Number(r.hi)) : n
+
+            if (lo < 0 || hi < lo || hi > n)
+                fault("this slice runs from " + lo + " to " + hi + ", which is outside something " + n + " long")
+
+            return [lo, hi]
+        }
+
+        const index = (t, k) => {
+            if (Array.isArray(t)) {
+                if (k instanceof SRange) {
+                    const [lo, hi] = span(k, t.length)
+
+                    return t.slice(lo, hi)
+                }
+
+                if (!isInt(k)) fault("an array is indexed by an integer, and this is " + typeName(k))
+
+                const i = Number(k)
+
+                if (i < 0 || i >= t.length)
+                    fault("the index " + i + " is outside an array of " + t.length)
+
+                return t[i]
+            }
+
+            if (isStr(t)) {
+                if (k instanceof SRange) {
+                    const [lo, hi] = span(k, strLen(t))
+
+                    return strSlice(t, lo, hi)
+                }
+
+                if (!isInt(k)) fault("a string is not indexed by " + typeName(k))
+
+                return strAt(t, k)
+            }
+
+            if (t instanceof SObj) {
+                if (!isStr(k)) fault("an object is indexed by a string, and this is " + typeName(k))
+
+                return t.fields.has(k) ? t.fields.get(k) : undefined
+            }
+
+            fault(typeName(t) + " cannot be indexed")
+        }
+
+        const setIndex = (t, k, v) => {
+            if (Array.isArray(t)) {
+                if (!isInt(k)) fault("an array is indexed by an integer, and this is " + typeName(k))
+
+                const i = Number(k)
+
+                if (i < 0 || i >= t.length) fault("the index " + i + " is outside an array of " + t.length)
+
+                t[i] = keep(v, "put in an array")
+
+                return v
+            }
+
+            if (t instanceof SObj) {
+                if (!isStr(k)) fault("an object is indexed by a string, and this is " + typeName(k))
+
+                t.fields.set(k, keep(v, "put in an object"))
+
+                return v
+            }
+
+            fault(typeName(t) + " cannot be assigned to")
+        }
+
+        // -- fields, methods and calls -------------------------------------------------------------------
+
+        const field = (t, name) => {
+            if (t instanceof SObj) return t.lookup(name)[0]
+            if (t === null || t === undefined) fault("`" + name + "` was asked of " + typeName(t))
+
+            // **A builtin method is the free function of the same name**, handed back unbound exactly as
+            // the interpreter hands it back: `xs.map` is `map`, and `map(xs, f)` is how it is then called.
+            const m = builtinMethod(t, name)
+
+            if (m !== undefined) return m
+
+            fault(typeName(t) + " has no `" + name + "`")
+        }
+
+        // `o?.name`, which answers undefined rather than complaining where there is nothing to ask.
+        const fieldOpt = (t, name) => {
+            if (t === null || t === undefined) return undefined
+
+            return field(t, name)
+        }
+
+        const setField = (t, name, v) => {
+            if (!(t instanceof SObj)) fault(typeName(t) + " has no field to assign to")
+
+            t.fields.set(name, keep(v, "put in an object"))
+
+            return v
+        }
+
+        // `o.m(a)`, which is where the receiver rule lives: an object's own field is called as it stands,
+        // and one reached through a `proto` -- or answered by the builtin table -- takes the receiver in
+        // front of the written arguments.
+        const method = (t, name, args) => {
+            if (t instanceof SObj) {
+                const [f, delegated] = t.lookup(name)
+
+                if (f === undefined)
+                    fault("`" + name + "` is not a field of this object, so there is nothing to call")
+
+                return call(f, delegated ? [t].concat(args) : args)
+            }
+
+            const m = builtinMethod(t, name)
+
+            if (m === undefined) fault(typeName(t) + " cannot `" + name + "`")
+
+            return m.apply(null, [t].concat(args))
+        }
+
+        const call = (f, args) => {
+            if (typeof f !== "function") fault(typeName(f) + " is not something that can be called")
+
+            for (const a of args) keep(a, "passed to a function")
+
+            return f.apply(null, args)
+        }
+
+        // `f(...xs)`: the arguments arrive as an array and nothing else will do.
+        const spread = (v) => {
+            if (!Array.isArray(v)) fault("`...` spreads an array, and this is " + typeName(v))
+
+            return v
+        }
+
+        // What `await` may be given. A slate `await` takes a promise; anything else is a mistake worth
+        // naming rather than a value silently resolved.
+        const awaited = (v) => {
+            if (v instanceof Promise) return v
+
+            fault("`await` takes a promise, and this is " + typeName(v))
+        }
+
+        // -- iteration ---------------------------------------------------------------------------------
+
+        function* rangeIter(r) {
+            if (!r.hasLo || !r.hasHi) fault("a range with an open end cannot be walked")
+
+            const last = r.inclusive ? r.hi : r.hi - 1n
+
+            for (let i = r.lo; i <= last; i++) yield i
+        }
+
+        const iter = (v) => {
+            if (Array.isArray(v)) return v.slice()
+            if (isStr(v)) return wide(v) === null ? v.split("") : Array.from(v)
+            if (v instanceof SRange) return rangeIter(v)
+            if (isGen(v)) return v
+
+            fault(typeName(v) + " is not something to walk over")
+        }
+
+        // -- patterns -------------------------------------------------------------------------------------
+
+        // A pattern is data, and this is the walk over it. It answers the values it bound, in the order
+        // the names were written, or null where the pattern does not hold.
+        const matchPattern = (v, pat, bound) => {
+            const kind = pat[0]
+
+            if (kind === "_") { bound.push(v); return true }
+            if (kind === "t") return test(v, pat[1])
+            if (kind === "v") return sameLiteral(v, pat[1])
+
+            if (kind === "@") {
+                bound.push(v)
+
+                return matchPattern(v, pat[1], bound)
+            }
+
+            if (kind === "arr") {
+                const items = pat[1]
+                const open = pat[2]
+                const rest = pat[3]
+
+                if (!Array.isArray(v)) return false
+                if (open || rest ? v.length < items.length : v.length !== items.length) return false
+
+                for (let i = 0; i < items.length; i++)
+                    if (!matchPattern(v[i], items[i], bound)) return false
+
+                if (rest) bound.push(v.slice(items.length))
+
+                return true
+            }
+
+            if (kind === "obj") {
+                const keys = pat[1]
+                const values = pat[2]
+
+                if (!(v instanceof SObj)) return false
+
+                for (let i = 0; i < keys.length; i++) {
+                    if (!v.fields.has(keys[i])) return false
+                    if (!matchPattern(v.fields.get(keys[i]), values[i], bound)) return false
+                }
+
+                return true
+            }
+
+            if (kind === "or") {
+                for (const alt of pat[1]) if (matchPattern(v, alt, bound)) return true
+
+                return false
+            }
+
+            if (kind === "proto") return hasProto(v, pat[1])
+
+            return false
+        }
+
+        // Whether the value's `proto` chain reaches this very object, which is what `p is Point` asks.
+        //
+        // **Identity, walked up the chain**: `==` on objects is structural, so it would answer true for
+        // a different class holding the same fields.
+        const hasProto = (v, cls) => {
+            if (!(v instanceof SObj) || !(cls instanceof SObj)) return false
+
+            let up = v
+            let depth = 0
+
+            for (;;) {
+                const next = up.fields.get("proto")
+
+                if (!(next instanceof SObj)) return false
+                if (next === cls) return true
+
+                depth += 1
+
+                if (depth >= MaxProtoDepth) return false
+
+                up = next
+            }
+        }
+
+        const matched = (v, pat) => {
+            const bound = []
+
+            return matchPattern(v, pat, bound) ? bound : null
+        }
+
+        const matches = (v, pat) => matchPattern(v, pat, [])
+
+        // A binding that has to hold: `val [a, b] = xs`, and a `for` over a pattern.
+        const unpacked = (v, pat) => {
+            const bound = matched(v, pat)
+
+            if (bound === null) fault("this value does not have the shape this takes apart: " + show(v))
+
+            return bound
+        }
+
+        const noArm = (v) => fault("no arm of this match applies to " + text(v))
+
+        // The sentence a thrown value carries.
+        //
+        // **An object with a `message` is READ for that field rather than rendered**, which is what lets
+        // a library put a fault back with `throw e` without turning it into
+        // `{message: "...", line: 3, file: "..."}` -- a description of a fault rather than the fault.
+        const thrownMessage = (v) => {
+            if (isStr(v)) return v
+
+            if (v instanceof SObj) {
+                const said = v.fields.get("message")
+
+                if (isStr(said)) return said
+            }
+
+            return text(v)
+        }
+
+        // What a `catch` binds: an ordinary object carrying the sentence, the line it was raised at and
+        // the file it was in.
+        //
+        // **A thrown value becomes one too**, which is the interpreter's rule and is easy to get wrong:
+        // `throw "gone wrong"` is caught as `{message: "gone wrong", line: 44, file: "p.sl"}` and not as
+        // the string.
+        const faultObject = (message, line, file) =>
+            new SObj([["message", message], ["line", BigInt(line)], ["file", file]])
+
+        const caught = (e) => {
+            if (e instanceof Thrown) return faultObject(thrownMessage(e.value), e.line, e.file)
+            if (e instanceof Fault) return faultObject(e.reason, e.line, e.file)
+
+            // A JavaScript error from inside the runtime is still a fault a program can read.
+            return faultObject(String(e && e.message ? e.message : e), $line, $file)
+        }
+
+        return {
+            Fault, Thrown, SObj, SRange, host,
+            i64, fault, truthy, present, keep, typeName, test, text, show, realText,
+            isInt, isReal, isNum, isStr, isGen,
+            arith, compare, neg, bitnot, eq, same: (a, b) => same(a, b, []), sameLiteral,
+            strLen, strAt, strSlice, wide, span,
+            index, setIndex, field, fieldOpt, setField, method, call, spread, awaited, iter,
+            matched, matches, unpacked, noArm, caught, hasProto,
+
+            // Where the program is, for a fault to name. The emitted code sets it a statement at a time.
+            at(line, file) { $line = line; if (file !== undefined) $file = file },
+
+            // An array literal, which may hold no `undefined`.
+            arr(items) {
+                for (const v of items) keep(v, "put in an array")
+
+                return items
+            },
+
+            // An object literal, in the order its keys were written.
+            obj(entries) {
+                for (const [, v] of entries) keep(v, "put in an object")
+
+                return new SObj(entries)
+            },
+
+            range(lo, hi, inclusive) {
+                if (lo !== undefined && !isInt(lo)) fault("a range runs between integers, and this is " + typeName(lo))
+                if (hi !== undefined && !isInt(hi)) fault("a range runs between integers, and this is " + typeName(hi))
+
+                return new SRange(lo === undefined ? 0n : lo, hi === undefined ? 0n : hi,
+                    inclusive, lo !== undefined, hi !== undefined)
+            },
+
+            // `x with { a: 1 }`: a new object, the base's fields first.
+            withFields(base, entries) {
+                if (!(base instanceof SObj)) fault("`with` takes an object, and this is " + typeName(base))
+
+                const made = new SObj(base.fields)
+
+                for (const [k, v] of entries) made.fields.set(k, keep(v, "put in an object"))
+
+                return made
+            },
+
+            withAll(base, other) {
+                if (!(base instanceof SObj) || !(other instanceof SObj))
+                    fault("`with` takes two objects, and this is " + typeName(base instanceof SObj ? other : base))
+
+                const made = new SObj(base.fields)
+
+                for (const [k, v] of other.fields) made.fields.set(k, v)
+
+                return made
+            },
+
+            // `[v; n]`, an array of one value repeated.
+            repeat(v, n) {
+                if (!isInt(n)) fault("a repeat count is an integer, and this is " + typeName(n))
+                if (n < 0n) fault("a repeat count is not negative, and this is " + n)
+
+                return new Array(Number(n)).fill(keep(v, "put in an array"))
+            },
+
+            // The pieces of `s"..."`, each rendered as a program prints it.
+            interp(pieces) {
+                let out = ""
+
+                for (const p of pieces) out += typeof p === "string" ? p : text(p)
+
+                return out
+            }
+        }
+    })()
+    """
