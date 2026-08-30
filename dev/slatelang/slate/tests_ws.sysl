@@ -1,0 +1,327 @@
+module dev.slatelang.slate
+@tests
+
+// `slate:ws`, and the upgrade `slate:http` hands it.
+//
+// **The protocol's arithmetic is tested without a socket and the handover is tested with one**, which
+// is the split the module is built to allow: `accepting`, `framed` and `unframed` are pure functions
+// of bytes, and only `accept` needs a connection. A suite that reached for a server to check a
+// length prefix would be testing three things and reporting on one.
+//
+// **The client in the wire tests writes its own frames rather than using `framed`.** A test whose
+// client shared the code under test could not tell a frame written wrongly from one read wrongly --
+// the two errors would cancel and the test would pass. What it sends is masked by hand, because a
+// client's frames are masked and the server's are not.
+
+// A client's frame: masked, with a key whose four bytes all differ so a wrong index shows up.
+private val MaskedFrame: string =
+    "masked(op, payload)\n" +
+    "    val key = [7, 11, 13, 17]\n" +
+    "    var out = [0x80 | op]\n" +
+    "    val n = len(payload)\n" +
+    "    if n < 126\n" +
+    "        push(out, 0x80 | n)\n" +
+    "    else\n" +
+    "        push(out, 0x80 | 126)\n" +
+    "        push(out, (n >> 8) & 0xFF)\n" +
+    "        push(out, n & 0xFF)\n" +
+    "    for b in key\n" +
+    "        push(out, b)\n" +
+    "    for i in 0..<n\n" +
+    "        push(out, payload[i] ^ key[i % 4])\n" +
+    "    out\n"
+
+// A frame that is NOT masked, which is what a client must never send.
+private val PlainFrame: string =
+    "plain(op, payload)\n" +
+    "    var out = [0x80 | op, len(payload)]\n" +
+    "    for b in payload\n" +
+    "        push(out, b)\n" +
+    "    out\n"
+
+// Where a head ends, in bytes, so the frames behind it are not read as text.
+private val CutHead: string =
+    "cut(bs)\n" +
+    "    var i = 0\n" +
+    "    while i + 3 < len(bs)\n" +
+    "        if bs[i] == 13 && bs[i + 1] == 10 && bs[i + 2] == 13 && bs[i + 3] == 10 then return i\n" +
+    "        i = i + 1\n" +
+    "    0 - 1\n"
+
+private val Handshake: string =
+    "\"GET /ws HTTP/1.1\\r\\nHost: h\\r\\nUpgrade: websocket\\r\\nConnection: Upgrade\\r\\n" +
+    "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\\r\\nSec-WebSocket-Version: 13\\r\\n\\r\\n\""
+
+// A server that upgrades and echoes, and a client that drives it. `<react>` is what the client does
+// with each frame that comes back, and `<open>` is what it sends once the handshake is answered.
+private wire(open: string, react: string) -> string =
+    "val server = serve(0, (req) -> \"not a websocket\", (req, socket, head) ->\n" +
+    "    val r = accept(req, socket, head)\n" +
+    "    if !r.ok\n" +
+    "        print(\"refused: \" + r.error)\n" +
+    "        return\n" +
+    "    val ws = r.value\n" +
+    "    ws.onMessage((m) -> ws.send(\"echo:\" + m))\n" +
+    "    ws.onBinary((bs) -> ws.sendBytes(bs))\n" +
+    "    ws.onClose((code, why) -> 0))\n" +
+    MaskedFrame + PlainFrame + CutHead +
+    "async main()\n" +
+    "    val c = (await connect(\"127.0.0.1\", localPort(server))).value\n" +
+    "    var got = []\n" +
+    "    var up = false\n" +
+    "    stop()\n" +
+    "        shutSocket(c)\n" +
+    "        close(server)\n" +
+    "        done()\n" +
+    "    heard(chunk)\n" +
+    "        if chunk == null\n" +
+    "            print(\"the server hung up\")\n" +
+    "            stop()\n" +
+    "            return\n" +
+    "        got = concat(got, chunk)\n" +
+    "        if !up\n" +
+    "            val at = cut(got)\n" +
+    "            if at < 0 then return\n" +
+    "            print(split(fromBytes(got[0..<at]).value, \"\\r\\n\")[0])\n" +
+    "            up = true\n" +
+    "            got = got[(at + 4)..]\n" +
+    "            " + open + "\n" +
+    "        while true\n" +
+    "            val f = unframed(got, 0)\n" +
+    "            if f == null || f.tooBig then return\n" +
+    "            got = got[f.size..]\n" +
+    "            " + react + "\n" +
+    "    onBytes(c, heard)\n" +
+    "    await send(c, " + Handshake + ")\n" +
+    "main()\n"
+
+@test
+THE_ACCEPT_VALUE_IS_THE_ONE_RFC_6455_PRINTS()
+    // **The RFC's own worked example**, key and answer both. It is the one value in the handshake a
+    // server cannot fake by echoing something back, so getting it wrong is a server no browser will
+    // talk to -- and the failure is a connection that closes with nothing said.
+
+    assert_eq(ws_out("print(accepting(\"dGhlIHNhbXBsZSBub25jZQ==\"))\n"),
+              "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+
+@test
+A_FRAME_WRITTEN_HERE_IS_READ_BACK_WHOLE()
+    // The round trip, which is the whole of what a framing owes -- and the header bytes said out
+    // loud, because `0x81` is FIN and text and a reader has to be able to see that it is.
+
+    val text = "val f = framed(1, toBytes(\"hello\"))\n" +
+        "print(f[0], f[1], len(f))\n" +
+        "val r = unframed(f, 0)\n" +
+        "print(r.opcode, r.fin, r.masked, fromBytes(r.payload).value)\n"
+
+    assert_eq(ws_out(text), "129 5 7\n1 true false hello")
+
+@test
+A_LENGTH_IS_WRITTEN_IN_ONE_TWO_OR_EIGHT_BYTES()
+    // **The two boundaries the protocol draws**, and they are drawn at 126 rather than at 128: a
+    // seven-bit length carries 0 to 125, and 126 and 127 are the two escapes. A frame of exactly 125
+    // bytes is the largest that fits in the first form, and one of 126 is the smallest that does not.
+
+    val text = "print(len(framed(2, repeatBytes(125))) - 125)\n" +
+        "print(len(framed(2, repeatBytes(126))) - 126)\n" +
+        "print(len(framed(2, repeatBytes(65535))) - 65535)\n" +
+        "print(len(framed(2, repeatBytes(65536))) - 65536)\n"
+
+    val helper = "repeatBytes(n)\n    var out = []\n    for i in 0..<n\n        push(out, 65)\n    out\n"
+
+    assert_eq(ws_out(helper + text), "2\n4\n4\n10")
+
+@test
+A_BIG_FRAME_SURVIVES_THE_EIGHT_BYTE_LENGTH()
+    // The eight-byte form written and read, which the count above does not check: a length assembled
+    // from the wrong end of eight bytes is still eight bytes long.
+
+    val text = "repeatBytes(n)\n    var out = []\n    for i in 0..<n\n        push(out, 66)\n    out\n" +
+        "val f = framed(2, repeatBytes(70000))\n" +
+        "val r = unframed(f, 0)\n" +
+        "print(len(r.payload), r.payload[69999], r.size == len(f))\n"
+
+    assert_eq(ws_out(text), "70000 66 true")
+
+@test
+A_FRAME_THAT_HAS_NOT_ALL_ARRIVED_IS_NOT_A_FRAME_YET()
+    // **`null` rather than a partial answer**, at every point a frame can be cut: inside the header,
+    // inside the extended length, inside the mask key, and inside the payload. A reader that answered
+    // early would hand over a message that is missing its end.
+
+    val text = "print(unframed([], 0) == null)\n" +
+        "print(unframed([129], 0) == null)\n" +
+        "print(unframed([129, 126, 0], 0) == null)\n" +
+        "print(unframed([129, 0x85, 1, 2], 0) == null)\n" +
+        "print(unframed([129, 5, 104, 101], 0) == null)\n"
+
+    assert_eq(ws_out(text), "true\ntrue\ntrue\ntrue\ntrue")
+
+@test
+TWO_FRAMES_IN_ONE_ARRIVAL_ARE_READ_IN_ORDER()
+    // **One TCP arrival is not one frame**, in either direction: a peer may send several at once and
+    // a reader that took the first and dropped the rest would lose messages under load and never
+    // under test. `size` is what says where the next one starts.
+
+    val text = "var two = concat(framed(1, toBytes(\"ab\")), framed(1, toBytes(\"cd\")))\n" +
+        "val f1 = unframed(two, 0)\n" +
+        "val f2 = unframed(two, f1.size)\n" +
+        "print(fromBytes(f1.payload).value, fromBytes(f2.payload).value)\n"
+
+    assert_eq(ws_out(text), "ab cd")
+
+@test
+A_CLIENTS_FRAME_IS_MASKED_AND_COMES_BACK_UNMASKED()
+    // **Reading a masked frame is the direction a server is in**, and the mask is not encryption --
+    // it is there so that a hostile page cannot steer an intermediary into reading payload bytes as
+    // a request of its own. What matters here is that the four-byte key repeats correctly past its
+    // own length, which a payload of five bytes is the shortest to show.
+
+    val text = "var f = [129, 0x85, 7, 11, 13, 17]\n" +
+        "for i in 0..<5\n" +
+        "    push(f, toBytes(\"hello\")[i] ^ [7, 11, 13, 17][i % 4])\n" +
+        "val r = unframed(f, 0)\n" +
+        "print(r.masked, fromBytes(r.payload).value)\n"
+
+    assert_eq(ws_out(text), "true hello")
+
+@test
+A_HANDSHAKE_IS_ANSWERED_101_AND_A_MESSAGE_COMES_BACK()
+    // The whole path in one test: an ordinary HTTP request that says `Connection: upgrade`, the
+    // server's 101, a masked frame from the client and an unmasked one back.
+
+    val text = wire("send(c, masked(1, toBytes(\"hi\")))",
+                    "print(fromBytes(f.payload).value)\n            stop()\n            return")
+
+    assert_eq(ws_wire_out(text), "HTTP/1.1 101 Switching Protocols\necho:hi")
+
+@test
+A_BINARY_MESSAGE_STAYS_BINARY()
+    // **Bytes that are not text go through unchanged**, which is the difference between opcode 2 and
+    // opcode 1 and the reason the two are not one: `0xFF` is not valid UTF-8, so a server that read
+    // every payload as text would close this connection with 1007.
+
+    val text = wire("send(c, masked(2, [0, 255, 128]))",
+                    "print(f.opcode, f.payload[0], f.payload[1], f.payload[2])\n            stop()\n            return")
+
+    assert_eq(ws_wire_out(text), "HTTP/1.1 101 Switching Protocols\n2 0 255 128")
+
+@test
+A_PING_IS_ANSWERED_WITH_A_PONG_CARRYING_THE_SAME_BYTES()
+    // **A pong echoes the ping's payload**, which is what makes a ping a round-trip measurement
+    // rather than a bare liveness bit -- the sender can tell its own ping from an earlier one.
+
+    val text = wire("send(c, masked(9, toBytes(\"beat\")))",
+                    "print(f.opcode, fromBytes(f.payload).value)\n            stop()\n            return")
+
+    assert_eq(ws_wire_out(text), "HTTP/1.1 101 Switching Protocols\n10 beat")
+
+@test
+A_FRAGMENTED_MESSAGE_ARRIVES_AS_ONE()
+    // **A browser splits anything large**, so continuation frames are the ordinary case rather than
+    // the exotic one. The pieces carry opcode 0 and only the first says what the message is.
+
+    val open = "send(c, [0x01, 0x83, 7, 11, 13, 17, 97 ^ 7, 98 ^ 11, 99 ^ 13])\n" +
+        "            send(c, [0x80, 0x83, 7, 11, 13, 17, 100 ^ 7, 101 ^ 11, 102 ^ 13])"
+
+    val text = wire(open, "print(fromBytes(f.payload).value)\n            stop()\n            return")
+
+    assert_eq(ws_wire_out(text), "HTTP/1.1 101 Switching Protocols\necho:abcdef")
+
+@test
+A_CLOSE_FRAME_IS_ECHOED_AND_THE_CONNECTION_ENDS()
+    // **The close is a handshake of its own**: whoever sends first is answered with the same code,
+    // which is what lets a peer tell a deliberate end from a socket that dropped. `onClose` is told
+    // the code the peer sent rather than a code of the server's own.
+
+    val text = wire("send(c, masked(8, [3, 232]))",
+                    "print(f.opcode, (f.payload[0] << 8) | f.payload[1])\n            stop()\n            return")
+
+    assert_eq(ws_wire_out(text), "HTTP/1.1 101 Switching Protocols\n8 1000")
+
+@test
+AN_UNMASKED_FRAME_FROM_A_CLIENT_CLOSES_THE_CONNECTION()
+    // **The protocol says to fail the connection rather than read it**, and 1002 is the code for a
+    // peer that is not following it. A server that read one anyway would be the one an intermediary
+    // could be steered through, which is the whole reason masking exists.
+
+    val text = wire("send(c, plain(1, toBytes(\"hi\")))",
+                    "print(f.opcode, (f.payload[0] << 8) | f.payload[1])\n            stop()\n            return")
+
+    assert_eq(ws_wire_out(text), "HTTP/1.1 101 Switching Protocols\n8 1002")
+
+@test
+A_REQUEST_THAT_IS_NOT_A_HANDSHAKE_IS_REFUSED_RATHER_THAN_UPGRADED()
+    // **Every missing piece is its own sentence**, because they are four different mistakes: a
+    // request that is not an upgrade at all, one that asked for a version this server does not
+    // speak, and one with no key. A single "bad handshake" would send all three to look in the
+    // wrong place.
+
+    val text = "val server = serve(0, (req) -> \"page\", (req, socket, head) ->\n" +
+        "    val r = accept(req, socket, head)\n" +
+        "    print(r.ok)\n" +
+        "    print(r.error)\n" +
+        "    close(server)\n" +
+        "    done())\n" +
+        "async main()\n" +
+        "    val c = (await connect(\"127.0.0.1\", localPort(server))).value\n" +
+        "    onBytes(c, (chunk) -> 0)\n" +
+        "    await send(c, \"GET /ws HTTP/1.1\\r\\nHost: h\\r\\nUpgrade: websocket\\r\\nConnection: Upgrade\\r\\n" +
+        "Sec-WebSocket-Version: 8\\r\\nSec-WebSocket-Key: k\\r\\n\\r\\n\")\n" +
+        "main()\n"
+
+    assert_eq(ws_wire_out(text),
+              "false\nthis server speaks websocket version 13, and this handshake asked for 8")
+
+@test
+A_SERVER_WITH_NO_UPGRADE_HANDLER_SAYS_SO()
+    // **501 rather than silence.** The client asked for a protocol this program does not speak,
+    // which is something it can act on; leaving it holding a socket nothing will ever answer is not.
+
+    val text = "val server = serve(0, (req) -> \"page\")\n" +
+        "async main()\n" +
+        "    val c = (await connect(\"127.0.0.1\", localPort(server))).value\n" +
+        "    var got = []\n" +
+        "    heard(chunk)\n" +
+        "        if chunk == null\n" +
+        "            print(split(fromBytes(got).value, \"\\r\\n\")[0])\n" +
+        "            close(server)\n" +
+        "            done()\n" +
+        "            return\n" +
+        "        got = concat(got, chunk)\n" +
+        "    onBytes(c, heard)\n" +
+        "    await send(c, \"GET /ws HTTP/1.1\\r\\nHost: h\\r\\nUpgrade: websocket\\r\\nConnection: Upgrade\\r\\n" +
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\\r\\nSec-WebSocket-Version: 13\\r\\n\\r\\n\")\n" +
+        "main()\n"
+
+    assert_eq(ws_wire_out(text), "HTTP/1.1 501 Not Implemented")
+
+@test
+THE_SERVER_IS_TOLD_THE_CODE_THE_PEER_SENT()
+    // **`onClose` gets the peer's code, not a code of the server's own** -- which is what makes the
+    // callback worth having: 1000 is a window that was closed and 1002 is a client that broke the
+    // protocol, and a handler that cleans up after a session wants to tell them apart.
+    //
+    // The shared helper above deliberately prints nothing here, so that every other test asserts on
+    // one thing. This is the test that watches the other side.
+
+    val text = "val server = serve(0, (req) -> \"page\", (req, socket, head) ->\n" +
+        "    val ws = accept(req, socket, head).value\n" +
+        "    ws.onClose((code, why) ->\n" +
+        "        print(code)\n" +
+        "        print(why)\n" +
+        "        close(server)\n" +
+        "        done()))\n" +
+        "async main()\n" +
+        "    val c = (await connect(\"127.0.0.1\", localPort(server))).value\n" +
+        "    var up = false\n" +
+        "    heard(chunk)\n" +
+        "        if chunk == null then return\n" +
+        "        if !up\n" +
+        "            up = true\n" +
+        "            send(c, [0x88, 0x82, 7, 11, 13, 17, 3 ^ 7, 233 ^ 11])\n" +
+        "    onBytes(c, heard)\n" +
+        "    await send(c, " + Handshake + ")\n" +
+        "main()\n"
+
+    assert_eq(ws_wire_out(text), "1001\nthe peer closed the connection")
