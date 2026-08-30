@@ -8,6 +8,15 @@ JavaScript back end**, and that is the whole of what they are for:
     qjs p1.js                    > got.txt
     diff want.txt got.txt
 
+**node runs them too, and that is the point of the exercise rather than a side effect** — the same
+file, no flags, and a one-liner where the file is not wanted:
+
+    slate js p1.sl | node -
+
+`p7.sl` needs an event loop, so under quickjs it needs `qjs --std p7.js`: quickjs keeps its timers
+on `os` rather than on the global and `--std` is what puts `os` there. node has all four timers as
+globals and needs nothing. Every other program in this directory runs under a bare `qjs`.
+
 They are not run by `sysl test .`, because the suite has no JavaScript engine in it: running the
 emitted code needs `sysl-lang/quickjs-ng` as a dependency of this repo, which moves the compiler
 floor to 0.0.93 and puts `--include-path quickjs=…` on every test run. When that lands, these become
@@ -16,8 +25,13 @@ the differential suite and the diff above becomes an assertion.
 Until then they are run by hand, and every one of them was: `wide.sl` is the fixture for a driver
 test and the six numbered ones cover, in order, arithmetic and printing; patterns, `match`,
 labelled loops, closures and `try`/`catch`; classes, generators, `with`, defaults and spread
-arguments; the `...` literals; the annotations, which are checked while a program runs; and defaults
-inside a pattern.
+arguments; the `...` literals; the annotations, which are checked while a program runs; defaults
+inside a pattern; and the event loop.
+
+**`p7.sl` runs its phases one after another, and that is the test's own correctness rather than
+slate's.** Two timers due at the same instant fire in an order neither loop promises, and a repeating
+timer drifts by however long its callback took — an earlier draft asked both questions and the two
+loops disagreed about both, which says nothing about either.
 
 `mods/` holds the programs of **more than one file**, which are the same corpus with the same
 command — `slate js mods/two.sl -o two.js` writes every module of the program into one file, so

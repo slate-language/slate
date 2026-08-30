@@ -707,10 +707,194 @@ js_runtime_builtins() -> string = raw"""
             return t === undefined ? undefined : t.get(name)
         }
 
+        // -- the event loop ---------------------------------------------------------------------------
+        //
+        // **A promise is JavaScript's own**, which is the whole reason this is short: an `async` slate
+        // function already compiles to an `async function` and `await` to `await`, so what was missing
+        // was never the machinery -- it was the ten builtins that make a promise from OUTSIDE one.
+        //
+        // **The timers come from `$.host`**, taken from the engine before slate's own names were
+        // installed over them. A host with none is a host with no event loop.
+
+        const noLoop = (name) =>
+            fault("`" + name + "` needs an event loop, and this JavaScript host has no timers")
+
+        // A delay, in milliseconds.
+        //
+        // **A duration is refused rather than accepted** where the interpreter takes one, because
+        // `slate:time` is not in this back end yet and no program can hold a duration to pass. The
+        // sentence is the interpreter's, so it will be right when durations arrive.
+        const wantDelay = (v) => {
+            if (!$.isNum(v)) fault("a delay is a number of milliseconds or a duration, and this is " + typeName(v))
+
+            const ms = Number(asReal(v))
+
+            return ms < 0 ? 0 : ms
+        }
+
+        // Every live timer, by the id the program holds.
+        //
+        // **The id is slate's own number and not the engine's handle**, which node gives as an object
+        // and quickjs as a number -- neither of which is the integer a slate program is promised. It
+        // is never reused, so cancelling a timer that has already fired finds nothing rather than
+        // finding whatever took its place.
+        const timers = new Map()
+        let nextTimer = 0n
+
+        const startTimer = (args, repeating) => {
+            if (args.length === 0 || args.length > 2)
+                fault("a timer takes a function and a delay, and was given " + args.length +
+                    (args.length === 1 ? " argument" : " arguments"))
+
+            const f = args[0]
+
+            if (typeof f !== "function") fault("a timer needs a function to call, and this is " + typeName(f))
+
+            const ms = args.length === 2 ? wantDelay(args[1]) : 0
+            const id = ++nextTimer
+            const held = { handle: null, stop: null }
+
+            timers.set(id, held)
+
+            if (repeating && $.host.setInterval !== null) {
+                held.stop = $.host.clearInterval
+                held.handle = $.host.setInterval(() => $.call(f, []), ms)
+
+                return id
+            }
+
+            if ($.host.setTimeout === null) noLoop(repeating ? "setInterval" : "setTimeout")
+
+            held.stop = $.host.clearTimeout
+
+            if (repeating) {
+                // **An interval built out of one-shots, for a host that has only those** -- quickjs
+                // keeps `setTimeout` on `os` and has no `setInterval` at all. Re-armed after the
+                // callback rather than on a schedule, so it drifts by however long the callback took;
+                // node's own does the same, and a program that cares uses a deadline rather than a
+                // count of ticks.
+                const again = () => {
+                    $.call(f, [])
+
+                    // Cancelled by its own callback, which is how an interval in a program that means
+                    // to end is usually stopped.
+                    if (timers.get(id) === held) held.handle = $.host.setTimeout(again, ms)
+                }
+
+                held.handle = $.host.setTimeout(again, ms)
+
+                return id
+            }
+
+            // **A one-shot forgets itself before the body runs**, so that a callback cancelling its
+            // own timer is not left holding an id that names nothing.
+            held.handle = $.host.setTimeout(() => {
+                timers.delete(id)
+                $.call(f, [])
+            }, ms)
+
+            return id
+        }
+
+        B.setTimeout = (...args) => startTimer(args, false)
+        B.setInterval = (...args) => startTimer(args, true)
+
+        const clearOne = (v) => {
+            if (!$.isInt(v)) fault("a timer is cancelled by its id, and this is " + typeName(v))
+
+            const held = timers.get(v)
+
+            // A stale id names nothing, which is not an error: the timer it named has fired.
+            if (held === undefined) return null
+
+            timers.delete(v)
+            held.stop(held.handle)
+
+            return null
+        }
+
+        B.clearTimeout = clearOne
+        B.clearInterval = clearOne
+
+        B.sleep = (...args) => {
+            if (args.length !== 1)
+                fault("`sleep` takes a number of milliseconds and was given " + args.length +
+                    (args.length === 1 ? " argument" : " arguments"))
+
+            if (!$.isNum(args[0]))
+                fault("`sleep` takes a number of milliseconds or a duration, and this is " + typeName(args[0]))
+
+            const ms = wantDelay(args[0])
+
+            if ($.host.setTimeout === null) noLoop("sleep")
+
+            return new Promise((answer) => $.host.setTimeout(() => answer(null), ms))
+        }
+
+        // `resolve(v)` and `reject(message)` -- a promise that has already settled.
+        //
+        // **A rejection carries a SENTENCE and not the value**, which is the interpreter's rule: what
+        // an `await` on a failed promise raises is a fault, and a fault's reason is text. `reject(42)`
+        // is caught as `{message: "42", ...}`.
+        B.resolve = (...args) => {
+            if (args.length !== 1) fault("`resolve` takes one argument and was given " + args.length)
+
+            return Promise.resolve(args[0])
+        }
+
+        B.reject = (...args) => {
+            if (args.length !== 1) fault("`reject` takes one argument and was given " + args.length)
+
+            return Promise.reject(new $.Fault(text(args[0])))
+        }
+
+        // `pending()`, and `settle(p, v)` and `fail(p, message)` which answer it.
+        //
+        // **This is the bridge from a callback into `await`**, and it is what a program cannot write
+        // its way out of: without it the only awaitable things are the ones slate itself started.
+        B.pending = (...args) => {
+            if (args.length !== 0)
+                fault("`pending` takes no arguments and was given " + args.length +
+                    (args.length === 1 ? " argument" : " arguments"))
+
+            let answer, refuse
+            const p = new Promise((res, rej) => { answer = res; refuse = rej })
+
+            p.$answer = answer
+            p.$refuse = refuse
+
+            return p
+        }
+
+        // **A promise settles once and a second answer is DROPPED rather than refused**, which is the
+        // interpreter's rule and JavaScript's: two callbacks racing to answer one promise is a program
+        // deciding late, not a program in error. A promise something else already owns -- what an
+        // `async` function handed back -- has no answer of its own to give, so answering it is the
+        // same nothing.
+        const answerPromise = (args, name, failing) => {
+            if (args.length !== 2)
+                fault("`" + name + "` takes a promise and an answer, and was given " + args.length +
+                    (args.length === 1 ? " argument" : " arguments"))
+
+            const p = args[0]
+
+            if (!(p instanceof Promise)) fault("`" + name + "` answers a promise, and this is " + typeName(p))
+
+            if (failing) {
+                if (p.$refuse !== undefined) p.$refuse(new $.Fault(text(args[1])))
+            } else if (p.$answer !== undefined) {
+                p.$answer(args[1])
+            }
+
+            return null
+        }
+
+        B.settle = (...args) => answerPromise(args, "settle", false)
+        B.fail = (...args) => answerPromise(args, "fail", true)
+
         // Every name the interpreter declares, so that a program reaching one this back end has not
         // built yet is told so rather than failing as an undefined name.
-        const OWED = ["setTimeout", "setInterval", "clearTimeout", "clearInterval", "sleep", "resolve",
-            "reject", "pending", "settle", "fail", "readFile", "readBytes", "writeFile", "readDir",
+        const OWED = ["readFile", "readBytes", "writeFile", "readDir",
             "stat", "exists", "remove", "mkdir", "rmdir", "rename", "readFileSync", "readBytesSync",
             "writeFileSync", "readDirSync", "statSync", "existsSync", "removeSync", "mkdirSync",
             "rmdirSync", "renameSync", "listen", "connect", "onData", "onBytes", "onError", "send",
