@@ -55,3 +55,17 @@ print("next:", removeAt(queue, 0), "leaving", queue)
 // Strings and numbers answer to the same syntax, for the same reason.
 print("  hello, world  ".trim().upper().split(", "))
 print((3.7).floor(), (2.1).ceil(), (16).sqrt())
+
+// **`...` takes an array apart where a list of values is wanted**, which is the same `...` a call's
+// arguments and a binding's pattern already use. Written and spread values may be in any order, and
+// as many as you like.
+val early = [1, 2]
+val late = [5, 6]
+
+print("joined:", [...early, 3, 4, ...late])
+
+// A spread builds a NEW array, which is what makes it the way to copy one.
+val copy = [...early]
+
+push(copy, 99)
+print("copy:", copy, "original:", early)

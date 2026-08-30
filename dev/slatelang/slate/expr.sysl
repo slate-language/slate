@@ -343,12 +343,26 @@ private async_lambda(p: *Parser, t: Spanned[Tok]) -> Expr
 end async_lambda
 
 // `[a, b, c]`. A newline inside the brackets is not a line ending, so nothing here handles one.
+//
+// **`...xs` among the elements is the `Spread` node a call's arguments already carry**, put in a
+// second position rather than given a second spelling. An argument list and an array literal are the
+// same problem -- a run of written values with arrays folded in between them -- so `compile_expr`
+// builds both with the one routine.
 private array_literal(p: *Parser, t: Spanned[Tok]) -> Expr
     var items: Buf[Expr] = buf()
 
     if !p.at(RBracket)
         loop
-            items.push(parse_expr(p))
+            if p.at(Spread)
+                val at = p.here()
+
+                p.bump()
+
+                val inner = parse_expr(p)
+
+                items.push(expr(at.to(inner.span), Spread(inner)))
+            else
+                items.push(parse_expr(p))
 
             // `[v; n]` -- one value and a count, which is a different form from a list and is told
             // apart by the `;` after the first element.
@@ -357,7 +371,20 @@ private array_literal(p: *Parser, t: Spanned[Tok]) -> Expr
 
                 p.expect(RBracket, "`]`")
 
-                return expr(t.span.to(p.just_taken()), ArrayRepeat(items.at(0), count))
+                val whole = t.span.to(p.just_taken())
+
+                // **The two forms mean opposite things about one array and cannot be combined.**
+                // `[v; n]` makes `n` copies of one value; `...xs` takes the elements out of one. A
+                // reader writing `[...xs; 3]` wants a repeat of something and this is not where to
+                // say it, so the refusal names both rather than reporting a stray `;`.
+                *items.at(0).kind match
+                    Spread(_) ->
+                        p.fault(whole, "`[v; n]` repeats one value and `...` spreads an array apart -- one array cannot be both")
+
+                        return expr(whole, Bad)
+                    _ -> ()
+
+                return expr(whole, ArrayRepeat(items.at(0), count))
 
             if !p.accept(Comma) then break
             if p.at(RBracket) then break
@@ -377,9 +404,9 @@ private with_fields(p: *Parser, base: Expr) -> Expr
     var values: Buf[Expr] = buf()
 
     // **The right-hand side may be an ordinary expression**, and then the fields are whatever that
-    // object turns out to hold. Merging two objects a program computed had no spelling at all
-    // otherwise -- `{ ...a, ...b }` is what JavaScript writes and slate deliberately has no spread
-    // in a literal, so this is where that need had to land.
+    // object turns out to hold. It is also what `{ ...a, ...b }` is built out of: an object
+    // literal desugars each of its spreads into one of these, so there is one merge in the language
+    // and two ways to reach it.
     if !p.at(LBrace)
         // **ONE BELOW `with`'s OWN POWER, AND THAT IS NOT AN OFF-BY-ONE.** `with` binds as tightly as
         // a field selection -- deliberately, so `a + b with c` changes `b` rather than the sum -- and
@@ -392,7 +419,7 @@ private with_fields(p: *Parser, base: Expr) -> Expr
         // merge is the same answer either way, since `c` wins over `b` wins over `a` under both.
         val other = parse_expr_bp(p, power_of(With).left - 1)
 
-        return expr(base.span.to(other.span), WithAll(base, other))
+        return expr(base.span.to(other.span), WithAll(base, other, false))
 
     p.expect(LBrace, "`{` and the fields to change")
 
@@ -422,24 +449,55 @@ private object_literal(p: *Parser, t: Spanned[Tok]) -> Expr
     var key_spans: Buf[Span] = buf()
     var values: Buf[Expr] = buf()
 
+    // What the entries before the last `...` came to. While it is `None` no spread has been met and
+    // what is being read is the ordinary literal, which is what the great majority of them are.
+    var built: Option[Expr] = None
+
     if !p.at(RBrace)
         loop
-            val key_at = p.here()
+            if p.at(Spread)
+                p.bump()
 
-            keys.push(parse_key(p, "a field name"))
-            key_spans.push(key_at.to(p.just_taken()))
+                val other = parse_expr(p)
 
-            p.expect(Colon, "`:` and a value")
+                built = Some(expr(t.span.to(p.just_taken()),
+                    WithAll(object_so_far(built, keys, key_spans, values, t.span.to(p.just_taken())), other, true)))
 
-            values.push(parse_expr(p))
+                keys = buf()
+                key_spans = buf()
+                values = buf()
+            else
+                val key_at = p.here()
+
+                keys.push(parse_key(p, "a field name"))
+                key_spans.push(key_at.to(p.just_taken()))
+
+                p.expect(Colon, "`:` and a value")
+
+                values.push(parse_expr(p))
 
             if !p.accept(Comma) then break
             if p.at(RBrace) then break
 
     p.expect(RBrace, "`}`")
 
-    expr(t.span.to(p.just_taken()), ObjectLit(keys, key_spans, values))
+    object_so_far(built, keys, key_spans, values, t.span.to(p.just_taken()))
 end object_literal
+
+// The entries read so far as one expression: the literal itself where no `...` has been met, and
+// otherwise what has been merged, with any fields written since the last one laid over it.
+//
+// **This is where `{ a: 1, ...o, b: 2 }` becomes `{ a: 1 } with o with { b: 2 }`**, which is the
+// same object by the same rule -- a later entry wins over an earlier one, and a field already
+// present keeps the place it had. Desugaring here rather than carrying a spread into the tree means
+// nothing downstream learns a new shape, and it means the meaning can be checked by writing the
+// longhand and comparing.
+private object_so_far(built: Option[Expr], keys: Buf[string], key_spans: Buf[Span], values: Buf[Expr], at: Span) -> Expr
+    built match
+        Some(b) ->
+            if keys.len() == 0 then b else expr(at, WithFields(b, keys, values))
+        None -> expr(at, ObjectLit(keys, key_spans, values))
+end object_so_far
 
 // `if c then a else b`, and the indented form.
 //
@@ -638,11 +696,10 @@ private call(p: *Parser, callee: Expr) -> Expr
 
     if !p.at(RParen)
         loop
-            // **`...xs` is an argument list worked out while running**, and it is read here and
-            // nowhere else. A spread in a literal is deliberately absent -- `{ ...o }` is
-            // `o with { ... }` and `[...xs, y]` is `concat(xs, [y])`, both of which slate has -- but
-            // an argument list built at run time has no other spelling at all, `apply` not being
-            // something a program can reach.
+            // **`...xs` is an argument list worked out while running.** An array literal reads one
+            // the same way and an object literal desugars one into `with`; what is peculiar to this
+            // position is that an argument list built at run time has no other spelling at all,
+            // `apply` not being something a program can reach.
             if p.at(Spread)
                 val at = p.here()
 

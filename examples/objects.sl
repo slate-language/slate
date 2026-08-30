@@ -65,3 +65,17 @@ val c = counter()
 
 c.bump()
 print(c.bump())
+
+// **`...` spreads another object's fields into a literal**, and the rule is the one reading suggests:
+// a later entry wins over an earlier one, and a field already present keeps the place it had.
+val defaults = { size: 1, colour: "black" }
+
+print("a bigger one:", { ...defaults, size: 4 })
+print("with an extra:", { ...defaults, label: "x" })
+
+// It is a copy, so writing to the result leaves the original alone -- which is what makes this the
+// way to say "the same, but for this" without a `with`.
+val bigger = { ...defaults }
+
+bigger.size = 10
+print(bigger.size, defaults.size)
