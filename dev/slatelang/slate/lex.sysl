@@ -38,6 +38,12 @@ lex(src: Source) -> Lexed
     var out: Tokens[Tok] = tokens()
     var rep = report()
 
+    // The elements and holes still open, innermost last, and where each of them began. Two buffers
+    // rather than one of pairs, because the top of the stack is REPLACED as often as it is pushed --
+    // an opening tag's `>` turns it into children -- and replacing means a pop and a push.
+    var slx: Buf[SlxWhere] = buf()
+    var slx_at: Buf[Span] = buf()
+
     // Whether the cursor is at the head of a line whose indentation has not been measured yet. It is
     // only ever set where the layout is significant, so a line continued inside brackets never
     // reaches the measuring branch at all.
@@ -73,6 +79,14 @@ lex(src: Source) -> Lexed
             at_line_head = false
         end if
 
+        // **Children are read before the blank-skipping below, and that ordering is the whole
+        // reason a mode is needed.** Between a tag's `>` and the `<` that ends it a space is a
+        // character, `//` is not a comment and a newline is not a line ending, so every line of the
+        // loop under this one would take something out of the text.
+        if slx_in_text(&slx)
+            scan_slx_text(&s, &lay, &out, &rep, &slx, &slx_at)
+            continue
+
         s.skip_blanks()
 
         if s.starts_with("//".bytes)
@@ -90,7 +104,7 @@ lex(src: Source) -> Lexed
             continue
         end if
 
-        scan_token(&s, &lay, &out, &rep)
+        scan_token(&s, &lay, &out, &rep, &slx, &slx_at)
     end loop
 
     // Whatever is still open at the end of the file closes there, and the statement on the last line
@@ -140,8 +154,37 @@ end emit_dent
 //
 // The cursor is known not to be at a newline, at the end, or on a space: the loop above has dealt
 // with all three, so what is here begins something.
-private scan_token(s: *Scanner, lay: *Layout, out: *Tokens[Tok], rep: *Report)
+private scan_token(s: *Scanner, lay: *Layout, out: *Tokens[Tok], rep: *Report,
+                   slx: *Buf[SlxWhere], slx_at: *Buf[Span])
+    // Inside a tag the grammar is its own: a name may hold a hyphen, whitespace separates nothing,
+    // and `>` ends the tag rather than comparing two things.
+    if slx_in_tag(slx)
+        scan_slx_tag(s, lay, out, rep, slx, slx_at)
+        return
+
+    // The `}` that ends a hole, told from the `}` of an object literal written inside one by the
+    // frame every `{` pushes.
+    if slx_top(slx) == Some(SlxWhere.Hole) && s.starts_with("}".bytes)
+        val h = s.mark()
+
+        s.bump()
+        close_blocks(lay, out, h)
+        out.push(RBrace, s.span_from(h))
+        slx_leave(slx, slx_at)
+        return
+
     val m = s.mark()
+
+    // **`<` begins an element only where an operand is expected**, which is the whole of the
+    // ambiguity: `<` is otherwise always an infix operator, so in prefix position it can begin
+    // nothing else.
+    if opens_element(s, out)
+        s.bump()
+        out.push(SlxOpen, s.span_from(m))
+        lay.open_bracket()
+        slx.push(SlxWhere.Opening)
+        slx_at.push(s.span_from(m))
+        return
 
     s.peek() match
         None -> return
@@ -156,6 +199,12 @@ private scan_token(s: *Scanner, lay: *Layout, out: *Tokens[Tok], rep: *Report)
                 scan_string(s, out, rep, m)
             else
                 scan_punct(s, lay, out, rep, m)
+
+    // A `{` written inside an element opens a frame of its own, so that the `}` closing an object
+    // literal in a hole is not mistaken for the one closing the hole.
+    if slx.len() > 0 && just_pushed(out) == LBrace
+        slx.push(SlxWhere.Hole)
+        slx_at.push(s.span_from(m))
 end scan_token
 
 // `'outer` -- the name a loop carries.
@@ -476,3 +525,236 @@ private lit_message(e: LitError) -> string
         BadCodepoint(_) -> "this escape is not a character"
         BadReal(_) -> "this is not a number that can be read"
 end lit_message
+
+// Elements in the source -- slx, after tsx.
+//
+// **The lexer needs a mode, and it needs it because children are not tokens.** `<div>hello there</div>`
+// holds two words and a space that mean one string, and the run may cross lines and hold a `//` that
+// is not a comment. Everything above this line reads a file by asking what the byte at the cursor
+// begins; between a tag's `>` and the `<` that ends it, the answer is "text, until proved otherwise".
+//
+// **What makes the mode reachable at all is that `<` in prefix position begins nothing else.** It is
+// otherwise always an infix operator, and slate has no `<T>` generics -- which is the reason
+// TypeScript had to make `.tsx` a separate parse mode from `.ts` and slate does not.
+
+// Where inside an element the cursor is standing.
+enum SlxWhere
+    // Between `<` and the `>` that ends the tag: attributes, read as tokens.
+    Opening
+
+    // A closing tag, from its `</` to its `>`. Told apart from `Opening` because the `>` that ends
+    // this one ends the ELEMENT, where an opening tag's `>` begins the children.
+    Closing
+
+    // A tag's children, where whatever is not a `<` or a `{` is text.
+    Text
+
+    // A `{ ... }`, in a tag or among children: ordinary tokens again. One is pushed for every `{`
+    // read inside an element, so that the `}` of an object literal written in a hole is not taken
+    // for the one that closes the hole.
+    Hole
+end SlxWhere
+
+// The frame the cursor is in, or nothing where the file is not inside an element.
+private slx_top(slx: *Buf[SlxWhere]) -> Option[SlxWhere]
+    if slx.len() == 0 then return None
+
+    Some(slx.at(slx.len() - 1))
+
+private slx_in_text(slx: *Buf[SlxWhere]) -> bool = slx_top(slx) == Some(SlxWhere.Text)
+
+private slx_in_tag(slx: *Buf[SlxWhere]) -> bool
+    slx_top(slx) match
+        Some(Opening) -> true
+        Some(Closing) -> true
+        _ -> false
+
+// Leave the innermost frame.
+private slx_leave(slx: *Buf[SlxWhere], slx_at: *Buf[Span])
+    slx.pop()
+    slx_at.pop()
+
+// Make the innermost frame a different one, which is what an opening tag's `>` does.
+private slx_become(slx: *Buf[SlxWhere], w: SlxWhere)
+    slx.pop()
+    slx.push(w)
+
+// Whether the cursor is on a `<` that begins an element.
+//
+// **The question is what the PREVIOUS token was**, and the answer is a closed set: a `<` after
+// something that can end an operand is a comparison, and after anything else there is no operand for
+// it to compare and it can only be a tag. A lexer walking forwards has the previous token already,
+// which is what makes this cheap enough to ask at every token.
+//
+// The byte after the `<` is checked too, so that `<<` and `<=` are never mistaken for a tag with a
+// strange name -- and so that the complaint about `< 3` written where an operand was wanted is the
+// ordinary one about an operator, rather than a sentence about elements.
+private opens_element(s: *Scanner, out: *Tokens[Tok]) -> bool
+    if !s.starts_with("<".bytes) then return false
+    if ends_an_operand(just_pushed(out)) then return false
+
+    s.peek_at(1) match
+        None -> false
+        Some(c) -> is_ident_start(c) || c == u8('>')
+end opens_element
+
+// Whether a token can be the last one of an operand.
+//
+// **A closed set, and short on purpose.** Everything else in the language is an operator, a keyword
+// or a separator, after which an operand is what must come next.
+private ends_an_operand(k: Tok) -> bool
+    k match
+        IntLit -> true
+        RealLit -> true
+        StrLit -> true
+        StrInterp -> true
+        Ident -> true
+        True -> true
+        False -> true
+        Null -> true
+        Undefined -> true
+        RParen -> true
+        RBracket -> true
+        RBrace -> true
+        PlusPlus -> true
+        MinusMinus -> true
+        SlxTagEnd -> true
+        SlxSelfEnd -> true
+        _ -> false
+end ends_an_operand
+
+// Whatever ends a run of children's text.
+private is_text_break(c: u8) -> bool = c == u8('<') || c == u8('{')
+
+// A run of children's text, and whatever ended it.
+private scan_slx_text(s: *Scanner, lay: *Layout, out: *Tokens[Tok], rep: *Report,
+                      slx: *Buf[SlxWhere], slx_at: *Buf[Span])
+    val m = s.mark()
+
+    s.accept_until(is_text_break)
+
+    // **Pushed raw, whitespace and line breaks and all.** What it comes to is the parser's, because
+    // the rule is about lines rather than bytes -- a run holding no newline is kept as written, and
+    // one that spans lines loses the indentation that only lined it up under its tag.
+    if s.offset > m then out.push(SlxText, s.span_from(m))
+
+    if s.at_end()
+        slx_unclosed(rep, slx, slx_at)
+        return
+
+    val d = s.mark()
+
+    if s.accept_seq("</".bytes)
+        out.push(SlxCloseOpen, s.span_from(d))
+        slx_become(slx, SlxWhere.Closing)
+        return
+
+    if s.accept(u8('<'))
+        out.push(SlxOpen, s.span_from(d))
+        lay.open_bracket()
+        slx.push(SlxWhere.Opening)
+        slx_at.push(s.span_from(d))
+        return
+
+    s.bump()
+    out.push(LBrace, s.span_from(d))
+    lay.open_bracket()
+    slx.push(SlxWhere.Hole)
+    slx_at.push(s.span_from(d))
+end scan_slx_text
+
+// One token from inside a tag.
+//
+// **Whitespace separates nothing here**, so it is skipped whole -- newlines included, since a tag
+// with an attribute on each of five lines is the ordinary way to write one and the layout is
+// suppressed inside the element anyway.
+private scan_slx_tag(s: *Scanner, lay: *Layout, out: *Tokens[Tok], rep: *Report,
+                     slx: *Buf[SlxWhere], slx_at: *Buf[Span])
+    s.skip_space()
+
+    if s.at_end()
+        slx_unclosed(rep, slx, slx_at)
+        return
+
+    val m = s.mark()
+
+    if s.accept_seq("/>".bytes)
+        out.push(SlxSelfEnd, s.span_from(m))
+        close_blocks(lay, out, m)
+        slx_leave(slx, slx_at)
+        return
+
+    if s.accept(u8('>'))
+        out.push(SlxTagEnd, s.span_from(m))
+
+        // An opening tag's `>` begins the children; a closing one's ends the element.
+        if slx_top(slx) == Some(SlxWhere.Closing)
+            close_blocks(lay, out, m)
+            slx_leave(slx, slx_at)
+        else
+            slx_become(slx, SlxWhere.Text)
+
+        return
+
+    if s.accept(u8('{'))
+        out.push(LBrace, s.span_from(m))
+        lay.open_bracket()
+        slx.push(SlxWhere.Hole)
+        slx_at.push(s.span_from(m))
+        return
+
+    if s.accept(u8('='))
+        out.push(Assign, s.span_from(m))
+        return
+
+    if s.accept(u8('.'))
+        out.push(Dot, s.span_from(m))
+        return
+
+    s.peek() match
+        None -> ()
+        Some(c) ->
+            if c == u8('"') then
+                scan_string(s, out, rep, m)
+            elif is_ident_start(c) then
+                scan_slx_name(s, out, rep, m)
+            else
+                rep.add(error(point(s.offset), "a tag holds a name, an attribute or a `{ ... }`, and this is none of them")
+                    .with_note("write text between the tags rather than inside one"))
+
+                s.bump()
+end scan_slx_tag
+
+// A name inside a tag, which is not quite an identifier.
+//
+// **A hyphen is part of the name here**, because `data-id`, `aria-label` and `<my-widget>` are how
+// the web spells things -- and outside a tag a hyphen is a subtraction, which is exactly why the
+// lexer has to be in a mode to read one. A dot is left a token of its own, `<Menu.Item>` being a
+// field selection read by a different route rather than a name with a dot in it.
+private scan_slx_name(s: *Scanner, out: *Tokens[Tok], rep: *Report, m: usize)
+    s.read_ident(is_ident_start, is_slx_name_cont)
+
+    // `s"..."` as an attribute's value, which is a word followed by a quote and is spotted the same
+    // way it is everywhere else.
+    if s.text_from(m) == "s".bytes && s.starts_with("\"".bytes)
+        scan_interpolated(s, out, rep, m)
+        return
+
+    out.push(Ident, s.span_from(m))
+end scan_slx_name
+
+private is_slx_name_cont(c: u8) -> bool = is_ident_cont(c) || c == u8('-')
+
+// A file that ends inside an element.
+//
+// **The complaint points at the tag that never closed, not at the end of the file**, which is where
+// the reader has to go. Everything still open is then abandoned so that the lexer walks out of the
+// mode instead of reading the end of the file forever.
+private slx_unclosed(rep: *Report, slx: *Buf[SlxWhere], slx_at: *Buf[Span])
+    if slx_at.len() > 0
+        rep.add(error(slx_at.at(0), "this element reaches the end of the file without closing")
+            .with_note("an element ends with `</name>`, or with `/>` where it has no children"))
+
+    slx.truncate(0)
+    slx_at.truncate(0)
+end slx_unclosed

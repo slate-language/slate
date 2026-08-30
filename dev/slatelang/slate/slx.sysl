@@ -1,0 +1,282 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{str_builder, from_utf8_unchecked}
+
+// Elements, as the calls they stand for.
+//
+// **An element adds NOTHING to the tree, and that is the whole design.** `<div class="x">hi</div>`
+// is read here and handed on as `createElement("div", { class: "x" }, "hi")` -- an ordinary call
+// node, built out of the ordinary object literal and string literal the language already had. So
+// `check.sysl`, `compile.sysl`, the machine and the JavaScript back end all learn nothing, and what
+// an element MEANS is a function a program can read rather than a rule inside the compiler.
+//
+// It is what JSX does, and it is what makes this affordable: the parser is the only file that knows
+// elements exist, and `lex.sysl` is the only other one that knows they have a syntax.
+//
+// **The framework supplies `createElement` and `Fragment`, and slate does not.** A file that writes
+// an element and imports neither is refused by the undefined-name check, which is the right place
+// for it -- an element is a call, and a call to something that is not there is already a thing slate
+// complains about.
+
+// What an element is desugared into. A name rather than anything built in, so that a program may see
+// what it is calling and a test may supply its own.
+const CreateElement: string = "createElement"
+
+// What `<>...</>` is an element of. React's name, kept because a reader arriving with React in mind
+// will look for it.
+const Fragment: string = "Fragment"
+
+// `<div class="x">hello {name}</div>`, from the `<` that opened it.
+//
+// **The tag's name decides where the type comes from, and the rule is React's**: a lowercase name is
+// a host element and travels as the string `"div"`, a capitalised one is an ordinary name the
+// program has in scope. It is learned behaviour that costs no syntax, which is the best kind to
+// take.
+parse_element(p: *Parser, t: Spanned[Tok]) -> Expr
+    val open = t.span
+
+    // The name as written, kept for the sentence a mismatched closing tag gets, and the expression
+    // it stands for.
+    var name = ""
+    var kind = expr(open, Name(Fragment))
+
+    if !p.at(SlxTagEnd)
+        if !p.expect(Ident, "a tag name") then return expr(open, Bad)
+
+        val first = p.just_taken()
+
+        name = p.text(first)
+        kind = tag_head(p, first, name)
+
+        // `<Menu.Item>` -- a field off a name, which is how a component that lives on another one is
+        // reached. The dot is a token only inside a tag; outside one it is a field selection, which
+        // is the same thing read by a different route.
+        loop
+            if !p.accept(Dot) then break
+            if !p.expect(Ident, "a name after the `.`") then break
+
+            val f = p.just_taken()
+
+            name = s"${name}.${p.text(f)}"
+            kind = expr(first.to(f), Field(kind, p.text(f), false))
+
+    val props = parse_attributes(p, open)
+
+    var kids: Buf[Expr] = buf()
+
+    // `<br/>` has no children and no closing tag, which is the whole of the difference.
+    if !p.accept(SlxSelfEnd)
+        p.expect(SlxTagEnd, "`>` or `/>`")
+        parse_children(p, &kids)
+        close_tag(p, open, name)
+
+    val whole = open.to(p.just_taken())
+
+    // **The children travel as ONE array rather than as trailing arguments.** React spells its own
+    // `createElement(type, props, ...children)`, and slate has no rest parameter to receive them
+    // with -- but an array is the better answer even where one exists: it is what `props.children`
+    // holds in the end, and a component that passes its children on writes them as the value they
+    // already are.
+    var args: Buf[Expr] = buf()
+
+    args.push(kind)
+    args.push(props)
+    args.push(expr(whole, ArrayLit(kids)))
+
+    expr(whole, Call(expr(open, Name(CreateElement)), args))
+end parse_element
+
+// A lowercase tag is a host element and a capitalised one is a name in scope.
+private tag_head(p: *Parser, at: Span, name: string) -> Expr
+    if name.bytes.len > 0 && is_lower(name.bytes[0])
+        expr(at, ExprKind.StrLit(name))
+    else
+        expr(at, Name(name))
+
+private is_lower(c: u8) -> bool = c >= u8('a') && c <= u8('z')
+
+// Everything between the tag's name and the `>` that ends it, as the object a component is handed.
+//
+// **`{...props}` is the spread an object literal already takes**, folded the same way and into the
+// same `with` -- so an attribute written after a spread wins over it, which is the rule a reader
+// coming from JSX expects and the rule slate's own literals already had.
+private parse_attributes(p: *Parser, open: Span) -> Expr
+    var keys: Buf[string] = buf()
+    var key_spans: Buf[Span] = buf()
+    var values: Buf[Expr] = buf()
+    var built: Option[Expr] = None
+
+    loop
+        if p.at(SlxTagEnd) || p.at(SlxSelfEnd) || p.at(Eof) then break
+
+        if p.accept(LBrace)
+            if !p.expect(Spread, "`...` and the object whose fields to spread") then break
+
+            val other = parse_expr(p)
+
+            p.expect(RBrace, "`}`")
+
+            val so_far = object_so_far(built, keys, key_spans, values, open.to(p.just_taken()))
+
+            built = Some(expr(open.to(p.just_taken()), WithAll(so_far, other, true)))
+
+            keys = buf()
+            key_spans = buf()
+            values = buf()
+        else
+            if !p.expect(Ident, "an attribute name, or `>`") then break
+
+            val at = p.just_taken()
+
+            keys.push(p.text(at))
+            key_spans.push(at)
+
+            // **A bare attribute is `true`**, which is what `<input disabled>` means everywhere it
+            // is written and saves the reader `disabled={true}`.
+            if p.accept(Assign)
+                values.push(attribute_value(p))
+            else
+                values.push(expr(at, BoolLit(true)))
+
+    object_so_far(built, keys, key_spans, values, open.to(p.just_taken()))
+end parse_attributes
+
+// `="text"` or `={ anything }`, and nothing else.
+//
+// **A bare word is refused rather than read as a name.** `class=wide` would be a variable called
+// `wide` in every other position, and a reader writing it means the string -- so the two readings
+// disagree about something silent, and the one that runs is not the one that was meant.
+private attribute_value(p: *Parser) -> Expr
+    if p.accept(LBrace)
+        val e = parse_expr(p)
+
+        p.expect(RBrace, "`}`")
+
+        return e
+
+    if p.at(StrLit) || p.at(StrInterp) then return parse_expr(p)
+
+    p.fault(p.here(), "an attribute's value is a quoted string or a `{ ... }`")
+
+    expr(p.here(), Bad)
+end attribute_value
+
+// The children, up to the `</` that ends them.
+private parse_children(p: *Parser, args: *Buf[Expr])
+    loop
+        if p.at(SlxCloseOpen) || p.at(Eof) then break
+
+        if p.at(SlxText)
+            val at = p.here()
+
+            p.bump()
+
+            // **Text that comes to nothing is not a child.** A tag written across lines is mostly
+            // indentation, and a `""` between two elements would be a child the reader never wrote.
+            val text = slx_text(p.text(at))
+
+            if text != "" then args.push(expr(at, ExprKind.StrLit(text)))
+        elif p.accept(LBrace)
+            // `{}` is how a reader writes nothing at all, and is not an error.
+            if !p.accept(RBrace)
+                args.push(parse_expr(p))
+                p.expect(RBrace, "`}`")
+        elif p.at(SlxOpen)
+            p.take() match
+                Some(inner) -> args.push(parse_element(p, inner))
+                None -> break
+        else
+            break
+end parse_children
+
+// `</div>`, checked against the tag it is supposed to be closing.
+//
+// **The complaint names both names**, because either one of them may be the mistake and the reader
+// is the only one who knows which.
+private close_tag(p: *Parser, open: Span, name: string)
+    p.expect(SlxCloseOpen, "`</` and the tag's name")
+
+    var closed = ""
+
+    if !p.at(SlxTagEnd)
+        if p.expect(Ident, "the tag's name")
+            closed = p.text(p.just_taken())
+
+            loop
+                if !p.accept(Dot) then break
+                if !p.expect(Ident, "a name after the `.`") then break
+
+                closed = s"${closed}.${p.text(p.just_taken())}"
+
+    if closed != name && closed != ""
+        p.fault(p.just_taken(), s"this closes `${closed}`, and the tag it is closing is `${name}`")
+
+    // A fragment closes with `</>`, so an empty name is not a mismatch -- but a named tag closed
+    // with a bare `</>` is, and says so.
+    if closed == "" && name != ""
+        p.fault(p.just_taken(), s"`</>` closes a fragment, and this element is `${name}`")
+
+    p.expect(SlxTagEnd, "`>`")
+end close_tag
+
+// What a run of text between tags comes to.
+//
+// **A run holding no line break is kept exactly as written**, which is the case that matters most:
+// the space in `<h1>Count: {n}</h1>` is one the reader put there and means it. A run that spans
+// lines is mostly the indentation that lined it up under its tag, so each line is trimmed, lines
+// with nothing on them are dropped, and what is left is joined with one space.
+//
+// It is JSX's rule, and it is JSX's rule because any other one makes an element that is indented read
+// differently from the same element on one line.
+slx_text(raw: string) -> string
+    val bs = raw.bytes
+
+    var lines = false
+
+    for i in 0..<bs.len
+        if bs[i] == u8('\n') then lines = true
+
+    if !lines then return raw
+
+    var out = str_builder()
+    var wrote = false
+    var i: usize = 0
+
+    loop
+        if i >= bs.len then break
+
+        var j = i
+
+        loop
+            if j >= bs.len || bs[j] == u8('\n') then break
+
+            j += 1
+
+        var a = i
+        var b = j
+
+        loop
+            if a >= b || !is_slx_blank(bs[a]) then break
+
+            a += 1
+
+        loop
+            if b <= a || !is_slx_blank(bs[b - 1]) then break
+
+            b -= 1
+
+        if b > a
+            if wrote then out.push_char(' ')
+
+            out.push(from_utf8_unchecked(bs[a..<b]))
+
+            wrote = true
+
+        i = j + 1
+
+    out.finish()
+end slx_text
+
+private is_slx_blank(c: u8) -> bool = c == u8(' ') || c == u8('\t') || c == u8('\r')
