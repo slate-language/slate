@@ -452,3 +452,216 @@ private add_maker(b: *ClassBody, at: Span, params: Buf[string], value: Expr)
     b.key_spans.push(at)
     b.values.push(value)
 end add_maker
+
+// -- data declarations ------------------------------------------------------------------------------
+
+// Whether what stands at `i` is `data Name`.
+//
+// **`data` is a SOFT word**, as `class`, `type` and `end` are: two tokens settle it, a bare name
+// followed by another bare name beginning nothing else in slate. `val data = 1` still compiles, and
+// there is a test.
+at_data_decl(p: *Parser, i: usize) -> bool
+    if p.peek_kind_at(i) != Ident then return false
+    if p.text_at(i) != "data" then return false
+
+    p.peek_kind_at(i + 1) == Ident
+end at_data_decl
+
+// The variants gathered while a data body is read.
+//
+// **The field names are NOT kept**, because a variant registers its type as it is read and nothing
+// after that asks again: `VariantPat` carries the names, and a pattern is what travels between files.
+private struct DataBody
+    names: Buf[string]
+    spans: Buf[Span]
+    made: Buf[Expr]
+end DataBody
+
+// Whether the line the cursor is on declares a variant rather than a member.
+//
+// **What tells them apart is a BODY, which is the question `at_definition_from` already asks about a
+// call.** `Circle(r)` and `area(self) = ...` are the same shape up to the `)`; a variant is that
+// shape with nothing after it -- no `=`, no indented block. A bare name alone is a variant too, and
+// is the one line a class body has no reading for at all.
+private at_variant(p: *Parser) -> bool
+    if !p.at(Ident) then return false
+
+    var i: usize = 1
+
+    if p.peek_kind_at(1) == LParen
+        var depth: usize = 0
+
+        loop
+            val k = p.peek_kind_at(i)
+
+            if k == Eof then return false
+
+            if k == LParen || k == LBracket || k == LBrace
+                depth += 1
+            elif k == RParen || k == RBracket || k == RBrace
+                depth -= 1
+
+                if depth == 0
+                    i += 1
+                    break
+            end if
+
+            i += 1
+    end if
+
+    val k = p.peek_kind_at(i)
+
+    k == Newline || k == Dedent || k == Eof
+end at_variant
+
+// `data Shape`, the variants under it, and the members they share.
+//
+// **A variant IS a class from the data type, and that is the whole implementation.** `Circle(r)`
+// declares the same `var r` a class body would and gets the same generated `new`; the data type is
+// the object every variant has as its `proto`, so a definition written under `data` is reached from
+// every one of them by the receiver rule that was already there. What `data` adds over writing that
+// out by hand is a closed list of the variants, which is what makes a `match` over one checkable.
+//
+// **Each variant registers a `VariantPat` and the type registers a `DataPat` naming them all**, so
+// `is`, an annotation, `export` and a cross-file import work with no code of their own -- `type`'s
+// machinery again, for `class`'s reason.
+//
+// **A DATA VALUE DOES NOT CHANGE.** The instance a variant's `new` answers is sealed, which is what
+// makes it safe to compare by what it holds, to use as a key in a table, and to copy with `with`
+// rather than reach into. The maker itself is not sealed: it is an ordinary object like a class.
+parse_data_decl(p: *Parser, public: bool) -> Stmt
+    val start = p.here()
+    val top = p.depth == 0
+
+    p.bump()
+
+    val name = parse_name(p, "a name for the data type")
+
+    if p.at(Ident) && p.text(p.here()) == "from"
+        p.fault(p.here(), s"a data type has no `from` -- it IS the base its variants descend from, and each of them has `${name}` as its `proto` already")
+
+    var shared = ClassBody(buf(), buf(), buf(), buf(), buf(), buf(), buf(), start, buf(), buf(), buf(), 0, false)
+    var d = DataBody(buf(), buf(), buf())
+
+    if p.at(Indent) then data_members(p, name, &shared, &d, public)
+
+    accept_end_named(p, name)
+
+    val span = start.to(p.just_taken())
+
+    if d.names.len() == 0
+        p.fault(span, s"`data ${name}` declares no variants, and a data type IS its variants -- write one under it, `Circle(r)` for one carrying fields or `Empty` for one that is a value on its own")
+
+    if !top
+        p.fault(start, "a data declaration belongs to the top level of a file -- its name is a type as well as a value, and one declared inside a block would not be there for `is` to resolve against")
+    else
+        p.type_names.push(name)
+        p.type_pats.push(pattern(span, DataPat(name, d.names)))
+        p.type_public.push(public)
+
+    // **The shared object first, because every variant names it**: a variant's `proto` is a `Name`
+    // read where the variant is bound, and the group binds in order.
+    var stmts: Buf[Stmt] = buf()
+
+    stmts.push(stmt(span, Val(name, expr(span, ObjectLit(shared.keys, shared.key_spans, shared.values)))))
+
+    for i in 0..<d.names.len()
+        stmts.push(stmt(d.spans.at(i), Val(d.names.at(i), d.made.at(i))))
+
+    stmt(span, Group(stmts))
+end parse_data_decl
+
+// The body of a data declaration: its variants, and the members every variant shares.
+private data_members(p: *Parser, data: string, b: *ClassBody, d: *DataBody, public: bool)
+    p.expect(Indent, "an indented block")
+
+    p.depth += 1
+    p.skip_newlines()
+
+    loop
+        if p.at(Eof) then break
+        if p.at(Dedent) then break
+
+        if at_variant(p) then one_variant(p, data, d, public) else one_member(p, "data", data, b, false)
+
+        if !p.end_of_statement()
+            p.fault(p.here(), "this is where the variant should have ended")
+            p.bump()
+
+        p.skip_newlines()
+    end loop
+
+    p.depth -= 1
+    p.expect(Dedent, "the end of the data declaration")
+end data_members
+
+// One variant: a name, and the fields it carries.
+private one_variant(p: *Parser, data: string, d: *DataBody, public: bool)
+    val at = p.here()
+    val vname = parse_name(p, "the name of a variant")
+    val named = at.to(p.just_taken())
+
+    for i in 0..<d.names.len()
+        if d.names.at(i) == vname
+            p.fault(named, s"`${vname}` is given twice in `data ${data}`")
+            return
+
+    if vname == data
+        p.fault(named, s"a variant may not be called `${data}` too -- that name is already the whole of the data type, and `v is ${data}` and `v is ${vname}` would be one question asked of two different things")
+        return
+    end if
+
+    var vb = ClassBody(buf(), buf(), buf(), buf(), buf(), buf(), buf(), named, buf(), buf(), buf(), 0, false)
+
+    vb.keys.push("proto")
+    vb.key_spans.push(named)
+    vb.values.push(expr(named, Name(data)))
+
+    var keys: Buf[string] = buf()
+
+    if p.accept(LParen)
+        if !p.at(RParen)
+            loop
+                val fat = p.here()
+                val fname = parse_name(p, "the name of a field")
+                val fnamed = fat.to(p.just_taken())
+                var twice = false
+
+                for i in 0..<keys.len()
+                    if keys.at(i) == fname then twice = true
+
+                if twice
+                    p.fault(fnamed, s"`${fname}` is given twice in `${vname}`")
+                else
+                    keys.push(fname)
+
+                    // A field may carry a default, which is the generated constructor's default:
+                    // the same expression, worked out at the call, for the same reason a class's
+                    // initialiser is.
+                    val init = if p.accept(Assign) then Some(parse_body(p)) else None
+
+                    declare_field(&vb, fname, fnamed, init)
+
+                if !p.accept(Comma) then break
+
+        p.expect(RParen, "a `)` after the variant's fields")
+    end if
+
+    // **A variant with no fields is the VALUE rather than a maker of them**, which is Scala's `case
+    // object` and is what lets `Empty` be written where a value is wanted and where a pattern is.
+    // `make_constructor` adds nothing to a body that declares no fields, so what is bound is the
+    // object itself -- sealed, since it is a data value like any other.
+    val single = keys.len() == 0
+
+    make_constructor(p, vname, &vb, named, true)
+
+    val made = expr(named, ObjectLit(vb.keys, vb.key_spans, vb.values))
+
+    d.names.push(vname)
+    d.spans.push(named)
+    d.made.push(if single then expr(named, DataLit(made)) else made)
+
+    p.type_names.push(vname)
+    p.type_pats.push(pattern(named, VariantPat(vname, buf(), keys, single)))
+    p.type_public.push(public)
+end one_variant
