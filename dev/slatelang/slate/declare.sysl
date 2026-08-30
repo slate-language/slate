@@ -1,0 +1,454 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// `class` and `data` -- the two declarations that make a TYPE and a VALUE under one name.
+//
+// **Split out of `define.sysl` at the seam that file's own header named**, and it is a seam rather
+// than a halving: everything below is reached from `parse.sysl` through two entry points each, and
+// crosses back into `define.sysl` for five names -- `parse_def`, `parse_name`, `accept_end_named`,
+// `param_declares` and `allow_declaring_params`. Nothing else in either file needs the other.
+//
+// **What the two declarations share is the object underneath.** A class is a `val` holding an object
+// literal; a data type is one `val` for the shared object and one more for each variant, and every
+// variant is a class from it. So `ClassBody`, `instance_of` and `make_constructor` are written once
+// and read twice, and the machine, the checker and `show_program` are handed what a program could
+// have typed itself in either case.
+
+// -- classes ---------------------------------------------------------------------------------------
+
+// Whether what stands at `i` is `class Name`.
+//
+// **`class` is a SOFT word**, as `type` and `end` are, so a program may still call a variable
+// `class`. Two tokens settle it: a bare name followed by another bare name begins nothing else in
+// slate, there being no juxtaposition anywhere in the grammar.
+at_class_decl(p: *Parser, i: usize) -> bool
+    if p.peek_kind_at(i) != Ident then return false
+    if p.text_at(i) != "class" then return false
+
+    p.peek_kind_at(i + 1) == Ident
+end at_class_decl
+
+// Everything a class body is being gathered into.
+//
+// **A struct rather than a dozen pointers**, one loop filling all of it. The two halves are the whole
+// design: `keys` is what the CLASS holds, shared by everything made from it, and `fields` is what each
+// OBJECT holds, one per object.
+private struct ClassBody
+    keys: Buf[string]
+    key_spans: Buf[Span]
+    values: Buf[Expr]
+
+    fields: Buf[string]
+    field_spans: Buf[Span]
+    inits: Buf[Expr]
+    has_init: Buf[bool]
+
+    // The `new` a program wrote, kept whole until the field list is complete -- a member may declare a
+    // field below the constructor that reads it.
+    maker_at: Span
+    maker_params: Buf[string]
+    maker_defaults: Buf[Expr]
+    maker_declares: Buf[bool]
+    maker_body: usize
+    has_maker: bool
+end ClassBody
+
+// The name a constructor holds the object under while it is being made.
+//
+// **Unspellable on purpose**, for the reason a destructured parameter's is: the names in a body are
+// the program's, and a synthetic one that could be written would shadow something a person wrote.
+private const Made: string = "(new)"
+
+// `class Square from Shape`, and the members written under it.
+//
+// **Most of it is sugar over the object a program could already write.** `class` binds a `val` to an
+// object literal, `from` is the `proto` field, and a method is a field holding a function -- so the
+// checker, the compiler, the machine and `show_program` are handed the object, and the receiver rule
+// that was already there does the dispatch.
+//
+// **What the sugar buys is a method written in slate's ordinary definition syntax.** A field's value
+// is an expression, so a method in a literal is a lambda and its body is whatever fits after `->`; a
+// definition's body may be an indented run of statements. That is the difference between a class of
+// twenty methods reading like twenty functions and reading like twenty fields.
+//
+// **The two words carry the distinction that bites.** `val` is the class's, one of it however many
+// objects there are; `var` is each object's, and its initialiser runs once per object. Reading them
+// the other way round is Python's oldest trap -- a mutable default shared by every instance -- and
+// here the words say which is which.
+//
+// **A class also gives slate its one NOMINAL identity**, which is why the name is registered as a
+// type: `p is Square` asks whether this object was made from that class, which no structural pattern
+// can ask and which `p.proto == Square` gets wrong twice over -- `==` on objects is deep, so it
+// answers true for any class holding the same fields, and it looks only one link up the chain.
+parse_class_decl(p: *Parser, public: bool) -> Stmt
+    val start = p.here()
+    val top = p.depth == 0
+
+    p.bump()
+
+    val name = parse_name(p, "a name for the class")
+
+    var b = ClassBody(buf(), buf(), buf(), buf(), buf(), buf(), buf(), start, buf(), buf(), buf(), 0, false)
+
+    // **`from` takes an EXPRESSION rather than a name**, because the field it becomes takes one: a
+    // base may arrive under an import alias, out of a module object, or be chosen at run time. The
+    // word is soft here too -- it is the same `from` an import already reads.
+    if p.at(Ident) && p.text(p.here()) == "from"
+        val at = p.here()
+
+        p.bump()
+        b.keys.push("proto")
+        b.key_spans.push(at)
+        b.values.push(parse_expr_before_is(p))
+
+    // **`is Drawable` is TypeScript\'s `implements`, and it is a promise rather than an inheritance.**
+    // `from` gives a class its behaviour; this gives it nothing at all and only checks -- so a class
+    // may promise as many types as it likes and descend from one.
+    var promised: Buf[string] = buf()
+    var promises: Buf[Pattern] = buf()
+
+    if p.accept(Is)
+        loop
+            promised.push(if p.at(Ident) then p.text(p.here()) else "")
+            promises.push(parse_pattern(p))
+
+            if !p.accept(Comma) then break
+
+    if p.at(Indent) then class_members(p, name, &b)
+
+    accept_end_named(p, name)
+
+    val span = start.to(p.just_taken())
+
+    make_constructor(p, name, &b, span, false)
+
+    if !top
+        p.fault(start, "a class belongs to the top level of a file -- its name is a type as well as a value, and one declared inside a block would not be there for `is` to resolve against")
+    else
+        p.type_names.push(name)
+        p.type_pats.push(pattern(span, ProtoPat(name)))
+        p.type_public.push(public)
+
+    val made = expr(span, ObjectLit(b.keys, b.key_spans, b.values))
+
+    if promises.len() == 0 then return stmt(span, Val(name, made))
+
+    // **The object is bound UNDER THE CLASS\'S OWN NAME inside a block, checked there, and answered.**
+    // Naming the temporary after the class is the whole trick: `CheckType` reads the name out of the
+    // scope and puts it in its complaint, so what a reader gets is *"`Square` was declared Drawable,
+    // and was given ..."* rather than a sentence about an unspellable binding. The block\'s value is
+    // the object, which the outer `val` binds where the class really lives.
+    var checked: Buf[Stmt] = buf()
+
+    checked.push(stmt(span, Val(name, made)))
+
+    for i in 0..<promises.len()
+        checked.push(stmt(promises.at(i).span, CheckType(name, promised.at(i), promises.at(i))))
+
+    checked.push(stmt(span, Eval(expr(span, Name(name)))))
+
+    stmt(span, Val(name, expr(span, Block(checked))))
+end parse_class_decl
+
+// The members under a class, which are slate's ordinary declarations.
+private class_members(p: *Parser, cls: string, b: *ClassBody)
+    p.expect(Indent, "an indented block")
+
+    p.depth += 1
+    p.skip_newlines()
+
+    loop
+        if p.at(Eof) then break
+        if p.at(Dedent) then break
+
+        one_member(p, "class", cls, b, true)
+
+        if !p.end_of_statement()
+            p.fault(p.here(), "this is where the member should have ended")
+            p.bump()
+
+        p.skip_newlines()
+    end loop
+
+    p.depth -= 1
+    p.expect(Dedent, "the end of the class")
+end class_members
+
+// Whether a class already has something under this name, on either side.
+//
+// **A member written twice is refused rather than won by the last one.** An object literal lets a
+// later key win, which is right for data assembled from parts; a class body is one declaration a
+// person sat down and wrote, and two of a name in it are a mistake nobody meant and that nothing else
+// would ever report. The two halves share one namespace because an object reaches both through the
+// same `.`, so a field and a method of one name would be one of them and silently not the other.
+private taken_name(b: *ClassBody, name: string) -> bool
+    for i in 0..<b.keys.len()
+        if b.keys.at(i) == name then return true
+
+    for i in 0..<b.fields.len()
+        if b.fields.at(i) == name then return true
+
+    false
+end taken_name
+
+// One member: a `var` field, a `val` the class holds, or a definition.
+// **`what` is the word the reader wrote and `fields_ok` is whether a `var` means anything here**,
+// which is the whole of the difference between a class body and a data type's. A class's `var`
+// declares a field on every object it makes; a data type makes no objects itself -- its variants do
+// -- so a `var` under `data` is refused with the line that would have worked.
+private one_member(p: *Parser, what: string, cls: string, b: *ClassBody, fields_ok: bool)
+    val at = p.here()
+
+    if p.at(Var)
+        if !fields_ok
+            p.fault(at, s"a field belongs to a VARIANT rather than to `data ${cls}` itself, because it is a variant that makes an object -- write it in the variant's own brackets, `Circle(r)`. A `val` here is one value the whole of `${cls}` shares")
+            parse_expr_stmt(p)
+            return
+        end if
+
+        p.bump()
+
+        val name_at = p.here()
+        val fname = parse_name(p, "a name for the field")
+        val named = name_at.to(p.just_taken())
+        val init = if p.accept(Assign) then Some(parse_body(p)) else None
+
+        if taken_name(b, fname)
+            p.fault(named, s"`${fname}` is given twice in ${what} `${cls}`")
+            return
+        end if
+
+        declare_field(b, fname, named, init)
+        return
+    end if
+
+    if p.at(Val)
+        p.bump()
+
+        val name_at = p.here()
+        val vname = parse_name(p, "a name for the member")
+        val named = name_at.to(p.just_taken())
+
+        p.expect(Assign, "`=` and a value")
+
+        val value = parse_body(p)
+
+        // **A mutable literal here is refused, and the message names the fix.** One `val` serves every
+        // object the class makes, so an array or an object written under it is pushed to and written
+        // into by all of them at once -- which is what a reader coming from TypeScript, where `items =
+        // []` is per-instance, will least expect. Refusing only a LITERAL is deliberate: a shared
+        // object bound outside the class and named here is sharing somebody asked for.
+        *value.kind match
+            ArrayLit(_) -> shared_mutable(p, cls, vname, named)
+            ArrayRepeat(_, _) -> shared_mutable(p, cls, vname, named)
+            ObjectLit(_, _, _) -> shared_mutable(p, cls, vname, named)
+            _ -> ()
+
+        if taken_name(b, vname)
+            p.fault(named, if vname == "proto" then s"${what} `${cls}` says `from` and also gives a `proto`, and those are the same field -- keep whichever says it better" else s"`${vname}` is given twice in ${what} `${cls}`")
+            return
+        end if
+
+        b.keys.push(vname)
+        b.key_spans.push(named)
+        b.values.push(value)
+        return
+    end if
+
+    if !(p.at(Async) && at_definition_from(p, 1) || at_definition_from(p, 0))
+        p.fault(at, "a class body holds definitions, `val`s and `var`s -- a method is written `area(self) = self.side * self.side`, a field each object gets `var side`, and a value the class itself carries `val kind = \"square\"`")
+        parse_expr_stmt(p)
+        return
+    end if
+
+    // **`var` in a parameter list is legal here and nowhere else**, so the gate is opened around the
+    // constructor and shut again whatever the read turns up.
+    val naming = if p.at(Async) then p.text_at(1) else p.text_at(0)
+    val outer = allow_declaring_params
+
+    allow_declaring_params = naming == "new"
+
+    val s = parse_def(p)
+    val declares = param_declares
+
+    allow_declaring_params = outer
+
+    *s.kind match
+        Def(name, params, defaults, body, is_async) ->
+            if taken_name(b, name)
+                p.fault(s.span, s"`${name}` is given twice in ${what} `${cls}`")
+                return
+            end if
+
+            if name != "new"
+                b.keys.push(name)
+                b.key_spans.push(s.span)
+                b.values.push(expr(s.span, Lambda(params, defaults, body, is_async)))
+                return
+            end if
+
+            if is_async
+                p.fault(s.span, s"a constructor cannot be `async` -- `new` answers the object, and an `async` one would answer a promise with the object still to come. Give class `${cls}` an ordinary `new` and let a caller await whatever it needs")
+
+            b.maker_at = s.span
+            b.maker_params = params
+            b.maker_defaults = defaults
+            b.maker_declares = declares
+            b.maker_body = body
+            b.has_maker = true
+
+            for i in 0..<params.len()
+                if declares.at(i)
+                    if taken_name(b, params.at(i))
+                        p.fault(s.span, s"`${params.at(i)}` is given twice in ${what} `${cls}`")
+                    else
+                        declare_field(b, params.at(i), s.span, None)
+        _ -> ()
+end one_member
+
+private declare_field(b: *ClassBody, name: string, at: Span, init: Option[Expr])
+    b.fields.push(name)
+    b.field_spans.push(at)
+
+    init match
+        Some(e) ->
+            b.inits.push(e)
+            b.has_init.push(true)
+        None ->
+            b.inits.push(expr(at, NullLit))
+            b.has_init.push(false)
+end declare_field
+
+private shared_mutable(p: *Parser, cls: string, name: string, at: Span)
+    p.fault(at, s"`${name}` is a `val`, so class `${cls}` holds one of it and every object made from the class shares that one -- an array or an object written here is pushed to and written into by all of them at once. Write `var ${name} = ...` for one per object, or bind it outside the class where the sharing is what was meant")
+
+// The object a constructor answers: every declared field it can fill, and the class as its proto.
+//
+// **The initialiser is the EXPRESSION, put here rather than evaluated once**, which is the whole of
+// what `var` buys over `val`: `var tags = []` gives every object its own array, and the same words
+// under `val` would have given them all one.
+//
+// `assigned` names the fields a parameter supplies. Anything else with an initialiser takes it, and a
+// field with neither is simply absent -- which is what a dynamically typed language has instead of
+// TypeScript's definite-assignment check, and it faults at the first read rather than at the make.
+//
+// **A generated constructor names every field, so that middle case is a written `new(var w, var h)`
+// and nothing else**: there, the fields the parameter list did not name are filled from their own
+// declarations. A generated one carries each initialiser as that parameter's default instead, which
+// runs in the head of the chunk and is the same expression evaluated the same number of times.
+// **`seal` makes the object a DATA VALUE**, which is a variant's instance and nothing else. It is a
+// parameter rather than two functions because everything else about building one is the same: the
+// fields a parameter supplies, the initialisers, and the class as the proto.
+private instance_of(cls: string, b: *ClassBody, assigned: Buf[string], at: Span, seal: bool) -> Expr
+    var keys: Buf[string] = buf()
+    var key_spans: Buf[Span] = buf()
+    var values: Buf[Expr] = buf()
+
+    for i in 0..<b.fields.len()
+        val f = b.fields.at(i)
+        var taken = false
+
+        for j in 0..<assigned.len()
+            if assigned.at(j) == f then taken = true
+
+        if taken
+            keys.push(f)
+            key_spans.push(b.field_spans.at(i))
+            values.push(expr(b.field_spans.at(i), Name(f)))
+        elif b.has_init.at(i)
+            keys.push(f)
+            key_spans.push(b.field_spans.at(i))
+            values.push(b.inits.at(i))
+
+    keys.push("proto")
+    key_spans.push(at)
+    values.push(expr(at, Name(cls)))
+
+    val made = expr(at, ObjectLit(keys, key_spans, values))
+
+    if seal then expr(at, DataLit(made)) else made
+end instance_of
+
+// The `new` a class ends up with: the one it wrote, or the one its field declarations imply.
+private make_constructor(p: *Parser, cls: string, b: *ClassBody, at: Span, seal: bool)
+    if !b.has_maker
+        // **A class that declares nothing gets no constructor**, rather than one answering an object
+        // with nothing in it. `{ proto: Square }` compiles, runs, and faults later at the first field
+        // nobody set, which moves the complaint away from the mistake -- and `{ side: 4, proto: Square }`
+        // is still how such a class is instantiated, exactly as it was before classes existed.
+        if b.fields.len() == 0 then return
+
+        // **Every declared field is a parameter: the ones with no initialiser first, then the ones
+        // with, each carrying its initialiser as its default.** A field the class gives a value may
+        // therefore be given another one at the call, which is what `Box.new(7, ["a"])` reads as in
+        // every language that has this; and leaving it out means exactly what it meant before, since
+        // a default is worked out at the call and so runs once per object.
+        //
+        // **Where an initialised field was declared first, the parameter order is NOT the declaration
+        // order**, a default having to be trailing: `var kind = "plain"` above `var side` gives
+        // `new(side, kind = "plain")`. The alternative was to refuse that class the way Python
+        // refuses the same shape in a dataclass, which would break classes that compile today to buy
+        // a rule nobody asked for.
+        //
+        // **An initialiser may read a field to its left in that order**, because the defaults are
+        // bound in order like any others -- so `var w` then `var area = w * w` works, and did not
+        // before.
+        var params: Buf[string] = buf()
+        var defaults: Buf[Expr] = buf()
+
+        for i in 0..<b.fields.len()
+            if !b.has_init.at(i) then params.push(b.fields.at(i))
+
+        for i in 0..<b.fields.len()
+            if b.has_init.at(i)
+                params.push(b.fields.at(i))
+                defaults.push(b.inits.at(i))
+
+        add_maker(b, at, params, expr(at, Lambda(params, defaults, intern_body(instance_of(cls, b, params, at, seal), false), false)))
+        return
+    end if
+
+    var assigned: Buf[string] = buf()
+
+    for i in 0..<b.maker_declares.len()
+        if b.maker_declares.at(i) then assigned.push(b.maker_params.at(i))
+
+    if assigned.len() != 0
+        // `new(var side)`: the object is made from the declarations, and the body runs for its effect
+        // with `self` bound to what is being made. That is TypeScript's constructor, and it is the
+        // one shape where a body has an object to talk about -- an ordinary `new` is called before
+        // there is one, which is why it is handed no receiver.
+        var stmts: Buf[Stmt] = buf()
+
+        stmts.push(stmt(b.maker_at, Val(Made, instance_of(cls, b, assigned, b.maker_at, seal))))
+        stmts.push(stmt(b.maker_at, Val("self", expr(b.maker_at, Name(Made)))))
+        stmts.push(stmt(b.maker_at, Eval(body_at(b.maker_body))))
+        stmts.push(stmt(b.maker_at, Eval(expr(b.maker_at, Name(Made)))))
+
+        add_maker(b, b.maker_at, b.maker_params, expr(b.maker_at, Lambda(b.maker_params, b.maker_defaults, intern_body(expr(b.maker_at, Block(stmts)), false), false)))
+        return
+    end if
+
+    if b.fields.len() != 0
+        p.fault(b.maker_at, s"class `${cls}` declares fields with `var`, so its `new` has to name the ones it takes -- `new(var ${b.fields.at(0)})` declares and assigns in one place, and the rest are filled from their own declarations. A `new` that builds the object itself leaves nothing to fill them")
+
+    // The plain form, which is what a class with no declared fields has: the body's value is the
+    // object, and it is given the class as its proto on the way out. **It is written to rather than
+    // copied** -- `with` would have said the same thing in one node and allocated a second object for
+    // every instance, on the one path where allocation is measured.
+    var stmts: Buf[Stmt] = buf()
+
+    stmts.push(stmt(b.maker_at, Val(Made, body_at(b.maker_body))))
+    stmts.push(stmt(b.maker_at, Assign(Tok.Assign, expr(b.maker_at, Field(expr(b.maker_at, Name(Made)), "proto", false)), expr(b.maker_at, Name(cls)))))
+    stmts.push(stmt(b.maker_at, Eval(expr(b.maker_at, Name(Made)))))
+
+    add_maker(b, b.maker_at, b.maker_params, expr(b.maker_at, Lambda(b.maker_params, b.maker_defaults, intern_body(expr(b.maker_at, Block(stmts)), false), false)))
+end make_constructor
+
+private add_maker(b: *ClassBody, at: Span, params: Buf[string], value: Expr)
+    b.keys.push("new")
+    b.key_spans.push(at)
+    b.values.push(value)
+end add_maker
