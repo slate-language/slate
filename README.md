@@ -1025,4 +1025,4 @@ of them saying something that no longer compiles.
 
 ## Licence
 
-ISC.
+ISC. See [LICENSE](LICENSE).
