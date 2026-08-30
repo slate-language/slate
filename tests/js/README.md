@@ -26,13 +26,26 @@ Until then they are run by hand, and every one of them was: `wide.sl` is the fix
 test and the six numbered ones cover, in order, arithmetic and printing; patterns, `match`,
 labelled loops, closures and `try`/`catch`; classes, generators, `with`, defaults and spread
 arguments; the `...` literals; the annotations, which are checked while a program runs; defaults
-inside a pattern; the event loop; and the file system and the environment.
+inside a pattern; the event loop; the file system and the environment; and a script's own arguments
+and exit status.
 
 **`p8.sl` writes into `tests/js/scratch/` and takes it away again**, so that running it twice says
 the same thing and running it leaves nothing behind — the directory is git-ignored for the run that
 does not reach the end. It needs node: a file system is the one thing quickjs has none of that node
 brings, and under `qjs` every call in it answers *"`existsSync` needs a file system, and this
 JavaScript host has none"*.
+
+**`p9.sl` is the one whose EXIT STATUS is part of the comparison, and it is the only one.** It is
+slate as a scripting language — a `#!` line the lexer skips, `args`, and `exit(3)` — so a diff of the
+output alone would miss half of what it is about:
+
+    slate p9.sl one two three                    > want.txt ; echo $?
+    slate js p9.sl -o p9.js && node p9.js one two three > got.txt ; echo $?
+
+Both print eight identical lines and both leave with **3**; `qjs --std p9.js one two three` agrees
+with them, taking its arguments off `scriptArgs` rather than off `process.argv`. It is also the one
+program here that begins with a shebang, which is the point: the same bytes are a file the kernel can
+start and a file both back ends read.
 
 **`p7.sl` runs its phases one after another, and that is the test's own correctness rather than
 slate's.** Two timers due at the same instant fire in an order neither loop promises, and a repeating

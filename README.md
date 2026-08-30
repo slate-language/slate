@@ -37,6 +37,7 @@ dev/slatelang/slate/
     main.sysl       the driver: a path in, a report out
 examples/tour.sl    the language in one file
 examples/match.sl   the patterns, in another
+examples/script.sl  a `#!` script: its arguments and its exit status
 ```
 
 The module is **`dev.slatelang.slate`**, reversed from the domain the way `sh.sysl.*` is reversed
@@ -51,12 +52,74 @@ prefix: the executable is named for the package, so while the sources lived in a
 A slate program is a **`.sl`** file. A literate one — prose with the program in it, as sysl has for
 `.lsysl` — will be **`.lsl`**, and is not built yet.
 
+## Installing
+
+```
+brew tap slate-language/tap
+brew install slate
+```
+
+macOS on Apple silicon is the only build there is so far: sysl does not cross-compile, so a Linux
+binary has to be built on Linux and nothing does that yet. Everywhere else, build it from source —
+which is a clone and one command, given [sysl](https://sysl.sh) installed.
+
 ## Running it
+
+```
+slate hello.sl                  run a program
+slate hello.sl one two three    ... and give it arguments
+slate test .                    run every `@test` in a file or a directory
+slate js hello.sl -o hello.js   the same program, as JavaScript
+```
+
+From a clone, with no `slate` on the path yet:
 
 ```
 sysl test .
 sysl run . -- examples/tour.sl
 ```
+
+## Writing a script
+
+A `.sl` file with a `#!` line is a command. slate skips that line — it belongs to the kernel, not to
+the language — and everything after the program's name on the command line belongs to the program.
+
+```
+#!/usr/bin/env slate
+
+import { args, exit } from slate:process
+
+if args.len() == 0
+    print("usage: greet <name>...")
+    exit(2)
+
+for name in args
+    print("Hello, " + name + "!")
+```
+
+```
+$ chmod +x greet.sl
+$ ./greet.sl world slate
+Hello, world!
+Hello, slate!
+```
+
+- **`args` is a value, not a call**, and it holds only what came after the program's name — so
+  `args[0]` is the first thing a person typed and `args.len()` is how many they typed. That is where
+  slate parts from C, node and Python, all three of which hand a program its whole command line and
+  begin by skipping past themselves.
+- **`exit(status)` stops the program and tells the shell what it came to.** Everything printed before
+  it is still printed, a `try` between it and the top cannot swallow it, and a status outside 0–255 is
+  refused rather than truncated — a shell keeps the low eight bits, so an unexamined `exit(256)` is a
+  program that says it failed and is recorded as having succeeded.
+- **slate reads no argument of its own after the program's name**, so a script's own options are safe
+  to invent: there is no flag slate could add later that would take one away.
+- Without an `exit`, a program that ran answers 0 and one that faulted answers 1. `slate` itself
+  answers 2 when it could not work out what it was being asked to do, which a shell script can tell
+  from your program failing.
+
+`#!` is read at the very first byte of the file and nowhere else. `#` is not a comment in slate — a
+comment is `//` — and this did not make it one.
 
 ## The language
 
