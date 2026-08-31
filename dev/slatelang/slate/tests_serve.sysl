@@ -1,8 +1,9 @@
 module dev.slatelang.slate
 @tests
 
+import sh.sysl.libuv
 import sh.sysl.parsing.*
-import sysl.text.Search
+import sysl.text.{replace_all, Search}
 
 // What `slate:http` gives a program writing an API server, beyond the protocol `tests_lang.sysl`
 // covers: a handler that answers bytes rather than text.
@@ -106,7 +107,7 @@ AN_ARRAY_OF_DATA_IS_STILL_ANSWERED_WITH_toJSON()
 // Everything the API surface exports. **One import line rather than one per test**, since what each
 // of these is about is the behaviour and not which names it needed.
 private val ApiImport: string =
-    "import { serve, close, router, parseQuery, parseForm, parseCookies, setCookie, encodeComponent } from slate:http\n"
+    "import { serve, close, router, files, parseQuery, parseForm, parseCookies, setCookie, encodeComponent } from slate:http\n"
 
 // A program that needs no socket -- the parsers and the encoder are ordinary functions.
 private api_out(text: string) -> string = out(ApiImport + text)
@@ -326,3 +327,191 @@ A_ROUTE_GIVEN_SOMETHING_THAT_IS_NOT_A_FUNCTION_SAYS_SO_WHERE_IT_WAS_WRITTEN()
 
     assert(api_out("val app = router()\ntry\n    app.get(\"/a\", 4)\ncatch e\n    print(e.message)")
         .contains("a route needs a function to call"))
+
+// -- serving files ----------------------------------------------------------------------------
+
+// A program with the server, a socket, and the disk, run against a scratch directory `<dir>` names.
+//
+// **`in_scratch`'s arrangement with a wider import**: a file server is the one thing here that needs
+// all three modules, and the directory has to be a real one because what is being tested is what the
+// file system answers.
+private in_files(text: string) -> string
+    val dir = libuv.mkdtemp_sync("/tmp/slate-serve-XXXXXX").unwrap()
+    val said = out(ApiImport + WireImport + FsImport + watched(replace_all(text, "<dir>", dir)))
+
+    scrub(dir)
+    said
+
+// A directory holding one file, a server over it, and one request written on the wire.
+private file_probe(name: string, content: string, request: string) -> string =
+    "writeFileSync(\"<dir>/" + name + "\", " + content + ")\n" +
+    "val app = router()\n" +
+    "app.get(\"/*rest\", files(\"<dir>\"))\n" +
+    "val server = serve(0, app)\n" +
+    "async main()\n" +
+    "    val c = (await connect(\"127.0.0.1\", localPort(server))).value\n" +
+    "    var got = \"\"\n" +
+    "    heard(chunk)\n" +
+    "        if chunk == null\n" +
+    "            print(join(split(got, \"\\r\\n\"), \"|\"))\n" +
+    "            shutSocket(c)\n" +
+    "            close(server)\n" +
+    "            done()\n" +
+    "        else\n" +
+    "            got = got + chunk\n" +
+    "    onData(c, heard)\n" +
+    "    await send(c, " + request + ")\n" +
+    "main()\n"
+
+@test
+A_FILE_UNDER_THE_ROOT_IS_SERVED_WITH_ITS_TYPE_AND_ITS_LENGTH()
+    val said = in_files(file_probe("hello.txt", "\"hi there\"", get_of("/hello.txt", "")))
+
+    assert(said.contains("HTTP/1.1 200 OK"))
+    assert(said.contains("Content-Type: text/plain; charset=utf-8"))
+    assert(said.contains("Content-Length: 8"))
+    assert(said.contains("hi there"))
+
+@test
+THE_TYPE_COMES_OFF_THE_EXTENSION()
+    // **The handful where guessing wrongly breaks the page**, rather than a thousand-line table that
+    // goes out of date.
+
+    assert(in_files(file_probe("page.html", "\"<p>hi</p>\"", get_of("/page.html", "")))
+        .contains("Content-Type: text/html; charset=utf-8"))
+    assert(in_files(file_probe("a.css", "\"p{}\"", get_of("/a.css", "")))
+        .contains("Content-Type: text/css; charset=utf-8"))
+    assert(in_files(file_probe("a.wasm", "\"x\"", get_of("/a.wasm", "")))
+        .contains("Content-Type: application/wasm"))
+    assert(in_files(file_probe("a.unheardof", "\"x\"", get_of("/a.unheardof", "")))
+        .contains("Content-Type: application/octet-stream"))
+
+@test
+A_PATH_THAT_CLIMBS_OUT_OF_THE_ROOT_IS_REFUSED_RATHER_THAN_RESOLVED()
+    // **`tar.sysl`'s rule for the same attack**, which is the oldest bug in every program that ever
+    // took a path from outside: such a request is not a request with a mistake in it, and quietly
+    // rewriting the name would hide what was attempted.
+
+    val said = in_files(file_probe("ok.txt", "\"fine\"", get_of("/../../etc/passwd", "")))
+
+    assert(said.contains("403 Forbidden"))
+    assert(!said.contains("root:"))
+
+@test
+A_FILE_THAT_IS_NOT_THERE_IS_404_AND_SO_IS_A_DIRECTORY_WITH_NO_INDEX()
+    // **The same 404 for both, on purpose**: telling a client which is which maps out a server's
+    // disk for it.
+
+    assert(in_files(file_probe("ok.txt", "\"fine\"", get_of("/nope.txt", ""))).contains("404 Not Found"))
+
+    assert(in_files("mkdirSync(\"<dir>/sub\")\n" + file_probe("ok.txt", "\"fine\"", get_of("/sub", "")))
+        .contains("404 Not Found"))
+
+@test
+A_DIRECTORY_IS_ITS_INDEX_FILE()
+    val said = in_files(
+        "mkdirSync(\"<dir>/sub\")\n" +
+        "writeFileSync(\"<dir>/sub/index.html\", \"<h1>in here</h1>\")\n" +
+        file_probe("ok.txt", "\"fine\"", get_of("/sub", "")))
+
+    assert(said.contains("200 OK"))
+    assert(said.contains("<h1>in here</h1>"))
+    assert(said.contains("Content-Type: text/html; charset=utf-8"))
+
+@test
+AN_ETag_COMES_BACK_AND_SENDING_IT_AGAIN_IS_ANSWERED_304()
+    // **The size and the modification time, not a hash of the contents.** Hashing a file on every
+    // request is what a static server exists not to do.
+    //
+    // The tag is read out of the first answer and sent back on the second, so the test asserts the
+    // round trip rather than a number it could only have got by computing it the same way.
+
+    val said = in_files(
+        "writeFileSync(\"<dir>/a.txt\", \"cached\")\n" +
+        "val app = router()\n" +
+        "app.get(\"/*rest\", files(\"<dir>\"))\n" +
+        "val server = serve(0, app)\n" +
+        "async once(extra)\n" +
+        "    val c = (await connect(\"127.0.0.1\", localPort(server))).value\n" +
+        "    var got = \"\"\n" +
+        "    heard(chunk)\n" +
+        "        if chunk != null then got = got + chunk\n" +
+        "    onData(c, heard)\n" +
+        "    await send(c, \"GET /a.txt HTTP/1.1\\r\\nHost: h\\r\\n\" + extra + \"Connection: close\\r\\n\\r\\n\")\n" +
+        "    await sleep(60)\n" +
+        "    shutSocket(c)\n" +
+        "    got\n" +
+        "async main()\n" +
+        "    val first = await once(\"\")\n" +
+        "    val at = indexOf(first, \"ETag: \")\n" +
+        "    val tag = first[(at + 6)..<indexOf(first[at..<len(first)], \"\\r\\n\") + at]\n" +
+        "    print(join(split(first, \"\\r\\n\"), \"|\"))\n" +
+        "    print(join(split(await once(\"If-None-Match: \" + tag + \"\\r\\n\"), \"\\r\\n\"), \"|\"))\n" +
+        "    close(server)\n" +
+        "    done()\n" +
+        "main()\n")
+
+    assert(said.contains("200 OK"))
+    assert(said.contains("cached"))
+    assert(said.contains("304 Not Modified"))
+
+@test
+files_IS_A_HANDLER_SO_IT_SERVES_A_WHOLE_SERVER_TOO()
+    // It reads `req.params.rest` where a route bound one and `req.path` otherwise, so the root is
+    // said once whether or not a router is in use.
+
+    val said = in_files(
+        "writeFileSync(\"<dir>/plain.txt\", \"no router\")\n" +
+        "val server = serve(0, files(\"<dir>\"))\n" +
+        "async main()\n" +
+        "    val c = (await connect(\"127.0.0.1\", localPort(server))).value\n" +
+        "    var got = \"\"\n" +
+        "    heard(chunk)\n" +
+        "        if chunk == null\n" +
+        "            print(join(split(got, \"\\r\\n\"), \"|\"))\n" +
+        "            shutSocket(c)\n" +
+        "            close(server)\n" +
+        "            done()\n" +
+        "        else\n" +
+        "            got = got + chunk\n" +
+        "    onData(c, heard)\n" +
+        "    await send(c, " + get_of("/plain.txt", "") + ")\n" +
+        "main()\n")
+
+    assert(said.contains("200 OK"))
+    assert(said.contains("no router"))
+
+@test
+A_CACHE_CONTROL_IS_WRITTEN_WHERE_ONE_WAS_ASKED_FOR()
+    val said = in_files(
+        "writeFileSync(\"<dir>/a.txt\", \"x\")\n" +
+        "val app = router()\n" +
+        "app.get(\"/*rest\", files(\"<dir>\", { cacheControl: \"max-age=300\" }))\n" +
+        "val server = serve(0, app)\n" +
+        "async main()\n" +
+        "    val c = (await connect(\"127.0.0.1\", localPort(server))).value\n" +
+        "    var got = \"\"\n" +
+        "    heard(chunk)\n" +
+        "        if chunk == null\n" +
+        "            print(join(split(got, \"\\r\\n\"), \"|\"))\n" +
+        "            shutSocket(c)\n" +
+        "            close(server)\n" +
+        "            done()\n" +
+        "        else\n" +
+        "            got = got + chunk\n" +
+        "    onData(c, heard)\n" +
+        "    await send(c, " + get_of("/a.txt", "") + ")\n" +
+        "main()\n")
+
+    assert(said.contains("Cache-Control: max-age=300"))
+
+@test
+A_STAT_ANSWERS_WHEN_A_FILE_WAS_MODIFIED()
+    // **A stat without a modification time is not a stat**, and slate's had none: it is what every
+    // cache validator is made of, and the file server could not have been written without it. An
+    // INSTANT and not a number, because that is the type slate has for a point on the timeline.
+
+    assert_eq(in_scratch(
+        "writeFileSync(\"<dir>/a.txt\", \"x\")\n" +
+        "val s = statSync(\"<dir>/a.txt\").value\n" +
+        "print(s.modified is instant, s.modified.epochMillis() > 1700000000000)"), "true true")

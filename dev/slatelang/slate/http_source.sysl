@@ -104,6 +104,7 @@ http_source() -> string = raw"""
     // server otherwise: the same keep-alive rule, the same order, the same clock.
     //
     import { listen, onBytes, send, close as shutSocket } from slate:net
+    import { stat, readBytes } from slate:fs
 
     // `close(server)` -- and with it the program's last reason to stay alive.
     //
@@ -618,6 +619,7 @@ http_source() -> string = raw"""
         var bytes = null
         var extra = ""
         var encoded = false
+        var said = ""
 
         if v is string
             body = v
@@ -637,6 +639,7 @@ http_source() -> string = raw"""
             if has(v, "headers")
                 for [k, hv] in entries(v.headers)
                     if lower(k) == "content-encoding" then encoded = true
+                    if lower(k) == "content-type" then said = string(hv)
 
                     // **AN ARRAY VALUE IS THE HEADER WRITTEN ONCE PER ELEMENT**, which is the only
                     // way to say `Set-Cookie` twice: an object has one value per name and HTTP does
@@ -655,7 +658,10 @@ http_source() -> string = raw"""
         // megabyte of them would otherwise be converted twice over for nothing.
         val raw = bytes ?? toBytes(body)
 
-        if encoded || len(raw) < CompressBytes || !wantsBrotli(req)
+        // **A body whose type says it is already compressed is not compressed again.** The check
+        // below would catch it -- a PNG comes back larger and is sent as it was -- but a static
+        // server would then run brotli over every image on every request and throw the answer away.
+        if encoded || alreadyPacked(said) || len(raw) < CompressBytes || !wantsBrotli(req)
             return sendBody(conn, status, extra, body, bytes, keep)
 
         // **`Vary` goes on whether or not this one was compressed**, because what a cache must not do is
@@ -1028,4 +1034,143 @@ http_source() -> string = raw"""
             i = i + 1
 
         if len(want) != len(parts) then null else out
+
+    // -- serving files ---------------------------------------------------------------------------------
+
+    // `files(root)` -- a handler that answers what is under `root`, and nothing above it.
+    //
+    //     app.get("/assets/*rest", files("./public"))
+    //     app.get("/*rest", files("./public", { index: "index.html", cacheControl: "max-age=300" }))
+    //
+    // **It answers a HANDLER rather than being one**, so the root is said once and the router decides
+    // which paths reach it. A `*rest` parameter is what it reads where there is one, and `req.path`
+    // otherwise -- so it also works as a whole server: `serve(3000, files("./public"))`.
+    export files(root, options = {}) =
+        val index = if has(options, "index") then options.index else "index.html"
+        val cache = if has(options, "cacheControl") then options.cacheControl else null
+
+        async answerOne(req)
+            val asked = if has(req.params, "rest") then req.params.rest else req.path
+            val rel = safePath(asked)
+
+            // **A path that climbs out is REFUSED and not sanitised**, which is `tar.sysl`'s rule for the
+            // same attack: such a request is not a request with a mistake in it, and quietly rewriting
+            // the name would hide what was attempted.
+            if rel == null then return { status: 403, body: "Forbidden" }
+
+            var path = joinPath(root, rel)
+            var info = await stat(path)
+
+            // A directory is its index file, where it has one and the caller wanted it.
+            if info.ok && info.value.isDir && index != ""
+                path = joinPath(path, index)
+                info = await stat(path)
+
+            // **A file that is not there and a path that is a directory answer the same 404**, on
+            // purpose: telling a client which is which maps out a server's disk for it.
+            if !info.ok || !info.value.isFile then return { status: 404, body: "Not Found" }
+
+            val tag = etagOf(info.value)
+
+            // **`ETag` and `If-None-Match`, and deliberately not `Last-Modified`.** A validator a client
+            // never received is one it can never send, so the two are not both needed -- and the older
+            // pair costs an HTTP date, which is a rendering in English of a moment in one zone. One
+            // validator that is exact beats two where one is approximate to the second.
+            if has(req.headers, "if-none-match") && req.headers["if-none-match"] == tag
+                return { status: 304, headers: withCache({ ETag: tag }, cache), body: "" }
+
+            val read = await readBytes(path)
+
+            if !read.ok then return { status: 500, body: "Not Read" }
+
+            var headers = withCache({ ETag: tag, "Content-Type": contentTypeOf(path) }, cache)
+
+            { status: 200, headers: headers, body: read.value }
+
+        answerOne
+
+    // The size and the modification time, which change together and cheaply.
+    //
+    // **Not a hash of the contents.** Hashing a file on every request is what a static server exists not
+    // to do, and size-and-time is what every server in the world uses for the same reason.
+    etagOf(info) = "\"" + string(info.size) + "-" + string(info.modified.epochMillis()) + "\""
+
+    withCache(headers, cache) =
+        if cache == null then headers else headers with { "Cache-Control": cache }
+
+    // The path under the root, or `null` where it does not stay under it.
+    //
+    // **`..` is refused rather than resolved**, and an empty or `.` part is dropped -- so `//a`, `/./a`
+    // and `a` are one path and `../etc/passwd` is not a path at all.
+    safePath(p) =
+        var out = []
+
+        for part in split(p, "/")
+            if part == ".." then return null
+
+            if part != "" && part != "." then push(out, percentDecode(part, false))
+
+        join(out, "/")
+
+    joinPath(a, b) =
+        if b == "" then a
+        elif endsWith(a, "/") then a + b
+        else a + "/" + b
+
+    // What is after the last `.` of the last segment, lowercased. Empty where there is none.
+    extensionOf(path) =
+        var name = path
+        var cut = lastIndexOf(name, "/")
+
+        if cut != null then name = name[(cut + 1)..<len(name)]
+
+        val dot = lastIndexOf(name, ".")
+
+        if dot == null || dot == 0 then "" else lower(name[(dot + 1)..<len(name)])
+
+    // **The types a program actually serves, and `application/octet-stream` for everything else.** A
+    // complete table is a thousand lines that go out of date; what a browser needs to be told is the
+    // handful where guessing wrongly breaks the page.
+    contentTypeOf(path) =
+        val ext = extensionOf(path)
+
+        if ext == "html" || ext == "htm" then "text/html; charset=utf-8"
+        elif ext == "css" then "text/css; charset=utf-8"
+        elif ext == "js" || ext == "mjs" then "text/javascript; charset=utf-8"
+        elif ext == "json" then "application/json"
+        elif ext == "map" then "application/json"
+        elif ext == "txt" || ext == "md" then "text/plain; charset=utf-8"
+        elif ext == "xml" then "application/xml"
+        elif ext == "csv" then "text/csv; charset=utf-8"
+        elif ext == "svg" then "image/svg+xml"
+        elif ext == "png" then "image/png"
+        elif ext == "jpg" || ext == "jpeg" then "image/jpeg"
+        elif ext == "gif" then "image/gif"
+        elif ext == "webp" then "image/webp"
+        elif ext == "avif" then "image/avif"
+        elif ext == "ico" then "image/x-icon"
+        elif ext == "woff2" then "font/woff2"
+        elif ext == "woff" then "font/woff"
+        elif ext == "ttf" then "font/ttf"
+        elif ext == "otf" then "font/otf"
+        elif ext == "pdf" then "application/pdf"
+        elif ext == "wasm" then "application/wasm"
+        elif ext == "zip" then "application/zip"
+        elif ext == "gz" then "application/gzip"
+        elif ext == "mp4" then "video/mp4"
+        elif ext == "webm" then "video/webm"
+        elif ext == "mp3" then "audio/mpeg"
+        elif ext == "wav" then "audio/wav"
+        else "application/octet-stream"
+
+    // Whether a body of this type is already compressed, so that brotli is not run over it to find out.
+    //
+    // **A static server would otherwise compress every image on every request and throw the answer
+    // away**, the `len(small) >= len(raw)` check being what catches it -- correct, and paid for once per
+    // request per file. These are the types where the answer is known in advance.
+    alreadyPacked(type) =
+        ((startsWith(type, "image/") && !startsWith(type, "image/svg")) ||
+            startsWith(type, "video/") || startsWith(type, "audio/") ||
+            startsWith(type, "font/woff") || type == "application/zip" ||
+            type == "application/gzip" || type == "application/pdf")
     """
