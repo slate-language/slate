@@ -17,17 +17,36 @@ file, no flags, and a one-liner where the file is not wanted:
 on `os` rather than on the global and `--std` is what puts `os` there. node has all four timers as
 globals and needs nothing. Every other program in this directory runs under a bare `qjs`.
 
-They are not run by `sysl test .`, because the suite has no JavaScript engine in it: running the
-emitted code needs `sysl-lang/quickjs-ng` as a dependency of this repo, which moves the compiler
-floor to 0.0.93 and puts `--include-path quickjs=…` on every test run. When that lands, these become
-the differential suite and the diff above becomes an assertion.
+**THEY ARE RUN BY `sysl test .` NOW, THROUGH NODE**, which is what `tests_js_run.sysl` does: the
+interpreter side runs in the test process the way every other driver here does, the emitted program
+is started as a subprocess, and the two outputs are diffed. `Runnable` in that file is the list, and
+a walk beside it fails when a program is added here and not to the list.
 
-Until then they are run by hand, and every one of them was: `wide.sl` is the fixture for a driver
-test and the six numbered ones cover, in order, arithmetic and printing; patterns, `match`,
+`p9.sl` is the one left out: its exit status is half of what it is about and it calls `exit`, which
+in the test process would take the suite with it. It is still run by hand, as below.
+
+**That does not settle the `quickjs-ng` question, which is about a different thing.** Making the
+emitted code run under an engine *linked into the compiler* would let a test assert on it without
+starting a process, and would make `qjs` — an engine with no file system and no `os` on the global —
+part of the routine check rather than an occasional one. It moves the compiler floor to 0.0.93 and
+puts `--include-path quickjs=…` on every `sysl test .`, so it remains the user's call.
+
+Each program covers, in order: `wide.sl` is the fixture for a driver
+test and the numbered ones cover arithmetic and printing; patterns, `match`,
 labelled loops, closures and `try`/`catch`; classes, generators, `with`, defaults and spread
 arguments; the `...` literals; the annotations, which are checked while a program runs; defaults
 inside a pattern; the event loop; the file system and the environment; and a script's own arguments
 and exit status.
+
+**`p10.sl` is about the BUILTINS rather than about a construct**, which makes it the odd one here.
+Every other program reaches a few builtins on the way to demonstrating something else; that one is
+for the cases where JavaScript has an answer of its own and it is the wrong answer — a miss that is
+`-1` rather than `null`, a `Number()` that trims and reads `""` as zero. It exists because `indexOf`
+answered `-1` here for as long as this back end had one, and the golden tests in `tests_js.sysl`,
+which pin the emitted TEXT, could not have seen it: the runtime those texts call into is a `raw"""`
+block no expectation ever quotes.
+
+**`dom/` is a run of its own and needs jsdom** — see `dom/README.md`.
 
 **`p8.sl` writes into `tests/js/scratch/` and takes it away again**, so that running it twice says
 the same thing and running it leaves nothing behind — the directory is git-ignored for the run that

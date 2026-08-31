@@ -23,6 +23,16 @@ print(html(root))
 `createElement` and `Fragment` have to be imported wherever an element is written: slx desugars
 `<div/>` into a call to them, and slate itself has no idea what an element means.
 
+**A COMPONENT TAKES ITS PROPS, EVEN WHEN IT IGNORES THEM.** `Counter(props)` or
+`Counter({ start = 0 })` — never `Counter()`. React allows the empty parameter list; slate checks
+arity, and the framework calls every component with one argument. Writing `Counter()` gets
+
+    error: this function takes 0 arguments and was given 1
+       --> packages/react/react.slx:199:19
+
+which names *this file* rather than the component, because the call is here. Read past the path: the
+line that is wrong is the one in your own program.
+
 ## What is here
 
 | | |
@@ -33,17 +43,56 @@ print(html(root))
 | `flush(root)` | render every change since the last one, now |
 | `html(root)` | the tree as markup — the string host's answer |
 | `stringHost()` | the default host |
+| `domHost(selector)` | the other one, in `dom.slx` — a real page |
 
-## The host is behind an adapter, and that is the point
+## The host is behind an adapter, and there are two of them
 
 Nothing in the reconciler knows what a node is. `stringHost` builds plain objects and serialises
-them; a DOM host will create real elements through the same six functions — `element`, `text`,
-`setProps`, `setKids`, `setText`, `serialise`. **So one set of components renders to HTML on a server
-and to the document in a browser**, which is the thing that makes this worth writing in slate rather
-than reaching for React.
+them; `domHost` creates real elements through the same functions — `element`, `text`, `setProps`,
+`setKids`, `setText`, `serialise`, `drop` and `mounted`. **So one set of components renders to HTML
+beside `slate:http` and into the document in a browser**, which is the thing that makes this worth
+writing in slate rather than reaching for React.
 
-The DOM host is waiting on the JavaScript back end growing a way to reach the DOM. Nothing else here
-is.
+```
+import { createElement, Fragment, mount, useState } from "./packages/react/react.slx"
+import { domHost } from "./packages/react/dom.slx"
+
+mount(<Counter/>, domHost("#app"))
+```
+
+Then `slate js app.slx -o app.js` and a `<script src="app.js">` beside a `<div id="app">`. The
+emitted file is self-contained — the runtime, the framework and the program in one — so there is no
+bundler and nothing to install.
+
+**`drop` and `mounted` are the two the string host does not need**, and they were added when the DOM
+host was written rather than guessed at in advance:
+
+- **`drop(node)`** is a node the framework has torn down. A string host's node is an ordinary object
+  the collector takes; a DOM host hands out a handle into a table it keeps, and a node nobody tells
+  it about is a slot held for the life of the page.
+- **`mounted(nodes)`** is the top of the tree, handed over on **every** commit. A component at the
+  very top has no host node above it, so when it renders a different set of nodes the reconciler has
+  nobody to tell — for a string host that is invisible, `html` walking the tree afresh whenever it is
+  asked, and for a DOM host it is an element left on the page after the program stopped rendering it.
+
+`tests/host.slx` pins both against a recording host, which is how a contract with two
+implementations gets checked without a document in the room.
+
+## What a handler is given
+
+**A record, not the event.** `MouseEvent` has no representation in slate and inventing one would mean
+inventing a foreign value, so `slate:dom` builds an object at the moment the handler fires:
+
+| | |
+|---|---|
+| `type` | `"click"`, `"input"`, … |
+| `value` | what the target holds now, as a string, or `null` |
+| `checked` | a checkbox's state, or `null` |
+| `key` | for a keyboard event |
+| `stop()`, `prevent()` | `stopPropagation` and `preventDefault` |
+
+A counter reads none of it. A form reads `e.value`, which is a *property* and not the attribute — the
+host sets it as one, which is what keeps a re-render from freezing a field somebody is typing in.
 
 ## Where it diverges from React, deliberately
 
@@ -72,9 +121,10 @@ is.
 
 ## Not here yet
 
-`useContext`, `memo`, error boundaries, portals, and a DOM host. The reconciler replaces a host node's
-whole child list rather than moving children, which is right for a string and wants a real diff once
-there is a DOM under it.
+`useContext`, `memo`, error boundaries and portals. **The reconciler replaces a host node's whole
+child list rather than moving children**, which was right when the only host was a string and is now
+the obvious next thing: `replaceChildren` on a list of a thousand rows rebuilds the lot, where a real
+diff would move a handful. It is correct and it is not fast.
 
 ## This is going to be a package
 

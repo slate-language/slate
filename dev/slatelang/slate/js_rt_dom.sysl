@@ -1,0 +1,257 @@
+module dev.slatelang.slate
+
+// The document, as JavaScript. What `slate:dom` is when there is a page.
+//
+// **This is the only part of the runtime that reaches outside the language**, which is why it is a
+// file of its own rather than a section of `js_rt_builtins.sysl`. Everything else in the runtime is
+// slate's own semantics written in JavaScript; this is a door.
+//
+// **A NODE IS A SLATE INTEGER**, and that is the decision the rest follows from. The engine keeps
+// the elements in a table and hands out its index, so no foreign object ever becomes a slate value:
+// `==` still compares what slate says it compares, `print` still has something to say, a node still
+// travels through an array or a pattern like any other value, and there is no second kind of thing
+// for the checker to learn. It is the arrangement the timers already use -- *"the id is slate's own
+// number and not the engine's handle"* -- reached again for the same reason.
+//
+// **The cost, stated once**: a node handed out is a node held, so a table entry outlives the element
+// unless something gives it back. `release` is what gives it back, and the reconciler in
+// `packages/react/` calls it when it drops a child. A program that never releases leaks table slots
+// and not much else, the elements themselves being freed by the page when they leave it.
+//
+// **AN EVENT ARRIVES AS A SLATE OBJECT AND NOT AS THE EVENT.** A `MouseEvent` has no representation
+// here and inventing one would be inventing a foreign value; what a handler is given is a record of
+// the fields a handler actually reads, built at the moment it fires. It is a summary and the module
+// says so -- the alternative is a value slate cannot print, compare or store.
+js_runtime_dom() -> string = raw"""
+        // -- the document ------------------------------------------------------------------------------
+
+        const isInt = $.isInt
+        const isStr = $.isStr
+
+        const noDocument = (name) =>
+            fault("`" + name + "` needs a document, and this JavaScript host has none -- `slate:dom` is for a page")
+
+        // The page, taken once and by feature rather than by name: a host with a `document` that can
+        // make an element has one, and everything else does not.
+        const doc = (typeof globalThis.document === "object" && globalThis.document !== null &&
+            typeof globalThis.document.createElement === "function") ? globalThis.document : null
+
+        // The table the handles index. **Slot 0 is never given out**, so that a handle is always
+        // truthy and an uninitialised one cannot look like a valid node.
+        const nodes = [null]
+
+        // The slots `release` gave back. **A free LIST and not a scan**, because a scan for the first
+        // empty slot is linear in the table and an interface that builds and drops elements does that
+        // on every element it ever makes -- which is quadratic in a page's whole history, on the path
+        // a re-render takes.
+        const free = []
+
+        // What a program is holding, or the sentence saying it is not a node.
+        //
+        // **The check is the whole point of the handle.** A number that came from somewhere else --
+        // arithmetic on a handle, a released one, a length -- would otherwise reach the DOM as an
+        // index and do something arbitrary; here it says which builtin was asked and what it got.
+        const nodeOf = (v, name) => {
+            if (!isInt(v)) fault("`" + name + "` takes a node, and this is " + typeName(v))
+
+            const at = Number(v)
+            const node = nodes[at]
+
+            if (at < 1 || at >= nodes.length || node === null)
+                fault("`" + name + "` was given a node that is not there -- it was released, or it never came from `slate:dom`")
+
+            return node
+        }
+
+        // A handle for something the page handed back, and `null` for nothing at all. Reusing a
+        // released slot keeps the table from growing for the lifetime of a page that builds and drops
+        // elements, which is what a re-rendering interface does all day.
+        const handleFor = (node) => {
+            if (node === null || node === undefined) return null
+
+            const spare = free.pop()
+
+            if (spare !== undefined) {
+                nodes[spare] = node
+
+                return BigInt(spare)
+            }
+
+            nodes.push(node)
+
+            return BigInt(nodes.length - 1)
+        }
+
+        const wantText = (v, name) => {
+            if (!isStr(v)) fault("`" + name + "` takes a string, and this is " + typeName(v))
+
+            return v
+        }
+
+        B.createElement = (tag) => {
+            if (doc === null) noDocument("createElement")
+
+            return handleFor(doc.createElement(wantText(tag, "createElement")))
+        }
+
+        B.createText = (s) => {
+            if (doc === null) noDocument("createText")
+
+            return handleFor(doc.createTextNode(wantText(s, "createText")))
+        }
+
+        B.byId = (id) => {
+            if (doc === null) noDocument("byId")
+
+            return handleFor(doc.getElementById(wantText(id, "byId")))
+        }
+
+        B.query = (selector) => {
+            if (doc === null) noDocument("query")
+
+            return handleFor(doc.querySelector(wantText(selector, "query")))
+        }
+
+        // **An attribute's value is written as slate would print it**, `true` being the empty string
+        // that HTML uses for a bare attribute. A `null` or a `false` removes it, which is the rule
+        // the string renderer in `packages/react/` already follows, so one component means one thing
+        // on a server and in a page.
+        B.setAttribute = (node, name, value) => {
+            const el = nodeOf(node, "setAttribute")
+            const key = wantText(name, "setAttribute")
+
+            if (value === null || value === false || value === undefined) return el.removeAttribute(key), null
+
+            el.setAttribute(key, value === true ? "" : text(value))
+
+            return null
+        }
+
+        B.removeAttribute = (node, name) => {
+            nodeOf(node, "removeAttribute").removeAttribute(wantText(name, "removeAttribute"))
+
+            return null
+        }
+
+        // **A PROPERTY IS NOT AN ATTRIBUTE, and an input is where the difference shows.** Setting the
+        // `value` attribute says what the field started as; setting the property says what it holds
+        // now. A form that re-renders needs the second and would appear frozen with the first.
+        B.setProperty = (node, name, value) => {
+            const el = nodeOf(node, "setProperty")
+
+            el[wantText(name, "setProperty")] = isInt(value) ? Number(value) : value
+
+            return null
+        }
+
+        // The listeners this module installed, so that `off` can take back the wrapper `on` made.
+        // Keyed by the element and then by the slate function, which is identity here exactly as it
+        // is in the interpreter.
+        const listeners = new WeakMap()
+
+        B.on = (node, type, f) => {
+            const el = nodeOf(node, "on")
+            const kind = wantText(type, "on")
+
+            if (typeof f !== "function") fault("`on` takes a function to call, and this is " + typeName(f))
+
+            let forNode = listeners.get(el)
+
+            if (forNode === undefined) {
+                forNode = new Map()
+                listeners.set(el, forNode)
+            }
+
+            const already = forNode.get(kind)
+
+            if (already !== undefined && already.has(f)) return null
+
+            const wrapper = (e) => $.call(f, [eventRecord(e)])
+
+            if (already === undefined) forNode.set(kind, new Map([[f, wrapper]]))
+            else already.set(f, wrapper)
+
+            el.addEventListener(kind, wrapper)
+
+            return null
+        }
+
+        B.off = (node, type, f) => {
+            const el = nodeOf(node, "off")
+            const kind = wantText(type, "off")
+            const forNode = listeners.get(el)
+            const forKind = forNode === undefined ? undefined : forNode.get(kind)
+            const wrapper = forKind === undefined ? undefined : forKind.get(f)
+
+            if (wrapper === undefined) return null
+
+            el.removeEventListener(kind, wrapper)
+            forKind.delete(f)
+
+            return null
+        }
+
+        // **What a handler is given: a record, not the event.** These are the fields a handler reads
+        // -- what happened, what the field holds now, which key -- and `stop` and `prevent` are the
+        // two things it does back. Anything else is not reachable, deliberately: the alternative is
+        // handing slate a value it cannot print, compare or keep.
+        const eventRecord = (e) => {
+            const target = e.target === null || e.target === undefined ? null : e.target
+            const held = target === null ? null : target.value
+            const checked = target === null ? null : target.checked
+
+            return $.obj([
+                ["type", e.type],
+                ["value", held === undefined || held === null ? null : String(held)],
+                ["checked", checked === undefined || checked === null ? null : checked],
+                ["key", e.key === undefined || e.key === null ? null : e.key],
+                ["stop", () => (e.stopPropagation(), null)],
+                ["prevent", () => (e.preventDefault(), null)]])
+        }
+
+        // **The whole child list at once**, which is what the reconciler above has and what the DOM
+        // does in one call. Replacing rather than appending is what makes a re-render idempotent.
+        B.setChildren = (node, kids) => {
+            const el = nodeOf(node, "setChildren")
+
+            if (!Array.isArray(kids)) fault("`setChildren` takes an array of nodes, and this is " + typeName(kids))
+
+            el.replaceChildren(...kids.map((k) => nodeOf(k, "setChildren")))
+
+            return null
+        }
+
+        B.setText = (node, s) => {
+            nodeOf(node, "setText").textContent = wantText(s, "setText")
+
+            return null
+        }
+
+        // What the page would show for this node, which is what a test reads and what `html()` in
+        // `packages/react/` answers over a DOM host.
+        //
+        // **A text node has no `outerHTML`**, and handing back its `textContent` raw would be the one
+        // place this answers something a browser would not show: the string host escapes its text,
+        // and so must this, or the two hosts disagree about the very thing they are compared on.
+        B.markup = (node) => {
+            const el = nodeOf(node, "markup")
+
+            if (el.outerHTML !== undefined) return el.outerHTML
+
+            return String(el.textContent).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+        }
+
+        // Give a handle back. **A node dropped from the page still holds a table slot until this is
+        // called**, and the reconciler calls it -- so a long-running interface does not grow a table
+        // as long as everything it has ever rendered.
+        B.release = (node) => {
+            nodeOf(node, "release")
+
+            const at = Number(node)
+
+            nodes[at] = null
+            free.push(at)
+
+            return null
+        }
+    """

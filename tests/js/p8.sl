@@ -23,6 +23,17 @@ sweep()
 
 said(r) = if r.ok then s"ok ${r.value}" else s"no ${r.error}"
 
+// **A stat carries the moment the file was last written, and the two back ends write it at two
+// different moments** -- so the whole record cannot be compared and the three fields that are about
+// the file rather than about when it was made can. It is the same reason `readDir` is sorted below:
+// what is compared has to be what both back ends actually promise.
+statSaid(r) =
+    if !r.ok then return s"no ${r.error}"
+
+    val v = r.value
+
+    s"ok {size: ${v.size}, isFile: ${v.isFile}, isDir: ${v.isDir}}"
+
 blocking()
     print("-- blocking")
     print(said(mkdirSync(Dir)))
@@ -31,7 +42,7 @@ blocking()
     print(said(readFileSync(s"${Dir}/one.txt")))
     print(said(readFileSync(s"${Dir}/two.txt")))
     print(said(readBytesSync(s"${Dir}/one.txt")))
-    print(said(statSync(s"${Dir}/one.txt")))
+    print(statSaid(statSync(s"${Dir}/one.txt")))
     print(existsSync(s"${Dir}/one.txt"), existsSync(s"${Dir}/nope.txt"))
 
     // The names in a directory arrive in whatever order the file system keeps them, which is not a
@@ -46,7 +57,7 @@ blocking()
     // And the failures, which are an answer rather than a fault.
     print(said(readFileSync(s"${Dir}/gone.txt")))
     print(said(readDirSync(s"${Dir}/gone")))
-    print(said(statSync(s"${Dir}/gone")))
+    print(statSaid(statSync(s"${Dir}/gone")))
     print(said(removeSync(s"${Dir}/gone")))
     print(said(rmdirSync(s"${Dir}/gone")))
     print(said(mkdirSync(s"${Dir}/one.txt")))
@@ -59,7 +70,7 @@ async waiting()
     print("-- waiting")
     print(said(await readFile(s"${Dir}/one.txt")))
     print(said(await readBytes(s"${Dir}/one.txt")))
-    print(said(await stat(s"${Dir}/one.txt")))
+    print(statSaid(await stat(s"${Dir}/one.txt")))
     print(await exists(s"${Dir}/one.txt"), await exists(s"${Dir}/nope.txt"))
     print(said(await writeFile(s"${Dir}/four.txt", "written later")))
     print(said(await readFile(s"${Dir}/four.txt")))
@@ -75,7 +86,7 @@ async refusals()
     print("-- refusals")
     print(said(await readFile(s"${Dir}/gone.txt")))
     print(said(await readDir(s"${Dir}/gone")))
-    print(said(await stat(s"${Dir}/gone")))
+    print(statSaid(await stat(s"${Dir}/gone")))
     print(said(await remove(s"${Dir}/gone")))
     print(said(await rmdir(s"${Dir}/gone")))
     print(said(await mkdir(s"${Dir}/one.txt")))
