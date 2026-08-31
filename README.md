@@ -3,9 +3,14 @@
 A small indentation-structured, garbage-collected language, written in [sysl](https://sysl.sh).
 
 Dynamically typed with a gradual checker, `async`/`await` on a real event loop, generators, modules,
-pattern matching, classes over prototypes, and a package manager. It is aimed first at what an API
-server needs — HTTP over node's own llhttp, TCP, TLS, a file system, processes, regular expressions
-and JSON.
+pattern matching, classes over prototypes, algebraic data types, and a package manager. It is aimed
+first at what an API server needs — HTTP over node's own llhttp, TCP, TLS, a file system, processes,
+regular expressions and JSON.
+
+**It also compiles to JavaScript**, so the same program runs under the interpreter, under node or
+quickjs, and — with `slate:dom` and the React-shaped framework in `packages/react/` — in a browser.
+`slate js app.slx -o app.js` writes one self-contained file: the runtime, the framework and the
+program, with no bundler and nothing to install.
 
 It began as a way of finding out what sysl is like to write a real front end in: a tree-walking
 interpreter reaches for nearly everything a language has — recursive data through references,
@@ -33,11 +38,18 @@ dev/slatelang/slate/
     runtime.sysl    equality, arithmetic, indexing, matching and calling
     builtin.sysl    the functions a program has without writing them
     show.sysl       the tree as `(+ 1 (* 2 3))`, for the tests
-    tests.sysl      what all of it claims, run by `sysl test .`
+    stdlib.sysl     the modules slate brings with it, and what each one exports
+    js.sysl         the same tree read a second time, as JavaScript
+    js_rt.sysl      that program's runtime, carried as text
+    js_rt_dom.sysl  `slate:dom` -- the one part that reaches outside the language
+    tests_*.sysl    what all of it claims, run by `sysl test .`
     main.sysl       the driver: a path in, a report out
 examples/tour.sl    the language in one file
 examples/match.sl   the patterns, in another
 examples/script.sl  a `#!` script: its arguments and its exit status
+examples/api.sl     what an API server writes every time
+examples/web/       a counter in a web page
+packages/react/     React in slate, over slx elements
 ```
 
 The module is **`dev.slatelang.slate`**, reversed from the domain the way `sh.sysl.*` is reversed
@@ -120,6 +132,51 @@ Hello, slate!
 
 `#!` is read at the very first byte of the file and nowhere else. `#` is not a comment in slate — a
 comment is `//` — and this did not make it one.
+
+## Writing a page
+
+`slate js` reads the same tree a second time and writes JavaScript, so a slate program runs under
+node, under quickjs, or in a browser. The last of those is what `slate:dom` and `packages/react/` are
+for — React's model *and* React's mechanism, written in slate, over JSX-shaped elements the parser
+desugars into ordinary calls.
+
+```
+import { createElement, Fragment, mount, useState } from "./packages/react/react.slx"
+import { domHost } from "./packages/react/dom.slx"
+
+Counter({ start = 0 }) =
+    val [count, setCount] = useState(start)
+
+    <div class="counter">
+        <p>{count}</p>
+        <button onClick={() -> setCount(count + 1)}>+1</button>
+    </div>
+
+mount(<Counter/>, domHost("#app"))
+```
+
+```
+$ slate js counter.slx -o counter.js
+```
+
+Then a `<script src="counter.js">` beside a `<div id="app">`. **One self-contained file** — the
+runtime, the framework and the program — so there is no bundler, no `node_modules`, and nothing to
+install.
+
+- **`class`, not `className`; `for`, not `htmlFor`.** React's spellings exist only because JSX
+  compiles into a JavaScript object literal where those were reserved words. An attribute here is its
+  own lexical context and can take the right name.
+- **The host is behind an adapter, and there are two of them.** The same components render to markup
+  beside `slate:http` — server-side rendering as a by-product rather than a project — and into the
+  document in a browser. Nothing in the reconciler knows which.
+- **A handler is given a record, not the event**: `{ type, value, checked, key, stop, prevent }`. A
+  `MouseEvent` has no representation in slate, and inventing one would mean inventing a value that
+  could not be printed, compared or stored.
+- **`slate:dom` says so where there is no document.** Under the interpreter every one of its names
+  faults with a sentence naming the command rather than the code, because the same program is correct
+  in a browser and it is the command that is wrong.
+
+`examples/web/` is a working counter; `packages/react/README.md` is the framework.
 
 ## The language
 
@@ -1083,9 +1140,12 @@ Two consequences worth knowing:
 ## What is not here yet
 
 A literate `.lsl` form, a name resolver for `connect`, Unicode case conversion, and a standard
-library beyond the builtins. Modules have no packages behind them either — every path is a file on
-disk. On the object side: `super`, and a check that a proto satisfies a `type` when it is
-attached to an object literal by hand.
+library beyond the builtins. On the object side: `super`, and a check that a proto satisfies a `type`
+when it is attached to an object literal by hand.
+
+In the JavaScript back end: `slate:net`, `slate:time`, `slate:regex`, `fetch`, `run`,
+`slate:password`, `slate:brotli`, `slate:llhttp`, and the modules written over them. Each one is a
+name that says *"not in the JavaScript back end yet"* rather than a name that is not there.
 
 **`defer` is on sysl's list and is deliberately not here.** It earns its place in Go and in sysl
 because neither collects: a function that acquires something has to release it on every exit path,
