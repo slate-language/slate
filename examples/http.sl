@@ -14,7 +14,7 @@ val server = serve(8080, async req ->
     if req.path == "/"
         "try /greet?name=Ada or POST to /echo"
     elif req.path == "/greet"
-        "hello, " + (req.query.replace("name=", "") ?? "world")
+        "hello, " + (req.query.name ?? "world")
     elif req.path == "/echo" && req.method == "POST"
         { status: 200, headers: { "Content-Type": "text/plain" }, body: req.body }
     elif req.path == "/slow"

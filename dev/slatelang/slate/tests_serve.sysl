@@ -100,3 +100,229 @@ AN_ARRAY_OF_DATA_IS_STILL_ANSWERED_WITH_toJSON()
 
     assert(said.contains("Content-Type: application/json"))
     assert(said.contains("Content-Length: 5"))
+
+// -- the query, forms, cookies and the router --------------------------------------------------
+
+// Everything the API surface exports. **One import line rather than one per test**, since what each
+// of these is about is the behaviour and not which names it needed.
+private val ApiImport: string =
+    "import { serve, close, router, parseQuery, parseForm, parseCookies, setCookie, encodeComponent } from slate:http\n"
+
+// A program that needs no socket -- the parsers and the encoder are ordinary functions.
+private api_out(text: string) -> string = out(ApiImport + text)
+
+// A server, one request written on the wire, and what came back: the head `|`-joined and the body.
+//
+// **Written over a socket rather than through `fetch`**, because `fetch` folds repeated response
+// headers into one object and `Set-Cookie` is the header that repeats.
+private asked(setup: string, request: string) -> string =
+    ApiImport + WireImport + watched(setup +
+        "async main()\n" +
+        "    val c = (await connect(\"127.0.0.1\", localPort(server))).value\n" +
+        "    var got = \"\"\n" +
+        "    heard(chunk)\n" +
+        "        if chunk == null\n" +
+        "            print(join(split(got, \"\\r\\n\"), \"|\"))\n" +
+        "            shutSocket(c)\n" +
+        "            close(server)\n" +
+        "            done()\n" +
+        "        else\n" +
+        "            got = got + chunk\n" +
+        "    onData(c, heard)\n" +
+        "    await send(c, " + request + ")\n" +
+        "main()\n")
+
+private asked_out(setup: string, request: string) -> string = out(asked(setup, request))
+
+// A plain `GET` of `path`, with whatever extra header lines are wanted.
+private get_of(path: string, extra: string) -> string =
+    "\"GET " + path + " HTTP/1.1\\r\\nHost: h\\r\\n" + extra + "Connection: close\\r\\n\\r\\n\""
+
+@test
+A_QUERY_STRING_REACHES_THE_HANDLER_AS_AN_OBJECT()
+    // `req.search` is the raw text after the `?` and `req.query` is what it means -- the URL API's
+    // two names, so a program that wants the text it was sent still has it.
+
+    assert(asked_out("val server = serve(0, req -> req.query.x + \"|\" + req.query.y + \"|\" + req.search)\n",
+        get_of("/a?x=1&y=two+words", "")).contains("1|two words|x=1&y=two+words"))
+
+@test
+A_PERCENT_ENCODED_QUERY_IS_DECODED_OVER_BYTES_AND_NOT_CHARACTERS()
+    // **`%C3%A9` is two bytes that are one character**, which is why the decoder collects bytes and
+    // decodes the lot at the end rather than working a character at a time.
+
+    assert(asked_out("val server = serve(0, req -> req.query.n + \"|\" + string(len(req.query.n)))\n",
+        get_of("/a?n=caf%C3%A9", "")).contains("café|4"))
+
+@test
+A_QUERY_NAME_WITH_NO_VALUE_IS_PRESENT_AND_EMPTY()
+    // Which is what a bare `?debug` means to everybody who writes one.
+
+    assert(asked_out("val server = serve(0, req -> string(has(req.query, \"debug\")) + \"|\" + req.query.debug + \"|\")\n",
+        get_of("/a?debug", "")).contains("true||"))
+
+@test
+A_REPEATED_QUERY_NAME_IS_THE_LAST_ONE_AND_THE_RAW_TEXT_KEEPS_BOTH()
+    // **A decision rather than an oversight.** The alternative every framework reaches for is an
+    // array where a name repeats, which makes the TYPE of `q.name` depend on what a client sent --
+    // so a program that read it as a string works until somebody sends the field twice. The text is
+    // on `search` for a program that genuinely expects one more than once.
+
+    assert(asked_out("val server = serve(0, req -> req.query.a + \"|\" + req.search)\n",
+        get_of("/a?a=1&a=2", "")).contains("2|a=1&a=2"))
+
+@test
+COOKIES_ARRIVE_PARSED_AND_ONLY_THE_VALUE_IS_DECODED()
+    // A cookie's name is a token by the specification and browsers do not encode one, so decoding a
+    // name would turn two different cookies into one.
+
+    assert(asked_out("val server = serve(0, req -> req.cookies.session + \"|\" + req.cookies.who)\n",
+        get_of("/a", "Cookie: session=abc123; who=ada%20l\r\n")).contains("abc123|ada l"))
+
+@test
+A_REQUEST_WITH_NO_COOKIE_HEADER_HAS_AN_EMPTY_OBJECT_AND_NOT_A_MISSING_FIELD()
+    // A field that is there only sometimes is one every handler has to test for before reading, and
+    // `undefined` may not be passed anywhere in slate -- so the empty object is what makes
+    // `req.cookies` safe to read.
+
+    assert(asked_out("val server = serve(0, req -> string(len(keys(req.cookies))))\n",
+        get_of("/a", "")).contains("0"))
+
+@test
+A_HEADER_WHOSE_VALUE_IS_AN_ARRAY_IS_WRITTEN_ONCE_PER_ELEMENT()
+    // **The only way to say `Set-Cookie` twice**: an object has one value per name and HTTP does not.
+    // It is general rather than a case for cookies -- `Link`, `Vary` and `Via` all repeat.
+
+    val said = asked_out(
+        "val server = serve(0, req -> { headers: { \"Set-Cookie\": [setCookie(\"a\", \"1\"), setCookie(\"b\", \"2\", { httpOnly: true })] }, body: \"ok\" })\n",
+        get_of("/a", ""))
+
+    assert(said.contains("Set-Cookie: a=1; Path=/"))
+    assert(said.contains("Set-Cookie: b=2; Path=/; HttpOnly"))
+
+@test
+setCookie_WRITES_THE_ATTRIBUTES_IT_IS_GIVEN_AND_A_PATH_IT_IS_NOT()
+    // **`Path=/` is the one default here that is not the specification's.** A cookie with no path is
+    // scoped to the directory of the request that set it, which is almost never what a program means
+    // and is a bug that only appears on the second path.
+
+    assert_eq(api_out("print(setCookie(\"s\", \"a b\"))"), "s=a%20b; Path=/")
+    assert_eq(api_out("print(setCookie(\"s\", \"x\", { maxAge: 60, httpOnly: true, secure: true, sameSite: \"Lax\" }))"),
+        "s=x; Max-Age=60; Path=/; SameSite=Lax; HttpOnly; Secure")
+    assert_eq(api_out("print(setCookie(\"s\", \"x\", { path: \"/admin\", domain: \"example.com\" }))"),
+        "s=x; Domain=example.com; Path=/admin")
+
+@test
+A_FORM_BODY_IS_THE_SAME_GRAMMAR_AS_A_QUERY_AND_IS_NOT_PARSED_UNASKED()
+    // A body has a content type, and a handler that did not ask for a form should not have one
+    // parsed for it -- so `parseForm` is a function rather than a field.
+
+    assert_eq(api_out("val f = parseForm(\"name=Ada+Lovelace&year=1843\")\nprint(f.name, f.year)"),
+        "Ada Lovelace 1843")
+    assert_eq(api_out("print(len(keys(parseForm(\"\"))))"), "0")
+
+@test
+encodeComponent_IS_THE_UNRESERVED_SET_AND_NOTHING_MORE()
+    // Encoding more than is needed is always safe and encoding less never is.
+
+    assert_eq(api_out("print(encodeComponent(\"a b/c?d=e&f\"))"), "a%20b%2Fc%3Fd%3De%26f")
+    assert_eq(api_out("print(encodeComponent(\"-_.~AZaz09\"))"), "-_.~AZaz09")
+    assert_eq(api_out("print(encodeComponent(\"café\"))"), "caf%C3%A9")
+
+@test
+A_ROUTER_BINDS_THE_PARAMETERS_A_PATH_NAMES()
+    assert(asked_out(
+        "val app = router()\n" +
+        "app.get(\"/users/:id\", (req) -> \"user \" + req.params.id)\n" +
+        "val server = serve(0, app)\n",
+        get_of("/users/42", "")).contains("user 42"))
+
+@test
+serve_TAKES_A_ROUTER_BECAUSE_IT_HAS_A_handle()
+    // **Nothing in the server knows what routing is.** A handler is a function, and one place to look
+    // for one is inside an object that says it has a `handle` -- which is the whole of the coupling.
+
+    assert(asked_out(
+        "val app = router()\n" +
+        "app.get(\"/\", (req) -> \"root\")\n" +
+        "val server = serve(0, app.handle)\n",
+        get_of("/", "")).contains("root"))
+
+@test
+A_PATH_THAT_IS_THERE_UNDER_ANOTHER_METHOD_IS_405_AND_NAMES_WHAT_IS_ALLOWED()
+    // **The four lines nobody writes by hand**, and the difference between a client being told what
+    // to send and being told the thing is not there. `Allow` is required on a 405.
+
+    val said = asked_out(
+        "val app = router()\n" +
+        "app.post(\"/things\", (req) -> \"made\")\n" +
+        "app.put(\"/things\", (req) -> \"replaced\")\n" +
+        "val server = serve(0, app)\n",
+        get_of("/things", ""))
+
+    assert(said.contains("405 Method Not Allowed"))
+    assert(said.contains("Allow: POST, PUT"))
+
+@test
+A_PATH_NOTHING_ROUTES_IS_404_AND_notFound_REPLACES_IT()
+    assert(asked_out("val app = router()\nval server = serve(0, app)\n", get_of("/nope", ""))
+        .contains("404 Not Found"))
+
+    assert(asked_out(
+        "val app = router()\n" +
+        "app.notFound((req) -> { status: 404, body: \"nothing at \" + req.path })\n" +
+        "val server = serve(0, app)\n",
+        get_of("/nope", "")).contains("nothing at /nope"))
+
+@test
+A_STAR_TAKES_THE_WHOLE_OF_THE_REST_SLASHES_INCLUDED()
+    // Which is what a file server needs, and is the one pattern that may match a different number of
+    // parts than it has.
+
+    assert(asked_out(
+        "val app = router()\n" +
+        "app.get(\"/files/*rest\", (req) -> \"[\" + req.params.rest + \"]\")\n" +
+        "val server = serve(0, app)\n",
+        get_of("/files/a/b/c.txt", "")).contains("[a/b/c.txt]"))
+
+@test
+ROUTES_ARE_TRIED_IN_THE_ORDER_THEY_WERE_ADDED()
+    // The rule every router has and the only one a reader can predict: a more specific route written
+    // second does not win.
+
+    assert(asked_out(
+        "val app = router()\n" +
+        "app.get(\"/a/*rest\", (req) -> \"star\")\n" +
+        "app.get(\"/a/b\", (req) -> \"exact\")\n" +
+        "val server = serve(0, app)\n",
+        get_of("/a/b", "")).contains("star"))
+
+@test
+A_TRAILING_SLASH_IS_THE_SAME_PATH_AND_THE_ROOT_IS_NO_PARTS_AT_ALL()
+    assert(asked_out(
+        "val app = router()\n" +
+        "app.get(\"/a\", (req) -> \"one\")\n" +
+        "app.get(\"/\", (req) -> \"root\")\n" +
+        "val server = serve(0, app)\n",
+        get_of("/a/", "")).contains("one"))
+
+@test
+AN_ASYNC_ROUTE_IS_AWAITED_LIKE_ANY_OTHER_HANDLER()
+    // A router answers whatever its route answered, so a promise travels out through `handle` and the
+    // server awaits it where it always did.
+
+    assert(asked_out(
+        "val app = router()\n" +
+        "app.get(\"/slow\", async (req) ->\n" +
+        "    await sleep(10)\n" +
+        "    \"worth it\")\n" +
+        "val server = serve(0, app)\n",
+        get_of("/slow", "")).contains("worth it"))
+
+@test
+A_ROUTE_GIVEN_SOMETHING_THAT_IS_NOT_A_FUNCTION_SAYS_SO_WHERE_IT_WAS_WRITTEN()
+    // For `serve`'s reason: nothing would look at it until a request arrived on that path, which may
+    // be an hour later and on a connection somebody is waiting for.
+
+    assert(api_out("val app = router()\ntry\n    app.get(\"/a\", 4)\ncatch e\n    print(e.message)")
+        .contains("a route needs a function to call"))

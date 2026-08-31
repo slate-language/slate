@@ -71,11 +71,28 @@ http_source() -> string = raw"""
     // request was HTTP, this server has simply decided not to hold it, which is something a client can
     // act on.
     //
+    // ## What the request carries, and what a router adds
+    //
+    // A handler is a function from a request to a response. The request has `method`, `path`, `search`
+    // (the raw text after the `?`), `query` and `cookies` (both parsed), `headers` (names lowercased),
+    // `params` (what a route's `:name` bound, and `{}` where no router is in use), `body` where the
+    // server read one, `keepAlive` and `upgrade`.
+    //
+    // **`router()` is an object holding functions and the server takes one because it has a `handle`**
+    // -- so `serve(3000, app)` works and nothing in the server knows what routing is. What it buys
+    // over a chain of `if req.path == ...` is the parameters, the order, and a `405` with an `Allow`
+    // for a path that is there under another method: that last one is four lines nobody writes by
+    // hand and it is the difference between a client being told what to send and being told to go
+    // away.
+    //
     // ## What is deliberately not here
     //
-    // **No routing**, and that is the only thing left on this list. A handler is a function from a
-    // request to a response, and matching on `req.path` is something slate can already do -- a router
-    // that only ever called `startsWith` would be a thing to learn for nothing.
+    // **No middleware**, and that is a decision rather than a gap. A chain that each link may
+    // short-circuit is a control flow of its own to learn, and in a language with first-class
+    // functions the same thing is a function calling a function -- `app.get("/x", authed(handler))`
+    // says what it does at the site that needs it, where a `use` several screens away does not.
+    //
+    // **No multipart body**, so a file upload is `serveStream` and the parsing is the program's.
     //
     // ## Two servers, and which one a program wants
     //
@@ -135,7 +152,13 @@ http_source() -> string = raw"""
         // oversight: `listen` is given the port and complains about it in its own words, while nothing
         // would look at the handler until the first request arrived -- an hour later, on a connection
         // somebody was waiting for. This is what `throw` is for.
-        if !(handler is function) then throw "`serve` needs a function to call with each request"
+        // **A ROUTER IS AN OBJECT AND IS TAKEN AS ONE**, so `serve(3000, app)` works: an object with
+        // a `handle` is asked for its `handle`, and everything else about the server is unchanged.
+        // Nothing here knows what routing is -- what it knows is that a handler is a function, and
+        // that one place to look for it is inside an object that says it has one.
+        val called = if handler is object && has(handler, "handle") then handler.handle else handler
+
+        if !(called is function) then throw "`serve` needs a function to call with each request, or an object with a `handle` that is one"
 
         // **Checked here for the same reason the handler is**: a connection asking to upgrade may not
         // arrive for an hour, and a program that passed the wrong thing wants to hear about it now.
@@ -252,8 +275,20 @@ http_source() -> string = raw"""
             async answer(req, again)
                 var reply = null
 
+                // **The parsed query and cookies are added HERE**, which is one place for both
+                // servers rather than one in each parser -- and the raw text stays on `search`, so
+                // nothing is lost by the object keeping only the last of a repeated name.
+                //
+                // **`params` is `{}` and not absent.** A handler reached without a router would
+                // otherwise read `undefined`, which slate refuses to pass anywhere -- so the empty
+                // object is what makes `req.params` safe to write whether or not one is in use.
+                req.search = req.search ?? ""
+                req.query = parseQuery(req.search)
+                req.cookies = if has(req.headers, "cookie") then parseCookies(req.headers["cookie"]) else {}
+                req.params = {}
+
                 try
-                    reply = await handler(req)
+                    reply = await called(req)
                 catch e
                     holding = false
 
@@ -422,7 +457,7 @@ http_source() -> string = raw"""
 
             // The request a streaming handler is given: the head, and the one way of asking for the rest.
             streamed(p) =
-                val req = { method: p.method, path: p.path, query: p.query, headers: p.headers,
+                val req = { method: p.method, path: p.path, search: p.search, headers: p.headers,
                             keepAlive: p.keepAlive }
 
                 // **Stored on the object rather than reached through a proto**, so calling it passes the
@@ -603,7 +638,16 @@ http_source() -> string = raw"""
                 for [k, hv] in entries(v.headers)
                     if lower(k) == "content-encoding" then encoded = true
 
-                    extra = extra + k + ": " + string(hv) + "\r\n"
+                    // **AN ARRAY VALUE IS THE HEADER WRITTEN ONCE PER ELEMENT**, which is the only
+                    // way to say `Set-Cookie` twice: an object has one value per name and HTTP does
+                    // not. It is general rather than a case for cookies -- `Link`, `Vary` and `Via`
+                    // all repeat -- and without it an array rendered as its own text, which is a
+                    // header no client can read.
+                    if hv is array
+                        for one in hv
+                            extra = extra + k + ": " + string(one) + "\r\n"
+                    else
+                        extra = extra + k + ": " + string(hv) + "\r\n"
         else
             body = string(v)
 
@@ -717,4 +761,271 @@ http_source() -> string = raw"""
         elif status == 500 then "Internal Server Error"
         elif status == 503 then "Service Unavailable"
         else "Status"
+
+    // -- the query string, forms and cookies -----------------------------------------------------------
+
+    // Percent-decoding, over BYTES rather than characters.
+    //
+    // **`%C3%A9` is two bytes that are one character**, so a decoder working a character at a time cannot
+    // put them back together -- it collects the bytes and decodes the lot at the end. That is also why
+    // this answers its input unchanged where the bytes turn out not to be text: a query string is
+    // something a client wrote, and a fault here would let any peer stop a program.
+    //
+    // `plusIsSpace` is the one difference between a query or a form and everything else that is
+    // percent-encoded. A cookie's `+` is a `+`.
+    percentDecode(s, plusIsSpace) =
+        if !contains(s, "%") && !(plusIsSpace && contains(s, "+")) then return s
+
+        val bs = toBytes(s)
+        var out = []
+        var i = 0
+
+        while i < len(bs)
+            val b = bs[i]
+
+            if b == 37 && i + 2 < len(bs)
+                val hi = hexNibble(bs[i + 1])
+                val lo = hexNibble(bs[i + 2])
+
+                // **A `%` that is not followed by two hex digits is a `%`**, which is what every browser
+                // does with one. Refusing would be refusing a request over a character a person typed.
+                if hi < 0 || lo < 0
+                    push(out, b)
+                    i = i + 1
+                else
+                    push(out, hi * 16 + lo)
+                    i = i + 3
+            elif b == 43 && plusIsSpace
+                push(out, 32)
+                i = i + 1
+            else
+                push(out, b)
+                i = i + 1
+
+        val back = fromBytes(out)
+
+        if back.ok then back.value else s
+
+    hexNibble(b) =
+        if b >= 48 && b <= 57 then b - 48
+        elif b >= 65 && b <= 70 then b - 55
+        elif b >= 97 && b <= 102 then b - 87
+        else 0 - 1
+
+    // Percent-ENCODING, for the value of a cookie this server sets.
+    //
+    // **The unreserved set of RFC 3986 and nothing more.** Encoding more than is needed is always safe
+    // and encoding less never is, so the rule is the narrow one.
+    export encodeComponent(s) =
+        val bs = toBytes(s)
+        var out = []
+        var i = 0
+
+        while i < len(bs)
+            val b = bs[i]
+
+            if unreserved(b)
+                push(out, b)
+            else
+                push(out, 37)
+                push(out, hexDigit(b / 16))
+                push(out, hexDigit(b % 16))
+
+            i = i + 1
+
+        fromBytes(out).value
+
+    // **The brackets are what continue the lines**, a trailing operator outside a bracket pair not
+    // being a continuation in slate -- the same thing `head` says about its `+`.
+    unreserved(b) =
+        ((b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) ||
+            b == 45 || b == 46 || b == 95 || b == 126)
+
+    hexDigit(n) = if n < 10 then 48 + n else 55 + n
+
+    // `a=1&b=two+words` as an object.
+    //
+    // **A repeated name is the LAST one**, and that is a decision rather than an oversight. The
+    // alternative every framework reaches for is an array where a name repeats, which makes the TYPE of
+    // `q.name` depend on what a client sent -- so a program that read it as a string works until somebody
+    // sends the field twice. A value whose shape varies is the thing this language argues against
+    // everywhere; a name a program genuinely expects more than once is read off `req.search` by hand.
+    export parseQuery(s) = readPairs(s, "&", true)
+
+    // A body sent as `application/x-www-form-urlencoded`, which is the same grammar as a query string.
+    //
+    // **It is not called automatically.** A body has a content type and a handler that did not ask for a
+    // form should not have one parsed for it -- and a body arrives as text, so nothing is lost by asking.
+    export parseForm(body) = readPairs(body, "&", true)
+
+    // `a=1; b=2` -- the `Cookie` header a client sends.
+    //
+    // **Only the value is decoded.** A cookie's name is a token by the specification, and one holding a
+    // `%` means that `%`; browsers do not encode names and decoding them would make two different
+    // cookies into one.
+    export parseCookies(header) = readPairs(header, ";", false)
+
+    readPairs(s, sep, plusIsSpace) =
+        var out = {}
+
+        if s == "" then return out
+
+        for part in split(s, sep)
+            val one = trim(part)
+
+            if one != ""
+                val at = indexOf(one, "=")
+
+                if at == null
+                    // **A name with no `=` is present and empty**, which is what a bare `?debug` means to
+                    // everybody who writes one.
+                    out[percentDecode(one, plusIsSpace)] = ""
+                elif at > 0
+                    val name = one[0..<at]
+                    val value = unquoted(one[(at + 1)..<len(one)])
+
+                    out[if plusIsSpace then percentDecode(name, true) else name] = percentDecode(value, plusIsSpace)
+
+        out
+
+    // A cookie value may be wrapped in quotes by the specification, and a program wants what is inside.
+    unquoted(v) =
+        if len(v) >= 2 && startsWith(v, "\"") && endsWith(v, "\"") then v[1..<(len(v) - 1)] else v
+
+    // One `Set-Cookie` value, for a handler to put in its headers.
+    //
+    // **A function answering a string rather than a shape the server understands**, because that is what
+    // composes: several cookies are several strings, and `headers` already takes an array for a header
+    // name that repeats. Nothing about setting a cookie had to be built into the server.
+    //
+    //     { headers: { "Set-Cookie": setCookie("session", id, { httpOnly: true, maxAge: 3600 }) } }
+    export setCookie(name, value, options = {}) =
+        var out = name + "=" + encodeComponent(value)
+
+        if has(options, "maxAge") then out = out + "; Max-Age=" + string(options.maxAge)
+        if has(options, "expires") then out = out + "; Expires=" + string(options.expires)
+        if has(options, "domain") then out = out + "; Domain=" + string(options.domain)
+
+        // **`Path=/` by default, which is the one default here that is not the specification's.** A
+        // cookie with no path is scoped to the directory of the request that set it, which is almost
+        // never what a program means and is a bug that only appears on the second path.
+        out = out + "; Path=" + (if has(options, "path") then string(options.path) else "/")
+
+        if has(options, "sameSite") then out = out + "; SameSite=" + string(options.sameSite)
+        if has(options, "httpOnly") && options.httpOnly then out = out + "; HttpOnly"
+        if has(options, "secure") && options.secure then out = out + "; Secure"
+
+        out
+
+    // -- routing ---------------------------------------------------------------------------------------
+
+    // A router: what path and method each handler is for, and the parameters a path binds.
+    //
+    //     val app = router()
+    //
+    //     app.get("/users/:id", (req) -> "user " + req.params.id)
+    //     app.post("/users", (req) -> created(req.body))
+    //     app.get("/files/*rest", (req) -> serveFile(req.params.rest))
+    //
+    //     serve(3000, app)
+    //
+    // **A router is an ordinary object holding functions**, which is what lets `serve` take one: a
+    // handler is a function, and an object with a `handle` is asked for its `handle`. Nothing about the
+    // server knows what routing is.
+    export router() =
+        var routes = []
+        var fallback = null
+
+        add(method, pattern, handler) =
+            if !(handler is function) then throw "a route needs a function to call, and this is not one"
+
+            push(routes, { method: method, parts: segments(pattern), handler: handler })
+
+        // **Every route is tried in the order it was added**, which is the rule every router has and the
+        // only one a reader can predict. A more specific route written second does not win.
+        handle(req) =
+            val want = segments(req.path)
+            var allowed = []
+
+            for r in routes
+                val bound = fit(r.parts, want)
+
+                if bound != null
+                    if r.method == "" || r.method == req.method
+                        req.params = bound
+
+                        return r.handler(req)
+
+                    if !contains(allowed, r.method) then push(allowed, r.method)
+
+            // **A path that matched with the wrong method is 405 and not 404**, and the difference is
+            // worth the four lines: 404 tells a client the thing is not there, and it is. `Allow` is
+            // required on a 405 and is what a client reads to find out what it should have sent.
+            if len(allowed) != 0
+                return { status: 405, headers: { Allow: join(sorted(allowed), ", ") }, body: "" }
+
+            if fallback != null then return fallback(req)
+
+            { status: 404, body: "Not Found" }
+
+        // **A named function and not a lambda**, because a lambda's one-line body is an expression
+        // and `fallback = h` is a statement. Every other member is a call and needs no name.
+        setFallback(h) =
+            fallback = h
+
+        { get: (p, h) -> add("GET", p, h),
+          post: (p, h) -> add("POST", p, h),
+          put: (p, h) -> add("PUT", p, h),
+          patch: (p, h) -> add("PATCH", p, h),
+          delete: (p, h) -> add("DELETE", p, h),
+          head: (p, h) -> add("HEAD", p, h),
+          options: (p, h) -> add("OPTIONS", p, h),
+          any: (p, h) -> add("", p, h),
+          notFound: setFallback,
+          handle: handle }
+
+    // The parts of a path, with the leading and trailing slashes gone. `/` is no parts at all, which is
+    // what makes it match a route written `/` and nothing else.
+    segments(path) =
+        var p = path
+        var q = indexOf(p, "?")
+
+        if q != null then p = p[0..<q]
+
+        while startsWith(p, "/")
+            p = p[1..<len(p)]
+
+        while endsWith(p, "/") && p != ""
+            p = p[0..<(len(p) - 1)]
+
+        if p == "" then [] else split(p, "/")
+
+    // Whether a route's parts fit a request's, and what its parameters bind to. `null` where they do not.
+    //
+    // **A `*name` takes the whole of the rest, slashes included**, which is what a file server needs and
+    // is the one pattern that may match a different number of parts than it has.
+    fit(parts, want) =
+        var out = {}
+        var i = 0
+
+        while i < len(parts)
+            val p = parts[i]
+
+            if startsWith(p, "*")
+                val rest = p[1..<len(p)]
+
+                if rest != "" then out[rest] = join(want[i..<len(want)], "/")
+
+                return out
+
+            if i >= len(want) then return null
+
+            if startsWith(p, ":")
+                out[p[1..<len(p)]] = percentDecode(want[i], false)
+            elif p != want[i]
+                return null
+
+            i = i + 1
+
+        if len(want) != len(parts) then null else out
     """
