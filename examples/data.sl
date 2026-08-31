@@ -69,6 +69,20 @@ sides(s: Shape) = s match
 
 print(map(shapes, sides))
 
+// A variant is taken apart by NAME as well as by position, which is the form to reach for once there
+// are more fields than fit comfortably in brackets: it does not depend on the order and it picks the
+// ones it wants. A singleton has no fields, so it is still written bare.
+corners(s: Shape) = s match
+    Circle { r } -> s"round, radius ${r}"
+    Rect { w, h } -> s"${w} by ${h}"
+    Empty -> "nothing"
+
+print(map(shapes, corners))
+
+// The exhaustiveness check reads the two forms alike -- how an arm took a variant apart says nothing
+// about which variant it was for -- and a field name the variant does not have is refused where it is
+// written, which a bare `{ ... }` pattern can never be.
+
 // Recursive, which is where the closed list earns the most: every case of the walk is on the page.
 data Tree
     Leaf(v)

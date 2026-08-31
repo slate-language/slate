@@ -195,9 +195,15 @@ kind.
 
 An object pattern matches an object with *at least* those fields, because a record grows fields over
 its life. `{ name }` is shorthand for `{ name: name }`. No alternative of a `|` may bind a name, since
-it would be bound down one path and not the other. **There is no exhaustiveness check and there
-cannot be one** — slate is dynamically typed, so the set of values a name may hold is not known; a
-subject matching no arm is a runtime fault, as Scala's `MatchError` is.
+it would be bound down one path and not the other. A subject matching no arm is a runtime fault, as
+Scala's `MatchError` is.
+
+**Exhaustiveness is checked exactly where the value's shape was written down**, and nowhere else —
+slate is dynamically typed, so for an unannotated subject the set of values a name may hold is not
+known and nothing useful can be said. What `data` adds is a closed list of variants, so a `match` over
+a subject annotated with one is checked against it and every variant left out is named. A class name
+and a `data` variant may also be written with fields after them, taking the value apart in the same
+breath as testing it — see **Classes** and **Data types** below.
 
 It is dynamically typed. Values are `null`, booleans, integers, reals, strings, arrays, objects,
 functions and promises. Arrays and objects are reference types and compare by their contents. Only `false` and
@@ -823,6 +829,33 @@ position is a binding unless something has declared it, and a class declaration 
 so the name works everywhere a type does: in `is`, in a `match` arm, and in a parameter's annotation.
 A class crosses a file under `export` as both halves at once, the value and the type.
 
+**A class name written with fields after it tests and takes apart at once**, which is what a Scala
+case class does. By position, or by name:
+
+```
+tell(v) = v match
+    Square(n) -> s"a square of side ${n}"       // the order `new` takes them in
+    Circle { radius: r } -> s"a circle of ${r}"  // order-independent
+    Rect { w, h } -> s"${w} by ${h}"             // `{ w }` is short for `{ w: w }`
+    _ -> "something else"
+```
+
+**The positional order is the constructor's, and that holds by construction rather than by
+convention** — the field list a pattern is checked against *is* the parameter list of the `new` the
+class was given, so `Square(n)` binds what `Square.new(4)` sets and the two cannot drift apart. It
+follows that an initialised field is positioned where the constructor puts it, not where it was
+written: `var kind = "plain"` above `var side` gives `Tagged(side, kind)`. A class that builds its own
+object in a hand-written `new` has no such list and is refused the positional form by name, with the
+named one offered instead; the same goes for a `new` that takes anything that is not a field.
+
+**Naming the class is also what lets a misspelled field be caught.** A bare `{ raduis: r }` is a legal
+pattern that never matches — any object may lack any field — so the arm is silently dead. Written
+after a class name there is a declaration to check it against, and it is refused where it stands.
+
+Both forms nest and both take an `@` binding, patterns being patterns wherever they stand. The test
+is the proto *walk*, so a pattern written for a base class takes an object of a class descended from
+it apart — the same question `is` answers.
+
 **`is` in a class header is TypeScript's `implements`** — a promise, checked where the class is
 written:
 
@@ -857,6 +890,49 @@ Counting links from whatever object turned up — `self.proto.proto` — is a di
 A class belongs to the top level of a file, as a `type` does and for the same reason: its name is
 resolved while compiling. `class` is a soft word, so a program already using it as a variable name is
 untouched.
+
+### Data types
+
+`data` declares a closed set of variants — an algebraic data type — and that closed set is what makes
+a `match` over one worth checking:
+
+```
+data Shape
+    Circle(r)
+    Rect(w, h)
+    Empty
+
+    area(self) = self match
+        Circle(r) -> 3 * r * r
+        Rect(w, h) -> w * h
+        Empty -> 0
+
+print(Circle(3), Circle(3).area())        // Circle(3) 27
+```
+
+**A variant is a class from the data type**, which is the whole of the implementation: `is Shape`, an
+annotation, `export`, a cross-file import and a method on the shared body are all the machinery
+`class` already had. `Circle(3)` is the generated constructor, reached by the rule that calling an
+object calls its `new`. A variant that declares no fields — `Empty` — is a *value* rather than a
+maker, so the test for it is identity.
+
+**A data value does not change.** A write to one of its fields is refused, and `v with { r: 4 }`
+answers a new one that differs there. Two equal ones are equal and hash alike, so a data value is an
+ordinary key.
+
+**A `match` over an annotated subject must cover every variant**, and the complaint names each one
+left out. It is checked exactly where the shape was written down — an unannotated subject is said
+nothing about — and a `_` arm is how a program says it has finished listing:
+
+```
+sides(s: Shape) = s match
+    Circle(_) -> 0
+    Rect(_, _) -> 4
+    Empty -> 0
+```
+
+Variants take the same two pattern forms a class does — `Circle(r)` by position, `Circle { r }` by
+name — and a field name the variant does not carry is refused where it is written.
 
 ### Tests
 
@@ -1002,8 +1078,8 @@ Two consequences worth knowing:
 
 A literate `.lsl` form, a name resolver for `connect`, Unicode case conversion, and a standard
 library beyond the builtins. Modules have no packages behind them either — every path is a file on
-disk. On the object side: `super`, a check that a proto satisfies a `type` when it is attached, and
-`class` as sugar over prototypes.
+disk. On the object side: `super`, and a check that a proto satisfies a `type` when it is
+attached to an object literal by hand.
 
 **`defer` is on sysl's list and is deliberately not here.** It earns its place in Go and in sysl
 because neither collects: a function that acquires something has to release it on every exit path,

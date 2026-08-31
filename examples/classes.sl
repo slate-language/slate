@@ -134,6 +134,54 @@ class Loud from Square
 
 print(Loud.new(2).describe())
 
+// -- taking a class apart in a pattern ---------------------------------------------------------------
+
+// A class name in a pattern tests which class made the value. Written with fields after it, it takes
+// the value apart in the same breath -- which is what a Scala case class does, and what `data`'s
+// variants already did.
+
+// **By position**, in the order the constructor takes them. That is not a convention to remember:
+// the list a pattern is checked against IS the parameter list of the `new` the class was given, so
+// `Square(n)` binds what `Square.new(4)` sets. A class that builds its own object in a hand-written
+// `new` has no such list, and slate says so rather than guessing.
+tell(v) = v match
+    Square(n) -> s"a square of side ${n}"
+    Circle(r, _) -> s"a circle of radius ${r}"
+    _ -> "something else"
+
+print(tell(Square.new(4)))
+print(tell(Circle.new(1)))
+print(tell(7))
+
+// **Or by name**, which is the one to reach for by default: it does not depend on the order, it picks
+// the fields it wants out of however many there are, and it reads as the object literal does.
+// `{ side }` is the shorthand for `{ side: side }` that every object pattern has.
+describe_one(v) = v match
+    Square { side } -> s"square ${side}"
+    Circle { radius: r } -> s"circle ${r}"
+    _ -> "?"
+
+print(describe_one(Square.new(2)))
+print(describe_one(Circle.new(3)))
+
+// **Naming the class is what lets a MISSPELLED FIELD be caught.** A bare `{ raduis: r }` is a legal
+// pattern that simply never matches, because any object may lack any field -- so the arm is silently
+// dead. Written after a class name there is a declaration to check it against, and `Circle { raduis: r }`
+// is refused where it stands.
+
+// Both forms nest, and both take an `@` binding, patterns being patterns wherever they stand.
+val pair = [Square.new(2), Circle.new(1)]
+
+print(pair match
+    [whole @ Square { side }, Circle(r, _)] -> s"${side} and ${r}, from ${whole.name()}"
+    _ -> "?")
+
+// **The test is the proto WALK, not one link of it**, so a pattern written for a base class takes an
+// object of a class descended from it apart. That is the same question `is` answers.
+print(Loud.new(3) match
+    Square(n) -> s"a Loud of side ${n}, matched as a Square"
+    _ -> "?")
+
 // -- when a class is not what you want ---------------------------------------------------------------
 
 // A class is shared behaviour. A method that has to capture something -- a counter, a handle, a
