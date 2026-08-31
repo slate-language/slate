@@ -2,6 +2,7 @@ module dev.slatelang.slate
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
+import sysl.text.str_builder
 
 // The walk: every statement and every expression, checked against what `fits.sysl` knows.
 //
@@ -346,6 +347,100 @@ private is_arithmetic(op: Tok) -> bool = op match
 
 // -- what is complained about ----------------------------------------------------------------------
 
+// Whether a `match` over a data type leaves one of its variants unmatched.
+//
+// **This is the one check in this pass that reports something the machine would refuse for a value
+// nobody has yet written down.** It is sound because the subject's own ANNOTATION is the promise: a
+// name declared `Shape` admits every variant of `Shape`, and a match that answers none of them for
+// one of those is a function that refuses a value its own signature accepts -- which the machine
+// meets as *"no arm of this match applies to ..."*. Where the subject's type is anything else, this
+// says nothing at all, which is nearly everywhere.
+private check_covers(subject: Expr, arms: Buf[Arm], env: *TypeEnv)
+    val subject_type = type_of_expr(subject, env)
+
+    val known = *subject_type.kind match
+        DataType(name, variants) -> (name, variants)
+        _ -> return
+
+    val data = known.0
+    val variants = known.1
+
+    // **A variant reached under another name says nothing here.** An import may rename, so a list
+    // naming `Circle` where the file binds it as `Round` would report a variant missing that is
+    // matched on the very next line. Silence is the safe direction and this is the whole of the
+    // guard: unless every name still resolves to the variant it names, nothing is claimed.
+    for i in 0..<variants.len()
+        if !variant_still_named(variants.at(i), subject.span) then return
+
+    var covered: Buf[string] = buf()
+
+    for i in 0..<arms.len()
+        // **A guarded arm covers nothing.** Its guard may answer false for a value its pattern fits,
+        // and the arm after it is then the one that has to have that value.
+        if arms.at(i).guard.is_none()
+            val pat = resolve_pattern(arms.at(i).pattern, 0)
+
+            // A pattern that matches anything is how a program says it has finished listing cases,
+            // and it is the way out of this check.
+            if catches_all(pat) then return
+
+            gather_variants(pat, &covered)
+
+    var missing: Buf[string] = buf()
+
+    for i in 0..<variants.len()
+        if !holds(covered, variants.at(i)) then missing.push(variants.at(i))
+
+    if missing.len() != 0
+        complain_here(subject.span, s"this match does not cover every ${data} -- ${listed(missing)} unmatched. Add an arm for it, or `_` for whatever is left")
+end check_covers
+
+// Whether a name still resolves to the variant of that name.
+private variant_still_named(name: string, at: Span) -> bool =
+    *resolve_pattern(pattern(at, Bind(name)), 0).kind match
+        VariantPat(n, _, _, _) -> n == name
+        _ -> false
+
+// Whether a pattern fits every value there is, which is what ends the listing.
+private catches_all(pat: Pattern) -> bool =
+    *pat.kind match
+        Wild -> true
+        Bind(_) -> true
+        At(_, inner) -> catches_all(inner)
+        _ -> false
+
+// The variants an arm accounts for.
+//
+// **An alternative may not bind, so `Circle | Rect` is the one shape that covers two** -- and an
+// alternative that is not a variant covers nothing, which is right: `Circle | 0` says nothing about
+// `Rect`.
+private gather_variants(pat: Pattern, into: *Buf[string])
+    *pat.kind match
+        VariantPat(name, _, _, _) -> if !holds(*into, name) then into.push(name)
+        OrPat(alts) ->
+            for i in 0..<alts.len()
+                gather_variants(alts.at(i), into)
+        At(_, inner) -> gather_variants(inner, into)
+        _ -> ()
+end gather_variants
+
+// `Circle` / `Circle and Rect` / `Circle, Rect and Empty` -- one name or a list read aloud.
+private listed(names: Buf[string]) -> string
+    if names.len() == 1 then return s"`${names.at(0)}` is"
+
+    var out = str_builder()
+
+    for i in 0..<names.len()
+        if i != 0 then out.push(if i == names.len() - 1 then " and " else ", ")
+
+        out.push_char('`')
+        out.push(names.at(i))
+        out.push_char('`')
+
+    out.push(" are")
+    out.finish()
+end listed
+
 private check_expr(x: Expr, env: *TypeEnv)
     val at = x.span
 
@@ -421,8 +516,18 @@ private check_expr(x: Expr, env: *TypeEnv)
                 enter_scope(env)
                 note_bindings(arms.at(i).pattern, env)
                 narrow_by_arm(subject, arms.at(i).pattern, env)
+
+                // **The guard is walked in the ARM's scope, and was not walked at all until now.**
+                // It runs where the pattern's names are bound, which is what it is for -- and a name
+                // misspelled in one was the single place the undefined-name check could not see.
+                arms.at(i).guard match
+                    Some(g) -> check_expr(g, env)
+                    None -> ()
+
                 check_expr(arms.at(i).body, env)
                 leave_scope(env)
+
+            check_covers(subject, arms, env)
         While(_, cond, body, otherwise) ->
             check_expr(cond, env)
             check_expr(body, env)
