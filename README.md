@@ -256,6 +256,12 @@ multiplication rather than like C's.
 `s"a ${b} c"` interpolates, `[v; n]` is an array of copies, `base with { f: v }` is a copy with a
 field changed, and every comma list takes a trailing comma.
 
+**A hole that is a single name needs no braces**, which is Scala's short form and covers most of
+them: `s"$w by $h"` is `s"${w} by ${h}"`. It is identifier-only and stops at the end of the name, so
+`$point.x` interpolates `point` and then reads `.x` as text — `${point.x}` says the other thing. `$$`
+is a literal `$`, and a `$` that does not begin a name is just itself, so `s"costs 5$"` needs nothing
+doing to it.
+
 **A parameter may carry what it is when nobody gives one**, on a definition, a lambda, a method or a
 class's `new`:
 

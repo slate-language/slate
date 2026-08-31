@@ -15,6 +15,32 @@ print(greeting[0], greeting[1], greeting[7])
 print(greeting[0..<5])
 print(chars("añb"))
 
+// -- writing values into a string --------------------------------------------------------------
+
+// `s"..."` renders what stands in its holes, and a hole that is a single name needs no braces --
+// which is Scala's short form and covers most of them.
+val w = 3
+val h = 4
+
+print(s"$w by $h")
+print(s"$w by $h" == s"${w} by ${h}")
+
+// **The short form is identifier-only and stops at the end of the name**, so anything with a dot, a
+// call or an operator in it wants the braces. That keeps where a hole ends a question with one
+// answer.
+val box = { w: 2, h: 5 }
+
+print(s"$box.w")
+print(s"${box.w} by ${box.h}, area ${box.w * box.h}")
+
+// `$$` is a literal `$`, and a `$` that begins no name is simply itself -- so a price needs nothing
+// doing to it.
+print(s"$$w is the text, $w is the value")
+print(s"costs 5$")
+
+// A hole renders as `print` would, so a container shows its contents rather than its address.
+print(s"${[1, 2]} and ${ { a: 1 } }")
+
 // Taking text apart and putting it back together.
 val row = "  name , age,  city  "
 val fields = split(row, ",")
