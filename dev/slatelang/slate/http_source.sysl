@@ -1,7 +1,5 @@
 module dev.slatelang.slate
 
-import sysl.text.str_builder
-
 // slate's HTTP server, written in slate and carried in the binary.
 //
 // **THE SECOND KIND OF BUILT-IN MODULE.** `slate:time`, `slate:fs`, `slate:net`, `slate:process` and
@@ -10,688 +8,686 @@ import sysl.text.str_builder
 // everything after the parse is the same: it follows its own imports, it runs, and what it exports is
 // what it wrote `export` in front of.
 //
-// **ONE ENTRY PER LINE, BECAUSE SYSL HAS NO RAW STRING LITERAL AND ITS SINGLE QUOTES ARE CHARACTERS.**
-// The alternative is one enormous literal nobody could read or safely edit. What the shape costs is
-// that the module's own quotes and backslashes are escaped here and are not escaped in the module --
-// so `\r\n` below is the two characters slate's lexer will see, and a reader comparing this against
-// a slate file should expect exactly that one difference.
+// **A RAW TEXT BLOCK, SO WHAT IS WRITTEN HERE IS WHAT SLATE READS.** `raw"""` takes no escapes and
+// strips only the incidental indentation, so the module sits below at four spaces and reaches the
+// lexer at the margin -- and a `\r\n`, a quote or a `${...}` in it means itself. `js_rt.sysl` carries
+// JavaScript the same way and for the same reason.
+//
+// **It was 667 escaped strings in an array until 2026-08-30**, one per line, because this file's own
+// header said sysl had no raw string literal. **That had stopped being true**: sysl has had `"""` on
+// any quote form since before the JavaScript back end was written, and `js_rt.sysl` had been using
+// one the whole time. What the array cost was that every quote and backslash in the module was
+// escaped here and not in the module, so editing `slate:http` meant a round trip through an escaping
+// nobody could check by eye. The conversion was verified by decoding the array and diffing it against
+// what this block answers: not one byte moved.
 
 // The module's source, as slate will read it.
-http_source() -> string
-    var out = str_builder()
+http_source() -> string = raw"""
+    // An HTTP server, written in slate on the sockets slate already has.
+    //
+    // This module is slate, not the machine: `serve` is a function over `listen`, `onBytes`, `send` and
+    // `close`, the way node's `http` is JavaScript over its own C sockets. **The parse is not slate**,
+    // and that is node's layering too -- `httpParser` is llhttp, the state machine node itself is built
+    // on. What each side owns is the whole of the split: this module decides everything a *server*
+    // decides, and llhttp decides only what the bytes are.
+    //
+    // ## Keep-alive, and who decides it
+    //
+    // **A connection carries as many requests as the client wants.** The handshake and the socket are
+    // paid for once rather than once per request, which is what a browser and every HTTP library already
+    // expect. **The client decides, by HTTP's own rule**: `HTTP/1.1` keeps the connection unless the
+    // request says `Connection: close`, `HTTP/1.0` closes it unless the request asks for `keep-alive`.
+    // That reading is llhttp's now rather than this module's, and it arrives as `req.keepAlive`. Every
+    // response says which of the two happened, so a client is never left to guess.
+    //
+    // **Requests on one connection are answered one at a time, in order.** A second request that arrives
+    // while the first is still being answered waits in the parser until the first has been written --
+    // which is what a client that pipelined them is owed, HTTP having no request ids: answers are
+    // matched to requests by their order and by nothing else.
+    //
+    // **A connection with nothing outstanding is closed after `IdleMillis`.** A client may keep a
+    // connection and then simply go away, and without a clock that socket is held forever. This is the
+    // decision keep-alive costs and there is no avoiding it: a server that keeps connections has to say
+    // when a quiet one has ended.
+    //
+    // ## Why the parse is not written here
+    //
+    // **Recognising a well-formed request is not the hard part.** The hard part is the request that is
+    // malformed on purpose: two `Content-Length` headers, or one beside a `Transfer-Encoding`, is a
+    // request-smuggling primitive -- one hop reads a body where the next reads a second request, and
+    // that is how a cache is poisoned and an authorization check is walked past. llhttp is generated
+    // from a state machine and refuses those by construction.
+    //
+    // **And a byte-at-a-time scan is the worst thing an interpreted language can be asked to do.** It
+    // runs over every byte of every request, and the scan restarted from the front of the buffer on each
+    // arrival, so a large body cost the interpreter time proportional to its square.
+    //
+    // ## A request that is too big is refused rather than held
+    //
+    // **`HeadBytes` and `BodyBytes` are the limits, and they are the reason for the tier of the parser
+    // this module uses.** A server that grows a buffer for as long as bytes keep arriving is one
+    // connection away from being over, and it does not take an attacker -- a file upload sent to a JSON
+    // endpoint does it. Over the head is `431`, over the body is `413`, and neither is `400`: the
+    // request was HTTP, this server has simply decided not to hold it, which is something a client can
+    // act on.
+    //
+    // ## What is deliberately not here
+    //
+    // **No routing**, and that is the only thing left on this list. A handler is a function from a
+    // request to a response, and matching on `req.path` is something slate can already do -- a router
+    // that only ever called `startsWith` would be a thing to learn for nothing.
+    //
+    // ## Two servers, and which one a program wants
+    //
+    // **`serve` reads each body whole**, so `req.body` is a string. That is the right shape for the
+    // requests a program written in slate actually gets, and it is bounded by `BodyBytes`.
+    //
+    // **`serveStream` calls the handler as soon as the head is complete** and hands it the body as it
+    // arrives, so the memory a request costs stops depending on how big the request is. It is the same
+    // server otherwise: the same keep-alive rule, the same order, the same clock.
+    //
+    import { listen, onBytes, send, close as shutSocket } from slate:net
 
-    for i in 0..<HttpLines.len
-        out.push(HttpLines[i])
-        out.push("\n")
+    // `close(server)` -- and with it the program's last reason to stay alive.
+    //
+    // **A server is a socket, so this is the network's `close` under another name.** It is exported here
+    // so that a program serving HTTP needs one import rather than two, and so that a later server that
+    // is more than a socket can change what closing means without changing what programs write.
+    export close(server) = shutSocket(server)
 
-    out.finish()
-end http_source
+    // `serve(port, handler)` -- listen, and call `handler` with each request.
+    //
+    // The answer is the listening socket, which is what a program closes -- and closing it is the only
+    // way a program with a server in it ever exits.
+    export serve(port, handler, onUpgrade = null) = server(port, handler, false, onUpgrade)
 
-private val HttpLines: []const string = [
-    "// An HTTP server, written in slate on the sockets slate already has.",
-    "//",
-    "// This module is slate, not the machine: `serve` is a function over `listen`, `onBytes`, `send` and",
-    "// `close`, the way node's `http` is JavaScript over its own C sockets. **The parse is not slate**,",
-    "// and that is node's layering too -- `httpParser` is llhttp, the state machine node itself is built",
-    "// on. What each side owns is the whole of the split: this module decides everything a *server*",
-    "// decides, and llhttp decides only what the bytes are.",
-    "//",
-    "// ## Keep-alive, and who decides it",
-    "//",
-    "// **A connection carries as many requests as the client wants.** The handshake and the socket are",
-    "// paid for once rather than once per request, which is what a browser and every HTTP library already",
-    "// expect. **The client decides, by HTTP's own rule**: `HTTP/1.1` keeps the connection unless the",
-    "// request says `Connection: close`, `HTTP/1.0` closes it unless the request asks for `keep-alive`.",
-    "// That reading is llhttp's now rather than this module's, and it arrives as `req.keepAlive`. Every",
-    "// response says which of the two happened, so a client is never left to guess.",
-    "//",
-    "// **Requests on one connection are answered one at a time, in order.** A second request that arrives",
-    "// while the first is still being answered waits in the parser until the first has been written --",
-    "// which is what a client that pipelined them is owed, HTTP having no request ids: answers are",
-    "// matched to requests by their order and by nothing else.",
-    "//",
-    "// **A connection with nothing outstanding is closed after `IdleMillis`.** A client may keep a",
-    "// connection and then simply go away, and without a clock that socket is held forever. This is the",
-    "// decision keep-alive costs and there is no avoiding it: a server that keeps connections has to say",
-    "// when a quiet one has ended.",
-    "//",
-    "// ## Why the parse is not written here",
-    "//",
-    "// **Recognising a well-formed request is not the hard part.** The hard part is the request that is",
-    "// malformed on purpose: two `Content-Length` headers, or one beside a `Transfer-Encoding`, is a",
-    "// request-smuggling primitive -- one hop reads a body where the next reads a second request, and",
-    "// that is how a cache is poisoned and an authorization check is walked past. llhttp is generated",
-    "// from a state machine and refuses those by construction.",
-    "//",
-    "// **And a byte-at-a-time scan is the worst thing an interpreted language can be asked to do.** It",
-    "// runs over every byte of every request, and the scan restarted from the front of the buffer on each",
-    "// arrival, so a large body cost the interpreter time proportional to its square.",
-    "//",
-    "// ## A request that is too big is refused rather than held",
-    "//",
-    "// **`HeadBytes` and `BodyBytes` are the limits, and they are the reason for the tier of the parser",
-    "// this module uses.** A server that grows a buffer for as long as bytes keep arriving is one",
-    "// connection away from being over, and it does not take an attacker -- a file upload sent to a JSON",
-    "// endpoint does it. Over the head is `431`, over the body is `413`, and neither is `400`: the",
-    "// request was HTTP, this server has simply decided not to hold it, which is something a client can",
-    "// act on.",
-    "//",
-    "// ## What is deliberately not here",
-    "//",
-    "// **No routing**, and that is the only thing left on this list. A handler is a function from a",
-    "// request to a response, and matching on `req.path` is something slate can already do -- a router",
-    "// that only ever called `startsWith` would be a thing to learn for nothing.",
-    "//",
-    "// ## Two servers, and which one a program wants",
-    "//",
-    "// **`serve` reads each body whole**, so `req.body` is a string. That is the right shape for the",
-    "// requests a program written in slate actually gets, and it is bounded by `BodyBytes`.",
-    "//",
-    "// **`serveStream` calls the handler as soon as the head is complete** and hands it the body as it",
-    "// arrives, so the memory a request costs stops depending on how big the request is. It is the same",
-    "// server otherwise: the same keep-alive rule, the same order, the same clock.",
-    "//",
-    "import { listen, onBytes, send, close as shutSocket } from slate:net",
-    "",
-    "// `close(server)` -- and with it the program's last reason to stay alive.",
-    "//",
-    "// **A server is a socket, so this is the network's `close` under another name.** It is exported here",
-    "// so that a program serving HTTP needs one import rather than two, and so that a later server that",
-    "// is more than a socket can change what closing means without changing what programs write.",
-    "export close(server) = shutSocket(server)",
-    "",
-    "// `serve(port, handler)` -- listen, and call `handler` with each request.",
-    "//",
-    "// The answer is the listening socket, which is what a program closes -- and closing it is the only",
-    "// way a program with a server in it ever exits.",
-    "export serve(port, handler, onUpgrade = null) = server(port, handler, false, onUpgrade)",
-    "",
-    "// `serveStream(port, handler)` -- the same server, calling `handler` as soon as a request's head is",
-    "// complete and handing it the body as it arrives.",
-    "//",
-    "// A streamed request has no `body`. What it has instead is `each`:",
-    "//",
-    "//     serveStream(3000, async (req) ->",
-    "//         var total = 0",
-    "//",
-    "//         await req.each((chunk) -> total = total + len(chunk))",
-    "//",
-    "//         \"that was \" + string(total) + \" bytes\")",
-    "//",
-    "// **`each` answers a promise for the number of bytes the body turned out to be**, and it is not a",
-    "// generator: slate's generators are pulled and are synchronous, so a chunk that has not arrived",
-    "// cannot be pulled. The chunk it hands over is a byte array, which is what `slate:net` delivers and",
-    "// what `toBytes` and `fromBytes` convert.",
-    "//",
-    "// **Call `each` before the handler's first `await`.** Chunks arriving before it is called are held",
-    "// for it, so nothing is ever lost -- but a handler that holds them is a handler accumulating the",
-    "// body, which is the thing it asked not to do. One that never calls `each` at all accumulates the",
-    "// whole of it and is stopped by `BodyBytes`, exactly as `serve` is.",
-    "//",
-    "// **Two exports rather than one with an option, and that is settled.** `serve(port, handler,",
-    "// options = {})` is writable and would break nothing -- but the two differ by what the HANDLER IS",
-    "// GIVEN rather than by what the server was told: a streamed request has no `body`, and answers",
-    "// `each` instead. Under one name the shape of the function being written would be decided by a",
-    "// flag several lines above it, where the name being called says it outright.",
-    "export serveStream(port, handler, onUpgrade = null) = server(port, handler, true, onUpgrade)",
-    "",
-    "server(port, handler, streaming, onUpgrade) =",
-    "    // **The handler is checked here and the port is not**, which is the layering rather than an",
-    "    // oversight: `listen` is given the port and complains about it in its own words, while nothing",
-    "    // would look at the handler until the first request arrived -- an hour later, on a connection",
-    "    // somebody was waiting for. This is what `throw` is for.",
-    "    if !(handler is function) then throw \"`serve` needs a function to call with each request\"",
-    "",
-    "    // **Checked here for the same reason the handler is**: a connection asking to upgrade may not",
-    "    // arrive for an hour, and a program that passed the wrong thing wants to hear about it now.",
-    "    if onUpgrade != null && !(onUpgrade is function)",
-    "        throw \"`serve` needs a function to call with an upgrade, and this is not one\"",
-    "",
-    "    accept(conn)",
-    "        // The parser this connection's bytes go through. **Nothing is buffered here**: what a",
-    "        // request is made of is llhttp's business, and this module asks only what it has ready.",
-    "        val parser = if streaming then httpStream(HeadBytes) else httpParser(HeadBytes, BodyBytes)",
-    "",
-    "        // Whether a request is being answered. **This is what puts the connection in order**: a",
-    "        // second request waits in the parser until the first has been written, because HTTP matches",
-    "        // an answer to a request by its position in the stream and by nothing else.",
-    "        var busy = false",
-    "",
-    "        // Whether this connection is finished. Every way out sets it, so nothing writes to a closed",
-    "        // socket and no timer fires against one.",
-    "        var shut = false",
-    "",
-    "        // Whether the client has stopped sending. A request completed by the end of the stream is",
-    "        // still answered, and the connection is not kept afterwards whatever it asked for.",
-    "        var ended = false",
-    "",
-    "        // The clock that closes a connection nobody is using, or null while it is not running.",
-    "        var idle = null",
-    "",
-    "        // What a streamed request is made of while it is being read. `sink` is the function the",
-    "        // handler asked to be given the body, `ending` is the promise it is awaiting, `held` is what",
-    "        // arrived before it asked, `got` is how much of the body has been handed over, and `reading`",
-    "        // says whether the parts still coming out of the parser belong to the request being answered",
-    "        // -- which is what keeps a pipelined second request waiting for the first.",
-    "        var sink = null",
-    "",
-    "        // Whether the handler is still running and might yet ask for the body. **This is what says",
-    "        // where a chunk goes, and `busy` used to stand in for it wrongly**: `busy` stays up until",
-    "        // the answer has been WRITTEN, so a handler that answered without asking went on holding the",
-    "        // rest of the upload while its own response was going out -- and a large enough body was",
-    "        // refused with `413` after it had already been answered `200`.",
-    "        var holding = false",
-    "",
-    "        var ending = null",
-    "        var held = []",
-    "        var heldBytes = 0",
-    "        var got = 0",
-    "        var reading = false",
-    "",
-    "        // Stop the clock, a connection with something to do not being idle by definition.",
-    "        awake()",
-    "            if idle != null",
-    "                clearTimeout(idle)",
-    "",
-    "                idle = null",
-    "",
-    "        stop()",
-    "            if shut then return",
-    "",
-    "            shut = true",
-    "",
-    "            awake()",
-    "            release()",
-    "            httpClose(parser)",
-    "            shutSocket(conn)",
-    "",
-    "        // Stop being this connection's server, and leave the socket open.",
-    "        //",
-    "        // **Everything `stop` does except closing the socket**, which is the whole of what handing a",
-    "        // connection to another protocol means: the clock is stopped, the parser is let go, and every",
-    "        // path back into this module is closed by `shut` -- but the socket belongs to somebody else",
-    "        // now and closing it is theirs to do.",
-    "        handOver()",
-    "            if shut then return",
-    "",
-    "            shut = true",
-    "",
-    "            awake()",
-    "            release()",
-    "            httpClose(parser)",
-    "",
-    "        // Let go of a handler waiting for a body that is not going to finish arriving.",
-    "        //",
-    "        // **The count it is given is short of the `Content-Length` it was promised**, which is how a",
-    "        // handler tells a client that hung up mid-upload from one that did not. Answering the promise",
-    "        // rather than failing it is deliberate: a client going away is the ordinary end of a",
-    "        // connection and not a defect in the program, and a failure here would be put back by",
-    "        // `answer` and would stop the server.",
-    "        release()",
-    "            if ending != null",
-    "                reading = false",
-    "",
-    "                settle(ending, got)",
-    "",
-    "                ending = null",
-    "",
-    "        // Start the clock, which is what every path that leaves the connection with nothing",
-    "        // outstanding ends with.",
-    "        quiet()",
-    "            awake()",
-    "",
-    "            idle = setTimeout(stop, IdleMillis)",
-    "",
-    "        // **A handler may answer a promise, and the ordinary one does** -- it reads a file, asks a",
-    "        // database, calls another service. `await` on something that is not a promise answers it",
-    "        // unchanged, so both kinds of handler take this one path.",
-    "        //",
-    "        // **A HANDLER THAT THROWS AND A WRITE THAT FAILS ARE NOT THE SAME THING**, and they used to",
-    "        // share a `try`. A defect in a handler is a defect in the program: the client is told, and",
-    "        // the fault is put back afterwards, where nothing awaits it and it reaches the loop and stops",
-    "        // the program as any other fault would. **A write that fails is a client that has gone** --",
-    "        // it hung up, or it was never going to read the answer -- which is the ordinary end of a",
-    "        // connection and no reason at all to stop the server. Taking the second for the first meant a",
-    "        // client pressing ^C mid-request could end the process, and streaming makes that the common",
-    "        // case rather than a rare one, since a handler now runs while the client is still sending.",
-    "        async answer(req, again)",
-    "            var reply = null",
-    "",
-    "            try",
-    "                reply = await handler(req)",
-    "            catch e",
-    "                holding = false",
-    "",
-    "                await refuse(500, \"this request was not answered\")",
-    "                throw e",
-    "",
-    "            // **The handler has had its chance to ask**, so nothing is held for it from here: the",
-    "            // rest of the body is read off the wire and dropped, which is what the three cases in",
-    "            // `pump` say and what `busy` was too coarse to express.",
-    "            //",
-    "            // **What was held BEFORE it answered goes too, and saying \"holding nothing\" without",
-    "            // this was not quite true.** Those bytes were kept for an `each` that is not coming;",
-    "            // leaving them would hold a whole body until the connection's next request, which on a",
-    "            // kept connection is exactly the megabyte streaming exists not to hold.",
-    "            holding = false",
-    "            held = []",
-    "            heldBytes = 0",
-    "",
-    "            try",
-    "                await write(conn, req, reply, again)",
-    "            catch e",
-    "                stop()",
-    "                return",
-    "",
-    "            busy = false",
-    "",
-    "            // **The next request may already be here**, where a client pipelined -- so this is not a",
-    "            // wait for more bytes to arrive, it is the turn the second request has been waiting for.",
-    "            if again",
-    "                quiet()",
-    "                next()",
-    "            else",
-    "                stop()",
-    "",
-    "        // A response this connection writes for itself, and its last: a request this server could not",
-    "        // read leaves the stream at an offset nobody knows, so there is nothing to keep it open for.",
-    "        //",
-    "        // **`busy` is set here rather than by the caller, and that is safe because an `async` body",
-    "        // runs up to its first `await` before the caller goes on** -- so by the time `step` returns,",
-    "        // this connection is marked as owing an answer.",
-    "        async refuse(status, message)",
-    "            busy = true",
-    "",
-    "            // **The same rule as `answer`'s second half**: the connection this is complaining about",
-    "            // may already have gone, and failing to deliver a complaint about a client is not",
-    "            // something to complain about.",
-    "            try",
-    "                await plainly(conn, status, message)",
-    "            catch e",
-    "                val gone = e",
-    "",
-    "            stop()",
-    "",
-    "        // Take one whole request from the parser, where there is one and nothing else is owed.",
-    "        step()",
-    "            if shut || busy then return",
-    "",
-    "            val req = httpTake(parser)",
-    "",
-    "            if req == null then return",
-    "",
-    "            busy = true",
-    "",
-    "            awake()",
-    "",
-    "            // **A connection the client has already closed is not kept**, whatever the request asked",
-    "            // for -- there is nobody left to send the next one.",
-    "            answer(req, req.keepAlive && !ended)",
-    "",
-    "        // Hand over the pieces of a streamed request as they come out of the parser.",
-    "        pump()",
-    "            if shut then return",
-    "",
-    "            while true",
-    "                // **A pipelined second request waits its turn**, exactly as it does in `step`: a",
-    "                // part is only pulled while it still belongs to the request being answered.",
-    "                if busy && !reading then return",
-    "",
-    "                val p = httpTakePart(parser)",
-    "",
-    "                if p == null then return",
-    "",
-    "                if p.kind == \"head\"",
-    "                    busy = true",
-    "                    reading = true",
-    "                    holding = true",
-    "                    sink = null",
-    "                    held = []",
-    "                    heldBytes = 0",
-    "                    got = 0",
-    "                    ending = pending()",
-    "",
-    "                    awake()",
-    "",
-    "                    // **A connection the client has already closed is not kept**, whatever the",
-    "                    // request asked for -- there is nobody left to send the next one.",
-    "                    answer(streamed(p), p.keepAlive && !ended)",
-    "                elif p.kind == \"body\"",
-    "                    got = got + len(p.chunk)",
-    "",
-    "                    // **Three things a chunk can be, and only the middle one is held.**",
-    "                    //",
-    "                    // The handler asked for the body, so it gets it. Or the handler has already",
-    "                    // answered without asking -- which is an ordinary thing to do, and the rest of",
-    "                    // the body is then read off the wire and **dropped**, holding nothing and",
-    "                    // keeping the stream aligned for whatever comes next. Or the handler is still",
-    "                    // running and has not asked yet, and that is the only case with anywhere to put",
-    "                    // the bytes: they are held for an `each` that may still be coming, and a handler",
-    "                    // that never asks is a handler accumulating the whole body, which is the case",
-    "                    // `serve` bounds and this has to bound the same way.",
-    "                    if sink != null",
-    "                        sink(p.chunk)",
-    "                    elif holding",
-    "                        held.push(p.chunk)",
-    "",
-    "                        heldBytes = heldBytes + len(p.chunk)",
-    "",
-    "                        // **`reading` goes down FIRST, and without that the refusal repeats.**",
-    "                        // `refuse` is async, so `shut` is not set until after its write -- and every",
-    "                        // chunk arriving in the meantime would come back through here, be held, be",
-    "                        // over the limit again, and be refused again. The accumulating server does",
-    "                        // not have the problem because llhttp pauses itself; this one has to say so.",
-    "                        if heldBytes > BodyBytes",
-    "                            reading = false",
-    "",
-    "                            tooLarge()",
-    "                            return",
-    "                else",
-    "                    reading = false",
-    "",
-    "                    settle(ending, got)",
-    "",
-    "                    ending = null",
-    "",
-    "        // The bound was passed -- but the handler is given the turn it is owed before it is refused.",
-    "        //",
-    "        // **`holding` is cleared a turn LATE for a handler that answers outright, and that turn is",
-    "        // this race.** `answer` calls the handler at once, but `await` on a value that is not a",
-    "        // promise still yields, deliberately, so `holding = false` runs only when the scheduler",
-    "        // comes back to it -- and a client that pushes a megabyte in the meantime drew a `413` for",
-    "        // a body the handler had already decided not to read. It arrived BEFORE the answer, on the",
-    "        // same connection, which is two responses to one request.",
-    "        //",
-    "        // **`await 0` IS the one turn**, and it is a timer-free one: awaiting a value that is not a",
-    "        // promise queues a resumption and nothing else, so this comes back in the same drain pass",
-    "        // rather than at whatever the event loop does next.",
-    "        //",
-    "        // **Waiting one turn settles it in the right order, and not by luck.** `ready` is drained in",
-    "        // the order it was filled, and `answer` was queued when the head was parsed -- before any of",
-    "        // these bytes existed -- so it always resumes first. What is left to ask afterwards is the",
-    "        // question the bound is actually about: is the handler STILL running and still not asking?",
-    "        // An `async` handler that has not settled is, and is refused exactly as before.",
-    "        async tooLarge()",
-    "            await 0",
-    "",
-    "            if holding && sink == null",
-    "                await refuse(413, \"the body is larger than \" + string(BodyBytes) + \" bytes\")",
-    "                return",
-    "",
-    "            // **The handler answered, or asked, in the turn it was given -- so reading goes back",
-    "            // on.** Leaving it down would be worse than the wrong refusal it replaces: a handler",
-    "            // that asked would wait forever for a body nobody is pulling any more.",
-    "            reading = true",
-    "",
-    "            next()",
-    "",
-    "        // The request a streaming handler is given: the head, and the one way of asking for the rest.",
-    "        streamed(p) =",
-    "            val req = { method: p.method, path: p.path, query: p.query, headers: p.headers,",
-    "                        keepAlive: p.keepAlive }",
-    "",
-    "            // **Stored on the object rather than reached through a proto**, so calling it passes the",
-    "            // function what it was given and nothing else -- `req.each(f)` is `f` and no receiver,",
-    "            // which is what this wants.",
-    "            req.each = (f) ->",
-    "                sink = f",
-    "",
-    "                for c in held",
-    "                    f(c)",
-    "",
-    "                held = []",
-    "                heldBytes = 0",
-    "",
-    "                ending",
-    "",
-    "            req",
-    "",
-    "        // Whichever of the two this connection reads with. Every path that has just made progress",
-    "        // ends here rather than at one of them.",
-    "        next()",
-    "            if streaming then pump() else step()",
-    "",
-    "        // **Called after every chunk, because there is no other way to know a request is whole.**",
-    "        // TCP hands over whatever has arrived, and a request may be split anywhere at all --",
-    "        // including in the middle of the blank line that ends its headers.",
-    "        arrived(chunk)",
-    "            if shut then return",
-    "",
-    "            // The client has hung up. **Not an error**: that is how a client ends a kept connection",
-    "            // it has finished with, and it is the ordinary end of most of them. A request whose body",
-    "            // ran to the end of the stream is completed by `httpFinish` and still answered.",
-    "            if chunk == null",
-    "                ended = true",
-    "",
-    "                httpFinish(parser)",
-    "                next()",
-    "",
-    "                // **A body that was still arriving is not going to finish.** `httpFinish` completes a",
-    "                // request that ends at end-of-file and says nothing about one that does not, so the",
-    "                // handler awaiting the rest of this body is let go here or waits forever.",
-    "                release()",
-    "",
-    "                if !busy then stop()",
-    "",
-    "                return",
-    "",
-    "            awake()",
-    "",
-    "            // **A refusal is an answer rather than a fault.** The bytes were not a request this",
-    "            // server will act on, so the status goes back and the connection ends -- taking the",
-    "            // program down over a bad client would be the wrong trade entirely.",
-    "            val bad = httpFeed(parser, chunk)",
-    "",
-    "            if bad != null",
-    "                refuse(bad.status, bad.message)",
-    "                return",
-    "",
-    "            // **A request that asked to stop being HTTP ends this module's interest in the socket.**",
-    "            // `httpUpgraded` answers where the HTTP stopped, and everything after that offset belongs",
-    "            // to whatever protocol the client asked for. **Zero is a real answer** -- a handshake that",
-    "            // arrived on its own leaves nothing behind it -- so the test is against `null`.",
-    "            val upTo = httpUpgraded(parser)",
-    "",
-    "            if upTo != null",
-    "                hoist(chunk, upTo)",
-    "                return",
-    "",
-    "            next()",
-    "",
-    "            if !busy then quiet()",
-    "",
-    "        // The request that asked to upgrade, taken from whichever parser this server is using.",
-    "        //",
-    "        // **A streaming server has no `httpTake`**, so the handshake comes out as a head part -- which",
-    "        // carries everything a whole request does but its body, and a handshake has no body.",
-    "        upgradeRequest()",
-    "            if !streaming then return httpTake(parser)",
-    "",
-    "            val part = httpTakePart(parser)",
-    "",
-    "            if part == null || part.kind != \"head\" then null else part",
-    "",
-    "        // Hand this connection to whoever was told to expect one.",
-    "        //",
-    "        // **The bytes left over are from THIS FEED, not from the connection.** `httpUpgraded` counts",
-    "        // into the chunk it was given, so `chunk[upTo..]` is what the other protocol has already sent",
-    "        // and what it would otherwise never see -- a client that pipelines its first frame behind the",
-    "        // handshake is ordinary, and losing it would look like a peer that said nothing.",
-    "        hoist(chunk, upTo)",
-    "            val req = upgradeRequest()",
-    "",
-    "            // **A server with no upgrade handler says so rather than going quiet.** The client asked",
-    "            // for a protocol this program does not speak, which is something it can act on; leaving",
-    "            // it holding a socket nothing will ever answer is not.",
-    "            if onUpgrade == null || req == null",
-    "                refuse(501, \"this server does not upgrade connections\")",
-    "                return",
-    "",
-    "            handOver()",
-    "",
-    "            onUpgrade(req, conn, chunk[upTo..])",
-    "",
-    "        onBytes(conn, arrived)",
-    "",
-    "        // **The clock starts before the first request, not after it.** A client that opens a",
-    "        // connection and then says nothing is exactly as quiet as one that has stopped mid-stream.",
-    "        quiet()",
-    "",
-    "    listen(port, accept)",
-    "",
-    "// How long a connection with nothing outstanding is held open. **Node's number**, and the reasoning",
-    "// is the same: long enough that a browser fetching a page and its stylesheet reuses one connection,",
-    "// short enough that a client that has gone away is not remembered for long.",
-    "val IdleMillis = 5000",
-    "",
-    "// How much of a request this server will hold before refusing it.",
-    "//",
-    "// **Node's llhttp defaults, and the reasoning is the same**: eight kilobytes of head is more than any",
-    "// browser sends and less than any attack, and a megabyte of body is a JSON document rather than a",
-    "// file upload. A server that wants uploads wants `serveStream`, where `BodyBytes` bounds only what a",
-    "// handler leaves unasked-for and the head limit is the only one a body is measured against at all.",
-    "val HeadBytes = 8192",
-    "val BodyBytes = 1048576",
-    "",
-    "// The smallest body worth compressing, and how hard to compress it.",
-    "//",
-    "// **Below a kilobyte brotli usually makes a body larger**, having a frame to write, and the round",
-    "// trip costs a client more than the bytes save it. Quality 5 is the on-the-fly setting: 0-4 are",
-    "// faster and 9-11 are for something built ahead of time -- quality 11 on a megabyte costs about half",
-    "// a second and 60 MB of working memory, which is not what a request handler should be doing.",
-    "val CompressBytes = 1024",
-    "val CompressQuality = 5",
-    "",
-    "// What a handler answered, written to the socket.",
-    "//",
-    "// **A string is a whole response**, which is what makes the first program somebody writes one line",
-    "// long. An object says more -- `{ status, headers, body }` -- and every part of it is optional.",
-    "// Anything else is rendered as `print` would render it, which is what a handler answering a number",
-    "// or an array meant.",
-    "//",
-    "// **A BODY WORTH COMPRESSING GOES OUT COMPRESSED, AND THE HANDLER IS NOT ASKED.** Every browser",
-    "// sends `Accept-Encoding: br` and on text brotli is worth roughly a sixth over gzip, so a server",
-    "// that made this a decision would be making everybody write the same three lines. The escape hatch",
-    "// is to set `Content-Encoding` yourself, which says the body is already encoded and is left alone.",
-    "write(conn, req, v, keep) =",
-    "    var status = 200",
-    "    var body = \"\"",
-    "    var extra = \"\"",
-    "    var encoded = false",
-    "",
-    "    if v is string",
-    "        body = v",
-    "    elif v is object",
-    "        if has(v, \"status\") then status = v.status",
-    "",
-    "        if has(v, \"body\")",
-    "            body = if v.body is string then v.body else string(v.body)",
-    "",
-    "        if has(v, \"headers\")",
-    "            for [k, hv] in entries(v.headers)",
-    "                if lower(k) == \"content-encoding\" then encoded = true",
-    "",
-    "                extra = extra + k + \": \" + string(hv) + \"\\r\\n\"",
-    "    else",
-    "        body = string(v)",
-    "",
-    "    val raw = toBytes(body)",
-    "",
-    "    if encoded || len(raw) < CompressBytes || !wantsBrotli(req)",
-    "        return reply(conn, status, extra, body, keep)",
-    "",
-    "    // **`Vary` goes on whether or not this one was compressed**, because what a cache must not do is",
-    "    // hand a compressed body to a client that did not ask for one -- and it cannot know that unless",
-    "    // every response whose content depended on `Accept-Encoding` says so.",
-    "    val varied = extra + \"Vary: Accept-Encoding\\r\\n\"",
-    "",
-    "    val small = compress(raw, CompressQuality)",
-    "",
-    "    // **A body that does not get smaller is sent as it was.** Brotli frames its input, so something",
-    "    // already compressed -- a PNG, a zip, an asset built ahead of time -- comes back slightly larger,",
-    "    // and sending that would cost the client a decode for nothing.",
-    "    if len(small) >= len(raw)",
-    "        return reply(conn, status, varied, body, keep)",
-    "",
-    "    replyBytes(conn, status, varied + \"Content-Encoding: br\\r\\n\", small, keep)",
-    "",
-    "// Whether this client asked for brotli, reading the header rather than looking for the two letters.",
-    "//",
-    "// **`br;q=0` is a client saying it would rather not**, which is not the same as not mentioning it,",
-    "// and `deflate` contains no `br` but a future token might -- so the field is split into its tokens",
-    "// the way the specification says it is.",
-    "wantsBrotli(req) =",
-    "    if req == null then return false",
-    "    if !has(req.headers, \"accept-encoding\") then return false",
-    "",
-    "    for part in split(lower(req.headers[\"accept-encoding\"]), \",\")",
-    "        val token = trim(part)",
-    "",
-    "        if token == \"br\" || startsWith(token, \"br;\")",
-    "            if contains(token, \"q=0\") && !contains(token, \"q=0.\") then return false",
-    "",
-    "            return true",
-    "",
-    "    false",
-    "",
-    "// A response this module writes for itself, where there is no handler answer to write. **Always the",
-    "// connection's last**, so it never has to say whether one is being kept.",
-    "//",
-    "// **Never compressed**, and not for want of a request to ask: these are short sentences about a",
-    "// request that could not be read, and a client being told why is a client that may not be in a",
-    "// state to decode anything.",
-    "plainly(conn, status, message) = reply(conn, status, \"\", message, false)",
-    "",
-    "// **`Content-Length` is counted in BYTES and not in characters**, which is the one place this module",
-    "// has to remember that a slate string is characters: a body with an `é` in it is one byte longer",
-    "// than it is characters, and a wrong length here is a client that hangs waiting for the rest of a",
-    "// response that has all arrived.",
-    "//",
-    "// **This answers a promise and closes nothing**, which is what makes keep-alive possible at all: the",
-    "// caller awaits it and then decides. Where the decision is to close, the close comes after the await",
-    "// and that ordering is the whole of it -- closing a socket with a write still queued throws the write",
-    "// away, and the difference a client sees is between a response and a reset connection.",
-    "async reply(conn, status, extra, body, keep)",
-    "    await send(conn, head(status, extra, len(toBytes(body)), keep) + body)",
-    "",
-    "// The same, for a body that is already bytes.",
-    "//",
-    "// **Two functions rather than one taking bytes always**, because a slate byte array is one value per",
-    "// byte: making every response go through one would cost a megabyte of text a million boxed integers",
-    "// for nothing. The compressed path pays it because the body is small by then, and it is the only",
-    "// path that has to.",
-    "async replyBytes(conn, status, extra, body, keep)",
-    "    await send(conn, concat(toBytes(head(status, extra, len(body), keep)), body))",
-    "",
-    "// The status line, the headers and the blank line that ends them.",
-    "//",
-    "// **The brackets are what continue the lines**, a trailing `+` outside a bracket pair not being a",
-    "// continuation in slate -- which is why the expression this was cut out of never needed them and",
-    "// this does.",
-    "head(status, extra, length, keep) =",
-    "    (\"HTTP/1.1 \" + string(status) + \" \" + reason(status) + \"\\r\\n\" + extra +",
-    "        \"Content-Length: \" + string(length) + \"\\r\\nConnection: \" +",
-    "        (if keep then \"keep-alive\" else \"close\") + \"\\r\\n\\r\\n\")",
-    "",
-    "// The word beside the number. **Only the ones a handler is likely to answer with**, since a client",
-    "// reads the number and the text is for a person reading a log.",
-    "reason(status) =",
-    "    if status == 200 then \"OK\"",
-    "    elif status == 201 then \"Created\"",
-    "    elif status == 204 then \"No Content\"",
-    "    elif status == 301 then \"Moved Permanently\"",
-    "    elif status == 302 then \"Found\"",
-    "    elif status == 304 then \"Not Modified\"",
-    "    elif status == 400 then \"Bad Request\"",
-    "    elif status == 401 then \"Unauthorized\"",
-    "    elif status == 403 then \"Forbidden\"",
-    "    elif status == 404 then \"Not Found\"",
-    "    elif status == 405 then \"Method Not Allowed\"",
-    "    elif status == 411 then \"Length Required\"",
-    "    elif status == 413 then \"Content Too Large\"",
-    "    elif status == 431 then \"Request Header Fields Too Large\"",
-    "    elif status == 501 then \"Not Implemented\"",
-    "    elif status == 418 then \"I am a teapot\"",
-    "    elif status == 500 then \"Internal Server Error\"",
-    "    elif status == 503 then \"Service Unavailable\"",
-    "    else \"Status\""]
+    // `serveStream(port, handler)` -- the same server, calling `handler` as soon as a request's head is
+    // complete and handing it the body as it arrives.
+    //
+    // A streamed request has no `body`. What it has instead is `each`:
+    //
+    //     serveStream(3000, async (req) ->
+    //         var total = 0
+    //
+    //         await req.each((chunk) -> total = total + len(chunk))
+    //
+    //         "that was " + string(total) + " bytes")
+    //
+    // **`each` answers a promise for the number of bytes the body turned out to be**, and it is not a
+    // generator: slate's generators are pulled and are synchronous, so a chunk that has not arrived
+    // cannot be pulled. The chunk it hands over is a byte array, which is what `slate:net` delivers and
+    // what `toBytes` and `fromBytes` convert.
+    //
+    // **Call `each` before the handler's first `await`.** Chunks arriving before it is called are held
+    // for it, so nothing is ever lost -- but a handler that holds them is a handler accumulating the
+    // body, which is the thing it asked not to do. One that never calls `each` at all accumulates the
+    // whole of it and is stopped by `BodyBytes`, exactly as `serve` is.
+    //
+    // **Two exports rather than one with an option, and that is settled.** `serve(port, handler,
+    // options = {})` is writable and would break nothing -- but the two differ by what the HANDLER IS
+    // GIVEN rather than by what the server was told: a streamed request has no `body`, and answers
+    // `each` instead. Under one name the shape of the function being written would be decided by a
+    // flag several lines above it, where the name being called says it outright.
+    export serveStream(port, handler, onUpgrade = null) = server(port, handler, true, onUpgrade)
+
+    server(port, handler, streaming, onUpgrade) =
+        // **The handler is checked here and the port is not**, which is the layering rather than an
+        // oversight: `listen` is given the port and complains about it in its own words, while nothing
+        // would look at the handler until the first request arrived -- an hour later, on a connection
+        // somebody was waiting for. This is what `throw` is for.
+        if !(handler is function) then throw "`serve` needs a function to call with each request"
+
+        // **Checked here for the same reason the handler is**: a connection asking to upgrade may not
+        // arrive for an hour, and a program that passed the wrong thing wants to hear about it now.
+        if onUpgrade != null && !(onUpgrade is function)
+            throw "`serve` needs a function to call with an upgrade, and this is not one"
+
+        accept(conn)
+            // The parser this connection's bytes go through. **Nothing is buffered here**: what a
+            // request is made of is llhttp's business, and this module asks only what it has ready.
+            val parser = if streaming then httpStream(HeadBytes) else httpParser(HeadBytes, BodyBytes)
+
+            // Whether a request is being answered. **This is what puts the connection in order**: a
+            // second request waits in the parser until the first has been written, because HTTP matches
+            // an answer to a request by its position in the stream and by nothing else.
+            var busy = false
+
+            // Whether this connection is finished. Every way out sets it, so nothing writes to a closed
+            // socket and no timer fires against one.
+            var shut = false
+
+            // Whether the client has stopped sending. A request completed by the end of the stream is
+            // still answered, and the connection is not kept afterwards whatever it asked for.
+            var ended = false
+
+            // The clock that closes a connection nobody is using, or null while it is not running.
+            var idle = null
+
+            // What a streamed request is made of while it is being read. `sink` is the function the
+            // handler asked to be given the body, `ending` is the promise it is awaiting, `held` is what
+            // arrived before it asked, `got` is how much of the body has been handed over, and `reading`
+            // says whether the parts still coming out of the parser belong to the request being answered
+            // -- which is what keeps a pipelined second request waiting for the first.
+            var sink = null
+
+            // Whether the handler is still running and might yet ask for the body. **This is what says
+            // where a chunk goes, and `busy` used to stand in for it wrongly**: `busy` stays up until
+            // the answer has been WRITTEN, so a handler that answered without asking went on holding the
+            // rest of the upload while its own response was going out -- and a large enough body was
+            // refused with `413` after it had already been answered `200`.
+            var holding = false
+
+            var ending = null
+            var held = []
+            var heldBytes = 0
+            var got = 0
+            var reading = false
+
+            // Stop the clock, a connection with something to do not being idle by definition.
+            awake()
+                if idle != null
+                    clearTimeout(idle)
+
+                    idle = null
+
+            stop()
+                if shut then return
+
+                shut = true
+
+                awake()
+                release()
+                httpClose(parser)
+                shutSocket(conn)
+
+            // Stop being this connection's server, and leave the socket open.
+            //
+            // **Everything `stop` does except closing the socket**, which is the whole of what handing a
+            // connection to another protocol means: the clock is stopped, the parser is let go, and every
+            // path back into this module is closed by `shut` -- but the socket belongs to somebody else
+            // now and closing it is theirs to do.
+            handOver()
+                if shut then return
+
+                shut = true
+
+                awake()
+                release()
+                httpClose(parser)
+
+            // Let go of a handler waiting for a body that is not going to finish arriving.
+            //
+            // **The count it is given is short of the `Content-Length` it was promised**, which is how a
+            // handler tells a client that hung up mid-upload from one that did not. Answering the promise
+            // rather than failing it is deliberate: a client going away is the ordinary end of a
+            // connection and not a defect in the program, and a failure here would be put back by
+            // `answer` and would stop the server.
+            release()
+                if ending != null
+                    reading = false
+
+                    settle(ending, got)
+
+                    ending = null
+
+            // Start the clock, which is what every path that leaves the connection with nothing
+            // outstanding ends with.
+            quiet()
+                awake()
+
+                idle = setTimeout(stop, IdleMillis)
+
+            // **A handler may answer a promise, and the ordinary one does** -- it reads a file, asks a
+            // database, calls another service. `await` on something that is not a promise answers it
+            // unchanged, so both kinds of handler take this one path.
+            //
+            // **A HANDLER THAT THROWS AND A WRITE THAT FAILS ARE NOT THE SAME THING**, and they used to
+            // share a `try`. A defect in a handler is a defect in the program: the client is told, and
+            // the fault is put back afterwards, where nothing awaits it and it reaches the loop and stops
+            // the program as any other fault would. **A write that fails is a client that has gone** --
+            // it hung up, or it was never going to read the answer -- which is the ordinary end of a
+            // connection and no reason at all to stop the server. Taking the second for the first meant a
+            // client pressing ^C mid-request could end the process, and streaming makes that the common
+            // case rather than a rare one, since a handler now runs while the client is still sending.
+            async answer(req, again)
+                var reply = null
+
+                try
+                    reply = await handler(req)
+                catch e
+                    holding = false
+
+                    await refuse(500, "this request was not answered")
+                    throw e
+
+                // **The handler has had its chance to ask**, so nothing is held for it from here: the
+                // rest of the body is read off the wire and dropped, which is what the three cases in
+                // `pump` say and what `busy` was too coarse to express.
+                //
+                // **What was held BEFORE it answered goes too, and saying "holding nothing" without
+                // this was not quite true.** Those bytes were kept for an `each` that is not coming;
+                // leaving them would hold a whole body until the connection's next request, which on a
+                // kept connection is exactly the megabyte streaming exists not to hold.
+                holding = false
+                held = []
+                heldBytes = 0
+
+                try
+                    await write(conn, req, reply, again)
+                catch e
+                    stop()
+                    return
+
+                busy = false
+
+                // **The next request may already be here**, where a client pipelined -- so this is not a
+                // wait for more bytes to arrive, it is the turn the second request has been waiting for.
+                if again
+                    quiet()
+                    next()
+                else
+                    stop()
+
+            // A response this connection writes for itself, and its last: a request this server could not
+            // read leaves the stream at an offset nobody knows, so there is nothing to keep it open for.
+            //
+            // **`busy` is set here rather than by the caller, and that is safe because an `async` body
+            // runs up to its first `await` before the caller goes on** -- so by the time `step` returns,
+            // this connection is marked as owing an answer.
+            async refuse(status, message)
+                busy = true
+
+                // **The same rule as `answer`'s second half**: the connection this is complaining about
+                // may already have gone, and failing to deliver a complaint about a client is not
+                // something to complain about.
+                try
+                    await plainly(conn, status, message)
+                catch e
+                    val gone = e
+
+                stop()
+
+            // Take one whole request from the parser, where there is one and nothing else is owed.
+            step()
+                if shut || busy then return
+
+                val req = httpTake(parser)
+
+                if req == null then return
+
+                busy = true
+
+                awake()
+
+                // **A connection the client has already closed is not kept**, whatever the request asked
+                // for -- there is nobody left to send the next one.
+                answer(req, req.keepAlive && !ended)
+
+            // Hand over the pieces of a streamed request as they come out of the parser.
+            pump()
+                if shut then return
+
+                while true
+                    // **A pipelined second request waits its turn**, exactly as it does in `step`: a
+                    // part is only pulled while it still belongs to the request being answered.
+                    if busy && !reading then return
+
+                    val p = httpTakePart(parser)
+
+                    if p == null then return
+
+                    if p.kind == "head"
+                        busy = true
+                        reading = true
+                        holding = true
+                        sink = null
+                        held = []
+                        heldBytes = 0
+                        got = 0
+                        ending = pending()
+
+                        awake()
+
+                        // **A connection the client has already closed is not kept**, whatever the
+                        // request asked for -- there is nobody left to send the next one.
+                        answer(streamed(p), p.keepAlive && !ended)
+                    elif p.kind == "body"
+                        got = got + len(p.chunk)
+
+                        // **Three things a chunk can be, and only the middle one is held.**
+                        //
+                        // The handler asked for the body, so it gets it. Or the handler has already
+                        // answered without asking -- which is an ordinary thing to do, and the rest of
+                        // the body is then read off the wire and **dropped**, holding nothing and
+                        // keeping the stream aligned for whatever comes next. Or the handler is still
+                        // running and has not asked yet, and that is the only case with anywhere to put
+                        // the bytes: they are held for an `each` that may still be coming, and a handler
+                        // that never asks is a handler accumulating the whole body, which is the case
+                        // `serve` bounds and this has to bound the same way.
+                        if sink != null
+                            sink(p.chunk)
+                        elif holding
+                            held.push(p.chunk)
+
+                            heldBytes = heldBytes + len(p.chunk)
+
+                            // **`reading` goes down FIRST, and without that the refusal repeats.**
+                            // `refuse` is async, so `shut` is not set until after its write -- and every
+                            // chunk arriving in the meantime would come back through here, be held, be
+                            // over the limit again, and be refused again. The accumulating server does
+                            // not have the problem because llhttp pauses itself; this one has to say so.
+                            if heldBytes > BodyBytes
+                                reading = false
+
+                                tooLarge()
+                                return
+                    else
+                        reading = false
+
+                        settle(ending, got)
+
+                        ending = null
+
+            // The bound was passed -- but the handler is given the turn it is owed before it is refused.
+            //
+            // **`holding` is cleared a turn LATE for a handler that answers outright, and that turn is
+            // this race.** `answer` calls the handler at once, but `await` on a value that is not a
+            // promise still yields, deliberately, so `holding = false` runs only when the scheduler
+            // comes back to it -- and a client that pushes a megabyte in the meantime drew a `413` for
+            // a body the handler had already decided not to read. It arrived BEFORE the answer, on the
+            // same connection, which is two responses to one request.
+            //
+            // **`await 0` IS the one turn**, and it is a timer-free one: awaiting a value that is not a
+            // promise queues a resumption and nothing else, so this comes back in the same drain pass
+            // rather than at whatever the event loop does next.
+            //
+            // **Waiting one turn settles it in the right order, and not by luck.** `ready` is drained in
+            // the order it was filled, and `answer` was queued when the head was parsed -- before any of
+            // these bytes existed -- so it always resumes first. What is left to ask afterwards is the
+            // question the bound is actually about: is the handler STILL running and still not asking?
+            // An `async` handler that has not settled is, and is refused exactly as before.
+            async tooLarge()
+                await 0
+
+                if holding && sink == null
+                    await refuse(413, "the body is larger than " + string(BodyBytes) + " bytes")
+                    return
+
+                // **The handler answered, or asked, in the turn it was given -- so reading goes back
+                // on.** Leaving it down would be worse than the wrong refusal it replaces: a handler
+                // that asked would wait forever for a body nobody is pulling any more.
+                reading = true
+
+                next()
+
+            // The request a streaming handler is given: the head, and the one way of asking for the rest.
+            streamed(p) =
+                val req = { method: p.method, path: p.path, query: p.query, headers: p.headers,
+                            keepAlive: p.keepAlive }
+
+                // **Stored on the object rather than reached through a proto**, so calling it passes the
+                // function what it was given and nothing else -- `req.each(f)` is `f` and no receiver,
+                // which is what this wants.
+                req.each = (f) ->
+                    sink = f
+
+                    for c in held
+                        f(c)
+
+                    held = []
+                    heldBytes = 0
+
+                    ending
+
+                req
+
+            // Whichever of the two this connection reads with. Every path that has just made progress
+            // ends here rather than at one of them.
+            next()
+                if streaming then pump() else step()
+
+            // **Called after every chunk, because there is no other way to know a request is whole.**
+            // TCP hands over whatever has arrived, and a request may be split anywhere at all --
+            // including in the middle of the blank line that ends its headers.
+            arrived(chunk)
+                if shut then return
+
+                // The client has hung up. **Not an error**: that is how a client ends a kept connection
+                // it has finished with, and it is the ordinary end of most of them. A request whose body
+                // ran to the end of the stream is completed by `httpFinish` and still answered.
+                if chunk == null
+                    ended = true
+
+                    httpFinish(parser)
+                    next()
+
+                    // **A body that was still arriving is not going to finish.** `httpFinish` completes a
+                    // request that ends at end-of-file and says nothing about one that does not, so the
+                    // handler awaiting the rest of this body is let go here or waits forever.
+                    release()
+
+                    if !busy then stop()
+
+                    return
+
+                awake()
+
+                // **A refusal is an answer rather than a fault.** The bytes were not a request this
+                // server will act on, so the status goes back and the connection ends -- taking the
+                // program down over a bad client would be the wrong trade entirely.
+                val bad = httpFeed(parser, chunk)
+
+                if bad != null
+                    refuse(bad.status, bad.message)
+                    return
+
+                // **A request that asked to stop being HTTP ends this module's interest in the socket.**
+                // `httpUpgraded` answers where the HTTP stopped, and everything after that offset belongs
+                // to whatever protocol the client asked for. **Zero is a real answer** -- a handshake that
+                // arrived on its own leaves nothing behind it -- so the test is against `null`.
+                val upTo = httpUpgraded(parser)
+
+                if upTo != null
+                    hoist(chunk, upTo)
+                    return
+
+                next()
+
+                if !busy then quiet()
+
+            // The request that asked to upgrade, taken from whichever parser this server is using.
+            //
+            // **A streaming server has no `httpTake`**, so the handshake comes out as a head part -- which
+            // carries everything a whole request does but its body, and a handshake has no body.
+            upgradeRequest()
+                if !streaming then return httpTake(parser)
+
+                val part = httpTakePart(parser)
+
+                if part == null || part.kind != "head" then null else part
+
+            // Hand this connection to whoever was told to expect one.
+            //
+            // **The bytes left over are from THIS FEED, not from the connection.** `httpUpgraded` counts
+            // into the chunk it was given, so `chunk[upTo..]` is what the other protocol has already sent
+            // and what it would otherwise never see -- a client that pipelines its first frame behind the
+            // handshake is ordinary, and losing it would look like a peer that said nothing.
+            hoist(chunk, upTo)
+                val req = upgradeRequest()
+
+                // **A server with no upgrade handler says so rather than going quiet.** The client asked
+                // for a protocol this program does not speak, which is something it can act on; leaving
+                // it holding a socket nothing will ever answer is not.
+                if onUpgrade == null || req == null
+                    refuse(501, "this server does not upgrade connections")
+                    return
+
+                handOver()
+
+                onUpgrade(req, conn, chunk[upTo..])
+
+            onBytes(conn, arrived)
+
+            // **The clock starts before the first request, not after it.** A client that opens a
+            // connection and then says nothing is exactly as quiet as one that has stopped mid-stream.
+            quiet()
+
+        listen(port, accept)
+
+    // How long a connection with nothing outstanding is held open. **Node's number**, and the reasoning
+    // is the same: long enough that a browser fetching a page and its stylesheet reuses one connection,
+    // short enough that a client that has gone away is not remembered for long.
+    val IdleMillis = 5000
+
+    // How much of a request this server will hold before refusing it.
+    //
+    // **Node's llhttp defaults, and the reasoning is the same**: eight kilobytes of head is more than any
+    // browser sends and less than any attack, and a megabyte of body is a JSON document rather than a
+    // file upload. A server that wants uploads wants `serveStream`, where `BodyBytes` bounds only what a
+    // handler leaves unasked-for and the head limit is the only one a body is measured against at all.
+    val HeadBytes = 8192
+    val BodyBytes = 1048576
+
+    // The smallest body worth compressing, and how hard to compress it.
+    //
+    // **Below a kilobyte brotli usually makes a body larger**, having a frame to write, and the round
+    // trip costs a client more than the bytes save it. Quality 5 is the on-the-fly setting: 0-4 are
+    // faster and 9-11 are for something built ahead of time -- quality 11 on a megabyte costs about half
+    // a second and 60 MB of working memory, which is not what a request handler should be doing.
+    val CompressBytes = 1024
+    val CompressQuality = 5
+
+    // What a handler answered, written to the socket.
+    //
+    // **A string is a whole response**, which is what makes the first program somebody writes one line
+    // long. An object says more -- `{ status, headers, body }` -- and every part of it is optional.
+    // Anything else is rendered as `print` would render it, which is what a handler answering a number
+    // or an array meant.
+    //
+    // **A BODY WORTH COMPRESSING GOES OUT COMPRESSED, AND THE HANDLER IS NOT ASKED.** Every browser
+    // sends `Accept-Encoding: br` and on text brotli is worth roughly a sixth over gzip, so a server
+    // that made this a decision would be making everybody write the same three lines. The escape hatch
+    // is to set `Content-Encoding` yourself, which says the body is already encoded and is left alone.
+    write(conn, req, v, keep) =
+        var status = 200
+        var body = ""
+        var extra = ""
+        var encoded = false
+
+        if v is string
+            body = v
+        elif v is object
+            if has(v, "status") then status = v.status
+
+            if has(v, "body")
+                body = if v.body is string then v.body else string(v.body)
+
+            if has(v, "headers")
+                for [k, hv] in entries(v.headers)
+                    if lower(k) == "content-encoding" then encoded = true
+
+                    extra = extra + k + ": " + string(hv) + "\r\n"
+        else
+            body = string(v)
+
+        val raw = toBytes(body)
+
+        if encoded || len(raw) < CompressBytes || !wantsBrotli(req)
+            return reply(conn, status, extra, body, keep)
+
+        // **`Vary` goes on whether or not this one was compressed**, because what a cache must not do is
+        // hand a compressed body to a client that did not ask for one -- and it cannot know that unless
+        // every response whose content depended on `Accept-Encoding` says so.
+        val varied = extra + "Vary: Accept-Encoding\r\n"
+
+        val small = compress(raw, CompressQuality)
+
+        // **A body that does not get smaller is sent as it was.** Brotli frames its input, so something
+        // already compressed -- a PNG, a zip, an asset built ahead of time -- comes back slightly larger,
+        // and sending that would cost the client a decode for nothing.
+        if len(small) >= len(raw)
+            return reply(conn, status, varied, body, keep)
+
+        replyBytes(conn, status, varied + "Content-Encoding: br\r\n", small, keep)
+
+    // Whether this client asked for brotli, reading the header rather than looking for the two letters.
+    //
+    // **`br;q=0` is a client saying it would rather not**, which is not the same as not mentioning it,
+    // and `deflate` contains no `br` but a future token might -- so the field is split into its tokens
+    // the way the specification says it is.
+    wantsBrotli(req) =
+        if req == null then return false
+        if !has(req.headers, "accept-encoding") then return false
+
+        for part in split(lower(req.headers["accept-encoding"]), ",")
+            val token = trim(part)
+
+            if token == "br" || startsWith(token, "br;")
+                if contains(token, "q=0") && !contains(token, "q=0.") then return false
+
+                return true
+
+        false
+
+    // A response this module writes for itself, where there is no handler answer to write. **Always the
+    // connection's last**, so it never has to say whether one is being kept.
+    //
+    // **Never compressed**, and not for want of a request to ask: these are short sentences about a
+    // request that could not be read, and a client being told why is a client that may not be in a
+    // state to decode anything.
+    plainly(conn, status, message) = reply(conn, status, "", message, false)
+
+    // **`Content-Length` is counted in BYTES and not in characters**, which is the one place this module
+    // has to remember that a slate string is characters: a body with an `é` in it is one byte longer
+    // than it is characters, and a wrong length here is a client that hangs waiting for the rest of a
+    // response that has all arrived.
+    //
+    // **This answers a promise and closes nothing**, which is what makes keep-alive possible at all: the
+    // caller awaits it and then decides. Where the decision is to close, the close comes after the await
+    // and that ordering is the whole of it -- closing a socket with a write still queued throws the write
+    // away, and the difference a client sees is between a response and a reset connection.
+    async reply(conn, status, extra, body, keep)
+        await send(conn, head(status, extra, len(toBytes(body)), keep) + body)
+
+    // The same, for a body that is already bytes.
+    //
+    // **Two functions rather than one taking bytes always**, because a slate byte array is one value per
+    // byte: making every response go through one would cost a megabyte of text a million boxed integers
+    // for nothing. The compressed path pays it because the body is small by then, and it is the only
+    // path that has to.
+    async replyBytes(conn, status, extra, body, keep)
+        await send(conn, concat(toBytes(head(status, extra, len(body), keep)), body))
+
+    // The status line, the headers and the blank line that ends them.
+    //
+    // **The brackets are what continue the lines**, a trailing `+` outside a bracket pair not being a
+    // continuation in slate -- which is why the expression this was cut out of never needed them and
+    // this does.
+    head(status, extra, length, keep) =
+        ("HTTP/1.1 " + string(status) + " " + reason(status) + "\r\n" + extra +
+            "Content-Length: " + string(length) + "\r\nConnection: " +
+            (if keep then "keep-alive" else "close") + "\r\n\r\n")
+
+    // The word beside the number. **Only the ones a handler is likely to answer with**, since a client
+    // reads the number and the text is for a person reading a log.
+    reason(status) =
+        if status == 200 then "OK"
+        elif status == 201 then "Created"
+        elif status == 204 then "No Content"
+        elif status == 301 then "Moved Permanently"
+        elif status == 302 then "Found"
+        elif status == 304 then "Not Modified"
+        elif status == 400 then "Bad Request"
+        elif status == 401 then "Unauthorized"
+        elif status == 403 then "Forbidden"
+        elif status == 404 then "Not Found"
+        elif status == 405 then "Method Not Allowed"
+        elif status == 411 then "Length Required"
+        elif status == 413 then "Content Too Large"
+        elif status == 431 then "Request Header Fields Too Large"
+        elif status == 501 then "Not Implemented"
+        elif status == 418 then "I am a teapot"
+        elif status == 500 then "Internal Server Error"
+        elif status == 503 then "Service Unavailable"
+        else "Status"
+    """
