@@ -567,6 +567,46 @@ slot is reused, so the value a program holds carries the *generation* that claim
 socket held across a `close` would come to mean its successor and compare equal to it. That was a
 real defect, and the same one had been sitting in `setTimeout`'s ids since the loop was built.
 
+### Digests and randomness
+
+```
+import { sha256, hmac, pbkdf2, randomBytes, timingSafeEqual } from slate:crypto
+
+val nonce = randomBytes(18)
+val key = pbkdf2("SHA-256", password, salt, 4096, 32)
+val tag = hmac("SHA-256", key, "the message")
+
+if timingSafeEqual(tag, sent) then print("that is the right tag")
+```
+
+`sha1`, `sha256`, `sha384` and `sha512` take text or bytes and answer the digest as bytes. `hmac` and
+`pbkdf2` take the digest by name — `"SHA-1"`, `"SHA-256"`, `"SHA-384"`, `"SHA-512"` — because what a
+program is speaking to decides it, and a default here would be a decision taken by whoever wrote the
+module rather than by the protocol.
+
+**The module is for a package, and that is why it exists.** `slate:jwt` and `slate:ws` are carried in
+the binary and are compiled against the scope the natives live in; a package installed with
+`slate add` is not, so one speaking a protocol with a challenge in it — SCRAM, SASL, a signed
+webhook, a request signed for S3 — had no digest at all and no source of unpredictability at all.
+**A nonce a program worked out from the clock is not a nonce**, and that half cannot be written in
+slate at any price.
+
+**What a program can write, it writes.** Hex, base64 and the message layout of whatever protocol is
+being spoken are ordinary slate — `slate:jwt` writes its own base64url — so they are not here. What
+is here is the compression functions and the kernel.
+
+**`pbkdf2` is here for a reason that is not tidiness**: one SCRAM handshake is 4,096 HMACs, which is
+some eight thousand SHA-256 compressions — a millisecond as a native and seconds in the interpreter.
+
+**`timingSafeEqual` is what a program checks a tag it was sent with.** `==` on two byte arrays stops
+at the first byte that differs, which tells an attacker how much of a forged tag was right, and a tag
+can be guessed a byte at a time from that.
+
+**`sha1` is exported and it is not an endorsement.** It is what an existing protocol asks for — a
+WebSocket handshake, a Git object, an old server's SASL — and a program speaking one has no say in
+the matter. Nothing new should be signed with it. For a *password*, none of these is the answer:
+`slate:password` is Argon2id and is deliberately slow, which is the whole difference.
+
 ### Modules
 
 A file is a module. What another file can see is what it writes `export` in front of:
@@ -1165,7 +1205,7 @@ library beyond the builtins. On the object side: `super`, and a check that a pro
 when it is attached to an object literal by hand.
 
 In the JavaScript back end: `slate:net`, `slate:time`, `slate:regex`, `fetch`, `run`,
-`slate:password`, `slate:brotli`, `slate:llhttp`, and the modules written over them. Each one is a
+`slate:password`, `slate:crypto`, `slate:brotli`, `slate:llhttp`, and the modules written over them. Each one is a
 name that says *"not in the JavaScript back end yet"* rather than a name that is not there.
 
 **`defer` is on sysl's list and is deliberately not here.** It earns its place in Go and in sysl

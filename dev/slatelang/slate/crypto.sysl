@@ -3,7 +3,8 @@ module dev.slatelang.slate
 import sh.sysl.openssl
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
-import sysl.crypto.{hmac256, hmac384, hmac512, sha1}
+import sysl.crypto.{hmac1, hmac256, hmac384, hmac512, sha1, sha256, sha384, sha512}
+import sysl.posix.rand.entropy_from_os
 
 // The cryptography slate's own modules stand on, and deliberately nothing above it.
 //
@@ -181,25 +182,264 @@ do_jws_verify(args: Buf[Value], at: Span) -> Step
         Ok(good) -> Ok(Bool(good))
 end do_jws_verify
 
-// `sha1(bytes)` -- the twenty-byte digest, as a byte array.
+
+// -- `slate:crypto` -------------------------------------------------------------------------------
+
+// **The digests, HMAC, key derivation and randomness a PROGRAM reaches**, which is a different
+// question from what the two modules above stand on.
 //
-// **`slate:ws` is the whole caller, and the use is the one SHA-1's weakness does not touch.** RFC
-// 6455 has a server answer `base64(sha1(key + GUID))` so that a client can tell a server that
-// understood WebSocket from a cache or a proxy replaying an earlier response. Nothing is signed and
-// nothing is compared for authenticity; what the protocol wants is a value only the other end could
-// have computed. **This is not a licence to reach for it anywhere else**, and there is no slate-level
-// export of it for that reason -- a program wanting a digest has SHA-2 through `slate:jwt`.
-do_sha1(args: Buf[Value], at: Span) -> Step
-    if args.len() != 1 then return fault(at, s"`sha1` takes a byte array, and was given ${counted(args.len(), "argument")}")
+// **The module exists because a package cannot have a native.** `slate:jwt` and `slate:ws` are
+// carried in the binary and are compiled against the scope these are declared into; anything
+// installed with `slate add` is not, so a package speaking a protocol with a challenge in it -- SASL,
+// SCRAM, a signed webhook, an S3 request -- had no digest at all and no source of randomness at all.
+// A nonce a program made up out of the clock is not a nonce, and that is the half of this that cannot
+// be written in slate at any price.
+//
+// **What CAN be written in slate stays in slate**, which is the seam every module here is cut on:
+// hex, base64 and the message layout of whatever protocol is being spoken are a package's own work,
+// and `slate:jwt` writing its own base64url is the precedent. What is here is the compression
+// functions and the kernel.
+//
+// **PBKDF2 is here rather than in a package for one reason, and it is not tidiness.** It is 4,096
+// HMACs of a 32-byte message for one SCRAM handshake, which is some eight thousand SHA-256
+// compressions -- seconds of interpreter time per connection, against a millisecond here. `slate:ws`
+// wrote its own SHA-1 in slate until `sysl.crypto` grew one, and this is the same lesson taken
+// before it costs anything.
 
-    val data = bytes_arg(args.at(0), at, "sha1", "the data")?
+// What every digest this knows about is called, for a message that has to list them.
+private digests() -> string = "SHA-1, SHA-256, SHA-384 and SHA-512"
+
+// A fixed-size digest as a buffer, which is what everything below passes around.
+private collected(bytes: []const u8) -> Buf[u8]
+    var out: Buf[u8] = buf()
+
+    for i in 0..<bytes.len
+        out.push(bytes[i])
+
+    out
+end collected
+
+// The digest by name, or nothing where the name is not one of the four.
+private digest_of(alg: string, data: []const u8) -> Option[Buf[u8]]
+    // Each digest is bound before it is sliced: these answer a `[N]u8` this frame owns, and a slice
+    // of one handed straight to a call would outlive the array it points into.
+    if alg == "SHA-1"
+        val d = sha1(data)
+
+        return Some(collected(d[..]))
+    elif alg == "SHA-256"
+        val d = sha256(data)
+
+        return Some(collected(d[..]))
+    elif alg == "SHA-384"
+        val d = sha384(data)
+
+        return Some(collected(d[..]))
+    elif alg == "SHA-512"
+        val d = sha512(data)
+
+        return Some(collected(d[..]))
+
+    None
+end digest_of
+
+// The same for HMAC, and the same answer where the name is not one of the four.
+private hmac_by_name(alg: string, key: []const u8, message: []const u8) -> Option[Buf[u8]]
+    if alg == "SHA-1"
+        val t = hmac1(key, message)
+
+        return Some(collected(t[..]))
+    elif alg == "SHA-256"
+        val t = hmac256(key, message)
+
+        return Some(collected(t[..]))
+    elif alg == "SHA-384"
+        val t = hmac384(key, message)
+
+        return Some(collected(t[..]))
+    elif alg == "SHA-512"
+        val t = hmac512(key, message)
+
+        return Some(collected(t[..]))
+
+    None
+end hmac_by_name
+
+// PBKDF2 as RFC 8018 writes it: `T_i` is the exclusive-or of `iterations` HMACs, the first over the
+// salt with the block number appended big-endian, each one after that over the answer before it.
+//
+// **The block counter is four bytes and starts at one**, which is the part an implementation gets
+// wrong silently -- every value that comes out is a fine-looking key and none of them agrees with
+// anybody else's.
+private pbkdf2_of(alg: string, password: []const u8, salt: []const u8, iterations: long,
+                  length: usize) -> Option[Buf[u8]]
+    var out: Buf[u8] = buf()
+    var block: long = 1
+
+    loop
+        if out.len() >= length then break
+
+        var seed: Buf[u8] = buf()
+
+        for i in 0..<salt.len
+            seed.push(salt[i])
+
+        seed.push(u8((block >> 24) & 255))
+        seed.push(u8((block >> 16) & 255))
+        seed.push(u8((block >> 8) & 255))
+        seed.push(u8(block & 255))
+
+        var u = hmac_by_name(alg, password, seed.view()) match
+            Some(v) -> v
+            None -> return None
+
+        var acc = collected(u.view())
+        var round: long = 1
+
+        loop
+            if round >= iterations then break
+
+            u = hmac_by_name(alg, password, u.view()) match
+                Some(v) -> v
+                None -> return None
+
+            for j in 0..<acc.len()
+                acc.set(j, acc.at(j) ^ u.at(j))
+
+            round += 1
+
+        for j in 0..<acc.len()
+            if out.len() < length
+                out.push(acc.at(j))
+
+        block += 1
+
+    Some(out)
+end pbkdf2_of
+
+// A count of bytes, which a program writes as a number and nothing else.
+private count_of(v: Value, at: Span, name: string, what: string) -> Result[usize, Signal]
+    v match
+        Int(n) ->
+            if n < 0 then Err(failure(at, s"`${name}` takes ${what} as a count that is not negative, and this is ${n}"))
+            else Ok(usize(n))
+        other -> Err(failure(at, s"`${name}` takes ${what} as a number, and this is ${other.type_name()}"))
+
+private whole_of(v: Value, at: Span, name: string, what: string) -> Result[long, Signal]
+    v match
+        Int(n) -> Ok(n)
+        other -> Err(failure(at, s"`${name}` takes ${what} as a number, and this is ${other.type_name()}"))
+
+// `sha1(data)`, `sha256(data)`, `sha384(data)`, `sha512(data)` -- the digest, as a byte array.
+//
+// **SHA-1 is exported and it is not an endorsement.** It is what an existing protocol asks for --
+// a WebSocket handshake, a Git object, an old server's SASL -- and a program speaking one of those
+// has no say in the matter. Nothing new should be signed with it.
+do_digest(args: Buf[Value], at: Span, name: string, alg: string) -> Step
+    if args.len() != 1 then return fault(at, s"`${name}` takes the data to hash, and was given ${counted(args.len(), "argument")}")
+
+    val data = bytes_arg(args.at(0), at, name, "the data")?
+    val digest = digest_of(alg, data.view()) match
+        Some(d) -> d
+        None -> return fault(at, s"`${alg}` is not a digest this understands -- there are ${digests()}")
+
     val mark = root_mark()
-
-    // `sha1` answers a `[20]u8` rather than a slice, so it is `d[..]` that `as_array` is given.
-    val digest = sha1(data.view())
-    val made = as_array_of(digest[..])
+    val made = as_array(digest)
 
     hold(made)
     release(mark)
     Ok(made)
-end do_sha1
+end do_digest
+
+// `hmac(alg, key, message)` -- the tag, as a byte array.
+//
+// **The algorithm is an argument for the reason `jwsSign`'s is**: what a program is speaking to
+// decides it, and a default would be a decision taken by whoever wrote this file rather than by the
+// protocol.
+do_hmac(args: Buf[Value], at: Span) -> Step
+    if args.len() != 3 then return fault(at, s"`hmac` takes an algorithm, a key and a message, and was given ${counted(args.len(), "argument")}")
+
+    val alg = text_arg(args.at(0), at, "hmac", "the algorithm")?
+    val key = bytes_arg(args.at(1), at, "hmac", "the key")?
+    val message = bytes_arg(args.at(2), at, "hmac", "the message")?
+
+    val tag = hmac_by_name(alg, key.view(), message.view()) match
+        Some(t) -> t
+        None -> return fault(at, s"`${alg}` is not a digest this understands -- there are ${digests()}")
+
+    val mark = root_mark()
+    val made = as_array(tag)
+
+    hold(made)
+    release(mark)
+    Ok(made)
+end do_hmac
+
+// `pbkdf2(alg, password, salt, iterations, length)` -- the derived key, as a byte array.
+//
+// **The iteration count is the caller's because the protocol says it.** SCRAM carries the server's
+// count on the wire, and a client that used its own would derive a different key and be told its
+// password was wrong.
+do_pbkdf2(args: Buf[Value], at: Span) -> Step
+    if args.len() != 5 then return fault(at, s"`pbkdf2` takes an algorithm, a password, a salt, an iteration count and a length, and was given ${counted(args.len(), "argument")}")
+
+    val alg = text_arg(args.at(0), at, "pbkdf2", "the algorithm")?
+    val password = bytes_arg(args.at(1), at, "pbkdf2", "the password")?
+    val salt = bytes_arg(args.at(2), at, "pbkdf2", "the salt")?
+    val iterations = whole_of(args.at(3), at, "pbkdf2", "the iteration count")?
+    val length = count_of(args.at(4), at, "pbkdf2", "the length")?
+
+    if iterations < 1 then return fault(at, s"`pbkdf2` takes at least one iteration, and was asked for ${iterations}")
+    if length == 0 then return fault(at, "`pbkdf2` was asked for a key of no length")
+
+    val key = pbkdf2_of(alg, password.view(), salt.view(), iterations, length) match
+        Some(k) -> k
+        None -> return fault(at, s"`${alg}` is not a digest this understands -- there are ${digests()}")
+
+    val mark = root_mark()
+    val made = as_array(key)
+
+    hold(made)
+    release(mark)
+    Ok(made)
+end do_pbkdf2
+
+// `randomBytes(n)` -- n bytes from the kernel, as a byte array.
+//
+// **This is the half of the module that cannot be written in slate at any price.** Everything else
+// here is a speed argument; a program has no source of unpredictability at all, and a nonce or a
+// salt a program computed from the clock is neither.
+do_random_bytes(args: Buf[Value], at: Span) -> Step
+    if args.len() != 1 then return fault(at, s"`randomBytes` takes a count, and was given ${counted(args.len(), "argument")}")
+
+    val n = count_of(args.at(0), at, "randomBytes", "the count")?
+
+    if n == 0 then return fault(at, "`randomBytes` was asked for no bytes")
+
+    var bytes: []u8 = [0u8; n]
+
+    if !entropy_from_os(bytes)
+        return fault(at, "`randomBytes` could not get randomness from the kernel, and bytes this program made up would not be worth having")
+
+    val mark = root_mark()
+    val made = as_array_of(bytes)
+
+    hold(made)
+    release(mark)
+    Ok(made)
+end do_random_bytes
+
+// `timingSafeEqual(a, b)` -- whether two byte strings are the same, in time that does not say how
+// much of one was right.
+//
+// **A comparison that stops at the first differing byte is how a tag is forged a byte at a time**,
+// and `==` on two arrays is exactly that comparison. A program checking a signature it was sent
+// wants this one.
+do_timing_safe_equal(args: Buf[Value], at: Span) -> Step
+    if args.len() != 2 then return fault(at, s"`timingSafeEqual` takes two byte strings, and was given ${counted(args.len(), "argument")}")
+
+    val a = bytes_arg(args.at(0), at, "timingSafeEqual", "the first")?
+    val b = bytes_arg(args.at(1), at, "timingSafeEqual", "the second")?
+
+    Ok(Bool(same_tag(a.view(), b.view())))
+end do_timing_safe_equal
