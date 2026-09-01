@@ -599,9 +599,25 @@ What it costs is that a path cannot be computed, which is the same bargain sysl 
 makes the set of files a program is made of knowable by reading it.
 
 **A path is relative to the file the import is written in**, so a directory of files that import each
-other works wherever the program is run from. A bare `util.sl` is refused rather than guessed at: a
-specifier with no `./` is what a package will be called when slate has packages, and a language that
-resolved it as a file today could not tell the two apart tomorrow.
+other works wherever the program is run from. A bare `util.sl` is refused rather than guessed at: an
+unquoted specifier is how a **package** is named, and a language that resolved it as a file could not
+tell the two apart.
+
+```
+import { helper } from "./util.sl"     // a quoted path  — a file
+import { mount } from lath             // a bare word    — a package
+import { domHost } from lath/dom       // and one of that package's other modules
+import { date, now } from slate:time   // slate:name     — one of slate's own
+```
+
+**A package exposes its `main` and whatever its own manifest lists under `modules`**, which is what
+the slash names. It is a list rather than a search: resolving `lath/dom` by trying `dom.slx` and then
+`dom.sl` would make every private helper in every package importable by accident, and would turn a
+renamed file into a broken consumer with no way for the author to have said otherwise.
+
+```
+{ name: "lath", version: "0.1.0", main: "lath.slx", modules: { dom: "dom.slx" } }
+```
 
 **A circle of imports is refused, with the chain named.** node allows one and initialises half a
 module, which is a famous source of confusion; refusing can be relaxed later, and half-built modules
