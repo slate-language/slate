@@ -1,0 +1,165 @@
+module dev.slatelang.slate
+@tests
+
+import sh.sysl.libuv
+import sh.sysl.libuv.Handle
+import sh.sysl.parsing.*
+import sysl.text.Search
+
+// Being asked to stop, which is `onSignal` and `offSignal` in `slate:process`.
+//
+// **THE SIGNAL IS REAL AND THE PROCESS IS THIS ONE.** There is nothing to stand in for a signal:
+// what is being tested is that the kernel delivers one to the process the suite is running in, that
+// libuv turns it into a turn of the loop, and that the slate function registered for it runs there.
+// So the tests send it to themselves -- `kill(pid(), ...)` -- which is how the libuv binding's own
+// signal tests are written, and the only way to reach this seam at all.
+//
+// **Two things make that safe to do in a test suite, and both are deliberate.**
+//
+// The first is `raised`'s guard: a watcher of the suite's own, armed on the same signal before the
+// program under test is run. Several watchers may watch one signal and every one of them is called,
+// so it takes nothing away from the program -- but a delivery the program *misses*, because it
+// failed to compile or ended early, lands on a watcher that ignores it instead of on a default
+// action that would kill the suite. Without it, a broken `onSignal` would not fail these tests; it
+// would end the run, which is a much worse thing to debug.
+//
+// The second is which signal each test uses. The one that proves the real case sends `SIGTERM`,
+// because that is the signal a deployment actually sends and a test that never used it would be
+// testing a number. The tests whose whole point is that **nothing** is watching -- `offSignal`, and
+// the program that never registers -- send `SIGWINCH`, whose default action is to be ignored: the
+// signal those tests arrange to have missed is a signal that is harmless to miss.
+
+// Run `text` while a signal is on its way to this process.
+//
+// `after` is the delay in milliseconds, and `every` repeats it -- `0` for one delivery. The program
+// under test has to keep itself alive long enough to be there when it lands, which is what the
+// timer in each of these is for.
+private raised(signum: i32, after: u64, every: u64, text: string) -> string
+    val guard = libuv.signal().expect("a guard watcher")
+
+    guard.start(signum, (n: i32) -> ()).expect("the guard watches")
+
+    // **`unref`ed, or the loop would wait on it forever.** `drain_events` ends with a turn of the
+    // default loop, and an open handle that counts is one that turn has no reason to come back from.
+    guard.unref()
+
+    val raiser = libuv.timer().expect("a timer to raise it with")
+
+    raiser.start(after, every, () -> libuv.kill(libuv.pid(), signum).expect("the signal was sent"))
+        .expect("the raiser starts")
+
+    // **AND SO IS THE RAISER, WHICH IS NOT THE SAME PRECAUTION AS THE GUARD'S.** `drain_events` ends
+    // with a `RUN_DEFAULT` turn, and that turn runs until no handle that *counts* is active -- so a
+    // repeating raiser left counting is a loop with a reason to go round every time, forever. It
+    // hung the suite for an hour and three quarters at 0% CPU, which reads as a deadlock and is a
+    // timer doing exactly what it was told. Unref'ed it still fires; it just stops being a reason to
+    // keep running, which is the same thing `signals.sysl` does to a watcher and for the same reason.
+    raiser.unref()
+
+    val said = out(s"${SignalImport}${text}")
+
+    // **Both are closed before the next test**, which is the same rule `forget_watches` keeps for
+    // slate's own: a raiser left armed would fire into whatever ran next, and a guard left open
+    // would leave the suite catching a signal on behalf of a test that has finished.
+    raiser.close(() -> ())
+    guard.close(() -> ())
+
+    // **`RUN_NOWAIT`, and the default would have been the wrong thing to reach for.** A close
+    // callback runs on the next turn and that is all this needs; `run()` with no argument is
+    // `RUN_DEFAULT`, which waits for everything the loop has, so a test helper that used it would be
+    // one stray handle away from hanging the suite instead of failing it.
+    libuv.default_loop().run(libuv.RUN_NOWAIT).expect("the closes finish")
+
+    said
+end raised
+
+@test
+a_handler_runs_when_the_signal_arrives()
+    // The timer is what keeps the program alive to be signalled; the handler cancels it, so the
+    // program ends when it is asked to and not when the timer would have run out.
+    val program =
+        "val t = setTimeout(() -> print(\"gave up\"), 2000)\n" +
+        "onSignal(\"SIGTERM\", () ->\n" +
+        "    print(\"stopping\")\n" +
+        "    clearTimeout(t))\n"
+
+    assert_eq(raised(libuv.SIGTERM, 40u64, 0u64, program), "stopping")
+
+@test
+a_handler_runs_every_time_the_signal_arrives()
+    // A one-shot watcher would pass the test above and fail this one, which is the reason it is
+    // here: `start` and `start_once` are one word apart in the binding.
+    val program =
+        "var n = 0\n" +
+        "val t = setTimeout(() -> print(\"gave up\"), 2000)\n" +
+        "onSignal(\"SIGWINCH\", () ->\n" +
+        "    n = n + 1\n" +
+        "    if n == 2\n" +
+        "        print(\"twice\")\n" +
+        "        clearTimeout(t))\n"
+
+    assert_eq(raised(libuv.SIGWINCH, 40u64, 40u64, program), "twice")
+
+@test
+a_watcher_does_not_keep_the_program_alive()
+    // **node's rule, checked against node**: `node -e 'process.on("SIGINT", () => {})'` prints
+    // nothing and exits at once. A program that installed a handler out of habit and could then
+    // never end would be a hang with nothing in the source to explain it.
+    assert_eq(out(SignalImport + "onSignal(\"SIGTERM\", () -> print(\"caught\"))\nprint(\"registered\")"), "registered")
+
+@test
+a_handler_that_was_stopped_does_not_run()
+    val program =
+        "val id = onSignal(\"SIGWINCH\", () -> print(\"caught\"))\n" +
+        "offSignal(id)\n" +
+        "setTimeout(() -> print(\"done\"), 200)\n"
+
+    assert_eq(raised(libuv.SIGWINCH, 40u64, 0u64, program), "done")
+
+@test
+stopping_a_handler_that_is_not_there_is_not_an_error()
+    // `clearTimeout`'s rule: a program that stops a handler twice has said something true about what
+    // it wants, and an id from a run that is over names nothing at all.
+    assert_eq(out(SignalImport + "val id = onSignal(\"SIGWINCH\", () -> print(\"caught\"))\noffSignal(id)\noffSignal(id)\noffSignal(9999)\nprint(\"fine\")"), "fine")
+
+@test
+a_signal_nobody_has_heard_of_is_refused()
+    val said = fails(SignalImport + "onSignal(\"SIGNOPE\", () -> print(\"caught\"))")
+
+    assert(said.contains("there is no signal called `SIGNOPE`"), s"it says which name: ${said}")
+    assert(said.contains("SIGTERM"), s"and what the names are: ${said}")
+
+@test
+a_signal_that_cannot_be_caught_says_so_rather_than_naming_an_argument()
+    // libuv answers `EINVAL` for these two, which is a sentence about an invalid argument where the
+    // truth is about the kernel -- so they are refused here, by name, before it is asked.
+    val term = fails(SignalImport + "onSignal(\"SIGKILL\", () -> print(\"caught\"))")
+    val stop = fails(SignalImport + "onSignal(\"SIGSTOP\", () -> print(\"caught\"))")
+
+    assert(term.contains("`SIGKILL` cannot be caught"), s"SIGKILL says so: ${term}")
+    assert(stop.contains("`SIGSTOP` cannot be caught"), s"SIGSTOP says so: ${stop}")
+
+@test
+onSignal_says_what_it_was_given_instead()
+    // The handler is `Any` in the signature -- a slate function's own type is not what that pass
+    // works in -- so this one is the machine's to refuse, and it does.
+    assert(fails(SignalImport + "onSignal(\"SIGTERM\", 3)").contains("needs a function to call"), "a number is not a handler")
+
+@test
+a_call_written_wrong_is_refused_before_the_program_runs()
+    // **These two are the reason `onSignal` and `offSignal` have signatures at all.** The pair is
+    // easy to write backwards, and without a signature a name handed to `offSignal` is a fault at
+    // the moment the signal arrives -- which may be days later and is nowhere near what was typed.
+    val short = fails(SignalImport + "onSignal(\"SIGTERM\")")
+    val named = fails(SignalImport + "offSignal(\"SIGTERM\")")
+
+    assert(short.contains("`onSignal` takes 2 arguments and this gives it 1"), s"the count is checked: ${short}")
+    assert(named.contains("`offSignal` takes integer here"), s"and so is what it is given: ${named}")
+
+@test
+a_handler_stopped_by_something_that_is_not_an_id_says_so()
+    // Reached through an unannotated parameter, which is `Any` to the checker -- so this is the
+    // machine's complaint rather than the one above, and both paths are covered.
+    val said = fails(SignalImport + "stop(x) = offSignal(x)\nstop(\"SIGTERM\")")
+
+    assert(said.contains("stopped by its id"), s"a handler is stopped by its id and not by its name: ${said}")

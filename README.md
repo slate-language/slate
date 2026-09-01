@@ -567,6 +567,42 @@ slot is reused, so the value a program holds carries the *generation* that claim
 socket held across a `close` would come to mean its successor and compare equal to it. That was a
 real defect, and the same one had been sitting in `setTimeout`'s ids since the loop was built.
 
+### Being asked to stop
+
+A program that leaves a socket open never exits, so a server ends only from the inside — and every
+way a deployment has of asking one to stop is a signal:
+
+```
+import { onSignal } from slate:process
+import { serve, close } from slate:http
+
+val server = serve(8080, req -> "hello")
+
+onSignal("SIGTERM", () ->
+    print("shutting down")
+    close(server))
+```
+
+`SIGTERM` is what a container stopping and a `systemd` unit restarting both send, and `SIGINT` is
+Ctrl-C at a terminal. A program that hears neither can only be killed, part way through whatever it
+was answering.
+
+**The handler is an ordinary function at an ordinary time.** It runs between one turn of the loop
+and the next, so nothing about it is restricted the way a C signal handler is: it may print,
+allocate, close a socket, start a timer, and take as long as the shutdown needs.
+
+**It is handed nothing, and the registration is what names the signal.** slate checks the count of a
+call's arguments, so a name passed to every handler would be a parameter almost none of them would
+read; a program that wants one function for two signals registers it twice.
+
+**A watcher does not keep the program alive.** node's rule: a script that installs a handler and does
+nothing else still ends. What keeps a server running is the server.
+
+`onSignal` answers an id and `offSignal(id)` stops that handler, after which the signal does whatever
+it did before. Stopping one twice is not an error, and neither is an id from a program that has
+finished. `SIGKILL` and `SIGSTOP` are refused by name — the kernel acts on those itself and nothing a
+program says will run first.
+
 ### Modules
 
 A file is a module. What another file can see is what it writes `export` in front of:
