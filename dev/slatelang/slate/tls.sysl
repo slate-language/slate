@@ -41,13 +41,23 @@ private struct Tls
     // it. **A server usually never has any** -- a program writes from inside its read callback, and
     // by the time that runs the handshake is long done -- but a protocol whose server speaks first
     // does, and dropping those bytes would be silent.
+    //
+    // **A CLIENT IS THE ORDINARY CASE RATHER THAN THE ODD ONE**, since `startTls` answers a promise a
+    // program is free not to await: writing the moment the upgrade is asked for is the natural way to
+    // spell it, and those bytes wait here until there is a session to put them in.
     queued: Buf[u8]
     waiting: Buf[usize]
+
+    // The request waiting on the handshake itself, which only the end that ASKED for one has. A
+    // server is handed a connection and never awaits its handshake -- there is nobody to tell -- so
+    // this is `None` for everything `tls_accepted` makes and `Some` for everything `tls_connect`
+    // does.
+    awaiting: Option[usize]
 end Tls
 
 private var slots: Buf[Tls] = buf()
 
-private blank() -> Tls = Tls(None, None, false, buf(), buf())
+private blank() -> Tls = Tls(None, None, false, buf(), buf(), None)
 
 // Forget every connection's TLS. Called when a new program is run, exactly as the socket table is.
 forget_tls()
@@ -119,6 +129,106 @@ tls_accepted(listener: usize, conn: usize) -> Result[unit, string]
     Ok(())
 end tls_accepted
 
+// A socket a program is upgrading gets a stream of its own, made as a CLIENT.
+//
+// **The host is used twice and both are mandatory**, which is the binding's own note: it goes out in
+// the handshake as SNI, without which a shared server does not know which certificate to send, and
+// it is what the certificate's names are checked against, without which a valid certificate for any
+// host at all would satisfy the verification. So there is no way to spell "encrypt but do not check
+// who this is" here, and that is deliberate -- `sh.sysl.openssl` offers none either.
+//
+// **`trust` is ADDED to the machine's store and never put in place of it**, which is what
+// `client.sysl` already says about `fetch`: a program naming a certificate is saying "this one as
+// well", so a connection to a public host in the same program is verified exactly as it was. Empty
+// means the machine's own store and nothing more.
+tls_connect(id: usize, host: string, trust: []const u8, request: usize) -> Result[unit, string]
+    room(id)
+
+    val client = openssl.client() match
+        Err(e) -> return Err(s"TLS could not be set up: ${e}")
+        Ok(c) -> c
+
+    if trust.len > 0
+        client.trust(trust) match
+            Err(e) -> return Err(s"this certificate could not be trusted: ${e}")
+            Ok(_) -> ()
+
+    val stream = openssl.connect(client, host) match
+        Err(e) -> return Err(s"TLS could not be set up: ${e}")
+        Ok(s) -> s
+
+    var slot = slots.at(id)
+
+    slot.stream = Some(stream)
+    slot.ready = false
+    slot.awaiting = Some(request)
+    slots.set(id, slot)
+    Ok(())
+end tls_connect
+
+// Start the handshake, for the end that speaks first.
+//
+// **THIS IS THE ONE ASYMMETRY BETWEEN THE TWO ENDS.** A server has nothing to say until it has been
+// spoken to, so `tls_accepted` gives a connection its stream and stops, and every turn after that is
+// driven from a read in `tls_took`. A client has to produce the ClientHello, and by the header's own
+// rule nothing is in the outgoing buffer until something has been asked to produce it -- so a client
+// that connected and waited would wait forever, with each end expecting the other to go first.
+tls_kick(id: usize) -> Result[unit, string]
+    if id >= slots.len() then return Ok(())
+
+    val stream = slots.at(id).stream match
+        Some(s) -> s
+        None -> return Ok(())
+
+    advance(id, stream) match
+        Err(e) -> return Err(e)
+        Ok(_) -> ()
+
+    Ok(())
+end tls_kick
+
+// One turn of the handshake, and whether that turn finished it.
+//
+// **Both ends' handshake is this**, which is what makes the client half three functions rather than
+// a second copy of the file: the difference is only ever who asks for the first turn.
+private advance(id: usize, stream: &openssl.Stream) -> Result[bool, string]
+    stream.handshake() match
+        Err(e) -> return Err(s"the TLS handshake failed: ${e}")
+        Ok(step) ->
+            if step != openssl.Step.Done then return Ok(false)
+
+    var slot = slots.at(id)
+
+    slot.ready = true
+    slots.set(id, slot)
+
+    // Whatever the program wrote while the handshake was still going now has somewhere to go.
+    push_queued(id)?
+    Ok(true)
+end advance
+
+// Whether this socket's handshake has finished, which is what says the promise a program is holding
+// for it can be answered.
+tls_ready(id: usize) -> bool
+    if id >= slots.len() then return false
+
+    slots.at(id).ready
+
+// The request waiting on this socket's handshake, taken out so the caller can settle it.
+//
+// **Taken rather than read**, for `tls_settled`'s reason: a handshake finishes once, and answering
+// its promise twice would answer a slot that has since been given to something else.
+tls_awaited(id: usize) -> Option[usize]
+    if id >= slots.len() then return None
+
+    var slot = slots.at(id)
+    val held = slot.awaiting
+
+    slot.awaiting = None
+    slots.set(id, slot)
+    held
+end tls_awaited
+
 // Everything OpenSSL wants sent, taken out of its outgoing buffer.
 //
 // **Answered rather than written**, so that this file never touches a socket: `net.sysl` owns the
@@ -168,18 +278,7 @@ tls_took(id: usize, cipher: []const u8) -> Result[Buf[u8], string]
         Ok(_) -> ()
 
     if !slots.at(id).ready
-        stream.handshake() match
-            Err(e) -> return Err(s"the TLS handshake failed: ${e}")
-            Ok(step) ->
-                if step != openssl.Step.Done then return Ok(plain)
-
-        var slot = slots.at(id)
-
-        slot.ready = true
-        slots.set(id, slot)
-
-        // Whatever the program wrote while the handshake was still going now has somewhere to go.
-        push_queued(id)?
+        if !advance(id, stream)? then return Ok(plain)
 
     var out: []u8 = [u8(0); 16384]
 
@@ -343,13 +442,50 @@ end listen_target
 private pem_of(o: *ObjectObj, name: string, at: Span) -> Result[Buf[u8], Signal]
     obj_get_name(o, name) match
         None -> Err(failure(at, s"a secured listener needs `${name}`, as PEM text -- `{ port, cert, key }`"))
-        Some(Str(p)) ->
-            var out: Buf[u8] = buf()
-
-            for i in 0..<p.s.bytes.len
-                out.push(p.s.bytes[i])
-
-            Ok(out)
+        Some(Str(p)) -> Ok(pem_from(p.s))
         Some(Array(a)) -> bytes_of(a, at, name)
         Some(other) -> Err(failure(at, s"`${name}` is PEM text or its bytes, and this is ${other.type_name()}"))
 end pem_of
+
+// PEM a program wrote as text, as the bytes every one of these calls takes.
+private pem_from(text: string) -> Buf[u8]
+    var out: Buf[u8] = buf()
+
+    for i in 0..<text.bytes.len
+        out.push(text.bytes[i])
+
+    out
+end pem_from
+
+// `startTls`'s second argument: the host, or an object saying more than that.
+//
+// **The host is the whole of the ordinary case**, so it is spelled as itself -- `startTls(sock,
+// "db.example.com")` -- and the object form is for the one other thing a program may need to say,
+// which is a certificate authority this machine does not already have. That is `listen_target`'s
+// arrangement read from the other end and for the same reason: a name and an object can never be
+// mistaken for one another, which is what makes the one argument safe.
+//
+//     startTls(sock, { host: "db.example.com", trust: pem })
+//
+// **There is nothing here that means "encrypt but do not check who this is."** The binding verifies
+// the certificate and the name against it and offers no way to relax either, so a private authority
+// or a self-signed certificate is named with `trust` rather than waved past -- which is the same
+// answer with the failure kept where it can be read.
+start_tls_target(v: Value, at: Span) -> Result[(string, Buf[u8]), Signal]
+    v match
+        Str(p) -> Ok((p.s, buf()))
+        Object(o) ->
+            val host = obj_get_name(o, "host") match
+                Some(Str(h)) -> h.s
+                Some(other) -> return Err(failure(at, s"`startTls` takes the host as a name, and this is ${other.type_name()}"))
+                None -> return Err(failure(at, "`startTls` was given an object with no `host` in it -- the name is what the certificate is checked against"))
+
+            val trust: Buf[u8] = obj_get_name(o, "trust") match
+                None -> buf()
+                Some(Str(p)) -> pem_from(p.s)
+                Some(Array(a)) -> bytes_of(a, at, "trust")?
+                Some(other) -> return Err(failure(at, s"`trust` is PEM text or its bytes, and this is ${other.type_name()}"))
+
+            Ok((host, trust))
+        other -> Err(failure(at, s"`startTls` takes the host to connect as, or an object saying more about it, and this is ${other.type_name()}"))
+end start_tls_target

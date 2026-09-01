@@ -1,6 +1,8 @@
 module dev.slatelang.slate
 @tests
 
+import sysl.text.Search
+
 // HTTPS: `listen` told a certificate, and everything above it unchanged.
 //
 // **These run against a real certificate in `tests/tls/`** and a real handshake over a real
@@ -58,3 +60,77 @@ A_KEY_THAT_DOES_NOT_GO_WITH_THE_CERTIFICATE_IS_REFUSED_AT_THE_LISTENER()
 
     assert_eq(out(watched(text)),
         "refused")
+
+// -- `startTls`: the other end of the same machinery ------------------------------------------------
+//
+// **Every one of these is a real handshake over a real loopback socket**, for the reason the four
+// above are: a mocked handshake tests the mock. What differs is only which end asked for it -- the
+// server under test up there, and the client down here, against a listener that is itself slate's.
+//
+// **The client and the server share every line below `tls_accepted`**, so what these are really
+// pinning is the three things that are not shared: that somebody produces the ClientHello, that the
+// certificate is checked against a name the program gave, and that the promise `startTls` hands out
+// is answered however the connection ends.
+
+const SecureEcho: string = "import { readFileSync } from slate:fs\nval theCert = readFileSync(\"tests/tls/cert.pem\").value\nval theKey = readFileSync(\"tests/tls/key.pem\").value\nserve(conn)\n    heard(chunk)\n        if chunk == null\n            close(conn)\n        else\n            send(conn, \"echo: \" + chunk)\n    onData(conn, heard)\nval server = listen({ port: 0, cert: theCert, key: theKey }, serve)\nval port = localPort(server)\n"
+
+@test
+startTls_UPGRADES_AN_OPEN_SOCKET_AND_WHAT_GOES_AFTER_IT_IS_ENCRYPTED()
+    // **The whole feature, and the shape every protocol that upgrades needs.** The socket is
+    // connected in the clear, `startTls` is awaited, and `send` after it is `send` -- the program
+    // never learns that its bytes are now records, which is the same seam `listen` gives a server.
+
+    assert_eq(net_out(SecureEcho + "async main()\n    val c = (await connect(\"127.0.0.1\", port)).value\n    reply(chunk)\n        print(chunk)\n        close(c)\n        close(server)\n        done()\n    onData(c, reply)\n    val up = await startTls(c, { host: \"localhost\", trust: theCert })\n    print(up.ok)\n    await send(c, \"hello\")\nmain()"), "true\necho: hello")
+
+@test
+A_CERTIFICATE_NOTHING_TRUSTS_IS_REFUSED_AND_THE_PROMISE_CARRIES_THE_REASON()
+    // **A promise that settles `ok: false` and not a connection that half works.** This is the case
+    // `fetch` already gets right; what is new is that a program driving its own socket is told, in a
+    // sentence it can print, rather than finding out as an end of stream it cannot explain.
+
+    assert_eq(net_out(SecureEcho + "async main()\n    val c = (await connect(\"127.0.0.1\", port)).value\n    reply(chunk) = chunk\n    onData(c, reply)\n    val up = await startTls(c, \"localhost\")\n    print(up.ok, up.error.contains(\"certificate\"))\n    close(c)\n    close(server)\n    done()\nmain()"), "false true")
+
+@test
+THE_NAME_startTls_IS_GIVEN_IS_WHAT_THE_CERTIFICATE_IS_CHECKED_AGAINST()
+    // **The host is not decoration and this is what says so**: the same server, the same trusted
+    // certificate, a name that is not on it -- refused. Without the check a valid certificate for any
+    // host at all would satisfy the verification, which is the failure that makes TLS worthless
+    // rather than the one that makes it noisy.
+
+    assert_eq(net_out(SecureEcho + "async main()\n    val c = (await connect(\"127.0.0.1\", port)).value\n    reply(chunk) = chunk\n    onData(c, reply)\n    val up = await startTls(c, { host: \"example.com\", trust: theCert })\n    print(up.ok, up.error.contains(\"handshake\"))\n    close(c)\n    close(server)\n    done()\nmain()"), "false true")
+
+@test
+A_SOCKET_THAT_IS_ALREADY_SECURED_IS_NOT_UPGRADED_TWICE()
+    // A second upgrade would give the slot a second stream and lose the first, and the connection
+    // would fail some records later with nothing pointing back here.
+
+    assert_eq(net_out(SecureEcho + "async main()\n    val c = (await connect(\"127.0.0.1\", port)).value\n    reply(chunk) = chunk\n    onData(c, reply)\n    startTls(c, { host: \"localhost\", trust: theCert })\n    try\n        startTls(c, { host: \"localhost\", trust: theCert })\n        print(\"accepted\")\n    catch e\n        print(\"refused\")\n    close(c)\n    close(server)\n    done()\nmain()"), "refused")
+
+@test
+BYTES_WRITTEN_BEFORE_THE_HANDSHAKE_FINISHED_ARE_QUEUED_AND_NOT_LOST()
+    // **The client is what makes the queue ordinary.** A server rarely has anything queued -- it
+    // writes from inside a read callback, by which time the handshake is long done -- but a client
+    // that does not await `startTls` before writing is the natural way to write this, and the bytes
+    // go out when the handshake ends. The promise `send` answered is settled then too, which is why
+    // `sent` prints before the echo rather than never.
+
+    assert_eq(net_out(SecureEcho + "async main()\n    val c = (await connect(\"127.0.0.1\", port)).value\n    reply(chunk)\n        print(chunk)\n        close(c)\n        close(server)\n        done()\n    onData(c, reply)\n    startTls(c, { host: \"localhost\", trust: theCert })\n    await send(c, \"early\")\n    print(\"sent\")\nmain()"), "sent\necho: early")
+
+@test
+A_HANDSHAKE_THE_PEER_ABANDONS_SETTLES_THE_PROMISE_RATHER_THAN_HANGING()
+    // **A promise that never settles is a program that never ends.** The listener here is a plain one
+    // that hangs up, which is what a port not speaking TLS does, and the program is told -- where
+    // before it would have waited for a ServerHello nobody was going to send.
+
+    assert_eq(net_out("hangUp(conn)\n    close(conn)\nval plain = listen(0, hangUp)\nasync main()\n    val c = (await connect(\"127.0.0.1\", localPort(plain))).value\n    reply(chunk) = chunk\n    onData(c, reply)\n    val up = await startTls(c, \"localhost\")\n    print(up.ok, up.error.contains(\"handshake\"))\n    close(c)\n    close(plain)\n    done()\nmain()"), "false true")
+
+@test
+startTls_ON_A_CLOSED_SOCKET_IS_A_COMPLAINT_AND_NOT_A_PROMISE()
+    assert(net_fails("val s = listen(0, print)\nclose(s)\nstartTls(s, \"localhost\")").contains("this socket is closed, and `startTls` needs an open one"))
+
+@test
+startTls_NEEDS_A_HOST_TO_CHECK_THE_CERTIFICATE_AGAINST()
+    // The one field that cannot be defaulted: there is no name to check a certificate against but the
+    // one the program was looking for, and the address it happened to dial is not it.
+
+    assert(net_fails("val s = listen(0, print)\nstartTls(s, {})").contains("no `host` in it"))
