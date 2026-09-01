@@ -632,9 +632,47 @@ SNI, without which a shared host does not know which certificate to send, and it
 certificate's names are verified against, without which a valid certificate for any host at all would
 do. An address works too and is checked against the certificate's addresses rather than its names —
 which is why `connect` resolving matters here rather than being a convenience: verify against the
-name the program was looking for, not the address the resolver happened to answer with. A private authority or a self-signed certificate is named with `trust`, which is *added* to the
+name the program was looking for, not the address the resolver happened to answer with.
+
+A private authority or a self-signed certificate is named with `trust`, which is *added* to the
 machine's own store rather than put in place of it — so naming one does not stop verifying everything
 else the program talks to.
+
+### Being asked to stop
+
+A program that leaves a socket open never exits, so a server ends only from the inside — and every
+way a deployment has of asking one to stop is a signal:
+
+```
+import { onSignal } from slate:process
+import { serve, close } from slate:http
+
+val server = serve(8080, req -> "hello")
+
+onSignal("SIGTERM", () ->
+    print("shutting down")
+    close(server))
+```
+
+`SIGTERM` is what a container stopping and a `systemd` unit restarting both send, and `SIGINT` is
+Ctrl-C at a terminal. A program that hears neither can only be killed, part way through whatever it
+was answering.
+
+**The handler is an ordinary function at an ordinary time.** It runs between one turn of the loop
+and the next, so nothing about it is restricted the way a C signal handler is: it may print,
+allocate, close a socket, start a timer, and take as long as the shutdown needs.
+
+**It is handed nothing, and the registration is what names the signal.** slate checks the count of a
+call's arguments, so a name passed to every handler would be a parameter almost none of them would
+read; a program that wants one function for two signals registers it twice.
+
+**A watcher does not keep the program alive.** node's rule: a script that installs a handler and does
+nothing else still ends. What keeps a server running is the server.
+
+`onSignal` answers an id and `offSignal(id)` stops that handler, after which the signal does whatever
+it did before. Stopping one twice is not an error, and neither is an id from a program that has
+finished. `SIGKILL` and `SIGSTOP` are refused by name — the kernel acts on those itself and nothing a
+program says will run first.
 
 ### Digests and randomness
 

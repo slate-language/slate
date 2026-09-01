@@ -1,0 +1,275 @@
+module dev.slatelang.slate
+
+import sh.sysl.gc
+import sh.sysl.libuv
+
+// `close` and `unref` are `Handle` members, and a trait has to be in scope to reach one.
+import sh.sysl.libuv.Handle
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// What a program is told when something outside it asks it to stop.
+//
+//     onSignal("SIGTERM", () ->
+//         print("shutting down")
+//         close(server))
+//
+// **This is how a server is stopped, and nothing else is.** A program with a listening socket in it
+// runs until something closes that socket, so the only way it ever ends is from the inside -- and
+// every way a deployment has of asking it to stop is a signal. A container stopping, a `systemd`
+// unit restarting and Ctrl-C at a terminal are all `SIGTERM` or `SIGINT`, and a program that cannot
+// hear one is a program that can only be killed: whatever it was in the middle of answering is
+// dropped where it stood.
+//
+// **It is not a signal handler**, in the sense that word has in C. libuv catches the signal in
+// whatever way the platform allows and delivers it to the loop, so what runs here is an ordinary
+// slate function at an ordinary time, between one turn of the loop and the next. Nothing about it is
+// restricted to what is async-signal-safe: it may print, allocate, close a socket and start a timer,
+// which is exactly what a program shutting down needs to do.
+//
+// **A handler is handed nothing, and the registration is what names the signal.** slate checks the
+// count of a call's arguments, so a name passed to the handler would be a parameter every program
+// had to write and nearly none would read -- node hands one over because one JavaScript function is
+// commonly registered for several signals and JavaScript ignores what it is not expecting. A program
+// here that wants one function for two signals registers it twice, and a program that needs to tell
+// them apart says so at the two registrations rather than in a branch inside the handler.
+//
+// ## A watcher does not keep the program alive
+//
+// **This is node's rule and it is deliberate.** `node -e 'process.on("SIGINT", () => {})'` prints
+// nothing and exits at once, and a slate program that registers a handler and does nothing else does
+// the same. The alternative is worse than it looks: a script that installs a `SIGTERM` handler out
+// of habit would never end, and the reason would be invisible in the source.
+//
+// So a watcher is `unref`ed and its slot is **not** counted in `outstanding`. What keeps a server
+// running is the server -- the listening socket's slot, exactly as before -- and the handler is
+// something that happens to be armed while it does.
+//
+// ## Why this is a table of its own rather than a slot in `event.sysl`'s
+//
+// `Pending` is what the loop is **waiting for**, and `outstanding` is how many of those there are:
+// a slot in it is a reason for the program to still be running. A signal watcher is the opposite
+// kind of thing -- something armed for as long as the program happens to last -- so putting one in
+// that table would have meant claiming a slot and then undoing the count it exists to keep.
+//
+// Everything else about the arrangement is the same, and for the same reasons: the collector cannot
+// see through an ARC box, so a callback captures a `usize` into this table rather than the slate
+// closure it means to call, and the closure itself lives in the slot where the mark phase can reach
+// it. A `&libuv.Signal` is a counted box and may not live in the collected heap at all, so it lives
+// here too.
+
+// One signal being watched.
+private struct Watch
+    // Whether this slot is in use. A spent slot is reused rather than grown past.
+    live: bool
+
+    // The slate function to call. `Null` once the slot is spent, which is what makes it collectable
+    // again -- the flag is what the mark phase reads, and a live-looking slot holding a dead closure
+    // would keep it alive forever.
+    callback: Value
+
+    // The watcher itself, kept alive here for as long as the program may still be sent the signal.
+    watcher: Option[&libuv.Signal]
+
+    // Which occupant of this slot this is, and it is what makes an id safe to hand a program. A
+    // spent slot is reused, so an id on its own names a *position* rather than a thing: held across
+    // an `offSignal` it would come to mean whatever took the position next, and stopping a handler
+    // by a stale id would stop somebody else's. `event.sysl`'s `Pending.gen` is the same field for
+    // the same reason.
+    gen: usize
+
+// Every signal this program is watching.
+//
+// **Module storage and a collector root**, for the reason in the header: this table is the only
+// thing standing between a registered handler and the sweep.
+private var watches: Buf[Watch] = buf()
+
+// The number the next registration will stamp its slot with. Never reused, never reset within a run.
+private var watch_generation: usize = 0
+
+// Mark what a signal may still call.
+//
+// Not `private`: `obj.sysl` roots the collector's walk and this is one of the places it reaches.
+mark_watches(h: *gc.Heap)
+    for i in 0..<watches.len()
+        if watches.at(i).live
+            mark_value(h, watches.at(i).callback)
+
+// Give the table back between runs.
+//
+// **Every watcher is stopped and not merely dropped, and that matters more here than it does for a
+// timer.** A handle holds a reference to itself while it is open, so letting go of the last name for
+// one stops nothing -- and a `SIGTERM` watcher left armed from a program that has finished would go
+// on catching `SIGTERM` for the process it was running in. In the test suite that process is the
+// suite, which would then quietly stop being stoppable.
+//
+// Not `private`: `event.sysl` puts the loop back to nothing between programs and this goes with it.
+forget_watches()
+    for i in 0..<watches.len()
+        stop_watch(i)
+
+    watches.clear()
+    watch_generation = 0
+
+// Take a slot, reusing a spent one where there is one. `event.sysl`'s `claim` is the same shape.
+private claim_watch(w: Watch) -> usize
+    var slot = w
+
+    watch_generation += 1
+    slot.gen = watch_generation
+
+    for i in 0..<watches.len()
+        if !watches.at(i).live
+            watches.set(i, slot)
+            return i
+
+    watches.push(slot)
+    watches.len() - 1
+end claim_watch
+
+// Stop watching, and give the slot back.
+//
+// **Closing is what stops it.** libuv takes a handle off the signal as it closes, so there is no
+// second call to make -- and a handle never closed is one the loop would wait on forever if it were
+// counted, which is the rule `event.sysl`'s `surrender` keeps for a timer and a socket.
+private stop_watch(id: usize)
+    if id >= watches.len() then return
+
+    var w = watches.at(id)
+
+    if !w.live then return
+
+    w.live = false
+    w.callback = Null
+
+    w.watcher match
+        Some(s) -> s.close(() -> ())
+        None -> ()
+
+    w.watcher = None
+    watches.set(id, w)
+end stop_watch
+
+// Run the slate function in a slot.
+//
+// **A fault inside a handler stops the program**, as one inside a timer callback does and as an
+// uncaught throw does in node. There is no statement to attach it to -- the loop is not running any
+// -- so it is reported against the whole run.
+private fire_watch(id: usize)
+    if id >= watches.len() then return
+
+    val w = watches.at(id)
+
+    if !w.live then return
+
+    val cb = w.callback
+    var none: Buf[Value] = buf()
+    val mark = root_mark()
+
+    hold(cb)
+
+    apply(cb, none, point(0)) match
+        Ok(_) -> ()
+        Err(s) -> loop_fault = Some(s)
+
+    release(mark)
+end fire_watch
+
+// The number a name stands for, which is the platform's and is asked for rather than written down.
+//
+// **`SIGKILL` and `SIGSTOP` are named here even though neither can be caught**, so that a program
+// asking for one is told what is true of it rather than that no such signal exists. A program that
+// named `SIGKILL` meant it, and the answer it needs is that nothing of its own will run.
+private signal_number(name: string) -> Option[i32]
+    if name == "SIGHUP" then return Some(libuv.SIGHUP)
+    if name == "SIGINT" then return Some(libuv.SIGINT)
+    if name == "SIGQUIT" then return Some(libuv.SIGQUIT)
+    if name == "SIGABRT" then return Some(libuv.SIGABRT)
+    if name == "SIGKILL" then return Some(libuv.SIGKILL)
+    if name == "SIGPIPE" then return Some(libuv.SIGPIPE)
+    if name == "SIGALRM" then return Some(libuv.SIGALRM)
+    if name == "SIGTERM" then return Some(libuv.SIGTERM)
+    if name == "SIGCHLD" then return Some(libuv.SIGCHLD)
+    if name == "SIGCONT" then return Some(libuv.SIGCONT)
+    if name == "SIGSTOP" then return Some(libuv.SIGSTOP)
+    if name == "SIGTSTP" then return Some(libuv.SIGTSTP)
+    if name == "SIGUSR1" then return Some(libuv.SIGUSR1)
+    if name == "SIGUSR2" then return Some(libuv.SIGUSR2)
+    if name == "SIGWINCH" then return Some(libuv.SIGWINCH)
+
+    None
+end signal_number
+
+// What a name nobody knows is told about instead. Every catchable one, in the order above.
+private val Catchable: string =
+    "SIGHUP, SIGINT, SIGQUIT, SIGABRT, SIGPIPE, SIGALRM, SIGTERM, SIGCHLD, SIGCONT, SIGTSTP, " +
+    "SIGUSR1, SIGUSR2 and SIGWINCH"
+
+// -- what a program calls --------------------------------------------------------------------------
+
+// `onSignal(name, fn)` -- call `fn` every time this program is sent that signal.
+//
+// The answer is an id, which `offSignal` takes and nothing else reads. That it is a number at all is
+// `setTimeout`'s convention, and it carries a generation for that function's reason.
+do_on_signal(args: Buf[Value], at: Span) -> Step
+    wants(args, 2, at, "onSignal", "a signal name and a function")?
+
+    val name = text_argument(args.at(0), at, "onSignal", "a signal name")?
+    val cb = args.at(1)
+
+    cb match
+        Fn(_) -> ()
+        Native(_) -> ()
+        other -> return fault(at, s"`onSignal` needs a function to call, and this is ${other.type_name()}")
+
+    // **Refused by name, before libuv is asked.** `start` on either answers `EINVAL`, which is a
+    // sentence about an invalid argument where the truth is about the kernel.
+    if name == "SIGKILL" || name == "SIGSTOP"
+        return fault(at, s"`${name}` cannot be caught: the kernel acts on it itself, and nothing this program says will run first")
+
+    signal_number(name) match
+        None -> fault(at, s"there is no signal called `${name}`; the ones a program may catch are ${Catchable}")
+        Some(number) -> watch_signal(number, cb, at)
+end do_on_signal
+
+// Arm one watcher, and put the slate function that goes with it in the same slot.
+private watch_signal(number: i32, cb: Value, at: Span) -> Step
+    libuv.signal() match
+        Err(e) -> fault(at, s"this signal could not be watched: ${e}")
+        Ok(s) ->
+            val id = claim_watch(Watch(true, cb, Some(s), 0))
+
+            // **The closure captures the id and not the value**, which is the arrangement the
+            // collector needs: it cannot see through this box, so what the box holds must be
+            // something it does not have to see through.
+            s.start(number, (n: i32) -> fire_watch(id)) match
+                Err(e) ->
+                    stop_watch(id)
+                    fault(at, s"this signal could not be watched: ${e}")
+                Ok(_) ->
+                    // **Armed, and not a reason to keep running.** See the header: a program with
+                    // nothing but a handler in it ends, exactly as node's does.
+                    s.unref()
+
+                    Ok(Int(long(watches.at(id).gen)))
+end watch_signal
+
+// `offSignal(id)` -- stop the handler that id names, and go back to whatever the signal did before.
+//
+// **An id that names nothing is not an error**, which is `clearTimeout`'s rule: a program that stops
+// a handler twice, or stops one after the run that registered it, has said something true about what
+// it wants and there is nothing to report.
+do_off_signal(args: Buf[Value], at: Span) -> Step
+    wants(args, 1, at, "offSignal", "the id `onSignal` answered")?
+
+    args.at(0) match
+        Int(n) ->
+            if n >= 0
+                for i in 0..<watches.len()
+                    if watches.at(i).live && watches.at(i).gen == usize(n)
+                        stop_watch(i)
+                        break
+
+            Ok(Null)
+        other -> fault(at, s"a signal handler is stopped by its id, and this is ${other.type_name()}")
+end do_off_signal
