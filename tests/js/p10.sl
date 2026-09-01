@@ -8,7 +8,7 @@
 //
 // It exists because `indexOf` answered `-1` here for as long as this back end had one, and the
 // compiler's golden tests -- which pin the emitted text -- could not have seen it. What found it was
-// `packages/react/`, whose `isVoid(tag)` asks `[...].indexOf(tag) != null`: every tag was a void tag,
+// `slate-language/lath`, whose `isVoid(tag)` asks `[...].indexOf(tag) != null`: every tag was a void tag,
 // so an element rendered as its opening tag and nothing else.
 
 // -- a miss is `null`, because slate has no out-of-band integer -------------------------------------

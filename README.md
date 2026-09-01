@@ -8,7 +8,8 @@ first at what an API server needs — HTTP over node's own llhttp, TCP, TLS, a f
 regular expressions and JSON.
 
 **It also compiles to JavaScript**, so the same program runs under the interpreter, under node or
-quickjs, and — with `slate:dom` and the React-shaped framework in `packages/react/` — in a browser.
+quickjs, and — with `slate:dom` and [lath](https://github.com/slate-language/lath), the React-shaped
+framework written in slate — in a browser.
 `slate js app.slx -o app.js` writes one self-contained file: the runtime, the framework and the
 program, with no bundler and nothing to install.
 
@@ -48,8 +49,6 @@ examples/tour.sl    the language in one file
 examples/match.sl   the patterns, in another
 examples/script.sl  a `#!` script: its arguments and its exit status
 examples/api.sl     what an API server writes every time
-examples/web/       a counter in a web page
-packages/react/     React in slate, over slx elements
 ```
 
 The module is **`dev.slatelang.slate`**, reversed from the domain the way `sh.sysl.*` is reversed
@@ -136,13 +135,17 @@ comment is `//` — and this did not make it one.
 ## Writing a page
 
 `slate js` reads the same tree a second time and writes JavaScript, so a slate program runs under
-node, under quickjs, or in a browser. The last of those is what `slate:dom` and `packages/react/` are
-for — React's model *and* React's mechanism, written in slate, over JSX-shaped elements the parser
-desugars into ordinary calls.
+node, under quickjs, or in a browser. The last of those is what `slate:dom` and
+[lath](https://github.com/slate-language/lath) are for — React's model *and* React's mechanism,
+written in slate, over JSX-shaped elements the parser desugars into ordinary calls.
 
 ```
-import { createElement, Fragment, mount, useState } from "./packages/react/react.slx"
-import { domHost } from "./packages/react/dom.slx"
+$ slate add github.com/slate-language/lath
+```
+
+```
+import { createElement, Fragment, mount, useState } from lath
+import { domHost } from lath/dom
 
 Counter({ start = 0 }) =
     val [count, setCount] = useState(start)
@@ -176,7 +179,9 @@ install.
   faults with a sentence naming the command rather than the code, because the same program is correct
   in a browser and it is the command that is wrong.
 
-`examples/web/` is a working counter; `packages/react/README.md` is the framework.
+**lath is a package rather than part of the language**, and deliberately so: a UI framework iterates
+far faster than a compiler, and baking one in would tie every framework fix to a language release.
+`slate-language/lath` has the counter, the framework and its own tests.
 
 ## The language
 
