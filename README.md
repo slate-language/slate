@@ -396,6 +396,15 @@ chain stops it.
 **And a failure nothing was waiting for is the program's failure**, reported against the line that
 raised it. That is the one thing node gets wrong by default and warns about instead.
 
+**A call whose promise was thrown away fails at once, and everything else is asked at the end.** The
+question "was this handled?" usually cannot be answered when a promise fails — `val p = risky()` and
+`await p` three lines later is ordinary, so a failed promise with nothing waiting on it may still be
+awaited — and it is therefore asked once, after everything has settled. But a call written on a line
+of its own, `main()`, was never given to anybody: there is no name for it and no line that could ever
+await it, so its failure is final where it happens. That distinction is what makes the report reach a
+*server*, which never settles and would otherwise hold the diagnostic for as long as the process
+lived — a fault in a coroutine that looks, from outside, exactly like a hang.
+
 `sleep(ms)` answers a promise for later; `resolve(v)` and `reject(message)` answer one that has
 already settled. Top-level `await` is refused — the whole program would have to become a coroutine,
 which is a real design and one to make on purpose.
@@ -556,7 +565,9 @@ its callback** — that replacement is the point of it, and a handler passed alo
 be silently dropped by the next call.
 
 A port of `0` asks the kernel to pick one and `localPort` says which, so nothing has to guess at a
-number that is free. `connect` takes an address rather than a name — there is no resolver yet.
+number that is free. **`connect` takes a name or an address**, resolving through libuv's resolver on
+its thread pool — the one `fetch` uses. A name that does not resolve settles the promise the way a
+refused connection does, rather than raising.
 
 **A socket keeps the program alive, exactly as a timer does**, so `close` is not optional; a program
 that leaves one open never exits. Closing twice is fine, which is what lets a server close its
@@ -586,7 +597,7 @@ The other end is `startTls`, which upgrades a socket that is already open:
 
 ```
 async main()
-    val db = (await connect(host, 5432)).value
+    val db = (await connect("db.example.com", 5432)).value
 
     onBytes(db, read)
 
@@ -605,10 +616,23 @@ one builtin covers both where a flag would have covered neither.
 with the reason when it does not. Everything after it is unchanged: `send` takes plaintext, the reader
 is handed plaintext, and a program that writes before awaiting has its bytes queued rather than lost.
 
+**A server upgrades its end the same way**, with the certificate and key `listen` would have taken:
+
+```
+startTls(conn, { cert: pem, key: keyPem })
+```
+
+Without it a slate server would be TLS from byte zero or not at all, and none of the protocols above
+could be written — each of them has the *server* answer in the clear before either end speaks TLS.
+There is no third argument saying which end this is: a client has a name to check and a server has a
+certificate to present, and neither object could be mistaken for the other.
+
 **The name is checked against the certificate and there is no way to say otherwise.** It goes out as
 SNI, without which a shared host does not know which certificate to send, and it is what the
 certificate's names are verified against, without which a valid certificate for any host at all would
-do. A private authority or a self-signed certificate is named with `trust`, which is *added* to the
+do. An address works too and is checked against the certificate's addresses rather than its names —
+which is why `connect` resolving matters here rather than being a convenience: verify against the
+name the program was looking for, not the address the resolver happened to answer with. A private authority or a self-signed certificate is named with `trust`, which is *added* to the
 machine's own store rather than put in place of it — so naming one does not stop verifying everything
 else the program talks to.
 

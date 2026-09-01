@@ -266,32 +266,71 @@ private accepted(id: usize, gen: usize)
 
 // `connect(host, port)` -- a promise of a connected socket.
 //
-// **`host` is an address and not a name.** There is no resolver here yet, so `"localhost"` is not a
-// thing that can be connected to and the failure says so in libuv's words.
+// **`host` IS A NAME AND NOT ONLY AN ADDRESS**, which is what puts a hosted service in reach: a
+// program dialling `db.example.com` has to be able to say `db.example.com`, and not only because
+// typing an address is tiresome. **TLS verifies a NAME**, so a program that had resolved the name
+// itself would arrive at `startTls` holding an address and have nothing left to check a certificate
+// against -- and the only ways out of that are to trust whatever certificate turns up, or to carry
+// the name alongside the address by hand. Resolving here is what keeps the name where the handshake
+// needs it.
+//
+// The resolver is libuv's, on its thread pool, which is the same one `fetch` uses.
 connect_socket(host: string, port: long, at: Span) -> Step
     if port < 0 || port > 65535 then return fault(at, s"a port is between 0 and 65535, and this is ${port}")
 
-    val client = libuv.tcp() match
-        Err(e) -> return fault(at, s"this socket could not be made: ${e}")
-        Ok(t) -> t
+    // The promise is made before the lookup starts, because the lookup can fail and a failure has to
+    // have somewhere to go -- and a name that does not resolve is a connection that did not happen,
+    // which is a settled promise and not a thrown complaint.
+    val waiting = begin_request()
+    val promised = awaited_request(waiting)
+    val what = s"cannot connect to ${host}:${port}"
 
-    val addr = libuv.ip4(host, int(port)) match
-        Err(e) -> return fault(at, s"cannot connect to ${host}: ${e}")
-        Ok(a) -> a
+    // **The port goes in as the SERVICE**, which is what puts it in the address libuv answers with;
+    // there is no way to set one on an `Address` afterwards. `client.sysl` says the same thing.
+    libuv.resolve(host, s"${port}", (r) ->
+        r match
+            Ok(found) -> connect_resolved(waiting, found, host, what, at)
+            Err(e) -> refuse_request(waiting, at, s"cannot find ${host}", e)) match
+        Err(e) ->
+            refuse_request(waiting, at, s"cannot find ${host}", e)
+            Ok(promised)
+        Ok(_) -> Ok(promised)
+end connect_socket
+
+// The name resolved, so there is somewhere to connect to.
+//
+// **The first IPv4 answer is preferred, and any answer will do where there is none.** A resolver
+// hands back every way it found and the ordering is the system's, so `localhost` on this machine
+// answers `::1` ahead of `127.0.0.1` -- and a program that listened with `listen` and connected to
+// its own port would then be refused, because a slate listener binds IPv4. Preferring one family is
+// the smallest thing that keeps those two agreeing, and it costs nothing on a host that has only
+// the other. **Walking the whole list on a refusal is what a browser does** and is what this should
+// grow into; it would change nothing above.
+private connect_resolved(waiting: usize, found: []libuv.AddrInfo, host: string, what: string, at: Span)
+    if found.len == 0
+        deny_request(waiting, at, s"there is no address for ${host}")
+        return
+
+    var pick: usize = 0
+
+    for i in 0..<found.len
+        if found[i].family == libuv.AF_INET
+            pick = i
+            break
+
+    val client = libuv.tcp() match
+        Err(e) ->
+            refuse_request(waiting, at, "this socket could not be made", e)
+            return
+        Ok(t) -> t
 
     // **Two slots, and they are not the same thing.** One holds the socket for as long as the
     // program has it; the other roots the promise for the length of the attempt and is given back
     // when the attempt finishes. Settling the promise would otherwise take the socket with it.
     val held = hold_socket(client, Null)
     val (id, gen) = socket_slot(held)
-    val waiting = begin_request()
-    val what = s"cannot connect to ${host}:${port}"
 
-    // The promise is read before anything can refuse the request -- see `request_started` in
-    // `event.sysl`: a refusal surrenders the slot, and a slot surrendered has no promise left in it.
-    val promised = awaited_request(waiting)
-
-    client.connect(addr, (r) ->
+    client.connect(found[pick].address, (r) ->
         r match
             Ok(_) -> answer_request(waiting, Socket(id, gen))
             Err(e) ->
@@ -300,9 +339,8 @@ connect_socket(host: string, port: long, at: Span) -> Step
         Err(e) ->
             surrender(id)
             refuse_request(waiting, at, what, e)
-            Ok(promised)
-        Ok(_) -> Ok(promised)
-end connect_socket
+        Ok(_) -> ()
+end connect_resolved
 
 // `startTls(sock, host)` -- an open socket, upgraded, answering a promise that settles when the
 // handshake has finished.
@@ -319,10 +357,7 @@ end connect_socket
 // either after this -- what arrives before then is the kernel's to hold -- but a program that never
 // does is one whose handshake never finishes.
 start_tls_socket(v: Value, host: string, trust: []const u8, at: Span) -> Step
-    val (id, gen) = socket_of(v, at, "startTls")?
-
-    if tls_here(id) then return fault(at, "this socket is already secured, and `startTls` upgrades a plain one")
-
+    val (id, gen) = upgradable(v, at)?
     val waiting = begin_request()
     val promised = awaited_request(waiting)
 
@@ -345,6 +380,39 @@ start_tls_socket(v: Value, host: string, trust: []const u8, at: Span) -> Step
     push_wire(id, gen)
     Ok(promised)
 end start_tls_socket
+
+// `startTls(conn, { cert, key })` -- the same upgrade asked for from the other end.
+//
+// **A SERVER HAS NOTHING TO SAY UNTIL IT HAS BEEN SPOKEN TO, so there is no kick and nothing to
+// push.** That is the one asymmetry between the two ends, and it is why this is four lines where the
+// client is a dozen: the handshake begins on the next read, exactly as it does for a connection
+// handed out by a secured `listen`, and the promise is answered from the same place.
+//
+// **The connection must be one somebody is reading, and here that is not a caution but the whole
+// mechanism** -- a server that never calls `onData` or `onBytes` will never see the ClientHello and
+// its handshake will never start.
+present_tls_socket(v: Value, certificate: []const u8, key: []const u8, alpn: []const string, at: Span) -> Step
+    val (id, _) = upgradable(v, at)?
+    val waiting = begin_request()
+    val promised = awaited_request(waiting)
+
+    tls_present(id, certificate, key, alpn, waiting) match
+        Err(e) ->
+            deny_request(waiting, at, e)
+            return Ok(promised)
+        Ok(_) -> ()
+
+    Ok(promised)
+end present_tls_socket
+
+// The socket an upgrade was asked for, or the complaint about why it cannot be one.
+private upgradable(v: Value, at: Span) -> Result[(usize, usize), Signal]
+    val (id, gen) = socket_of(v, at, "startTls")?
+
+    if tls_here(id) then return Err(failure(at, "this socket is already secured, and `startTls` upgrades a plain one"))
+
+    Ok((id, gen))
+end upgradable
 
 // A handshake this socket will never finish.
 //

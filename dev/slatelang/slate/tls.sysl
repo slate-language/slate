@@ -166,6 +166,43 @@ tls_connect(id: usize, host: string, trust: []const u8, request: usize) -> Resul
     Ok(())
 end tls_connect
 
+// A connection a program is upgrading gets a stream of its own, made as a SERVER.
+//
+// **A SERVER CAN BE ASKED TO UPGRADE TOO, and a protocol is what decides which end asks.** PostgreSQL
+// has the client send eight bytes in the clear and the server answer one before either speaks TLS, so
+// a program writing the server end of it needs exactly what `listen` gives -- a certificate and a key
+// -- applied to a connection that is already open. Without this, `listen` is the only way to a
+// certificate and a server is TLS from byte zero or not at all.
+//
+// **The listener's `Server` is not stored here.** An `openssl.Stream` keeps the context it was
+// accepted from alive itself, and a slot whose `server` was set would read as a *listener* to every
+// path in `net.sysl` that asks.
+tls_present(id: usize, certificate: []const u8, key: []const u8, alpn: []const string,
+            request: usize) -> Result[unit, string]
+    room(id)
+
+    val sv = openssl.server(certificate, key) match
+        Err(e) -> return Err(s"this certificate and key could not be used: ${e}")
+        Ok(s) -> s
+
+    if alpn.len > 0
+        sv.offer(alpn) match
+            Err(e) -> return Err(s"these protocols could not be offered: ${e}")
+            Ok(_) -> ()
+
+    val stream = openssl.accept(sv) match
+        Err(e) -> return Err(s"this connection could not be secured: ${e}")
+        Ok(s) -> s
+
+    var slot = slots.at(id)
+
+    slot.stream = Some(stream)
+    slot.ready = false
+    slot.awaiting = Some(request)
+    slots.set(id, slot)
+    Ok(())
+end tls_present
+
 // Start the handshake, for the end that speaks first.
 //
 // **THIS IS THE ONE ASYMMETRY BETWEEN THE TWO ENDS.** A server has nothing to say until it has been
@@ -418,20 +455,10 @@ listen_target(v: Value, at: Span) -> Result[(long, Option[Secure]), Signal]
                 Some(other) -> return Err(failure(at, s"`listen` takes the port as a number, and this is ${other.type_name()}"))
                 None -> return Err(failure(at, "`listen` was given an object with no `port` in it -- a secured listener is `{ port, cert, key }`"))
 
-            val certificate = pem_of(o, "cert", at)?
-            val key = pem_of(o, "key", at)?
-            var alpn: Buf[string] = buf()
+            val certificate = pem_of(o, "cert", at, "{ port, cert, key }")?
+            val key = pem_of(o, "key", at, "{ port, cert, key }")?
 
-            obj_get_name(o, "alpn") match
-                None -> ()
-                Some(Array(a)) ->
-                    for i in 0..<a.items.len()
-                        a.items.at(i) match
-                            Str(name) -> alpn.push(name.s)
-                            other -> return Err(failure(at, s"`alpn` is a list of protocol names, and one of them is ${other.type_name()}"))
-                Some(other) -> return Err(failure(at, s"`alpn` is a list of protocol names, and this is ${other.type_name()}"))
-
-            Ok((port, Some(Secure(certificate, key, alpn))))
+            Ok((port, Some(Secure(certificate, key, alpn_of(o, at)?))))
         other -> Err(failure(at, s"`listen` takes a port number, or an object saying how to secure one, and this is ${other.type_name()}"))
 end listen_target
 
@@ -439,13 +466,30 @@ end listen_target
 // secret store, an environment variable, a test's own string -- is the program's business, and a
 // listener that took a path would be asking for the filesystem to answer a question about
 // cryptography. The binding says the same thing one layer down.
-private pem_of(o: *ObjectObj, name: string, at: Span) -> Result[Buf[u8], Signal]
+private pem_of(o: *ObjectObj, name: string, at: Span, shape: string) -> Result[Buf[u8], Signal]
     obj_get_name(o, name) match
-        None -> Err(failure(at, s"a secured listener needs `${name}`, as PEM text -- `{ port, cert, key }`"))
+        None -> Err(failure(at, s"securing this needs `${name}`, as PEM text -- `${shape}`"))
         Some(Str(p)) -> Ok(pem_from(p.s))
         Some(Array(a)) -> bytes_of(a, at, name)
         Some(other) -> Err(failure(at, s"`${name}` is PEM text or its bytes, and this is ${other.type_name()}"))
 end pem_of
+
+// The protocols a server is offering, where it named any. Empty is ALPN not offered at all, which is
+// an ordinary connection for a client that does not ask.
+private alpn_of(o: *ObjectObj, at: Span) -> Result[Buf[string], Signal]
+    var alpn: Buf[string] = buf()
+
+    obj_get_name(o, "alpn") match
+        None -> ()
+        Some(Array(a)) ->
+            for i in 0..<a.items.len()
+                a.items.at(i) match
+                    Str(name) -> alpn.push(name.s)
+                    other -> return Err(failure(at, s"`alpn` is a list of protocol names, and one of them is ${other.type_name()}"))
+        Some(other) -> return Err(failure(at, s"`alpn` is a list of protocol names, and this is ${other.type_name()}"))
+
+    Ok(alpn)
+end alpn_of
 
 // PEM a program wrote as text, as the bytes every one of these calls takes.
 private pem_from(text: string) -> Buf[u8]
@@ -457,28 +501,47 @@ private pem_from(text: string) -> Buf[u8]
     out
 end pem_from
 
+// Which end of the handshake `startTls` was asked to be.
+//
+// **The two ends are told apart by what the program had to say, and not by a flag**, because they
+// have nothing in common to flag: a client has a name to check and may have an authority to check it
+// against, and a server has a certificate and a key. Neither object could be mistaken for the other,
+// and a `{ host, cert }` is a program that has not decided which end it is.
+enum Upgrade
+    AsClient(host: string, trust: Buf[u8])
+    AsServer(certificate: Buf[u8], key: Buf[u8], alpn: Buf[string])
+end Upgrade
+
 // `startTls`'s second argument: the host, or an object saying more than that.
 //
 // **The host is the whole of the ordinary case**, so it is spelled as itself -- `startTls(sock,
-// "db.example.com")` -- and the object form is for the one other thing a program may need to say,
-// which is a certificate authority this machine does not already have. That is `listen_target`'s
-// arrangement read from the other end and for the same reason: a name and an object can never be
-// mistaken for one another, which is what makes the one argument safe.
+// "db.example.com")` -- and the object form is for the two other things a program may need to say. A
+// name and an object can never be mistaken for one another, which is what makes the one argument
+// safe; `listen_target` reads the same way from the other end.
 //
 //     startTls(sock, { host: "db.example.com", trust: pem })
+//     startTls(conn, { cert: pem, key: keyPem })
 //
 // **There is nothing here that means "encrypt but do not check who this is."** The binding verifies
 // the certificate and the name against it and offers no way to relax either, so a private authority
 // or a self-signed certificate is named with `trust` rather than waved past -- which is the same
 // answer with the failure kept where it can be read.
-start_tls_target(v: Value, at: Span) -> Result[(string, Buf[u8]), Signal]
+start_tls_target(v: Value, at: Span) -> Result[Upgrade, Signal]
     v match
-        Str(p) -> Ok((p.s, buf()))
+        Str(p) -> Ok(AsClient(p.s, buf()))
         Object(o) ->
+            // **`cert` is what says this end is the server**, read before `host` so that the object a
+            // server writes is never measured against a client's requirements.
+            if obj_get_name(o, "cert").is_some()
+                val certificate = pem_of(o, "cert", at, "{ cert, key }")?
+                val key = pem_of(o, "key", at, "{ cert, key }")?
+
+                return Ok(AsServer(certificate, key, alpn_of(o, at)?))
+
             val host = obj_get_name(o, "host") match
                 Some(Str(h)) -> h.s
                 Some(other) -> return Err(failure(at, s"`startTls` takes the host as a name, and this is ${other.type_name()}"))
-                None -> return Err(failure(at, "`startTls` was given an object with no `host` in it -- the name is what the certificate is checked against"))
+                None -> return Err(failure(at, "`startTls` was given an object with no `host` in it -- the name is what the certificate is checked against, and a server upgrading its end says `{ cert, key }` instead"))
 
             val trust: Buf[u8] = obj_get_name(o, "trust") match
                 None -> buf()
@@ -486,6 +549,6 @@ start_tls_target(v: Value, at: Span) -> Result[(string, Buf[u8]), Signal]
                 Some(Array(a)) -> bytes_of(a, at, "trust")?
                 Some(other) -> return Err(failure(at, s"`trust` is PEM text or its bytes, and this is ${other.type_name()}"))
 
-            Ok((host, trust))
+            Ok(AsClient(host, trust))
         other -> Err(failure(at, s"`startTls` takes the host to connect as, or an object saying more about it, and this is ${other.type_name()}"))
 end start_tls_target
