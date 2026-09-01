@@ -3,7 +3,8 @@ module dev.slatelang.slate
 import sh.sysl.openssl
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
-import sysl.crypto.{hmac1, hmac256, hmac384, hmac512, sha1, sha256, sha384, sha512}
+import sysl.crypto.{hmac1, hmac256, hmac384, hmac512, hmacmd5, md5, sha1, sha256, sha384, sha512}
+import sysl.crypto.{pbkdf2_hmac1, pbkdf2_hmac256, pbkdf2_hmac384, pbkdf2_hmac512}
 import sysl.posix.rand.entropy_from_os
 
 // The cryptography slate's own modules stand on, and deliberately nothing above it.
@@ -202,12 +203,21 @@ end do_jws_verify
 //
 // **PBKDF2 is here rather than in a package for one reason, and it is not tidiness.** It is 4,096
 // HMACs of a 32-byte message for one SCRAM handshake, which is some eight thousand SHA-256
-// compressions -- seconds of interpreter time per connection, against a millisecond here. `slate:ws`
-// wrote its own SHA-1 in slate until `sysl.crypto` grew one, and this is the same lesson taken
-// before it costs anything.
+// compressions -- seconds of interpreter time per connection, against a millisecond here. What it is
+// *implemented* by is `sysl.crypto`'s, which keys the hash once and copies the keyed state per
+// iteration; it was written out here until the standard library grew one.
+//
+// **MD5 is exported on `sha1`'s terms and for `sha1`'s reason.** It is broken, nothing new may be
+// signed with it, and a client speaking PostgreSQL's `md5` authentication, HTTP Digest or an S3
+// `ETag` has no say in the matter. `slate-language/pg` wrote its own in slate until this arrived.
+// **`pbkdf2` does not take it**: deriving a key is the one thing here that is a program's own
+// choice, and the standard library offers no PBKDF2 over MD5 to reach for.
 
 // What every digest this knows about is called, for a message that has to list them.
-private digests() -> string = "SHA-1, SHA-256, SHA-384 and SHA-512"
+private digests() -> string = "MD5, SHA-1, SHA-256, SHA-384 and SHA-512"
+
+// The same, for key derivation, which does not take MD5.
+private derivations() -> string = "SHA-1, SHA-256, SHA-384 and SHA-512"
 
 // A fixed-size digest as a buffer, which is what everything below passes around.
 private collected(bytes: []const u8) -> Buf[u8]
@@ -219,102 +229,46 @@ private collected(bytes: []const u8) -> Buf[u8]
     out
 end collected
 
-// The digest by name, or nothing where the name is not one of the four.
+// The digest by name, or nothing where the name is not one of the five.
+//
+// **A digest is sliced where it is answered.** Each of these hands back a `[N]u8` this frame owns,
+// and a view of one that gets out of the frame moves it to the heap -- so there is nothing to bind
+// first and nothing for a local to buy.
 private digest_of(alg: string, data: []const u8) -> Option[Buf[u8]]
-    // Each digest is bound before it is sliced: these answer a `[N]u8` this frame owns, and a slice
-    // of one handed straight to a call would outlive the array it points into.
-    if alg == "SHA-1"
-        val d = sha1(data)
-
-        return Some(collected(d[..]))
-    elif alg == "SHA-256"
-        val d = sha256(data)
-
-        return Some(collected(d[..]))
-    elif alg == "SHA-384"
-        val d = sha384(data)
-
-        return Some(collected(d[..]))
-    elif alg == "SHA-512"
-        val d = sha512(data)
-
-        return Some(collected(d[..]))
+    if alg == "MD5" then return Some(collected(md5(data)[..]))
+    if alg == "SHA-1" then return Some(collected(sha1(data)[..]))
+    if alg == "SHA-256" then return Some(collected(sha256(data)[..]))
+    if alg == "SHA-384" then return Some(collected(sha384(data)[..]))
+    if alg == "SHA-512" then return Some(collected(sha512(data)[..]))
 
     None
 end digest_of
 
-// The same for HMAC, and the same answer where the name is not one of the four.
+// The same for HMAC, and the same answer where the name is not one of the five.
 private hmac_by_name(alg: string, key: []const u8, message: []const u8) -> Option[Buf[u8]]
-    if alg == "SHA-1"
-        val t = hmac1(key, message)
-
-        return Some(collected(t[..]))
-    elif alg == "SHA-256"
-        val t = hmac256(key, message)
-
-        return Some(collected(t[..]))
-    elif alg == "SHA-384"
-        val t = hmac384(key, message)
-
-        return Some(collected(t[..]))
-    elif alg == "SHA-512"
-        val t = hmac512(key, message)
-
-        return Some(collected(t[..]))
+    if alg == "MD5" then return Some(collected(hmacmd5(key, message)[..]))
+    if alg == "SHA-1" then return Some(collected(hmac1(key, message)[..]))
+    if alg == "SHA-256" then return Some(collected(hmac256(key, message)[..]))
+    if alg == "SHA-384" then return Some(collected(hmac384(key, message)[..]))
+    if alg == "SHA-512" then return Some(collected(hmac512(key, message)[..]))
 
     None
 end hmac_by_name
 
-// PBKDF2 as RFC 8018 writes it: `T_i` is the exclusive-or of `iterations` HMACs, the first over the
-// salt with the block number appended big-endian, each one after that over the answer before it.
+// PBKDF2 is `sysl.crypto`'s, one function per digest, each writing into storage the caller owns.
+// It keys the hash once and copies the keyed state per iteration, so tens of thousands of iterations
+// cost tens of thousands of hashes rather than twice that.
 //
-// **The block counter is four bytes and starts at one**, which is the part an implementation gets
-// wrong silently -- every value that comes out is a fine-looking key and none of them agrees with
-// anybody else's.
-private pbkdf2_of(alg: string, password: []const u8, salt: []const u8, iterations: long,
-                  length: usize) -> Option[Buf[u8]]
-    var out: Buf[u8] = buf()
-    var block: long = 1
+// **Three answers rather than two**: `None` where the name is not a digest this derives with,
+// `Some(false)` where the library refused the request, and `Some(true)` where `key` was filled.
+private pbkdf2_of(alg: string, password: []const u8, salt: []const u8, iterations: u32,
+                  key: []u8) -> Option[bool]
+    if alg == "SHA-1" then return Some(pbkdf2_hmac1(password, salt, iterations, key).is_ok())
+    if alg == "SHA-256" then return Some(pbkdf2_hmac256(password, salt, iterations, key).is_ok())
+    if alg == "SHA-384" then return Some(pbkdf2_hmac384(password, salt, iterations, key).is_ok())
+    if alg == "SHA-512" then return Some(pbkdf2_hmac512(password, salt, iterations, key).is_ok())
 
-    loop
-        if out.len() >= length then break
-
-        var seed: Buf[u8] = buf()
-
-        for i in 0..<salt.len
-            seed.push(salt[i])
-
-        seed.push(u8((block >> 24) & 255))
-        seed.push(u8((block >> 16) & 255))
-        seed.push(u8((block >> 8) & 255))
-        seed.push(u8(block & 255))
-
-        var u = hmac_by_name(alg, password, seed.view()) match
-            Some(v) -> v
-            None -> return None
-
-        var acc = collected(u.view())
-        var round: long = 1
-
-        loop
-            if round >= iterations then break
-
-            u = hmac_by_name(alg, password, u.view()) match
-                Some(v) -> v
-                None -> return None
-
-            for j in 0..<acc.len()
-                acc.set(j, acc.at(j) ^ u.at(j))
-
-            round += 1
-
-        for j in 0..<acc.len()
-            if out.len() < length
-                out.push(acc.at(j))
-
-        block += 1
-
-    Some(out)
+    None
 end pbkdf2_of
 
 // A count of bytes, which a program writes as a number and nothing else.
@@ -330,11 +284,13 @@ private whole_of(v: Value, at: Span, name: string, what: string) -> Result[long,
         Int(n) -> Ok(n)
         other -> Err(failure(at, s"`${name}` takes ${what} as a number, and this is ${other.type_name()}"))
 
-// `sha1(data)`, `sha256(data)`, `sha384(data)`, `sha512(data)` -- the digest, as a byte array.
+// `md5(data)`, `sha1(data)`, `sha256(data)`, `sha384(data)`, `sha512(data)` -- the digest, as a byte
+// array.
 //
-// **SHA-1 is exported and it is not an endorsement.** It is what an existing protocol asks for --
-// a WebSocket handshake, a Git object, an old server's SASL -- and a program speaking one of those
-// has no say in the matter. Nothing new should be signed with it.
+// **MD5 and SHA-1 are exported and neither is an endorsement.** Each is what an existing protocol
+// asks for -- a WebSocket handshake, a Git object, an old server's SASL, PostgreSQL's `md5` login --
+// and a program speaking one of those has no say in the matter. Nothing new should be signed with
+// either, and no content address may be one.
 do_digest(args: Buf[Value], at: Span, name: string, alg: string) -> Step
     if args.len() != 1 then return fault(at, s"`${name}` takes the data to hash, and was given ${counted(args.len(), "argument")}")
 
@@ -392,12 +348,21 @@ do_pbkdf2(args: Buf[Value], at: Span) -> Step
     if iterations < 1 then return fault(at, s"`pbkdf2` takes at least one iteration, and was asked for ${iterations}")
     if length == 0 then return fault(at, "`pbkdf2` was asked for a key of no length")
 
-    val key = pbkdf2_of(alg, password.view(), salt.view(), iterations, length) match
-        Some(k) -> k
-        None -> return fault(at, s"`${alg}` is not a digest this understands -- there are ${digests()}")
+    // The count crosses into a `u32` here, which is what the derivation takes. A number that does
+    // not fit is refused rather than wrapped: a wrapped count derives a perfectly good-looking key
+    // that agrees with nobody.
+    if iterations > 4294967295 then return fault(at, s"`pbkdf2` takes an iteration count of at most 4294967295, and was asked for ${iterations}")
+
+    var key: []u8 = [0u8; length]
+
+    val filled = pbkdf2_of(alg, password.view(), salt.view(), u32(iterations), key) match
+        Some(done) -> done
+        None -> return fault(at, s"`${alg}` is not a digest this derives a key with -- there are ${derivations()}")
+
+    if !filled then return fault(at, s"`pbkdf2` could not derive a key of ${length} bytes with ${alg}")
 
     val mark = root_mark()
-    val made = as_array(key)
+    val made = as_array_of(key)
 
     hold(made)
     release(mark)

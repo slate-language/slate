@@ -686,10 +686,12 @@ val tag = hmac("SHA-256", key, "the message")
 if timingSafeEqual(tag, sent) then print("that is the right tag")
 ```
 
-`sha1`, `sha256`, `sha384` and `sha512` take text or bytes and answer the digest as bytes. `hmac` and
-`pbkdf2` take the digest by name — `"SHA-1"`, `"SHA-256"`, `"SHA-384"`, `"SHA-512"` — because what a
-program is speaking to decides it, and a default here would be a decision taken by whoever wrote the
-module rather than by the protocol.
+`md5`, `sha1`, `sha256`, `sha384` and `sha512` take text or bytes and answer the digest as bytes.
+`hmac` takes the digest by name — `"MD5"`, `"SHA-1"`, `"SHA-256"`, `"SHA-384"`, `"SHA-512"` — because
+what a program is speaking to decides it, and a default here would be a decision taken by whoever
+wrote the module rather than by the protocol. **`pbkdf2` takes the same names without `"MD5"`**:
+every other name here reads a protocol somebody else chose, and deriving a key is the one thing a
+program chooses for itself.
 
 **The module is for a package, and that is why it exists.** `slate:jwt` and `slate:ws` are carried in
 the binary and are compiled against the scope the natives live in; a package installed with
@@ -709,9 +711,10 @@ some eight thousand SHA-256 compressions — a millisecond as a native and secon
 at the first byte that differs, which tells an attacker how much of a forged tag was right, and a tag
 can be guessed a byte at a time from that.
 
-**`sha1` is exported and it is not an endorsement.** It is what an existing protocol asks for — a
-WebSocket handshake, a Git object, an old server's SASL — and a program speaking one has no say in
-the matter. Nothing new should be signed with it. For a *password*, none of these is the answer:
+**`md5` and `sha1` are exported and neither is an endorsement.** Each is what an existing protocol
+asks for — a WebSocket handshake, a Git object, an old server's SASL, PostgreSQL's `md5` login, HTTP
+Digest, an S3 `ETag` — and a program speaking one has no say in the matter. Nothing new should be
+signed with either, and no content address may be one. For a *password*, none of these is the answer:
 `slate:password` is Argon2id and is deliberately slow, which is the whole difference.
 
 ### Modules
