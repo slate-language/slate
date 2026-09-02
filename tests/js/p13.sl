@@ -31,11 +31,12 @@ print(Point)
 print({ proto: Empty })
 print([p, q])
 
-// A nominal value compares by identity, and a plain object, an array and a variant stay deep.
+// `==` is content-based for every value, a class instance included.
 print(p == q, p == p, {x: 1} == {x: 1}, [1, 2] == [1, 2])
 print(Circle(3) == Circle(3), Nothing == Nothing)
 
-// `eq` is identity on every value that has one and equality on every value that has not.
+// `eq` is the other question, and the only way to ask it: identity on every value that has one, and
+// equality on every value that has not.
 print(p.eq(q), p.eq(p), p.ne(q))
 print([1, 2].eq([1, 2]), 1.eq(1), "a".eq("a"), true.eq(true), null.eq(null))
 
