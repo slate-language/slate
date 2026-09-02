@@ -58,3 +58,40 @@ print(distance(here, elsewhere({ x: 0 })) catch e -> s"caught: ${e.message}")
 // A bare name that names no type is a binding, exactly as it always was.
 print(42 match
     whatever -> s"bound ${whatever}")
+
+// **A FIELD THE VALUE NEED NOT HAVE IS MARKED `?`.** Present, it must fit; absent, the shape still
+// holds. A nullable union says something else: `tag: string | null` still requires the key to be
+// there holding a null.
+type Note = { title: string, pinned?: boolean }
+
+print({ title: "a" } is Note, { title: "a", pinned: true } is Note, { title: "a", pinned: 1 } is Note)
+
+// **`&` IS `|`'s DUAL and binds tighter.** Where `|` matches if any alternative does, an
+// intersection matches only where every part does -- which is what a value that has accumulated
+// fields on its way down through a stack of functions needs, each layer adding its own.
+type Authed = { user: { id: integer } }
+type Bodied = { body: string }
+
+serve(req: Authed & Bodied) = s"${req.user.id} said ${req.body}"
+
+print(serve({ user: { id: 7 }, body: "hello" }))
+
+// **AND A TYPE IS A VALUE UNDER ITS OWN NAME**, so a function can be handed the shape to check
+// against. That is what makes the declaration above the validator: nothing is written twice, and
+// there is no schema library to keep in step with it.
+print(Note)
+print(Note.name())
+print(Note.test({ title: "a" }))
+
+// `mismatch` collects every reason rather than stopping at the first, because a person filling in a
+// form wants to be told about all of it at once. `path` says where in the value the problem is.
+print(Note.mismatch({ pinned: 1 }))
+
+// So a checker is an ordinary function taking a shape.
+validated(shape, v) =
+    val wrong = shape.mismatch(v)
+
+    if len(wrong) == 0 then s"a good ${shape.name()}" else s"bad ${shape.name()}: ${toJSON(wrong)}"
+
+print(validated(Note, { title: "a" }))
+print(validated(Point, { x: 1 }))

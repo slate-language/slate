@@ -46,6 +46,13 @@ answered `-1` here for as long as this back end had one, and the golden tests in
 which pin the emitted TEXT, could not have seen it: the runtime those texts call into is a `raw"""`
 block no expectation ever quotes.
 
+**`p11.sl` is about a `type` being a VALUE**, and it earns its place because the two back ends hold
+one entirely differently: the interpreter keeps a slot with the resolved pattern and a pointer to the
+scope the declaration ran in, and the emitted program keeps the same pattern data `is` is emitted
+against, captured lexically. Nothing about those two arrangements makes them agree — what a
+`mismatch` report says is the only thing that does, so the program prints one for every shape a
+pattern can be.
+
 **`dom/` is a run of its own and needs jsdom** — see `dom/README.md`.
 
 **`p8.sl` writes into `tests/js/scratch/` and takes it away again**, so that running it twice says

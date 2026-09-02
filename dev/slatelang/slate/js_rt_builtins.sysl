@@ -710,6 +710,174 @@ js_runtime_builtins() -> string = raw"""
             return new TextDecoder().decode(bytes)
         }
 
+        // -- shapes ------------------------------------------------------------------------------------
+
+        // How a pattern is written, for the `wanted` half of a `mismatch` report. It reads the same
+        // data `matchPattern` walks, and it is the interpreter's `write_shape` word for word.
+        const shapeText = (pat) => {
+            const kind = pat[0]
+
+            if (kind === "_") return "any"
+            if (kind === "t") return pat[1]
+
+            // A literal as a program writes it. **`$.text` and not `$.show`**, so that a string is
+            // quoted here and not escaped -- which is what the interpreter's renderer does.
+            if (kind === "v") return typeof pat[1] === "string" ? '"' + pat[1] + '"' : $.text(pat[1])
+
+            if (kind === "@") return shapeText(pat[1])
+
+            if (kind === "arr") {
+                const parts = pat[1].map(shapeText)
+
+                if (pat[2] || pat[3]) parts.push("...")
+
+                return "[" + parts.join(", ") + "]"
+            }
+
+            if (kind === "obj") {
+                const parts = []
+
+                for (let i = 0; i < pat[1].length; i++)
+                    parts.push(pat[1][i] + (pat[3][i] ? "?" : "") + ": " + shapeText(pat[2][i]))
+
+                return "{ " + parts.join(", ") + " }"
+            }
+
+            if (kind === "or") return pat[1].map(shapeText).join(" | ")
+            if (kind === "and") return pat[1].map(shapeText).join(" & ")
+
+            // **The declared name, which travels beside the class for exactly this** -- a JavaScript
+            // object knows no name of its own.
+            if (kind === "proto") return pat[2]
+            if (kind === "one") return pat[2]
+            if (kind === "made") return pat[3] + " " + shapeText(pat[2])
+            if (kind === "variant")
+                return pat[3].length === 0 ? pat[4] : pat[4] + "(" + pat[3].map(shapeText).join(", ") + ")"
+
+            return "any"
+        }
+
+        // The word a report uses for what actually arrived. **Every one of these is a word a pattern
+        // could be written with**, so what a report says a value is can be pasted back into a type.
+        const kindWord = (v) => {
+            if (v === null) return "null"
+            if (typeof v === "boolean") return "boolean"
+            if ($.isInt(v)) return "integer"
+            if ($.isReal(v)) return "real"
+            if ($.isStr(v)) return "string"
+            if (Array.isArray(v)) return "array"
+            // **A data value is named by its VARIANT**, which is a word a pattern is written with
+            // and is what `print` says about the same value.
+            if (v instanceof $.SObj) return $.variantName(v) ?? "object"
+            if (v instanceof $.SShape) return "shape"
+            if (v instanceof Promise) return "promise"
+            if ($.isGen(v)) return "generator"
+            if (typeof v === "function") return "function"
+
+            return $.typeName(v)
+        }
+
+        const under = (path, part) => (path === "" ? part : path + "." + part)
+
+        const problem = (out, path, wanted, got) =>
+            out.push($.obj([["path", path], ["wanted", wanted], ["got", got]]))
+
+        // Everything about `v` that does not fit `pat`, as deep as the pattern goes.
+        //
+        // **A node that MATCHES is walked no further and reports nothing**, which is what makes a
+        // false entry impossible: every problem follows a match that actually answered no.
+        const collect = (pat, v, path, out) => {
+            if ($.matches(v, pat)) return
+
+            const kind = pat[0]
+
+            if (kind === "@") return collect(pat[1], v, path, out)
+
+            if (kind === "and") {
+                for (const part of pat[1]) collect(part, v, path, out)
+
+                return
+            }
+
+            if (kind === "obj") {
+                if (!(v instanceof $.SObj)) return problem(out, path, "object", kindWord(v))
+
+                const keys = pat[1]
+
+                for (let i = 0; i < keys.length; i++) {
+                    // `lookup` walks `proto`, as `field_through` does for the machine.
+                    const [held] = v.lookup(keys[i])
+
+                    if (held === undefined) {
+                        if (!pat[3][i]) problem(out, under(path, keys[i]), shapeText(pat[2][i]), "nothing")
+                    } else collect(pat[2][i], held, under(path, keys[i]), out)
+                }
+
+                return
+            }
+
+            if (kind === "arr") {
+                if (!Array.isArray(v)) return problem(out, path, "array", kindWord(v))
+
+                const items = pat[1]
+
+                // **The length is reported OR the elements are, never both.** An array of the wrong
+                // length has nothing useful to say about element three.
+                if (v.length >= pat[4] && (pat[2] || pat[3] || v.length <= items.length)) {
+                    for (let i = 0; i < items.length && i < v.length; i++)
+                        collect(items[i], v[i], under(path, String(i)), out)
+                } else problem(out, path, shapeText(pat), "an array of " + v.length)
+
+                return
+            }
+
+            // **The nominal half is asked on its own, and the fields are walked only where it
+            // held.** A value made by the wrong variant has nothing to say about field two.
+            if (kind === "variant") {
+                const items = pat[3]
+
+                if (items.length === 0 || !$.hasProto(v, pat[1]) || !(v instanceof $.SObj))
+                    return problem(out, path, shapeText(pat), kindWord(v))
+
+                const keys = pat[2]
+
+                for (let i = 0; i < items.length; i++) {
+                    const [held] = v.lookup(keys[i])
+
+                    if (held === undefined) problem(out, under(path, keys[i]), shapeText(items[i]), "nothing")
+                    else collect(items[i], held, under(path, keys[i]), out)
+                }
+
+                return
+            }
+
+            if (kind === "made") {
+                if ($.hasProto(v, pat[1])) return collect(pat[2], v, path, out)
+
+                return problem(out, path, pat[3], kindWord(v))
+            }
+
+            problem(out, path, shapeText(pat), kindWord(v))
+        }
+
+        const wantShape = (v, name) => {
+            if (!(v instanceof $.SShape)) fault("`" + name + "` takes a shape, and this is " + typeName(v))
+
+            return v
+        }
+
+        B.$shapeTest = (s, v) => $.matches(v, wantShape(s, "test").pat)
+
+        B.$shapeMismatch = (s, v) => {
+            const out = []
+
+            collect(wantShape(s, "mismatch").pat, v, "", out)
+
+            return out
+        }
+
+        B.$shapeName = (s) => wantShape(s, "name").name
+
         // -- the method tables -----------------------------------------------------------------------------
 
         const ARRAY = ["len", "push", "pop", "insert", "removeAt", "clear", "map", "filter", "reduce",
@@ -733,8 +901,13 @@ js_runtime_builtins() -> string = raw"""
             return t
         }
 
+        // **A shape's three, and they are `$`-prefixed so they are not also globals** -- `test` and
+        // `name` are words a program wants for its own, and the interpreter declares neither.
+        const SHAPE = new Map([["test", B.$shapeTest], ["mismatch", B.$shapeMismatch],
+            ["name", B.$shapeName]])
+
         const TABLES = { array: table(ARRAY), string: table(STRING), number: table(NUMBER),
-            generator: table(GENERATOR) }
+            generator: table(GENERATOR), shape: SHAPE }
 
         // The word a value's methods are looked up under, or "" for one that has none. **An object
         // answers "" and that is the decision rather than an omission**: its names belong to the program.
@@ -743,6 +916,7 @@ js_runtime_builtins() -> string = raw"""
             if ($.isStr(v)) return "string"
             if ($.isNum(v)) return "number"
             if ($.isGen(v)) return "generator"
+            if (v instanceof $.SShape) return "shape"
 
             return ""
         }

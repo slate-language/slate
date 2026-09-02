@@ -1,0 +1,380 @@
+module dev.slatelang.slate
+
+import sh.sysl.gc
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{str_builder, StrBuilder}
+
+// A declared type, as a value a program can hold.
+//
+// `type NewNote = { title: string, text: string }` binds `NewNote`, and what it binds answers three
+// questions: does this value fit (`test`), what about it does not (`mismatch`), and what was the
+// type called (`name`). **It answers nothing else, and the absence is the design** -- there is no
+// way to read a shape's fields back out, so nothing downstream can grow to depend on the structure
+// of a type and "a type has no run-time cost" survives in the sense that mattered.
+//
+// **WHY A TYPE HAD TO BECOME A VALUE.** A validator is a function that takes the shape it validates
+// against -- `body(NewNote, handler)` -- and until this there was no way to write the first
+// argument: `print(NewNote)` was ``` `NewNote` is not defined ```, a type having been a compile-time
+// name and nothing more. Every other declaration in the language already bound one, a class, a data
+// type and a variant each being a shape and a value under one name; **a `type` name was the only
+// name in slate that bound nothing**, which is why adding this breaks no program.
+//
+// **`is` IS NOT EXTENDED TO TAKE ONE.** A bare name in pattern position binds, so `check(v, s) =
+// v is s` would silently match everything -- the trap `check_type_shapes` already exists for. `is`
+// stays static and the dynamic question gets methods of its own.
+
+// -- the table -------------------------------------------------------------------------------------
+
+// One declared type.
+private struct Slot
+    // The pattern, already resolved -- so a type written in terms of another is what the other
+    // stands for, exactly as it is where the compiler tests it.
+    pat: Pattern
+
+    // What the declaration called it, for `name` and for `print`.
+    name: string
+
+    // **The scope the declaration ran in, and it is what makes a shape carryable.** A pattern may
+    // name a class, and `ProtoPat` looks that name up in a scope at the moment it matches -- so a
+    // shape tested inside a library it was passed to would look for the class in the library's
+    // scope and, patterns having nowhere to report from, quietly match nothing. Holding the
+    // declaring scope answers the question where it was asked.
+    scope: *EnvObj
+
+// Every shape the program has declared.
+//
+// **A slot is never given back, which is `RegexVal`'s rule and for `RegexVal`'s reason**: a type
+// declaration runs once and there is no `close` for a shape, so a slot names the same shape for as
+// long as the program runs and the id alone is the whole of the value. Nothing here needs a
+// generation.
+//
+// **Module storage and a collector root.** A `Pattern` is a counted box and a `*EnvObj` is a
+// collected one, so neither may sit in a `Value` -- both sit here, and `mark_shapes` is what keeps
+// the scope alive.
+private var slots: Buf[Slot] = buf()
+
+// Take a slot for a declaration that is running now.
+//
+// Not `private`: `execute.sysl`'s `PushShape` is the one instruction that makes one.
+shape_value(pat: Pattern, name: string, scope: *EnvObj) -> Value
+    slots.push(Slot(pat, name, scope))
+    Shape(slots.len() - 1)
+
+// What a shape was declared as.
+//
+// Not `private`: `builtin.sysl` prints one as `<shape NewNote>`.
+shape_name(id: usize) -> string = slots.at(id).name
+
+// Mark the scopes the declared types are holding.
+//
+// Not `private`: `obj.sysl` roots the collector's walk and this is one of the places it reaches.
+mark_shapes(h: *gc.Heap)
+    for i in 0..<slots.len()
+        gc.mark(h, ptr_cast(slots.at(i).scope))
+
+// Give the table back between runs.
+//
+// **It goes with `module_values` rather than with the event loop**, holding module scopes and
+// nothing else: a shape outlives every turn of the loop and dies with the program that declared it.
+//
+// Not `private`: `vm.sysl` puts the machine back to nothing between programs and this goes with it.
+forget_shapes()
+    slots.clear()
+
+// -- saying what a value is --------------------------------------------------------------------
+
+// The word a `mismatch` entry uses for what actually arrived.
+//
+// **Every one of these is a word `type_test_named` accepts**, so what a report says a value *is* can
+// be pasted straight into a pattern testing for it. The fallback is for the kinds that have no word
+// -- a range, a socket, `undefined` -- where a sentence is better than a word nobody can write.
+//
+// **The one entry that does not use this says a LENGTH instead**, an array of the wrong size being
+// the case where the kind is right and the count is what is wrong.
+private kind_word(v: Value) -> string = v match
+    Null -> "null"
+    Bool(_) -> "boolean"
+    Int(_) -> "integer"
+    Real(_) -> "real"
+    Str(_) -> "string"
+    Array(_) -> "array"
+
+    // **A data value is named by its VARIANT**, which is a word a pattern is written with and is
+    // what `print` says about the same value. `object` is true of it and tells a reader nothing.
+    Object(o) -> variant_name(o) match
+        Some(made) -> made
+        None -> "object"
+    Fn(_) -> "function"
+    Native(_) -> "function"
+    Promise(_) -> "promise"
+    InstantVal(_) -> "instant"
+    DurationVal(_) -> "duration"
+    DateVal(_) -> "date"
+    TimeVal(_) -> "time"
+    DateTimeVal(_, _) -> "dateTime"
+    ZoneVal(_) -> "zone"
+    ZonedVal(_, _) -> "zoned"
+    PeriodVal(_, _) -> "period"
+    Gen(_, _) -> "generator"
+    RegexVal(_) -> "regex"
+    Shape(_) -> "shape"
+    other -> other.type_name()
+
+// How a pattern is written, for the `wanted` half of a report.
+//
+// **`show.sysl`'s `write_pattern` renders a parse and this renders slate**, which is the difference
+// between `(| 1 2)` and `1 | 2`. A reader of a validation error is holding the type declaration, not
+// a tree dump, so what they are shown has to be what they wrote.
+private pattern_text(pat: Pattern) -> string
+    var out = str_builder()
+
+    write_shape(&out, pat)
+    out.finish()
+end pattern_text
+
+private write_shape(out: *StrBuilder, pat: Pattern)
+    *pat.kind match
+        Wild -> out.push("any")
+        Bind(name) -> out.push(name)
+        TypePat(test) -> out.push(type_test_text(test))
+        At(_, inner) -> write_shape(out, inner)
+        IntPat(v) -> out.push_int(v)
+        RealPat(v) -> out.push_real(v)
+        StrPat(v) ->
+            out.push_char('"')
+            out.push(v)
+            out.push_char('"')
+        BoolPat(v) -> out.push_bool(v)
+        NullPat -> out.push("null")
+        ArrayPat(items, open, rest, _) ->
+            out.push_char('[')
+
+            for i in 0..<items.len()
+                if i > 0 then out.push(", ")
+
+                write_shape(out, items.at(i))
+
+            if open
+                if !items.is_empty() then out.push(", ")
+
+                out.push("...")
+
+                rest match
+                    Some(name) -> out.push(name)
+                    None -> ()
+
+            out.push_char(']')
+        ObjectPat(keys, values, _, optional) ->
+            out.push("{ ")
+
+            for i in 0..<keys.len()
+                if i > 0 then out.push(", ")
+
+                out.push(keys.at(i))
+
+                if optional.at(i) then out.push_char('?')
+
+                out.push(": ")
+                write_shape(out, values.at(i))
+
+            out.push(" }")
+        OrPat(alts) ->
+            for i in 0..<alts.len()
+                if i > 0 then out.push(" | ")
+
+                write_shape(out, alts.at(i))
+        AndPat(parts) ->
+            for i in 0..<parts.len()
+                if i > 0 then out.push(" & ")
+
+                write_shape(out, parts.at(i))
+        ProtoPat(name, _, _) -> out.push(name)
+        DataPat(name, _) -> out.push(name)
+        MadeFrom(name, inner) ->
+            out.push(name)
+            out.push_char(' ')
+            write_shape(out, inner)
+        VariantPat(name, items, _, _) ->
+            out.push(name)
+
+            if !items.is_empty()
+                out.push_char('(')
+
+                for i in 0..<items.len()
+                    if i > 0 then out.push(", ")
+
+                    write_shape(out, items.at(i))
+
+                out.push_char(')')
+end write_shape
+
+// -- what does not fit ----------------------------------------------------------------------------
+
+// `title`, `items.0`, `user.name` -- where in the value the problem is, and `""` for the value
+// itself.
+private under(path: string, part: string) -> string = if path == "" then part else path + "." + part
+
+// One entry of a `mismatch` report.
+private problem(out: *Buf[Value], path: string, wanted: string, got: string)
+    val o = new_object()
+
+    hold(Object(o))
+    obj_put_name(o, "path", str_value(path))
+    obj_put_name(o, "wanted", str_value(wanted))
+    obj_put_name(o, "got", str_value(got))
+    out.push(Object(o))
+
+// Everything about `v` that does not fit `pat`, as deep as the pattern goes.
+//
+// **A node that MATCHES is walked no further and reports nothing**, which is what makes a false
+// entry impossible: every problem here follows a `match_pattern` that actually answered no. Where
+// the walk can say something more precise than "this does not fit" it descends -- a field of an
+// object, an element of an array, each part of an intersection -- and where it cannot, it names the
+// pattern and what arrived.
+private collect(pat: Pattern, v: Value, path: string, scratch: *EnvObj, out: *Buf[Value])
+    if match_pattern(pat, v, scratch, false) then return
+
+    *pat.kind match
+        At(_, inner) -> collect(inner, v, path, scratch, out)
+
+        // **Every part is walked, which is the whole reason an intersection is worth descending
+        // into**: `Authed & Noted` failing both should say so twice rather than once.
+        AndPat(parts) ->
+            for i in 0..<parts.len()
+                collect(parts.at(i), v, path, scratch, out)
+        ObjectPat(keys, values, defaults, optional) -> v match
+            Object(fields) ->
+                for i in 0..<keys.len()
+                    // `field_through`, so a field a proto supplies counts -- which is the question
+                    // `match_object` asks and the question `.` answers.
+                    field_through(fields, keys.at(i)) match
+                        Some(field) -> collect(values.at(i), field, under(path, keys.at(i)), scratch, out)
+                        None ->
+                            if defaults.at(i).is_none() && !optional.at(i)
+                                problem(out, under(path, keys.at(i)), pattern_text(values.at(i)), "nothing")
+            _ -> problem(out, path, "object", kind_word(v))
+        ArrayPat(items, open, _, defaults) -> v match
+            Array(xs) ->
+                // **The length is reported OR the elements are, never both.** An array of the wrong
+                // length has nothing useful to say about element three, and saying it anyway buries
+                // the one thing the reader has to fix.
+                if array_length_fits(items, open, defaults, xs.items.len())
+                    for i in 0..<items.len()
+                        if i < xs.items.len()
+                            collect(items.at(i), xs.items.at(i), under(path, integer_text(i)), scratch, out)
+                else
+                    problem(out, path, pattern_text(pat), s"an array of ${xs.items.len()}")
+            _ -> problem(out, path, "array", kind_word(v))
+        // **The nominal half is asked on its own, and the fields are walked only where it held.**
+        // A value made by the wrong variant has nothing to say about field two; one made by the
+        // right variant with the wrong contents has nothing to say about the variant.
+        VariantPat(name, items, keys, singleton) ->
+            if singleton || items.is_empty() || !match_pattern(bare_variant(pat, name, keys, singleton), v, scratch, false)
+                problem(out, path, pattern_text(pat), kind_word(v))
+            else
+                v match
+                    Object(fields) ->
+                        for i in 0..<items.len()
+                            field_through(fields, keys.at(i)) match
+                                Some(field) -> collect(items.at(i), field, under(path, keys.at(i)), scratch, out)
+                                None -> problem(out, under(path, keys.at(i)), pattern_text(items.at(i)), "nothing")
+                    _ -> problem(out, path, pattern_text(pat), kind_word(v))
+        MadeFrom(name, inner) ->
+            if match_pattern(pattern(pat.span, ProtoPat(name, buf(), false)), v, scratch, false)
+                collect(inner, v, path, scratch, out)
+            else
+                problem(out, path, name, kind_word(v))
+        _ -> problem(out, path, pattern_text(pat), kind_word(v))
+end collect
+
+// The nominal half of a variant pattern, which is what a variant written bare already is.
+private bare_variant(pat: Pattern, name: string, keys: Buf[string], singleton: bool) -> Pattern =
+    pattern(pat.span, VariantPat(name, buf(), keys, singleton))
+
+// Whether an array of `got` elements is the length this pattern admits.
+//
+// **The floor is the elements with no default**, which is `match_array`'s rule: a defaulted element
+// is one the array may stop before. It is the same arithmetic the JavaScript back end sends along
+// with the pattern, so the two answer alike.
+private array_length_fits(items: Buf[Pattern], open: bool, defaults: Buf[Option[Expr]], got: usize) -> bool
+    var optional: usize = 0
+
+    for i in 0..<defaults.len()
+        if defaults.at(i).is_some() then optional = optional + 1
+
+    if got < items.len() - optional then return false
+
+    open || got <= items.len()
+end array_length_fits
+
+private integer_text(n: usize) -> string
+    var out = str_builder()
+
+    out.push_int(long(n))
+    out.finish()
+end integer_text
+
+// -- what a program calls ---------------------------------------------------------------------
+
+// The shape a value names, for a method whose receiver has to be one.
+private shape_of(v: Value, at: Span, name: string) -> Result[usize, Signal] = v match
+    Shape(id) -> Ok(id)
+    other -> Err(failure(at, s"`${name}` takes a shape, and this is ${other.type_name()}"))
+
+// A scope for the walk's own bindings to fall into.
+//
+// **A pattern binds as it matches and there is nowhere for those names to go**, this being a
+// question rather than a binding -- so they go into a child of the scope the type was declared in,
+// which is thrown away when the call ends. The parent is what lets a `ProtoPat` inside the shape
+// still find its class.
+private scratch_scope(id: usize) -> *EnvObj = new_env(slots.at(id).scope)
+
+// `NewNote.test(v)` -- whether the value fits.
+do_shape_test(args: Buf[Value], at: Span) -> Step
+    wants(args, 2, at, "test", "a shape and a value")?
+
+    val id = shape_of(args.at(0), at, "test")?
+    val mark = env_mark()
+    val scratch = scratch_scope(id)
+
+    hold_env(scratch)
+
+    val fits = match_pattern(slots.at(id).pat, args.at(1), scratch, false)
+
+    release_env(mark)
+    Ok(Bool(fits))
+end do_shape_test
+
+// `NewNote.mismatch(v)` -- every reason it does not fit, and `[]` where it does.
+//
+// **It collects rather than stopping at the first**, which is the whole difference from `test`: a
+// person filling in a form wants to be told about all four fields at once, and an API that answers
+// one problem per request is an API somebody has to call five times.
+do_shape_mismatch(args: Buf[Value], at: Span) -> Step
+    wants(args, 2, at, "mismatch", "a shape and a value")?
+
+    val id = shape_of(args.at(0), at, "mismatch")?
+    val mark = root_mark()
+    val emark = env_mark()
+    val scratch = scratch_scope(id)
+
+    hold_env(scratch)
+
+    var found: Buf[Value] = buf()
+
+    collect(slots.at(id).pat, args.at(1), "", scratch, &found)
+
+    val xs = new_array(found)
+
+    release_env(emark)
+    release(mark)
+    Ok(Array(xs))
+end do_shape_mismatch
+
+// `NewNote.name()` -- what the declaration called it.
+do_shape_name(args: Buf[Value], at: Span) -> Step
+    wants(args, 1, at, "name", "a shape")?
+
+    Ok(str_value(slots.at(shape_of(args.at(0), at, "name")?).name))
+end do_shape_name

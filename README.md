@@ -37,6 +37,7 @@ dev/slatelang/slate/
     event.sysl      the event loop, over libuv: timers, and what roots a callback
     async.sysl      promises, and the queue that resumes a suspended call
     runtime.sysl    equality, arithmetic, indexing, matching and calling
+    shape.sysl      a declared type, as a value: `test`, `mismatch` and `name`
     builtin.sysl    the functions a program has without writing them
     show.sysl       the tree as `(+ 1 (* 2 3))`, for the tests
     stdlib.sysl     the modules slate brings with it, and what each one exports
@@ -256,8 +257,9 @@ evaluates `[3, 4] < 0` and faults, where `n @ number if n < 0` cannot reach the 
 kind.
 
 An object pattern matches an object with *at least* those fields, because a record grows fields over
-its life. `{ name }` is shorthand for `{ name: name }`. No alternative of a `|` may bind a name, since
-it would be bound down one path and not the other. A subject matching no arm is a runtime fault, as
+its life. `{ name }` is shorthand for `{ name: name }`, and `{ pinned? }` is a field the subject need
+not have. No alternative of a `|` may bind a name, since it would be bound down one path and not the
+other; `&` is its dual, binds tighter, and *may* bind, every part of an intersection running. A subject matching no arm is a runtime fault, as
 Scala's `MatchError` is.
 
 **Exhaustiveness is checked exactly where the value's shape was written down**, and nowhere else —
@@ -861,9 +863,9 @@ the whole of its value: one declaration serves both the pattern and the check at
 TypeScript app that reads an API response writes the shape twice, once as a `type` for the checker
 and once as a zod schema for the run; slate needs one.
 
-**Nothing of a type exists at run time.** A name standing in a pattern is replaced by the pattern the
-type declared, while the program is compiled — so `p is Point` is the `is` slate always had, and a
-type costs no instruction.
+**Nothing of a type's STRUCTURE exists at run time.** A name standing in a pattern is replaced by the
+pattern the type declared, while the program is compiled — so `p is Point` is the `is` slate always
+had, and a type costs no instruction. What the name *binds* is a shape, below.
 
 **A type is a shape and may not bind a name.** `type Tagged = { x: n }` is refused: a name written
 inside a type would be introduced wherever the type is used, which is not what a declaration that
@@ -873,12 +875,20 @@ outside a declaration binds exactly as it always did.
 **A bare name that names no type is still a binding.** That is sysl's rule for a nullary variant and
 slate already had it; declaring a type is what makes the name name something.
 
-**`export type` is how an interface leaves the file it was written in.** It counts as an export for
-the import check and imports like anything else, but binds nothing — the module has no field of that
-name, a type never having been a value.
+**`export type` is how an interface leaves the file it was written in**, and it imports like anything
+else — both halves cross, the shape the compiler resolves and the value the name binds.
 
 **Annotating is per parameter**, so `f(a, b: Point, c)` is fine — nothing has to be annotated for
 anything to be.
+
+**A field the value need not have is marked `?`.** Present it must fit, absent the shape still holds
+— which a nullable union cannot say, `tag: string | null` still requiring the key to be there. The
+pair states the rule: **`=` is for a pattern that binds and `?` is for one that tests**, and each is
+refused where the other belongs.
+
+```
+type Note = { title: string, pinned?: boolean }
+```
 
 **A type may be a union, and `null` may be one of the alternatives**, which is how a parameter says
 it will take nothing:
@@ -907,6 +917,36 @@ error: `b` was declared Point, and was given {x: 0}
 which is most of what a type buys a language with no checker. What is lost against TypeScript is
 real and worth saying: TS catches a mistake on a path you never ran, and this only fires when that
 path executes.
+
+**`&` is `|`'s dual and binds tighter**, matching only where every part does. A value picks up fields
+on its way down through a stack of functions, and this is how the one at the bottom says what it
+receives without writing the sum out by hand:
+
+```
+type Authed = { user: { id: integer } }
+type Bodied = { body: string }
+
+serve(req: Authed & Bodied) = req.user.id
+```
+
+A part *may* bind, where an alternative may not: every part runs, so `{ a } & { b }` binding both is
+sound where `{ a } | { b }` binding either is not.
+
+**A TYPE IS A VALUE UNDER ITS OWN NAME**, which is what makes the declaration the validator — nothing
+written twice, and no schema library to keep in step with it:
+
+```
+Note.test(v)       // true where it fits
+Note.mismatch(v)   // [{ path: "title", wanted: "string", got: "nothing" }, ...]
+Note.name()        // "Note"
+```
+
+`mismatch` collects every reason rather than stopping at the first, because a person filling in a form
+wants to be told about all of it at once, and `path` says where in the value each one is. Those three
+are the whole surface: **a shape's fields cannot be read back out**, so nothing can grow to depend on
+the structure of a type. `is` is deliberately not extended to take one — a bare name in pattern
+position binds, so `v is s` would match everything — and `shape` is a type word, so `s is shape` asks
+whether `s` is one of these.
 
 An interface, in the sense of a set of operations, needs nothing further — functions are values, so
 `type Drawable = { draw: function }` is one. And a trait's other half, the default methods, is what a proto
