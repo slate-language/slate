@@ -343,6 +343,23 @@ may read the parameters to its left: `slice(xs, from, to = len(xs))`. A paramete
 has to come last, or leaving it out would slide every later argument one place left; the parser says
 so where it is written. An arity complaint then names the range rather than only its upper end.
 
+**An argument may say which parameter it fills**, which is what makes a default in the *middle*
+reachable:
+
+```
+greet("ada")                      // hello, ada!
+greet("ada", punct: "?")          // hello, ada?   -- greeting skipped
+greet(greeting: "hi", name: "ada")
+```
+
+A name comes after every positional argument, and it may pick out any parameter — a class's `new`
+and a data variant's maker are ordinary functions, so `Rect(h: 4, w: 3)` and `Circle(r: 7)` read the
+same way. A method names its parameters and not its receiver.
+
+Naming a parameter twice, naming one the function does not have, naming an argument to a builtin, or
+naming one to a function that gathers with `...` are each refused with their own sentence — the
+second lists the parameters it does have.
+
 **A lambda's body may be a block, written where the lambda is passed.** A newline inside brackets
 normally means nothing — that is what lets an argument list be split over lines — so a callback would
 otherwise have to be lifted out and named before the call that wanted it:
@@ -949,6 +966,14 @@ which is most of what a type buys a language with no checker. What is lost again
 real and worth saying: TS catches a mistake on a path you never ran, and this only fires when that
 path executes.
 
+**The checker reads the rest of the block before it says what a name holds.** A `var` is the union of
+its initialiser and every value ever assigned to it, so a counter stays an integer through `+= 1` and
+`n++` and a wrong call is refused before the program runs; one the program reassigns to another kind
+is said nothing about, since refusing a program that runs is the one thing this pass may not do. A
+local object's fields are known for as long as nothing can have made them stale — its name never
+mentioned except to read a field off it, so nothing else holds the object and no field of it is ever
+written.
+
 **`&` is `|`'s dual and binds tighter**, matching only where every part does. A value picks up fields
 on its way down through a stack of functions, and this is how the one at the bottom says what it
 receives without writing the sum out by hand:
@@ -1002,6 +1027,25 @@ and not four**, so a type cannot order inconsistently with itself; `==` keeps `e
 type whose ordering is coarser than its equality is an ordinary thing to want. **The left operand
 decides and the right is never asked** — `equals`'s rule already — so there is no reflected form and
 `2 * money` is a fault. A hook is the *last* thing tried, so none can shadow what an operator means.
+
+**A class may also say how it PRINTS and how it ENCODES**, which is what a value object needs to
+stop leaking the fields it is made of:
+
+```
+class Money
+    var cents
+
+    toString(self) = "$" + string(self.cents / 100)
+    toJSON(self)   = string(self.cents / 100)
+
+print(Money(150))                      // $1
+print(toJSON({ paid: Money(150) }))    // {"paid":"1"}
+```
+
+Both replace everything below them at every depth, so a value inside an array or a response body
+renders the way its class says rather than only when printed on its own. Without `toJSON`, a class
+instance and a data variant encode as their own fields — `Circle(3)` is `{"r":3}` — and never as the
+chain they hang from.
 
 ### Objects that share their behaviour
 
