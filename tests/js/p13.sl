@@ -55,3 +55,31 @@ print((42).toString(), [1, 2].toString(), Circle(3).toString(), {a: 1}.toString(
 
 // A tag a declaration wrote is not a field.
 print(keys(Point), len(Point), keys(p), len(p))
+
+// A DIAGNOSTIC does not run `toString` -- a message about a fault that renders its values with the
+// program's own code can fault again, and the second fault is the one the reader would meet. Both
+// back ends have to draw that line in the same place, and for one release they did not.
+print((m match
+    1 -> "one") catch e -> e.message)
+
+print((Money.new(1) + 1) catch e -> e.message)
+print(assertEq(m, 1) catch e -> e.message)
+
+speak(v: string) = v
+
+print(speak(m) catch e -> e.message)
+
+// `equals` and `==` are one function, so a redefined `equals` decides both.
+print(m == Money.new(150), m.equals(Money.new(150)), m == 150)
+
+// `eq` and `ne` over every kind that has an identity and every kind that has not.
+val xs = [1, 2]
+val o = { a: 1 }
+
+print(xs.eq(xs), xs.eq([1, 2]), o.eq(o), o.eq({ a: 1 }))
+print(xs.ne(xs), xs.ne([1, 2]))
+print(1.eq(1.0), 1.eq(2), true.ne(false), null.eq(null))
+
+val f = (x) -> x
+
+print(f.eq(f), f.ne(f))

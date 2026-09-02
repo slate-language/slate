@@ -83,14 +83,181 @@ js_runtime_core() -> string = raw"""
         // walks it. A `Map` holds the fields because a slate key may be any string at all, `__proto__`
         // and `constructor` included, and none of JavaScript's inherited furniture should be reachable
         // by writing a field name.
+        // **A SLATE KEY IS ANY VALUE, AND THIS USED TO BE A `Map` OF STRINGS.** `t[[1, 2]] = "x"` and
+        // `t[{a: 1}] = "y"` work in the interpreter and were refused outright here -- *"an object is
+        // indexed by a string, and this is an array"* -- so a `hash` hook could never be reached under
+        // `slate js` at all, an object never getting as far as being a key.
+        //
+        // **The map is keyed by a SLOT STRING and holds `[key, value]`**, so the original key comes
+        // back out for `keys`, `entries` and the printer. A slot is worked out two ways:
+        //
+        // - **a scalar is its own exact slot** -- `"s"` and the text, `"i"` and the digits -- which
+        //   keeps a field name one string concatenation away from the `Map` it was always in, and that
+        //   is the whole of what this costs on the path every program takes.
+        // - **anything else is HASHED AND THEN COMPARED**, `"h" + hash + "#" + n`, walking `n` upward
+        //   until the slot is free or its key is `eq` to this one. That is a hash table with linear
+        //   probing written in three lines, and it is what an exact canonical string cannot do: a
+        //   cyclic key has no finite spelling, and a class with its own `equals` decides equality by
+        //   rules no spelling could reproduce.
+        //
+        // **The hash is INTERNAL and deliberately not the interpreter's number.** Nothing compares one
+        // across the two back ends -- `hash` is a hook and not a readable method, exactly so that this
+        // stays free -- so all it owes is agreement with `eq` in this runtime.
+        const scalarSlot = (k) => {
+            if (typeof k === "string") return "s" + k
+            if (typeof k === "bigint") return "i" + k
+
+            // **An integer and a real that are numerically equal MUST share a slot**, because `==`
+            // says they are equal: `1 == 1.0` is true in slate, so `t[1]` and `t[1.0]` have to find
+            // each other.
+            if (typeof k === "number") return Number.isInteger(k) ? "i" + BigInt(k) : "r" + k
+            if (typeof k === "boolean") return k ? "b1" : "b0"
+            if (k === null) return "z"
+            if (k instanceof SRange) return "g" + k.lo + ":" + k.hi + ":" + (k.inclusive ? 1 : 0) +
+                (k.hasLo ? 1 : 0) + (k.hasHi ? 1 : 0)
+
+            return null
+        }
+
+        // Where a value hashes to, for the slot scan above.
+        //
+        // **A `hash` the program wrote decides**, with the receiver rule every other hook takes, so a
+        // class keying a table by its own notion of sameness works here as it does in the interpreter.
+        const hashValue = (v, depth) => {
+            const said = callHook(v, "hash", [])
+
+            if (said !== NO_HOOK) {
+                if (typeof said !== "bigint")
+                    fault("`hash` must answer an integer, and this answered " + typeName(said))
+
+                return Number(BigInt.asUintN(32, said))
+            }
+
+            const mix = (a, b) => (Math.imul(a, 31) + b) | 0
+
+            // **A cycle stops at the cap rather than descending forever**, and that is free: a slot is
+            // settled by `eq` and not by the hash, so two values landing on one number cost a probe
+            // and nothing else.
+            if (depth > 8) return 17
+
+            if (Array.isArray(v)) {
+                let h = 7
+
+                for (const x of v) h = mix(h, hashValue(x, depth + 1))
+
+                return h
+            }
+
+            if (v instanceof SObj) {
+                let h = 0
+
+                // **Summed rather than mixed in order, because `same` compares contents and not
+                // order** -- an object that gained its fields in another order is the same object, so
+                // an order-sensitive hash would lose one of the two.
+                for (const [k, x] of v.entries())
+                    h = (h + Math.imul(hashValue(k, depth + 1), 31) + hashValue(x, depth + 1)) | 0
+
+                return h
+            }
+
+            const scalar = scalarSlot(v)
+
+            if (scalar !== null) {
+                let h = 5
+
+                for (let i = 0; i < scalar.length; i++) h = mix(h, scalar.charCodeAt(i))
+
+                return h
+            }
+
+            // A function, a promise and a generator compare by identity, so they hash by one: a lazy
+            // serial number, which is what an address is for the interpreter.
+            return identityNumber(v)
+        }
+
+        const IDENTITY = new WeakMap()
+        let identityNext = 1
+
+        const identityNumber = (v) => {
+            if (v === null || (typeof v !== "object" && typeof v !== "function")) return 3
+
+            const had = IDENTITY.get(v)
+
+            if (had !== undefined) return had
+
+            IDENTITY.set(v, identityNext)
+
+            return identityNext++
+        }
+
         class SObj {
+            // **`entries` is `[key, value]` pairs as a program wrote them**, not slots -- an object
+            // literal is emitted as one of these and knows nothing about the table underneath. A COPY
+            // goes through `SObj.copy`, which clones the slot map and hashes nothing a second time.
             constructor(entries) {
-                this.fields = new Map(entries || [])
+                this.fields = new Map()
+
+                if (entries) for (const [k, v] of entries) this.setKey(k, v)
 
                 // Whether this is a DATA VALUE, which does not change. The interpreter keeps the same
                 // flag on its own object, and both refuse the same writes with the same sentence.
                 this.frozen = false
             }
+
+            // The slot this key occupies, or would occupy -- **always a string, never null**, so the
+            // four operations below are one `Map` call each and the "is it there" question is asked
+            // of the map rather than answered twice.
+            slot(k) {
+                const scalar = scalarSlot(k)
+
+                if (scalar !== null) return scalar
+
+                const at = "h" + hashValue(k, 0) + "#"
+
+                for (let n = 0; ; n++) {
+                    const here = at + n
+                    const held = this.fields.get(here)
+
+                    if (held === undefined) return here
+                    if (eq(held[0], k)) return here
+                }
+            }
+
+            getKey(k) {
+                const held = this.fields.get(this.slot(k))
+
+                return held === undefined ? undefined : held[1]
+            }
+
+            setKey(k, v) { this.fields.set(this.slot(k), [k, v]) }
+
+            hasKey(k) { return this.fields.has(this.slot(k)) }
+
+            deleteKey(k) { return this.fields.delete(this.slot(k)) }
+
+            // The keys and values a program wrote, in the order it wrote them -- which is the `Map`'s
+            // own order, the slot strings being incidental.
+            *entries() { for (const [, kv] of this.fields) yield kv }
+
+            // A copy carrying the slots already worked out. `with` makes one per expression, so
+            // rehashing every key of the base would make that cost the size of the object.
+            static copy(base) {
+                const made = new SObj()
+
+                made.fields = new Map(base.fields)
+
+                return made
+            }
+
+            get size() { return this.fields.size }
+
+            // A field by NAME, which is the path every program takes and the reason a scalar slot is a
+            // concatenation rather than a hash.
+            getName(name) { return this.getKey(name) }
+
+            hasName(name) { return this.fields.has("s" + name) }
+
+            setName(name, v) { this.fields.set("s" + name, [name, v]) }
 
             // What `name` is here or up the chain, and whether it was delegated to.
             //
@@ -100,16 +267,16 @@ js_runtime_core() -> string = raw"""
             // **`new` is the one name the rule does not reach**, there being no object yet to hand it --
             // the interpreter's `field_from` says the same thing for the same reason.
             lookup(name) {
-                if (this.fields.has(name)) return [this.fields.get(name), false]
+                if (this.hasName(name)) return [this.getName(name), false]
 
                 let up = this
                 let depth = 0
 
                 for (;;) {
-                    const next = up.fields.get("proto")
+                    const next = up.getName("proto")
 
                     if (!(next instanceof SObj)) return [undefined, false]
-                    if (next.fields.has(name)) return [next.fields.get(name), name !== "new"]
+                    if (next.hasName(name)) return [next.getName(name), name !== "new"]
 
                     depth += 1
 
@@ -258,7 +425,7 @@ js_runtime_core() -> string = raw"""
 
         // A value as a program prints it: a string bare at the top level and quoted inside a container,
         // and a container already on the path as `[...]` rather than descending forever.
-        const write = (v, quoted, path) => {
+        const write = (v, quoted, path, hooks) => {
             if (v === null) return "null"
             if (v === undefined) return "undefined"
             if (typeof v === "boolean") return v ? "true" : "false"
@@ -271,7 +438,7 @@ js_runtime_core() -> string = raw"""
 
                 path.push(v)
 
-                const out = "[" + v.map((x) => write(x, true, path)).join(", ") + "]"
+                const out = "[" + v.map((x) => write(x, true, path, hooks)).join(", ") + "]"
 
                 path.pop()
 
@@ -284,8 +451,9 @@ js_runtime_core() -> string = raw"""
                 path.push(v)
 
                 // **A `toString` the program wrote replaces everything below, at every depth**, so
-                // `print([d, d])` renders each element the way its own class says.
-                const said = callHook(v, "toString", [])
+                // `print([d, d])` renders each element the way its own class says -- and is not
+                // consulted at all where a diagnostic is being composed.
+                const said = hooks ? callHook(v, "toString", []) : NO_HOOK
 
                 if (said !== NO_HOOK) {
                     path.pop()
@@ -304,8 +472,8 @@ js_runtime_core() -> string = raw"""
                 if (made !== null) {
                     const held = []
 
-                    for (const [k, x] of v.fields)
-                        if (k !== "proto" && k !== "(data)") held.push(write(x, true, path))
+                    for (const [k, x] of v.entries())
+                        if (k !== "proto" && k !== "(data)") held.push(write(x, true, path, hooks))
 
                     path.pop()
 
@@ -320,9 +488,9 @@ js_runtime_core() -> string = raw"""
                 if (cls !== null) {
                     const shown = []
 
-                    for (const [k, x] of v.fields)
+                    for (const [k, x] of v.entries())
                         if (k !== "proto" && !tagKey(k))
-                            shown.push((plainName(k) ? k : escaped(k)) + " = " + write(x, true, path))
+                            shown.push((plainName(k) ? k : escaped(k)) + " = " + write(x, true, path, hooks))
 
                     path.pop()
 
@@ -341,8 +509,8 @@ js_runtime_core() -> string = raw"""
 
                 const parts = []
 
-                for (const [k, x] of v.fields)
-                    if (!tagKey(k)) parts.push((plainName(k) ? k : escaped(k)) + ": " + write(x, true, path))
+                for (const [k, x] of v.entries())
+                    if (!tagKey(k)) parts.push((plainName(k) ? k : escaped(k)) + ": " + write(x, true, path, hooks))
 
                 path.pop()
 
@@ -367,8 +535,19 @@ js_runtime_core() -> string = raw"""
             return "<value>"
         }
 
-        const text = (v) => write(v, false, [])
-        const show = (v) => write(v, true, [])
+        // **`text`/`show` are the PROGRAM's printers and `plain`/`plainShow` are the DIAGNOSTICS'.**
+        // The split is the interpreter's `printed` against `value_text` and it exists for one reason:
+        // a message about a fault may not run the program's own code to render its values, because a
+        // `toString` can fault in turn and the second fault is the one the reader would be shown.
+        //
+        // **The two back ends have to draw the line in the SAME place**, and for one release they did
+        // not: this file had the hook inside `write` with no way to turn it off, so `no arm of this
+        // match applies to $150` under node was `... to Money(cents = 150)` under the interpreter.
+        // Every caller below says which of the two it is.
+        const text = (v) => write(v, false, [], true)
+        const show = (v) => write(v, true, [], true)
+        const plain = (v) => write(v, false, [], false)
+        const plainShow = (v) => write(v, true, [], false)
 
         // The engine's own way of writing a line, taken NOW rather than when it is needed.
         //
@@ -626,15 +805,17 @@ js_runtime_core() -> string = raw"""
             }
 
             if (a instanceof SObj) {
-                if (!(b instanceof SObj) || a.fields.size !== b.fields.size) return false
+                if (!(b instanceof SObj) || a.size !== b.size) return false
                 if (a === b) return true
 
                 for (const [x, y] of seen) if (x === a && y === b) return true
 
                 seen.push([a, b])
 
-                for (const [k, v] of a.fields)
-                    if (!b.fields.has(k) || !same(v, b.fields.get(k), seen)) { seen.pop(); return false }
+                for (const [k, v] of a.entries()) {
+                    if (!b.hasKey(k)) { seen.pop(); return false }
+                    if (!same(v, b.getKey(k), seen)) { seen.pop(); return false }
+                }
 
                 seen.pop()
 
@@ -761,11 +942,10 @@ js_runtime_core() -> string = raw"""
                 return strAt(t, k)
             }
 
-            if (t instanceof SObj) {
-                if (!isStr(k)) fault("an object is indexed by a string, and this is " + typeName(k))
-
-                return t.fields.has(k) ? t.fields.get(k) : undefined
-            }
+            // **A slate key is any value**, which is what the table underneath is now for. This
+            // refused everything but a string, so an object or an array as a key was a fault here and
+            // a perfectly ordinary program in the interpreter.
+            if (t instanceof SObj) return t.hasKey(k) ? t.getKey(k) : undefined
 
             fault(typeName(t) + " cannot be indexed")
         }
@@ -784,10 +964,9 @@ js_runtime_core() -> string = raw"""
             }
 
             if (t instanceof SObj) {
-                if (!isStr(k)) fault("an object is indexed by a string, and this is " + typeName(k))
-                if (t.frozen) fault(frozenComplaint(text(k)))
+                if (t.frozen) fault(frozenComplaint(plain(k)))
 
-                t.fields.set(k, keep(v, "put in an object"))
+                t.setKey(k, keep(v, "put in an object"))
 
                 return v
             }
@@ -834,7 +1013,7 @@ js_runtime_core() -> string = raw"""
             if (!(t instanceof SObj)) fault(typeName(t) + " has no field to assign to")
             if (t.frozen) fault(frozenComplaint("`" + name + "`"))
 
-            t.fields.set(name, keep(v, "put in an object"))
+            t.setName(name, keep(v, "put in an object"))
 
             return v
         }
@@ -1023,7 +1202,7 @@ js_runtime_core() -> string = raw"""
 
                 if (!(v instanceof SObj)) return false
 
-                for (const x of v.fields.values()) if (!matchPattern(x, pat[2], bound)) return false
+                for (const [, x] of v.entries()) if (!matchPattern(x, pat[2], bound)) return false
 
                 return true
             }
@@ -1098,7 +1277,7 @@ js_runtime_core() -> string = raw"""
         const className = (v) => {
             if (!(v instanceof SObj)) return null
 
-            const up = v.fields.get("proto")
+            const up = v.getName("proto")
 
             if (!(up instanceof SObj)) return null
 
@@ -1111,7 +1290,7 @@ js_runtime_core() -> string = raw"""
         const classOwnName = (v) => {
             if (!(v instanceof SObj)) return null
 
-            const tag = v.fields.get("(class)")
+            const tag = v.getName("(class)")
 
             return typeof tag === "string" ? tag : null
         }
@@ -1130,7 +1309,7 @@ js_runtime_core() -> string = raw"""
             let depth = 0
 
             for (;;) {
-                const next = up.fields.get("proto")
+                const next = up.getName("proto")
 
                 if (!(next instanceof SObj)) return false
                 if (next === cls) return true
@@ -1155,12 +1334,12 @@ js_runtime_core() -> string = raw"""
         const unpacked = (v, pat) => {
             const bound = matched(v, pat)
 
-            if (bound === null) fault("this value does not have the shape this takes apart: " + show(v))
+            if (bound === null) fault("this value does not have the shape this takes apart: " + plainShow(v))
 
             return bound
         }
 
-        const noArm = (v) => fault("no arm of this match applies to " + text(v))
+        const noArm = (v) => fault("no arm of this match applies to " + plain(v))
 
         // The sentence a thrown value carries.
         //
@@ -1171,12 +1350,12 @@ js_runtime_core() -> string = raw"""
             if (isStr(v)) return v
 
             if (v instanceof SObj) {
-                const said = v.fields.get("message")
+                const said = v.getName("message")
 
                 if (isStr(said)) return said
             }
 
-            return text(v)
+            return plain(v)
         }
 
         // What a `catch` binds: an ordinary object carrying the sentence, the line it was raised at and
@@ -1203,7 +1382,7 @@ js_runtime_core() -> string = raw"""
             arith, compare, neg, bitnot, eq, same: (a, b) => same(a, b, []), sameLiteral,
             strLen, strAt, strSlice, wide, span,
             index, setIndex, field, fieldOpt, setField, method, call, spread, awaited, iter, seal,
-            matched, matches, unpacked, noArm, caught, hasProto, variantName,
+            matched, matches, unpacked, noArm, caught, hasProto, variantName, plain, plainShow,
             className, classOwnName, tagKey, identical,
 
             // What a `type` declaration binds. **The pattern is walked and never read back out**, so
@@ -1249,9 +1428,9 @@ js_runtime_core() -> string = raw"""
             withFields(base, entries) {
                 if (!(base instanceof SObj)) fault("`with` takes an object, and this is " + typeName(base))
 
-                const made = new SObj(base.fields)
+                const made = SObj.copy(base)
 
-                for (const [k, v] of entries) made.fields.set(k, keep(v, "put in an object"))
+                for (const [k, v] of entries) made.setKey(k, keep(v, "put in an object"))
 
                 made.frozen = base.frozen
 
@@ -1274,9 +1453,9 @@ js_runtime_core() -> string = raw"""
                         ? "`...` spreads the fields of an object, and this is " + typeName(other)
                         : "`with` copies the fields of an object, and this is " + typeName(other))
 
-                const made = new SObj(base.fields)
+                const made = SObj.copy(base)
 
-                for (const [k, v] of other.fields) made.fields.set(k, v)
+                for (const [k, v] of other.entries()) made.setKey(k, v)
 
                 made.frozen = base.frozen
 
