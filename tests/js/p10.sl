@@ -53,3 +53,23 @@ catch e
 
 print(number(2.5), number(7))
 print([1, 2, 3].indexOf(1), "abc".indexOf("a"))
+
+// -- A COMPARATOR ANSWERS A BOOLEAN, AND THE BACK END DEMANDED A NUMBER ------------------------------
+//
+// slate's rule is `sorted(xs, (a, b) -> a.age < b.age)`, because zero is TRUE here and a -1/0/1
+// comparator would read as "yes, yes, yes" and sort nothing. The JavaScript runtime asked for a
+// number instead, so the documented idiom faulted under `slate js` and nowhere else -- and every
+// golden test stayed green, the runtime being a text block no expectation quotes.
+
+print(sorted([3, 1, 2], (a, b) -> a < b))
+print(sorted([3, 1, 2], (a, b) -> a > b))
+
+// Stability: two elements the comparator calls equal keep the order they came in.
+val people = [{ n: "a", age: 2 }, { n: "b", age: 1 }, { n: "c", age: 2 }]
+
+print(map(sorted(people, (x, y) -> x.age < y.age), p -> p.n))
+
+try
+    sorted([2, 1], (a, b) -> a - b)
+catch e
+    print(e.message)

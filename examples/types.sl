@@ -95,3 +95,32 @@ validated(shape, v) =
 
 print(validated(Note, { title: "a" }))
 print(validated(Point, { x: 1 }))
+
+// **A LIST IS DESCRIBED WITH `array of T`, AND NOTHING COULD SAY IT BEFORE.** An array pattern
+// tests the elements it writes and lets the rest through, so `["a", 2] is [string, ...]` is true --
+// which means a list of unknown length, the commonest thing in a request body, had no spelling.
+type Tags = array of string
+type Roster = array of Named
+
+print(["a", "b"] is Tags, ["a", 2] is Tags)
+print([{ name: "ann" }] is Roster, [{ name: 4 }] is Roster)
+
+// **An empty container fits**, every element of nothing fitting anything -- which is the ordinary
+// answer to a query that found none. A floor is said with an intersection.
+print([] is Tags, [] is [any, ...] & Tags)
+
+// `object of T` is the other half: an object's values, its keys being the program's.
+type Counts = object of integer
+
+print({ hits: 1 } is Counts, { hits: "many" } is Counts)
+
+// It nests, an element being an ordinary pattern -- which is what this buys over a single word.
+print(Roster.mismatch([{ name: "ann" }, { name: 4 }, {}]))
+
+// **And the loop variable is typed from it**, so a method the element cannot do is refused before
+// the program runs rather than when the loop reaches it.
+shout(names: Tags) =
+    for n in names
+        print(n.upper())
+
+shout(["ann", "bo"])

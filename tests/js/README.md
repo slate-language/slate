@@ -53,6 +53,12 @@ against, captured lexically. Nothing about those two arrangements makes them agr
 `mismatch` report says is the only thing that does, so the program prints one for every shape a
 pattern can be.
 
+**`p12.sl` is about a rest parameter and an operator a class answers for.** The two back ends hold
+both entirely differently — the interpreter gathers the surplus into an array before it binds
+anything and looks a hook up through `field_from`, and the emitted program uses JavaScript's own
+`...` and `SObj.lookup` — so what they print is the only thing that says they agree. It carries the
+refusals too, an operator with no hook still having to name itself.
+
 **`dom/` is a run of its own and needs jsdom** — see `dom/README.md`.
 
 **`p8.sl` writes into `tests/js/scratch/` and takes it away again**, so that running it twice says

@@ -200,3 +200,58 @@ val c = counter()
 
 c.bump()
 print(c.bump())
+
+// **AN OBJECT MAY ANSWER FOR AN OPERATOR.** `equals` and `hash` have always been proto hooks looked
+// up by name, and these are the same mechanism widened: the word is the method's name, so a class
+// body writes one with the definition syntax it already has.
+class Money
+    var cents
+
+    plus(self, o) = Money(self.cents + o.cents)
+    minus(self, o) = Money(self.cents - o.cents)
+    times(self, n) = Money(self.cents * n)
+    negated(self) = Money(-self.cents)
+
+    // **Ordering is ONE hook, not four.** It answers a number below, at or above zero, and `<`,
+    // `<=`, `>` and `>=` all read its sign -- so a type cannot order inconsistently with itself.
+    compare(self, o) = self.cents - o.cents
+
+    string(self) = "$" + string(self.cents / 100)
+
+val rent = Money(90000)
+val bill = Money(4500)
+
+print((rent + bill).string(), (rent - bill).string(), (rent * 2).string(), (-bill).string())
+print(bill < rent, rent <= rent)
+
+// **`==` keeps its own hook and is NOT routed through `compare`**, a type whose ordering is coarser
+// than its equality being an ordinary thing to want. `equals` is handed no receiver, which is what
+// keeps every hook written before operators existed working -- so it is written as a captured
+// function rather than as a method, and a class wanting one says so on the object.
+print(rent == Money(90000), rent == bill)
+
+// So a comparator is an ordinary `<`, and sorting falls out of the one hook.
+print(map(sorted([rent, bill, Money(12000)], (a, b) -> a < b), m -> m.string()))
+
+// **THE LEFT OPERAND DECIDES AND THE RIGHT IS NEVER ASKED**, which is `equals`'s rule already --
+// so there is no reflected form and `2 * rent` is not `rent.times(2)`.
+print((2 * rent) catch e -> e.message)
+
+// **AND A FUNCTION MAY GATHER WHAT IS LEFT OVER.** slate could spread at a call long before it
+// could gather at a definition; `...rest` is always bound, to an empty array where a call gave
+// nothing past the fixed parameters.
+total(first, ...others) =
+    var sum = first
+
+    for m in others
+        sum = sum + m
+
+    sum
+
+print(total(rent).string())
+print(total(rent, bill, Money(12000)).string())
+
+// It composes with the spread it is the counterpart of.
+val monthly = [rent, bill]
+
+print(total(...monthly).string())

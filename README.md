@@ -881,6 +881,21 @@ else — both halves cross, the shape the compiler resolves and the value the na
 **Annotating is per parameter**, so `f(a, b: Point, c)` is fine — nothing has to be annotated for
 anything to be.
 
+**A list is described with `array of T`.** An array pattern tests the elements it writes and lets
+the rest through — `["a", 2] is [string, ...]` is **true** — so a list of unknown length had no
+spelling at all until this. `object of T` is the other half, describing an object's values.
+
+```
+type Tags   = array of string
+type Counts = object of integer
+type Grid   = array of array of integer
+```
+
+An empty container fits, every element of nothing fitting anything; a floor is said with an
+intersection (`[any, ...] & array of string`). The element pattern may not bind, running once per
+element. **A `for` over one types its variable**, so `for u in users` where `users: array of User`
+makes `u` a `User`.
+
 **A field the value need not have is marked `?`.** Present it must fit, absent the shape still holds
 — which a nullable union cannot say, `tag: string | null` still requiring the key to be there. The
 pair states the rule: **`=` is for a pattern that binds and `?` is for one that tests**, and each is
@@ -897,6 +912,20 @@ it will take nothing:
 type MaybePoint = Point | null
 type Shape = { side: number } | { radius: number }
 ```
+
+**A function may gather what is left over.** slate could spread at a call long before it could
+gather at a definition; `...rest` is always bound, to an empty array where a call gave nothing past
+the fixed parameters, so there is no `undefined` to test for:
+
+```
+total(first, ...others) = reduce(others, (a, b) -> a + b, first)
+
+total(1)                 // 1
+total(1, 2, 3)           // 6
+total(...xs)             // the spread it is the counterpart of
+```
+
+It must be last and takes no default — one could never fire. A default *before* it is fine.
 
 **A definition may say what it answers**, which is what anything downstream of a call needs:
 
@@ -951,6 +980,26 @@ whether `s` is one of these.
 An interface, in the sense of a set of operations, needs nothing further — functions are values, so
 `type Drawable = { draw: function }` is one. And a trait's other half, the default methods, is what a proto
 already is. A class promises one with `is`, below.
+
+**An object may answer for an operator.** `equals` and `hash` have always been proto hooks looked up
+by name; these are the same mechanism widened, so the word is the method's name and a class body
+writes one with the definition syntax it already has:
+
+```
+class Money
+    var cents
+
+    plus(self, o)  = Money(self.cents + o.cents)
+    times(self, n) = Money(self.cents * n)
+    negated(self)  = Money(-self.cents)
+    compare(self, o) = self.cents - o.cents      // `<`, `<=`, `>` and `>=` read its sign
+```
+
+`plus`, `minus`, `times`, `dividedBy`, `remainder`, `negated` and `compare`. **Ordering is one hook
+and not four**, so a type cannot order inconsistently with itself; `==` keeps `equals`, because a
+type whose ordering is coarser than its equality is an ordinary thing to want. **The left operand
+decides and the right is never asked** — `equals`'s rule already — so there is no reflected form and
+`2 * money` is a fault. A hook is the *last* thing tried, so none can shadow what an operator means.
 
 ### Objects that share their behaviour
 

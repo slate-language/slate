@@ -173,38 +173,118 @@ builtin_receiver(target: Value, name: string, at: Span) -> Result[(Value, bool),
 // scope the closure *captured*, so nothing about where the call was written matters -- which is also
 // what lets `==` call a user-supplied `equals` from inside a table lookup, where there is no
 // interpreter scope to hand over.
+// The arguments a call binds, with a variadic function's surplus gathered into its last parameter.
+//
+// **Done at the CALL and not at the head of the chunk**, which is where a default is done -- and the
+// difference is that a default answers "nobody gave this" from inside the body, where the surplus is
+// the arguments that have no parameter at all and are gone by the time a chunk runs.
+//
+// **The array is held on the way out and the caller's own `release` is what lets it go.** Nothing
+// here may allocate while the incoming values are reachable from a sysl local and nowhere else.
+//
+// Not `private`: `execute.sysl`'s call path is the other one, and gathering twice differently is how
+// two paths come to disagree about what a call binds.
+gather_rest(chunk: Chunk, args: Buf[Value]) -> Buf[Value]
+    if !chunk.variadic then return args
+
+    val fixed = chunk.params.len() - 1
+
+    // **A DEFAULTED parameter before the rest may go unfilled**, so there can be FEWER arguments
+    // than fixed parameters -- which is what makes this a `min` rather than a count. Taking `fixed`
+    // of them unconditionally reads past the end of the list, and `h(a, b = 9, ...rest)` called
+    // `h(1)` is the shortest program that does it.
+    val kept = if args.len() < fixed then args.len() else fixed
+
+    for i in 0..<args.len()
+        hold(args.at(i))
+
+    var rest: Buf[Value] = buf()
+
+    for i in kept..<args.len()
+        rest.push(args.at(i))
+
+    val gathered = new_array(rest)
+
+    hold(Array(gathered))
+
+    var out: Buf[Value] = buf()
+
+    for i in 0..<kept
+        out.push(args.at(i))
+
+    // **The rest lands at `kept` and not at `params.len() - 1`**, so a call that left a default
+    // unfilled binds the gathered array to the parameter the head is about to skip over -- which is
+    // wrong, and is why the head runs after. See the caller: a defaulted parameter is bound by the
+    // chunk's own first instructions, and those look up by NAME rather than by position.
+    out.push(Array(gathered))
+    out
+end gather_rest
+
+// Bind a call's arguments to a chunk's parameters.
+//
+// **The one place that knows where a gathered array goes, and it does not go where it sits.**
+// `gather_rest` appends it, and where a DEFAULTED parameter before the rest went unfilled that
+// position is the defaulted one -- so `h(a, b = 9, ...rest)` called `h(1)` would bind the array to
+// `b` and leave `rest` for the chunk's head to complain about. The last value goes to the last
+// parameter; everything before it is positional; and what is still unbound is what the head fills.
+//
+// Not `private`: all four call paths bind arguments -- `invoke`, `apply`, `start_async` and
+// `start_generator` -- and four copies of this rule is how they come to disagree.
+bind_arguments(scope: *EnvObj, c: *ClosureObj, given: Buf[Value], variadic: bool)
+    for i in 0..<given.len()
+        val slot = if variadic && i == given.len() - 1 then c.params.len() - 1 else i
+
+        declare(scope, c.params.at(slot), given.at(i), true)
+
 apply(f: Value, vals: Buf[Value], at: Span) -> Step
     f match
         Native(f) -> call_native(f, vals, at)
         Fn(c) ->
-            val required = current_unit.chunks.at(c.body).required
+            val chunk = current_unit.chunks.at(c.body)
+            val required = chunk.required
 
-            if vals.len() < required || vals.len() > c.params.len()
-                return fault(at, arity_complaint(required, c.params.len(), vals.len()))
+            if vals.len() < required || (!chunk.variadic && vals.len() > c.params.len())
+                return fault(at, arity_complaint(required, c.params.len(), vals.len(), chunk.variadic))
+
+            val emark = env_mark()
+            val mark = root_mark()
+
+            // **The gather is above the two ways out**, which is `invoke`'s rule for `invoke`'s
+            // reason: a rest parameter belongs to the function rather than to how it is entered, so
+            // an `async` or a generator has to be started with the arguments an ordinary call would
+            // bind. It holds what it makes, so this mark covers every path below.
+            val given = gather_rest(chunk, vals)
 
             // **An `async` function starts a coroutine wherever it is called from**, including from a
             // native -- a timer callback, a user `equals`. Running its body here instead would put an
             // `await` under a sysl frame that cannot be captured, which is the one thing the machine
             // exists to avoid.
-            if current_unit.chunks.at(c.body).is_async
-                return start_async(c, vals, at)
+            if chunk.is_async
+                val started = start_async(c, given, at)
+
+                release(mark)
+
+                return started
 
             // **And a generator is PREPARED here too, for the same reason.** `invoke` routes both,
             // and this is the other call path -- a function reached from a native, a callback, a
             // `map`. Missing it would run a generator's body under a sysl frame that cannot be set
             // aside, which is the one thing the machine exists to avoid.
-            if current_unit.chunks.at(c.body).is_gen
-                return start_generator(c, vals, at)
+            if chunk.is_gen
+                val prepared = start_generator(c, given, at)
 
-            val emark = env_mark()
+                release(mark)
+
+                return prepared
+
             val scope = new_env(c.scope)
 
             hold_env(scope)
 
             // Only what was given: a defaulted parameter nobody filled is bound by the head of the
             // chunk, exactly as it is on the machine's own call path.
-            for i in 0..<vals.len()
-                declare(scope, c.params.at(i), vals.at(i), true)
+            bind_arguments(scope, c, given, chunk.variadic)
+            release(mark)
 
             // The annotation is the one the compiler asks for: a bare `Ok`/`Err` pair in a `match`
             // used as a value has nothing on the line to say what the other half is.
@@ -334,6 +414,29 @@ match_pattern(pat: Pattern, v: Value, scope: *EnvObj, assignable: bool) -> bool
         // descended from it. The variant list it carries is the checker's and nothing runs on it.
         DataPat(name, _) -> match_proto(name, v, scope)
         VariantPat(name, items, keys, singleton) -> match_variant(name, items, keys, singleton, v, scope, assignable)
+
+        // **Every element, and an EMPTY container fits.** Every element of nothing is a string,
+        // which is the reading a test wants: a shape refusing `[]` would refuse the ordinary answer
+        // to a query that found nothing. A floor is said with the fixed prefix -- `[string, ...]`.
+        //
+        // An object's VALUES are what is walked. Its keys are the program's, so a shape saying
+        // anything about them would be a different feature.
+        EveryPat(container, element) -> v match
+            Array(xs) ->
+                if container != IsArray then return false
+
+                for i in 0..<xs.items.len()
+                    if !match_pattern(element, xs.items.at(i), scope, assignable) then return false
+
+                true
+            Object(o) ->
+                if container != IsObject then return false
+
+                for i in 0..<o.entries.len()
+                    if !o.entries.at(i).dead && !match_pattern(element, o.entries.at(i).value, scope, assignable) then return false
+
+                true
+            _ -> false
 end match_pattern
 
 // Whether `v` is the variant `name` names, and whether what it carries fits.

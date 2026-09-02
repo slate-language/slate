@@ -99,8 +99,11 @@ private note_bindings(pat: Pattern, e: *TypeEnv)
             for i in 0..<items.len()
                 note_bindings(items.at(i), e)
 
+            // **What `...rest` catches is an ARRAY, whatever is in it.** The pattern says so on its
+            // own -- no subject needed -- so this is the one binding in a pattern that has a type
+            // without anybody writing one. `val [a, ...rest] = xs` then `rest.upper()` is refused.
             rest match
-                Some(name) -> note_type(e, name, type_of(Any))
+                Some(name) -> note_type(e, name, type_of(ArrayOf(type_of(Any))))
                 None -> ()
         ObjectPat(_, values, _, _) ->
             for i in 0..<values.len()
@@ -128,7 +131,7 @@ private check_stmts(stmts: Buf[Stmt], env: *TypeEnv)
     for i in 0..<stmts.len()
         *stmts.at(i).kind match
             Def(name, params, defaults, body, is_async) ->
-                note_type(env, name, signature_of(params, params.len() - defaults.len(), body_at(body), is_async))
+                note_type(env, name, signature_of(params, floor_of(params, defaults.len()), body_at(body), is_async))
 
             // **EVERY name this block binds is noted before any body is walked, not only the
             // definitions.** A closure may name something declared later in the block it sits in --
@@ -176,16 +179,33 @@ end check_stmts
 private signature_of(params: Buf[string], required: usize, body: Expr, is_async: bool) -> Type
     var types: Buf[Type] = buf()
 
+    // **A rest parameter is read through `plain_param`**, its name in the tree carrying the mark
+    // `ast.sysl` describes -- and an annotation is looked up by the name the body binds.
     for i in 0..<params.len()
-        types.push(annotation_for(params.at(i), body))
+        types.push(annotation_for(plain_param(params.at(i)), body))
 
     // **An `async` function answers a promise and not what its body says**, so a result annotation
     // on one describes the awaited value rather than the call. Nothing here can say that yet, so it
     // says nothing.
     val result = if is_async then type_of(Any) else result_annotation(body)
 
-    type_of(FunctionType(types, required, result))
+    type_of(FunctionType(types, required, variadic_params(params), result))
 end signature_of
+
+// Whether the last parameter gathers what is left over.
+//
+// **A call on one has no upper arity**, so counting it against `params.len()` would refuse a program
+// that runs -- which is the one thing this pass may not do.
+private variadic_params(params: Buf[string]) -> bool =
+    !params.is_empty() && rest_param(params.at(params.len() - 1)).is_some()
+
+// How many arguments a call must give: every parameter with neither a default nor the dots.
+//
+// **A rest parameter is not one of them.** It is always bound -- to an empty array where a call gave
+// nothing left over -- which is `compile_chunk`'s rule and has to be the same rule here, or the
+// checker refuses a call the machine accepts.
+private floor_of(params: Buf[string], defaults: usize) -> usize =
+    (if variadic_params(params) then params.len() - 1 else params.len()) - defaults
 
 // The `CheckType` a parameter's annotation became, if it had one.
 private annotation_for(name: string, body: Expr) -> Type
@@ -262,8 +282,18 @@ end check_stmt
 private check_body(params: Buf[string], defaults: Buf[Expr], body: Expr, env: *TypeEnv)
     enter_scope(env)
 
+    // **The name the BODY binds, which is the plain one** -- a rest parameter carries its mark only
+    // in the tree, and a body that named `...rest` would be naming something unspellable.
+    //
+    // **And a rest parameter is an ARRAY whatever a call gave it**, which is the same free answer
+    // `...rest` gets in a pattern: it is bound to an empty one where nothing was left over, so
+    // there is no call that makes it anything else.
     for i in 0..<params.len()
-        note_type(env, params.at(i), annotation_for(params.at(i), body))
+        val name = plain_param(params.at(i))
+
+        rest_param(params.at(i)) match
+            Some(_) -> note_type(env, name, type_of(ArrayOf(type_of(Any))))
+            None -> note_type(env, name, annotation_for(name, body))
 
     for i in 0..<defaults.len()
         check_expr(defaults.at(i), env)
@@ -299,7 +329,7 @@ type_of_expr(x: Expr, env: *TypeEnv) -> Type
             for i in 0..<params.len()
                 out.push(type_of(Any))
 
-            type_of(FunctionType(out, params.len() - defaults.len(), type_of(Any)))
+            type_of(FunctionType(out, floor_of(params, defaults.len()), variadic_params(params), type_of(Any)))
 
         // A comparison and an `is` are booleans whatever they compared.
         Compare(_, _) -> type_of(BooleanType)
@@ -309,7 +339,7 @@ type_of_expr(x: Expr, env: *TypeEnv) -> Type
             _ -> type_of_expr(rhs, env)
         Binary(op, lhs, rhs) -> binary_type(op, type_of_expr(lhs, env), type_of_expr(rhs, env))
         Call(callee, _) -> *type_of_expr(callee, env).kind match
-            FunctionType(_, _, result) -> result
+            FunctionType(_, _, _, result) -> result
             _ -> type_of(Any)
         Ensures(_, _, pat) -> type_from_pattern(resolve_pattern(pat, 0))
         _ -> type_of(Any)
@@ -554,7 +584,21 @@ private check_expr(x: Expr, env: *TypeEnv)
         For(_, binding, iter, body, otherwise) ->
             check_expr(iter, env)
             enter_scope(env)
-            note_bindings(binding, env)
+
+            // **A `for` OVER A KNOWN LIST TYPES ITS NAME, and that became possible the day
+            // `array of T` did.** `ArrayOf` has carried its element since the checker was written
+            // and had nothing but `Any` to put there, so the loop variable said nothing; now
+            // `for u in users` where `users: array of User` makes `u` a `User`, which the
+            // method-name check reads.
+            //
+            // **Only a BARE name is typed**, for narrowing's reason: anything else is a pattern
+            // taking the element apart, and what its names catch is the pattern's business.
+            element_of(type_of_expr(iter, env)) match
+                Some(element) -> *binding.kind match
+                    Bind(name) -> note_type(env, name, element)
+                    _ -> note_bindings(binding, env)
+                None -> note_bindings(binding, env)
+
             check_expr(body, env)
             leave_scope(env)
             check_otherwise(otherwise, env)
@@ -754,7 +798,7 @@ private check_call(callee: Expr, args: Buf[Expr], env: *TypeEnv, at: Span)
             _ -> ()
 
     *type_of_expr(callee, env).kind match
-        FunctionType(params, required, result) ->
+        FunctionType(params, required, variadic, result) ->
             // A lambda's type has `Any` parameters and says nothing; a definition with no annotated
             // parameter has the same shape. Either way there is nothing here to check against.
             // **`FunctionType(no params, any result)` IS THE BARE WORD `function`**, which says
@@ -762,8 +806,8 @@ private check_call(callee: Expr, args: Buf[Expr], env: *TypeEnv, at: Span)
             // against it would refuse `f(1)` inside a function whose parameter was annotated
             // `function`, which runs. The cost is that a genuine `() -> x` has the same shape and
             // goes uncounted too, and the cost is worth paying to be sure.
-            if !says_nothing(params, result) && (args.len() < required || args.len() > params.len())
-                complain_here(at, s"${named(callee)} ${takes_from(required, params.len())} and this gives it ${args.len()}")
+            if !says_nothing(params, result) && (args.len() < required || (!variadic && args.len() > params.len()))
+                complain_here(at, s"${named(callee)} ${takes_from(required, params.len(), variadic)} and this gives it ${args.len()}")
                 return
             end if
 
@@ -771,7 +815,7 @@ private check_call(callee: Expr, args: Buf[Expr], env: *TypeEnv, at: Span)
             // the case a type saying nothing about arity leaves behind: there is no parameter
             // opposite an argument to compare it to. Where there are FEWER, every argument still
             // has one, and the ones nobody gave are the defaults.
-            if args.len() > params.len() then return
+            if variadic || args.len() > params.len() then return
 
             for i in 0..<args.len()
                 val want = params.at(i)
@@ -783,7 +827,12 @@ private check_call(callee: Expr, args: Buf[Expr], env: *TypeEnv, at: Span)
 end check_call
 
 // The half of an arity complaint that says what the function will accept.
-private takes_from(required: usize, takes: usize) -> string
+// **A function that gathers has no upper end, so the only thing to say is the floor** -- and naming
+// one anyway sends the reader looking for a limit the function does not have. This is the machine's
+// `arity_complaint` said in the checker's voice, and the two have to agree about what they refuse.
+private takes_from(required: usize, takes: usize, variadic: bool) -> string
+    if variadic then return s"takes at least ${counted(required, "argument")}"
+
     if required == takes then return s"takes ${counted(takes, "argument")}"
 
     s"takes from ${required} to ${counted(takes, "argument")}"

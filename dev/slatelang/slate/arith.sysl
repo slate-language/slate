@@ -46,8 +46,118 @@ arith(op: Tok, a: Value, b: Value, at: Span) -> Step
         Some(answer) -> return answer
         None -> ()
 
+    // **An object may answer for itself, and this is the LAST thing tried** -- so a hook can never
+    // shadow what an operator already means, and the fast path costs nothing to have it.
+    overloaded(op, a, b, at) match
+        Some(answer) -> return answer
+        None -> ()
+
     fault(at, s"`${op_text(op)}` does not apply to ${a.type_name()} and ${b.type_name()}")
 end arith
+
+// -- an object answering for itself --------------------------------------------------------------
+
+// **THE LEFT OPERAND DECIDES AND THE RIGHT IS NEVER ASKED, which is `equals`'s rule already.**
+// `a.equals(b)` consults `a` and stops; consulting both and disagreeing has no answer, and
+// consulting the right where the left declined makes an operator non-obvious to read.
+//
+// **The cost is that there is no reflected form**, so `2 * v` is not `v.times(2)` and does not
+// become it. Python has `__rmul__` for exactly that and pays for it with a second lookup and a
+// precedence rule between the two; slate says the left side owns the operator.
+//
+// **The word is the name of the method, not the symbol.** `equals` and `hash` are already words, an
+// object's keys are the program's, and a class body reads `plus(self, o) = ...` with the definition
+// syntax it already has -- where `"+"(self, o)` would have needed a parser that takes a string
+// where a name goes.
+private operator_word(op: Tok) -> Option[string] = op match
+    Plus -> Some("plus")
+    Minus -> Some("minus")
+    Star -> Some("times")
+    Slash -> Some("dividedBy")
+    Percent -> Some("remainder")
+    _ -> None
+
+// Whether this operator asks how two values ORDER, which one hook answers for all four.
+private orders(op: Tok) -> bool = op == Lt || op == LtEq || op == Gt || op == GtEq
+
+// The operator's answer where the left operand supplies one.
+//
+// **Ordering is ONE hook and not four.** `compare(self, other)` answers a number -- negative, zero
+// or positive -- and the four operators read its sign, which is `compareTo`'s shape in every
+// language that has one. Four hooks would be four chances for a type to order inconsistently with
+// itself.
+//
+// **`==` is deliberately NOT routed through it.** Equality already has `equals`, and a type whose
+// ordering is coarser than its equality -- a case-insensitive name, a version with build metadata --
+// is an ordinary thing to want and would become impossible.
+private overloaded(op: Tok, a: Value, b: Value, at: Span) -> Option[Step]
+    if orders(op)
+        call_hook_with(a, "compare", b, at) match
+            None -> return None
+            Some(Err(e)) -> return Some(Err(e))
+            Some(Ok(answer)) ->
+                if !is_number(answer)
+                    return Some(fault(at, s"`compare` says how two values order, so it answers a number below, at or above zero -- and this one gave ${answer.type_name()}"))
+
+                val n = as_real(answer)
+
+                return Some(Ok(Bool(op match
+                    Lt -> n < 0.0
+                    LtEq -> n <= 0.0
+                    Gt -> n > 0.0
+                    _ -> n >= 0.0)))
+
+    operator_word(op) match
+        Some(word) -> call_hook_with(a, word, b, at)
+        None -> None
+end overloaded
+
+// Call a hook on the left operand, with the receiver rule the rest of the language uses.
+//
+// **A method reached through a `proto` is handed the object and one stored on the object is not**,
+// which is `CallMethod`'s rule and is what lets a class write `plus(self, o) = ...` with the same
+// definition syntax every other member uses. A captured closure sitting on the instance still works
+// and still takes one argument, which is how `equals` has always been written.
+//
+// Not `private`: `same_in` below calls `equals` through it, so a class may write that as a method
+// too -- which it could not before, an inherited one having been handed the wrong argument count.
+// **`extra` is a LIST rather than one value, because `negated` takes none.** Handing it an
+// `Undefined` to keep the shape would have been the one value slate refuses to bind, so the hook
+// would have faulted on its own argument instead of running.
+call_hook(a: Value, name: string, extra: Buf[Value], at: Span) -> Option[Step]
+    val o = a match
+        Object(p) -> p
+        _ -> return None
+
+    val found = field_from(o, name, at) match
+        Ok(pair) -> pair
+        Err(e) -> return Some(Err(e))
+
+    val f = found.0
+
+    val callable = f match
+        Fn(_) -> true
+        Native(_) -> true
+        _ -> false
+
+    if !callable then return None
+
+    var args: Buf[Value] = buf()
+
+    if found.1 then args.push(a)
+
+    for i in 0..<extra.len()
+        args.push(extra.at(i))
+
+    Some(apply(f, args, at))
+end call_hook
+
+// The one-argument form, which is every operator but `negated`.
+private call_hook_with(a: Value, name: string, b: Value, at: Span) -> Option[Step]
+    var extra: Buf[Value] = buf()
+
+    extra.push(b)
+    call_hook(a, name, extra, at)
 
 private int_arith(op: Tok, x: long, y: long, at: Span) -> Step
     op match
@@ -187,6 +297,15 @@ same(a: Value, b: Value, at: Span) -> Result[bool, Signal]
 //
 // A hook makes `==` run arbitrary slate code, so a lookup re-enters the interpreter and a bad
 // `equals` can fault or loop. Java lives with exactly this.
+// **`equals` IS HANDED NO RECEIVER, AND THAT IS DELIBERATE RATHER THAN AN OVERSIGHT.** It is what
+// makes protos backward compatible: `apply` faults on an arity mismatch, so handing one to the
+// capture-style hooks slate already had -- `{ equals: o -> ... }` used as a `proto` -- would have
+// broken every one of them. The operator hooks above take the receiver rule instead because they
+// are NEW and there is nothing written against them to break.
+//
+// **The cost, said out loud: a class cannot write `equals(self, o)` as a method.** It is reached
+// through the proto chain and called with one argument, so it dies on the arity. Widening this is a
+// breaking change to the other spelling and is the user's call, not a rider on an operator feature.
 private same_in(a: Value, b: Value, seen: *Buf[SeenPair], at: Span) -> Result[bool, Signal]
     hook_of(a, "equals") match
         Some(f) ->

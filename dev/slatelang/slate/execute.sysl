@@ -111,23 +111,11 @@ private invoke(u: *Unit, callee: Value, args: Buf[Value], at: Span, depth: usize
     callee match
         Native(f) -> Ok(Answered(call_native(f, args, at)?))
         Fn(c) ->
-            val required = u.chunks.at(c.body).required
+            val chunk = u.chunks.at(c.body)
+            val required = chunk.required
 
-            if args.len() < required || args.len() > c.params.len()
-                return Err(failure(at, arity_complaint(required, c.params.len(), args.len())))
-
-            // **An `async` function is not called, it is STARTED**, on a machine of its own, and what
-            // the caller gets back is a promise rather than a result.
-            if u.chunks.at(c.body).is_async then return Ok(Answered(start_async(c, args, at)?))
-
-            // **A generator function is not called either -- it is PREPARED.** The body does not run
-            // until something asks it for a value, so what the caller gets back is the generator and
-            // not whatever the first statement would have computed. Read here, beside `is_async`,
-            // because they are the same question asked twice: does calling this enter it?
-            if u.chunks.at(c.body).is_gen then return Ok(Answered(start_generator(c, args, at)?))
-
-            if depth >= MaxCallDepth
-                return Err(failure(at, s"this call is ${MaxCallDepth} deep, which is farther than slate will go -- a recursion this deep is usually one that never ends"))
+            if args.len() < required || (!chunk.variadic && args.len() > c.params.len())
+                return Err(failure(at, arity_complaint(required, c.params.len(), args.len(), chunk.variadic)))
 
             // **The arguments are held while the scope is built.** They are off the operand stack by
             // now and live only in a sysl local, which the mark phase cannot see -- and a full heap
@@ -135,8 +123,41 @@ private invoke(u: *Unit, callee: Value, args: Buf[Value], at: Span, depth: usize
             // ordinary path was relying on the heap not being full at that instant.
             val mark = root_mark()
 
-            for i in 0..<args.len()
-                hold(args.at(i))
+            // **The gather is ABOVE the three ways out, which is not tidiness.** A rest parameter
+            // belongs to the function and not to how it is entered, so an `async` or a generator
+            // must be started with the same arguments an ordinary call would bind -- and starting
+            // one with the raw list would leave its rest parameter holding the first surplus
+            // argument instead of an array of them. It holds what it makes, which is what lets this
+            // one mark cover every path below.
+            val given = gather_rest(chunk, args)
+
+            for i in 0..<given.len()
+                hold(given.at(i))
+
+            // **An `async` function is not called, it is STARTED**, on a machine of its own, and what
+            // the caller gets back is a promise rather than a result.
+            if chunk.is_async
+                val started = start_async(c, given, at)
+
+                release(mark)
+
+                return Ok(Answered(started?))
+
+            // **A generator function is not called either -- it is PREPARED.** The body does not run
+            // until something asks it for a value, so what the caller gets back is the generator and
+            // not whatever the first statement would have computed. Read here, beside `is_async`,
+            // because they are the same question asked twice: does calling this enter it?
+            if chunk.is_gen
+                val prepared = start_generator(c, given, at)
+
+                release(mark)
+
+                return Ok(Answered(prepared?))
+
+            if depth >= MaxCallDepth
+                release(mark)
+
+                return Err(failure(at, s"this call is ${MaxCallDepth} deep, which is farther than slate will go -- a recursion this deep is usually one that never ends"))
 
             val called = new_env(c.scope)
 
@@ -144,9 +165,7 @@ private invoke(u: *Unit, callee: Value, args: Buf[Value], at: Span, depth: usize
             // argument is left unbound here, and the head of its chunk binds it -- which is what
             // lets the default be an expression rather than a constant, and lets it read the
             // parameters to its left.
-            for i in 0..<args.len()
-                declare(called, c.params.at(i), args.at(i), true)
-
+            bind_arguments(called, c, given, chunk.variadic)
             release(mark)
             Ok(Enter(c.body, called))
         // **An object with a `new` is callable, and the call IS that `new`.** `Circle(3)` and

@@ -235,6 +235,23 @@ resolve_pattern(pat: Pattern, depth: usize) -> Pattern
                 out.push(resolve_pattern(parts.at(i), depth))
 
             pattern(pat.span, AndPat(out))
+
+        // **The element is resolved like any other pattern, and this is also where a binding in one
+        // is refused.** It cannot be refused while parsing -- a bare name is a type where one was
+        // declared -- and it cannot be left, because an element pattern runs once per element and a
+        // name in it would be bound to whichever element ran last.
+        EveryPat(container, element) ->
+            val inner = resolve_pattern(element, depth)
+
+            first_binding(inner) match
+                // **The message leads with "is not a type", which is nearly always the cause.** A
+                // reader told only that an element pattern may not bind goes and looks at binding,
+                // where what they wrote was a type name that is not one -- the mechanism is worth
+                // saying second and the mistake first.
+                Some(loose) -> complain_here(pat.span, s"`${loose}` is not a type, so an element pattern naming it would bind it once per element rather than test anything${instead_of(loose)}")
+                None -> ()
+
+            pattern(pat.span, EveryPat(container, inner))
         _ -> pat
 end resolve_pattern
 
@@ -352,7 +369,7 @@ compile_module(u: *Unit, prog: Program, src: usize, name: string, is_entry: bool
     // exactly as a parse error does -- and it has to be after `open_types` because an annotation
     // naming a declared type cannot be read until that type is registered.
     check_program(prog, is_slate_module(name))
-    u.chunks.push(Chunk(buf(), params, 0, name, false, false, src))
+    u.chunks.push(Chunk(buf(), params, 0, false, name, false, false, src))
 
     // **The top level is not async, so top-level `await` is refused.** node draws the same line for a
     // script, and lifting it would mean the whole program becoming a coroutine -- which is a real
@@ -400,11 +417,23 @@ compile_chunk(u: *Unit, params: Buf[string], defaults: Buf[Expr], body: Expr, na
 
     // **`defaults` covers the LAST of the parameters**, which the parser has already made sure of,
     // so the count of the ones a caller must give is the whole of what a call needs to know.
-    val required = params.len() - defaults.len()
+    //
+    // **A rest parameter is not one of them.** It is always bound -- to an empty array where a call
+    // gave nothing left over -- so a caller must give every parameter before it and none of it.
+    val variadic = !params.is_empty() && rest_param(params.at(params.len() - 1)).is_some()
+    val fixed = if variadic then params.len() - 1 else params.len()
+    val required = fixed - defaults.len()
+
+    // **The mark comes off HERE and nowhere else**, so a `Chunk` carries the name the body binds and
+    // nothing downstream of compilation knows how a rest parameter was written.
+    var plain: Buf[string] = buf()
+
+    for i in 0..<params.len()
+        plain.push(plain_param(params.at(i)))
 
     // Every chunk a compilation makes belongs to the file being compiled, which `compile_module`
     // named before it started.
-    u.chunks.push(Chunk(buf(), params, required, name, is_async, is_gen, compiling_source))
+    u.chunks.push(Chunk(buf(), plain, required, variadic, name, is_async, is_gen, compiling_source))
 
     var e = fresh_emit(is_async, is_gen)
 
@@ -412,7 +441,7 @@ compile_chunk(u: *Unit, params: Buf[string], defaults: Buf[Expr], body: Expr, na
     // is compiled here rather than evaluated once and stored: `f(xs = [])` gives each call an array
     // of its own, and `f(a, b = a + 1)` can read what came before it. The parameters are bound in
     // order, so a default sees every parameter to its left and none to its right.
-    compile_defaults(u, &e, params, defaults, required)
+    compile_defaults(u, &e, plain, defaults, required)
     compile_expr(u, &e, body)
     put(&e, Ret, body.span)
 
@@ -502,6 +531,7 @@ pattern_defaults(pat: Pattern) -> bool
                 if defaults.at(i).is_some() || pattern_defaults(items.at(i)) then return true
 
             false
+        EveryPat(_, element) -> pattern_defaults(element)
         ObjectPat(_, values, defaults, _) ->
             for i in 0..<values.len()
                 if defaults.at(i).is_some() || pattern_defaults(values.at(i)) then return true
@@ -532,6 +562,7 @@ private pattern_optionals(pat: Pattern) -> bool
                 if pattern_optionals(items.at(i)) then return true
 
             false
+        EveryPat(_, element) -> pattern_optionals(element)
         ObjectPat(_, values, _, optional) ->
             for i in 0..<values.len()
                 if optional.at(i) || pattern_optionals(values.at(i)) then return true
