@@ -80,6 +80,17 @@ the_operations_that_change_an_array_answer_nothing() =
     assertEq(len(xs), 0)
 
 @test
+clear_takes_an_array_and_not_an_object() =
+    // An object's names belong to the program, so the array operations are not in its table at all
+    // — `clear` is one of them, and the JavaScript back end accepted an object where the
+    // interpreter refuses one.
+    val said = (anything({ a: 1 }).clear()) catch e -> e.message
+
+    assert(contains(said, "clear"))
+    assert(contains(said, "object"))
+    assert(clear(anything({ a: 1 })) catch e -> true)
+
+@test
 popping_an_empty_array_is_a_fault_rather_than_an_absence() =
     var xs = []
 

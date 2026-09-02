@@ -69,6 +69,32 @@ a_string_prints_bare_and_shows_quoted_inside_a_container() =
     assertEq(string(["a\"b"]), "[\"a\\\"b\"]")
 
 @test
+bytes_go_out_and_come_back_as_a_result() =
+    // **A result, because arbitrary bytes are not text.** Answering the string itself would hide the
+    // difference between a file that is not text and one that is empty — and it is what the
+    // JavaScript back end did, so every `fromBytes(bs).value` in every program was `undefined` there.
+    val r = fromBytes(toBytes("日本語"))
+
+    assert(r.ok)
+    assertEq(r.value, "日本語")
+
+    // The decoder is strict where JavaScript's own replaces what it cannot read with U+FFFD: a
+    // continuation byte standing alone spells nothing.
+    val bad = fromBytes([0x80])
+
+    assert(!bad.ok)
+    assert(len(bad.error) > 0)
+
+    // An overlong form, a surrogate and a sequence that stops early are each refused.
+    assert(!fromBytes([0xc0, 0xaf]).ok)
+    assert(!fromBytes([0xed, 0xa0, 0x80]).ok)
+    assert(!fromBytes([0xe6, 0x97]).ok)
+
+    // A byte outside the range is the program's own mistake, so it FAULTS rather than answering.
+    assert(fromBytes([256]) catch e -> true)
+    assert(fromBytes(["a"]) catch e -> true)
+
+@test
 asking_a_string_for_something_only_an_array_can_do_is_a_fault() =
     assert((anything("abc").push(1)) catch e -> true)
 
