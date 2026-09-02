@@ -1,0 +1,224 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// What a block does to one of the names declared in it.
+//
+// **This is the escape analysis `fits.sysl` said was the way in, in its smallest honest form.** Two
+// of the checker's absences rested on the same fact -- that a name may be written to, or may be
+// handed somewhere that writes to what it holds -- and neither could be lifted by looking harder at
+// the declaration. Both are answered by looking at the rest of the block instead.
+//
+// - **A `var` was `Any` whatever it held**, the pass not following assignments. It can follow them:
+//   every assignment to a local name is written in the block that declared it, so the union of the
+//   initialiser and every right-hand side is what the name may ever hold, and it does not depend on
+//   the order they run in.
+// - **A field read was `Any`, and the reason was aliasing rather than a missing lookup.** A shape
+//   recorded when an object was built goes stale if anything writes a field of it -- through the
+//   name, or through a second name for the same object. So the shape is kept for a `val` whose name
+//   is never MENTIONED except to read a field off it: nothing else can hold that object, and no
+//   field of it is ever written, so the shape it was built with is the shape it dies with.
+//
+// **The walk is exhaustive over `ExprKind` on purpose and must stay so.** A variant added later that
+// carries an expression and is not walked here would make the analysis miss a use -- which lands as
+// a shape kept where it should have been dropped, and a program refused that runs. Sysl's
+// exhaustiveness check is what stops that, and an `else` arm would throw it away.
+
+// Everything the walk found about one name.
+struct Uses
+    // The assignments to the bare name, as the operator and the right-hand side. `Assign` is a plain
+    // `=` and anything else is the compound form's own operator -- `+=` carries `Plus`, which is
+    // what `compile_assign` reads too.
+    ops: Buf[Tok]
+    values: Buf[Expr]
+
+    // `x++` and `x--`, which have no right-hand side and add one.
+    bumps: usize
+
+    // An assignment whose value cannot be stated on its own -- a multiple assignment, where which
+    // value lands on which target is a question about counts rather than about this name.
+    murky: bool
+
+    // Whether the name was ever mentioned other than as the target of a field read or of an
+    // assignment. **This is the aliasing question**: a name that is only ever read through cannot
+    // have been handed anywhere.
+    bare: bool
+
+    // Whether a field of it was written -- `x.f = e` or `x[k] = e`.
+    field_written: bool
+end Uses
+
+// What a block does to one name.
+uses_in(name: string, stmts: Buf[Stmt]) -> Uses
+    var u = Uses(buf(), buf(), 0, false, false, false)
+
+    walk_stmts(name, stmts, &u)
+    u
+end uses_in
+
+// Whether the shape an object was built with is still the shape it has.
+//
+// **Never mentioned and never written through is the whole test.** It is far short of a real escape
+// analysis and is the part of one that costs nothing: the object cannot be reached from anywhere
+// else, so nothing outside this block can add a field to it or change the type of one.
+shape_survives(u: Uses) -> bool = !u.bare && !u.field_written && u.ops.is_empty() && u.bumps == 0
+
+private walk_stmts(name: string, stmts: Buf[Stmt], u: *Uses)
+    for i in 0..<stmts.len()
+        walk_stmt(name, stmts.at(i), u)
+
+private walk_stmt(name: string, s: Stmt, u: *Uses)
+    *s.kind match
+        Val(_, init) -> walk(name, init, u)
+        Var(_, init) -> walk(name, init, u)
+        Unpack(_, init, _) -> walk(name, init, u)
+        Group(inner) -> walk_stmts(name, inner, u)
+        Assign(op, target, value) ->
+            walk_target(name, op, target, value, u)
+            walk(name, value, u)
+        MultiAssign(_, targets, values) ->
+            for i in 0..<targets.len()
+                *targets.at(i).kind match
+                    Name(n) -> if n == name then u.murky = true
+                    _ -> walk(name, targets.at(i), u)
+
+            for i in 0..<values.len()
+                walk(name, values.at(i), u)
+        Def(_, _, defaults, body, _) ->
+            for i in 0..<defaults.len()
+                walk(name, defaults.at(i), u)
+
+            walk(name, body_at(body), u)
+        Eval(x) -> walk(name, x, u)
+        Return(value) -> walk_option(name, value, u)
+        Throw(x) -> walk(name, x, u)
+        Break(_, value) -> walk_option(name, value, u)
+        Continue(_) -> ()
+        ImportNames(_, _, _, _, _) -> ()
+        ImportAll(_, _, _, _) -> ()
+        TypeDecl(_, _) -> ()
+        CheckType(_, _, _) -> ()
+end walk_stmt
+
+// The left-hand side of an assignment, which is written rather than read.
+private walk_target(name: string, op: Tok, target: Expr, value: Expr, u: *Uses)
+    *target.kind match
+        Name(n) ->
+            if n == name
+                u.ops.push(op)
+                u.values.push(value)
+        // `x.f = e` and `x[k] = e` -- the name is read and a field of what it holds is written.
+        Field(inner, _, _) -> walk_written_through(name, inner, u)
+        Index(inner, key) ->
+            walk_written_through(name, inner, u)
+            walk(name, key, u)
+        _ -> walk(name, target, u)
+end walk_target
+
+private walk_written_through(name: string, inner: Expr, u: *Uses)
+    *inner.kind match
+        Name(n) ->
+            if n == name then u.field_written = true else ()
+        _ -> walk(name, inner, u)
+
+// Reading a field or an element off the name is not a mention of the name itself: what leaves is
+// what the field held, and the object stays where it is.
+private walk_through(name: string, inner: Expr, u: *Uses)
+    *inner.kind match
+        Name(n) -> if n != name then walk(name, inner, u)
+        _ -> walk(name, inner, u)
+
+private walk_option(name: string, x: Option[Expr], u: *Uses)
+    x match
+        Some(inner) -> walk(name, inner, u)
+        None -> ()
+
+private walk_all(name: string, xs: Buf[Expr], u: *Uses)
+    for i in 0..<xs.len()
+        walk(name, xs.at(i), u)
+
+private walk(name: string, x: Expr, u: *Uses)
+    *x.kind match
+        IntLit(_) -> ()
+        RealLit(_) -> ()
+        StrLit(_) -> ()
+        BoolLit(_) -> ()
+        NullLit -> ()
+        UndefinedLit -> ()
+        Bad -> ()
+        Name(n) -> if n == name then u.bare = true else ()
+        Spread(inner) -> walk(name, inner, u)
+        Named(_, value) -> walk(name, value, u)
+        DataLit(inner) -> walk(name, inner, u)
+        Await(inner) -> walk(name, inner, u)
+        Yield(inner) -> walk(name, inner, u)
+        Unary(_, rhs) -> walk(name, rhs, u)
+        Binary(_, lhs, rhs) ->
+            walk(name, lhs, u)
+            walk(name, rhs, u)
+        Call(callee, args) ->
+            walk(name, callee, u)
+            walk_all(name, args, u)
+        Index(target, key) ->
+            walk_through(name, target, u)
+            walk(name, key, u)
+        Field(target, _, _) -> walk_through(name, target, u)
+        ArrayLit(items) -> walk_all(name, items, u)
+        ArrayRepeat(value, count) ->
+            walk(name, value, u)
+            walk(name, count, u)
+        Interp(pieces) -> walk_all(name, pieces, u)
+
+        // **`o with { ... }` mentions `o`**, the whole object being what the copy is made from --
+        // so the name has been somewhere other than a field read and the shape is given up.
+        WithFields(base, _, values) ->
+            walk(name, base, u)
+            walk_all(name, values, u)
+        WithAll(base, other, _) ->
+            walk(name, base, u)
+            walk(name, other, u)
+        ObjectLit(_, _, values) -> walk_all(name, values, u)
+        Lambda(_, defaults, body, _) ->
+            walk_all(name, defaults, u)
+            walk(name, body_at(body), u)
+        Compare(operands, _) -> walk_all(name, operands, u)
+        Range(lo, hi, _) ->
+            walk_option(name, lo, u)
+            walk_option(name, hi, u)
+        IsPattern(subject, _, _) -> walk(name, subject, u)
+
+        // `x++` adds one to what the name holds, and has no right-hand side to say what with.
+        IncDec(target, _, _) ->
+            *target.kind match
+                Name(n) -> if n == name then u.bumps += 1 else ()
+                _ -> walk(name, target, u)
+        IfExpr(cond, then_branch, else_branch) ->
+            walk(name, cond, u)
+            walk(name, then_branch, u)
+            walk_option(name, else_branch, u)
+        MatchExpr(subject, arms) ->
+            walk(name, subject, u)
+
+            for i in 0..<arms.len()
+                walk_option(name, arms.at(i).guard, u)
+                walk(name, arms.at(i).body, u)
+        While(_, cond, body, otherwise) ->
+            walk(name, cond, u)
+            walk(name, body, u)
+            walk_option(name, otherwise, u)
+        For(_, _, iter, body, otherwise) ->
+            walk(name, iter, u)
+            walk(name, body, u)
+            walk_option(name, otherwise, u)
+        Loop(_, body) -> walk(name, body, u)
+        DoWhile(_, body, cond, otherwise) ->
+            walk(name, body, u)
+            walk(name, cond, u)
+            walk_option(name, otherwise, u)
+        Block(stmts) -> walk_stmts(name, stmts, u)
+        Ensures(value, _, _) -> walk(name, value, u)
+        TryCatch(body, _, handler) ->
+            walk(name, body, u)
+            walk(name, handler, u)
+end walk

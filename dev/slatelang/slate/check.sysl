@@ -171,7 +171,7 @@ private check_stmts(stmts: Buf[Stmt], env: *TypeEnv)
             _ -> ()
 
     for i in 0..<stmts.len()
-        check_stmt(stmts.at(i), env)
+        check_stmt(stmts.at(i), stmts, env)
         guard_narrows(stmts.at(i), env)
 end check_stmts
 
@@ -283,19 +283,29 @@ private result_annotation(body: Expr) -> Type
         Ensures(_, _, pat) -> type_from_pattern(resolve_pattern(pat, 0))
         _ -> type_of(Any)
 
-private check_stmt(s: Stmt, env: *TypeEnv)
+// **`block` is the statements this one stands among**, which is what a `val`'s shape and a `var`'s
+// type are both worked out from: every assignment to a local name, and every mention of it, is
+// written in the block that declared it.
+private check_stmt(s: Stmt, block: Buf[Stmt], env: *TypeEnv)
     *s.kind match
         Val(name, init) ->
             check_expr(init, env)
-            note_type(env, name, type_of_expr(init, env))
 
-        // **A `var` is `Any` whatever it was initialised with**, because a later assignment may put
-        // anything there and this pass does not follow assignments. Narrowing one would be reporting
-        // a program the checker had not read all of.
+            val t = type_of_expr(init, env)
+
+            // **A SHAPE IS KEPT WHERE NOTHING CAN MAKE IT STALE.** `note_type` drops one, because an
+            // object is mutable and a field may be added to it anywhere -- by the next line, by a
+            // function it was passed to, through a second name for the same object. None of those
+            // can have happened to a name that is never mentioned except to read a field off it,
+            // which is what `shape_survives` asks the block.
+            if is_shape(t) && shape_survives(uses_in(name, block))
+                note_shaped(env, name, t)
+            else
+                note_type(env, name, t)
         Var(name, init) ->
             check_expr(init, env)
-            note_binding(env, name, type_of(Any), false)
-        Group(stmts) -> for i in 0..<stmts.len() do check_stmt(stmts.at(i), env)
+            note_binding(env, name, var_type(name, init, block, env), false)
+        Group(stmts) -> for i in 0..<stmts.len() do check_stmt(stmts.at(i), stmts, env)
         Unpack(pat, init, _) ->
             check_expr(init, env)
             note_bindings(pat, env)
@@ -399,6 +409,22 @@ type_of_expr(x: Expr, env: *TypeEnv) -> Type
         Call(callee, _) -> *type_of_expr(callee, env).kind match
             FunctionType(_, _, _, result) -> result
             _ -> type_of(Any)
+
+        // **A FIELD READ, WHERE THE SHAPE IS ONE NOTHING COULD HAVE MADE STALE.** A name only
+        // carries a shape at all when `flow.sysl` proved the object it holds is reachable from
+        // nowhere else and has no field written to it, so what is recorded here is what is there.
+        // An optional field is left alone: `{ ok: boolean, value?: any }` says `value` may be
+        // absent, and absence is not a type this pass may report against.
+        Field(target, field, optional) ->
+            if optional then return type_of(Any)
+
+            *type_of_expr(target, env).kind match
+                ObjectWith(keys, values, maybe) ->
+                    for i in 0..<keys.len()
+                        if keys.at(i) == field && !maybe.at(i) then return values.at(i)
+
+                    type_of(Any)
+                _ -> type_of(Any)
         Ensures(_, _, pat) -> type_from_pattern(resolve_pattern(pat, 0))
         _ -> type_of(Any)
 end type_of_expr
@@ -956,6 +982,70 @@ private is_named_kind(t: Type) -> bool
         NamedType(_) -> true
         _ -> false
 
+// Whether this type says what an object's FIELDS are, and is describing an ordinary object.
+//
+// **A NOMINAL VALUE'S TYPE IS ITS NAME AND NOT ITS FIELDS**, so a literal carrying a `proto` or one
+// of the two tags is refused here. A singleton data variant is a `val` bound to exactly such a
+// literal, and keeping its shape made `Empty` a `{ proto: any, (data): string }` that no longer fit
+// the data type it belongs to -- refusing a program that runs, from four tests at once.
+private is_shape(t: Type) -> bool = *t.kind match
+    ObjectWith(keys, _, _) ->
+        for i in 0..<keys.len()
+            if keys.at(i) == "proto" || keys.at(i) == DataTag || keys.at(i) == ClassTag then return false
+
+        true
+    _ -> false
+
+// The two types describe the same values.
+//
+// **`fits` in both directions, which is what "the same" means to a pass built on it** -- and both
+// sides are asked to be certain first, since `Any` fits everything and would call anything the same
+// as anything.
+private same_type(a: Type, b: Type) -> bool = certain(a) && certain(b) && fits(a, b) && fits(b, a)
+
+// WHAT A `var` MAY EVER HOLD, which is the union of its initialiser and every right-hand side ever
+// assigned to it.
+//
+// **The pass can follow assignments after all, and does not have to follow them in ORDER.** What
+// stopped a `var` being typed was that a later assignment may put anything there -- so this reads
+// the later assignments. Every one of them is written in the block that declared the name, a local
+// being reachable from nowhere else, so the union is complete however the program branches and
+// whatever order the lines run in. Nothing here is narrowing: a `var` is still `settled: false` and
+// `may_narrow` still refuses it, because a *branch* may make a recorded type stale where the union
+// of everything cannot.
+//
+// **Anything less than certain gives up at once**, which is nearly all of the code below: a union of
+// two kinds is not something to argue from, and a type this pass would not argue from is `Any`.
+private var_type(name: string, init: Expr, block: Buf[Stmt], env: *TypeEnv) -> Type
+    val u = uses_in(name, block)
+
+    // A multiple assignment says which value lands on which target by counting, and this pass does
+    // not count.
+    if u.murky then return type_of(Any)
+
+    val t = type_of_expr(init, env)
+
+    if !certain(t) then return type_of(Any)
+
+    for i in 0..<u.ops.len()
+        val given = type_of_expr(u.values.at(i), env)
+
+        // **A compound assignment is the operator it carries**, `+=` holding `Plus` exactly as
+        // `compile_assign` reads it -- so what lands in the name is what that operator answers, and
+        // `binary_type` is the same table the machine works to. Using the initialiser as the left
+        // operand is exact rather than an approximation: the loop gives up unless every assignment
+        // leaves the same type, so if it finishes the name held that type at every step.
+        val landed = if u.ops.at(i) == Assign then given else binary_type(u.ops.at(i), t, given)
+
+        if !same_type(landed, t) then return type_of(Any)
+
+    // `x++` is `x + 1`, and on anything but a number it is not this type any more.
+    if u.bumps > 0 && !same_type(binary_type(Plus, t, type_of(IntegerType)), t)
+        return type_of(Any)
+
+    t
+end var_type
+
 // Whether enough is known about a type to argue from it.
 private certain(t: Type) -> bool
     *t.kind match
@@ -981,16 +1071,15 @@ end named
 //   a `for` head all introduce names the walk leaves as `Any`. The patterns already carry the
 //   information -- `type_from_pattern` would answer for most of them -- and threading it in is the
 //   obvious next step.
-// - **A `var` is always `Any`**, because this pass does not follow assignments. Narrowing one would
-//   be reporting a program the checker has not read all of.
-// - **A field read is `Any`, and it is NOT just a missing lookup** -- that reading was wrong and is
-//   worth correcting here rather than being rediscovered. The information does sit in `ObjectWith`,
-//   but a field is *mutable* and this pass does not follow assignments: `val o = { x: 1 }` then
-//   `o.x = "s"` leaves the recorded type saying `integer` about a string. **`val` binds the
-//   reference, not the fields.** So typing a field read would report what the machine would not, and
-//   that is the one thing this pass may not do -- the same reason a `var` is `Any`, applied one level
-//   in. Following field assignment is the way in, and it is a real piece of work rather than a
-//   lookup.
+// - ~~**A `var` is always `Any`**~~ and ~~**a field read is `Any`**~~ -- both were the same fact
+//   about mutation, and both are answered by `flow.sysl` reading the rest of the block rather than
+//   by looking harder at the declaration. A `var` is the union of its initialiser and every
+//   right-hand side ever assigned to it, which does not depend on the order the lines run in; a
+//   `val`'s shape is kept where its name is never mentioned except to read a field off it, so
+//   nothing else can hold the object and no field of it is ever written. What is still `Any`:
+//   **a `var` the program reassigns to another kind** (a union of two kinds is not something to
+//   argue from), **an annotated PARAMETER's shape** (the object came from the caller, who may hold
+//   another name for it), and **a field of an object reached through anything but a bare name**.
 // - **A function's RESULT is not checked against its body.** `-> integer` is enforced by
 //   `CheckResult` at run time and believed here.
 // - **A NAMED ARGUMENT is not placed.** `FunctionType` carries parameter types and not parameter
