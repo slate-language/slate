@@ -23,3 +23,12 @@ print(isGhost(haunt()), isGhost(b))
 // The interface crosses as an ordinary `export type`, and `Bird` keeps its promise with a method
 // `Animal` supplies -- one link up the chain.
 print(if b is Speaker then "speaks" else "silent")
+
+// **A DECLARATION MAY NAME AN IMPORTED TYPE**, which is what lets a package build a vocabulary on
+// another module's. It could not until 2026-09-02: the shape check ran before the imported types
+// were opened, so every one of them looked like a name the declaration was binding -- while `is`
+// on the very same name, one line below, worked.
+type Winged = Tweeter
+type Perched = { on: string, who: Animal }
+
+print(b is Winged, { on: "wire", who: b } is Perched, { on: "wire", who: 5 } is Perched)

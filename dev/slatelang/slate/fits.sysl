@@ -73,18 +73,26 @@ fits(got: Type, want: Type) -> bool
         ArrayOf(want_element) -> *got.kind match
             ArrayOf(got_element) -> fits(got_element, want_element)
             _ -> false
-        ObjectWith(want_keys, want_values) -> *got.kind match
+        ObjectWith(want_keys, want_values, want_optional) -> *got.kind match
             // **At least these fields**, which is the object pattern's rule and has to be the type's
             // too, or one annotation would mean two things.
-            ObjectWith(got_keys, got_values) ->
+            //
+            // **A key the annotation marked `?` need not be there at all**, which is what
+            // `match_object` does at run time -- it skips a missing key the pattern called optional.
+            // Where it IS there it still has to fit: `{ n?: integer }` is not satisfied by an object
+            // whose `n` is a string, and neither the matcher nor this accepts one.
+            ObjectWith(got_keys, got_values, _) ->
                 for i in 0..<want_keys.len()
                     var found = false
+                    var present = false
 
                     for j in 0..<got_keys.len()
-                        if got_keys.at(j) == want_keys.at(i) && fits(got_values.at(j), want_values.at(i))
-                            found = true
+                        if got_keys.at(j) == want_keys.at(i)
+                            present = true
 
-                    if !found then return false
+                            if fits(got_values.at(j), want_values.at(i)) then found = true
+
+                    if !found && !(want_optional.at(i) && !present) then return false
 
                 true
             _ -> false
@@ -211,7 +219,7 @@ note_binding(e: *TypeEnv, name: string, t: Type, settled: bool)
 
 private unshaped(t: Type) -> Type
     *t.kind match
-        ObjectWith(_, _) -> type_of(Any)
+        ObjectWith(_, _, _) -> type_of(Any)
         _ -> t
 
 // **Backwards, so the innermost binding of a name is the one found.**
@@ -281,9 +289,65 @@ narrow_by(cond: Expr, want_true: bool, env: *TypeEnv)
 
         // **`a && b` narrows by both**, which is what makes `if x is string && len(x) > 0` work --
         // the second operand is already inside the first's narrowing when the machine evaluates it.
+        //
+        // **`x != null` narrows too, and it has to**, because it is how slate asks the question:
+        // `indexOf` answers `integer | null`, `safePath` answers `string | null`, and every one of
+        // those is guarded with a comparison rather than with `is`. Without this a union annotation
+        // could not be written at all -- the pass would refuse the very program the annotation was
+        // describing, which is the one mistake it may not make.
         Binary(op, lhs, rhs) ->
             if op == AndAnd && want_true
                 narrow_by(lhs, true, env)
                 narrow_by(rhs, true, env)
+
+            if op == EqEq || op == BangEq
+                // The name may be written either side of the comparison; only one of the two is a
+                // name and only one is `null`, so this reads both orders without deciding anything.
+                val subject = if is_null_literal(rhs) then lhs elif is_null_literal(lhs) then rhs else lhs
+
+                if is_null_literal(rhs) || is_null_literal(lhs)
+                    *subject.kind match
+                        Name(name) ->
+                            if !may_narrow(env, name) then return
+
+                            // `x == null` on the true side says it IS null, and on the false side
+                            // says it is not; `!=` is the same two answers the other way round.
+                            val says_null = (op == EqEq) == want_true
+
+                            if says_null
+                                note_binding(env, name, type_of(NullType), true)
+                            else
+                                without_null(known_type(env, name)) match
+                                    Some(rest) -> note_binding(env, name, rest, true)
+                                    None -> ()
+                        _ -> ()
         _ -> ()
 end narrow_by
+
+private is_null_literal(x: Expr) -> bool
+    *x.kind match
+        NullLit -> true
+        _ -> false
+
+// A union with `null` taken out of it, or nothing where there was no `null` to take.
+//
+// **Nothing where the type is not a union**, because this pass may only sharpen what it already
+// knew: a name whose type is `Any` is still `Any` after a null test, an unannotated value being one
+// this pass has nothing to say about either way.
+private without_null(t: Type) -> Option[Type]
+    *t.kind match
+        OneOf(alts) ->
+            var kept: Buf[Type] = buf()
+
+            for i in 0..<alts.len()
+                *alts.at(i).kind match
+                    NullType -> ()
+                    _ -> kept.push(alts.at(i))
+
+            if kept.len() == alts.len() then return None
+            if kept.len() == 0 then return None
+            if kept.len() == 1 then return Some(kept.at(0))
+
+            Some(type_of(OneOf(kept)))
+        _ -> None
+end without_null
