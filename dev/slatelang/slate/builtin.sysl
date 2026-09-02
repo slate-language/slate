@@ -388,7 +388,7 @@ end install_natives
 // Not `private`: `eval.sysl` dispatches a `Native` value here.
 call_native(f: NativeFn, args: Buf[Value], at: Span) -> Step
     f match
-        NPrint -> do_print(args)
+        NPrint -> do_print(args, at)
         NAssert -> do_assert(args, at)
         NAssertEq -> do_assert_eq(args, at)
 
@@ -445,6 +445,10 @@ call_native(f: NativeFn, args: Buf[Value], at: Span) -> Step
         NFlat -> do_flat(args, at)
         NSum -> do_sum(args, at)
         NString -> do_string(args, at)
+        NToString -> do_to_string(args, at)
+        NEq -> do_eq(args, at, true)
+        NNe -> do_eq(args, at, false)
+        NEquals -> do_equals(args, at)
         NKeys -> do_keys(args, at)
         NParseJson -> do_parse_json(args, at)
         NToJson -> do_to_json(args, at)
@@ -635,7 +639,7 @@ private do_assert(args: Buf[Value], at: Span) -> Step
     if args.at(0).truthy() then return Ok(Null)
 
     if args.len() == 2
-        return fault(at, value_text(args.at(1)))
+        return fault(at, printed(args.at(1), at)?)
 
     fault(at, "this assertion does not hold")
 end do_assert
@@ -706,7 +710,7 @@ private do_send(args: Buf[Value], at: Span) -> Step
             send_bytes(args.at(0), payload.view(), at)
 
         // Rendered as `print` would render it, which is the reading `writeFile` already takes.
-        other -> send_socket(args.at(0), value_text(other), at)
+        other -> send_socket(args.at(0), printed(other, at)?, at)
 
 private do_close(args: Buf[Value], at: Span) -> Step
     if args.len() != 1 then return fault(at, s"`close` takes a socket and was given ${counted(args.len(), "argument")}")
@@ -756,7 +760,7 @@ private do_write_file(args: Buf[Value], at: Span) -> Step
         // **Anything else is rendered as `print` would render it**, which is the reading a program
         // writing a number or an array to a file expects -- and the alternative, refusing everything
         // but a string, would make `writeFile(path, str(x))` the only spelling anybody ever wrote.
-        other -> write_file_promise(path, value_text(other), at)
+        other -> write_file_promise(path, printed(other, at)?, at)
 end do_write_file
 
 private do_write_file_sync(args: Buf[Value], at: Span) -> Step
@@ -766,7 +770,7 @@ private do_write_file_sync(args: Buf[Value], at: Span) -> Step
 
     args.at(1) match
         Str(p) -> write_file_sync(path, p.s, at)
-        other -> write_file_sync(path, value_text(other), at)
+        other -> write_file_sync(path, printed(other, at)?, at)
 
 private do_rename_sync(args: Buf[Value], at: Span) -> Step
     if args.len() != 2 then return fault(at, s"`renameSync` takes two paths and was given ${counted(args.len(), "argument")}")
@@ -809,7 +813,7 @@ private do_settled(args: Buf[Value], at: Span, failing: bool) -> Step
 
     hold(Promise(pr))
 
-    if failing then settle_err(pr, value_text(args.at(0)), at) else settle_ok(pr, args.at(0))
+    if failing then settle_err(pr, printed(args.at(0), at)?, at) else settle_ok(pr, args.at(0))
 
     release(mark)
     Ok(Promise(pr))
@@ -844,7 +848,7 @@ private do_answer(args: Buf[Value], at: Span, failing: bool) -> Step
         Promise(p) -> p
         other -> return fault(at, s"`${name}` answers a promise, and this is ${other.type_name()}")
 
-    if failing then settle_err(pr, value_text(args.at(1)), at) else settle_ok(pr, args.at(1))
+    if failing then settle_err(pr, printed(args.at(1), at)?, at) else settle_ok(pr, args.at(1))
 
     Ok(Null)
 end do_answer
@@ -872,13 +876,13 @@ private do_clear(args: Buf[Value], at: Span) -> Step
     clear_timer(args.at(0), at)
 
 // `print(a, b, ...)` -- every argument rendered, a space between, one line.
-private do_print(args: Buf[Value]) -> Step
+private do_print(args: Buf[Value], at: Span) -> Step
     var out = str_builder()
 
     for i in 0..<args.len()
         if i > 0 then out.push_char(' ')
 
-        out.push(value_text(args.at(i)))
+        out.push(printed(args.at(i), at)?)
 
     output.push(out.finish())
     Ok(Null)
@@ -924,7 +928,32 @@ end do_push
 private do_string(args: Buf[Value], at: Span) -> Step
     if args.len() != 1 then return fault(at, s"`string` takes one argument and was given ${args.len()}")
 
-    Ok(str_value(value_text(args.at(0))))
+    Ok(str_value(printed(args.at(0), at)?))
+
+// `v.toString()` -- what `print` would show, and what a class may say for itself.
+//
+// **Reached only where the value has no `toString` of its own**, the universal table being the last
+// thing a method lookup tries -- so this never recurses into the hook that would have replaced it.
+private do_to_string(args: Buf[Value], at: Span) -> Step
+    if args.len() != 1 then return fault(at, s"`toString` takes no arguments and was given ${args.len() - 1}")
+
+    Ok(str_value(printed(args.at(0), at)?))
+
+// `a.eq(b)` and `a.ne(b)` -- the same OBJECT, not the same shape.
+private do_eq(args: Buf[Value], at: Span, want: bool) -> Step
+    if args.len() != 2 then return fault(at, s"`${if want then "eq" else "ne"}` takes one argument and was given ${args.len() - 1}")
+
+    Ok(Bool(identical(args.at(0), args.at(1), at) == want))
+
+// `a.equals(b)` -- `==` under its own name, hooks and all.
+//
+// **The two may not disagree**, which is why this is `same` rather than a second reading of it: a
+// class that writes an `equals` changes both at once, and a class that writes none gets identity from
+// both because that is what `same` now does for a nominal value.
+private do_equals(args: Buf[Value], at: Span) -> Step
+    if args.len() != 2 then return fault(at, s"`equals` takes one argument and was given ${args.len() - 1}")
+
+    Ok(Bool(same(args.at(0), args.at(1), at)?))
 
 // `keys(o)` -- an object's field names, as an array of strings.
 private do_keys(args: Buf[Value], at: Span) -> Step
@@ -1033,7 +1062,7 @@ value_text(v: Value) -> string
     var out = str_builder()
     var path: Buf[*u8] = buf()
 
-    write_value(&out, v, false, &path)
+    ignore_signal(write_value(&out, v, false, &path, None))
     out.finish()
 
 // The same, with a string quoted rather than bare.
@@ -1044,8 +1073,71 @@ show_value(v: Value) -> string
     var out = str_builder()
     var path: Buf[*u8] = buf()
 
-    write_value(&out, v, true, &path)
+    ignore_signal(write_value(&out, v, true, &path, None))
     out.finish()
+
+// **A `write_value` told `None` cannot fail**, there being nothing in it that runs a program: every
+// `?` inside it is on a hook call, and a hook is only reached where a span was given. This is the one
+// place that is said, so the two infallible printers above stay one line each.
+private ignore_signal(r: Result[unit, Signal])
+    r match
+        Ok(_) -> ()
+        Err(_) -> ()
+
+// A value as the PROGRAM would render it, consulting a `toString` its class wrote.
+//
+// **This is what `print`, `string(v)` and an interpolation hole use, and `value_text` is what a
+// DIAGNOSTIC uses.** The split is deliberate and is the same one `same_literal` draws against `==`: a
+// message about a fault may not run the program's own code to render its values, because the hook can
+// fault in turn and the second fault is the one the reader would be shown.
+//
+// **The value is HELD for the walk.** A hook re-enters the interpreter and a `Value` in a sysl local
+// is not a root, so a collection inside a `toString` would free the very object being printed --
+// which is the trap `run_one_test` paid for. Holding the root holds everything reachable from it, so
+// the `path` addresses stay good too.
+printed(v: Value, at: Span) -> Result[string, Signal] = rendered(v, false, at)
+
+// The same, with a string quoted rather than bare.
+printed_quoted(v: Value, at: Span) -> Result[string, Signal] = rendered(v, true, at)
+
+private rendered(v: Value, quoted: bool, at: Span) -> Result[string, Signal]
+    var out = str_builder()
+    var path: Buf[*u8] = buf()
+    val mark = root_mark()
+
+    hold(v)
+
+    write_value(&out, v, quoted, &path, Some(at)) match
+        Ok(_) -> ()
+        Err(e) ->
+            release(mark)
+            return Err(e)
+
+    release(mark)
+    Ok(out.finish())
+end rendered
+
+// What a value's own `toString` says, where it has one.
+//
+// **The receiver rule, so a class writes `toString(self)` like every other method** -- and a captured
+// `{ toString: () -> "x" }` sitting on the object itself still takes none, which is what `call_hook`
+// answers for. A hook that gives back something other than a string is a fault naming what it gave:
+// silently rendering it would make a `toString` answering an object print an object, which is the
+// thing the hook was written to stop.
+//
+// **`quoted` is not passed on.** A class saying how it prints has said it; wrapping that in quotes
+// because it happened to appear inside an array would be the printer overruling the type.
+private user_text(v: Value, quoted: bool, at: Span) -> Result[Option[string], Signal]
+    var none: Buf[Value] = buf()
+
+    call_hook(v, "toString", none, at) match
+        Some(step) -> step? match
+            Str(p) -> Ok(Some(p.s))
+            other -> fault_text(at, s"`toString` says how a value prints, so it answers a string -- and this one gave ${other.type_name()}")
+        None -> Ok(None)
+end user_text
+
+private fault_text(at: Span, message: string) -> Result[Option[string], Signal] = Err(failure(at, message))
 
 // Whether a container is already being written, further up this same walk.
 //
@@ -1078,10 +1170,29 @@ variant_name(o: *ObjectObj) -> Option[string]
         _ -> None
 end variant_name
 
-// The two keys a data value does not print: the chain it is reached through, and the name it prints
-// AS -- which would otherwise appear as a field of every singleton.
+// The class an object is an INSTANCE of, if it is one.
+//
+// **The walk starts at the proto and not at the object**, and that is the whole of the distinction
+// between a class and one of its instances: the tag is the class's own field, so an instance reaches
+// it through the chain and the class itself does not. `Point` is therefore not an instance of
+// `Point`, which is the answer `is` already gives.
+class_name(o: *ObjectObj) -> Option[string]
+    obj_get_name(o, "proto") match
+        Some(Object(up)) -> field_through(up, ClassTag) match
+            Some(Str(p)) -> Some(p.s)
+            _ -> None
+        _ -> None
+end class_name
+
+// The name of a CLASS, asked of the class object itself.
+class_own_name(o: *ObjectObj) -> Option[string] = obj_get_name(o, ClassTag) match
+    Some(Str(p)) -> Some(p.s)
+    _ -> None
+
+// The keys a nominal value does not print: the chain it is reached through, and the two tags that
+// say what made it -- which would otherwise appear as a field of every singleton and every instance.
 private hidden_key(k: Value) -> bool = k match
-    Str(p) -> p.s == "proto" || p.s == DataTag
+    Str(p) -> p.s == "proto" || p.s == DataTag || p.s == ClassTag
     _ -> false
 
 // A value, as written at the top level or inside a container.
@@ -1092,7 +1203,26 @@ private hidden_key(k: Value) -> bool = k match
 // stack. That arrives as a bare SIGSEGV carrying no message and none of the output the program had
 // already produced, which is filed against sysl as card 0299 -- but the descent is this function's
 // to stop.
-private write_value(out: *StrBuilder, v: Value, quoted: bool, path: *Buf[*u8])
+private write_value(out: *StrBuilder, v: Value, quoted: bool, path: *Buf[*u8], hooks: Option[Span]) -> Result[unit, Signal]
+    // **A `toString` THE PROGRAM WROTE REPLACES EVERYTHING BELOW, AT EVERY DEPTH.** The hook is
+    // consulted here rather than at the top so that `print([d, d])` renders each element the way its
+    // own class says, which is the whole point of having one -- a rendering that applied only to a
+    // value printed on its own would be the case that matters least.
+    //
+    // **`hooks` IS THE SPAN AND THE PERMISSION AT ONCE, AND THAT IS DELIBERATE.** Calling a hook
+    // re-enters the interpreter, so it needs somewhere to report a failure from and it may not
+    // happen at all while slate is composing a DIAGNOSTIC: a message about a fault that runs the
+    // program's own code to render its values can fault again, and the second fault is the one the
+    // reader would be shown. So `None` means both "no span" and "no hooks", and the two cannot drift
+    // apart. `value_text` passes `None` and `text_of` passes a span.
+    hooks match
+        Some(at) -> user_text(v, quoted, at)? match
+            Some(text) ->
+                out.push(text)
+                return Ok(())
+            None -> ()
+        None -> ()
+
     v match
         Null -> out.push("null")
         Undefined -> out.push("undefined")
@@ -1113,7 +1243,7 @@ private write_value(out: *StrBuilder, v: Value, quoted: bool, path: *Buf[*u8])
                 for i in 0..<a.items.len()
                     if i > 0 then out.push(", ")
 
-                    write_value(out, a.items.at(i), true, path)
+                    write_value(out, a.items.at(i), true, path, hooks)?
 
                 out.push_char(']')
                 path.truncate(path.len() - 1)
@@ -1141,7 +1271,7 @@ private write_value(out: *StrBuilder, v: Value, quoted: bool, path: *Buf[*u8])
 
                             if !e.dead && !hidden_key(e.key)
                                 out.push(if wrote == 0 then "(" else ", ")
-                                write_value(out, e.value, true, path)
+                                write_value(out, e.value, true, path, hooks)?
                                 wrote += 1
 
                         // A variant that declared no fields is written as its bare name, which is how
@@ -1149,7 +1279,55 @@ private write_value(out: *StrBuilder, v: Value, quoted: bool, path: *Buf[*u8])
                         if wrote != 0 then out.push_char(')')
 
                         path.truncate(path.len() - 1)
-                        return
+                        return Ok(())
+                    None -> ()
+
+                // **A CLASS INSTANCE PRINTS AS ITS CLASS AND ITS OWN FIELDS, WITH THE NAMES.** A
+                // class instance used to print the object it desugars to -- `{x: 1, y: 2, proto:
+                // {new: <function of 2>}}` -- which wrote out the whole class beside every value of
+                // it and buried the two numbers a reader wanted.
+                //
+                // **The names are written where a variant's are not**, and the difference is what
+                // the two declarations say. A variant's fields are positional by construction, so
+                // `Circle(3)` is how it was made and how it is matched; a class's are named, mutable
+                // and may be set after the fact, so `Rect(3, 4)` would leave a reader guessing which
+                // is the width.
+                class_name(o) match
+                    Some(name) ->
+                        out.push(name)
+
+                        var shown: usize = 0
+
+                        for i in 0..<o.entries.len()
+                            val e = o.entries.at(i)
+
+                            if !e.dead && !hidden_key(e.key)
+                                out.push(if shown == 0 then "(" else ", ")
+
+                                e.key match
+                                    Str(kp) -> if plain_name(kp.s) then out.push(kp.s) else write_value(out, e.key, true, path, hooks)?
+                                    _ -> write_value(out, e.key, true, path, hooks)?
+
+                                out.push(" = ")
+                                write_value(out, e.value, true, path, hooks)?
+                                shown += 1
+
+                        // A class that declares no fields is written as its bare name, as a variant
+                        // that carries none is -- `Empty`, never `Empty()`.
+                        if shown != 0 then out.push_char(')')
+
+                        path.truncate(path.len() - 1)
+                        return Ok(())
+                    None -> ()
+
+                // **The class OBJECT says it is one rather than printing its own members**, which
+                // are a constructor and a table of methods and are never what a reader printing
+                // `Point` wanted to see. Java prints `class Point` for the same reason.
+                class_own_name(o) match
+                    Some(name) ->
+                        out.push(s"<class ${name}>")
+                        path.truncate(path.len() - 1)
+                        return Ok(())
                     None -> ()
 
                 out.push_char('{')
@@ -1166,11 +1344,11 @@ private write_value(out: *StrBuilder, v: Value, quoted: bool, path: *Buf[*u8])
                         // is what JavaScript does: `{a: 1}` reads better than `{"a": 1}`, and a key
                         // that is not a name has to be distinguishable from one that is.
                         e.key match
-                            Str(kp) -> if plain_name(kp.s) then out.push(kp.s) else write_value(out, e.key, true, path)
-                            _ -> write_value(out, e.key, true, path)
+                            Str(kp) -> if plain_name(kp.s) then out.push(kp.s) else write_value(out, e.key, true, path, hooks)?
+                            _ -> write_value(out, e.key, true, path, hooks)?
 
                         out.push(": ")
-                        write_value(out, e.value, true, path)
+                        write_value(out, e.value, true, path, hooks)?
                         first = false
 
                 out.push_char('}')
@@ -1189,7 +1367,7 @@ private write_value(out: *StrBuilder, v: Value, quoted: bool, path: *Buf[*u8])
                 out.push(s"<promise failed: ${p.message}>")
             else
                 out.push("<promise ")
-                write_value(out, p.value, true, path)
+                write_value(out, p.value, true, path, hooks)?
                 out.push_char('>')
         // **Shown by its generation and not its slot**, since the slot is a position two sockets
         // may hold one after the other and the generation is the thing that names one of them.
@@ -1233,6 +1411,7 @@ private write_value(out: *StrBuilder, v: Value, quoted: bool, path: *Buf[*u8])
             out.push_int(long(stamp))
             out.push_char('>')
         Native(f) -> out.push(s"<builtin ${f}>")
+    Ok(())
 end write_value
 
 // The sentence a program gets for reaching a `slate:dom` name where there is no document.

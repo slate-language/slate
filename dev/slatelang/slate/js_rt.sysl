@@ -283,6 +283,19 @@ js_runtime_core() -> string = raw"""
 
                 path.push(v)
 
+                // **A `toString` the program wrote replaces everything below, at every depth**, so
+                // `print([d, d])` renders each element the way its own class says.
+                const said = callHook(v, "toString", [])
+
+                if (said !== NO_HOOK) {
+                    path.pop()
+
+                    if (typeof said !== "string")
+                        fault("`toString` says how a value prints, so it answers a string -- and this one gave " + typeName(said))
+
+                    return said
+                }
+
                 // **A data value prints as the variant that made it** -- `Circle(3)` rather than the
                 // object with its whole proto chain written out. The interpreter says the same, and
                 // the two back ends printing one value differently is a difference between them.
@@ -299,10 +312,37 @@ js_runtime_core() -> string = raw"""
                     return held.length === 0 ? made : made + "(" + held.join(", ") + ")"
                 }
 
+                // **A class instance prints as its class and its own fields, WITH the names** --
+                // a class's fields are named and mutable where a variant's are positional by
+                // construction, so `Rect(3, 4)` would leave a reader guessing which is the width.
+                const cls = className(v)
+
+                if (cls !== null) {
+                    const shown = []
+
+                    for (const [k, x] of v.fields)
+                        if (k !== "proto" && !tagKey(k))
+                            shown.push((plainName(k) ? k : escaped(k)) + " = " + write(x, true, path))
+
+                    path.pop()
+
+                    return shown.length === 0 ? cls : cls + "(" + shown.join(", ") + ")"
+                }
+
+                // **The class OBJECT says it is one** rather than printing a constructor and a table
+                // of methods, which is never what a reader printing `Point` wanted to see.
+                const own = classOwnName(v)
+
+                if (own !== null) {
+                    path.pop()
+
+                    return "<class " + own + ">"
+                }
+
                 const parts = []
 
                 for (const [k, x] of v.fields)
-                    parts.push((plainName(k) ? k : escaped(k)) + ": " + write(x, true, path))
+                    if (!tagKey(k)) parts.push((plainName(k) ? k : escaped(k)) + ": " + write(x, true, path))
 
                 path.pop()
 
@@ -624,22 +664,35 @@ js_runtime_core() -> string = raw"""
             return v === lit
         }
 
-        // **The left side's `equals` decides, and only the left side's** -- Java's rule for `a.equals(b)`.
-        // **`equals` IS HANDED NO RECEIVER, AND THIS BACK END WAS HANDING ONE OVER.** The
-        // interpreter's `same_in` goes through `hook_of`, which takes no receiver on purpose --
-        // that is what makes a capture-style hook used as a `proto` keep working, `apply` faulting
-        // on an arity mismatch. Applying the general receiver rule here made
-        // `{ equals: o -> true }` used as a proto a two-argument call, which faults; the same
-        // program answered `stored 1` under the interpreter and stopped under `slate js`.
+        // Whether two values are the same OBJECT rather than the same shape -- `a.eq(b)`.
         //
-        // **A golden test could not have seen it** -- the runtime is a text block no expectation
-        // quotes -- and the interpreter's own test for it pinned only the interpreter.
-        const eq = (a, b) => {
-            if (a instanceof SObj) {
-                const [f] = a.lookup("equals")
+        // **Only the kinds with a heap identity are compared by address.** A string, a number and a
+        // boolean are immutable and nothing can observe which copy it holds, so `"a".eq("a")`
+        // answering false would be a trap rather than a distinction.
+        const identical = (a, b) => {
+            if (a instanceof SObj || Array.isArray(a) || typeof a === "function" || a instanceof Promise)
+                return a === b
 
-                if (typeof f === "function") return truthy(call(f, [b]))
-            }
+            return same(a, b, [])
+        }
+
+        // Whether a value's equality is its own rather than its fields'.
+        //
+        // **Asked of BOTH sides and not only the left**, where every hook consults the left alone: an
+        // `Account` comparing structurally against a bare `{balance: 5}` because the literal was
+        // written on the left would make `==` depend on which side of it a value sat.
+        const nominal = (v) => className(v) !== null
+
+        // **The left side's `equals` decides, and only the left side's** -- Java's rule for `a.equals(b)`.
+        //
+        // **A class instance that declared no `equals` compares by IDENTITY**, which is Scala's rule
+        // and Java's: the default `equals` on a nominal value is `eq`. A plain object, an array and a
+        // data variant stay deep -- a variant's fields ARE the value, the way a case class's are.
+        const eq = (a, b) => {
+            const said = callHook(a, "equals", [b])
+
+            if (said !== NO_HOOK) return truthy(said)
+            if (nominal(a) || nominal(b)) return identical(a, b)
 
             return same(a, b, [])
         }
@@ -754,7 +807,20 @@ js_runtime_core() -> string = raw"""
         // -- fields, methods and calls -------------------------------------------------------------------
 
         const field = (t, name) => {
-            if (t instanceof SObj) return t.lookup(name)[0]
+            if (t instanceof SObj) {
+                const held = t.lookup(name)[0]
+
+                // **`o.toString` on its own hands back the plain builtin**, exactly as `xs.map` does
+                // -- it is the same value `o.toString()` calls, which is what makes the four methods
+                // real rather than a syntax.
+                if (held === undefined) {
+                    const m = builtinMethod(t, name)
+
+                    if (m !== undefined) return m
+                }
+
+                return held
+            }
             if (t === null || t === undefined) fault("`" + name + "` was asked of " + typeName(t))
 
             // **A builtin method is the free function of the same name**, handed back unbound exactly as
@@ -801,8 +867,15 @@ js_runtime_core() -> string = raw"""
             if (t instanceof SObj) {
                 const [f, delegated] = t.lookup(name)
 
-                if (f === undefined)
+                if (f === undefined) {
+                    // **The four universal methods are what an object falls back to**, after its own
+                    // fields and its whole proto chain have answered nothing.
+                    const m = builtinMethod(t, name)
+
+                    if (m !== undefined) return m.apply(null, [t].concat(args))
+
                     fault("`" + name + "` is not a field of this object, so there is nothing to call")
+                }
 
                 return call(f, delegated ? [t].concat(args) : args)
             }
@@ -1026,6 +1099,35 @@ js_runtime_core() -> string = raw"""
             return typeof tag === "string" ? tag : null
         }
 
+        // The class an object is an INSTANCE of, if it is one.
+        //
+        // **The walk starts at the proto and not at the object**, which is the whole distinction
+        // between a class and one of its instances: the tag is the class's own field. The
+        // interpreter's `class_name` says the same.
+        const className = (v) => {
+            if (!(v instanceof SObj)) return null
+
+            const up = v.fields.get("proto")
+
+            if (!(up instanceof SObj)) return null
+
+            const [tag] = up.lookup("(class)")
+
+            return typeof tag === "string" ? tag : null
+        }
+
+        // The name of a CLASS, asked of the class object itself.
+        const classOwnName = (v) => {
+            if (!(v instanceof SObj)) return null
+
+            const tag = v.fields.get("(class)")
+
+            return typeof tag === "string" ? tag : null
+        }
+
+        // Whether a key is a tag a declaration wrote rather than a field a program did.
+        const tagKey = (k) => k === "(data)" || k === "(class)"
+
         // Whether the value's `proto` chain reaches this very object, which is what `p is Point` asks.
         //
         // **Identity, walked up the chain**: `==` on objects is structural, so it would answer true for
@@ -1111,6 +1213,7 @@ js_runtime_core() -> string = raw"""
             strLen, strAt, strSlice, wide, span,
             index, setIndex, field, fieldOpt, setField, method, call, spread, awaited, iter, seal,
             matched, matches, unpacked, noArm, caught, hasProto, variantName,
+            className, classOwnName, tagKey, identical,
 
             // What a `type` declaration binds. **The pattern is walked and never read back out**, so
             // nothing downstream can grow to depend on the structure of a type.

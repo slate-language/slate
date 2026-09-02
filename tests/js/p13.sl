@@ -1,0 +1,56 @@
+// The object model: what a value prints as, and what it means for two of them to be the same.
+//
+// Both back ends have to agree about every line here. The interpreter walks its own printer and its
+// own equality; the emitted program walks JavaScript's `Map` and `===`, and the two arrived at these
+// answers by different routes.
+
+class Point
+    var x
+    var y
+
+class Empty
+
+class Money
+    var cents
+
+    equals(self, o) = o is Money && self.cents == o.cents
+    toString(self) = "$" + string(self.cents)
+
+data Shape
+    Circle(r)
+    Nothing
+
+val p = Point.new(1, 2)
+val q = Point.new(1, 2)
+
+// A class instance names its class and its own fields; the class object says it is one.
+print(p)
+print(Point)
+// A class that declares no fields gets no constructor, so an instance is written out --
+// and it prints as the bare name, the way a variant carrying nothing does.
+print({ proto: Empty })
+print([p, q])
+
+// A nominal value compares by identity, and a plain object, an array and a variant stay deep.
+print(p == q, p == p, {x: 1} == {x: 1}, [1, 2] == [1, 2])
+print(Circle(3) == Circle(3), Nothing == Nothing)
+
+// `eq` is identity on every value that has one and equality on every value that has not.
+print(p.eq(q), p.eq(p), p.ne(q))
+print([1, 2].eq([1, 2]), 1.eq(1), "a".eq("a"), true.eq(true), null.eq(null))
+
+// `equals` is `==` under its own name, and the two may never disagree.
+print(p.equals(q), p.equals(p), [1, 2].equals([1, 2]))
+
+// A class that writes `equals` gets it for `==` too, and one that writes `toString` gets it
+// everywhere a value is rendered.
+val m = Money.new(150)
+
+print(m == Money.new(150), m.eq(Money.new(150)))
+print(m, string(m), m.toString(), s"cost $m", [m])
+
+// `toString` on anything else is what `print` would have shown.
+print((42).toString(), [1, 2].toString(), Circle(3).toString(), {a: 1}.toString())
+
+// A tag a declaration wrote is not a field.
+print(keys(Point), len(Point), keys(p), len(p))
