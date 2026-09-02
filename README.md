@@ -973,6 +973,20 @@ which is most of what a type buys a language with no checker. What is lost again
 real and worth saying: TS catches a mistake on a path you never ran, and this only fires when that
 path executes.
 
+**A call answers in terms of what it was given.** `filter`, `sorted`, `reversed` and `pop` all give
+back what they were handed, so the element type survives them and a mistake is caught where it is
+written rather than where it runs:
+
+```
+f(xs: array of string) = len(xs)
+f(filter(ns, n -> n > 1))       // error, where `ns` is an array of integer
+```
+
+A lambda's result is read off its body, which is what lets `map(ns, n -> string(n))` be an `array of
+string` — a lambda is the one function with no way to *say* what it answers. Its parameters are
+still `any`, so `map(ns, n -> n * 2)` is an `array of any` rather than of integer; tying a lambda's
+parameter to the array beside it is what a type variable would be for, and slate has none.
+
 **The checker reads the rest of the block before it says what a name holds.** A `var` is the union of
 its initialiser and every value ever assigned to it, so a counter stays an integer through `+= 1` and
 `n++` and a wrong call is refused before the program runs; one the program reassigns to another kind

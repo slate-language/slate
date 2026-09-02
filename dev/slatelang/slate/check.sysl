@@ -391,13 +391,13 @@ type_of_expr(x: Expr, env: *TypeEnv) -> Type
                 certain.push(false)
 
             type_of(ObjectWith(keys, out, certain))
-        Lambda(params, defaults, _, _) ->
+        Lambda(params, defaults, body, is_async) ->
             var out: Buf[Type] = buf()
 
             for i in 0..<params.len()
                 out.push(type_of(Any))
 
-            type_of(FunctionType(out, floor_of(params, defaults.len()), variadic_params(params), type_of(Any)))
+            type_of(FunctionType(out, floor_of(params, defaults.len()), variadic_params(params), lambda_result(params, body, is_async, env)))
 
         // A comparison and an `is` are booleans whatever they compared.
         Compare(_, _) -> type_of(BooleanType)
@@ -406,8 +406,8 @@ type_of_expr(x: Expr, env: *TypeEnv) -> Type
             Bang -> type_of(BooleanType)
             _ -> type_of_expr(rhs, env)
         Binary(op, lhs, rhs) -> binary_type(op, type_of_expr(lhs, env), type_of_expr(rhs, env))
-        Call(callee, _) -> *type_of_expr(callee, env).kind match
-            FunctionType(_, _, _, result) -> result
+        Call(callee, args) -> *type_of_expr(callee, env).kind match
+            FunctionType(_, _, _, result) -> resolved_result(result, args, env)
             _ -> type_of(Any)
 
         // **A FIELD READ, WHERE THE SHAPE IS ONE NOTHING COULD HAVE MADE STALE.** A name only
@@ -982,6 +982,79 @@ private is_named_kind(t: Type) -> bool
         NamedType(_) -> true
         _ -> false
 
+// WHAT A CALL ANSWERS, with the markers in its signature replaced by what this call was given.
+//
+// **Recursive, so a result may be BUILT out of markers** -- `map` is `ArrayOf(ResultOf(1))` and
+// `find` is `ElementOf(0) | null`. Everything that is not a marker is handed back as it stands, so
+// the ordinary signature costs one walk of a type that has nothing in it.
+//
+// **An argument nobody can place leaves the marker unresolved and the answer is `Any`.** A named or
+// spread argument is not at the position it was written at, so the marker cannot name it -- and
+// answering the wrong argument's type would report what the machine would not.
+private resolved_result(t: Type, args: Buf[Expr], env: *TypeEnv) -> Type
+    *t.kind match
+        SameAsArg(at) -> argument_type(at, args, env)
+        ElementOf(at) -> *argument_type(at, args, env).kind match
+            ArrayOf(element) -> element
+            _ -> type_of(Any)
+        ResultOf(at) -> *argument_type(at, args, env).kind match
+            FunctionType(_, _, _, result) -> result
+            _ -> type_of(Any)
+        ArrayOf(element) -> type_of(ArrayOf(resolved_result(element, args, env)))
+        OneOf(alts) ->
+            var out: Buf[Type] = buf()
+
+            for i in 0..<alts.len()
+                out.push(resolved_result(alts.at(i), args, env))
+
+            type_of(OneOf(out))
+        _ -> t
+end resolved_result
+
+// The type of one argument by position, or `Any` where the call does not give a plain one there.
+private argument_type(at: usize, args: Buf[Expr], env: *TypeEnv) -> Type
+    if at >= args.len() then return type_of(Any)
+
+    for i in 0..<args.len()
+        *args.at(i).kind match
+            Named(_, _) -> return type_of(Any)
+            Spread(_) -> return type_of(Any)
+            _ -> ()
+
+    type_of_expr(args.at(at), env)
+end argument_type
+
+// WHAT A LAMBDA ANSWERS, read off its body.
+//
+// **A lambda is the one function that cannot SAY what it answers** -- `x -> integer` is a body that
+// hands back the builtin, and there is no other place to write one -- so inferring it is the only
+// way `map(xs, n -> string(n))` can be an `array of string`. A named function says `-> integer` and
+// is believed, which is why this is not needed there.
+//
+// **The parameters are `Any` and are put in scope before the body is read**, so that a body naming
+// one gets nothing rather than picking up whatever an outer scope calls it. Without that,
+// `val x = "s"` then `map(ns, x -> x + 1)` would read the outer `x` and answer string.
+//
+// **A block body says nothing**, `type_of_expr` having no arm for one: what a block answers is its
+// last statement or any `return` inside it, and reading only the last would be wrong wherever a
+// `return` is written above it. An expression body is what a lambda usually is.
+//
+// **An `async` lambda answers a PROMISE**, which is `signature_of`'s rule for the same reason: what
+// the body gives back is what awaiting the call produces, not what calling it does.
+private lambda_result(params: Buf[string], body: usize, is_async: bool, env: *TypeEnv) -> Type
+    if is_async then return type_of(Any)
+
+    enter_scope(env)
+
+    for i in 0..<params.len()
+        note_type(env, plain_param(params.at(i)), type_of(Any))
+
+    val answered = type_of_expr(body_at(body), env)
+
+    leave_scope(env)
+    answered
+end lambda_result
+
 // Whether this type says what an object's FIELDS are, and is describing an ordinary object.
 //
 // **A NOMINAL VALUE'S TYPE IS ITS NAME AND NOT ITS FIELDS**, so a literal carrying a `proto` or one
@@ -1081,7 +1154,14 @@ end named
 //   argue from), **an annotated PARAMETER's shape** (the object came from the caller, who may hold
 //   another name for it), and **a field of an object reached through anything but a bare name**.
 // - **A function's RESULT is not checked against its body.** `-> integer` is enforced by
-//   `CheckResult` at run time and believed here.
+//   `CheckResult` at run time and believed here. A LAMBDA's result is now inferred FROM its body,
+//   which is a different question -- it has no way to say one, so there is nothing to believe.
+// - **A LAMBDA'S PARAMETERS ARE `Any`, and that is the edge of what can be said without type
+//   variables.** `map(ns, n -> n * 2)` is an `array of integer` and this pass answers `array of
+//   any`, because `n` is `Any` and so is `n * 2`. Tying a lambda's parameter to the element type of
+//   the array beside it is the relationship a type VARIABLE expresses and nothing here can:
+//   `resolved_result` names an argument by position, which is a lookup rather than unification.
+//   **That is the one part of this that would be generics**, and it is the next piece of work.
 // - **A NAMED ARGUMENT is not placed.** `FunctionType` carries parameter types and not parameter
 //   names, so `f(b = 1)` cannot be matched to a slot here and the per-argument type check steps
 //   aside for the whole call. The count is still checked, that being the same between the two ends
