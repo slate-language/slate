@@ -347,14 +347,21 @@ so where it is written. An arity complaint then names the range rather than only
 reachable:
 
 ```
-greet("ada")                      // hello, ada!
-greet("ada", punct: "?")          // hello, ada?   -- greeting skipped
-greet(greeting: "hi", name: "ada")
+greet("ada")                       // hello, ada!
+greet("ada", punct = "?")          // hello, ada?   -- greeting skipped
+greet(greeting = "hi", name = "ada")
 ```
 
+**`=` and not `:`, because it is what the declaration already says.** `greet(name, greeting =
+"hello")` writes the default after an equals, so a call uses the character that already means *this
+parameter gets this value* — where a colon means the parameter's **type** one line up. Assignment is
+a statement in slate, so `=` never appears inside an expression and there is nothing for it to be
+confused with; `==` is its own token, so `f(ok == true)` is an ordinary positional argument.
+
 A name comes after every positional argument, and it may pick out any parameter — a class's `new`
-and a data variant's maker are ordinary functions, so `Rect(h: 4, w: 3)` and `Circle(r: 7)` read the
-same way. A method names its parameters and not its receiver.
+and a data variant's maker are ordinary functions, so `Rect(h = 4, w = 3)` and `Circle(r = 7)` read
+the same way, which is also how a class instance prints. A method names its parameters and not its
+receiver.
 
 Naming a parameter twice, naming one the function does not have, naming an argument to a builtin, or
 naming one to a function that gathers with `...` are each refused with their own sentence — the
