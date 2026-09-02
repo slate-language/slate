@@ -143,3 +143,88 @@ asking_an_array_for_something_only_a_string_can_do_names_the_kind() =
     assert(contains(said, "array"))
 
 anything(v) = v
+
+// -- the eight an array answers that it did not before ---------------------------------------------
+
+@test
+slice_asks_for_whatever_part_of_the_array_is_there() =
+    val xs = [1, 2, 3, 4]
+
+    assertEq(xs.slice(1), [2, 3, 4])
+    assertEq(xs.slice(1, 3), [2, 3])
+
+    // **Both ends clamp**, which is what makes a slice a question rather than a claim: asking for
+    // more than is there gives what is there, and crossed ends give nothing rather than a reversed
+    // array.
+    assertEq(xs.slice(0, 100), [1, 2, 3, 4])
+    assertEq(xs.slice(3, 1), [])
+    assertEq(xs.slice(100), [])
+
+    // A negative position counts back from the end.
+    assertEq(xs.slice(-2), [3, 4])
+    assertEq(xs.slice(-3, -1), [2, 3])
+
+    // The array it was asked about is untouched.
+    assertEq(xs, [1, 2, 3, 4])
+
+@test
+at_is_the_negative_index_that_the_brackets_have_no_room_for() =
+    val xs = [1, 2, 3]
+
+    assertEq(xs.at(0), 1)
+    assertEq(xs.at(-1), 3)
+    assertEq(xs.at(2), 3)
+
+    // **Out of range is a fault and not an absent value**, which is `xs[i]`'s rule and `pop`'s:
+    // JavaScript answers `undefined`, which travels, and slate's `undefined` may not.
+    assert((xs.at(5) catch e -> e.message).contains("this array has 3 of them"))
+    assert((xs.at(-5) catch e -> e.message).contains("this array has 3 of them"))
+
+@test
+shift_is_pops_twin_and_unshift_is_pushs() =
+    var xs = [1, 2, 3]
+
+    assertEq(xs.shift(), 1)
+    assertEq(xs, [2, 3])
+
+    // **Nothing is handed back from `unshift`**, which is `push`'s rule rather than JavaScript's:
+    // there it answers the new length, a number nobody reads.
+    assertEq(xs.unshift(0), null)
+    assertEq(xs, [0, 2, 3])
+
+    var empty = []
+
+    assert((empty.shift() catch e -> e.message).contains("nothing to shift off an empty array"))
+
+@test
+flatMap_is_map_and_flat_in_one_walk() =
+    assertEq([1, 2].flatMap(n -> [n, n]), [1, 1, 2, 2])
+
+    // The case neither handles alone: nothing for some elements and several for others.
+    assertEq([1, 2, 3].flatMap(n -> if n == 2 then [] else [n]), [1, 3])
+
+    // One level and not all of them, which is `flat`'s rule.
+    assertEq([1].flatMap(n -> [[n]]), [[1]])
+
+@test
+forEach_is_for_what_it_does_rather_than_what_it_answers() =
+    var seen = []
+
+    assertEq([1, 2, 3].forEach(n -> push(seen, n * 2)), null)
+    assertEq(seen, [2, 4, 6])
+
+@test
+findLast_walks_from_the_other_end() =
+    val xs = [1, 2, 3, 2]
+
+    assertEq(xs.findLast(n -> n == 2), 2)
+    assertEq(xs.findLastIndex(n -> n == 2), 3)
+    assertEq(xs.findIndex(n -> n == 2), 1)
+
+    // Absent is `null` and not -1, which is `find`'s answer and `indexOf`'s.
+    assertEq(xs.findLast(n -> n > 5), null)
+    assertEq(xs.findLastIndex(n -> n > 5), null)
+
+@test
+the_new_eight_chain_with_the_ones_that_were_already_there() =
+    assertEq([4, 1, 3, 2].sorted().slice(1, 3).flatMap(n -> [n, n]).at(-1), 3)

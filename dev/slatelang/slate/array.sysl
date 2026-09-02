@@ -171,8 +171,11 @@ end do_reduce
 //
 // **Absent is `null` and not -1**, which is the same call `indexOf` makes and for the same reason:
 // slate has a null and the operators that go with it, so a sentinel would be an invented one.
-do_find(args: Buf[Value], at: Span, want_index: bool) -> Step
-    val name = if want_index then "findIndex" else "find"
+do_find(args: Buf[Value], at: Span, want_index: bool, from_end: bool) -> Step
+    val name = if from_end
+        if want_index then "findLastIndex" else "findLast"
+    else
+        if want_index then "findIndex" else "find"
 
     takes(args, 2, at, name, "an array and a function")?
 
@@ -181,11 +184,14 @@ do_find(args: Buf[Value], at: Span, want_index: bool) -> Step
     val n = xs.items.len()
 
     for i in 0..<n
-        val hit = call_on(args.at(1), xs.items.at(i), at)?.truthy()
+        // **The walk runs backwards for the `Last` pair and is otherwise the same function**, so the
+        // two directions cannot answer differently about anything but which one they found first.
+        val k = if from_end then n - 1 - i else i
+        val hit = call_on(args.at(1), xs.items.at(k), at)?.truthy()
 
         if xs.items.len() != n then return Err(walk_changed(at, name))
 
-        if hit then return Ok(if want_index then Int(long(i)) else xs.items.at(i))
+        if hit then return Ok(if want_index then Int(long(k)) else xs.items.at(k))
 
     Ok(Null)
 end do_find
@@ -452,6 +458,152 @@ do_flat(args: Buf[Value], at: Span) -> Step
     release(mark)
     Ok(Array(out))
 end do_flat
+
+// WHERE A NEGATIVE INDEX POINTS, which is what `at` and `slice` are for.
+//
+// **A negative index counts back from the END** -- `-1` is the last element -- which is the whole
+// reason JavaScript grew `at` beside `xs[i]`, that syntax having no room for it. Anything not a
+// whole number is a fault naming what arrived.
+private from_either_end(v: Value, at: Span, name: string, n: usize) -> Result[long, Signal] = v match
+    Int(i) -> Ok(if i < 0 then long(n) + i else i)
+    other -> Err(failure(at, s"`${name}` takes a position, and this is ${other.type_name()}"))
+
+// A position clamped into the array, which is what SLICING means: asking for more than is there
+// gives what is there. **`at` does not clamp** -- it is asking for one element, and a program that
+// asked for one that is not there has made a mistake worth a sentence.
+private clamped(i: long, n: usize) -> usize
+    if i < 0 then return 0
+    if usize(i) > n then return n
+
+    usize(i)
+end clamped
+
+// `slice(xs, from)` and `slice(xs, from, to)` -- a new array of the part between two positions.
+//
+// **`to` is exclusive and both ends clamp**, which is JavaScript's rule and Python's: a slice is a
+// question about whatever part of the array is there, so `slice(xs, 0, 100)` is the whole of it
+// rather than a fault. An empty answer where the ends cross, rather than a reversed one.
+do_slice(args: Buf[Value], at: Span) -> Step
+    if args.len() != 2 && args.len() != 3
+        return fault(at, s"`slice` takes an array, a position and an optional end, and was given ${counted(args.len(), "argument")}")
+
+    val xs = array_of(args.at(0), at, "slice")?
+    val n = xs.items.len()
+    val lo = clamped(from_either_end(args.at(1), at, "slice", n)?, n)
+
+    val hi = if args.len() == 3
+        clamped(from_either_end(args.at(2), at, "slice", n)?, n)
+    else
+        n
+
+    val mark = root_mark()
+    val out = new_array(buf())
+
+    hold(Array(out))
+
+    if hi > lo
+        for i in lo..<hi
+            out.items.push(xs.items.at(i))
+
+    release(mark)
+    Ok(Array(out))
+end do_slice
+
+// `at(xs, i)` -- one element, counted from either end.
+//
+// **Out of range is a FAULT and not an absent value**, which is `xs[i]`'s rule and `pop`'s:
+// JavaScript answers `undefined`, which travels, and slate's `undefined` is exactly the value that
+// may not. What `at` adds over `xs[i]` is the negative index and nothing else.
+do_array_at(args: Buf[Value], at: Span) -> Step
+    takes(args, 2, at, "at", "an array and a position")?
+
+    val xs = array_of(args.at(0), at, "at")?
+    val n = xs.items.len()
+    val i = from_either_end(args.at(1), at, "at", n)?
+
+    if i < 0 || usize(i) >= n
+        return fault(at, s"`at` was given the position ${i}, and this array has ${n} of them")
+
+    Ok(xs.items.at(usize(i)))
+end do_array_at
+
+// `shift(xs)` -- the FIRST element, taken off.
+//
+// `pop`'s twin, and empty is a fault for `pop`'s reason.
+do_shift(args: Buf[Value], at: Span) -> Step
+    takes(args, 1, at, "shift", "an array")?
+
+    val xs = array_of(args.at(0), at, "shift")?
+
+    if xs.items.len() == 0 then return fault(at, "there is nothing to shift off an empty array")
+
+    Ok(xs.items.remove(0))
+end do_shift
+
+// `unshift(xs, v)` -- put a value at the front.
+//
+// **Nothing is handed back**, which is `push`'s rule rather than JavaScript's: there, `unshift`
+// answers the new length, which is a number nobody reads and which makes the call look like it
+// produced something.
+do_unshift(args: Buf[Value], at: Span) -> Step
+    takes(args, 2, at, "unshift", "an array and a value")?
+
+    val xs = array_of(args.at(0), at, "unshift")?
+
+    keepable(args.at(1), at, "stored")?
+    xs.items.insert(0, args.at(1))
+    Ok(Null)
+end do_unshift
+
+// `flatMap(xs, f)` -- every element put through `f`, with one level of the result undone.
+//
+// **`map` then `flat` in one walk**, which is what it is for: a function answering nothing for some
+// elements and several for others is the case neither of them handles alone.
+do_flat_map(args: Buf[Value], at: Span) -> Step
+    takes(args, 2, at, "flatMap", "an array and a function")?
+
+    val xs = array_of(args.at(0), at, "flatMap")?
+    val mark = root_mark()
+    val out = new_array(buf())
+
+    hold(Array(out))
+
+    val n = xs.items.len()
+
+    for i in 0..<n
+        call_on(args.at(1), xs.items.at(i), at) match
+            Ok(v) -> v match
+                Array(inner) -> for j in 0..<inner.items.len() do out.items.push(inner.items.at(j))
+                other -> out.items.push(other)
+            Err(e) ->
+                release(mark)
+                return Err(e)
+
+        if xs.items.len() != n
+            release(mark)
+            return Err(walk_changed(at, "flatMap"))
+
+    release(mark)
+    Ok(Array(out))
+end do_flat_map
+
+// `forEach(xs, f)` -- `f` on every element, for what it does rather than what it answers.
+//
+// **Nothing is handed back**, so it cannot be mistaken for `map`. `for x in xs` is the idiom and
+// this is what a CHAIN ends with, which is the case the loop does not cover.
+do_for_each(args: Buf[Value], at: Span) -> Step
+    takes(args, 2, at, "forEach", "an array and a function")?
+
+    val xs = array_of(args.at(0), at, "forEach")?
+    val n = xs.items.len()
+
+    for i in 0..<n
+        call_on(args.at(1), xs.items.at(i), at)?
+
+        if xs.items.len() != n then return Err(walk_changed(at, "forEach"))
+
+    Ok(Null)
+end do_for_each
 
 // `sum(xs)` -- every element added up, starting from the integer zero.
 //

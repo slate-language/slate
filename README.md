@@ -907,6 +907,29 @@ else — both halves cross, the shape the compiler resolves and the value the na
 **Annotating is per parameter**, so `f(a, b: Point, c)` is fine — nothing has to be annotated for
 anything to be.
 
+**An array answers to method syntax, and so does every other builtin kind.**
+
+```
+[4, 1, 3, 2].sorted().slice(1, 3).flatMap(n -> [n, n]).at(-1)      // 3
+```
+
+`len push pop shift unshift insert removeAt clear map filter flatMap forEach reduce find findIndex
+findLast findLastIndex every some sort sorted reverse reversed slice at concat flat sum join contains
+indexOf lastIndexOf string`
+
+**A method is the free function of the same name with the receiver in front** — `xs.map(f)` *is*
+`map(xs, f)`, one implementation and one set of checks reachable two ways. So there is no array
+prototype and a program cannot add to one: the table is in the interpreter. Dispatch is on the
+receiver's **kind**, so `xs.upper()` says *"`upper` is not something an array can do"* rather than
+reaching `upper` and complaining about its argument.
+
+Where slate parts from JavaScript it is to remove a case rather than add one. **A mutator answers
+nothing**, so `sort` and `unshift` cannot be mistaken for the copying forms `sorted` and `concat`.
+**Nothing answers `undefined`**: `pop`, `shift` and `at` fault where there is nothing there, because
+`undefined` travels and slate's may not, while `find` and `indexOf` answer `null` — a search that
+found nothing is an answer, and reaching past the end is a mistake. `at` and `slice` count back from
+the end where the position is negative, which is the whole reason JavaScript grew `at` beside `xs[i]`.
+
 **A list is described with `array of T`.** An array pattern tests the elements it writes and lets
 the rest through — `["a", 2] is [string, ...]` is **true** — so a list of unknown length had no
 spelling at all until this. `object of T` is the other half, describing an object's values.
@@ -973,13 +996,15 @@ which is most of what a type buys a language with no checker. What is lost again
 real and worth saying: TS catches a mistake on a path you never ran, and this only fires when that
 path executes.
 
-**A call answers in terms of what it was given.** `filter`, `sorted`, `reversed` and `pop` all give
-back what they were handed, so the element type survives them and a mistake is caught where it is
-written rather than where it runs:
+**A call answers in terms of what it was given.** `filter`, `sorted`, `reversed`, `slice` and `pop`
+all give back what they were handed, so the element type survives them and a mistake is caught where
+it is written rather than where it runs — in either spelling, a method being checked as the free
+function it is:
 
 ```
 f(xs: array of string) = len(xs)
 f(filter(ns, n -> n > 1))       // error, where `ns` is an array of integer
+f(ns.filter(n -> n > 1))        // the same error
 ```
 
 A lambda's result is read off its body, which is what lets `map(ns, n -> string(n))` be an `array of
