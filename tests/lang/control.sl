@@ -178,3 +178,80 @@ async a_promise_may_be_settled_from_outside() =
 @test
 async awaiting_something_that_is_not_a_promise_answers_it() =
     assertEq(await 7, 7)
+
+@test
+async a_timer_resumes_the_program_later() =
+    var seen = []
+
+    setTimeout(() -> push(seen, "timer"), 10)
+    push(seen, "now")
+
+    await sleep(20)
+
+    assertEq(seen, ["now", "timer"])
+
+@test
+async timers_fire_in_the_order_they_come_due() =
+    var seen = []
+
+    setTimeout(() -> push(seen, "c"), 30)
+    setTimeout(() -> push(seen, "a"), 10)
+    setTimeout(() -> push(seen, "b"), 20)
+
+    await sleep(50)
+
+    assertEq(seen, ["a", "b", "c"])
+
+@test
+async two_timers_due_at_once_fire_in_the_order_they_were_set() =
+    var seen = []
+
+    setTimeout(() -> push(seen, "first"), 10)
+    setTimeout(() -> push(seen, "second"), 10)
+
+    await sleep(20)
+
+    assertEq(seen, ["first", "second"])
+
+@test
+async a_cancelled_timer_never_fires() =
+    var seen = []
+    val id = setTimeout(() -> push(seen, "no"), 10)
+
+    clearTimeout(id)
+
+    await sleep(20)
+
+    assertEq(seen, [])
+
+@test
+async an_interval_repeats_until_it_is_cancelled() =
+    var n = 0
+    var id = null
+
+    tick()
+        n = n + 1
+
+        if n == 3 then clearInterval(id)
+
+    id = setInterval(tick, 10)
+
+    await sleep(60)
+
+    assertEq(n, 3)
+
+@test
+async a_promise_settles_before_a_timer_that_is_already_due() =
+    // A continuation is a microtask and a timer is a macrotask, so everything already resolved runs
+    // before the loop takes its next turn. Both back ends have to agree about that ordering.
+    var seen = []
+
+    setTimeout(() -> push(seen, "timer"), 0)
+
+    await resolve(0)
+
+    push(seen, "promise")
+
+    await sleep(10)
+
+    assertEq(seen, ["promise", "timer"])

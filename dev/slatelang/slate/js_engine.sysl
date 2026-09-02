@@ -51,6 +51,13 @@ run_tests_js(src: Source) -> Tested
         Err(e) -> Tested(s"the JavaScript back end could not run it:\n${e}", buf())
 end run_tests_js
 
+// How many timers one file may fire before this calls it a program that will not end.
+//
+// **A repeating timer nobody cancels never runs out**, exactly as it does not under the interpreter
+// — where a `setInterval` keeps libuv's loop alive and `slate test` waits for it. The difference is
+// that a bound here can say so, where a hang says nothing.
+private const TickLimit: usize = 1_000_000
+
 // What each test did, read back out of the engine.
 private verdicts_of(code: string) -> Result[Buf[TestRan], quickjs.Error]
     val r = quickjs.realm()?
@@ -58,6 +65,11 @@ private verdicts_of(code: string) -> Result[Buf[TestRan], quickjs.Error]
     // **A realm of its own for each file**, which is `reset_heap` and the rest of `prepare`'s
     // clearing said in one line -- a program's globals, its module scopes and its registry all go
     // when the realm does, so nothing one file did can be seen by the next.
+    //
+    // **The timers go in FIRST, and that ordering is the whole of why they work.** `js_rt.sysl`
+    // reads `globalThis.setTimeout` once, as the prelude loads, and keeps whatever it found -- so a
+    // definition arriving afterwards is one nothing will ever look at.
+    r.eval(engine_timers(), "slate-timers.js")?
     r.eval(code, "slate.js")?
 
     // **THE DRAIN IS WHAT RUNS THE TESTS.** `$runTests` is `async` because a slate test may be, and
@@ -65,6 +77,7 @@ private verdicts_of(code: string) -> Result[Buf[TestRan], quickjs.Error]
     // pending promise and nothing in it has happened yet. An embedding that never drains reports
     // every file as having no tests.
     r.jobs()?
+    run_timers(r)?
 
     val results = r.global().get("$slateResults")?
 
@@ -85,3 +98,105 @@ private verdicts_of(code: string) -> Result[Buf[TestRan], quickjs.Error]
 
     Ok(out)
 end verdicts_of
+
+// Fire every timer the program set, oldest due first, draining the job queue after each.
+//
+// **A timer is a MACROTASK and a promise's continuation is a microtask, and the order between them
+// is what a program can see.** So this is one timer and then the whole job queue, never a batch of
+// timers followed by their continuations -- which is the ordering mistake every event loop written
+// in a hurry makes, and the one `drain_events` documents on the interpreter's side.
+private run_timers(r: &quickjs.Realm) -> Result[unit, quickjs.Error]
+    val tick = r.global().get("$slateTick")?
+    var fired: usize = 0
+
+    loop
+        if !tick.call([])?.truth()? then break
+
+        r.jobs()?
+
+        fired += 1
+
+        if fired >= TickLimit
+            return Err(quickjs.Error(s"this program was still setting timers after ${TickLimit} of them, which means one of them sets another", ""))
+
+    Ok(())
+end run_timers
+
+// The timers an embedded realm does not have.
+//
+// **`js_rt.sysl` says an embedder with a loop of its own puts one here, and this is that embedder.**
+// node and a browser have all four as globals and quickjs keeps its two on the `os` MODULE -- which
+// an embedded realm has no way to reach -- so a slate program under this harness could not `sleep`,
+// could not `setTimeout`, and therefore could not be an asynchronous program at all. That was 42 of
+// the 51 failures the first run of `slate-language/pg` and `slate-language/lath` produced, and not
+// one of them was the two back ends disagreeing.
+//
+// **The clock is VIRTUAL, and that is better than a real one rather than cheaper.** `now` moves to
+// whatever the next timer was waiting for, so `await sleep(50)` costs nothing and a suite of them
+// costs nothing; and the order timers fire in is decided by their due time and their age rather
+// than by how loaded the machine was, so a test cannot pass on one run and fail on the next.
+// `Date.now()` is left alone, being the wall clock rather than the loop's.
+private engine_timers() -> string = raw"""
+    // Timers for an embedded realm, driven by whoever is embedding it.
+    (() => {
+        const due = []
+        let next = 1
+        let now = 0
+
+        const add = (fn, delay, every) => {
+            if (typeof fn !== "function") return 0
+
+            const wait = Number(delay)
+            const at = now + (Number.isFinite(wait) && wait > 0 ? wait : 0)
+            const id = next++
+
+            // **`every` is at least 1 so that a repeating timer of no delay still ADVANCES.** A zero
+            // there would leave `at` where it is, and this loop would fire it forever having moved
+            // the clock nowhere -- a hang rather than the bound the driver is able to report.
+            due.push({ id: id, at: at, fn: fn, every: every ? Math.max(wait > 0 ? wait : 0, 1) : 0 })
+
+            return id
+        }
+
+        globalThis.setTimeout = (fn, delay) => add(fn, delay, false)
+        globalThis.setInterval = (fn, delay) => add(fn, delay, true)
+
+        globalThis.clearTimeout = (id) => {
+            for (let i = 0; i < due.length; i++)
+                if (due[i].id === id) { due.splice(i, 1); return }
+        }
+
+        globalThis.clearInterval = globalThis.clearTimeout
+
+        // The earliest timer that is due, run. Answers whether there was one.
+        //
+        // **Ties go to the older timer**, which is what every loop promises and what a program
+        // setting two timers of the same delay is relying on. The id counts up, so it is the age.
+        globalThis.$slateTick = () => {
+            // **Nothing fires once the runner has finished.** A failed test may leave a watchdog
+            // armed, and firing it afterwards runs a throw nobody is waiting for.
+            if (globalThis.$slateDone) return false
+
+            if (due.length === 0) return false
+
+            let best = 0
+
+            for (let i = 1; i < due.length; i++)
+                if (due[i].at < due[best].at || (due[i].at === due[best].at && due[i].id < due[best].id))
+                    best = i
+
+            const t = due[best]
+
+            now = t.at
+
+            // **Rescheduled BEFORE it runs**, so that a repeating callback which cancels itself is
+            // cancelling the entry this loop will look at next rather than one already taken out.
+            if (t.every > 0) t.at = now + t.every
+            else due.splice(best, 1)
+
+            t.fn()
+
+            return true
+        }
+    })()
+    """

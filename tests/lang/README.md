@@ -24,9 +24,14 @@ manifests — stays in sysl, where it can reach the compiler's own structures.
 ## What may not be used here
 
 The suite runs inside an embedded JavaScript engine as well as in the interpreter, and an embedded
-realm has **no file system, no environment, no command line, no way to stop the program and no
-timers**. So a test here may not read a file, call `sleep`, ask for the time, or reach the network.
-A promise made by `resolve` and awaited is fine — the job queue drives it.
+realm has **no file system, no environment, no command line and no way to stop the program**. So a
+test here may not read a file, ask for the time, or reach the network.
+
+**Timers work**, because `slate test --js` supplies them: the harness installs `setTimeout` and its
+three companions into the realm before the program loads, and drives them from a **virtual clock**.
+So `await sleep(50)` costs nothing, a suite of them costs nothing, and which timer runs first is
+decided by its delay and its age rather than by how loaded the machine was. A promise from `resolve`
+is fine too — the job queue drives it, and a continuation still runs before the next timer.
 
 That bound is real and worth keeping: it is what makes the suite a statement about the language
 rather than about a host.
