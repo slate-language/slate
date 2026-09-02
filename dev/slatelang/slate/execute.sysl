@@ -107,6 +107,113 @@ private enum Called
     // An ordinary slate function: the chunk to run and the scope to run it in.
     Enter(chunk: usize, scope: *EnvObj)
 
+// A call's arguments in the order the callee's PARAMETERS are written.
+//
+// **Which parameter `b: 1` fills is a question about the callee, and the callee is a value.** So
+// nothing about a named argument can be settled while compiling: the names travel in the
+// instruction, the values arrive in the order they were written, and this puts the two together
+// against the parameters the function turned out to have.
+//
+// **A skipped parameter is left as `Undefined`, which is what a HOLE is.** `f(a, b = 1, c = 2)`
+// called `f(1, c: 5)` gives nothing for `b`, and `bind_arguments` leaves an `Undefined` slot unbound
+// so the chunk's own head works the default out -- the same path a call that simply stopped early
+// takes. A program cannot pass `undefined` itself, `keepable` having refused it at the call, so the
+// marker cannot collide with a value anybody meant.
+//
+// **`offset` is the receiver**, which is parameter zero of a method reached through a proto and is
+// already in `given` when this is called. The names cover the WRITTEN arguments only.
+private arrange_named(u: *Unit, callee: Value, given: Buf[Value], names: Buf[string], offset: usize, at: Span) -> Result[Buf[Value], Signal]
+    callee match
+        Fn(c) ->
+            val chunk = u.chunks.at(c.body)
+
+            // **A gathering function is refused rather than guessed at.** `f(a, ...rest)` has no
+            // answer to "which parameter is this one" for anything past `a`: the rest parameter is
+            // not a slot a name can pick out, it is everything left over. Naming an argument to one
+            // is a mistake about what the function takes, and saying so is better than a rule about
+            // where the surplus goes that nobody could predict.
+            if chunk.variadic
+                return Err(failure(at, s"`${chunk.name}` gathers what it is given with `...`, so an argument to it cannot be named"))
+
+            var out: Buf[Value] = buf()
+            var filled: Buf[bool] = buf()
+
+            for i in 0..<c.params.len()
+                out.push(Value.Undefined)
+                filled.push(false)
+
+            var next: usize = 0
+
+            for i in 0..<given.len()
+                val name = if i < offset then "" else names.at(i - offset)
+
+                if name == ""
+                    if next >= c.params.len()
+                        return Err(failure(at, arity_complaint(chunk.required, c.params.len(), given.len(), false)))
+
+                    out.set(next, given.at(i))
+                    filled.set(next, true)
+                    next += 1
+                else
+                    var slot = c.params.len()
+
+                    for j in 0..<c.params.len()
+                        if c.params.at(j) == name then slot = j
+
+                    if slot == c.params.len()
+                        return Err(failure(at, s"`${chunk.name}` has no parameter called `${name}` -- it takes ${param_list(c.params)}"))
+
+                    // **Positionally as well as by name counts as twice.** `f(1, a: 2)` fills the
+                    // first slot from both directions, and silently letting the later one win would
+                    // make the argument that was written first do nothing.
+                    if filled.at(slot)
+                        return Err(failure(at, s"this call gives `${name}` twice"))
+
+                    out.set(slot, given.at(i))
+                    filled.set(slot, true)
+
+            for i in 0..<chunk.required
+                if !filled.at(i)
+                    return Err(failure(at, s"this call gives nothing for `${c.params.at(i)}`, which has no default"))
+
+            // **The trailing holes come off**, so that what reaches the ordinary arity check is the
+            // count a positional call giving the same things would have given.
+            var n = out.len()
+
+            loop
+                if n == 0 then break
+                if filled.at(n - 1) then break
+
+                n -= 1
+
+            out.truncate(n)
+            Ok(out)
+        // A class and a data variant are made through `new`, so naming an argument to one names a
+        // parameter of that -- which is where the field names are written.
+        Object(_) -> hook_of(callee, "new") match
+            Some(maker) -> arrange_named(u, maker, given, names, offset, at)
+            None -> Err(failure(at, no_maker()))
+        // **A builtin has no parameter names to match against.** Its arguments are a `Buf[Value]`
+        // and the names it is documented under are in prose, so there is nothing here to look up.
+        Native(_) -> Err(failure(at, "this is a builtin, and a builtin's parameters have no names an argument can pick out"))
+        // Anything else is not callable at all, which `invoke` says better than this could.
+        _ -> Ok(given)
+end arrange_named
+
+// The parameters a function takes, as a sentence naming them.
+private param_list(params: Buf[string]) -> string
+    if params.is_empty() then return "none"
+
+    var out = str_builder()
+
+    for i in 0..<params.len()
+        if i > 0 then out.push(if i == params.len() - 1 then " and " else ", ")
+
+        out.push(s"`${params.at(i)}`")
+
+    out.finish()
+end param_list
+
 private invoke(u: *Unit, callee: Value, args: Buf[Value], at: Span, depth: usize) -> Result[Called, Signal]
     callee match
         Native(f) -> Ok(Answered(call_native(f, args, at)?))
@@ -680,16 +787,20 @@ private run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usi
                 // idea which statement it was serving.
                 if heap_exhausted then return fault(at, "this program has run out of memory")
 
-            CallFn(argc) ->
-                var args: Buf[Value] = buf()
+            CallFn(argc, names) ->
+                var written: Buf[Value] = buf()
 
                 for i in 0..<argc
                     keepable(peek(argc - 1 - i), at, "passed to a function")?
-                    args.push(peek(argc - 1 - i))
+                    written.push(peek(argc - 1 - i))
 
                 val callee = peek(argc)
 
                 vm.stack.truncate(vm.stack.len() - argc - 1)
+
+                // **Zero means every argument was positional**, which is nearly every call, and the
+                // whole of what it costs one is this comparison.
+                val args = if names == 0 then written else arrange_named(u, callee, written, u.arg_names.at(names), 0, at)?
 
                 invoke(u, callee, args, at, vm.frames.len())? match
                     Answered(v) -> vm.stack.push(v)
@@ -759,7 +870,7 @@ private run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usi
             // time a `GetField` has handed a function to a `CallFn`, the fact that decides whether
             // an object is passed -- was it the object's own, or a shared one reached through a
             // proto -- has been thrown away.
-            CallMethod(k, argc) ->
+            CallMethod(k, argc, names) ->
                 val name = u.strings.at(k)
                 val target = peek(argc)
 
@@ -796,7 +907,11 @@ private run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usi
                 if is_absent(found.0)
                     return fault(at, s"`${name}` is not a field of this object, so there is nothing to call")
 
-                invoke(u, found.0, args, at, vm.frames.len())? match
+                // **The receiver is parameter zero and is already in the list**, so the names cover
+                // what was written and the arrangement is told how many slots are spoken for.
+                val placed = if names == 0 then args else arrange_named(u, found.0, args, u.arg_names.at(names), if found.1 then 1 else 0, at)?
+
+                invoke(u, found.0, placed, at, vm.frames.len())? match
                     Answered(v) -> vm.stack.push(v)
                     Enter(body, called) ->
                         vm.frames.push(Frame(chunk_ix, pc, vm.scope, base, vm.handlers.len()))
