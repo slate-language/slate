@@ -476,10 +476,18 @@ js_runtime_host() -> string = raw"""
         // names are the runtime's own and never become globals, and the emitter writes `$.$test`.
         $.$test = (name, fn) => { REGISTERED.push([name, fn]) }
 
-        // **`async`, because a slate test may be**, and reading the answer without awaiting would
-        // call every asynchronous test a pass whatever it did -- which is the mistake
-        // `run_one_test` documents on the other side.
-        $.$runTests = async (path) => {
+        // Every file of a suite, in ONE process, reported in the words `slate test` uses.
+        //
+        // **ONE runner for the whole suite is what makes running these under node affordable.** node
+        // costs about twenty-three milliseconds to start, so a process per file made a ten-file suite
+        // eight times slower than the work in it -- and the same suite is twenty times faster than an
+        // embedded interpreter once it IS running. Scala Native's test framework is arranged the same
+        // way and for the same reason: one binary, every test.
+        //
+        // Each entry is a path and a function that EVALUATES that file's program, which is what
+        // registers its tests. Running them is this function's job rather than the program's, so that
+        // one report covers the suite and one status leaves it.
+        $.$suite = async (files) => {
             let passed = 0
             let failed = 0
 
@@ -492,85 +500,72 @@ js_runtime_host() -> string = raw"""
 
             const said = []
 
-            // **What an EMBEDDER reads, and it is the verdicts rather than the report.** slate links
-            // a JavaScript engine and runs this file inside it, so that `slate test --js` gates the
-            // other back end with no `node` anywhere -- and what it wants back is what each test
-            // did, so that it can say it in the words `slate test` already uses. A host that cannot
-            // stop the program has no exit status to read either, which is the other half of why the
-            // answer has to be left somewhere rather than signalled.
-            //
-            // **On `globalThis` because that is what an embedder can reach.** The runtime itself is a
-            // top-level `const $`, which lives in the global LEXICAL scope and is not a property of
-            // anything.
-            const verdicts = []
-
-            globalThis.$slateResults = verdicts
-
-            for (const [name, fn] of REGISTERED) {
-                const began = Date.now()
-                const from = $.host.lines.length
-                let complaint = null
+            for (const [path, load] of files) {
+                // **The registry is emptied per FILE**, which is `compile_module`'s `is_entry` rule
+                // said at run time: a test file imports the module it tests, and a registry carried
+                // across files would run an imported file's tests once per importer.
+                REGISTERED.length = 0
 
                 try {
-                    const answered = fn()
-
-                    if (answered instanceof Promise) await answered
+                    load()
                 } catch (e) {
-                    // **`caught` is what a `catch` in a slate program would have been given**, so a
-                    // `throw` of a value, a fault raised by the machine and a JavaScript error from
-                    // inside the runtime all reach here as one shape -- which is `run_one_test`
-                    // reading its `Err` on the other side.
-                    complaint = $.caught(e).getName("message")
+                    // **A file whose top level faults is reported as the FILE failing**, not as every
+                    // test in it failing for one reason -- `run_tests` draws the same line, and its
+                    // reason is that such a file has no working tests to speak of.
+                    failed += 1
+                    said.push("  FAIL  " + path)
+
+                    for (const line of $.caught(e).getName("message").split("\n"))
+                        said.push("        " + line)
+
+                    continue
                 }
 
-                const ms = Date.now() - began
-                const printed = $.host.lines.slice(from)
+                for (const [name, fn] of REGISTERED) {
+                    const began = Date.now()
+                    const from = $.host.lines.length
+                    let complaint = null
 
-                verdicts.push({
-                    name: name,
-                    ok: complaint === null,
-                    said: complaint === null ? "" : complaint,
-                    printed: printed.join("\n"),
-                    ms: ms
-                })
+                    try {
+                        const answered = fn()
 
-                if (complaint === null) {
-                    passed += 1
-                    said.push("  ok    " + path + " :: " + name + "   " + ms + "ms")
-                } else {
-                    failed += 1
-                    said.push("  FAIL  " + path + " :: " + name + "   " + ms + "ms")
+                        if (answered instanceof Promise) await answered
+                    } catch (e) {
+                        // **`caught` is what a `catch` in a slate program would have been given**, so
+                        // a `throw` of a value, a fault raised by the machine and a JavaScript error
+                        // from inside the runtime all reach here as one shape -- which is
+                        // `run_one_test` reading its `Err` on the other side.
+                        complaint = $.caught(e).getName("message")
+                    }
 
-                    for (const line of printed) said.push("        " + line)
+                    const ms = Date.now() - began
+                    const printed = $.host.lines.slice(from)
 
-                    for (const line of complaint.split("\n")) said.push("        " + line)
+                    // **Cut back rather than left to grow**, or a long suite holds every line every
+                    // one of its tests ever printed.
+                    $.host.lines.length = from
+
+                    if (complaint === null) {
+                        passed += 1
+                        said.push("  ok    " + path + " :: " + name + "   " + ms + "ms")
+                    } else {
+                        failed += 1
+                        said.push("  FAIL  " + path + " :: " + name + "   " + ms + "ms")
+
+                        for (const line of printed) said.push("        " + line)
+
+                        for (const line of complaint.split("\n")) said.push("        " + line)
+                    }
                 }
             }
 
             $.host.echo = echoed
             $.host.lines.length = 0
 
-            // **Finding nothing to run is a FAILURE**, which is `test_command`'s rule and is there
-            // because the usual cause is a path that is wrong -- a green step that tested nothing is
-            // the worst outcome available to it.
-            if (REGISTERED.length === 0) {
-                $.host.write("slate: no tests in " + path)
-
-                if ($.host.exit !== null) $.host.exit(1)
-
-                return
-            }
-
-            // **The runner is FINISHED, and an embedder has to be told so.** A test that failed
-            // may have left a watchdog timer armed, and an embedder that goes on firing timers
-            // afterwards runs a throw nobody is waiting for — which took a whole file's verdicts
-            // with it, turning twenty-one honest failures into one unreadable one. The interpreter
-            // does not do that either: `slate test` moves to the next file when the last verdict
-            // is in.
-            globalThis.$slateDone = true
-
             for (const line of said) $.host.write(line)
 
+            // **The counts and the status are `test_command`'s, word for word and number for
+            // number** -- a file that would not load counts as one failure there too.
             $.host.write("")
             $.host.write(failed === 0 ? passed + " passed" : passed + " passed, " + failed + " failed")
 

@@ -89,12 +89,9 @@ slate --version                 which slate this is
 From a clone, with no `slate` on the path yet:
 
 ```
-sysl test . --include-path quickjs=/opt/homebrew/include --link-path /opt/homebrew/lib
-sysl run . --include-path quickjs=/opt/homebrew/include --link-path /opt/homebrew/lib -- examples/tour.sl
+sysl test .
+sysl run . -- examples/tour.sl
 ```
-
-The two flags say where quickjs-ng is — `brew install quickjs-ng` — and they are needed because slate
-links a JavaScript engine so that `slate test --js` can run a suite without a `node` anywhere.
 
 ## Writing a script
 
@@ -1328,19 +1325,21 @@ $ slate test --js .
 5 passed
 ```
 
-`slate test --js` compiles each file with `slate js` and runs it in a JavaScript engine **linked into
-slate**, reporting in the same words. Nothing has to be installed and no `node` is involved: a test is
-written about the language rather than about an implementation of it, so the same file is the check
-that the two back ends have not drifted apart.
+`slate test --js` compiles the whole directory into **one** JavaScript program and runs it under
+**node**, reporting in the same words. A test is written about the language rather than about an
+implementation of it, so the same file is the check that the two back ends have not drifted apart.
+
+One program and one process is what makes that cheap: node costs about twenty-three milliseconds to
+start, so a process per file would be most of what a suite of small files costs at all.
 
 That is worth more than it sounds. slate's own compiler is tested in sysl, driving the interpreter in
 the same process — so however many of those tests are green, they say nothing whatever about
 `slate js`. A suite you can put to both is the only thing that can notice a builtin answering
 differently, and several have.
 
-**A test run this way cannot touch a host.** An embedded engine has no file system, no environment,
-no command line, no way to stop the program and no timers, and a test that reaches for one is told
-so. A promise made with `resolve` and awaited is fine.
+**What a test run this way cannot use is what the JavaScript back end has not built** — `slate:net`,
+`slate:crypto` and `slate:time` among them. A program reaching one of those is told so rather than
+failing as an undefined name.
 
 ## What it leans on
 

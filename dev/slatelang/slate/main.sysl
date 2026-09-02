@@ -1,9 +1,11 @@
 module dev.slatelang.slate
 
+import sh.sysl.libuv.{mkdtemp_sync}
 import sh.sysl.parsing.{Source, source, source_of}
 import sysl.buf.{Buf, buf}
-import sysl.fs.{entries, is_dir, read_bytes, write_text}
-import sysl.text.{from_utf8_unchecked, str_builder}
+import sysl.fs.{entries, is_dir, read_bytes, remove_dir_all, write_text}
+import sysl.process.{capture}
+import sysl.text.{from_utf8_unchecked, str_builder, Search}
 
 // Running a slate program, and running its tests.
 //
@@ -31,7 +33,7 @@ val Misused: int = 2
 // release checklist and by the test below that reads the manifest and compares. That test is the
 // mechanism: a version bumped in one place and not the other fails the suite rather than shipping a
 // binary that misreports itself.
-const SlateVersion: string = "0.0.13"
+const SlateVersion: string = "0.0.14"
 
 main(args: []string)
     val code = run_cli(args, line -> print(line))
@@ -475,10 +477,10 @@ end vendor_command
 // module it tests from running that module's tests a second time. Only the file being pointed at
 // registers its tests; an imported one contributes its code and none of its verdicts.
 //
-// **`--js` runs the same suite through the OTHER back end**, in the JavaScript engine slate is
-// linked to. A `@test` is written about the language rather than about an implementation of it, so
-// the two runs are the same file judged twice -- and a package's own suite is then what notices the
-// back ends drifting apart, which nothing in the compiler's tests can do.
+// **`--js` runs the same suite through the OTHER back end**, under node. A `@test` is written about
+// the language rather than about an implementation of it, so the two runs are the same file judged
+// twice -- and a package's own suite is then what notices the back ends drifting apart, which
+// nothing in the compiler's tests can do.
 private test_command(args: []string, say: string -> unit) -> int
     // **The flag comes before the path**, so that `slate test --js` on its own still means the
     // directory it is standing in.
@@ -499,6 +501,8 @@ private test_command(args: []string, say: string -> unit) -> int
         return Failed
     end if
 
+    if js then return js_test_command(files, say)
+
     var passed: usize = 0
     var failed: usize = 0
     var unloadable: usize = 0
@@ -513,7 +517,7 @@ private test_command(args: []string, say: string -> unit) -> int
                 say(s"        cannot read it: ${e}")
             Ok(bytes) ->
                 val src = source(path, bytes)
-                val t = if js then run_tests_js(src) else run_tests(src)
+                val t = run_tests(src)
 
                 if t.report != ""
                     unloadable += 1
@@ -536,6 +540,122 @@ private test_command(args: []string, say: string -> unit) -> int
 
     Failed
 end test_command
+
+// -- slate test --js -------------------------------------------------------------------------------
+
+// Every file's `@test` functions compiled into ONE JavaScript program and run by ONE node.
+//
+// **The engine is node, and it is a subprocess rather than something slate is linked to.** slate
+// carried an embedded quickjs for a day and it was the wrong host twice over: quickjs has no `Intl`
+// at all, so `toLocaleString` with a zone SILENTLY IGNORES it -- a `slate:time` built on it would
+// answer Toronto for Tokyo rather than refusing -- and it costs a linked library, a Homebrew
+// dependency and two flags on every `sysl` command in this repo. node is where slate programs
+// actually run, which is the host worth testing on.
+//
+// **ONE program and ONE process, which is what makes that affordable.** node costs about
+// twenty-three milliseconds to start; a process per file made this ten-file suite take 0.45s where
+// the whole of it needs 0.06s. It is Scala Native's arrangement -- one binary, every test -- and
+// once it is running node is some twenty times faster than the embedded engine was.
+private js_test_command(files: Buf[string], say: string -> unit) -> int
+    var entries: Buf[string] = buf()
+    var refused: usize = 0
+
+    for i in 0..<files.len()
+        val path = files.at(i)
+
+        read_bytes(path) match
+            Err(e) ->
+                refused += 1
+                say(s"  FAIL  ${path}")
+                say(s"        cannot read it: ${e}")
+            Ok(bytes) ->
+                // **A file that will not compile is reported HERE and left out of the program**, so
+                // that one bad file does not stop every other file's tests from running. That is
+                // what the interpreter does too -- a file that would not load is one failure and the
+                // walk carries on.
+                val src = source(path, bytes)
+                val (loaded, said) = loaded_and_checked(src)
+
+                if said != ""
+                    refused += 1
+                    say(s"  FAIL  ${path}")
+                    indented(said, say)
+                else
+                    val made = program_body(loaded, true)
+
+                    if !made.ok()
+                        refused += 1
+                        say(s"  FAIL  ${path}")
+                        indented(rendered_against(loaded, made.report, made.srcs), say)
+                    else
+                        entries.push(one_entry(path, made.code))
+
+    if entries.len() == 0
+        say("")
+        say(s"0 passed, ${refused} failed")
+
+        return Failed
+    end if
+
+    val ran = node_ran(js_suite(entries), say)
+
+    // **The two counts are added rather than one being made to carry both.** node reports what it
+    // ran and this reports what never reached it, so a suite with a file that would not compile says
+    // so above node's own report and fails whatever node answered.
+    if refused > 0
+        say(s"${refused} more failed before node was asked")
+
+        return Failed
+    end if
+
+    ran
+end js_test_command
+
+// The program written where node can read it, run, and its report said as this program's own.
+//
+// **A file rather than a pipe**, because `sysl.process.capture` has no standard input to write to --
+// its third parameter is the working directory. The directory is removed on the way out, and named
+// rather than removed where node could not be started at all, which is the one failure worth being
+// able to look at.
+private node_ran(program: string, say: string -> unit) -> int
+    val dir = mkdtemp_sync("/tmp/slate-js-XXXXXX") match
+        Ok(d) -> d
+        Err(e) ->
+            say(s"slate: nowhere to write the test program: ${e}")
+
+            return Failed
+
+    val path = s"${dir}/suite.js"
+
+    write_text(path, program) match
+        Err(e) ->
+            say(s"slate: cannot write ${path}: ${e}")
+
+            return Failed
+        Ok(_) -> ()
+
+    val outcome = capture("node", [path], "", [], true) match
+        Err(e) ->
+            // **The absence of node is a failure with a sentence and not a skip.** A test step that
+            // is green having run nothing is the worst outcome available to it, and the program is
+            // left where a person can run it themselves.
+            say(s"slate: node could not be started: ${e}")
+            say(s"       `slate test --js` needs node on PATH; the program is at ${path}")
+
+            return Failed
+        Ok(o) ->
+            say_lines(o.text.trim_end(), "", say)
+
+            val errs = o.err.unwrap_or("").trim()
+
+            if errs != "" then say_lines(errs, "", say)
+
+            if o.status.ok() then Fine else Failed
+
+    remove_dir_all(dir)
+
+    outcome
+end node_ran
 
 // One file's verdicts, with the file named only where it has something to say.
 private say_results(path: string, t: Tested, say: string -> unit)
