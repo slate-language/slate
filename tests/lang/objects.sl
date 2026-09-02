@@ -136,3 +136,27 @@ equality_is_content_based_for_a_plain_object() =
 an_object_prints_its_contents() =
     assertEq(string({ a: 1, b: "x" }), "{a: 1, b: \"x\"}")
     assertEq(string({}), "{}")
+
+@test
+a_table_keyed_by_something_other_than_a_string_PRINTS() =
+    var t = {}
+
+    t[{ v: 1 }] = "object key"
+    t[[1, 2]] = "array key"
+    t[1] = "one"
+
+    // **Storing and reading back was never the problem, and printing was.** The suite already
+    // checked that any value is a key, so the JavaScript back end looked right -- its `SObj` hashes
+    // a key through `hashValue` and compares it with `eq`, both of which take anything. Its PRINTER
+    // assumed a string, so `print(t)` died inside the escaper with node's own `s is not iterable`
+    // and no line of slate anywhere in it. Nothing here had ever printed one.
+    assertEq(string(t), "{{v: 1}: \"object key\", [1, 2]: \"array key\", 1: \"one\"}")
+
+@test
+a_key_that_is_not_a_plain_name_is_quoted_where_a_name_is_bare() =
+    var t = {}
+
+    t["a b"] = 1
+    t["ok"] = 2
+
+    assertEq(string(t), "{\"a b\": 1, ok: 2}")
