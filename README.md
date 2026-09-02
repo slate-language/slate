@@ -81,15 +81,20 @@ which is a clone and one command, given [sysl](https://sysl.sh) installed.
 slate hello.sl                  run a program
 slate hello.sl one two three    ... and give it arguments
 slate test .                    run every `@test` in a file or a directory
+slate test --js .               ... in the JavaScript engine instead
 slate js hello.sl -o hello.js   the same program, as JavaScript
+slate --version                 which slate this is
 ```
 
 From a clone, with no `slate` on the path yet:
 
 ```
-sysl test .
-sysl run . -- examples/tour.sl
+sysl test . --include-path quickjs=/opt/homebrew/include --link-path /opt/homebrew/lib
+sysl run . --include-path quickjs=/opt/homebrew/include --link-path /opt/homebrew/lib -- examples/tour.sl
 ```
+
+The two flags say where quickjs-ng is — `brew install quickjs-ng` — and they are needed because slate
+links a JavaScript engine so that `slate test --js` can run a suite without a `node` anywhere.
 
 ## Writing a script
 
@@ -1313,6 +1318,29 @@ that read the answer straight away would call every asynchronous test a pass wha
 
 **Running a file plainly calls none of its tests**, so `@test` costs a program that is not being
 tested one closure and nothing else.
+
+### The same suite, in JavaScript
+
+```
+$ slate test --js .
+  ok    examples/testing.sl :: clamp_lifts_a_small_number_to_the_floor   0ms
+
+5 passed
+```
+
+`slate test --js` compiles each file with `slate js` and runs it in a JavaScript engine **linked into
+slate**, reporting in the same words. Nothing has to be installed and no `node` is involved: a test is
+written about the language rather than about an implementation of it, so the same file is the check
+that the two back ends have not drifted apart.
+
+That is worth more than it sounds. slate's own compiler is tested in sysl, driving the interpreter in
+the same process — so however many of those tests are green, they say nothing whatever about
+`slate js`. A suite you can put to both is the only thing that can notice a builtin answering
+differently, and several have.
+
+**A test run this way cannot touch a host.** An embedded engine has no file system, no environment,
+no command line, no way to stop the program and no timers, and a test that reaches for one is told
+so. A promise made with `resolve` and awaited is fine.
 
 ## What it leans on
 

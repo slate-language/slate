@@ -1,0 +1,87 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.{Source}
+import sh.sysl.quickjs
+import sysl.buf.{Buf, buf}
+
+// Running a slate program in the JavaScript engine slate is linked to.
+//
+// **This is what makes a slate test suite gate the OTHER back end.** The compiler's own tests are
+// sysl driving the interpreter in this process, so however many of them are green they say nothing
+// whatever about `slate js` -- which is how two divergences reached a shipped release. A `@test`
+// written in slate is not about either back end, so running the same file both ways and comparing
+// the verdicts is the one check that can notice the two drifting apart.
+//
+// **The engine is embedded rather than started.** `node` would do, and the differential corpus in
+// `tests_js_run.sysl` uses it on purpose -- an engine somebody else ships is the honest reader of
+// emitted text. But a subprocess makes this something a package cannot rely on: `slate-language/pg`
+// and `slate-language/lath` are slate `@test` files already, and asking their users for node before
+// `slate test --js` works would put the back end back where it started. quickjs-ng links in, and
+// then the binary alone is enough.
+//
+// **What an embedded realm does NOT have is a console, a file system, an environment, a command
+// line, a way to stop, and timers.** `js_rt.sysl`'s host looks each of them up when the prelude
+// loads and leaves what is missing null, so nothing here has to be arranged: output accumulates in
+// `host.lines` because there is nothing to echo it to, and a test that reaches for a clock or a file
+// is told there is none. That is a real bound on what can be run this way and it is the honest one
+// -- the alternative would be a half-host that answers some of those wrongly.
+
+// Load a file, emit it, and run its `@test` functions in the engine.
+//
+// **The answer is the same `Tested` the interpreter's `run_tests` gives**, which is what lets one
+// driver print both and one comparison read them. The verdicts are the engine's; the words they are
+// said in are `say_results`', on both sides.
+run_tests_js(src: Source) -> Tested
+    val (loaded, said) = loaded_and_checked(src)
+
+    if said != "" then return Tested(said, buf())
+
+    // `true` is what puts `$.$test(name, fn)` around every `@test` in the entry file and calls
+    // `$.$runTests` once every module has been read.
+    val made = emit_program(loaded, true)
+
+    if !made.ok() then return Tested(rendered_against(loaded, made.report, made.srcs), buf())
+
+    verdicts_of(made.code) match
+        Ok(rs) -> Tested("", rs)
+
+        // **A failure here is the FILE's and not any test's**, exactly as a module body that faults
+        // is on the interpreter's side: there are no verdicts to report, so this is the same shape
+        // as a file that would not compile.
+        Err(e) -> Tested(s"the JavaScript back end could not run it:\n${e}", buf())
+end run_tests_js
+
+// What each test did, read back out of the engine.
+private verdicts_of(code: string) -> Result[Buf[TestRan], quickjs.Error]
+    val r = quickjs.realm()?
+
+    // **A realm of its own for each file**, which is `reset_heap` and the rest of `prepare`'s
+    // clearing said in one line -- a program's globals, its module scopes and its registry all go
+    // when the realm does, so nothing one file did can be seen by the next.
+    r.eval(code, "slate.js")?
+
+    // **THE DRAIN IS WHAT RUNS THE TESTS.** `$runTests` is `async` because a slate test may be, and
+    // the emitted program calls it without awaiting -- so when `eval` answers, the runner is a
+    // pending promise and nothing in it has happened yet. An embedding that never drains reports
+    // every file as having no tests.
+    r.jobs()?
+
+    val results = r.global().get("$slateResults")?
+
+    // The runner sets this before it runs anything, so an absence means it never started -- a
+    // top-level fault in the program, which `eval` would have raised, or an emitter that stopped
+    // calling it.
+    if results.is_undefined()
+        return Err(quickjs.Error("the emitted program never reached its test runner", ""))
+
+    val n = results.length()?
+    var out: Buf[TestRan] = buf()
+
+    for i in 0..<usize(n)
+        val v = results.at(u32(i))?
+
+        out.push(TestRan(v.get("name")?.text()?, v.get("ok")?.truth()?, v.get("said")?.text()?,
+            v.get("printed")?.text()?, u64(v.get("ms")?.long()?)))
+
+    Ok(out)
+end verdicts_of

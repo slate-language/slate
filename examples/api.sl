@@ -6,6 +6,7 @@
 // cookies already read.
 
 import { serve, close, router, files, parseForm, setCookie } from slate:http
+import { localPort } from slate:net
 import { writeFileSync, mkdirSync, removeSync, rmdirSync } from slate:fs
 
 // Something to serve. A real program has these on the disk already.
@@ -41,36 +42,41 @@ app.get("/assets/*rest", files("./example-public", { cacheControl: "max-age=300"
 app.notFound((req) -> { status: 404, body: "no route for " + req.method + " " + req.path })
 
 // `serve` takes the router itself, because it is an object with a `handle`.
-val server = serve(8081, app)
+//
+// **A port of `0` asks the kernel for one, and `localPort` says which it gave.** A program you run
+// yourself writes the port it wants; an example that has to work on a machine somebody else is
+// already developing on cannot, 8080 and 8081 being the two a dev server takes first.
+val server = serve(0, app)
+val site = "http://127.0.0.1:" + string(localPort(server))
 
 async main()
-    val user = await fetch("http://127.0.0.1:8081/users/42")
+    val user = await fetch(site + "/users/42")
 
     print(user.value.body)
 
-    val greeting = await fetch("http://127.0.0.1:8081/greet?name=Ada+Lovelace")
+    val greeting = await fetch(site + "/greet?name=Ada+Lovelace")
 
     print(greeting.value.body)
 
-    val made = await fetch("http://127.0.0.1:8081/signup",
+    val made = await fetch(site + "/signup",
         { method: "POST", body: "name=Ada", headers: { "Content-Type": "application/x-www-form-urlencoded" } })
 
     print(made.value.status, made.value.body)
 
-    val known = await fetch("http://127.0.0.1:8081/whoami", { headers: { Cookie: "who=Ada" } })
+    val known = await fetch(site + "/whoami", { headers: { Cookie: "who=Ada" } })
 
     print(known.value.body)
 
-    val asset = await fetch("http://127.0.0.1:8081/assets/style.css")
+    val asset = await fetch(site + "/assets/style.css")
 
     print(asset.value.status, asset.value.body)
 
     // The wrong method on a path that is there says what to send instead.
-    val wrong = await fetch("http://127.0.0.1:8081/signup")
+    val wrong = await fetch(site + "/signup")
 
     print(wrong.value.status)
 
-    val nowhere = await fetch("http://127.0.0.1:8081/nowhere")
+    val nowhere = await fetch(site + "/nowhere")
 
     print(nowhere.value.status, nowhere.value.body)
 

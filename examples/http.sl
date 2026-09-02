@@ -9,8 +9,12 @@
 // `fetch` is the half that is still native, https needing OpenSSL.
 
 import { serve, close } from slate:http
+import { localPort } from slate:net
 
-val server = serve(8080, async req ->
+// **A port of `0` asks the kernel for one, and `localPort` says which it gave.** A program you run
+// yourself writes the port it wants; an example that has to work on a machine somebody else is
+// already developing on cannot, 8080 being the first port a dev server takes.
+val server = serve(0, async req ->
     if req.path == "/"
         "try /greet?name=Ada or POST to /echo"
     elif req.path == "/greet"
@@ -24,23 +28,25 @@ val server = serve(8080, async req ->
     else
         { status: 404, body: "no such path" })
 
+val site = "http://127.0.0.1:" + string(localPort(server))
+
 // `fetch` answers a result, as everything that reaches the network here does. A 404 is a success --
 // the server answered, and what it said is the answer; an error means there was no answer at all.
 
 async main()
-    val greeting = await fetch("http://127.0.0.1:8080/greet?name=Ada")
+    val greeting = await fetch(site + "/greet?name=Ada")
 
     print(greeting.value.status, greeting.value.body)
 
-    val echoed = await fetch("http://127.0.0.1:8080/echo", { method: "POST", body: "sent from slate" })
+    val echoed = await fetch(site + "/echo", { method: "POST", body: "sent from slate" })
 
     print(echoed.value.body)
 
-    val slow = await fetch("http://127.0.0.1:8080/slow")
+    val slow = await fetch(site + "/slow")
 
     print(slow.value.body)
 
-    val missing = await fetch("http://127.0.0.1:8080/nowhere")
+    val missing = await fetch(site + "/nowhere")
 
     print(missing.ok, missing.value.status, missing.value.body)
 
