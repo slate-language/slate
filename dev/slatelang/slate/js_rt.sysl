@@ -11,16 +11,22 @@ module dev.slatelang.slate
 // of the sysl around it and still say byte for byte what it holds.
 //
 // The builtins -- `print`, `map`, `toJSON` and the rest of the names a program has without writing
-// them -- are in `js_rt_builtins.sysl`, what needs a HOST is in `js_rt_host.sysl`, and `js_runtime`
-// is what puts the three together.
+// them -- are in `js_rt_builtins.sysl`, what needs a HOST is in `js_rt_host.sysl`, the temporal
+// values are in `js_rt_time.sysl`, and `js_runtime` is what puts them together.
 
 // The whole prelude: the value model, then the functions built on it.
-// **The last two are one JavaScript block continued, not two blocks.** `js_rt_host.sysl` uses the
-// helpers `js_rt_builtins.sysl` declares and closes the `$b` IIFE it opens, so neither half is a
-// program on its own. **A raw block's value ends with a newline**, which is why one `\n` here puts a
-// blank line between them -- the blank line that stood there while they were one file. It was checked
-// by emitting the runtime before and after the split and diffing: the change moved no byte.
-js_runtime() -> string = js_runtime_core() + "\n" + js_runtime_builtins() + "\n" + js_runtime_dom() + "\n" + js_runtime_host()
+// **The blocks after the first are one JavaScript block continued, not blocks of their own.**
+// `js_rt_host.sysl` uses the helpers `js_rt_builtins.sysl` declares and closes the `$b` IIFE it
+// opens, so neither half is a program on its own. **A raw block's value ends with a newline**, which
+// is why one `\n` here puts a blank line between them -- the blank line that stood there while they
+// were one file. It was checked by emitting the runtime before and after the split and diffing: the
+// change moved no byte.
+//
+// **`js_rt_time.sysl` contributes at two levels and that is why it is two calls.** Its value model
+// stands beside this file's, at the script's own level, where the core can reach the classes by
+// name; its builtins are inside the `$b` block with every other builtin.
+js_runtime() -> string = js_runtime_core() + "\n" + js_runtime_time() + "\n" + js_runtime_builtins() +
+    "\n" + js_runtime_time_builtins() + "\n" + js_runtime_dom() + "\n" + js_runtime_host()
 
 // The value model: faults, objects, arithmetic, equality, indexing, patterns and printing.
 js_runtime_core() -> string = raw"""
@@ -113,6 +119,12 @@ js_runtime_core() -> string = raw"""
             if (typeof k === "number") return Number.isInteger(k) ? "i" + BigInt(k) : "r" + k
             if (typeof k === "boolean") return k ? "b1" : "b0"
             if (k === null) return "z"
+
+            // **Each kind is salted with its own letter**, so an instant and a duration holding the
+            // same number never collide as table keys. `hash_plain` salts for the same reason.
+            if (k instanceof SInstant) return "t" + k.us
+            if (k instanceof SDuration) return "d" + k.us
+
             if (k instanceof SRange) return "g" + k.lo + ":" + k.hi + ":" + (k.inclusive ? 1 : 0) +
                 (k.hasLo ? 1 : 0) + (k.hasHi ? 1 : 0)
 
@@ -345,6 +357,8 @@ js_runtime_core() -> string = raw"""
             if (v instanceof SObj) return "an object"
             if (v instanceof SRange) return "a range"
             if (v instanceof SShape) return "a shape"
+            if (v instanceof SInstant) return "an instant"
+            if (v instanceof SDuration) return "a duration"
             if (v instanceof Promise) return "a promise"
             if (isGen(v)) return "a generator"
             if (typeof v === "function") return "a function"
@@ -365,6 +379,13 @@ js_runtime_core() -> string = raw"""
             if (kind === "function") return typeof v === "function" && !isGen(v)
             if (kind === "generator") return isGen(v)
             if (kind === "promise") return v instanceof Promise
+
+            // **The calendar kinds -- `date`, `time`, `dateTime`, `zone`, `zoned`, `period` -- are
+            // not here and answer FALSE**, which is what a value this back end cannot make ought to
+            // do: nothing can be one, so nothing is one. They arrive with the calendar.
+            if (kind === "instant") return v instanceof SInstant
+            if (kind === "duration") return v instanceof SDuration
+
             // **A class or a data name is one too**, carrying its own shape under the hidden tag --
             // the interpreter's `is_kind` says the same, and a parameter annotated `shape` has to
             // take the names the types page calls type expressions.
@@ -566,6 +587,10 @@ js_runtime_core() -> string = raw"""
             // program see.
             if (v instanceof SShape) return "<shape " + v.name + ">"
 
+            // **ISO 8601 for an instant, and `1h 30m` for a duration** -- `js_rt_time.sysl` writes
+            // both, and `time.sysl` writes them the same way for the other back end.
+            if (v instanceof SInstant || v instanceof SDuration) return temporalText(v)
+
             if (v instanceof Promise) return "<promise>"
             if (isGen(v)) return "<generator>"
             if (typeof v === "function") return "<function>"
@@ -679,6 +704,15 @@ js_runtime_core() -> string = raw"""
                 : typeof scriptArgs !== "undefined" && Array.isArray(scriptArgs) ? scriptArgs.slice(1)
                 : [],
 
+            // A clock that only ever goes forward, in milliseconds with a fraction.
+            //
+            // **`performance.now()` and never `Date.now()` as a stand-in.** The wall clock can be
+            // set backwards, which is the whole reason `monotonic` is a builtin of its own -- so a
+            // host with no such clock leaves this null and `monotonic` says it has none, rather than
+            // quietly becoming the thing it exists not to be.
+            monotonic: typeof performance !== "undefined" && typeof performance.now === "function"
+                ? () => performance.now() : null,
+
             // Stopping with a status. A host that cannot stop leaves this null, and the builtin says
             // so rather than pretending the program ended.
             exit: typeof process !== "undefined" && typeof process.exit === "function" ? (n) => process.exit(n)
@@ -731,6 +765,14 @@ js_runtime_core() -> string = raw"""
                 }
             }
 
+            // **An instant and a duration answer for themselves**, in `js_rt_time.sysl`. They are
+            // tried here rather than folded into the arms above because what an operator means over
+            // them depends on both sides: two instants subtract to a length and an instant and a
+            // duration to a moment. `arith.sysl` puts the same call in the same place.
+            const moved = temporalArith(op, a, b)
+
+            if (moved !== undefined) return moved
+
             // **An object may answer for itself, and this is the LAST thing tried** -- so a hook can
             // never shadow what an operator already means. The interpreter's `overloaded` in
             // `arith.sysl` is the same rule and the two must not drift.
@@ -781,6 +823,12 @@ js_runtime_core() -> string = raw"""
 
             if (isNum(a) && isNum(b)) return bothInt(a, b) ? ordered(a, b) : ordered(asReal(a), asReal(b))
             if (isStr(a) && isStr(b)) return ordered(a, b)
+
+            // Two instants order as moments and two durations as lengths; a moment and a length are
+            // not ordered against each other at all.
+            const timed = temporalCompare(op, a, b)
+
+            if (timed !== undefined) return timed
 
             // **Ordering is ONE hook and not four.** `compare(self, other)` answers a number and the
             // four operators read its sign, which is `compareTo`'s shape in every language with one.
@@ -859,6 +907,12 @@ js_runtime_core() -> string = raw"""
 
                 return true
             }
+
+            // **A temporal value is equal to one of its OWN kind naming the same thing, and to
+            // nothing else** -- an instant and a duration holding one number are not equal, being
+            // answers to different questions.
+            if (a instanceof SInstant) return b instanceof SInstant && a.us === b.us
+            if (a instanceof SDuration) return b instanceof SDuration && a.us === b.us
 
             if (a instanceof SRange) {
                 if (!(b instanceof SRange)) return false
@@ -1171,7 +1225,11 @@ js_runtime_core() -> string = raw"""
 
             const m = builtinMethod(t, name)
 
-            if (m === undefined) fault(typeName(t) + " cannot `" + name + "`")
+            // **The interpreter's sentence, word for word** (`method.sysl`'s `no_method`). It said
+            // "a string cannot `push`" here and "`push` is not something a string can do" there
+            // until 0.0.25, which is one fault with two spellings -- and a program's own tests are
+            // written against whichever back end its author ran.
+            if (m === undefined) fault("`" + name + "` is not something " + typeName(t) + " can do")
 
             if (names !== undefined)
                 fault("this is a builtin, and a builtin's parameters have no names an argument can pick out")

@@ -31,10 +31,45 @@ The operators follow because the two languages disagree too often for the except
 
 ## What is not there yet
 
-**`slate:net`, `slate:time`, `slate:regex`, `slate:crypto`, `slate:password`, `slate:brotli`,
+**`slate:net`, `slate:regex`, `slate:crypto`, `slate:password`, `slate:brotli`,
 `slate:llhttp`, `slate:process`'s `run`, `fetch`, and the modules written over them.** Each is a name that
 says *"not in the JavaScript back end yet"* when a program reaches it, rather than a name that is not
 there — so a program is told which half of the world it is in.
+
+### `slate:time` is half here, and the half it is not is named
+
+**The timeline is here and the calendar is not.** An instant, a duration, the clock that reads one and
+the arithmetic over both work exactly as they do under the interpreter:
+
+```slate
+import { epochMillis, epochSeconds, seconds, minutes, hours, now } from slate:time
+
+val t = epochMillis(1756900000000)
+
+print(t)
+print(t + minutes(90), (t + hours(2)) - t)
+print(hours(1) + minutes(30), minutes(hours(1) + minutes(30)))
+print(epochSeconds(t), now() is instant)
+```
+
+```output
+2025-09-03T11:46:40Z
+2025-09-03T13:16:40Z 2h
+1h 30m 90
+1756900000 true
+```
+
+**`date`, `time`, `dateTime`, `zone`, `zoned`, `period` and everything that formats or parses one still
+say they are not here** — so `date(2026, 1, 1)`, `t.at(zone("America/Toronto"))`, `days(1)` and
+`format` all refuse under `slate js`, each with that sentence.
+
+Half-doing the calendar is what this avoids. A zone read from `Intl` and a zone read from the IANA
+database are two answers to one question, and a program that says what time a meeting is in Toronto may
+not get a different answer for having been compiled rather than interpreted.
+
+**An instant is a whole number of milliseconds from the clock on both back ends**, `Date.now()` having
+nothing finer — the interpreter drops its microseconds to match. An instant a program *builds* keeps
+every digit: `epochMicros(1000000001)` is exact wherever it runs.
 
 **`slate:dom` is the other way round**: it works only here. Under the interpreter every one of its names
 faults with a sentence naming the *command* rather than the code, because the same program is correct in a

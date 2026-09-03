@@ -35,6 +35,12 @@ utc                         // a VALUE, not a call -- the one zone that cannot f
 
 `instant`, `epochSeconds`, `epochMillis` and `epochMicros` cross to and from a count.
 
+**The clock reads whole milliseconds and an instant holds microseconds.** `now()` is a millisecond
+reading on every back end — JavaScript's has nothing finer, and a timestamp that printed six fractional
+digits in one program and three in another would be a difference nobody asked for. An instant a program
+builds is exact: `epochMicros(1000000001)` keeps its last digit, and `monotonic()`, which is what an
+elapsed time is measured with, is finer than a millisecond wherever the host clock is.
+
 **Durations** are `micros millis seconds minutes hours days weeks`; **periods** are `months years`.
 
 ```slate
