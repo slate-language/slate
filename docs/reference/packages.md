@@ -31,12 +31,30 @@ A project or a package is a directory holding a **`package.sl`**, which is a sla
     dependencies: {
         pg: { git: "github.com/slate-language/pg", version: "0.2.0" },
     },
+
+    // What this package's own tests and examples need. A consumer never resolves these.
+    devDependencies: {
+        logger: { git: "github.com/slate-language/logger", version: "0.1.0" },
+    },
 }
 ```
 
-The keys are `name`, `version`, `main`, `modules` and `dependencies`, and nothing else — an unknown one is
-named. `name` and `version` are required; a dependency takes `git` and `version`, both required. Comments
-are `//`, as everywhere else, which is most of why the format is slate's rather than JSON's.
+The keys are `name`, `version`, `main`, `modules`, `dependencies` and `devDependencies`, and nothing else —
+an unknown one is named. `name` and `version` are required; a dependency takes `git` and `version`, both
+required. Comments are `//`, as everywhere else, which is most of why the format is slate's rather than
+JSON's.
+
+**`devDependencies` differs from `dependencies` in who resolves it and in nothing else.** It is fetched,
+hashed and pinned in `slate.sum` exactly as any other dependency when it is *your* project being built —
+and a package you depend on has its own second section skipped, however deep it sits. So a package's suite
+may reach for whatever it likes without every consumer paying for it.
+
+**A package is in one section or the other**, and `slate add` refuses to put a name in both: two packages
+cannot share an import name, and one package cannot be in two places.
+
+```
+slate add --dev github.com/slate-language/logger
+```
 
 **The format is slate's own syntax because slate's value model already is the config model** — null,
 booleans, two kinds of number, strings, arrays and records, and nothing else. What decided it is not the
