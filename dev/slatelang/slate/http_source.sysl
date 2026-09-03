@@ -27,13 +27,15 @@ module dev.slatelang.slate
 // **THE TEXT IS JOINED FROM THREE BLOCKS AND IS ONE MODULE.** `slate:http` outgrew the thousand-line
 // rule at 1255 lines, before HTTP/2 and streamed responses were anywhere near it, so the block was
 // cut at two section comments the code already had: `http_write_source.sysl` takes the bounds and the
-// response writer, `http_parts_source.sysl` takes the query string, the router and the file server.
+// response writer, `http_parts_source.sysl` takes the query string, the router and the file server,
+// and `http2_source.sysl` is the HTTP/2 speaker.
 //
 // **Joining rather than importing is the whole of the decision.** Three slate modules would have made
 // the pieces public -- a `slate:httpwrite` nobody asked for -- and would have needed export lists to
 // hand the private helpers across. Concatenation changes the text not at all: what the lexer is given
 // is byte for byte what it was given before.
-http_source() -> string = http_head_source() + http_write_source() + http_parts_source()
+http_source() -> string =
+    http_head_source() + http_write_source() + http_parts_source() + http2_source()
 
 // The first piece: what a handler is given, what it may answer, and the server that calls it.
 http_head_source() -> string = raw"""
@@ -117,8 +119,13 @@ http_head_source() -> string = raw"""
     // arrives, so the memory a request costs stops depending on how big the request is. It is the same
     // server otherwise: the same keep-alive rule, the same order, the same clock.
     //
-    import { listen, onBytes, send, close as shutSocket } from slate:net
+    import { listen, onBytes, send, close as shutSocket, alpnProtocol } from slate:net
     import { stat, readBytes } from slate:fs
+
+    // **HTTP/2's framing, which this module drives and does not implement.** `slate:nghttp2` is bytes
+    // in and bytes out and knows nothing of sockets; the socket stays here, exactly as llhttp's
+    // state machine leaves it here.
+    import { h2Server, h2Receive, h2Send, h2Next, h2Respond, h2Consume, h2Goaway, h2Close } from slate:nghttp2
 
     // -- what a handler is given and what it may answer -------------------------------------------------
 
@@ -202,7 +209,42 @@ http_head_source() -> string = raw"""
         if onUpgrade != null && !(onUpgrade is function)
             throw "`serve` needs a function to call with an upgrade, and this is not one"
 
+        // **WHICH VERSION A CONNECTION IS, ASKED ONCE AND NOWHERE ELSE.** `h2` and `http/1.1` arrive
+        // on one port over one socket and differ in nothing that can be sniffed -- HTTP/2's preface
+        // is bytes a malformed HTTP/1.1 request could also begin with -- so ALPN is the answer and
+        // `alpnProtocol` is where a program reads it. A plain socket answers `null`, which is
+        // `http/1.1` by the only reading there is.
+        //
+        // **AND IT IS ASKED AT THE FIRST BYTE RATHER THAN AT ACCEPT, WHICH IS THE WHOLE OF WHY THIS
+        // FUNCTION EXISTS.** A connection callback fires when TCP accepts, which is *before* the TLS
+        // handshake has said anything -- so `alpnProtocol` there answers `null` on a connection that
+        // is about to be `h2`, and every one of them would be handed to the HTTP/1.1 speaker, which
+        // would meet the preface and answer `400`. By the time a byte of application data arrives the
+        // handshake is long finished.
+        //
+        // **The chunk that decided it is handed on rather than dropped.** It is the client's first
+        // frames or its first request line; nothing else is going to arrive carrying it.
+        //
+        // **The two speakers share the handler and nothing else.** Each frames a request and a
+        // response its own way; what a handler is given and what it may answer is the same value on
+        // both, which is the whole point of doing this here rather than making everybody write two
+        // servers.
         accept(conn)
+            chosen(chunk)
+                // A connection that closed before saying anything: there is nothing to speak and
+                // nothing to close that the socket is not closing already.
+                if chunk == null then return
+
+                if alpnProtocol(conn) == "h2"
+                    speakH2(conn, called, streaming, chunk)
+                else
+                    speak11(conn, chunk)
+
+            onBytes(conn, chosen)
+
+        // **Each speaker installs a reader of its own over this one**, which is what `onBytes` being
+        // a replacement rather than an addition is for.
+        speak11(conn, first)
             // The parser this connection's bytes go through. **Nothing is buffered here**: what a
             // request is made of is llhttp's business, and this module asks only what it has ready.
             val parser = if streaming then httpStream(HeadBytes) else httpParser(HeadBytes, BodyBytes)
@@ -660,6 +702,9 @@ http_head_source() -> string = raw"""
             // **The clock starts before the first request, not after it.** A client that opens a
             // connection and then says nothing is exactly as quiet as one that has stopped mid-stream.
             quiet()
+
+            // The bytes that chose this speaker, fed to it now that everything it needs is built.
+            arrived(first)
 
         listen(port, accept)
 

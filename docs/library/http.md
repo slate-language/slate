@@ -90,6 +90,32 @@ rather than by what the server was told — a streamed request having no `body` 
 instead. Everything else about the connection is the same server: the same keep-alive rule, the same
 order, the same clock.
 
+## HTTP/2
+
+**A server that was given a certificate and an `alpn` list speaks either version, and the handler is
+written once.** What decides is ALPN and nothing else: `h2` and `http/1.1` arrive on one port over one
+socket, and HTTP/2's own preface is bytes a malformed HTTP/1.1 request could also begin with.
+
+```slate
+serve({ port: 8443, cert: pem, key: keyPem, alpn: ["h2", "http/1.1"] }, app)
+```
+
+- **The `Request` is the same value.** `method`, `path`, `search`, `query`, `cookies`, `params` and
+  `headers` are all filled in the same way, and a reply may be a string, an object or an array of
+  bytes exactly as before — the same compression rule and the same header rules apply.
+- **`:authority` arrives as `host`**, so a handler reading `req.headers.host` need not know which
+  version it was spoken to over.
+- **`keepAlive` is always `true`** and there is no pipelining question: a connection carries many
+  streams at once and each is answered on its own.
+- **A header name goes out lowercased**, an upper-case field name being malformed in HTTP/2 rather
+  than merely unconventional. On HTTP/1.1 what you wrote is what is sent.
+- **`serveStream` hands the body over in one chunk**, because [`slate:nghttp2`](nghttp2.md) holds a
+  DATA frame's bytes rather than passing them on as they land. A handler written for it runs
+  unchanged and sees one arrival.
+
+**Without a certificate there is no ALPN and nothing changes** — `h2c`, which is HTTP/2 in the clear,
+is not spoken here. The framing layer on its own is [`slate:nghttp2`](nghttp2.md).
+
 ## `router()`
 
 **A router is an ordinary object holding functions, and `serve` asks an object for its `handle`** — so

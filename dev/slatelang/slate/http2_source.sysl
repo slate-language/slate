@@ -1,0 +1,237 @@
+module dev.slatelang.slate
+
+// `slate:http`'s fourth piece: the same server, speaking HTTP/2.
+//
+// **One module, several blocks** -- see `http_write_source.sysl` for why. This one is separate as
+// much for the reader as for the line count: HTTP/1.1 is a byte stream a state machine walks and
+// HTTP/2 is a session frames go into and events come out of, and the two have almost no vocabulary
+// in common. What they share is `shaped`, which reads a handler's answer, and the handler itself.
+http2_source() -> string = raw"""
+    // -- HTTP/2 -------------------------------------------------------------------------------------
+
+    // The same server over HTTP/2, on a connection ALPN settled as `h2`.
+    //
+    // **THIS MODULE DRIVES THE PROTOCOL AND IMPLEMENTS NONE OF IT.** `slate:nghttp2` is bytes in,
+    // bytes out and events in between; the socket stays here, which is exactly the arrangement the
+    // HTTP/1.1 half has with llhttp. Nothing below writes a frame or reads one.
+    //
+    // **What a handler is given and what it may answer is unchanged**, and that is the whole feature:
+    // a `Request` built here has the same fields one built from a `GET / HTTP/1.1` has, and the reply
+    // goes through the same `shaped` -- so the same compression rule, the same header rules and the
+    // same three body forms hold on both versions.
+    //
+    // **There is no keep-alive question and no pipelining question.** A connection carries many
+    // streams at once and each is answered on its own, so the ordering machinery the 1.1 speaker
+    // needs -- `busy`, the parser's queue, the `Connection` header -- has nothing to do here.
+    speakH2(conn, called, streaming: boolean, first)
+        // **`autoWindowUpdate: false` is not an option, it is the only working setting.** nghttp2
+        // answers `INVALID_STATE` to `h2Consume` without it, and `h2Consume` is the call that returns
+        // flow-control credit once the work is done rather than when the bytes land.
+        val session = h2Server({ autoWindowUpdate: false })
+
+        // What has arrived on each stream and is not yet a request. **Keyed by the stream number as
+        // TEXT**, an object's keys being strings.
+        var pending = {}
+
+        var shut = false
+
+        // Everything the session wants written, written. **Called after every receive and after every
+        // response**, because a session may have frames of its own to send -- settings, window
+        // updates, an acknowledgement -- that no handler asked for.
+        flush()
+            val out = h2Send(session)
+
+            if len(out) > 0 then send(conn, out)
+
+        stop()
+            if shut then return
+
+            shut = true
+
+            h2Close(session)
+            shutSocket(conn)
+
+        // What a handler answered, as a HEADERS frame and a DATA frame on the stream that asked.
+        //
+        // **A HEADER NAME GOES OUT LOWERCASED.** An upper-case field name is malformed in HTTP/2 --
+        // it is not a convention there, it is a connection error -- and a handler writing
+        // `Content-Type` is writing what HTTP/1.1 taught it. The 1.1 speaker sends what it was given.
+        //
+        // **A defect in a handler is answered and then put back**, which is the 1.1 speaker's rule
+        // and the reason is the same: the client is told, and the fault reaches the loop and stops
+        // the program as any other fault would.
+        async answer(stream: integer, req: object)
+            var reply = null
+
+            try
+                reply = await called(req)
+            catch e
+                if !shut
+                    h2Respond(session, stream, [[":status", "500"]], "this request was not answered")
+                    flush()
+
+                throw e
+
+            if shut then return
+
+            val r = shaped(req, reply)
+            var headers = [[":status", string(r.status)]]
+
+            for [k, hv] in r.headers
+                push(headers, [lower(k), hv])
+
+            h2Respond(session, stream, headers, r.text ?? r.bytes)
+            flush()
+
+        // Everything the peer did since the last read.
+        drain()
+            loop
+                val e = h2Next(session)
+
+                if e == null then break
+
+                if e.kind == "headers" && e.of == "request"
+                    pending[string(e.stream)] = { headers: e.headers, body: [] }
+                elif e.kind == "data"
+                    val key = string(e.stream)
+
+                    if has(pending, key)
+                        pending[key] = pending[key] with { body: concat(pending[key].body, e.bytes) }
+
+                    // **Credit is returned when the work is done and not when the bytes land**, which
+                    // is what a flow-control window is for: a server that acknowledged on arrival
+                    // would be telling a client to keep sending while it was still reading the last
+                    // lot. This is the call `autoWindowUpdate: false` exists for.
+                    h2Consume(session, e.stream, len(e.bytes))
+                elif e.kind == "streamEnd"
+                    val key = string(e.stream)
+
+                    if has(pending, key)
+                        val held = pending[key]
+
+                        pending = forgotten(pending, key)
+
+                        answer(e.stream, requestOfH2(held.headers, held.body, streaming))
+                elif e.kind == "goaway"
+                    stop()
+
+                    return
+
+        heard(chunk)
+            if chunk == null
+                stop()
+
+                return
+
+            // **Bytes the peer got wrong are an ANSWER and not a fault**, which is `slate:nghttp2`'s
+            // rule: a peer that speaks nonsense is a condition a server handles, and the handling is
+            // to say goodbye and hang up rather than to stop the program.
+            val bad = h2Receive(session, chunk)
+
+            if bad != null
+                h2Goaway(session, 0)
+                flush()
+                stop()
+
+                return
+
+            drain()
+
+            if !shut then flush()
+
+        onBytes(conn, heard)
+
+        // **The server's own SETTINGS go out first.** A client is entitled to them and will wait.
+        flush()
+
+        // The bytes that chose this speaker -- the client's preface and its first frames.
+        heard(first)
+
+    // The request a handler is given, out of an HTTP/2 header block and the body that followed it.
+    //
+    // **A HEADER BLOCK ARRIVES AS PAIRS AND THE OBJECT KEEPS THE LAST OF A REPEATED NAME**, which is
+    // what `query` already does with a repeated field and is the same reasoning: an array where a
+    // name repeats makes the type of `req.headers.x` depend on what a peer sent. Folding on the way
+    // OUT is what request smuggling is made of; folding on the way in, having already framed the
+    // request, is not.
+    //
+    // **`:authority` becomes `host`.** It is the same fact under HTTP/2's name, and a handler that
+    // reads `req.headers.host` should not have to know which version it is being spoken to over.
+    //
+    // **A body that is not text is the empty string**, exactly as it is on the 1.1 path, where
+    // llhttp's bytes go through the same conversion and the same `unwrap_or("")`.
+    requestOfH2(pairs: array, bytes: array, streaming: boolean) -> object
+        var method = "GET"
+        var target = "/"
+        var headers = {}
+
+        for [name, value] in pairs
+            if name == ":method"
+                method = value
+            elif name == ":path"
+                target = value
+            elif name == ":authority"
+                headers["host"] = value
+            elif !startsWith(name, ":")
+                headers[name] = value
+
+        val q = indexOf(target, "?")
+        val path = if q == null then target else target[0..<q]
+        val search = if q == null then "" else target[(q + 1)..<len(target)]
+
+        val req = { method: method,
+                    path: path,
+                    search: search,
+                    headers: headers,
+                    query: parseQuery(search),
+                    cookies: if has(headers, "cookie") then parseCookies(headers["cookie"]) else {},
+                    params: {},
+                    keepAlive: true,
+                    upgrade: false }
+
+        if streaming then return streamedH2(req, bytes)
+
+        val text = fromBytes(bytes)
+
+        req with { body: if text.ok then text.value else "" }
+
+    // A streamed request over HTTP/2, where the body is already whole.
+    //
+    // **`sh.sysl.nghttp2` HOLDS A DATA FRAME'S BYTES RATHER THAN HANDING THEM OVER AS THEY LAND**, so
+    // there is nothing here to stream yet and this delivers the body in one chunk. A handler written
+    // for `serveStream` therefore runs unchanged and sees one arrival -- which is the honest shape of
+    // what is underneath rather than an imitation of it.
+    //
+    // **It is the largest thing that binding is missing** and the reason is written down there: the
+    // deferred/resume path is unbound. When it is bound this function is what changes, and nothing a
+    // program wrote does.
+    streamedH2(req: object, bytes: array) -> object
+        var pulled = false
+
+        // `each` answers a promise for the number of bytes the body turned out to be, which is the
+        // one number an upload handler usually wants.
+        async pushed(f)
+            if len(bytes) > 0 then f(bytes)
+
+            len(bytes)
+
+        // `next` is the same bytes pulled instead of pushed, which is what `for await` drives.
+        pull()
+            if pulled || len(bytes) == 0 then return { done: true, value: null }
+
+            pulled = true
+
+            { done: false, value: bytes }
+
+        req with { each: pushed, next: pull }
+
+    // An object with one key gone. **A copy rather than a removal**, slate having no remover -- and a
+    // stream table is small, being what is in flight rather than what has been.
+    forgotten(o: object, key: string) -> object
+        var out = {}
+
+        for [k, v] in entries(o)
+            if k != key then out[k] = v
+
+        out
+    """

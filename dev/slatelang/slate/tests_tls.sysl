@@ -292,3 +292,111 @@ A_WHOLE_HTTP_2_REQUEST_TRAVELS_OVER_TLS_AND_ALPN_IS_WHAT_CHOSE_IT()
         "main()"
 
     assert_eq(net_out(prog), "negotiated h2\nanswered /things over h2")
+
+// `slate:http` ITSELF SPEAKING HTTP/2, which is the piece the three modules above were built for.
+//
+// **The handler is written once and answers over either version.** What decides is ALPN, and the
+// server asks it at the FIRST BYTE rather than at accept -- a connection callback fires when TCP
+// accepts, which is before the TLS handshake has said anything, so `alpnProtocol` there answers
+// `null` on a connection that is about to be `h2`.
+const H2Server: string = raw"""
+    import { serve, close, router } from slate:http
+    import { h2Client, h2Receive, h2Send, h2Next, h2Request, h2Close } from slate:nghttp2
+    import { readFileSync } from slate:fs
+
+    val theCert = readFileSync("tests/tls/cert.pem").value
+    val theKey = readFileSync("tests/tls/key.pem").value
+
+    val app = router()
+
+    app.get("/notes/:id", (req) -> "note " + req.params.id + " for " + req.headers.host + " x=" + req.query.x)
+    app.post("/notes", (req) -> { status: 201, headers: { "Content-Type": "application/json" }, body: req.body })
+    app.notFound((req) -> { status: 404, body: "nothing at " + req.path })
+
+    val server = serve({ port: 0, cert: theCert, key: theKey, alpn: ["h2", "http/1.1"] }, app)
+    val site = "https://localhost:" + string(localPort(server))
+    """
+
+@test
+slate_http_ANSWERS_OVER_HTTP_2_WHEN_ALPN_SAYS_SO()
+    // **The same router, the same handler, the same reply forms** -- what differs is the framing and
+    // nothing a program wrote. The `:authority` arrives as `host`, so a handler reading it does not
+    // have to know which version it was spoken to over.
+    val prog = H2Server + raw"""
+
+    async main()
+        val c = (await connect("localhost", localPort(server))).value
+        val h = h2Client()
+
+        pump()
+            val out = h2Send(h)
+
+            if len(out) > 0 then send(c, out)
+
+        var seen = 0
+        var body = ""
+        var status = ""
+
+        arrived(chunk)
+            if chunk == null then return
+
+            h2Receive(h, chunk)
+
+            loop
+                val e = h2Next(h)
+
+                if e == null then break
+
+                if e.kind == "headers" then status = e.headers[0][1]
+
+                if e.kind == "data" then body = body + fromBytes(e.bytes).value
+
+                if e.kind == "streamClose"
+                    print(status, body)
+
+                    body = ""
+                    seen = seen + 1
+
+                    if seen == 2
+                        h2Close(h)
+                        close(c)
+                        close(server)
+                        done()
+
+                        return
+
+            pump()
+
+        onBytes(c, arrived)
+
+        await startTls(c, { host: "localhost", trust: theCert, alpn: ["h2"] })
+
+        h2Request(h, { ":method": "GET", ":scheme": "https", ":authority": "localhost", ":path": "/notes/7?x=1" })
+        h2Request(h, { ":method": "POST", ":scheme": "https", ":authority": "localhost", ":path": "/notes" }, "{\"t\":1}")
+        pump()
+
+    main()
+    """
+
+    assert_eq(net_out(prog), "200 note 7 for localhost x=1\n201 {\"t\":1}")
+
+@test
+THE_SAME_LISTENER_ANSWERS_HTTP_1_1_AND_THE_ANSWER_IS_THE_SAME()
+    // **A client that offers no ALPN gets `http/1.1`**, which is `null` from `alpnProtocol` read the
+    // only way there is to read it -- and the llhttp path is untouched.
+    val prog = H2Server + raw"""
+
+    async main()
+        val r = await fetch(site + "/notes/7?x=1", { trust: theCert })
+        val gone = await fetch(site + "/nowhere", { trust: theCert })
+
+        print(r.value.status, r.value.body)
+        print(gone.value.status, gone.value.body)
+
+        close(server)
+        done()
+
+    main()
+    """
+
+    assert_eq(net_out(prog), "200 note 7 for localhost x=1\n404 nothing at /nowhere")
