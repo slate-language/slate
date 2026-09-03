@@ -17,7 +17,7 @@ val server = serve(8080, req -> "hello")
 | `files(root, options = {})` | a handler serving a directory |
 | `setCookie(name, value, options = {})` | a header value |
 | `parseQuery(s)`, `parseForm(body)`, `parseCookies(header)` | |
-| `encodeComponent(s)` | |
+| `encodeComponent(s)`, `percentDecode(s, plusIsSpace)` | |
 
 `Request`, `Response` and `Router` are exported as [types](../reference/types.md) too.
 

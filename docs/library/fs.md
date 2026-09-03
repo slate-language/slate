@@ -32,6 +32,7 @@ main()
 | `readFile(path)` | text |
 | `readBytes(path)` | an array of numbers |
 | `writeFile(path, v)` | replaces whatever was there |
+| `appendFile(path, v)` | adds to it, and makes the file where there is none |
 | `readDir(path)` | the names in it |
 | `stat(path)` | size, kind, and `mtime` as an [instant](time.md) |
 | `exists(path)` | a plain `true` or `false` — the one call with no failure case |

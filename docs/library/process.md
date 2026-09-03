@@ -12,6 +12,26 @@ print(args, env("PATH") is string, env("NO_SUCH_VARIABLE_HERE"))
 [] true null
 ```
 
+## `stderr`
+
+**`print` is the answer a program produces and `stderr` is what it says about producing it**, which is
+the division every shell already makes: `slate app.sl > answers.txt` keeps the answers in the file and
+lets the complaints through to the terminal.
+
+```slate
+import { stderr } from slate:process
+
+stderr("could not reach the database, retrying\n")
+```
+
+- **It takes as many values as `print` does** and separates them the same way, and answers nothing.
+- **The newline is yours**, as node's `process.stderr.write` leaves it: a program writing a JSON object
+  per line and one drawing a progress bar want different answers, and only one of them can be the
+  default.
+- **It writes straight to the descriptor and does not wait.** A complaint is the one thing a program may
+  need to have said before the next line runs — a crash after an `await` would lose it — so this is
+  synchronous, exactly as `print` is.
+
 ## `args` and `exit`
 
 ```slate
