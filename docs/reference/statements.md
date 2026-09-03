@@ -29,6 +29,42 @@ slate 1
 A [definition](functions.md) is a statement too, and so are `type`, `class` and `data`, each of which
 belongs to the top level of a file.
 
+### What is in scope where
+
+**A definition is HOISTED to the top of the block it is written in**, which is JavaScript's rule, so
+a name may be used above the line that defines it:
+
+```slate
+val sink = written
+
+written(r) = "wrote " + string(r)
+
+print(sink(1))
+```
+
+```output
+wrote 1
+```
+
+**A `val` or `var` initialiser stays sequential** — it may read what is above it and not what is
+below — and that is the half that matters: nothing about hoisting makes a program's data flow depend
+on where a function happens to sit.
+
+```slate
+val a = b
+val b = 1
+
+print(a)
+```
+
+```error
+`b` is not defined
+```
+
+**The definitions run where they are hoisted**, so a statement standing between two of them is not
+reordered around anything: only the binding moves, and what it binds is a function that has not been
+called yet.
+
 ## Assignment
 
 Assignment is a **statement**, never an expression, so `=` cannot appear inside an expression and

@@ -98,6 +98,36 @@ An identifier is a letter or `_` followed by letters, digits and `_`. Names are 
 **There are no abbreviations.** It is `boolean` and `function`, never `bool` and `fn`; a short form
 is refused with the long one named.
 
+**A keyword may name a FIELD**, as it may in JavaScript — after a `.`, in an object literal, in a
+`with`, and as a pattern's key. A word the grammar happens to use is not a word a program controls:
+somebody else's JSON has an `if` in it.
+
+```slate
+val o = { with: 1, if: 2, match: 3 }
+
+print(o.with, o.if, (o with { if: 9 }).if)
+
+val { if: n } = o
+
+print(n)
+```
+
+```output
+1 2 9
+2
+```
+
+**A keyword still may not name a BINDING**, so the `{ name }` shorthand has nothing to introduce
+where the key is one, and says so:
+
+```slate
+val { with } = { with: 1 }
+```
+
+```error
+is a word the grammar has taken
+```
+
 ## Literals
 
 ```slate
