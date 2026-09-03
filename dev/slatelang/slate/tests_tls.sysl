@@ -194,3 +194,101 @@ A_SERVER_UPGRADE_WITH_A_KEY_THAT_DOES_NOT_GO_WITH_THE_CERTIFICATE_SETTLES_THE_PR
 @test
 A_SERVER_UPGRADE_NEEDS_BOTH_HALVES_OF_THE_PAIR()
     assert(net_fails("val s = listen(0, print)\nstartTls(s, { cert: \"not a certificate\" })").contains("securing this needs `key`"))
+
+// -- ALPN, which is how HTTP/2 is chosen ------------------------------------------------------------
+
+// A secured listener that OFFERS protocols, and answers with the one it settled on.
+const AlpnEcho: string = "import { readFileSync } from slate:fs\n\nval theCert = readFileSync(\"tests/tls/cert.pem\").value\nval theKey = readFileSync(\"tests/tls/key.pem\").value\n\nserve(conn)\n    heard(chunk)\n        if chunk == null then return\n\n        send(conn, \"server sees \" + string(alpnProtocol(conn)))\n\n    onData(conn, heard)\n\nval server = listen({ port: 0, cert: theCert, key: theKey, alpn: [\"h2\", \"http/1.1\"] }, serve)\nval port = localPort(server)\n"
+
+@test
+A_CLIENT_OFFERS_PROTOCOLS_AND_BOTH_ENDS_READ_WHAT_WAS_AGREED()
+    // **HTTP/2 over TLS is chosen by ALPN and by nothing else** -- no upgrade handshake, no version
+    // header -- so a server that takes both versions on one port cannot tell them apart without
+    // this. The client offers, the server picks from its OWN preference order, and both ends read
+    // the answer off the connection.
+
+    assert_eq(net_out(AlpnEcho + "async main()\n    val c = (await connect(\"localhost\", port)).value\n\n    reply(chunk)\n        print(chunk)\n        print(\"client sees\", alpnProtocol(c))\n        close(c)\n        close(server)\n        done()\n\n    onData(c, reply)\n\n    val up = await startTls(c, { host: \"localhost\", trust: theCert, alpn: [\"h2\", \"http/1.1\"] })\n\n    print(up.ok)\n    await send(c, \"hello\")\n\nmain()"),
+        "true\nserver sees h2\nclient sees h2")
+
+@test
+THE_SERVERS_OWN_ORDER_DECIDES_AND_NOT_THE_CLIENTS()
+    // **The end that knows which protocol it serves well is the server**, so its list is the one
+    // that ranks. A client asking for `http/1.1` first still gets `h2` here, because the listener
+    // above named `h2` first.
+
+    assert_eq(net_out(AlpnEcho + "async main()\n    val c = (await connect(\"localhost\", port)).value\n\n    reply(chunk)\n        print(chunk)\n        close(c)\n        close(server)\n        done()\n\n    onData(c, reply)\n    await startTls(c, { host: \"localhost\", trust: theCert, alpn: [\"http/1.1\", \"h2\"] })\n    await send(c, \"hello\")\n\nmain()"),
+        "server sees h2")
+
+@test
+A_CONNECTION_THAT_NEGOTIATED_NOTHING_ANSWERS_null()
+    // **`null` is an ordinary answer and not a failure**, and it covers three cases a program meets:
+    // a plain socket, a peer that offered nothing, and a handshake that has not finished. A client
+    // that names no protocols is the middle one, and the connection is perfectly good.
+
+    assert_eq(net_out(AlpnEcho + "async main()\n    val c = (await connect(\"localhost\", port)).value\n\n    reply(chunk)\n        print(chunk)\n        close(c)\n        close(server)\n        done()\n\n    onData(c, reply)\n    await startTls(c, { host: \"localhost\", trust: theCert })\n    await send(c, \"hello\")\n\nmain()"),
+        "server sees null")
+
+    // A socket with no TLS on it at all says the same thing, rather than faulting.
+    assert_eq(net_out("serve(conn)\n    print(alpnProtocol(conn))\n    close(conn)\n    close(server)\n    done()\n\nval server = listen(0, serve)\n\nasync main()\n    val c = (await connect(\"127.0.0.1\", localPort(server))).value\n\n    await send(c, \"hi\")\n\nmain()"),
+        "null")
+
+@test
+A_WHOLE_HTTP_2_REQUEST_TRAVELS_OVER_TLS_AND_ALPN_IS_WHAT_CHOSE_IT()
+    // **The proof that the three pieces are one feature**: `slate:net` negotiates `h2`, `slate:h2`
+    // frames what goes over it, and neither knows the other exists -- a session is bytes in and bytes
+    // out, so the socket is the program's own business.
+    //
+    // **Both ends are written in slate here**, which is what makes it a round trip rather than a
+    // parse: the server reads a request off frames it was handed and answers one on the same stream.
+    val prog = "import { h2Client, h2Server, h2Receive, h2Send, h2Next, h2Request, h2Respond, h2Close } from slate:h2\nimport { readFileSync } from slate:fs\n\n" +
+        "val theCert = readFileSync(\"tests/tls/cert.pem\").value\nval theKey = readFileSync(\"tests/tls/key.pem\").value\n\n" +
+        "serve(conn)\n" +
+        "    val s = h2Server()\n\n" +
+        "    flush()\n" +
+        "        val out = h2Send(s)\n\n" +
+        "        if len(out) > 0 then send(conn, out)\n\n" +
+        "    heard(chunk)\n" +
+        "        if chunk == null then return\n\n" +
+        "        h2Receive(s, chunk)\n\n" +
+        "        loop\n" +
+        "            val e = h2Next(s)\n\n" +
+        "            if e == null then break\n\n" +
+        "            if e.kind == \"headers\" && e.of == \"request\"\n" +
+        "                var path = \"?\"\n\n" +
+        "                for h in e.headers\n" +
+        "                    if h[0] == \":path\" then path = h[1]\n\n" +
+        "                h2Respond(s, e.stream, { \":status\": \"200\" }, \"answered \" + path + \" over \" + string(alpnProtocol(conn)))\n\n" +
+        "        flush()\n\n" +
+        "    onBytes(conn, heard)\n" +
+        "    flush()\n\n" +
+        "val server = listen({ port: 0, cert: theCert, key: theKey, alpn: [\"h2\", \"http/1.1\"] }, serve)\n\n" +
+        "async main()\n" +
+        "    val c = (await connect(\"localhost\", localPort(server))).value\n" +
+        "    val h = h2Client()\n\n" +
+        "    pump()\n" +
+        "        val out = h2Send(h)\n\n" +
+        "        if len(out) > 0 then send(c, out)\n\n" +
+        "    var body = \"\"\n\n" +
+        "    arrived(chunk)\n" +
+        "        if chunk == null then return\n\n" +
+        "        h2Receive(h, chunk)\n\n" +
+        "        loop\n" +
+        "            val e = h2Next(h)\n\n" +
+        "            if e == null then break\n\n" +
+        "            if e.kind == \"data\" then body = body + fromBytes(e.bytes).value\n\n" +
+        "            if e.kind == \"streamClose\"\n" +
+        "                print(body)\n" +
+        "                h2Close(h)\n" +
+        "                close(c)\n" +
+        "                close(server)\n" +
+        "                done()\n" +
+        "                return\n\n" +
+        "        pump()\n\n" +
+        "    onBytes(c, arrived)\n\n" +
+        "    await startTls(c, { host: \"localhost\", trust: theCert, alpn: [\"h2\"] })\n\n" +
+        "    print(\"negotiated\", alpnProtocol(c))\n\n" +
+        "    h2Request(h, { \":method\": \"GET\", \":scheme\": \"https\", \":authority\": \"localhost\", \":path\": \"/things\" })\n" +
+        "    pump()\n\n" +
+        "main()"
+
+    assert_eq(net_out(prog), "negotiated h2\nanswered /things over h2")

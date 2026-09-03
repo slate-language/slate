@@ -4,8 +4,8 @@ A small indentation-structured, garbage-collected language, written in [sysl](ht
 
 Dynamically typed with a gradual checker, `async`/`await` on a real event loop, generators, modules,
 pattern matching, classes over prototypes, algebraic data types, and a package manager. It is aimed first
-at what an API server needs — HTTP over node's own llhttp, TCP, TLS, a file system, processes, regular
-expressions and JSON.
+at what an API server needs — HTTP over node's own llhttp, HTTP/2 over nghttp2, TCP, TLS, a file system,
+processes, regular expressions and JSON.
 
 **It also compiles to JavaScript**, so the same program runs under the interpreter, under node or quickjs,
 and — with `slate:dom` and [lath](https://github.com/slate-language/lath), the React-shaped framework

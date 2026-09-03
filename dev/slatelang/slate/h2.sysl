@@ -1,0 +1,718 @@
+module dev.slatelang.slate
+
+import sh.sysl.nghttp2.*
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// HTTP/2, which is nghttp2 and is not written in slate.
+//
+// **THIS IS `slate:llhttp`'s SIBLING AND IT IS PUBLIC FOR `slate:llhttp`'s REASON.** That module is
+// the state machine under `slate:http`; this is the one under whatever speaks HTTP/2 next, and the
+// same list of programs wants it -- a server that takes both versions on one port, a client that
+// keeps its connections, a proxy, a gRPC endpoint. Every one of those is an ordinary package rather
+// than a change to slate.
+//
+// **NOTHING HERE TOUCHES A SOCKET.** Bytes that arrived go in at `h2Receive`, bytes to write come
+// out of `h2Send`, and what happened in between is read off with `h2Next`. HTTP/2 is a
+// *transformation*, and how bytes reach the wire stays the program's business -- which is what lets
+// the same session run over `slate:net`, over TLS, over a pipe, or between two sessions in memory
+// with no socket at all, as this module's own tests do.
+//
+// **A session is an INTEGER, which is the arrangement every handle in slate uses.** A socket, a
+// timer, a compiled regular expression and an llhttp parser are all a number into a table on this
+// side, so no foreign object ever becomes a slate value: `==` compares what slate says it compares,
+// `print` has something to say, and the collector has nothing new to walk.
+//
+// **The vocabulary keeps its `h2` prefix**, which is `slate:llhttp`'s rule: these are the names a
+// module written over them will be spelled with, so a reader moving between the two sees one
+// vocabulary rather than two.
+//
+// ## Where the two halves of HTTP/2 live
+//
+// **HPACK is here on its own as well**, and that is not a convenience: it is the fiddly,
+// security-relevant half, identical whoever drives the frames, and a decoder that trusts its input
+// is a decompression bomb waiting for somebody to send it one. A program that has a header block
+// from somewhere else -- a capture, a test vector, a proxy's log -- can read it without a session.
+//
+// **ALPN is `slate:net`'s.** `listen({ …, alpn: ["h2", "http/1.1"] })` offers, `startTls(…, { host,
+// alpn })` offers from the other end, and `alpnProtocol(conn)` says what was agreed. HTTP/2 over TLS
+// is chosen by ALPN and by nothing else, and a server cannot answer the question any other way --
+// `h2` and `http/1.1` arrive on one port over one socket.
+
+// One live session, or one live HPACK conversation.
+//
+// **Three tables rather than three variants of one**, because nothing ever holds two of these at
+// once and a handle from one table is never handed to a call that wants another: the check is the
+// table it is looked up in.
+private var sessions: Buf[Option[&Session]] = buf()
+private var deflaters: Buf[Option[&Deflater]] = buf()
+private var inflaters: Buf[Option[&Inflater]] = buf()
+
+// Forget every session. Called when a new program is run, exactly as the socket table is.
+//
+// **A session's own memory is nghttp2's and is freed by dropping the box**, which is what clearing
+// these buffers does.
+forget_h2()
+    sessions.clear()
+    deflaters.clear()
+    inflaters.clear()
+
+// -- what a program calls -----------------------------------------------------------------------
+
+// `h2Client()` and `h2Server()` -- a session, as an integer.
+//
+// **Which end this is decides everything nghttp2 does with the bytes**: a client opens odd-numbered
+// streams and reads responses, a server answers even-numbered SETTINGS and reads requests. It cannot
+// be changed afterwards, which is why it is the constructor rather than a flag.
+//
+// **`{ autoWindowUpdate: false }` is the one option there is, and it is what `h2Consume` needs.** A
+// default session gives the peer flow-control credit the moment bytes ARRIVE, which is right for a
+// program that deals with a body as fast as it reads one; a program that queues bodies, writes them
+// to disk or hands them to something slower wants the credit returned when the work is done, and
+// that is back-pressure. Everything else nghttp2 can be told is tuning nobody has asked for.
+do_h2_client(args: Buf[Value], at: Span) -> Step = new_session(args, at, "h2Client", false)
+
+do_h2_server(args: Buf[Value], at: Span) -> Step = new_session(args, at, "h2Server", true)
+
+private new_session(args: Buf[Value], at: Span, name: string, listening: bool) -> Step
+    if args.len() > 1 then return fault(at, s"`${name}` takes an optional object of options, and was given ${counted(args.len(), "argument")}")
+
+    val automatic = if args.len() == 0 then true else auto_window_of(args.at(0), at, name)?
+
+    val how = if automatic then options() else no_auto_window_update()
+
+    val made = if listening then server_with(how) else client_with(how)
+
+    made match
+        Err(e) -> fault(at, s"`${name}` could not make a session: ${e.message}")
+        Ok(s) ->
+            sessions.push(Some(s))
+            Ok(Int(long(sessions.len() - 1)))
+end new_session
+
+// `h2Receive(session, bytes)` -- bytes off the wire, handed to the session.
+//
+// **A protocol error is an ANSWER and not a fault**, which is `httpFeed`'s rule for `httpFeed`'s
+// reason: a peer that speaks nonsense is the ordinary thing a server deals with, and a fault would
+// take the server down with the connection. What comes back is `null` where the bytes were taken and
+// `{ error: … }` where they were not; a program that gets the second sends what `h2Send` has left
+// and closes.
+do_h2_receive(args: Buf[Value], at: Span) -> Step
+    if args.len() != 2 then return fault(at, s"`h2Receive` takes a session and some bytes, and was given ${counted(args.len(), "argument")}")
+
+    val id = session_of(args.at(0), at, "h2Receive")?
+
+    val payload = args.at(1) match
+        Array(p) -> bytes_of(p, at, "h2Receive")?
+        other -> return fault(at, s"`h2Receive` takes the bytes as an array, and this is ${other.type_name()}")
+
+    var s = live_session(id, at, "h2Receive")?
+
+    s.receive(payload.view()) match
+        Ok(_) -> Ok(Null)
+        Err(e) -> Ok(refusal(e.message))
+end do_h2_receive
+
+// `h2Send(session)` -- the bytes this session wants written, as an array.
+//
+// **Empty is the ordinary answer and not a signal**, a session with nothing to say having nothing to
+// write. A program calls it after everything else it did to the session, and writes whatever it got.
+do_h2_send(args: Buf[Value], at: Span) -> Step
+    if args.len() != 1 then return fault(at, s"`h2Send` takes a session, and was given ${counted(args.len(), "argument")}")
+
+    val id = session_of(args.at(0), at, "h2Send")?
+
+    var s = live_session(id, at, "h2Send")?
+    var out: Buf[u8] = buf()
+
+    s.send(&out) match
+        Ok(_) -> ()
+        Err(e) -> return fault(at, s"`h2Send` could not frame what it was given: ${e.message}")
+
+    Ok(byte_array(out.view()))
+end do_h2_send
+
+// `h2Next(session)` -- the next thing the peer did, or `null` where there is nothing left.
+//
+// **EVENTS RATHER THAN CALLBACKS, which is the binding's own design and worth restating here.**
+// nghttp2 calls back from inside `receive`, which is a place slate code has no business running: it
+// cannot submit frames there without reentering the library, and a closure it registered would have
+// to be kept alive by the session. What a program writes instead is a loop.
+do_h2_next(args: Buf[Value], at: Span) -> Step
+    if args.len() != 1 then return fault(at, s"`h2Next` takes a session, and was given ${counted(args.len(), "argument")}")
+
+    val id = session_of(args.at(0), at, "h2Next")?
+
+    var s = live_session(id, at, "h2Next")?
+
+    s.next_event() match
+        None -> Ok(Null)
+        Some(e) -> Ok(event_value(e))
+end do_h2_next
+
+// `h2Request(session, headers, body?)` -- open a stream and send a request on it. Answers the
+// stream's number, which everything else about that stream is said in terms of.
+//
+// **A client's call.** No body means the request ends with its headers, which is what a GET is.
+do_h2_request(args: Buf[Value], at: Span) -> Step
+    if args.len() < 2 || args.len() > 3
+        return fault(at, s"`h2Request` takes a session, the headers and an optional body, and was given ${counted(args.len(), "argument")}")
+
+    val id = session_of(args.at(0), at, "h2Request")?
+    val headers = headers_of(args.at(1), at, "h2Request")?
+    val body = body_of(args, 2, at, "h2Request")?
+
+    var s = live_session(id, at, "h2Request")?
+
+    s.request(headers.view(), sent_body(body)) match
+        Ok(stream) -> Ok(Int(long(stream)))
+        Err(e) -> fault(at, s"`h2Request` could not be sent: ${e.message}")
+end do_h2_request
+
+// `h2Respond(session, stream, headers, body?)` -- answer a request that arrived on a stream.
+//
+// **A server's call**, and the stream is the one the request came in on. No body means the response
+// is headers alone, which is what a 204 or a 304 is.
+do_h2_respond(args: Buf[Value], at: Span) -> Step
+    if args.len() < 3 || args.len() > 4
+        return fault(at, s"`h2Respond` takes a session, a stream, the headers and an optional body, and was given ${counted(args.len(), "argument")}")
+
+    val id = session_of(args.at(0), at, "h2Respond")?
+    val stream = stream_of(args.at(1), at, "h2Respond")?
+    val headers = headers_of(args.at(2), at, "h2Respond")?
+    val body = body_of(args, 3, at, "h2Respond")?
+
+    var s = live_session(id, at, "h2Respond")?
+
+    s.respond(stream, headers.view(), sent_body(body)) match
+        Ok(_) -> Ok(Null)
+        Err(e) -> fault(at, s"`h2Respond` could not be sent: ${e.message}")
+end do_h2_respond
+
+// `h2Settings(session, { maxConcurrentStreams: 100, initialWindowSize: 65535 })`.
+//
+// **An object rather than a list of pairs, because the names are a CLOSED set** -- a program cannot
+// invent a setting, so a name that is not one of these is a mistake and is refused as one rather
+// than being sent to a peer that will ignore it.
+do_h2_settings(args: Buf[Value], at: Span) -> Step
+    if args.len() != 2 then return fault(at, s"`h2Settings` takes a session and an object of settings, and was given ${counted(args.len(), "argument")}")
+
+    val id = session_of(args.at(0), at, "h2Settings")?
+    val values = settings_of(args.at(1), at)?
+
+    var s = live_session(id, at, "h2Settings")?
+
+    s.settings(values.view()) match
+        Ok(_) -> Ok(Null)
+        Err(e) -> fault(at, s"`h2Settings` could not be sent: ${e.message}")
+end do_h2_settings
+
+// `h2Goaway(session, lastStream, code?)` -- this end is going away.
+//
+// **The last stream it will process is the number that matters**, since a peer that opened a stream
+// above it knows to retry that request on a new connection rather than wonder.
+do_h2_goaway(args: Buf[Value], at: Span) -> Step
+    if args.len() < 2 || args.len() > 3
+        return fault(at, s"`h2Goaway` takes a session, the last stream and an optional error code, and was given ${counted(args.len(), "argument")}")
+
+    val id = session_of(args.at(0), at, "h2Goaway")?
+    val last = stream_of(args.at(1), at, "h2Goaway")?
+    val code = code_of(args, 2, at, "h2Goaway")?
+
+    var s = live_session(id, at, "h2Goaway")?
+
+    s.goaway(last, code) match
+        Ok(_) -> Ok(Null)
+        Err(e) -> fault(at, s"`h2Goaway` could not be sent: ${e.message}")
+end do_h2_goaway
+
+// `h2Reset(session, stream, code)` -- give up on one stream and leave the connection alone.
+do_h2_reset(args: Buf[Value], at: Span) -> Step
+    if args.len() != 3 then return fault(at, s"`h2Reset` takes a session, a stream and an error code, and was given ${counted(args.len(), "argument")}")
+
+    val id = session_of(args.at(0), at, "h2Reset")?
+    val stream = stream_of(args.at(1), at, "h2Reset")?
+    val code = code_of(args, 2, at, "h2Reset")?
+
+    var s = live_session(id, at, "h2Reset")?
+
+    s.reset(stream, code) match
+        Ok(_) -> Ok(Null)
+        Err(e) -> fault(at, s"`h2Reset` could not be sent: ${e.message}")
+end do_h2_reset
+
+// `h2WindowUpdate(session, stream, increment)` -- more flow-control credit. Stream 0 is the
+// connection's own window.
+do_h2_window_update(args: Buf[Value], at: Span) -> Step
+    if args.len() != 3 then return fault(at, s"`h2WindowUpdate` takes a session, a stream and an increment, and was given ${counted(args.len(), "argument")}")
+
+    val id = session_of(args.at(0), at, "h2WindowUpdate")?
+    val stream = stream_of(args.at(1), at, "h2WindowUpdate")?
+    val by = stream_of(args.at(2), at, "h2WindowUpdate")?
+
+    var s = live_session(id, at, "h2WindowUpdate")?
+
+    s.window_update(stream, by) match
+        Ok(_) -> Ok(Null)
+        Err(e) -> fault(at, s"`h2WindowUpdate` could not be sent: ${e.message}")
+end do_h2_window_update
+
+// `h2Consume(session, stream, bytes)` -- say that a body's bytes have been dealt with.
+//
+// **This is what stops a slow reader from being a memory leak.** A program that takes a body and
+// does not consume it holds the connection's window open forever; one that consumes as it goes lets
+// nghttp2 send the WINDOW_UPDATE that keeps the peer sending.
+do_h2_consume(args: Buf[Value], at: Span) -> Step
+    if args.len() != 3 then return fault(at, s"`h2Consume` takes a session, a stream and a number of bytes, and was given ${counted(args.len(), "argument")}")
+
+    val id = session_of(args.at(0), at, "h2Consume")?
+    val stream = stream_of(args.at(1), at, "h2Consume")?
+    val size = size_of(args.at(2), at, "h2Consume")?
+
+    var s = live_session(id, at, "h2Consume")?
+
+    s.consume(stream, size) match
+        Ok(_) -> Ok(Null)
+        Err(e) -> fault(at, s"`h2Consume` could not be recorded: ${e.message}")
+end do_h2_consume
+
+// `h2Ping(session)` -- a PING, whose answer arrives as a `ping` event with `ack` set.
+do_h2_ping(args: Buf[Value], at: Span) -> Step
+    if args.len() != 1 then return fault(at, s"`h2Ping` takes a session, and was given ${counted(args.len(), "argument")}")
+
+    val id = session_of(args.at(0), at, "h2Ping")?
+
+    var s = live_session(id, at, "h2Ping")?
+
+    s.ping() match
+        Ok(_) -> Ok(Null)
+        Err(e) -> fault(at, s"`h2Ping` could not be sent: ${e.message}")
+end do_h2_ping
+
+// `h2Wants(session)` -- `{ read, write }`, which is what says whether a connection is finished.
+//
+// **A session that wants neither is done**, and a program that closes the socket on anything less
+// than that cuts off frames it had already agreed to send.
+do_h2_wants(args: Buf[Value], at: Span) -> Step
+    if args.len() != 1 then return fault(at, s"`h2Wants` takes a session, and was given ${counted(args.len(), "argument")}")
+
+    val id = session_of(args.at(0), at, "h2Wants")?
+
+    val s = live_session(id, at, "h2Wants")?
+    val o = new_object()
+
+    hold(Object(o))
+    obj_put_name(o, "read", Bool(s.wants_read()))
+    obj_put_name(o, "write", Bool(s.wants_write()))
+    Ok(Object(o))
+end do_h2_wants
+
+// `h2Close(session)` -- give the session back.
+//
+// **A connection that has closed will never be fed again**, so its nghttp2 state is dropped here
+// rather than waiting for the program to end. The slot is not reused: a handle a program is still
+// holding must never come to mean somebody else's session, which is the rule every id in slate
+// follows.
+do_h2_close(args: Buf[Value], at: Span) -> Step
+    if args.len() != 1 then return fault(at, s"`h2Close` takes a session, and was given ${counted(args.len(), "argument")}")
+
+    val id = session_of(args.at(0), at, "h2Close")?
+
+    if id < sessions.len() then sessions.set(id, None)
+
+    Ok(Null)
+end do_h2_close
+
+// -- HPACK, which needs no session ------------------------------------------------------------------
+
+// `hpackDeflater(maxTable?)` and `hpackInflater()`.
+//
+// **A deflater and an inflater are each a CONVERSATION rather than a function**, and that is the
+// thing to know before using either: the dynamic table is built from every block that has gone
+// through, so blocks must be given to one inflater in the order they arrived. It is what makes the
+// second request on a connection cost five bytes where the first cost thirty-eight.
+do_hpack_deflater(args: Buf[Value], at: Span) -> Step
+    if args.len() > 1 then return fault(at, s"`hpackDeflater` takes an optional table size, and was given ${counted(args.len(), "argument")}")
+
+    val size = if args.len() == 0 then 4096usize else size_of(args.at(0), at, "hpackDeflater")?
+
+    deflater(size) match
+        Err(e) -> fault(at, s"`hpackDeflater` could not be made: ${e.message}")
+        Ok(d) ->
+            deflaters.push(Some(d))
+            Ok(Int(long(deflaters.len() - 1)))
+end do_hpack_deflater
+
+do_hpack_inflater(args: Buf[Value], at: Span) -> Step
+    if args.len() != 0 then return fault(at, s"`hpackInflater` takes nothing, and was given ${counted(args.len(), "argument")}")
+
+    inflater() match
+        Err(e) -> fault(at, s"`hpackInflater` could not be made: ${e.message}")
+        Ok(i) ->
+            inflaters.push(Some(i))
+            Ok(Int(long(inflaters.len() - 1)))
+end do_hpack_inflater
+
+// `hpackDeflate(deflater, headers)` -- one header block, as bytes.
+do_hpack_deflate(args: Buf[Value], at: Span) -> Step
+    if args.len() != 2 then return fault(at, s"`hpackDeflate` takes an encoder and the headers, and was given ${counted(args.len(), "argument")}")
+
+    val id = session_of(args.at(0), at, "hpackDeflate")?
+    val headers = headers_of(args.at(1), at, "hpackDeflate")?
+
+    if id >= deflaters.len() then return fault(at, "`hpackDeflate` was given something that is not an encoder")
+
+    var d = deflaters.at(id) match
+        Some(d) -> d
+        None -> return fault(at, "this encoder has been closed")
+
+    d.deflate(headers.view()) match
+        Ok(block) -> Ok(byte_array(block.view()))
+        Err(e) -> fault(at, s"`hpackDeflate` could not encode those headers: ${e.message}")
+end do_hpack_deflate
+
+// `hpackInflate(inflater, bytes)` -- the headers a block held, or `{ error: … }`.
+//
+// **A block that will not decode is an ANSWER**, because the bytes came from the wire: a header
+// block is exactly where a peer sends something malformed on purpose, and a fault would take the
+// program down with it.
+do_hpack_inflate(args: Buf[Value], at: Span) -> Step
+    if args.len() != 2 then return fault(at, s"`hpackInflate` takes a decoder and some bytes, and was given ${counted(args.len(), "argument")}")
+
+    val id = session_of(args.at(0), at, "hpackInflate")?
+
+    val block = args.at(1) match
+        Array(p) -> bytes_of(p, at, "hpackInflate")?
+        other -> return fault(at, s"`hpackInflate` takes the bytes as an array, and this is ${other.type_name()}")
+
+    if id >= inflaters.len() then return fault(at, "`hpackInflate` was given something that is not a decoder")
+
+    var i = inflaters.at(id) match
+        Some(i) -> i
+        None -> return fault(at, "this decoder has been closed")
+
+    i.inflate(block.view()) match
+        Ok(headers) -> Ok(header_list(headers))
+        Err(e) -> Ok(refusal(e.message))
+end do_hpack_inflate
+
+// `hpackClose(x)` -- give an encoder or a decoder back.
+//
+// **One word for both**, since a program holding one of each closes both the same way and nothing
+// downstream cares which it was. The two tables are separate, so a handle is cleared from whichever
+// it is in.
+do_hpack_close(args: Buf[Value], at: Span) -> Step
+    if args.len() != 1 then return fault(at, s"`hpackClose` takes an encoder or a decoder, and was given ${counted(args.len(), "argument")}")
+
+    val id = session_of(args.at(0), at, "hpackClose")?
+
+    if id < deflaters.len() then deflaters.set(id, None)
+    if id < inflaters.len() then inflaters.set(id, None)
+
+    Ok(Null)
+end do_hpack_close
+
+// -- what a value is, on the way in and on the way out ----------------------------------------------
+
+// `{ autoWindowUpdate: false }`, where a session was given options at all.
+private auto_window_of(v: Value, at: Span, name: string) -> Result[bool, Signal]
+    val o = v match
+        Object(o) -> o
+        Null -> return Ok(true)
+        other -> return Err(failure(at, s"`${name}` takes an object of options, and this is ${other.type_name()}"))
+
+    for i in 0..<o.entries.len()
+        val entry = o.entries.at(i)
+
+        if !entry.dead
+            val key = entry.key match
+                Str(k) -> k.s
+                other -> return Err(failure(at, s"an option is named, and this is ${other.type_name()}"))
+
+            if key != "autoWindowUpdate"
+                return Err(failure(at, s"`${key}` is not one of a session's options -- there is one, `autoWindowUpdate`, and setting it false is what `h2Consume` needs"))
+
+    obj_get_name(o, "autoWindowUpdate") match
+        None -> Ok(true)
+        Some(Bool(b)) -> Ok(b)
+        Some(other) -> Err(failure(at, s"`autoWindowUpdate` is true or false, and this is ${other.type_name()}"))
+end auto_window_of
+
+// The id of a session, an encoder or a decoder, checked as far as its shape.
+private session_of(v: Value, at: Span, name: string) -> Result[usize, Signal]
+    v match
+        Int(n) ->
+            if n < 0 then return Err(failure(at, s"`${name}` was given something that is not a session"))
+
+            Ok(usize(n))
+        other -> Err(failure(at, s"`${name}` takes a session, and this is ${other.type_name()}"))
+
+// The session behind an id, which must still be open.
+private live_session(id: usize, at: Span, name: string) -> Result[&Session, Signal]
+    if id >= sessions.len() then return Err(failure(at, s"`${name}` was given something that is not a session"))
+
+    sessions.at(id) match
+        Some(s) -> Ok(s)
+        None -> Err(failure(at, s"this session has been closed, and `${name}` needs an open one"))
+end live_session
+
+// A count of bytes, which is never negative.
+private size_of(v: Value, at: Span, name: string) -> Result[usize, Signal]
+    v match
+        Int(n) ->
+            if n < 0 then return Err(failure(at, s"`${name}` takes a count of bytes, and this is ${n}"))
+
+            Ok(usize(n))
+        other -> Err(failure(at, s"`${name}` takes a count of bytes, and this is ${other.type_name()}"))
+
+// A stream number, which is a 31-bit identifier and never negative.
+private stream_of(v: Value, at: Span, name: string) -> Result[i32, Signal]
+    v match
+        Int(n) ->
+            if n < 0 then return Err(failure(at, s"`${name}` takes a stream number, and this is ${n}"))
+
+            Ok(i32(n))
+        other -> Err(failure(at, s"`${name}` takes a stream number, and this is ${other.type_name()}"))
+
+// An HTTP/2 error code, which defaults to `NO_ERROR` where a call allows one to be left out.
+//
+// **These are the codes that travel in a RST_STREAM or a GOAWAY**, and they are a different space
+// from nghttp2's own: 0 is NO_ERROR, 1 PROTOCOL_ERROR, 2 INTERNAL_ERROR, and the rest are in RFC
+// 9113. A program writes the number, because a name for each would be eleven exports for something a
+// server sends twice.
+private code_of(args: Buf[Value], slot: usize, at: Span, name: string) -> Result[u32, Signal]
+    if slot >= args.len() then return Ok(0u32)
+
+    args.at(slot) match
+        Int(n) ->
+            if n < 0 then return Err(failure(at, s"`${name}` takes an error code, and this is ${n}"))
+
+            Ok(u32(n))
+        Null -> Ok(0u32)
+        other -> Err(failure(at, s"`${name}` takes an error code, and this is ${other.type_name()}"))
+
+// A body a call was given, where it was given one.
+private body_of(args: Buf[Value], slot: usize, at: Span, name: string) -> Result[Option[Buf[u8]], Signal]
+    if slot >= args.len() then return Ok(None)
+
+    args.at(slot) match
+        Null -> Ok(None)
+        Str(p) -> Ok(Some(text_bytes(p.s)))
+        Array(a) -> Ok(Some(bytes_of(a, at, name)?))
+        other -> Err(failure(at, s"`${name}` takes a body as text or bytes, and this is ${other.type_name()}"))
+
+// **The body has to outlive the call that submitted it**, so what goes to nghttp2 is a view of the
+// buffer the binding itself keeps -- which is what `request` and `respond` do with what they are
+// given. This is only the shape the two of them take.
+private sent_body(body: Option[Buf[u8]]) -> Option[[]const u8] = body match
+    Some(bs) -> Some(bs.view())
+    None -> None
+
+// The bytes of a string, for a body written as text.
+private text_bytes(text: string) -> Buf[u8]
+    var out: Buf[u8] = buf()
+
+    for i in 0..<text.bytes.len
+        out.push(text.bytes[i])
+
+    out
+end text_bytes
+
+// The headers a program wrote, as the binding's own.
+//
+// **TWO SPELLINGS, AND THE REASON IS THAT HTTP/2 NEEDS BOTH.** An object is what a program writes
+// nine times in ten -- `{ ":status": "200", "content-type": "text/plain" }` -- and it cannot say
+// everything: two `set-cookie` headers are legal and an object has one key. So a list of pairs is
+// taken as well, which is also the shape every header block comes BACK as.
+//
+// **A third element marks a field NEVER-INDEXED**, which is a wire decision rather than a comment:
+// an attacker who can insert requests learns a secret header's value by watching whether his guess
+// compressed, and keeping it out of the dynamic table is the defence. `authorization` and `cookie`
+// are the fields that want it.
+private headers_of(v: Value, at: Span, name: string) -> Result[Buf[Header], Signal]
+    var out: Buf[Header] = buf()
+
+    v match
+        Object(o) ->
+            for i in 0..<o.entries.len()
+                val entry = o.entries.at(i)
+
+                if !entry.dead
+                    val key = entry.key match
+                        Str(k) -> k.s
+                        other -> return Err(failure(at, s"a header name is text, and this is ${other.type_name()}"))
+
+                    out.push(header(key, header_text(entry.value, at, name)?))
+        Array(a) ->
+            for i in 0..<a.items.len()
+                a.items.at(i) match
+                    Array(pair) ->
+                        if pair.items.len() < 2 || pair.items.len() > 3
+                            return Err(failure(at, s"a header is a name and a value, and this one has ${counted(pair.items.len(), "part")}"))
+
+                        val key = pair.items.at(0) match
+                            Str(k) -> k.s
+                            other -> return Err(failure(at, s"a header name is text, and this is ${other.type_name()}"))
+
+                        val value = header_text(pair.items.at(1), at, name)?
+
+                        val hidden = if pair.items.len() == 3 then pair.items.at(2).truthy() else false
+
+                        out.push(if hidden then sensitive(key, value) else header(key, value))
+                    other -> return Err(failure(at, s"`${name}` takes the headers as pairs, and one of them is ${other.type_name()}"))
+        other -> return Err(failure(at, s"`${name}` takes the headers as an object or as pairs, and this is ${other.type_name()}"))
+
+    Ok(out)
+end headers_of
+
+// A header's value, which is text and is never a number.
+//
+// **`content-length: 12` is a mistake worth naming rather than converting**, because a header's
+// value is a string on the wire and a program that wrote a number there meant to write text -- and
+// converting it silently would make `true` a header value too.
+private header_text(v: Value, at: Span, name: string) -> Result[string, Signal]
+    v match
+        Str(p) -> Ok(p.s)
+        other -> Err(failure(at, s"a header value is text, and this one is ${other.type_name()} -- `${name}` writes what goes on the wire"))
+
+// The settings a program wrote, which are a closed set of names.
+private settings_of(v: Value, at: Span) -> Result[Buf[Setting], Signal]
+    var out: Buf[Setting] = buf()
+
+    val o = v match
+        Object(o) -> o
+        other -> return Err(failure(at, s"`h2Settings` takes an object of settings, and this is ${other.type_name()}"))
+
+    for i in 0..<o.entries.len()
+        val entry = o.entries.at(i)
+
+        if !entry.dead
+            val key = entry.key match
+                Str(k) -> k.s
+                other -> return Err(failure(at, s"a setting is named, and this is ${other.type_name()}"))
+
+            val n = entry.value match
+                Int(n) ->
+                    if n < 0 then return Err(failure(at, s"`${key}` is a count, and this is ${n}"))
+
+                    u32(n)
+                other -> return Err(failure(at, s"`${key}` is a number, and this is ${other.type_name()}"))
+
+            if key == "headerTableSize"
+                out.push(HeaderTableSize(n))
+            elif key == "enablePush"
+                out.push(EnablePush(n))
+            elif key == "maxConcurrentStreams"
+                out.push(MaxConcurrentStreams(n))
+            elif key == "initialWindowSize"
+                out.push(InitialWindowSize(n))
+            elif key == "maxFrameSize"
+                out.push(MaxFrameSize(n))
+            elif key == "maxHeaderListSize"
+                out.push(MaxHeaderListSize(n))
+            else
+                return Err(failure(at, s"`${key}` is not one of HTTP/2's settings -- they are `headerTableSize`, `enablePush`, `maxConcurrentStreams`, `initialWindowSize`, `maxFrameSize` and `maxHeaderListSize`"))
+
+    Ok(out)
+end settings_of
+
+// One event, as the object a program reads.
+//
+// **`kind` is a string and the rest of the fields depend on it**, which is the shape slate already
+// uses for a result and for a parsed request: a `match` over `{ kind: "data" }` reads exactly as one
+// over a data type, and nothing had to be declared to make it work.
+private event_value(e: Event) -> Value
+    val o = new_object()
+
+    hold(Object(o))
+
+    e match
+        Headers(stream, headers, kind) ->
+            obj_put_name(o, "kind", Str(new_str("headers")))
+            obj_put_name(o, "stream", Int(long(stream)))
+            obj_put_name(o, "headers", header_list(headers))
+            obj_put_name(o, "of", Str(new_str(kind match
+                Request -> "request"
+                Response -> "response"
+                PushResponse -> "pushResponse"
+                Trailer -> "trailer")))
+        Data(stream, bytes) ->
+            obj_put_name(o, "kind", Str(new_str("data")))
+            obj_put_name(o, "stream", Int(long(stream)))
+            obj_put_name(o, "bytes", byte_array(bytes.view()))
+        StreamEnd(stream) ->
+            obj_put_name(o, "kind", Str(new_str("streamEnd")))
+            obj_put_name(o, "stream", Int(long(stream)))
+        StreamClose(stream, code) ->
+            obj_put_name(o, "kind", Str(new_str("streamClose")))
+            obj_put_name(o, "stream", Int(long(stream)))
+            obj_put_name(o, "code", Int(long(code)))
+        Settings ->
+            obj_put_name(o, "kind", Str(new_str("settings")))
+        Goaway(last_stream, code) ->
+            obj_put_name(o, "kind", Str(new_str("goaway")))
+            obj_put_name(o, "lastStream", Int(long(last_stream)))
+            obj_put_name(o, "code", Int(long(code)))
+        RstStream(stream, code) ->
+            obj_put_name(o, "kind", Str(new_str("rstStream")))
+            obj_put_name(o, "stream", Int(long(stream)))
+            obj_put_name(o, "code", Int(long(code)))
+        WindowUpdate(stream, increment) ->
+            obj_put_name(o, "kind", Str(new_str("windowUpdate")))
+            obj_put_name(o, "stream", Int(long(stream)))
+            obj_put_name(o, "increment", Int(long(increment)))
+        Ping(ack) ->
+            obj_put_name(o, "kind", Str(new_str("ping")))
+            obj_put_name(o, "ack", Bool(ack))
+
+    Object(o)
+end event_value
+
+// A header block, as the pairs it arrived as.
+//
+// **PAIRS RATHER THAN AN OBJECT, and this is the end where the difference matters.** Two headers of
+// one name are legal and an object would silently keep one of them -- which is the shape of defect
+// that makes request smuggling possible, so what arrives is handed over exactly as it arrived. A
+// program that wants an object folds it in a line, and does so knowing what it discarded.
+private header_list(headers: Buf[Header]) -> Value
+    var items: Buf[Value] = buf()
+    val mark = root_mark()
+
+    for i in 0..<headers.len()
+        val h = headers.at(i)
+        var pair: Buf[Value] = buf()
+
+        pair.push(Str(new_str(h.name)))
+        pair.push(Str(new_str(h.value)))
+
+        val made = Array(new_array(pair))
+
+        hold(made)
+        items.push(made)
+
+    val out = Array(new_array(items))
+
+    hold(out)
+    release(mark)
+    hold(out)
+    out
+end header_list
+
+// Bytes, as the array a program reads them from.
+private byte_array(bytes: []const u8) -> Value
+    var items: Buf[Value] = buf()
+
+    for i in 0..<bytes.len
+        items.push(Int(long(bytes[i])))
+
+    Array(new_array(items))
+end byte_array
+
+// `{ error: … }` -- what a call answers where the WIRE was wrong rather than the program.
+private refusal(message: string) -> Value
+    val o = new_object()
+
+    hold(Object(o))
+    obj_put_name(o, "error", Str(new_str(message)))
+    Object(o)
+end refusal

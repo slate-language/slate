@@ -1,0 +1,302 @@
+module dev.slatelang.slate
+@tests
+
+import sysl.text.Search
+
+// `slate:h2` -- HTTP/2's framing and HPACK, handed to any program that asks.
+//
+// **These tests are the DOOR rather than the protocol**, which is `tests_llhttp.sysl`'s rule and is
+// here for its reason: what nghttp2 does with a frame is nghttp2's business and is tested in
+// `sh.sysl.nghttp2` against RFC 7541's own vectors. What is pinned here is that an ordinary slate
+// program can reach the session at all, that every value crossing the boundary arrives in the shape
+// this module promised, and that the two things a program gets wrong -- a handle it has closed, and
+// headers written as something other than text -- are refused where they are written.
+//
+// **A whole conversation runs in memory, with no socket and no port.** That is not a convenience of
+// the tests: it is what the module's own design buys, a session being a transformation of bytes that
+// never learns where they came from. The ALPN half needs a real handshake and is in `tests_net.sysl`
+// beside the other TLS tests.
+
+private val H2Import: string =
+    "import { h2Client, h2Server, h2Receive, h2Send, h2Next, h2Request, h2Respond, h2Settings, " +
+    "h2Goaway, h2Reset, h2WindowUpdate, h2Consume, h2Ping, h2Wants, h2Close } from slate:h2\n"
+
+private val HpackImport: string =
+    "import { hpackDeflater, hpackInflater, hpackDeflate, hpackInflate, hpackClose } from slate:h2\n"
+
+// A client and a server wired to each other, and the two lines every program that drives a pair
+// writes: hand what one wants to write to the other, and read off what that made happen.
+private val Wired: string =
+    "pump(from, to)\n" +
+    "    val bytes = h2Send(from)\n" +
+    "    if len(bytes) > 0 then h2Receive(to, bytes)\n" +
+    "    len(bytes)\n" +
+    "seen(who)\n" +
+    "    var out = []\n" +
+    "    loop\n" +
+    "        val e = h2Next(who)\n" +
+    "        if e == null then break\n" +
+    "        push(out, e)\n" +
+    "    out\n" +
+    "only(es, kind) = filter(es, e -> e.kind == kind)\n" +
+    "val Get = { \":method\": \"GET\", \":scheme\": \"https\", \":authority\": \"example.test\" }\n"
+
+private h2_out(text: string) -> string = out(H2Import + Wired + text)
+
+private h2_fails(text: string) -> string = fails(H2Import + Wired + text)
+
+private hpack_out(text: string) -> string = out(HpackImport + text)
+
+private hpack_fails(text: string) -> string = fails(HpackImport + text)
+
+@test
+A_PROGRAM_MAY_SPEAK_HTTP_2_WITH_slate_h2()
+    // **The whole point of the module in one program**: a request goes out of a client, arrives at a
+    // server as headers it can read, and the answer comes back with its body. None of these names is
+    // in a program's own scope -- they live inside `install_natives`' `if everything` with every
+    // other module's -- so before the export list existed this would not compile.
+    val prog =
+        "val c = h2Client()\n" +
+        "val s = h2Server()\n" +
+        "val stream = h2Request(c, { \":method\": \"GET\", \":scheme\": \"https\", \":path\": \"/things\", \":authority\": \"example.test\" })\n" +
+        "pump(c, s)\n" +
+        "val asked = only(seen(s), \"headers\")\n" +
+        "print(stream, asked[0].of, asked[0].headers[2])\n" +
+        "h2Respond(s, stream, { \":status\": \"200\" }, \"hello from h2\")\n" +
+        "pump(s, c)\n" +
+        "val back = seen(c)\n" +
+        "print(only(back, \"headers\")[0].of, only(back, \"headers\")[0].headers[0])\n" +
+        "print(fromBytes(only(back, \"data\")[0].bytes).value)\n" +
+        "h2Close(c)\n" +
+        "h2Close(s)"
+
+    assert_eq(h2_out(prog),
+        "1 request [\":path\", \"/things\"]\n" +
+        "response [\":status\", \"200\"]\n" +
+        "hello from h2")
+
+@test
+A_STREAM_ENDS_AND_THEN_CLOSES_AND_BOTH_ARE_EVENTS()
+    // **The two are not one thing**: `streamEnd` says the peer will send no more and may still be
+    // reading, and `streamClose` says the stream is finished at both ends. A program that answered a
+    // request on the first and stopped listening at the second is reading them the right way round.
+    val prog =
+        "val c = h2Client()\n" +
+        "val s = h2Server()\n" +
+        "val stream = h2Request(c, Get with { \":path\": \"/\" })\n" +
+        "pump(c, s)\n" +
+        "seen(s)\n" +
+        "h2Respond(s, stream, { \":status\": \"204\" })\n" +
+        "pump(s, c)\n" +
+        "val back = seen(c)\n" +
+        "print(map(filter(back, e -> e.kind != \"settings\"), e -> e.kind))\n" +
+        "val done = only(back, \"streamClose\")[0]\n" +
+        "print(done.stream, done.code)"
+
+    assert_eq(h2_out(prog), "[\"headers\", \"streamEnd\", \"streamClose\"]\n1 0")
+
+@test
+A_HEADER_BLOCK_ARRIVES_AS_PAIRS_AND_NOT_AS_AN_OBJECT()
+    // **Two headers of one name are legal and an object would silently keep one of them**, which is
+    // the shape of defect that makes request smuggling possible. So what arrives is handed over
+    // exactly as it arrived, and a program that wants an object folds it knowing what it discarded.
+    val prog =
+        "val c = h2Client()\n" +
+        "val s = h2Server()\n" +
+        "h2Request(c, [[\":method\", \"GET\"], [\":scheme\", \"https\"], [\":authority\", \"a.test\"], " +
+        "[\":path\", \"/\"], [\"cookie\", \"a=1\"], [\"cookie\", \"b=2\"]])\n" +
+        "pump(c, s)\n" +
+        "val asked = only(seen(s), \"headers\")[0]\n" +
+        "print(len(asked.headers))\n" +
+        "print(asked.headers[4], asked.headers[5])"
+
+    assert_eq(h2_out(prog), "6\n[\"cookie\", \"a=1\"] [\"cookie\", \"b=2\"]")
+
+@test
+A_HEADER_MAY_BE_MARKED_NEVER_INDEXED_AND_IT_IS_A_WIRE_DECISION()
+    // **`sensitive` is not a comment.** An attacker who can insert requests learns a secret header's
+    // value one character at a time by watching whether his guess compressed, and keeping it out of
+    // the dynamic table is the defence. The third element of a pair is what says so, and the header
+    // still arrives -- what changed is how it was encoded.
+    val prog =
+        "val c = h2Client()\n" +
+        "val s = h2Server()\n" +
+        "h2Request(c, [[\":method\", \"GET\"], [\":scheme\", \"https\"], [\":authority\", \"a.test\"], " +
+        "[\":path\", \"/\"], [\"authorization\", \"Bearer sh\", true]])\n" +
+        "pump(c, s)\n" +
+        "print(only(seen(s), \"headers\")[0].headers[4])"
+
+    assert_eq(h2_out(prog), "[\"authorization\", \"Bearer sh\"]")
+
+@test
+A_BODY_IS_TEXT_OR_BYTES_AND_ARRIVES_AS_BYTES()
+    // A body written either way is the same body on the wire; what comes back is always bytes,
+    // because that is what a DATA frame carries and slate refuses to guess an encoding.
+    val prog =
+        "val c = h2Client()\n" +
+        "val s = h2Server()\n" +
+        "h2Request(c, Get with { \":method\": \"POST\", \":path\": \"/a\" }, \"as text\")\n" +
+        "pump(c, s)\n" +
+        "h2Request(c, Get with { \":method\": \"POST\", \":path\": \"/b\" }, toBytes(\"as bytes\"))\n" +
+        "pump(c, s)\n" +
+        "print(map(only(seen(s), \"data\"), e -> fromBytes(e.bytes).value))"
+
+    assert_eq(h2_out(prog), "[\"as text\", \"as bytes\"]")
+
+@test
+SETTINGS_ARE_NAMED_AND_A_NAME_THAT_IS_NOT_ONE_IS_REFUSED()
+    // **The identifiers are a closed set**, so a name that is not one of them is a mistake rather
+    // than something to send to a peer that will ignore it -- and the message lists the six.
+    val prog =
+        "val c = h2Client()\n" +
+        "val s = h2Server()\n" +
+        "h2Settings(s, { maxConcurrentStreams: 100, initialWindowSize: 65535 })\n" +
+        "pump(s, c)\n" +
+        "print(len(only(seen(c), \"settings\")) > 0)"
+
+    assert_eq(h2_out(prog), "true")
+    assert(h2_fails("h2Settings(h2Server(), { maxStreams: 1 })").contains("is not one of HTTP/2's settings"))
+
+@test
+A_SESSION_SAYS_WHETHER_IT_STILL_WANTS_TO_READ_OR_WRITE()
+    // **A session that wants neither is done**, and a program that closes the socket on anything less
+    // cuts off frames it had already agreed to send.
+    val prog =
+        "val c = h2Client()\n" +
+        "print(h2Wants(c))\n" +
+        "h2Request(c, { \":method\": \"GET\", \":path\": \"/\" })\n" +
+        "print(h2Wants(c).write)\n" +
+        "h2Send(c)\n" +
+        "print(h2Wants(c).write)"
+
+    assert_eq(h2_out(prog), "{read: true, write: true}\ntrue\nfalse")
+
+@test
+GIVING_UP_IS_A_STREAM_OR_THE_WHOLE_CONNECTION_AND_THE_PEER_HEARS_WHICH()
+    val prog =
+        "val c = h2Client()\n" +
+        "val s = h2Server()\n" +
+        "val stream = h2Request(c, Get with { \":path\": \"/\" })\n" +
+        "pump(c, s)\n" +
+        "seen(s)\n" +
+        "h2Reset(s, stream, 8)\n" +
+        "pump(s, c)\n" +
+        "print(map(filter(seen(c), e -> e.kind == \"streamClose\"), e -> e.code))\n" +
+        "h2Goaway(s, stream, 1)\n" +
+        "pump(s, c)\n" +
+        "val bye = filter(seen(c), e -> e.kind == \"goaway\")\n" +
+        "print(bye[0].lastStream, bye[0].code)"
+
+    assert_eq(h2_out(prog), "[8]\n1 1")
+
+@test
+A_PING_COMES_BACK_MARKED_AS_AN_ANSWER()
+    val prog =
+        "val c = h2Client()\n" +
+        "val s = h2Server()\n" +
+        "h2Ping(c)\n" +
+        "pump(c, s)\n" +
+        "print(map(only(seen(s), \"ping\"), e -> e.ack))\n" +
+        "pump(s, c)\n" +
+        "print(map(only(seen(c), \"ping\"), e -> e.ack))"
+
+    assert_eq(h2_out(prog), "[false]\n[true]")
+
+@test
+FLOW_CONTROL_IS_A_WINDOW_AND_A_PROGRAM_MAY_MOVE_IT()
+    // **This is what stops a slow reader from being a memory leak**: a program that takes a body and
+    // never consumes it holds the window open, and one that consumes as it goes lets nghttp2 send
+    // the WINDOW_UPDATE that keeps the peer sending.
+    val prog =
+        "val c = h2Client({ autoWindowUpdate: false })\n" +
+        "val s = h2Server({ autoWindowUpdate: false })\n" +
+        "val stream = h2Request(c, Get with { \":method\": \"POST\", \":path\": \"/\" }, \"some bytes\")\n" +
+        "pump(c, s)\n" +
+        "val got = only(seen(s), \"data\")\n" +
+        "h2Consume(s, stream, len(got[0].bytes))\n" +
+        "h2WindowUpdate(s, 0, 1024)\n" +
+        "pump(s, c)\n" +
+        "print(len(got[0].bytes), len(only(seen(c), \"windowUpdate\")) > 0)"
+
+    assert_eq(h2_out(prog), "10 true")
+
+    // **And a default session refuses it, saying what to do about it.** nghttp2's own answer is two
+    // words about a state, which sends a reader to look at the stream; what is wrong is how the
+    // session was made.
+    assert(h2_fails("h2Consume(h2Server(), 1, 10)").contains("extends its own windows"))
+    assert(h2_fails("h2Client({ autoWindow: false })").contains("is not one of a session's options"))
+
+@test
+BYTES_THAT_ARE_NOT_HTTP_2_ARE_AN_ANSWER_AND_NOT_A_FAULT()
+    // **A peer that speaks nonsense is the ordinary thing a server deals with**, and a fault would
+    // take the server down with the connection -- which is `httpFeed`'s rule and is why this one
+    // answers `{ error }`. What a program does with it is send whatever is left and close.
+    val prog =
+        "val s = h2Server()\n" +
+        "val said = h2Receive(s, toBytes(\"GET / HTTP/1.1\\r\\n\\r\\n\"))\n" +
+        "print(said != null, said.error != \"\")"
+
+    assert_eq(h2_out(prog), "true true")
+
+@test
+A_HANDLE_THAT_HAS_BEEN_CLOSED_IS_REFUSED_WHERE_IT_IS_USED()
+    // **Using a closed session is a defect in the program**, exactly as using a closed socket is, so
+    // this is the one channel that faults -- and the sentence says what was closed rather than
+    // naming an integer.
+    assert(h2_fails("val c = h2Client()\nh2Close(c)\nh2Next(c)").contains("this session has been closed"))
+    assert(h2_fails("h2Next(7)").contains("is not a session"))
+    assert(h2_fails("h2Next(\"c\")").contains("takes a session, and this is a string"))
+
+@test
+A_HEADER_VALUE_IS_TEXT_AND_A_NUMBER_IS_REFUSED_RATHER_THAN_CONVERTED()
+    // **`content-length: 12` is a mistake worth naming.** A header's value is a string on the wire,
+    // so a program that wrote a number meant to write text -- and converting it silently would make
+    // `true` a header value too.
+    assert(h2_fails("h2Request(h2Client(), { \":path\": 12 })").contains("a header value is text"))
+    assert(h2_fails("h2Request(h2Client(), [[\":path\"]])").contains("a header is a name and a value"))
+    assert(h2_fails("h2Request(h2Client(), \"GET /\")").contains("takes the headers as an object or as pairs"))
+
+// -- HPACK, which needs no session --------------------------------------------------------------
+
+@test
+HPACK_IS_REACHABLE_ON_ITS_OWN_AND_A_BLOCK_ROUND_TRIPS()
+    // **The header-compression tier needs no session and is worth having by itself** -- a program
+    // holding a block from a capture, a test vector or a proxy's log can read it.
+    val prog =
+        "val enc = hpackDeflater()\n" +
+        "val dec = hpackInflater()\n" +
+        "val block = hpackDeflate(enc, { \":status\": \"200\", \"content-type\": \"text/plain\" })\n" +
+        "print(len(block) > 0)\n" +
+        "print(hpackInflate(dec, block))\n" +
+        "hpackClose(enc)\n" +
+        "hpackClose(dec)"
+
+    assert_eq(hpack_out(prog), "true\n[[\":status\", \"200\"], [\"content-type\", \"text/plain\"]]")
+
+@test
+AN_HPACK_CONVERSATION_IS_A_CONVERSATION_AND_THE_SECOND_BLOCK_IS_SMALLER()
+    // **A deflater and an inflater are each a conversation, not a function.** The dynamic table is
+    // built from every block that has gone through, which is what makes the second request on a
+    // connection cost a fraction of the first -- and it is why blocks have to be given to one
+    // inflater in the order they arrived.
+    val prog =
+        "val enc = hpackDeflater()\n" +
+        "val dec = hpackInflater()\n" +
+        "val first = hpackDeflate(enc, { \"x-long-header-name\": \"a rather long value indeed\" })\n" +
+        "val again = hpackDeflate(enc, { \"x-long-header-name\": \"a rather long value indeed\" })\n" +
+        "print(len(again) < len(first))\n" +
+        "print(hpackInflate(dec, first) == hpackInflate(dec, again))"
+
+    assert_eq(hpack_out(prog), "true\ntrue")
+
+@test
+A_BLOCK_THAT_WILL_NOT_DECODE_IS_AN_ANSWER()
+    // A header block is exactly where a peer sends something malformed on purpose, so this answers
+    // rather than faulting -- the bytes came from the wire.
+    val prog =
+        "val dec = hpackInflater()\n" +
+        "val said = hpackInflate(dec, [255, 255, 255, 255, 255, 255])\n" +
+        "print(said.error != \"\")"
+
+    assert_eq(hpack_out(prog), "true")
+    assert(hpack_fails("hpackInflate(hpackInflater(), \"not bytes\")").contains("takes the bytes as an array"))

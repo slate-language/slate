@@ -37,6 +37,7 @@ main()
 | `close(sock)` | |
 | `localPort(server)` | |
 | `startTls(sock, options)` | a promise that settles when the handshake finishes |
+| `alpnProtocol(conn)` | which application protocol was agreed, or `null` |
 
 ## Promises and callbacks
 
@@ -101,6 +102,28 @@ async main()
 
     if !up.ok then print(up.error)
 ```
+
+## ALPN, which is how HTTP/2 is chosen
+
+**A client offers a list of protocol names and the server picks one**, and for HTTP/2 that is the
+whole of the negotiation — there is no upgrade handshake and no version header. Both ends say what
+they will take, and both read the answer off the connection:
+
+```slate
+val server = listen({ port: 8443, cert: pem, key: keyPem, alpn: ["h2", "http/1.1"] }, conn ->
+    if alpnProtocol(conn) == "h2" then speakHttp2(conn) else speakHttp1(conn))
+
+val up = await startTls(sock, { host: "example.com", alpn: ["h2", "http/1.1"] })
+
+print(alpnProtocol(sock))
+```
+
+**The server's own order decides**, because it is the end that knows which protocol it serves well.
+**`alpnProtocol` answers `null` for three ordinary cases and no failure**: a plain socket, a peer that
+offered nothing, and a handshake that has not finished — a server reads it inside its connection
+callback, by which time the handshake is long done.
+
+[`slate:h2`](h2.md) is what frames the bytes once `h2` is what was agreed.
 
 **An upgrade rather than a flag on `connect`, because that is what protocols actually do.** TLS from byte
 zero is one case and not the general one: PostgreSQL sends eight bytes in the clear and reads one back
