@@ -1,10 +1,21 @@
 # `slate:brotli`
 
-```
+```slate
 import { compress, decompress } from slate:brotli
 
+val page = toBytes(repeat("<p>hello</p>", 40))
 val small = compress(page, 5)               // quality 0-11
-val back = decompress(bytes, 1 << 20)       // the limit is not optional
+val back = decompress(small, 1 << 20)       // the limit is not optional
+
+print(len(small) < len(page))
+print(back.ok, fromBytes(back.value).value == fromBytes(page).value)
+print(decompress(toBytes("not brotli"), 1 << 20).ok)
+```
+
+```output
+true
+true true
+false
 ```
 
 ## The two channels

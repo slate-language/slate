@@ -2,13 +2,19 @@
 
 Another program, this program's own environment, and being asked to stop.
 
+```slate
+import { env, args } from slate:process
+
+print(args, env("PATH") is string, env("NO_SUCH_VARIABLE_HERE"))
 ```
-import { run, env, args, exit, onSignal, offSignal } from slate:process
+
+```output
+[] true null
 ```
 
 ## `args` and `exit`
 
-```
+```slate
 #!/usr/bin/env slate
 
 import { args, exit } from slate:process
@@ -39,7 +45,7 @@ for name in args
 
 ## `run`
 
-```
+```slate
 val r = await run(cmd, args, options)       // { status, signal, out, err } or an error
 ```
 
@@ -64,7 +70,7 @@ Options are `{ cwd, env, timeout }`.
 A program that leaves a socket open never exits, so a server ends only from the inside — and every way a
 deployment has of asking one to stop is a signal:
 
-```
+```slate
 import { onSignal } from slate:process
 import { serve, close } from slate:http
 

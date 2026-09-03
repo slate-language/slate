@@ -2,7 +2,7 @@
 
 `@test` marks a function of no arguments, and `slate test` is the only thing that calls one.
 
-```
+```slate
 val floor = 2
 
 export clamp(x) = if x < floor then floor else x

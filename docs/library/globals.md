@@ -19,13 +19,20 @@ going to handle. See [Tests](../reference/tests.md).
 
 **The type words are the conversions**, and the same word [tests in a pattern](../reference/patterns.md).
 
+```slate
+print(string(123) + "!")
+print(number("42"), number("nonsense"))
+print(integer(2.9))
+print(boolean(0))           // only false and null are false
+print(len("日本語"))        // in characters
 ```
-string(123)                 // "123"
-number("42")                // 42
-number("nonsense")          // null
-integer(2.9)                // 2
-boolean(0)                  // true -- only false and null are false
-len("日本語")               // 3, in characters
+
+```output
+123!
+42 null
+2
+true
+3
 ```
 
 ## Text
@@ -62,8 +69,18 @@ As methods, a number answers: `abs floor ceil round trunc sqrt integer real bool
 `map  filter  flatMap  forEach  reduce  find  findIndex  findLast  findLastIndex  every  some`
 `sort  sorted  reverse  reversed  slice  at  concat  flat  sum  join  contains  indexOf  lastIndexOf`
 
+```slate
+print([4, 1, 3, 2].sorted().slice(1, 3).flatMap(n -> [n, n]).at(-1))
+print([1, 2, 3].sum(), [1, [2, [3]]].flat())
+print(indexOf([1, 2], 9), find([1, 2, 3], n -> n > 1))
+print([1, 2, 3].at(-1), [1, 2, 3].reversed())
 ```
-[4, 1, 3, 2].sorted().slice(1, 3).flatMap(n -> [n, n]).at(-1)      // 3
+
+```output
+3
+6 [1, 2, [3]]
+null 2
+3 [3, 2, 1]
 ```
 
 Where slate parts from JavaScript it is **to remove a case rather than add one**:
@@ -81,9 +98,19 @@ Where slate parts from JavaScript it is **to remove a case rather than add one**
 
 `keys  values  entries  has`
 
-```
+```slate
+val o = { a: 1, b: 2 }
+
+print(keys(o), values(o), has(o, "a"))
+
 for [k, v] in entries(o)
     print(k, v)
+```
+
+```output
+["a", "b"] [1, 2] true
+a 1
+b 2
 ```
 
 An object answers **no** methods of its own — its names belong to the program, and a builtin `o.keys`
@@ -141,7 +168,7 @@ See [Asynchrony](../reference/asynchrony.md).
 
 ## `fetch`
 
-```
+```slate
 val r = await fetch(url, options)
 ```
 

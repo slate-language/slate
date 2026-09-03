@@ -4,13 +4,12 @@
 
 An `async` function answers a promise rather than a value, and `await` waits for one:
 
-```
+```slate
 async work(name, ms, turns)
     var i = 0
 
     while i < turns
         await sleep(ms)
-        print(name, "step", i)
         i = i + 1
 
     name + " finished"
@@ -26,14 +25,29 @@ async main()
 main()
 ```
 
+```output
+started both
+a finished
+b finished
+```
+
 **Everything above a function's first `await` runs before its caller sees the promise, and everything
 below it runs after the caller has moved on** — which is node's rule, and why `started both` prints
-before either worker's first step.
+before either worker's first step. The two workers then interleave by their own clocks: with those
+numbers `a` takes its first two steps, `b` takes one, `a` finishes, and `b` finishes last.
 
-`async` goes in front of a definition, a lambda, or a method.
+**Top-level `await` is refused**, so a program that wants to wait writes an `async main` and calls it:
 
-**Top-level `await` is refused.** The whole program would have to become a coroutine, which is a real
-design and one to make on purpose.
+```slate
+val x = await sleep(1)
+```
+
+```error
+`await` belongs in an `async` function
+```
+
+`async` goes in front of a definition, a lambda, or a method. Making the whole program a coroutine is a
+real design and one to make on purpose.
 
 ## The order things run in
 
@@ -102,7 +116,7 @@ rather than a gap: there is no statement of the program's left to attach it to.
 
 **A function is a generator because it holds a `yield`** — Python's rule, with no word on the definition.
 
-```
+```slate
 counter(from)
     var n = from
 
@@ -112,12 +126,21 @@ counter(from)
 
 val g = counter(1)
 
-print(next(g))              // {value: 1, done: false}
-print(g.next())             // {value: 2, done: false}
+print(next(g))
+print(g.next())
 
 for x in counter(1)
     print(x)
+
     if x == 3 then break
+```
+
+```output
+{value: 1, done: false}
+{value: 2, done: false}
+1
+2
+3
 ```
 
 - **Calling one runs nothing.** The body starts on the first `next`.
@@ -128,6 +151,23 @@ for x in counter(1)
 - **A generator does not touch the event loop**, so generators work in a program with no loop running.
 - **`val got = yield x`** is how a value is sent in: the driver's value is written over the slot the
   yielded one left.
+
+```slate
+echoer()
+    val got = yield 1
+
+    yield got * 10
+
+val e = echoer()
+
+print(next(e))
+print(e.next(5))
+```
+
+```output
+{value: 1, done: false}
+{value: 50, done: false}
+```
 
 **`yield` takes the whole expression where `await` takes one operand.** `await f() + 1` waits for the
 call and adds to the answer; `yield x * x` yields the product. A yield used inside a larger expression is

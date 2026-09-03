@@ -3,7 +3,7 @@
 A class is an [object with a proto](objects.md) and a word in front of it. `class` binds a name to an
 object literal and `from` is that object's `proto`, so what runs is what protos already did.
 
-```
+```slate
 class Shape
     val sides = 0
 
@@ -17,7 +17,11 @@ class Square from Shape
 
     area(self) = self.side * self.side
 
-print(Square.new(4).describe())         // a square of area 16
+print(Square.new(4).describe())
+```
+
+```output
+a square of area 16
 ```
 
 A class belongs to the **top level of a file**, as a `type` does and for the same reason: its name is
@@ -34,13 +38,24 @@ methods reads like twenty functions rather than like twenty fields.
 **`is` asks which class a value was made from**, and walks the whole chain. This is the one thing `class`
 adds that a hand-written proto could not have:
 
-```
+```slate
+class Shape
+class Square from Shape
+    var side
+
 val sq = Square.new(1)
 
-print(sq is Square, sq is Shape)                // true true
-print({ side: 1, proto: Square } is Square)     // true
-print({ side: 1 } is Square)                    // false
-print(Square is Square)                         // false
+print(sq is Square, sq is Shape)
+print({ side: 1, proto: Square } is Square)
+print({ side: 1 } is Square)
+print(Square is Square)
+```
+
+```output
+true true
+true
+false
+false
 ```
 
 A bare name in pattern position is a binding unless something has declared it, and a class declaration
@@ -54,10 +69,32 @@ the type.
 is one value however many objects there are; a `var` declares a field each object gets, and its
 initialiser runs **once per object**:
 
-```
+```slate
 class Bag
     var items = []          // a NEW array for every bag
     val kind = "bag"        // one string, shared
+
+val a = Bag()
+val b = Bag()
+
+push(a.items, 1)
+
+print(a.items, b.items, a.kind)
+```
+
+```output
+[1] [] bag
+```
+
+A mutable literal under `val` is refused, and the message names `var` as the fix:
+
+```slate
+class Bag
+    val items = []
+```
+
+```error
+var
 ```
 
 TypeScript spells the per-instance one `items = []`, so a reader coming from TS writes `val` and gets
@@ -70,13 +107,18 @@ here is sharing somebody asked for, and still compiles.
 **A class that declares fields and writes no constructor is given one**, taking all of them — the fields
 with no initialiser first, then the initialised ones, each optional with its initialiser as its default:
 
-```
+```slate
 class Square
     var side
     var tags = []
 
-Square.new(4)               // side = 4, tags = a fresh []
-Square.new(4, ["red"])      // and tags said otherwise
+print(Square.new(4))            // tags is a fresh []
+print(Square.new(4, ["red"]))   // and tags said otherwise
+```
+
+```output
+Square(side = 4, tags = [])
+Square(side = 4, tags = ["red"])
 ```
 
 A default is [worked out at the call](functions.md), so leaving `tags` out still gives every square its
@@ -94,7 +136,7 @@ Write one when it has something to do. **`var` in its parameter list declares th
 — TypeScript's parameter property — and `self` is the object being made. The body runs for its effect
 and the object is what comes back:
 
-```
+```slate
 class Rect
     var area = 0
 
@@ -102,6 +144,14 @@ class Rect
         if w < 0 || h < 0 then throw "a side cannot be negative"
 
         self.area = w * h
+
+print(Rect(3, 4).area)
+print(Rect(-1, 4).area catch e -> e.message)
+```
+
+```output
+12
+a side cannot be negative
 ```
 
 A class with no declared fields keeps the plain form, where the body's value *is* the object:
@@ -112,12 +162,28 @@ A class with no declared fields keeps the plain form, where the body's value *is
 A class name written with fields after it tests and takes apart at once, which is what a Scala case
 class does — by position, or by name:
 
-```
+```slate
+class Square
+    var side
+
+class Circle
+    var radius
+
+class Rect
+    var w
+    var h
+
 tell(v) = v match
     Square(n) -> s"a square of side ${n}"
     Circle { radius: r } -> s"a circle of ${r}"
     Rect { w, h } -> s"${w} by ${h}"
     _ -> "something else"
+
+print(tell(Square(3)), tell(Circle(7)), tell(Rect(2, 5)), tell(42))
+```
+
+```output
+a square of side 3 a circle of 7 2 by 5 something else
 ```
 
 **The positional order is the constructor's, and that holds by construction rather than by convention**
@@ -134,11 +200,35 @@ that never matches, where `Circle { raduis: r }` is refused where it stands.
 
 `is` in a class header is TypeScript's `implements` — a promise, checked where the class is written:
 
-```
+```slate
 type Drawable = { draw: function }
 
 class Pen is Drawable
-    draw(self) = "pen"
+    var ink
+
+    draw(self) = "pen with " + self.ink
+
+print(Pen("blue").draw())
+```
+
+```output
+pen with blue
+```
+
+Leave `draw` out and the fault names the class, rather than arriving wherever something first wanted
+to draw one:
+
+```slate
+type Drawable = { draw: function }
+
+class Pen is Drawable
+    var ink
+
+    scribble(self) = "pen"
+```
+
+```error
+Drawable
 ```
 
 **It inherits nothing;** `from` does that. What it buys is *when* you find out: leave `draw` out and the
@@ -153,11 +243,25 @@ proto supplies.
 And none is needed. A base class is an ordinary value in scope, and a method stored on it directly is
 handed no receiver — so passing one is how you call it:
 
-```
+```slate
+class Shape
+    describe(self) = s"a shape of area ${self.area()}"
+
+class Square from Shape
+    var side
+
+    area(self) = self.side * self.side
+
 class Loud from Square
     new(side) = { side: side }
 
     describe(self) = upper(Shape.describe(self)) + "!"
+
+print(Loud(2).describe())
+```
+
+```output
+A SHAPE OF AREA 4!
 ```
 
 `Shape.describe(self)` names the class the call was written in, which is what a super call means.

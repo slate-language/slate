@@ -2,17 +2,23 @@
 
 **A file is a module.** What another file can see is what it writes `export` in front of:
 
-```
+```slate
 export val greeting = "hello"
 
 export double(x) = x * 2
 
 secret() = "no other file can reach this"
+
+print(greeting, double(21), secret())
+```
+
+```output
+hello 42 no other file can reach this
 ```
 
 and a file takes what it needs by name, or takes the whole module under one:
 
-```
+```slate
 import { double, greeting as hi } from "./util.sl"
 import * as util from "./util.sl"
 
@@ -25,7 +31,7 @@ compiler resolves.
 
 ## The three kinds of specifier
 
-```
+```slate
 import { helper } from "./util.sl"      // a quoted path  -- a file
 import { mount } from lath              // a bare word    -- a package
 import { domHost } from lath/dom        // ... and one of that package's other modules

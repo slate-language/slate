@@ -19,8 +19,18 @@ destructures one and the collector already traces one.
 `throw v` is a **statement**, like `return` and `break`: nothing after it runs, and the value is not
 optional — a fault with nothing in it says nothing to whoever catches it.
 
+```slate
+side(w)
+    if w < 0 then throw "a side cannot be negative"
+
+    w
+
+print(side(3))
+print(side(-1))
 ```
-if w < 0 then throw "a side cannot be negative"
+
+```error
+a side cannot be negative
 ```
 
 **A caught fault re-thrown keeps its own words.** `throw e` reads an object's `message` field rather than
@@ -35,22 +45,44 @@ the original and points at the line that put it back.
 
 Two forms of one thing. **The postfix one is an expression**, so it stands where a value is wanted:
 
-```
-val text = readFileSync(path) catch e -> ""
+```slate
+toPort(text)
+    val n = number(text)
 
-val port = toPort(argument) catch e ->
+    if n == null then throw "that is not a port"
+
+    n
+
+val port = toPort("nonsense") catch e ->
     print(s"${e.message}, so using the default")
     8080
+
+print(port)
+```
+
+```output
+that is not a port, so using the default
+8080
 ```
 
 and the block one is for a run of statements:
 
-```
+```slate
+setUp() = print("set up")
+
+go()
+    throw "it went wrong"
+
 try
     setUp()
-    run()
+    go()
 catch e
-    print(s"${e.file}:${e.line} ${e.message}")
+    print(e.message, e.line, e.file is string)
+```
+
+```output
+set up
+it went wrong 4 true
 ```
 
 `catch` binds looser than every arithmetic operator, so `a + b catch …` guards the sum, and tighter than
@@ -62,13 +94,22 @@ the lambda arrow, so `x -> risky() catch e -> 0` gives the lambda a body that gu
 slate objects already sort, print, go in arrays and match against patterns, so there is nothing here the
 rest of the language does not already do.
 
-```
+```slate
+risky()
+    throw "gone"
+
+recover() = "recovered"
+
 try
-    risky()
+    print(risky())
 catch e
-    e match
+    print(e match
         { message: "gone" } -> recover()
-        _ -> throw e
+        _ -> "something else")
+```
+
+```output
+recovered
 ```
 
 ## What `catch` does and does not reach

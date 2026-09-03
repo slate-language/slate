@@ -11,7 +11,7 @@ from `.ts` and slx does not.
 
 **An element adds nothing to the tree.** It is desugared in the parser:
 
-```
+```slate
 <div class="x">hi</div>   →   createElement("div", { class: "x" }, ["hi"])
 ```
 
@@ -19,7 +19,7 @@ So **what an element means is a function a program can read** rather than a rule
 `createElement` and `Fragment` come from wherever the program gets them — `lath` is one such —
 and a file that writes an element and imports neither is refused by the undefined-name check.
 
-```
+```slate
 import { createElement, Fragment, mount, useState } from lath
 import { domHost } from lath/dom
 

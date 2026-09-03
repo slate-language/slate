@@ -2,14 +2,21 @@
 
 Digests, HMAC, key derivation and randomness.
 
-```
-import { sha256, hmac, pbkdf2, randomBytes, timingSafeEqual } from slate:crypto
+```slate
+import { sha256, hmac, randomBytes, timingSafeEqual } from slate:crypto
 
 val nonce = randomBytes(18)
-val key = pbkdf2("SHA-256", password, salt, 4096, 32)
-val tag = hmac("SHA-256", key, "the message")
+val tag = hmac("SHA-256", "a key", "the message")
 
-if timingSafeEqual(tag, sent) then print("that is the right tag")
+print(len(nonce), len(sha256("abc")), len(tag))
+print(timingSafeEqual(tag, hmac("SHA-256", "a key", "the message")))
+print(timingSafeEqual(tag, hmac("SHA-256", "a key", "another message")))
+```
+
+```output
+18 32 32
+true
+false
 ```
 
 | | |

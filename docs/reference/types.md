@@ -17,18 +17,26 @@ ran, and this only fires where the pass can prove the value is wrong or where th
 
 A type is a shape with a name:
 
-```
+```slate
 type Point = { x: number, y: number }
 type Circle = { centre: Point, radius: number }
-
-{ x: 3, y: 4 } is Point                 // true
 
 describe(v) = v match
     Circle -> s"a circle of radius ${v.radius}"
     Point  -> s"the point ${v.x}, ${v.y}"
     _      -> "no idea"
 
-distance(a: Point, b: Point) = ...
+print({ x: 3, y: 4 } is Point)
+print(describe({ centre: { x: 0, y: 0 }, radius: 2 }))
+print(describe({ x: 3, y: 4 }))
+print(describe("nothing"))
+```
+
+```output
+true
+a circle of radius 2
+the point 3, 4
+no idea
 ```
 
 **It is TypeScript's `type`** — the same declaration, the same structural reading, asking for *at
@@ -64,10 +72,20 @@ the compiler resolves and the value the name binds.
 An array pattern tests the elements it writes and lets the rest through — `["a", 2] is [string, ...]`
 is **true** — so a list of unknown length needs this:
 
-```
+```slate
 type Tags   = array of string
 type Counts = object of integer
 type Grid   = array of array of integer
+
+print(["a", "b"] is Tags, [1] is Tags, [] is Tags)
+print({ a: 1 } is Counts, { a: "x" } is Counts)
+print([[1, 2], [3]] is Grid)
+```
+
+```output
+true false true
+true false
+true
 ```
 
 **An empty container fits**, every element of nothing fitting anything. A floor is said with an
@@ -82,8 +100,18 @@ element.
 **A field the value need not have is marked `?`.** Present it must fit; absent the shape still holds —
 which a nullable union cannot say, `tag: string | null` still requiring the key to be there.
 
-```
+```slate
 type Note = { title: string, pinned?: boolean }
+
+print({ title: "a" } is Note)               // absent, and the shape still holds
+print({ title: "a", pinned: true } is Note)
+print({ title: "a", pinned: 1 } is Note)    // present, and does not fit
+```
+
+```output
+true
+true
+false
 ```
 
 **`=` is for a pattern that binds and `?` is for one that tests**, and each is refused where the other
@@ -91,9 +119,18 @@ belongs.
 
 A union may have `null` as an alternative, which is how a parameter says it will take nothing:
 
-```
+```slate
+type Point = { x: number, y: number }
 type MaybePoint = Point | null
 type Shape = { side: number } | { radius: number }
+
+print(null is MaybePoint, { x: 1, y: 2 } is MaybePoint, 3 is MaybePoint)
+print({ side: 1 } is Shape, { radius: 1 } is Shape, { area: 1 } is Shape)
+```
+
+```output
+true true false
+true true false
 ```
 
 ### `&`
@@ -101,11 +138,17 @@ type Shape = { side: number } | { radius: number }
 `&` is `|`'s dual and binds tighter, matching only where every part does. A value picks up fields on
 its way down through a stack of functions, and this is how the one at the bottom says what it receives:
 
-```
+```slate
 type Authed = { user: { id: integer } }
 type Bodied = { body: string }
 
-serve(req: Authed & Bodied) = req.user.id
+handle(req: Authed & Bodied) = req.user.id
+
+print(handle({ user: { id: 7 }, body: "hi" }))
+```
+
+```output
+7
 ```
 
 **A part may bind, where an alternative may not**: every part runs, so `{ a } & { b }` binding both is
@@ -115,20 +158,40 @@ sound.
 
 Per parameter, and per result:
 
-```
+```slate
 double(x: number) -> number = x * 2
 
-name(p: { id: number }) -> string = p.id     // error: this answers string, and gave back 7
+print(double(21))
+```
+
+```output
+42
+```
+
+A result that does not fit what was promised is a fault where the answer was written:
+
+```slate
+name(p: { id: number }) -> string = p.id
+
+print(name({ id: 7 }))
+```
+
+```error
+this answers string, and gave back 7
 ```
 
 A parameter's complaint lands where the value was handed over:
 
+```slate
+type Point = { x: number, y: number }
+
+d(b: Point) = b.x
+
+print(d({ x: 0 }))
 ```
-error: `d` takes { x: number, y: number } here, and this is { x: integer }
- --> app.sl:3:9
-  |
-3 | print(d({ x: 0 }))
-  |         ^^^^^^^^
+
+```error
+`d` takes { x: number, y: number } here, and this is { x: integer }
 ```
 
 **A lambda's parameter cannot be annotated**, and a lambda's result is read off its body — a lambda is
@@ -142,12 +205,18 @@ the one function with no way to say what it answers.
 type survives them and a mistake is caught where it is written — in either spelling, a method being
 checked as the free function it is:
 
-```
+```slate
 f(xs: array of string) = len(xs)
 
-f(filter(ns, n -> n > 1))       // error, where `ns` is an array of integer
-f(ns.filter(n -> n > 1))        // the same error
+h(ns: array of integer) = f(ns.filter(n -> n > 1))
 ```
+
+```error
+`f` takes array of string here, and this is array of integer
+```
+
+`f(filter(ns, n -> n > 1))` draws the same complaint, a method being checked as the free function it
+is.
 
 `map(ns, n -> string(n))` is an `array of string`, the lambda's result being read off its body.
 
@@ -158,10 +227,34 @@ comparator with two; `reduce` calls its function with a running value and an ele
 so**, so a lambda written at the call gets its parameters typed from the array beside it — and what it
 *does* with them is checked:
 
-```
-g(ss: array of string) = map(ss, s -> s * 2)    // error: `*` does not apply to string and integer
+```slate
 h(ns: array of integer) = map(ns, n -> n * 2)   // an array of integer, not of any
-sorted(ns, a -> a)                              // error: `sorted` takes (integer, integer) -> any
+
+print(h([1, 2, 3]))
+```
+
+```output
+[2, 4, 6]
+```
+
+What the callback *does* with what it was handed is checked:
+
+```slate
+g(ss: array of string) = map(ss, s -> s * 2)
+```
+
+```error
+`*` does not apply to string and integer
+```
+
+and so is its arity:
+
+```slate
+q(ns: array of integer) = sorted(ns, a -> a)
+```
+
+```error
+`sorted` takes (integer, integer) -> any here, and this is (integer) -> integer
 ```
 
 **None of that is generics and slate has no type variables.** A signature names an argument by
@@ -193,10 +286,18 @@ there is no `<T>` to write anywhere.
 Which is what makes the declaration the validator — nothing written twice, and no schema library to
 keep in step with it:
 
+```slate
+type Note = { title: string, pinned?: boolean }
+
+print(Note.test({ title: "a" }))
+print(Note.mismatch({ }))
+print(Note.name())
 ```
-Note.test(v)                // true where it fits
-Note.mismatch(v)            // [{ path: "title", wanted: "string", got: "nothing" }, ...]
-Note.name()                 // "Note"
+
+```output
+true
+[{path: "title", wanted: "string", got: "nothing"}]
+Note
 ```
 
 `mismatch` collects **every** reason rather than stopping at the first, because a person filling in a

@@ -2,7 +2,7 @@
 
 A package is named by an **unquoted** specifier:
 
-```
+```slate
 import { mount } from lath              // the package's own `main`
 import { domHost } from lath/dom        // one of its other modules
 ```
@@ -15,7 +15,7 @@ $ slate add github.com/slate-language/lath
 
 A project or a package is a directory holding a **`package.sl`**, which is a slate object literal:
 
-```
+```slate
 {
     name: "lath",
     version: "0.2.0",

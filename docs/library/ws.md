@@ -2,7 +2,7 @@
 
 WebSockets, written in slate over the [`slate:http`](http.md) upgrade seam.
 
-```
+```slate
 import { serve } from slate:http
 import { accept } from slate:ws
 

@@ -11,17 +11,20 @@ way, and elements are read in every file. It is a name for a reader and an edito
 A file with a `#!` line on its first byte is a command. slate skips that line and everything after
 the program's name on the command line belongs to the program:
 
-```
+```slate
 #!/usr/bin/env slate
 
 import { args, exit } from slate:process
 
 if args.len() == 0
     print("usage: greet <name>...")
-    exit(2)
 
 for name in args
     print("Hello, " + name + "!")
+```
+
+```output
+usage: greet <name>...
 ```
 
 `#!` is read at the very first byte and nowhere else. **`#` is not a comment in slate.**
@@ -40,10 +43,16 @@ be split across lines. Two tokens suspend that rule, and only where they end a l
 **`match`**. Either one at the end of a line opens a block even inside brackets, which is what lets a
 callback with a real body be written where it is passed:
 
-```
-each([1, 2, 3], x ->
+```slate
+forEach([1, 2, 3], x ->
     val doubled = x * 2
     print(x, doubled))
+```
+
+```output
+1 2
+2 4
+3 6
 ```
 
 An arrow written mid-line would hand the block to whatever line came next, so it does not open one.
@@ -55,10 +64,20 @@ and a `,` arriving there has nothing to mean.
 statements, not a sum. Where an expression has to span lines, brackets are what say so — inside them
 the off-side rule is suspended and the continuation is unambiguous:
 
-```
+```slate
+isShort(n) = len(n) < 4
+isKnown(n) = n == "ada"
+
+val name = "ada"
 val ok = (
     isShort(name) ||
     isKnown(name))
+
+print(ok)
+```
+
+```output
+true
 ```
 
 ## `end`, and the closing words
@@ -81,15 +100,28 @@ is refused with the long one named.
 
 ## Literals
 
+```slate
+val text = "it"
+
+print(null, true, false)
+print(42, -7, 1_000_000)
+print(0xff, 0b1011, 0o17)
+print(3.14, 2e10, 1e-3)
+print("text", s"interpolated ${text}")
+print([1, 2, 3], [0; 5])
+print({ a: 1, b: 2 })
+print(0..<3, 1..10)
 ```
-null            true    false
-42              -7      1_000_000
-0xff            0b1011  0o17
-3.14            2e10    1e-3
-"text"          s"interpolated ${text}"
-[1, 2, 3]       [0; 5]
-{ a: 1, b: 2 }  { a }
-0..<n           1..10
+
+```output
+null true false
+42 -7 1000000
+255 11 15
+3.14 2e+10 0.001
+text interpolated it
+[1, 2, 3] [0, 0, 0, 0, 0]
+{a: 1, b: 2}
+0..<3 1..10
 ```
 
 An integer may be written in hexadecimal, binary or octal, and `_` may be written between digits of
@@ -109,13 +141,26 @@ no single-quoted form and no character type — **a single character is a string
 
 An **s-string** interpolates:
 
+```slate
+val w = 3
+val h = 4
+val point = { x: 7 }
+
+print(s"${w} by ${h}")
+print(s"$w by $h")           // the same thing
+print(s"$point.x")           // interpolates `point`, then `.x` is text
+print(s"${point.x}")         // says the other thing
+print(s"costs 5$")           // a `$` that begins no name is just itself
+print(s"$$")                 // a literal `$`
 ```
-s"${w} by ${h}"
-s"$w by $h"                  // the same thing
-s"$point.x"                  // interpolates `point`, then `.x` is text
-s"${point.x}"                // says the other thing
-s"costs 5$"                  // a `$` that begins no name is just itself
-s"$$"                        // a literal `$`
+
+```output
+3 by 4
+3 by 4
+{x: 7}.x
+7
+costs 5$
+$
 ```
 
 **A hole that is a single name needs no braces.** The short form is identifier-only and stops at the

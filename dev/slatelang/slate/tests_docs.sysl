@@ -1,0 +1,341 @@
+module dev.slatelang.slate
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{entries, is_dir, read_bytes}
+import sysl.slices.sort_by
+import sysl.text.{Search, from_utf8, split, str_builder}
+
+// The programs printed in `docs/` are run, and what they print is compared against what the page
+// says they print.
+//
+// **A reference rots silently.** Nothing in an ordinary build reads it, so a page goes on claiming
+// what the language did a year ago and the first person to find out is a reader who typed it in and
+// got a diagnostic. That failure is worse than no page at all: it costs the reader their confidence
+// that anything else on the site is true either. Writing these pages found four claims the README
+// had been making for weeks that did not run, and not one of them would have been caught by reading.
+//
+// **So a fenced block is not a picture of a program, it IS the program.** Which one it is comes from
+// what follows it, which is also how it reads to somebody scrolling past:
+//
+//   - a `slate` block followed by an `output` block is a whole program, and the output block is what
+//     it prints -- run, and compared;
+//   - a `slate` block followed by an `error` block is a program slate **refuses**, and the error
+//     block is what it says -- run, required to fail, and the diagnostic required to contain that
+//     text;
+//   - a `slate` block with neither under it is a fragment, quoted for its shape, and is not run.
+//
+// **The refusals matter as much as the acceptances.** A language is defined as much by what it will
+// not let you write, and a page showing only working code teaches half of it.
+//
+// **A fragment is as unverified as the prose beside it and looks exactly like a checked block to a
+// reader.** That is the hole this design has, and `EVERY_PAGE_CARRIES_THE_BLOCKS_IT_IS_EXPECTED_TO`
+// is what keeps it from widening: the counts are written down per page, so a block that quietly
+// loses its `output` shows up as a page whose runnable count fell.
+
+// -- what a block claims about itself ---------------------------------------------------------------
+
+// What a `slate` block on a page claims about itself.
+private enum Claim
+    // A whole program, and what running it prints.
+    Prints(text: string)
+
+    // A program slate refuses, and what its diagnostic says.
+    Refused(message: string)
+
+    // A fragment, quoted to make a point about shape. Nothing is asserted about it.
+    Quoted
+end Claim
+
+// A fenced block as the markdown holds it: the word after the backticks, and the body.
+private struct Fence
+    lang: string
+    body: string
+end Fence
+
+// One `slate` block, with where it came from -- a failure has to be able to name the page and the
+// position on it, because a reader of the failure has only the page to go and fix.
+private struct Snippet
+    page: string
+
+    // Which `slate` block on the page this is, counting from one.
+    //
+    // **Counted over the `slate` fences alone, not over every fence**: the number a failure quotes is
+    // the number a reader counts on the page, and they do not count the `output` and `error` blocks.
+    nth: usize
+
+    source: string
+    claim: Claim
+
+    display(self) -> string = s"${self.page}, slate block ${self.nth}"
+end Snippet
+
+// -- reading the pages -------------------------------------------------------------------------------
+
+private val DocsRoot: string = "docs"
+
+// Every markdown page under `docs/`, in the order a reader would meet them.
+//
+// **The path is relative to the project root**, which is where `sysl test .` runs -- the same
+// arrangement `ran_clean` uses for the examples, and the same failure if it is run from anywhere
+// else. The message says so rather than naming the file it could not open.
+private doc_pages() -> Buf[string]
+    var out: Buf[string] = buf()
+
+    walk_docs(DocsRoot, &out)
+    out
+end doc_pages
+
+private walk_docs(dir: string, out: *Buf[string])
+    var names = entries(dir).unwrap()
+    var dirs: Buf[string] = buf()
+
+    // **Sorted, because the census below is compared as text.** A directory answers in whatever
+    // order it feels like, so an unsorted walk would make the expected string a record of one
+    // machine's file system rather than of what the pages hold.
+    sort_by(names.view(), (a, b) -> a < b)
+
+    // Files first and then directories, deepest last, so a list of failures reads in page order
+    // rather than in whatever order the file system answered.
+    for i in 0..<names.len()
+        val path = s"${dir}/${names.at(i)}"
+
+        if is_dir(path) then dirs.push(path)
+        elif names.at(i).ends_with(".md") then out.push(path)
+
+    for i in 0..<dirs.len()
+        walk_docs(dirs.at(i), out)
+end walk_docs
+
+// The fenced blocks of a markdown document, in order.
+//
+// **Only a fence at the left margin opens a block.** An indented one is inside a list item or a
+// block quote, where the surrounding prose owns it -- and a program indented under a bullet is being
+// quoted by the prose rather than offered as something to run.
+private fences_of(text: string) -> Buf[Fence]
+    var out: Buf[Fence] = buf()
+    val lines = split(text, "\n")
+    var open = false
+    var lang = ""
+    var body = str_builder()
+
+    for i in 0..<lines.len
+        val line = lines[i]
+
+        if line.starts_with("```")
+            if open
+                out.push(Fence(lang, body.finish()))
+                body = str_builder()
+                open = false
+            else
+                // The word after the backticks and nothing else. Whatever follows it on that line is
+                // a highlighter's business rather than this harness's.
+                val info = lines[i].slice(3, line.len)
+                val cut = info.index_of(" ")
+
+                lang = if cut.is_none() then info else info.slice(0, cut.unwrap())
+                open = true
+        elif open
+            body.push(line)
+            body.push("\n")
+
+    out
+end fences_of
+
+// The `slate` blocks of one page, each paired with what the page claims about it.
+private snippets_of(page: string) -> Buf[Snippet]
+    val text = from_utf8(read_bytes(page).unwrap()).unwrap()
+    val fences = fences_of(text)
+    var out: Buf[Snippet] = buf()
+
+    for i in 0..<fences.len()
+        if fences.at(i).lang == "slate"
+            out.push(Snippet(page, out.len() + 1, fences.at(i).body, claim_after(fences, i + 1)))
+
+    out
+end snippets_of
+
+// What the fences after a `slate` block say about it: the first `output` or `error` block to appear
+// before the next `slate` block.
+//
+// **Not simply the very next fence**, because a page reads *program, how to run it, what it prints*
+// -- with a shell block in the middle -- and a rule that could not see past that would push a writer
+// into an order that suits the harness. What the rule does refuse is an `output` block belonging to a
+// *later* program: the search stops at the next `slate` block, so a claim can never be attached to
+// the wrong one.
+private claim_after(fences: Buf[Fence], from: usize) -> Claim
+    for i in from..<fences.len()
+        val f = fences.at(i)
+
+        if f.lang == "slate" then break
+        if f.lang == "output" then return Prints(f.body)
+        if f.lang == "error" then return Refused(f.body)
+
+    Quoted
+end claim_after
+
+// -- checking one block -------------------------------------------------------------------------------
+
+// Checks one snippet, answering the complaint if it has one.
+//
+// **Every snippet answers rather than asserting, so one run reports every page that has drifted**
+// instead of the first. A reference breaks in groups -- one language change invalidates the six
+// pages that lean on it -- and a suite that stopped at the first would take six runs to find them.
+private check_snippet(s: Snippet) -> string
+    s.claim match
+        Quoted -> ""
+
+        Prints(expected) ->
+            val r = run(source_of(s.page, s.source))
+
+            if !r.ok()
+                s"${s.display()}: the page says this runs, and it did not:\n${doc_indent(r.render())}"
+            elif tidied(r.printed()) != tidied(expected)
+                val said = s"page:\n${doc_indent(expected)}\nprogram:\n${doc_indent(r.printed())}"
+
+                s"${s.display()}: what it printed is not what the page says.\n${said}"
+            else
+                ""
+
+        Refused(expected) ->
+            val r = run(source_of(s.page, s.source))
+
+            if r.ok()
+                s"${s.display()}: the page says slate refuses this, and it ran"
+            elif !r.render().contains(expected.trim())
+                val said = s"page:\n${doc_indent(expected)}\nslate:\n${doc_indent(r.render())}"
+
+                s"${s.display()}: it was refused, but not in the words the page quotes.\n${said}"
+            else
+                ""
+end check_snippet
+
+// Trailing whitespace is not a claim a page is making. A markdown fence keeps a final newline the
+// writer did not type and cannot see, so comparing raw text would fail every block for a reason no
+// reader could act on.
+private tidied(text: string) -> string
+    val lines = split(text, "\n")
+    var b = str_builder()
+
+    for i in 0..<lines.len
+        if i > 0 then b.push("\n")
+
+        b.push(lines[i].trim_end())
+
+    b.finish().trim()
+end tidied
+
+private doc_indent(text: string) -> string
+    val lines = split(text, "\n")
+    var b = str_builder()
+
+    for i in 0..<lines.len
+        if i > 0 then b.push("\n")
+
+        b.push("    ")
+        b.push(lines[i])
+
+    b.finish()
+end doc_indent
+
+// -- the tests ----------------------------------------------------------------------------------------
+
+@test
+EVERY_PROGRAM_IN_THE_DOCUMENTATION_RUNS_AND_PRINTS_WHAT_THE_PAGE_SAYS()
+    val pages = doc_pages()
+    var complaints: Buf[string] = buf()
+    var checked: usize = 0
+
+    for i in 0..<pages.len()
+        val snippets = snippets_of(pages.at(i))
+
+        for j in 0..<snippets.len()
+            val s = snippets.at(j)
+            val said = check_snippet(s)
+
+            if said != "" then complaints.push(said)
+
+            s.claim match
+                Quoted -> ()
+                _ -> checked += 1
+
+    var b = str_builder()
+
+    for i in 0..<complaints.len()
+        b.push("\n")
+        b.push(complaints.at(i))
+        b.push("\n")
+
+    assert_eq(b.finish(), "")
+
+    // **Finding nothing to run would leave this green having tested nothing**, which is the failure a
+    // walk can have and a written list cannot.
+    assert(checked >= 60)
+
+@test
+EVERY_PAGE_CARRIES_THE_BLOCKS_IT_IS_EXPECTED_TO()
+    // **A fragment is compiled by nothing and looks exactly like a checked block to a reader**, so
+    // the one way this harness quietly stops working is a block losing the `output` under it. The
+    // counts are therefore written down: `page -> runnable refused fragment`. A page that gains a
+    // checked block fails this until the number is raised, which is the point -- the number is what
+    // says somebody looked.
+    val pages = doc_pages()
+    var b = str_builder()
+
+    for i in 0..<pages.len()
+        val snippets = snippets_of(pages.at(i))
+        var runnable: usize = 0
+        var refused: usize = 0
+        var fragments: usize = 0
+
+        for j in 0..<snippets.len()
+            snippets.at(j).claim match
+                Prints(_) -> runnable += 1
+                Refused(_) -> refused += 1
+                Quoted -> fragments += 1
+
+        b.push(s"${pages.at(i)} ${runnable} ${refused} ${fragments}\n")
+
+    assert_eq(b.finish(), DocBlockCensus)
+
+// What every page holds, as `path runnable refused fragment`.
+//
+// **94 runnable, 14 refused, 30 fragments.** The fragments are nearly all in
+// `docs/library/`, where a block needs a socket, a scratch directory or a browser to run -- and every
+// one in `docs/reference/` is a shape quoted to make a point about spelling rather than a program.
+private val DocBlockCensus: string = "docs/README.md 0 0 0\n" +
+    "docs/library/README.md 0 0 0\n" +
+    "docs/library/brotli.md 1 0 0\n" +
+    "docs/library/crypto.md 1 0 0\n" +
+    "docs/library/dom.md 0 0 1\n" +
+    "docs/library/fs.md 0 0 2\n" +
+    "docs/library/globals.md 3 0 1\n" +
+    "docs/library/http.md 0 0 4\n" +
+    "docs/library/jwt.md 0 0 1\n" +
+    "docs/library/llhttp.md 0 0 1\n" +
+    "docs/library/net.md 0 0 4\n" +
+    "docs/library/password.md 1 0 0\n" +
+    "docs/library/process.md 1 0 3\n" +
+    "docs/library/redis.md 0 0 1\n" +
+    "docs/library/regex.md 1 1 0\n" +
+    "docs/library/time.md 4 2 3\n" +
+    "docs/library/ws.md 0 0 1\n" +
+    "docs/reference/README.md 0 0 0\n" +
+    "docs/reference/asynchrony.md 3 1 0\n" +
+    "docs/reference/classes.md 8 2 0\n" +
+    "docs/reference/data-types.md 3 0 0\n" +
+    "docs/reference/elements.md 0 0 2\n" +
+    "docs/reference/expressions.md 10 0 0\n" +
+    "docs/reference/faults.md 3 1 0\n" +
+    "docs/reference/functions.md 9 0 0\n" +
+    "docs/reference/javascript.md 0 0 0\n" +
+    "docs/reference/lexical.md 5 0 0\n" +
+    "docs/reference/modules.md 1 0 2\n" +
+    "docs/reference/objects.md 7 0 0\n" +
+    "docs/reference/packages.md 0 0 2\n" +
+    "docs/reference/patterns.md 11 2 0\n" +
+    "docs/reference/statements.md 8 0 1\n" +
+    "docs/reference/tests.md 0 0 1\n" +
+    "docs/reference/types.md 8 5 0\n" +
+    "docs/reference/values.md 6 0 0\n"

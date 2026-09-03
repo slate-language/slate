@@ -2,13 +2,22 @@
 
 Argon2id — the one hash in slate meant to be slow.
 
+```slate
+import { hash, check, needsRehash } from slate:password
+
+val stored = hash("correct horse")      // a PHC record, 19 MiB and two passes
+
+print(startsWith(stored, "$argon2id$"))
+print(check(stored, "correct horse"))
+print(check(stored, "wrong"))
+print(needsRehash(stored))
 ```
-import { hash, hashStrong, check, needsRehash } from slate:password
 
-val stored = hash(password)             // a PHC record, 19 MiB and two passes
-
-if check(stored, attempt)
-    if needsRehash(stored) then store(hash(attempt))
+```output
+true
+true
+false
+false
 ```
 
 | | |

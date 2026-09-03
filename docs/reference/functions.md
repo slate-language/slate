@@ -3,7 +3,7 @@
 **There is no keyword on a function.** The shape is what identifies it: a name, a parameter list in
 brackets, and then either `=` and an expression or an indented block.
 
-```
+```slate
 double(x) = x * 2
 
 add(a, b)
@@ -15,6 +15,12 @@ grade(mark)
     else
         "C"
 end grade
+
+print(double(21), add(1, 2), grade(95), grade(20))
+```
+
+```output
+42 3 A C
 ```
 
 A block's value is its trailing expression, so `return` is for leaving early and nothing else.
@@ -22,7 +28,7 @@ A block's value is its trailing expression, so `return` is for leaving early and
 Functions are values. A definition binds a name in the scope it is written in, so a nested definition
 is a closure over that scope:
 
-```
+```slate
 counter()
     var count = 0
 
@@ -33,17 +39,28 @@ counter()
     bump
 
 val c = counter()
-print(c(), c(), c())            // 1 2 3
+
+print(c(), c(), c())
+```
+
+```output
+1 2 3
 ```
 
 ## Lambdas
 
 `->` with the parameters on its left:
 
+```slate
+val double = x -> x * 2
+val add = (a, b) -> a + b
+val zero = () -> 0
+
+print(double(21), add(1, 2), zero())
 ```
-x -> x * 2
-(a, b) -> a + b
-() -> 0
+
+```output
+42 3 0
 ```
 
 `->` is the one right-associative operator, so `x -> y -> x + y` is a function answering a function.
@@ -52,10 +69,16 @@ x -> x * 2
 normally means nothing, so a callback would otherwise have to be lifted out and named before the call
 that wanted it:
 
-```
-each([1, 2, 3], x ->
+```slate
+forEach([1, 2, 3], x ->
     val doubled = x * 2
     print(x, doubled))
+```
+
+```output
+1 2
+2 4
+3 6
 ```
 
 `->` and `match` are the two tokens that suspend the bracket rule, and only where they end a line.
@@ -70,10 +93,19 @@ A lambda's parameter cannot be annotated. What it answers is read off its body â
 A parameter may carry what it is when nobody gives one, on a definition, a lambda, a method, or a
 class's `new`. The annotation comes first and the default after it:
 
-```
+```slate
 greet(name, greeting = "hello") = greeting + ", " + name
-log(message, level = "info", at = now()) = ...
 f(n: integer = 0) = n
+
+print(greet("ada"))
+print(greet("ada", "hi"))
+print(f(), f(7))
+```
+
+```output
+hello, ada
+hi, ada
+0 7
 ```
 
 **The default is worked out at the call, not where the function was written.** Everything else follows
@@ -96,10 +128,18 @@ therefore passes `null` and does **not** take the default â€” which is the simpl
 
 An argument may say which parameter it fills, which is what makes a default in the *middle* reachable:
 
+```slate
+greet(name, greeting = "hello", punct = "!") = greeting + ", " + name + punct
+
+print(greet("ada"))
+print(greet("ada", punct = "?"))            // greeting skipped
+print(greet(greeting = "hi", name = "ada"))
 ```
-greet("ada")
-greet("ada", punct = "?")           // greeting skipped
-greet(greeting = "hi", name = "ada")
+
+```output
+hello, ada!
+hello, ada?
+hi, ada!
 ```
 
 **`=` and not `:`**, because the declaration already writes the default after an equals. Assignment is
@@ -118,12 +158,19 @@ lists the parameters it does have.
 
 A function may gather what is left over:
 
-```
+```slate
 total(first, ...others) = reduce(others, (a, b) -> a + b, first)
+val xs = [1, 2, 3]
 
-total(1)                    // 1
-total(1, 2, 3)              // 6
-total(...xs)                // the spread it is the counterpart of
+print(total(1))
+print(total(1, 2, 3))
+print(total(...xs))         // the spread it is the counterpart of
+```
+
+```output
+1
+6
+6
 ```
 
 **`...rest` is always bound**, to an empty array where a call gave nothing past the fixed parameters,
@@ -134,9 +181,15 @@ default *before* it is fine.
 
 A parameter may take its argument apart, on a definition or a lambda:
 
-```
+```slate
 f({ n }) = n * 2
-({ n }) -> n * 2
+val g = ({ n }) -> n + 1
+
+print(f({ n: 21 }), g({ n: 1 }))
+```
+
+```output
+42 2
 ```
 
 The pattern is any [pattern](patterns.md) that binds.
@@ -145,10 +198,17 @@ The pattern is any [pattern](patterns.md) that binds.
 
 Per parameter, and per result:
 
-```
-distance(a: Point, b: Point) = ...
+```slate
+type Point = { x: number, y: number }
+
 double(x: number) -> number = x * 2
-f(a, b: Point, c) = ...             // nothing has to be annotated for anything to be
+f(a, b: Point, c) = b.x + a + c     // nothing has to be annotated for anything to be
+
+print(double(3), f(1, { x: 2, y: 0 }, 3))
+```
+
+```output
+6 6
 ```
 
 An annotation is checked **at the call** for a parameter, and where the function answers for a result.

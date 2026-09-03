@@ -2,7 +2,7 @@
 
 TCP, and TLS at both ends.
 
-```
+```slate
 import { listen, connect, onData, onError, send, close, localPort, startTls } from slate:net
 
 val server = listen(0, conn ->
@@ -80,7 +80,7 @@ A listener told a certificate hands out connections whose bytes are already decr
 [`slate:http`](http.md) — and any other protocol written over these sockets — is an HTTPS server without
 learning that TLS exists:
 
-```
+```slate
 val server = listen({ port: 8443, cert: pem, key: keyPem }, conn -> …)
 ```
 
@@ -91,7 +91,7 @@ left out. `alpn` beside them offers a protocol list.
 
 **The other end is `startTls`, which upgrades a socket that is already open:**
 
-```
+```slate
 async main()
     val db = (await connect("db.example.com", 5432)).value
 
@@ -110,7 +110,7 @@ covers both where a flag would have covered neither.
 
 **A server upgrades its end the same way**, with the certificate and key `listen` would have taken:
 
-```
+```slate
 startTls(conn, { cert: pem, key: keyPem })
 ```
 

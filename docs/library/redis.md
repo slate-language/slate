@@ -2,7 +2,7 @@
 
 A Redis client on the event loop.
 
-```
+```slate
 import { redis } from slate:redis
 
 val r = (await redis("127.0.0.1", 6379)).value

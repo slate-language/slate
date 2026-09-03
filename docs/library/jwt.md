@@ -2,7 +2,7 @@
 
 JSON Web Tokens, written in slate.
 
-```
+```slate
 import { sign, verify, decode } from slate:jwt
 
 val token = sign({ sub: "alice", exp: when + 3600 }, secret, "HS256")

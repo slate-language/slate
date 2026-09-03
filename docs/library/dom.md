@@ -3,7 +3,7 @@
 The document. **The one module that works in one host out of three** — it is real only in a browser,
 reached through [`slate js`](../reference/javascript.md).
 
-```
+```slate
 import { byId, setText, on } from slate:dom
 ```
 

@@ -2,19 +2,35 @@
 
 An object is a collection of fields.
 
+```slate
+print({ name: "ada", born: 1815 })
+print({ "two words": 1 })
+print({})
 ```
-{ name: "ada", born: 1815 }
-{ name }                        // shorthand for `{ name: name }`
-{ "two words": 1 }
+
+```output
+{name: "ada", born: 1815}
+{"two words": 1}
+{}
 ```
+
+**Every field is written `key: value`.** There is no `{ name }` shorthand in a literal — that spelling
+belongs to an [object pattern](patterns.md), where it means *bind the field `name` to the name `name`*,
+and a literal reading it the other way round would make one notation mean two things.
 
 **A key in a literal is a name or a string**, and nothing else — a number there is a parse error. A key
 written through an index may be **any value**, and stays that value:
 
-```
+```slate
 var q = {}
+
 q[42] = "answer"
-print(q)                        // {42: "answer"}
+
+print(q, q[42])
+```
+
+```output
+{42: "answer"} answer
 ```
 
 That is why [`toJSON`](../library/globals.md) refuses a non-string key rather than rendering it: `{ 1: "a" }`
@@ -25,9 +41,19 @@ Objects are reference types and [compare by their contents](values.md).
 `keys(o)`, `values(o)`, `entries(o)` and `has(o, k)` are how a program walks one; `entries` is what
 makes a destructuring `for` head worth having:
 
-```
+```slate
+val o = { a: 1, b: 2 }
+
+print(keys(o), values(o), has(o, "a"))
+
 for [k, v] in entries(o)
     print(k, v)
+```
+
+```output
+["a", "b"] [1, 2] true
+a 1
+b 2
 ```
 
 `o with { f: v }` answers a **copy** with `f` changed. There is no spread in a literal — `with` is it.
@@ -36,7 +62,7 @@ for [k, v] in entries(o)
 
 **`proto` is an ordinary field, and a lookup that misses carries on into it:**
 
-```
+```slate
 val Shape = {
     describe: self -> s"${self.kind} with area ${self.area()}",
     kind: "shape"
@@ -46,7 +72,11 @@ val Square = { proto: Shape, kind: "square", area: self -> self.side * self.side
 
 square(side) = { side: side, proto: Square }
 
-print(square(4).describe())     // square with area 16
+print(square(4).describe())
+```
+
+```output
+square with area 16
 ```
 
 **No syntax and no new kind of value.** A proto may have a proto, so chains and overriding come free;
@@ -68,8 +98,8 @@ parameter.
 
 **A method stored on the object itself has already captured what it needs and is given nothing extra:**
 
-```
-counter() =
+```slate
+counter()
     var n = 0
     var c = {}
 
@@ -78,6 +108,14 @@ counter() =
         n
 
     c
+
+val c = counter()
+
+print(c.bump(), c.bump())
+```
+
+```output
+1 2
 ```
 
 That is not two rules but one: **captured methods take no receiver, shared ones must.**
@@ -90,7 +128,7 @@ off an object and calling it later is allowed and gives you what you took.
 An object may answer for an operator. The word is the method's name, and a [class](classes.md) body
 writes one with the definition syntax it already has:
 
-```
+```slate
 class Money
     var cents
 
@@ -98,6 +136,19 @@ class Money
     times(self, n)   = Money(self.cents * n)
     negated(self)    = Money(-self.cents)
     compare(self, o) = self.cents - o.cents      // `<`, `<=`, `>` and `>=` read its sign
+
+    toString(self)   = "$" + string(self.cents / 100)
+
+val a = Money(150)
+val b = Money(50)
+
+print(a + b, a * 2, -a)
+print(a < b, a > b)
+```
+
+```output
+$2 $3 $-1
+false true
 ```
 
 | hook | operator |
@@ -128,15 +179,20 @@ in a table.
 A class may say how it **prints** and how it **encodes**, which is what a value object needs to stop
 leaking the fields it is made of:
 
-```
+```slate
 class Money
     var cents
 
     toString(self) = "$" + string(self.cents / 100)
     toJSON(self)   = string(self.cents / 100)
 
-print(Money(150))                       // $1
-print(toJSON({ paid: Money(150) }))     // {"paid":"1"}
+print(Money(150))
+print(toJSON({ paid: Money(150) }))
+```
+
+```output
+$1
+{"paid":"1"}
 ```
 
 **Both replace everything below them at every depth**, so a value inside an array or a response body

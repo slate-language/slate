@@ -20,7 +20,7 @@ pattern position test rather than bind. Ordinary `val date = …` is unaffected.
 
 ## Making one
 
-```
+```slate
 import { now, monotonic, date, time, dateTime, zone, localZone, utc } from slate:time
 
 now()                       // an instant
@@ -37,7 +37,7 @@ utc                         // a VALUE, not a call -- the one zone that cannot f
 
 **Durations** are `micros millis seconds minutes hours days weeks`; **periods** are `months years`.
 
-```
+```slate
 seconds(90)                 // a duration
 months(3)                   // a period
 2.hours()                   // the same length, as a method
@@ -48,11 +48,25 @@ months(3)                   // a period
 **This is the distinction that earns the type count.** A duration is exact timeline and may be added to
 anything; a period is months and days and may be added only to a calendar reading.
 
+```slate
+import { date, days, months, weeks } from slate:time
+
+val d = date(2026, 3, 7)
+
+print(d + days(1))
+print(d + months(1))
+print(months(1).days(), weeks(2).days())
 ```
-zoned + days(1)             // keeps the wall clock across a daylight-saving change
-zoned + hours(24)           // does not
-instant + days(1)           // REFUSED -- an instant has no calendar
+
+```output
+2026-03-08
+2026-04-07
+0 14
 ```
+
+`zoned + days(1)` keeps the wall clock across a daylight-saving change and `zoned + hours(24)` does
+not — both right, and the program says which. `instant + days(1)` is **refused**, an instant having no
+calendar.
 
 Both are right, and the program says which.
 
@@ -63,15 +77,22 @@ days, so any other answer is wrong somewhere. There is deliberately no `days` on
 
 **One word per unit, and the receiver decides the question. Plural is a length, singular is a part.**
 
+```slate
+import { date, hours, seconds, year, month, day, weekday, daysInMonth, isLeapYear } from slate:time
+
+val d = date(2026, 9, 2)
+
+print(year(d), month(d), day(d))
+print(d.year(), weekday(d), daysInMonth(d), isLeapYear(d))
+print(2.hours(), seconds(90))
+print(hours(3).minutes())       // how many whole minutes it is
 ```
-years(3)                    // a period of three years
-year(d)                     // which year `d` is in
 
-2.hours()                   // makes a length
-d.hours()                   // asks how many whole hours `d` is
-
-date(y, m, d)               // builds
-date(z)                     // reads one off a zoned value
+```output
+2026 9 2
+2026 Wednesday 30 false
+2h 1m 30s
+180
 ```
 
 `year month day hour minute second weekday monthName dayOfYear daysInMonth isLeapYear`.
@@ -80,7 +101,7 @@ date(z)                     // reads one off a zoned value
 
 **`at` is the one word for reading one thing in terms of another:**
 
-```
+```slate
 instant.at(zone)
 zoned.at(zone)
 date.at(time)
@@ -96,9 +117,28 @@ next weekday.
 
 ## The two channels
 
+```slate
+import { parseDate } from slate:time
+
+print(parseDate("2026-09-02"))
+print(parseDate("2026-02-30"))      // text from outside is a RESULT
 ```
-date(2026, 2, 30)           // a FAULT -- three numbers the program wrote
-parseDate("2026-02-30")     // a RESULT -- text from outside
+
+```output
+{ok: true, value: 2026-09-02}
+{ok: false, error: "cannot read \"2026-02-30\" as a date: day is out of range"}
+```
+
+Three numbers the program wrote are a **fault**, the other half of the same rule:
+
+```slate
+import { date } from slate:time
+
+print(date(2026, 2, 30))
+```
+
+```error
+there is no such date
 ```
 
 `parseDate`, `parseTime`, `parseDateTime` and `parseTimestamp`. **There is no `Invalid Date` and nothing
@@ -112,10 +152,32 @@ line in the same place.
 
 ## `format`
 
-moment-flavoured, with `|bars|` around literal text:
+moment-flavoured, with `|bars|` around literal text and `WWWW` where moment writes `dddd`:
 
+```slate
+import { dateTime, utc } from slate:time
+
+val t = dateTime(2026, 9, 2, 14, 30, 0).at(utc).value
+
+print(t.format("YYYY-MM-DDThh:mm:ssZ"))
+print(t.format("|on| WWWW, MMMM D, YYYY"))
 ```
-now().at(utc).format("YYYY-MM-DDThh:mm:ss.fffZ")
+
+```output
+2026-09-02T14:30:00Z
+on Wednesday, September 2, 2026
+```
+
+An element the value does not have is refused, never zero-filled:
+
+```slate
+import { date } from slate:time
+
+print(date(2026, 9, 2).format("hh:mm"))
+```
+
+```error
+hh
 ```
 
 **An element the value does not have is refused, never zero-filled.** `date.format("hh:mm")` says a date

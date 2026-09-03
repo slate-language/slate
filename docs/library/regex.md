@@ -3,18 +3,40 @@
 PCRE2 patterns. **One export, because a pattern is one object and everything a program does with it is a
 method on that object.**
 
-```
+```slate
 import { regex } from slate:regex
 
-val re = regex("(\\d+)-(\\d+)", "i")
+val re = regex("(\\d+)-(\\d+)")
+val text = "a 10-20 b 30-40"
 
-print(re.test("10-20"))
-print(re.find("x 10-20 y").groups)          // ["10-20", "10", "20"]
-print(re.findAll(text))
+print(re.test(text))
+print(re.find(text).groups)
+print(re.find(text).start, re.find(text).end)
 print(re.replace(text, "$2-$1"))
 print(re.replaceFirst(text, "x"))
-print(re.split(text))
-print(re.pattern(), re.flags())
+print(re.pattern())
+```
+
+```output
+true
+["10-20", "10", "20"]
+2 7
+a 20-10 b 40-30
+a x b 30-40
+(\d+)-(\d+)
+```
+
+Asking for a `g` flag is refused by name, since a flag silently ignored would make `replace` look like
+it had worked for the wrong reason:
+
+```slate
+import { regex } from slate:regex
+
+print(regex("a", "g"))
+```
+
+```error
+g
 ```
 
 The flags are `i`, `m`, `s` and `x`.

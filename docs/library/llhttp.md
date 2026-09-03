@@ -2,7 +2,7 @@
 
 The HTTP parser itself — the state machine under [`slate:http`](http.md).
 
-```
+```slate
 import { httpParser, httpFeed, httpTake } from slate:llhttp
 ```
 

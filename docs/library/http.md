@@ -2,7 +2,7 @@
 
 An HTTP server, written in slate over [`slate:net`](net.md).
 
-```
+```slate
 import { serve, close } from slate:http
 
 val server = serve(8080, req -> "hello")
@@ -44,7 +44,7 @@ server read one, `keepAlive`, `upgrade`.
 
 A handler answers a string, an object, or an **array of bytes**:
 
-```
+```slate
 serve(3000, req -> "hello")
 serve(3000, req -> { status: 201, headers: { "X-Kind": "note" }, body: toJSON(v) })
 serve(3000, req -> { headers: { "Content-Type": "image/png" }, body: pngBytes })
@@ -62,7 +62,7 @@ repeat.
 The handler is called as soon as a request's **head** is complete and is given the body as it arrives, so
 the memory a request costs stops depending on how big the request is:
 
-```
+```slate
 serveStream(3000, async (req) ->
     var total = 0
 
@@ -84,7 +84,7 @@ order, the same clock.
 **A router is an ordinary object holding functions, and `serve` asks an object for its `handle`** — so
 `serve(3000, app)` works and nothing in the server knows what routing is.
 
-```
+```slate
 val app = router()
 
 app.get("/notes/:id", req -> find(req.params.id))

@@ -28,10 +28,16 @@ separate values: a guard about arithmetic would otherwise have to be written twi
 
 **Only `false` and `null` are false.** Zero, the empty string and the empty array are all true.
 
+```slate
+print(if 0 then "true" else "false")
+print(if "" then "true" else "false")
+print(if [] then "true" else "false")
 ```
-if 0 then "t" else "f"      // "t"
-if "" then "t" else "f"     // "t"
-if [] then "t" else "f"     // "t"
+
+```output
+true
+true
+true
 ```
 
 ## Equality
@@ -39,9 +45,12 @@ if [] then "t" else "f"     // "t"
 `==` compares **by value, all the way down**. Two arrays holding the same elements are equal; two
 objects holding the same fields are equal.
 
+```slate
+print([1, 2] == [1, 2], { a: 1 } == { a: 1 })
 ```
-[1, 2] == [1, 2]            // true
-{ a: 1 } == { a: 1 }        // true
+
+```output
+true true
 ```
 
 **An integer and a real compare across the kinds**, so `1 == 1.0` is true — but `1 is integer` and
@@ -58,18 +67,25 @@ A [class](classes.md) may take `==` over for its own instances by writing `equal
 
 **An integer is 64 bits and wraps**; it does not promote to a real and does not become a big integer.
 
+```slate
+print(9223372036854775807 + 1)
+print(1 << 40)
 ```
-9223372036854775807 + 1     // -9223372036854775808
-1 << 40                     // 1099511627776
+
+```output
+-9223372036854775808
+1099511627776
 ```
 
 **`/` between two integers divides towards zero** and answers an integer; `%` takes the sign of the
 left operand. Where either operand is a real the answer is a real.
 
+```slate
+print(7 / 2, 7.0 / 2, -7 / 2)
 ```
-7 / 2                       // 3
-7.0 / 2                     // 3.5
--7 / 2                      // -3
+
+```output
+3 3.5 -3
 ```
 
 **A real that is whole prints as an integer does.** `string(1.0)` is `"1"`. Only `%`, indexing, or a
@@ -80,11 +96,18 @@ kind test can tell the two apart, so a function that must answer an integer is w
 **A slate string is a sequence of characters**, so every position, length and slice is counted the way
 a person counts:
 
+```slate
+print(len("日本語"))
+print("日本語"[0..<1])
+print("héllo"[1])
+print(indexOf("héllo", "llo"))      // by character; it is 3 by byte
 ```
-len("日本語")               // 3
-"日本語"[0..<1]             // 日
-"héllo"[1]                  // é
-indexOf("héllo", "llo")     // 2 -- by character; it is 3 by byte
+
+```output
+3
+日
+é
+2
 ```
 
 There is no character type: a single character is a string of one. That is what lets indexing, `chars`
@@ -100,12 +123,16 @@ are the only place a slate program sees UTF-8, and `len(toBytes(s))` is the byte
 **The type words are the conversions.** `string`, `number`, `integer`, `real` and `boolean` each test
 in pattern position and convert in expression position; the two never overlap.
 
+```slate
+print(string(123) + "!")
+print(number("42"), number("nonsense"))
+print(integer(2.9), real(3), real(3) is real)
 ```
-string(123)                 // "123"
-number("42")                // 42
-number("nonsense")          // null
-integer(2.9)                // 2
-real(3)                     // a real, and prints as `3`
+
+```output
+123!
+42 null
+2 3 true
 ```
 
 `number` answers `null` where the text is not a number, which is how a program checks input without

@@ -45,8 +45,14 @@ looser than a call — `-f(x)` negates the result.
 
 **Comparisons chain rather than associate**, which is mathematics' reading and sysl's:
 
+```slate
+val n = 5
+
+print(0 <= n < 10)          // `n` is evaluated once
 ```
-0 <= n < 10                 // `n` is evaluated once
+
+```output
+true
 ```
 
 `==` and `!=` compare by value; see [Values](values.md).
@@ -55,16 +61,24 @@ looser than a call — `-f(x)` negates the result.
 
 `&&` and `||` short-circuit and **answer the operand that decided**, not a boolean:
 
+```slate
+print(1 && 2, null || "x")
 ```
-1 && 2                      // 2
-null || "x"                 // "x"
+
+```output
+2 x
 ```
 
 `??` answers its left operand unless that is `null`:
 
+```slate
+print(false ?? "d")         // `false` is a value
+print(null ?? "d")
 ```
-false ?? "d"                // false -- `false` is a value
-null ?? "d"                 // "d"
+
+```output
+false
+d
 ```
 
 ## `is`
@@ -72,11 +86,12 @@ null ?? "d"                 // "d"
 `is` puts a [pattern](patterns.md) where a condition is wanted, using the same grammar a `match` arm
 does:
 
+```slate
+print(3 is number, 3 is not string, 3 is 1 | 3 | 5)
 ```
-v is number
-v is not string
-v is 1 | 3 | 5
-v is Point
+
+```output
+true true true
 ```
 
 It sits between `&&` and the comparisons, so `a is P && b > 0` is two terms.
@@ -85,11 +100,20 @@ It sits between `&&` and the comparisons, so `a is P && b > 0` is two terms.
 
 A range is a **value**:
 
+```slate
+val xs = [1, 2, 3, 4]
+
+print(xs[1..<3])            // exclusive
+print(xs[1..2])             // inclusive
+print("hello"[..2])         // an end left out is taken from what it is used on
+print(xs[2..])
 ```
-for i in 0..<n              // exclusive
-for i in 1..10              // inclusive
-xs[1..<3]
-"hello"[..2]
+
+```output
+[2, 3]
+[2, 3]
+hel
+[3, 4]
 ```
 
 An end left out is taken from whatever the range is used on. Ranges do not associate, so `a..b..c` is
@@ -101,12 +125,20 @@ refused. **`a..=b` is refused by name**, since a reader arriving from Rust write
 
 **`?.` guards its own link and not the rest of the chain**, which is Kotlin's rule:
 
-```
-a?.b.c                      // reads `b` off `a` or answers null, then asks `.c` of that
-a?.b?.c                     // what the reader means
+```slate
+val a = { b: { c: 1 } }
+
+print(a?.b?.c)
+print(a.missing?.c)         // `?.` on the link that may be absent
 ```
 
-A nullish `a` therefore faults at `.c` in the first line. The rule is the one slate states everywhere
+```output
+1
+null
+```
+
+`a?.b.c` reads `b` off `a` or answers `null`, and then asks `.c` of whatever that was — so a nullish
+`a` faults at `.c`, and `a?.b?.c` is what the reader means. The rule is the one slate states everywhere
 about absence: **it stops at the boundary it arose at**, and one character quietly excusing every link
 after it is the opposite of that.
 
@@ -119,9 +151,16 @@ after it is the opposite of that.
 `a with b` answers a copy of `a` with `b`'s fields written over it. The right-hand side may be a
 literal or any expression answering an object:
 
+```slate
+val base = { a: 1, b: 2 }
+
+print(base with { b: 9 })
+print(base with { c: 3 })
 ```
-base with { f: v }
-header with claims.header
+
+```output
+{a: 1, b: 9}
+{a: 1, b: 2, c: 3}
 ```
 
 It binds as tightly as a field selection, so `a + b with { … }` changes `b` rather than the sum.
@@ -134,9 +173,17 @@ It binds as tightly as a field selection, so `a + b with { … }` changes `b` ra
 `f(...xs)` is the one spread slate has, and it exists because a computed argument list had no spelling
 at all:
 
+```slate
+show(...parts) = join(parts, "-")
+val xs = ["b", "c"]
+
+print(show(...xs))
+print(show("a", ...xs, "d"))        // in any order, any number of times
 ```
-total(...xs)
-f(a, ...xs, b)              // in any order, any number of times
+
+```output
+b-c
+a-b-c-d
 ```
 
 Spreading something that is not an array is a fault naming the spread rather than the call. **The
@@ -147,12 +194,24 @@ Spreading something that is not an array is a fault naming the spread rather tha
 `match` is postfix — a transformation of the thing to its left, as in Scala and sysl. It is an
 **expression**, so it stands where a value is wanted:
 
-```
-val what = v match
+```slate
+what(v) = v match
     { kind: "point", at: [0, 0] } -> "origin"
     [first, ...rest] -> "a list starting " + string(first)
     n @ number if n < 0 -> "a negative number"
     _ -> "something else"
+
+print(what({ kind: "point", at: [0, 0] }))
+print(what([9, 1]))
+print(what(-4))
+print(what(true))
+```
+
+```output
+origin
+a list starting 9
+a negative number
+something else
 ```
 
 See [Patterns](patterns.md) for what an arm may be written with, and for when the arms have to cover
@@ -164,12 +223,24 @@ everything.
 
 The postfix form of [fault handling](faults.md) is an expression too:
 
-```
-val text = readFileSync(path) catch e -> ""
+```slate
+toPort(text)
+    val n = number(text)
 
-val port = toPort(argument) catch e ->
+    if n == null then throw "that is not a port"
+
+    n
+
+val port = toPort("nonsense") catch e ->
     print(s"${e.message}, so using the default")
     8080
+
+print(port)
+```
+
+```output
+that is not a port, so using the default
+8080
 ```
 
 ## Blocks

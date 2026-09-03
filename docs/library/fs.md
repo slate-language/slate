@@ -2,7 +2,7 @@
 
 Ten operations, each in a promise-shaped and a blocking form.
 
-```
+```slate
 import { readFile, writeFile, mkdir, readDir, rename, remove, rmdir } from slate:fs
 
 async main()
@@ -43,7 +43,7 @@ main()
 **Every one has a blocking twin under a `Sync` suffix** — `readFileSync`, `writeFileSync`, `statSync` and
 the rest — which is node's arrangement and node's spelling:
 
-```
+```slate
 mkdirSync("scratch")
 writeFileSync("scratch/notes.txt", "one line")
 
