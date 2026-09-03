@@ -160,3 +160,215 @@ A_STREAMED_BODY_IS_WALKED_WITH_for_await_AND_THE_CHUNKS_STAY_APART()
 
     assert_eq(streamed_out(text),
         "HTTP/1.1 200 OK|Content-Length: 13|Connection: close||/up[abcdefg]2")
+
+// -- a body that arrives in pieces -----------------------------------------------------------------
+
+// **The other direction: a RESPONSE whose body is a source.** `serveStream` streams the request and
+// this streams the answer, and the two are independent -- an ordinary `serve` may stream a response.
+//
+// **A source is what `for await` drives**, which is a generator or anything with a `next`, so a
+// handler answering a generator function's result is streaming with nothing said and nothing wrapped.
+const Streaming: string = raw"""
+    import { serve, close, router, sse } from slate:http
+    import { localPort } from slate:net
+
+    counting()
+        yield "one "
+        yield "two "
+        yield "three"
+
+    val app = router()
+    """
+
+@test
+A_GENERATOR_ANSWERED_BY_A_HANDLER_IS_WRITTEN_AS_CHUNKED_TRANSFER()
+    // **No `Content-Length`, because there is none to know**: the length of a body that arrives in
+    // pieces is a fact about the last piece. What goes out instead is `Transfer-Encoding: chunked`,
+    // and `fetch` puts the pieces back together, which is what a client is for.
+    val text = Streaming + raw"""
+
+    app.get("/count", (req) -> counting())
+
+    val server = serve(0, app)
+
+    async main()
+        val r = await fetch("http://127.0.0.1:" + string(localPort(server)) + "/count")
+
+        print(r.value.status, r.value.headers["transfer-encoding"], has(r.value.headers, "content-length"))
+        print(r.value.body)
+
+        close(server)
+        done()
+
+    main()
+    """
+
+    assert_eq(net_out(text), "200 chunked false\none two three")
+
+@test
+AN_OBJECT_WITH_A_next_IS_A_SOURCE_TOO_AND_MAY_BE_A_RESPONSE_ENVELOPES_BODY()
+    // Nothing about this is a generator: `for await`'s protocol is a `next` answering
+    // `{ done, value }`, and a program that has its pieces already may hand them over as they are.
+    val text = Streaming + raw"""
+
+    fromList(xs)
+        var i = 0
+
+        pull()
+            if i >= len(xs) then return { done: true, value: null }
+
+            val v = xs[i]
+
+            i = i + 1
+
+            { done: false, value: v }
+
+        { next: pull }
+
+    app.get("/list", (req) -> { status: 202, headers: { "X-Kind": "stream" }, body: fromList(["a", "b"]) })
+
+    val server = serve(0, app)
+
+    async main()
+        val r = await fetch("http://127.0.0.1:" + string(localPort(server)) + "/list")
+
+        print(r.value.status, r.value.headers["x-kind"], r.value.body)
+
+        close(server)
+        done()
+
+    main()
+    """
+
+    assert_eq(net_out(text), "202 stream ab")
+
+@test
+A_STREAMED_BODY_IS_NOT_COMPRESSED_HOWEVER_BIG_IT_IS()
+    // **Compression needs the whole body and streaming is the promise not to hold it.** A client
+    // asking for brotli is answered in the clear, and `Vary` is not written either -- nothing about
+    // this response depended on the header.
+    val text = Streaming + raw"""
+
+    wide()
+        var i = 0
+
+        while i < 200
+            yield "the quick brown fox jumps over the lazy dog. "
+            i = i + 1
+
+    app.get("/big", (req) -> wide())
+
+    val server = serve(0, app)
+
+    async main()
+        val r = await fetch("http://127.0.0.1:" + string(localPort(server)) + "/big")
+
+        print(r.value.status, has(r.value.headers, "content-encoding"), has(r.value.headers, "vary"))
+        print(len(r.value.body))
+
+        close(server)
+        done()
+
+    main()
+    """
+
+    assert_eq(net_out(text), "200 false false\n9000")
+
+@test
+sse_FRAMES_A_STRING_AS_ITS_DATA_AND_AN_OBJECT_AS_THE_FIELDS_IT_NAMES()
+    // **Every line of the data is prefixed**, a bare newline inside one being what ends an event --
+    // which is the mistake this format invites and the one thing worth writing out.
+    val text = Streaming + raw"""
+
+    ticking()
+        yield { event: "tick", id: 1, data: { n: 1 } }
+        yield "plain\nlines"
+        yield { retry: 3000, data: "back soon" }
+
+    app.get("/events", (req) -> sse(ticking(), { heartbeat: 0 }))
+
+    val server = serve(0, app)
+
+    async main()
+        val r = await fetch("http://127.0.0.1:" + string(localPort(server)) + "/events")
+
+        print(r.value.status, r.value.headers["content-type"], r.value.headers["cache-control"])
+        print(toJSON(r.value.body))
+
+        close(server)
+        done()
+
+    main()
+    """
+
+    assert_eq(net_out(text),
+        "200 text/event-stream no-cache\n" +
+        "\"event: tick\\nid: 1\\ndata: {\\\"n\\\":1}\\n\\ndata: plain\\ndata: lines\\n\\nretry: 3000\\ndata: back soon\\n\\n\"")
+
+@test
+A_HEARTBEAT_IS_A_MEMBER_OF_THE_RESPONSE_AND_IS_WRITTEN_WHILE_NOTHING_ELSE_IS()
+    // **A line beginning `:` is a comment every SSE client ignores**, and it is what keeps an idle
+    // connection open through a proxy. The response asks for it by name rather than the writer
+    // sniffing a content type, so anything that streams may have one.
+    val text = Streaming + raw"""
+
+    // **An object with an async `next`, because a generator's `next` is synchronous** -- a
+    // generator cannot wait, so a source that has to is written as the protocol rather than as one.
+    slow()
+        var sent = false
+
+        async pull()
+            if sent then return { done: true, value: null }
+
+            await sleep(1300)
+
+            sent = true
+
+            { done: false, value: "at last" }
+
+        { next: pull }
+
+    app.get("/slow", (req) -> sse(slow(), { heartbeat: 1 }))
+
+    val server = serve(0, app)
+
+    async main()
+        val r = await fetch("http://127.0.0.1:" + string(localPort(server)) + "/slow")
+
+        print(contains(r.value.body, ": keep-alive"), contains(r.value.body, "data: at last"))
+
+        close(server)
+        done()
+
+    main()
+    """
+
+    assert_eq(out(fused(6000, NetImport + text)), "true true")
+
+@test
+A_SOURCE_THAT_FAULTS_MID_STREAM_ENDS_THE_RESPONSE_AND_THE_FAULT_IS_PUT_BACK()
+    // **The client sees a chunked response with no terminator**, which is the only thing HTTP can
+    // say once the status line has gone -- and the defect still reaches the loop and stops the
+    // program, exactly as a handler that faults before answering does.
+    val text = Streaming + raw"""
+
+    breaking()
+        yield "first "
+        throw "the source gave up"
+
+    app.get("/broken", (req) -> breaking())
+
+    val server = serve(0, app)
+
+    async main()
+        val r = await fetch("http://127.0.0.1:" + string(localPort(server)) + "/broken")
+
+        print("client saw", r.ok)
+
+        close(server)
+        done()
+
+    main()
+    """
+
+    assert(net_fails(text).contains("the source gave up"))

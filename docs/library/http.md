@@ -90,6 +90,56 @@ rather than by what the server was told — a streamed request having no `body` 
 instead. Everything else about the connection is the same server: the same keep-alive rule, the same
 order, the same clock.
 
+## A response that arrives in pieces
+
+**A handler may answer a source** — a generator, or anything with a `next()`, which is what
+[`for await`](../reference/asynchrony.md) drives — and the server writes it as chunked transfer as
+the pieces arrive:
+
+```slate
+counting()
+    yield "one "
+    yield "two "
+    yield "three"
+
+app.get("/count", req -> counting())
+app.get("/big", req -> { status: 202, headers: { "X-Kind": "report" }, body: rows() })
+```
+
+- **No `Content-Length` and no compression.** Both are facts about the last piece, and a server that
+  buffered the body to find them out would be undoing what streaming is for.
+- **A piece may be text or bytes**, exactly as a whole body may.
+- **A source that faults mid-stream ends the response and the fault is put back.** The client sees a
+  chunked body with no terminator, which is the only thing HTTP can say once the status line has
+  gone, and the defect stops the program as any other does.
+- **A streamed body needs HTTP/1.1.** Over HTTP/2 it is refused with a sentence saying so, rather
+  than drained — see below.
+
+## `sse(source)`
+
+Server-sent events, which is a streamed response with one format on top of it:
+
+```slate
+import { sse } from slate:http
+
+app.get("/events", req -> sse(ticks()))
+app.get("/quiet", req -> sse(ticks(), { heartbeat: 0 }))
+```
+
+A piece may be a **string**, which is its data, or an **object** naming any of `event`, `id`, `retry`
+and `data` — and a `data` that is not a string is JSON, which is what a browser's
+`JSON.parse(e.data)` wants anyway. **Every line of the data is prefixed**, a bare newline inside one
+being what would otherwise end the event.
+
+**`heartbeat` is a member of the response, not something the server guesses.** `sse` sets it to 15
+seconds; the writer sends `: keep-alive` on that interval while nothing else is going down the
+stream, which is what keeps a proxy from closing an idle connection. `0` turns it off, and any
+streamed response may ask for one:
+
+```slate
+{ status: 200, headers: { "Content-Type": "text/plain" }, heartbeat: 30, body: rows() }
+```
+
 ## HTTP/2
 
 **A server that was given a certificate and an `alpn` list speaks either version, and the handler is
@@ -112,6 +162,13 @@ serve({ port: 8443, cert: pem, key: keyPem, alpn: ["h2", "http/1.1"] }, app)
 - **`serveStream` hands the body over in one chunk**, because [`slate:nghttp2`](nghttp2.md) holds a
   DATA frame's bytes rather than passing them on as they land. A handler written for it runs
   unchanged and sees one arrival.
+- **A streamed RESPONSE is refused**, with a sentence naming the limitation and the way out — offer
+  only `"http/1.1"` in `alpn` for an endpoint that streams. That module has no data provider, so
+  `h2Respond` takes a whole body; draining the source instead would turn an event stream, whose
+  source never ends, into a request that hangs forever, and nothing on the client could diagnose it.
+
+**Those two are the same missing piece from its two ends** and are one piece of work in
+[`slate:nghttp2`](nghttp2.md) rather than here.
 
 **Without a certificate there is no ALPN and nothing changes** — `h2c`, which is HTTP/2 in the clear,
 is not spoken here. The framing layer on its own is [`slate:nghttp2`](nghttp2.md).

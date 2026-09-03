@@ -62,7 +62,9 @@ http_write_source() -> string = raw"""
         for [k, hv] in r.headers
             extra = extra + k + ": " + hv + "\r\n"
 
-        if r.text == null
+        if r.source != null
+            streamed(conn, r, extra, keep)
+        elif r.text == null
             replyBytes(conn, r.status, extra, r.bytes, keep)
         else
             reply(conn, r.status, extra, r.text, keep)
@@ -87,19 +89,31 @@ http_write_source() -> string = raw"""
         var status = 200
         var body = ""
         var bytes = null
+        var source = null
+        var heartbeat = 0
         var pairs = []
         var encoded = false
         var said = ""
 
-        if v is string
+        // **A source is asked about BEFORE `is object`**, a source being one.
+        if isSource(v)
+            source = v
+        elif v is string
             body = v
         elif v is array
             bytes = v
         elif v is object
             if has(v, "status") then status = v.status
 
+            // **A heartbeat is a member of the response and not a guess from its content type.**
+            // The writer emits a comment on this interval while nothing else is going down the
+            // stream; `sse` sets it, and a program streaming anything else may ask for the same.
+            if has(v, "heartbeat") then heartbeat = v.heartbeat
+
             if has(v, "body")
-                if v.body is array
+                if isSource(v.body)
+                    source = v.body
+                elif v.body is array
                     bytes = v.body
                 elif v.body is string
                     body = v.body
@@ -123,6 +137,13 @@ http_write_source() -> string = raw"""
                         push(pairs, [k, string(hv)])
         else
             body = string(v)
+
+        // **A body that arrives in pieces is passed through untouched.** It has no length to count
+        // and none to compress: both are knowable only after the last piece, and a server that
+        // buffered to find out would be undoing the thing streaming is for.
+        if source != null
+            return { status: status, headers: pairs, text: null, bytes: null,
+                     source: source, heartbeat: heartbeat }
 
         // **`??` and not an `if`, so `toBytes` is not run on a body that is already bytes.** A
         // megabyte of them would otherwise be converted twice over for nothing.
@@ -148,14 +169,22 @@ http_write_source() -> string = raw"""
 
         push(pairs, ["Content-Encoding", "br"])
 
-        { status: status, headers: pairs, text: null, bytes: small }
+        { status: status, headers: pairs, text: null, bytes: small, source: null, heartbeat: 0 }
 
-    // The two body fields, filled in so that exactly one of them is there.
+    // The three body fields, filled in so that exactly one of them is there.
     answered(status: integer, pairs: array, body: string, bytes: array | null) -> object =
         if bytes == null
-            { status: status, headers: pairs, text: body, bytes: null }
+            { status: status, headers: pairs, text: body, bytes: null, source: null, heartbeat: 0 }
         else
-            { status: status, headers: pairs, text: null, bytes: bytes }
+            { status: status, headers: pairs, text: null, bytes: bytes, source: null, heartbeat: 0 }
+
+    // Whether an answer is a body that arrives in pieces.
+    //
+    // **It is `for await`'s own question and not a new one**: a source is a generator, or anything
+    // with a `next` -- which is the same two things `for await` drives. So a generator function's
+    // result is a streamed body with nothing said and nothing wrapped, and an object a program built
+    // itself is one on the same terms.
+    isSource(v) -> boolean = v is generator || (v is object && has(v, "next") && v.next is function)
 
     // Whether this client asked for brotli, reading the header rather than looking for the two letters.
     //
@@ -204,6 +233,174 @@ http_write_source() -> string = raw"""
     // path that has to.
     async replyBytes(conn, status: integer, extra: string, body: array, keep: boolean)
         await send(conn, concat(toBytes(head(status, extra, len(body), keep)), body))
+
+    // -- a body that arrives in pieces ------------------------------------------------------------
+
+    // A response whose body arrives in pieces, written as HTTP/1.1 chunked transfer.
+    //
+    // **NO `Content-Length` AND NO COMPRESSION.** Neither is knowable before the last piece, and a
+    // server that buffered the lot to find out would be undoing the thing streaming is for.
+    //
+    // **A piece may be text or bytes**, exactly as a whole body may, and each is framed as it is.
+    //
+    // **A source that faults mid-stream ends the response and puts the fault back**, which is what
+    // the server does for a handler that faults: the client sees a truncated body -- which is what a
+    // chunked response with no terminator means, and is the only thing HTTP can say once the status
+    // line has gone -- and the defect still stops the program.
+    async streamed(conn, r: object, extra: string, keep: boolean)
+        await send(conn, streamHead(r.status, extra, keep))
+
+        var beating = false
+
+        // **A comment while nothing is happening**, on the interval the response asked for. A line
+        // beginning `:` is a comment every SSE client ignores, and it is what keeps an idle
+        // connection open through a proxy and tells a client the server is still there.
+        //
+        // **The response says so with `heartbeat` rather than the writer sniffing a content type.**
+        // What decides is then a thing a program wrote, and anything streaming may ask for it --
+        // `sse` is one caller of this and not the reason it exists.
+        //
+        // **The server writes it rather than the formatter.** A formatter pulling from a source
+        // cannot interleave a heartbeat with it without racing two promises; the writer already has
+        // the socket and a clock.
+        // **The comment goes through `sendChunk` rather than being framed by hand**, which is where
+        // the first version of this got it wrong: a size line counted in characters rather than
+        // bytes, or counted at all by eye, is a chunked stream no client can read past.
+        beat()
+            if !beating then return
+
+            sendChunk(conn, ": keep-alive\n\n")
+            setTimeout(beat, r.heartbeat * 1000)
+
+        if r.heartbeat > 0
+            beating = true
+
+            setTimeout(beat, r.heartbeat * 1000)
+
+        // **A SOURCE THAT FAULTS IS PUT BACK ON THE LOOP RATHER THAN THROWN FROM HERE**, and that is
+        // not fussiness: the server wraps this call in a `try` that reads a failure as *the client
+        // has gone*, which is the ordinary end of a connection and no reason to stop anything. A
+        // fault raised here would be swallowed by it, so the defect would vanish and the program
+        // would carry on with a client that had been told nothing.
+        //
+        // What the client sees either way is a chunked body with no terminator, which is the only
+        // thing HTTP can say once the status line has gone.
+        try
+            for await piece in r.source
+                await sendChunk(conn, piece)
+        catch e
+            beating = false
+
+            setTimeout(() -> putBack(e), 0)
+
+            return
+
+        beating = false
+
+        await send(conn, "0\r\n\r\n")
+
+    // **A named function because `throw` is a statement**, so a lambda cannot be one.
+    putBack(e)
+        throw e
+
+    // One chunk: the byte count in hexadecimal, the bytes, and a blank line.
+    async sendChunk(conn, piece)
+        if piece is array
+            await send(conn, concat(toBytes(hex(len(piece)) + "\r\n"), concat(piece, toBytes("\r\n"))))
+            return
+
+        val text = if piece is string then piece else string(piece)
+        val n = len(toBytes(text))
+
+        // **A zero-length chunk is the terminator**, so a source that answers an empty string would
+        // end the response with more to come. It is skipped rather than refused, an empty piece
+        // being a thing to write nothing about.
+        if n == 0 then return
+
+        await send(conn, hex(n) + "\r\n" + text + "\r\n")
+
+    // The status line and the headers of a chunked response.
+    streamHead(status: integer, extra: string, keep: boolean) -> string =
+        ("HTTP/1.1 " + string(status) + " " + reason(status) + "\r\n" + extra +
+            "Transfer-Encoding: chunked\r\nConnection: " +
+            (if keep then "keep-alive" else "close") + "\r\n\r\n")
+
+    // A number in lower-case hexadecimal, which is what a chunk's size line is written in.
+    hex(n: integer) -> string
+        if n == 0 then return "0"
+
+        val digits = "0123456789abcdef"
+        var out = ""
+        var left = n
+
+        while left > 0
+            out = digits[(left % 16)..<((left % 16) + 1)] + out
+            left = left / 16
+
+        out
+
+    // -- server-sent events ------------------------------------------------------------------------
+
+    // `sse(source)` -- a source of values as a `text/event-stream` response.
+    //
+    //     app.get("/events", (req) -> sse(ticks()))
+    //
+    // **A piece may be a string, which is its data**, or an object saying any of `event`, `id`,
+    // `retry` and `data` -- and a `data` that is not a string is JSON, which is what a browser's
+    // `JSON.parse(e.data)` is going to want anyway.
+    //
+    // **Every line of the data is prefixed**, because a bare newline inside one would end the event.
+    // That is the whole of the format and the whole of what this does.
+    //
+    // | option | |
+    // |---|---|
+    // | `heartbeat` | seconds between comments while nothing is sent; 15, and `0` for none |
+    // | `status` | 200 |
+    //
+    // **It is an ordinary response value**, so a handler may build one itself: what `sse` answers is
+    // `{ status, headers, body, heartbeat }` and nothing about the server knows this function exists.
+    export sse(source, options: object = {}) -> object =
+        { status: if has(options, "status") then options.status else 200,
+          headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" },
+          heartbeat: if has(options, "heartbeat") then options.heartbeat else 15,
+          body: framedEvents(source) }
+
+    // The source `sse` hands the writer: the one it was given, with each value formatted.
+    //
+    // **The parameter is unannotated because a generator is not an `object`**, and both are sources.
+    framedEvents(source) -> object
+        async pull()
+            val step = await source.next()
+
+            if step.done then return { done: true, value: null }
+
+            { done: false, value: oneEvent(step.value) }
+
+        { next: pull }
+
+    // One event, as the lines a client reads.
+    oneEvent(v) -> string
+        if v is string then return dataLines(v)
+        if !(v is object) then return dataLines(string(v))
+
+        var out = ""
+
+        if has(v, "event") then out = out + "event: " + string(v.event) + "\n"
+        if has(v, "id") then out = out + "id: " + string(v.id) + "\n"
+        if has(v, "retry") then out = out + "retry: " + string(v.retry) + "\n"
+
+        val body = if !has(v, "data") then "" elif v.data is string then v.data else toJSON(v.data)
+
+        out + dataLines(body)
+
+    // The data, one `data:` line per line of it, and the blank line that ends the event.
+    dataLines(text: string) -> string
+        var out = ""
+
+        for line in split(text, "\n")
+            out = out + "data: " + line + "\n"
+
+        out + "\n"
 
     // The status line, the headers and the blank line that ends them.
     //
