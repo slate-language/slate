@@ -112,6 +112,134 @@ The callback comes first, which is node's order — and a callback in that posit
 scheduling and nothing else, because the callback runs from the loop long afterwards. That is inherent
 rather than a gap: there is no statement of the program's left to attach it to.
 
+## `for await`
+
+**`for await x in source` asks the subject for `next()` and awaits the answer**, stopping when it says
+it is done. It is legal only inside an `async` function.
+
+```slate
+counted(n)
+    var i = 0
+    val it = {}
+
+    it.next = async () ->
+        await sleep(1)
+
+        if i >= n then { done: true, value: null }
+        else
+            i += 1
+            { done: false, value: i * 10 }
+
+    it
+
+async main()
+    for await v in counted(3)
+        print(v)
+
+main()
+```
+
+```output
+10
+20
+30
+```
+
+**A source is anything with a `next()`**, and that is the whole protocol — there is no second
+well-known name and no symbol. A [generator](#generators) already has one, so a synchronous subject
+works unchanged:
+
+```slate
+twoOf()
+    yield 1
+    yield 2
+
+async main()
+    for await x in twoOf()
+        print(x)
+
+main()
+```
+
+```output
+1
+2
+```
+
+**What makes one rule enough is that `await` of a plain value answers it.** A generator's `next()`
+answers `{ value, done }` outright and an asynchronous source answers a promise of the same shape, so
+there is no fallback branch to write and nothing for a reader to choose between.
+
+It is a loop like any other: `break` gives it a value, a label says which loop to leave, and an `else`
+runs when it finished on its own.
+
+```slate
+counted(n)
+    var i = 0
+    val it = {}
+
+    it.next = () ->
+        if i >= n then { done: true, value: null }
+        else
+            i += 1
+            { done: false, value: i * 10 }
+
+    it
+
+async main()
+    val found = 'search for await v in counted(9)
+        if v == 30 then break 'search v
+
+    print(found)
+
+    for await v in counted(0)
+        print("never")
+    else
+        print("nothing arrived")
+
+main()
+```
+
+```output
+30
+nothing arrived
+```
+
+**The subject is evaluated once**, so a call in the head makes one source and not one per turn.
+
+**An array is not a source.** It has no `next()`, and the refusal says so rather than naming a method
+the program never wrote:
+
+```slate
+async main()
+    for await x in [1, 2]
+        print(x)
+
+main()
+```
+
+```error
+a `for await` asks its subject for `next()`, and an array has none -- write `for` without `await` to walk an array
+```
+
+Outside an `async` function it is refused where the awaiting would happen:
+
+```slate
+twoOf()
+    yield 1
+
+for await x in twoOf()
+    print(x)
+```
+
+```error
+`for await` belongs in an `async` function
+```
+
+**There is no `async` generator yet.** A source is written by hand as an object with a `next`, which is
+how node's streams implement theirs; the sugar for *producing* one came second in JavaScript and can
+come second here.
+
 ## Generators
 
 **A function is a generator because it holds a `yield`** — Python's rule, with no word on the definition.

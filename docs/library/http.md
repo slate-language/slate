@@ -66,12 +66,23 @@ the memory a request costs stops depending on how big the request is:
 serveStream(3000, async (req) ->
     var total = 0
 
-    counted(c)
-        total = total + len(c)
-
-    await req.each(counted)
+    for await chunk in req
+        total = total + len(chunk)
 
     "that was " + string(total) + " bytes")
+```
+
+**`for await` is the shape to reach for**, and `req.each(fn)` is the same bytes pushed instead of
+pulled — it answers a promise for the byte count, which is the one number an upload handler usually
+wants:
+
+```slate
+serveStream(3000, async (req) ->
+    counted(c) = c
+
+    val n = await req.each(counted)
+
+    "that was " + string(n) + " bytes")
 ```
 
 **Two exports rather than one with an option**, because the two differ by *what the handler is given*

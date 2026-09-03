@@ -114,6 +114,9 @@ print(c, n)
 
 `do` introduces a one-line body — `while c do …`, `for x in xs do …`, `loop do …`.
 
+**`for await x in source`** is the fourth, and it walks something that answers `next()` a value at a
+time — see [Asynchrony](asynchrony.md).
+
 A `for` head may take its element apart with a [pattern](patterns.md):
 
 ```slate

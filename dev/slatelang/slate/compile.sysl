@@ -1101,7 +1101,11 @@ compile_do_while(u: *Unit, e: *Emit, label: string, body: Expr, cond: Expr, othe
 end compile_do_while
 
 // Not `private`: reached from `compile_expr.sysl` -- every loop is an EXPRESSION.
-compile_for(u: *Unit, e: *Emit, label: string, binding: Pattern, iter: Expr, body: Expr, otherwise: Option[Expr], at: Span)
+compile_for(u: *Unit, e: *Emit, label: string, binding: Pattern, iter: Expr, body: Expr, otherwise: Option[Expr], waits: bool, at: Span)
+    if waits
+        compile_for_await(u, e, label, binding, iter, body, otherwise, at)
+        return
+
     compile_expr(u, e, iter)
 
     // **`IterInit` KEEPS the subject and pushes a counter beside it**, so it gives one and takes
@@ -1158,6 +1162,89 @@ compile_for(u: *Unit, e: *Emit, label: string, binding: Pattern, iter: Expr, bod
     close_loop(e, top, brk)
     patch(e, done, here(e))
 end compile_for
+
+// `for await x in source` -- ask the subject for its next value, await the answer, and stop when it
+// says it is done.
+//
+// **The subject is asked with `next()` and nothing else, which is what lets ONE rule cover both
+// kinds of source.** A generator's `next()` answers `{value, done}` outright and an asynchronous one
+// answers a promise of the same shape -- and `await` of a plain value answers it, so the synchronous
+// case needs no fallback branch and no second protocol name. slate's well-known names are fields
+// (`proto`, `equals`, `hash`, `toString`, `toJSON`), and this is that mechanism once more rather than
+// a new one.
+//
+// **The shape is a `while` and not the counted walk above.** There is no counter, because what says
+// whether another value is coming is the subject; and there is one value on the stack through the
+// loop -- the subject -- where the ordinary `for` keeps two.
+private compile_for_await(u: *Unit, e: *Emit, label: string, binding: Pattern, iter: Expr, body: Expr, otherwise: Option[Expr], at: Span)
+    compile_expr(u, e, iter)
+
+    val top = here(e)
+
+    open_loop(e, label)
+
+    // **The subject is kept and copied**, `CallMethod` taking its receiver: the loop asks the same
+    // object every turn, so what is duplicated is the thing being walked rather than the answer.
+    push_n(e, IterAwaitCheck, at, 0, 0)
+    push_n(e, Dup, at, 0, 1)
+    push_n(e, CallMethod(intern_str(u, "next"), 0, 0), at, 1, 1)
+
+    // **Refused here rather than at the head**, so the complaint points at the line the awaiting
+    // happens on -- which is the whole loop, and is where a reader would put the `async`.
+    if e.is_async
+        push_n(e, Op.Await, at, 1, 1)
+    else
+        push_n(e, FailWith(intern_str(u, "`for await` belongs in an `async` function")), at, 1, 1)
+
+    // `{ value, done }`, read without being taken apart: `done` decides and `value` is what binds.
+    push_n(e, Dup, at, 0, 1)
+    push_n(e, GetField(intern_str(u, "done")), at, 1, 1)
+
+    // **Two jumps because there is no `JumpIfTrue` that pops**, and inverting is the honest way to
+    // spell it with what the instruction set has: fall into the body while `done` is false, and take
+    // the second jump out when it is not.
+    val into = push_n(e, JumpIfFalse(0), at, 1, 0)
+    val out = put(e, Jump(0), at)
+
+    patch(e, into, here(e))
+    push_n(e, GetField(intern_str(u, "value")), at, 1, 1)
+    push_n(e, PushScope, at, 0, 0)
+    e.scopes += 1
+
+    *binding.kind match
+        Bind(name) -> push_n(e, DeclareVal(intern_str(u, name)), at, 1, 0)
+        _ ->
+            refuse_optionals(binding, "and a `for await` head binds")
+            push_n(e, Unpack(intern_resolved(u, binding), true), at, 1, 0)
+            emit_pattern_defaults(u, e, binding, true)
+
+    compile_stmt_body(u, e, body)
+
+    push_n(e, PopScope, at, 0, 0)
+    e.scopes -= 1
+    put(e, Jump(top), at)
+    patch(e, out, here(e))
+
+    // The step that said `done` is still standing, and the subject under it. Both go before the
+    // answer is built, so that neither Pop can take it.
+    push_n(e, Pop, at, 1, 0)
+    push_n(e, Pop, at, 1, 0)
+    compile_else(u, e, otherwise, at)
+
+    val done = put(e, Jump(0), at)
+
+    // A `break` arrives with the subject still under its value, having unwound only to the frame's
+    // own height -- one value here where the counted walk leaves two.
+    val brk = here(e)
+    val after = e.sp
+
+    push_n(e, RotUp(1), at, 0, 0)
+    push_n(e, Pop, at, 1, 0)
+
+    e.sp = after
+    close_loop(e, top, brk)
+    patch(e, done, here(e))
+end compile_for_await
 
 // A loop body, run for effect: its value is discarded each turn.
 private compile_body(u: *Unit, e: *Emit, body: Expr)

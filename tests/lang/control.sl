@@ -255,3 +255,90 @@ async a_promise_settles_before_a_timer_that_is_already_due() =
     await sleep(10)
 
     assertEq(seen, ["promise", "timer"])
+
+@test
+async a_for_await_walks_a_generator_because_await_of_a_plain_value_answers_it() =
+    // The one rule covering both kinds of source: a generator's `next()` answers `{value, done}`
+    // outright, and awaiting something that is not a promise answers it and yields.
+    twoOf()
+        yield 1
+        yield 2
+
+    var seen = []
+
+    for await x in twoOf()
+        push(seen, x)
+
+    assertEq(seen, [1, 2])
+
+@test
+async a_for_await_walks_a_source_whose_next_answers_a_promise() =
+    counted(n)
+        var i = 0
+        val it = {}
+
+        it.next = async () ->
+            await sleep(1)
+
+            if i >= n then { done: true, value: null }
+            else
+                i += 1
+                { done: false, value: i * 10 }
+
+        it
+
+    var seen = []
+
+    for await v in counted(3)
+        push(seen, v)
+
+    assertEq(seen, [10, 20, 30])
+
+@test
+async a_for_await_breaks_with_a_value_and_takes_an_else() =
+    counted(n)
+        var i = 0
+        val it = {}
+
+        it.next = () ->
+            if i >= n then { done: true, value: null }
+            else
+                i += 1
+                { done: false, value: i * 10 }
+
+        it
+
+    val found = 'search for await v in counted(9)
+        if v == 30 then break 'search v
+
+    assertEq(found, 30)
+
+    val nothing = for await v in counted(0)
+        v
+    else
+        "none arrived"
+
+    assertEq(nothing, "none arrived")
+
+@test
+async a_for_await_evaluates_its_subject_once() =
+    // Emitting the subject inside the loop would make a fresh generator every turn and the loop would
+    // never end. Both back ends are asserted against it.
+    var made = 0
+
+    twoOf()
+        yield 1
+        yield 2
+
+    once()
+        made = made + 1
+
+        twoOf()
+
+    var seen = []
+
+    for await x in once()
+        push(seen, x)
+
+    assertEq(seen, [1, 2])
+    assertEq(made, 1)

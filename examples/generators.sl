@@ -79,3 +79,29 @@ squares(xs)
 
 for s in squares(counter(4))
     print(s)
+
+// `for await` walks anything that answers `next()`, which a generator already does -- so the same
+// loop reads a generator and a source whose values have not arrived yet.
+
+ticking(n)
+    var i = 0
+    val it = {}
+
+    it.next = async () ->
+        await sleep(1)
+
+        if i >= n then { done: true, value: null }
+        else
+            i += 1
+            { done: false, value: "tick " + string(i) }
+
+    it
+
+async watch()
+    for await x in squares(counter(3))
+        print("sync", x)
+
+    for await t in ticking(2)
+        print(t)
+
+watch()
