@@ -118,8 +118,51 @@ resolve_pattern(pat: Pattern, depth: usize) -> Pattern
     *pat.kind match
         Bind(name) ->
             visible_type(name) match
-                Some(found) -> resolve_pattern(found, depth + 1)
+                Some(found) -> *found.kind match
+                    // **A generic type used without its arguments is refused rather than erased.**
+                    // Erasing would be sound -- every parameter becomes "anything" -- and that is
+                    // exactly what makes it the wrong answer: `p is Pair` would quietly test only
+                    // that the fields are there, which is a check the reader believes and does not
+                    // get.
+                    GenericPat(params, _) ->
+                        complain_here(pat.span, s"`${name}` is generic over ${counted(params.len(), "type")}, so it needs them here -- write `${name}[${erased_args(params)}]`, or the types this one holds")
+                        pat
+                    _ -> resolve_pattern(found, depth + 1)
                 None -> pat
+
+        // **THE DECLARATION ITSELF, ERASED.** This is reached where the pattern a `type` registered
+        // is resolved on its own rather than through a use -- which is what makes the *value* a
+        // generic type binds: `Pair.test(v)` asks about the shape with every parameter standing for
+        // anything, which is all a shape with no arguments could ever ask. A USE of the bare name
+        // goes through the `Bind` arm above and is refused there instead, because a reader who wrote
+        // `p: Pair` meant to say something about the fields and this would quietly not.
+        GenericPat(params, inner) -> resolve_pattern(substituted(inner, params, erased_types(params, pat.span)), depth + 1)
+
+        // `Pair[string, integer]` -- the declaration, with what it is generic over put through it.
+        AppliedPat(name, args) ->
+            var out: Buf[Pattern] = buf()
+
+            for i in 0..<args.len()
+                out.push(resolve_pattern(args.at(i), depth))
+
+            visible_type(name) match
+                Some(found) -> *found.kind match
+                    GenericPat(params, inner) ->
+                        if params.len() != out.len()
+                            complain_here(pat.span, s"`${name}` is generic over ${counted(params.len(), "type")} and this gives it ${out.len()}")
+
+                            return pat
+
+                        // **Substituted and THEN resolved**, so a type given to a generic type may
+                        // name another type -- `Pair[Point, Note]` -- and the shape that comes out
+                        // is the one both declarations describe.
+                        resolve_pattern(substituted(inner, params, out), depth + 1)
+                    _ ->
+                        complain_here(pat.span, s"`${name}` is not generic, so it takes no types in brackets")
+                        pat
+                None ->
+                    complain_here(pat.span, s"nothing here declares a type called `${name}`")
+                    pat
         At(name, inner) -> pattern(pat.span, PatKind.At(name, resolve_pattern(inner, depth)))
         ArrayPat(items, open, rest, defaults) ->
             var out: Buf[Pattern] = buf()
@@ -252,8 +295,111 @@ resolve_pattern(pat: Pattern, depth: usize) -> Pattern
                 None -> ()
 
             pattern(pat.span, EveryPat(container, inner))
+
+        // **A name inside a function type is resolved like any other**, so `(Point) -> boolean` sees
+        // the declaration and a name that named nothing is refused where it stands rather than being
+        // read as a parameter nobody can supply.
+        FnPat(params, result) ->
+            var out: Buf[Pattern] = buf()
+
+            for i in 0..<params.len()
+                out.push(resolve_pattern(params.at(i), depth))
+
+            pattern(pat.span, FnPat(out, resolve_pattern(result, depth)))
         _ -> pat
 end resolve_pattern
+
+// One `any` for each type parameter, which is what a generic type with no arguments describes.
+private erased_types(params: Buf[string], at: Span) -> Buf[Pattern]
+    var out: Buf[Pattern] = buf()
+
+    for i in 0..<params.len()
+        out.push(pattern(at, Wild))
+
+    out
+end erased_types
+
+// What a generic type's parameters would look like written out, for the message above to quote.
+private erased_args(params: Buf[string]) -> string
+    var out = str_builder()
+
+    for i in 0..<params.len()
+        if i > 0 then out.push(", ")
+
+        out.push("any")
+
+    out.finish()
+end erased_args
+
+// One pattern with every type parameter replaced by the type it was given.
+//
+// **A rebuild rather than an environment carried through resolution**, and the reason is that a
+// generic type may be used inside another one: substituting where the use is found means the
+// argument patterns are the ones written at THIS use, and nothing has to be unwound afterwards.
+//
+// **A type parameter cannot appear in a key, a default or a name**, so the walk only has to reach
+// the places a type can stand -- which is what every arm below is.
+private substituted(pat: Pattern, params: Buf[string], args: Buf[Pattern]) -> Pattern
+    *pat.kind match
+        TypeVarPat(name) ->
+            for i in 0..<params.len()
+                if params.at(i) == name then return args.at(i)
+
+            pat
+        At(name, inner) -> pattern(pat.span, PatKind.At(name, substituted(inner, params, args)))
+        ArrayPat(items, open, rest, defaults) ->
+            var out: Buf[Pattern] = buf()
+
+            for i in 0..<items.len()
+                out.push(substituted(items.at(i), params, args))
+
+            pattern(pat.span, ArrayPat(out, open, rest, defaults))
+        ObjectPat(keys, values, defaults, optional) ->
+            var out: Buf[Pattern] = buf()
+
+            for i in 0..<values.len()
+                out.push(substituted(values.at(i), params, args))
+
+            pattern(pat.span, ObjectPat(keys, out, defaults, optional))
+        EveryPat(container, element) -> pattern(pat.span, EveryPat(container, substituted(element, params, args)))
+        OrPat(alts) ->
+            var out: Buf[Pattern] = buf()
+
+            for i in 0..<alts.len()
+                out.push(substituted(alts.at(i), params, args))
+
+            pattern(pat.span, OrPat(out))
+        AndPat(parts) ->
+            var out: Buf[Pattern] = buf()
+
+            for i in 0..<parts.len()
+                out.push(substituted(parts.at(i), params, args))
+
+            pattern(pat.span, AndPat(out))
+        FnPat(takes, result) ->
+            var out: Buf[Pattern] = buf()
+
+            for i in 0..<takes.len()
+                out.push(substituted(takes.at(i), params, args))
+
+            pattern(pat.span, FnPat(out, substituted(result, params, args)))
+        VariantPat(name, items, keys, singleton) ->
+            var out: Buf[Pattern] = buf()
+
+            for i in 0..<items.len()
+                out.push(substituted(items.at(i), params, args))
+
+            pattern(pat.span, VariantPat(name, out, keys, singleton))
+        MadeFrom(name, inner) -> pattern(pat.span, PatKind.MadeFrom(name, substituted(inner, params, args)))
+        AppliedPat(name, inner) ->
+            var out: Buf[Pattern] = buf()
+
+            for i in 0..<inner.len()
+                out.push(substituted(inner.at(i), params, args))
+
+            pattern(pat.span, AppliedPat(name, out))
+        _ -> pat
+end substituted
 
 // A pattern into the unit's table, resolved first.
 //

@@ -181,6 +181,11 @@ private check_stmts(stmts: Buf[Stmt], env: *TypeEnv)
                 for j in 0..<stmts.len()
                     *stmts.at(j).kind match
                         Val(name, _) -> note_type(env, name, type_of(Any))
+
+                        // **An annotated binding is a group as well now**, the parser writing the
+                        // binding and the check it turns into as one statement -- so a `var` has to
+                        // be noted here for the reason a `val` is.
+                        Var(name, _) -> note_binding(env, name, type_of(Any), false)
                         _ -> ()
             ImportNames(path, _, origin, names, locals) ->
                 for j in 0..<locals.len()
@@ -267,17 +272,51 @@ private check_stmt(s: Stmt, block: Buf[Stmt], env: *TypeEnv)
             if is_shape(t) && shape_survives(uses_in(name, block))
                 note_shaped(env, name, t)
             else
-                note_type(env, name, t)
+                note_type(env, name, elementless(t, init))
         Var(name, init) ->
             check_expr(init, env)
-            note_binding(env, name, var_type(name, init, block, env), false)
-        Group(stmts) -> for i in 0..<stmts.len() do check_stmt(stmts.at(i), stmts, env)
+            note_binding(env, name, elementless(var_type(name, init, block, env), init), false)
+        Group(stmts) ->
+            for i in 0..<stmts.len()
+                check_stmt(stmts.at(i), stmts, env)
+
+                // **An annotated binding is a `Group` of exactly two: the binding, then the check
+                // it turns into.** The pairing is the parser's, and reading it back here is what
+                // lets the initialiser be compared against the type the reader declared -- the same
+                // comparison the machine makes one instruction later, so the two cannot disagree.
+                if i > 0
+                    *stmts.at(i).kind match
+                        CheckType(name, _, pat) -> check_declared_init(stmts.at(i - 1), name, pat, env)
+                        _ -> ()
         Unpack(pat, init, _) ->
             check_expr(init, env)
             note_bindings(pat, env)
-        Assign(_, target, value) ->
+        Assign(op, target, value) ->
             check_expr(target, env)
             check_expr(value, env)
+
+            // **AN ASSIGNMENT IS CHECKED AGAINST WHAT THE NAME WAS DECLARED, WHICH IS WHAT AN
+            // ANNOTATED `var` MEANS.** TypeScript's `let`: the declared type is what the name holds
+            // for its whole life, so a value of another kind is refused where it is written rather
+            // than surfacing wherever it was first used.
+            //
+            // **An UNANNOTATED `var` cannot be caught out by this**, its recorded type being the
+            // union of every right-hand side ever assigned to it -- this one included -- so the
+            // comparison is one that cannot fail. What is left is exactly the case the reader asked
+            // to be held to.
+            //
+            // **A compound assignment is left alone.** `n += 1` hands over the right OPERAND rather
+            // than the value stored, and what the operator answers is `binary_type`'s question and
+            // is checked there.
+            if op == Tok.Assign
+                *target.kind match
+                    Name(name) ->
+                        val want = known_type(env, name)
+                        val got = type_of_expr(value, env)
+
+                        if !fits(got, want)
+                            complain_here(value.span, s"`${name}` was declared ${show_type(want)}, and this is ${show_type(got)}")
+                    _ -> ()
         MultiAssign(_, targets, values) ->
             for i in 0..<targets.len()
                 check_expr(targets.at(i), env)
@@ -299,8 +338,36 @@ private check_stmt(s: Stmt, block: Buf[Stmt], env: *TypeEnv)
             None -> ()
         Throw(x) -> check_expr(x, env)
         TypeDecl(name, _) -> note_type(env, name, shape_type())
+
+        // **What an annotation says, wherever one was written.** A parameter's is already in scope by
+        // the time this is walked -- `check_body` reads it off this very statement before the body is
+        // entered -- so re-noting it says the same thing twice. A BINDING's is not: the group the
+        // parser made binds the name first at whatever its initialiser gave, and this is what makes
+        // it the type the reader declared instead.
+        CheckType(name, _, pat) -> renote_declared(env, name, type_from_pattern(resolve_pattern(pat, 0)))
         _ -> ()
 end check_stmt
+
+// An annotated binding's initialiser, against the type the annotation declared.
+//
+// **The complaint lands on the VALUE and not on the annotation**, because the annotation is the thing
+// the reader meant and the value is the thing that is wrong. It is the same choice a call's complaint
+// makes, and it reads the same way: what was wanted, then what arrived.
+private check_declared_init(bound: Stmt, name: string, pat: Pattern, env: *TypeEnv)
+    val init = *bound.kind match
+        Val(who, x) -> if who == name then Some(x) else None
+        Var(who, x) -> if who == name then Some(x) else None
+        _ -> None
+
+    init match
+        Some(x) ->
+            val want = type_from_pattern(resolve_pattern(pat, 0))
+            val got = type_of_expr(x, env)
+
+            if !fits(got, want)
+                complain_here(x.span, s"`${name}` was declared ${show_type(want)}, and this is ${show_type(got)}")
+        None -> ()
+end check_declared_init
 
 // A definition's body, with its parameters in scope at the types its annotations gave them.
 //
@@ -325,10 +392,19 @@ type_of_expr(x: Expr, env: *TypeEnv) -> Type
         RealLit(_) -> type_of(RealType)
         StrLit(_) -> type_of(StringType)
         BoolLit(_) -> type_of(BooleanType)
+
+        // **`null` written out is a null**, which is what makes `f(null)` refusable where the
+        // parameter wanted something else -- the machine refuses the same call. `undefined` is left
+        // alone: it cannot be stored anywhere, so nothing can be said about where it went.
+        NullLit -> type_of(NullType)
         Interp(_) -> type_of(StringType)
         Name(name) -> known_type(env, name)
-        ArrayLit(_) -> type_of(ArrayOf(type_of(Any)))
-        ArrayRepeat(_, _) -> type_of(ArrayOf(type_of(Any)))
+        // **AN ARRAY LITERAL SAYS WHAT IT WAS BUILT OUT OF**, so `map([1, 2], n -> n * 2)` types its
+        // callback and `first([1, 2])` answers an integer. Elements that disagree make a union, and
+        // one element nothing is known about gives the whole thing up -- `Any` for the element is
+        // what a bare `array` means and is the honest answer there.
+        ArrayLit(items) -> type_of(ArrayOf(elements_of(items, env)))
+        ArrayRepeat(value, _) -> type_of(ArrayOf(type_of_expr(value, env)))
         DataLit(inner) -> type_of_expr(inner, env)
         ObjectLit(keys, _, values) ->
             var out: Buf[Type] = buf()
@@ -363,7 +439,13 @@ type_of_expr(x: Expr, env: *TypeEnv) -> Type
             as_method match
                 Some(t) -> t
                 None ->
-                    val sig = type_of_expr(callee, env)
+                    val read = type_of_expr(callee, env)
+
+                    // **A generic function's answer is what this call made of it**, solved from the
+                    // arguments beside it: `first(["a"])` answers a string. It is the marker path
+                    // one line down wearing another hat, and the guard is the same -- almost
+                    // nothing is generic, so almost no call pays for the question.
+                    val sig = if has_typevar(read) then solved_generics(read, args, env) else read
 
                     *sig.kind match
                         FunctionType(_, _, _, result) ->
@@ -388,6 +470,39 @@ type_of_expr(x: Expr, env: *TypeEnv) -> Type
         Ensures(_, _, pat) -> type_from_pattern(resolve_pattern(pat, 0))
         _ -> type_of(Any)
 end type_of_expr
+
+// What every element of a literal is, where they agree, and a union where they do not.
+//
+// **`Any` the moment anything is not known**, which is a union with `Any` in it saying nothing --
+// and an empty literal is `Any` too, there being no element to describe.
+private elements_of(items: Buf[Expr], env: *TypeEnv) -> Type
+    if items.is_empty() then return type_of(Any)
+
+    var out: Buf[Type] = buf()
+
+    for i in 0..<items.len()
+        val one = type_of_expr(items.at(i), env)
+
+        *one.kind match
+            Any -> return type_of(Any)
+
+            // A spread element is an array whose own elements are what land here, and this pass does
+            // not open one -- so a literal holding one says nothing.
+            _ -> ()
+
+        *items.at(i).kind match
+            Spread(_) -> return type_of(Any)
+            _ -> ()
+
+        var seen = false
+
+        for j in 0..<out.len()
+            if same_type(out.at(j), one) then seen = true
+
+        if !seen then out.push(one)
+
+    if out.len() == 1 then out.at(0) else type_of(OneOf(out))
+end elements_of
 
 // What an operator answers, given what it was handed.
 //
@@ -778,6 +893,27 @@ private is_shape(t: Type) -> bool = *t.kind match
 // sides are asked to be certain first, since `Any` fits everything and would call anything the same
 // as anything.
 private same_type(a: Type, b: Type) -> bool = certain(a) && certain(b) && fits(a, b) && fits(b, a)
+
+// A NAME's type, with an element type a LITERAL gave it dropped again.
+//
+// **An array is mutable and a name outlives the line that built it**, so `val xs = [1]` followed by
+// `xs[0] = "a"` holds an array of strings -- and a recorded `array of integer` would then refuse a
+// program the machine runs, which is the one mistake this pass may not make. It is the rule an
+// object's shape already follows, applied to the one other type this pass reads out of a literal.
+//
+// **What is NOT dropped is what an annotation says**, here or on a parameter: that is a promise the
+// machine checks where the value arrives, and a program that breaks it later breaks it against the
+// same annotation. Only what was INFERRED from a literal standing right here is given up.
+private elementless(t: Type, init: Expr) -> Type
+    *init.kind match
+        ArrayLit(_) -> ()
+        ArrayRepeat(_, _) -> ()
+        _ -> return t
+
+    *t.kind match
+        ArrayOf(_) -> type_of(ArrayOf(type_of(Any)))
+        _ -> t
+end elementless
 
 // WHAT A `var` MAY EVER HOLD, which is the union of its initialiser and every right-hand side ever
 // assigned to it.

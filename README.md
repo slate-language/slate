@@ -100,6 +100,23 @@ Note.mismatch(v)                // every reason, with a path to each
 save(n: Note) -> string = n.title
 ```
 
+Anything may be annotated and nothing has to be. A type is written inline wherever one is wanted — a
+function type is spelled the way the lambda is, and a definition may be generic over one:
+
+```
+val tags: array of string = ["reading"]
+var count: integer = 0
+
+apply(f: integer -> integer) -> integer = f(1)
+handle(req: Authed & Bodied, done: (string, integer) -> boolean) = done(req.body, req.user.id)
+
+first[T](xs: array of T) -> T = xs[0]
+type Pair[A, B] = { first: A, second: B }
+```
+
+An annotated `var` is TypeScript's `let`: the declared type is what the name holds, and every assignment
+is checked against it.
+
 An `async` function answers a promise, and a `catch` reaches across an `await`:
 
 ```

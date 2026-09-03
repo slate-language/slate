@@ -65,7 +65,11 @@ the compiler resolves and the value the name binds.
 | `object of T` | an object every value of which fits `T` |
 | `T \| U` | either |
 | `T & U` | both |
+| `(T)` | the same `T`, bracketed to group it |
+| `A -> B` | a function of one parameter |
+| `(A, B) -> C`, `() -> C` | a function of none or several |
 | a `type`, `class` or `data` name | what that declared |
+| `Name[A, B]` | a generic type, given what it is generic over |
 
 ### `array of T`
 
@@ -154,6 +158,62 @@ print(handle({ user: { id: 7 }, body: "hi" }))
 **A part may bind, where an alternative may not**: every part runs, so `{ a } & { b }` binding both is
 sound.
 
+### A function type
+
+**`integer -> integer` is the type of `n -> n + 1`, and it is spelled the way the lambda is.** One
+parameter needs no brackets; none or several are a bracketed list:
+
+```slate
+apply(f: integer -> integer) -> integer = f(1)
+twice(f: (integer, integer) -> integer) = f(2, 3)
+later(f: () -> string) = f()
+
+print(apply(n -> n + 1), twice((a, b) -> a * b), later(() -> "hi"))
+```
+
+```output
+2 6 hi
+```
+
+**The arrow is the loosest thing in a type and groups to the right.** `string | null -> integer` is a
+function taking either — which is what a parameter usually means — and a union *holding* a function
+says so with brackets:
+
+```slate
+type Handler = string | null -> integer
+type MaybeFn = (integer -> integer) | null
+
+run(f: MaybeFn) = if f is null then 0 else f(2)
+
+print(run(null), run(n -> n * 10))
+```
+
+```output
+0 20
+```
+
+**Writing one down is what types the lambda handed to it**, which is where most of what it buys shows
+up: the parameters flow inwards and what the body does with them is checked.
+
+```slate
+apply(f: integer -> integer) = f(1)
+
+print(apply(n -> n + "x"))
+```
+
+```error
+`+` does not apply to an integer and a string
+```
+
+**What is checked is the arity and the parameters, and deliberately not the result.** A function's own
+`-> string` is checked against what that function answers and never against what somebody who was
+handed it expected, so a mismatch there is a complaint no run could make. Where the result matters —
+`f(cb) = cb(1) + 1` — it is read off the annotation and the arithmetic is checked on its own.
+
+**At run time a function type asks what it can ask: is this callable, and would it take a call of this
+size.** What a function will *do* with what it is given is not a question about the value in front of
+you, which is why the parameters are the checker's business and the count is both.
+
 ## Annotating
 
 Per parameter, and per result:
@@ -194,8 +254,68 @@ print(d({ x: 0 }))
 `d` takes { x: number, y: number } here, and this is { x: integer }
 ```
 
-**A lambda's parameter cannot be annotated**, and a lambda's result is read off its body — a lambda is
-the one function with no way to say what it answers.
+**A lambda's parameters may be annotated and its result may not.** The arrow already separates the
+parameters from the body, so there is nowhere for a result to be written; it is read off the body.
+
+```slate
+val g = (n: integer) -> n + 1
+
+print(g(2))
+```
+
+```output
+3
+```
+
+### A binding
+
+**`val x: T = e` and `var n: T = e`**, checked where the value arrives and again by the pass that runs
+before the program does:
+
+```slate
+val name: string = "ada"
+val tags: array of string = ["reading", "writing"]
+var count: integer = 0
+
+count += 1
+
+print(name, tags, count)
+```
+
+```output
+ada ["reading", "writing"] 1
+```
+
+**An annotated `var` is TypeScript's `let`: the declared type is what the name holds for its whole
+life**, so every assignment is checked against it rather than against what happens to be there.
+
+```slate
+var n: integer = 0
+
+n = "later"
+```
+
+```error
+`n` was declared integer, and this is string
+```
+
+An **unannotated** `var` is left as it always was — the union of its initialiser and every value ever
+assigned to it — so a program that deliberately reuses a name for another kind is untouched.
+
+### A rest parameter
+
+**`...rest: array of T` describes the array**, because the array is what the name holds: a call gathers
+what is left over into one, and it is checked once, where the gathering happened.
+
+```slate
+total(...ns: array of number) = reduce(ns, (a, b) -> a + b, 0)
+
+print(total(1, 2, 3))
+```
+
+```output
+6
+```
 
 ## What the checker knows before the program runs
 
@@ -257,15 +377,107 @@ q(ns: array of integer) = sorted(ns, a -> a)
 `sorted` takes (integer, integer) -> any here, and this is (integer) -> integer
 ```
 
-**None of that is generics and slate has no type variables.** A signature names an argument by
-*position*, and the type at that position is filled in at the call. What it costs a reader is nothing —
-there is no `<T>` to write anywhere.
+**None of that is a type variable.** A builtin's signature names an argument by *position*, and the
+type at that position is filled in at the call — no binding, no scope, nothing to write anywhere. What
+a program writes for itself is the next section.
+
+## Type parameters
+
+**`first[T](xs: array of T) -> T` is how a function you write says the same thing a builtin says**: the
+answer is whatever the call was given.
+
+```slate
+first[T](xs: array of T) -> T = xs[0]
+
+print(first(["ada", "grace"]), first([1, 2]))
+```
+
+```output
+ada 1
+```
+
+The parameters are solved from the arguments left to right, so a callback written at the call is typed
+from the arguments before it — and what it does with them is checked:
+
+```slate
+map2[A, B](xs: array of A, f: A -> B) -> array of B = map(xs, f)
+
+print(map2(["a", "b"], s -> upper(s)))
+```
+
+```output
+["A", "B"]
+```
+
+**They are declared in one place and nowhere else** — `[T]` after the name of a definition or a type —
+and there are no bounds, no variance and no defaults. A generic type is used by giving it what it is
+generic over, and the shape that comes out is the shape both declarations describe:
+
+```slate
+type Pair[A, B] = { first: A, second: B }
+
+show(p: Pair[string, integer]) = s"${p.first} is ${p.second}"
+
+print(show({ first: "ada", second: 36 }))
+print({ first: "ada", second: "x" } is Pair[string, integer])
+```
+
+```output
+ada is 36
+false
+```
+
+**A generic type used without its arguments is refused rather than quietly erased**, because a check
+that passes for the wrong reason is worse than no check:
+
+```slate
+type Pair[A, B] = { first: A, second: B }
+
+show(p: Pair) = p.first
+```
+
+```error
+`Pair` is generic over 2 types, so it needs them here
+```
+
+### What a type parameter does not do
+
+**Nothing is ever refused on account of one, and the reason is that nothing at run time could.** A type
+parameter is erased: the machine sees values, not the calls that will be made, so there is nothing
+there to say that two arguments were the same type. Where a call disagrees with itself the parameter
+widens into a union rather than becoming a complaint:
+
+```slate
+pair[T](a: T, b: T) -> array of T = [a, b]
+
+print(pair(1, "x"))
+```
+
+```output
+[1, "x"]
+```
+
+**So `x is T` cannot be asked**, and it is refused where it is written rather than answering
+something. **There are no type arguments at a call either** — `first[string](xs)` is an index followed
+by a call, and no grammar can have both — so they are solved from the arguments or not given.
+
+**Inside the definition a `T` is a value nothing is known about**, which is what makes `upper(xs[0])`
+in a generic function perfectly legal: `T` may be a string, and refusing a program that runs is the one
+thing the checker may not do.
 
 ### It reads the rest of the block before it says what a name holds
 
 - **A `var` is the union of its initialiser and every value ever assigned to it**, so a counter stays an
   integer through `+= 1` and `n++` and a wrong call is refused before the program runs. A `var` the
-  program reassigns to another kind is said nothing about.
+  program reassigns to another kind is said nothing about. **An ANNOTATED `var` is what it was declared
+  and every assignment is checked against that**, which is the one place the pass refuses something the
+  machine would have run: the annotation is a promise the program made, and being held to it is what
+  writing one is for.
+- **An array literal says what it was built out of**, so `map([1, 2], n -> n * 2)` types its callback
+  and `first([1, 2])` answers an integer. Elements that disagree make a union and one that is not known
+  gives the whole thing up. **A NAME does not keep it**: an array is mutable and outlives the line that
+  built it, so the element type is dropped where a literal is bound to a name — the rule an object's
+  shape already follows. An annotation is not dropped, being a promise the machine checks.
 - **A local object's fields are known** for as long as nothing can have made them stale: its name never
   mentioned except to read a field off it, so nothing else holds the object and no field of it is ever
   written. `o with { … }` is a mention.

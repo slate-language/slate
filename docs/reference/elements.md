@@ -4,8 +4,9 @@
 the mechanism it is meant to serve is React's.
 
 **Elements are read in every file.** `.slx` is a name for a reader and an editor and says nothing to the
-compiler: slate has no `<T>` generics, which is the entire reason `.tsx` had to be a separate parse mode
-from `.ts` and slx does not.
+compiler: slate's [type parameters](types.md) are written `[T]` and never `<T>`, so a `<` where an
+operand would begin can only be an element — which is the entire reason `.tsx` had to be a separate
+parse mode from `.ts` and slx does not.
 
 ## What an element is
 

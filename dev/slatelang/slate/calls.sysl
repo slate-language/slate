@@ -199,7 +199,14 @@ private call_shape(callee: Expr, args: Buf[Expr], env: *TypeEnv) -> CallShape
                     None -> ()
         _ -> ()
 
-    CallShape(type_of_expr(callee, env), args, 0)
+    val sig = type_of_expr(callee, env)
+
+    // **A generic signature is solved HERE, before anything is checked or quoted**, which is the
+    // arrangement a marker already has: everything downstream reads one signature and none of it
+    // learns that type parameters exist.
+    if has_typevar(sig) then return CallShape(solved_generics(sig, args, env), args, 0)
+
+    CallShape(sig, args, 0)
 end call_shape
 
 struct CallShape
@@ -400,6 +407,195 @@ has_marker(t: Type) -> bool
             false
         _ -> false
 end has_marker
+
+// -- a call to a generic function ------------------------------------------------------------------
+
+// Whether a signature is generic at all.
+//
+// **`has_marker`'s guard, one more time and for its reason**: solving means typing the arguments,
+// and almost nothing is generic -- so this is asked first and a call to anything else pays nothing.
+//
+// Not `private`: `type_of_expr`'s Call arm asks it before it asks for a result.
+has_typevar(t: Type) -> bool
+    *t.kind match
+        TypeVar(_) -> true
+        ArrayOf(element) -> has_typevar(element)
+        ObjectWith(_, values, _) ->
+            for i in 0..<values.len()
+                if has_typevar(values.at(i)) then return true
+
+            false
+        FunctionType(params, _, _, result) ->
+            for i in 0..<params.len()
+                if has_typevar(params.at(i)) then return true
+
+            has_typevar(result)
+        OneOf(alts) ->
+            for i in 0..<alts.len()
+                if has_typevar(alts.at(i)) then return true
+
+            false
+        _ -> false
+end has_typevar
+
+// One generic signature, with its type parameters solved from the arguments this call gives it.
+//
+// **THE PARAMETERS ARE SOLVED LEFT TO RIGHT, WHICH IS WHAT LETS A CALLBACK BE TYPED FROM THE
+// ARGUMENTS BEFORE IT.** `map2[A, B](xs: array of A, f: A -> B) -> array of B` solves `A` from the
+// array, so the lambda's own parameter is typed before its body is read -- and `B` is then whatever
+// that body answered. It is `argument_types`' own order, for `argument_types`' own reason.
+//
+// **A CONFLICT WIDENS INTO A UNION AND REFUSES NOTHING.** `pair(1, "x")` makes `T` an
+// `integer | string` rather than a complaint, because a type parameter is erased: nothing at run
+// time could refuse that call, so nothing here may either.
+//
+// **An unsolved parameter is `Any`, and it may not be left standing.** A type nobody solved would
+// otherwise be quoted at a reader -- `takes T here` -- naming a thing they cannot act on, which is
+// the rule a marker already follows.
+//
+// Not `private`: `call_shape` solves before anything is checked and `type_of_expr` before anything
+// is answered.
+solved_generics(sig: Type, args: Buf[Expr], env: *TypeEnv) -> Type
+    *sig.kind match
+        FunctionType(params, required, variadic, result) ->
+            var names: Buf[string] = buf()
+            var bound: Buf[Type] = buf()
+            var stop = false
+
+            for i in 0..<args.len()
+                if !stop && i < params.len()
+                    // **THE PARAMETER IS SOLVED AGAINST AS IT WAS WRITTEN, and instantiated only to
+                    // ask a lambda what it will be handed.** Solving against the instantiated one
+                    // erases every parameter not yet solved to `Any` -- so `array of T` becomes
+                    // `array of any`, and the argument beside it then answers nothing at all. That
+                    // was the first draft, and it made every type parameter come out `any`.
+                    val declared = params.at(i)
+
+                    *args.at(i).kind match
+                        // **A named or a spread argument is not at the position it was written at**,
+                        // so everything from there on says nothing about which parameter it fills.
+                        Named(_, _) -> stop = true
+                        Spread(_) -> stop = true
+                        Lambda(ps, ds, body, is_async) ->
+                            val expect = wanted_params(instantiated(declared, names, bound))
+
+                            solve_into(declared, lambda_type(ps, ds, body, is_async, env, expect), &names, &bound)
+                        _ -> solve_into(declared, type_of_expr(args.at(i), env), &names, &bound)
+
+            var out: Buf[Type] = buf()
+
+            for i in 0..<params.len()
+                out.push(instantiated(params.at(i), names, bound))
+
+            type_of(FunctionType(out, required, variadic, instantiated(result, names, bound)))
+        _ -> sig
+end solved_generics
+
+// What a callback of this type is handed, where the type is a function at all.
+private wanted_params(want: Type) -> Buf[Type]
+    *want.kind match
+        FunctionType(params, _, _, _) -> params
+        _ -> buf()
+
+// What one argument says about the parameters standing in the type it was handed to.
+//
+// **Structural and one-sided: it reads what the two have in common and ignores the rest.** A shape
+// that does not line up says nothing rather than complaining -- whether the argument FITS is a
+// separate question, asked afterwards and by `fits`, against a signature this has already solved.
+private solve_into(want: Type, got: Type, names: *Buf[string], bound: *Buf[Type])
+    *want.kind match
+        TypeVar(name) -> record_solved(name, got, names, bound)
+        ArrayOf(element) -> *got.kind match
+            ArrayOf(had) -> solve_into(element, had, names, bound)
+            _ -> ()
+        ObjectWith(keys, values, _) -> *got.kind match
+            ObjectWith(had_keys, had_values, _) ->
+                for i in 0..<keys.len()
+                    for j in 0..<had_keys.len()
+                        if keys.at(i) == had_keys.at(j)
+                            solve_into(values.at(i), had_values.at(j), names, bound)
+            _ -> ()
+        FunctionType(params, _, _, result) -> *got.kind match
+            FunctionType(had, _, _, had_result) ->
+                for i in 0..<params.len()
+                    if i < had.len() then solve_into(params.at(i), had.at(i), names, bound)
+
+                solve_into(result, had_result, names, bound)
+            _ -> ()
+        OneOf(_) -> ()
+        _ -> ()
+end solve_into
+
+// One parameter's answer, widened where a second argument disagrees with the first.
+//
+// **`Any` is not an answer and is dropped.** An argument nothing is known about says nothing about
+// `T`, and recording it would throw away what the argument beside it did say.
+private record_solved(name: string, t: Type, names: *Buf[string], bound: *Buf[Type])
+    *t.kind match
+        Any -> return
+        _ -> ()
+
+    for i in 0..<names.len()
+        if names.at(i) == name
+            val had = bound.at(i)
+
+            if fits(t, had) then return
+
+            if fits(had, t)
+                bound.set(i, t)
+                return
+
+            var alts: Buf[Type] = buf()
+
+            widen_into(&alts, had)
+            widen_into(&alts, t)
+            bound.set(i, type_of(OneOf(alts)))
+            return
+
+    names.push(name)
+    bound.push(t)
+end record_solved
+
+// A union built flat, a union never holding a union.
+private widen_into(alts: *Buf[Type], t: Type)
+    *t.kind match
+        OneOf(inner) ->
+            for i in 0..<inner.len()
+                alts.push(inner.at(i))
+        _ -> alts.push(t)
+
+// One type with every solved parameter put in and every unsolved one erased to `Any`.
+private instantiated(t: Type, names: Buf[string], bound: Buf[Type]) -> Type
+    *t.kind match
+        TypeVar(name) ->
+            for i in 0..<names.len()
+                if names.at(i) == name then return bound.at(i)
+
+            type_of(Any)
+        ArrayOf(element) -> type_of(ArrayOf(instantiated(element, names, bound)))
+        ObjectWith(keys, values, optional) ->
+            var out: Buf[Type] = buf()
+
+            for i in 0..<values.len()
+                out.push(instantiated(values.at(i), names, bound))
+
+            type_of(ObjectWith(keys, out, optional))
+        FunctionType(params, required, variadic, result) ->
+            var out: Buf[Type] = buf()
+
+            for i in 0..<params.len()
+                out.push(instantiated(params.at(i), names, bound))
+
+            type_of(FunctionType(out, required, variadic, instantiated(result, names, bound)))
+        OneOf(alts) ->
+            var out: Buf[Type] = buf()
+
+            for i in 0..<alts.len()
+                out.push(instantiated(alts.at(i), names, bound))
+
+            type_of(OneOf(out))
+        _ -> t
+end instantiated
 
 // The types of a call's arguments, each worked out ONCE.
 //

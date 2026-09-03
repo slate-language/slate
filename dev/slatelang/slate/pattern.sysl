@@ -14,13 +14,124 @@ import sysl.buf.{Buf, buf}
 // Reading one as the other and converting afterwards would put the complaint about `[1 + 1]` in a
 // function that no longer knows a pattern was wanted.
 
+// -- the type parameters a definition is INSIDE ------------------------------------------------------
+
+// **The parser is what knows a name is a type parameter, and `ScopedNames` is where it remembers.**
+// A bare name in a type is a declared type or a mistake; one the enclosing `[...]` introduced is
+// neither, and nothing downstream could tell the difference -- a name resolved later would find no
+// type and complain about a name the reader deliberately wrote.
+//
+// **The stack itself is `sh.sysl.parsing`'s, because none of it is about types.** It answers "is
+// this word one of the names the region I am inside introduced", which is a question a loop label, a
+// `let ... in` binding and a macro parameter all ask; what is slate's is only which words go in it.
+//
+// **Module storage rather than a field on `Parser`**, one parse running at a time -- and a region
+// per definition, so `outer[T]` holding `inner[U]` leaves `U` unspellable the moment `inner` ends.
+private var active_params: ScopedNames = scoped_names()
+
+// Not `private`: `define.sysl` opens one around a definition and `parse.sysl` around a declaration.
+push_type_params(names: Buf[string])
+    active_params.open_with(names)
+
+pop_type_params()
+    active_params.close()
+
+// **Emptied before a parse rather than after one**, because a file that stopped on a syntax error
+// may have left a definition unclosed -- and a leftover parameter name would make a bare `T` in the
+// NEXT program a type that tests nothing.
+//
+// Not `private`: `parse_source` clears it with everything else it clears.
+reset_type_params()
+    active_params.clear()
+
+private is_type_param(name: string) -> bool = active_params.has(name)
+
+// `[A, B]` after a definition's or a declaration's name.
+//
+// **Bare names and nothing else.** There are no bounds, no variance and no defaults: slate refuses
+// nothing on a type parameter -- nothing at run time could -- so a bound would be a promise the
+// language cannot keep. What a parameter does is carry what a call was given through to the answer.
+//
+// Not `private`: read from `define.sysl` and `parse.sysl`.
+type_parameters(p: *Parser) -> Buf[string]
+    var names: Buf[string] = buf()
+
+    p.expect(LBracket, "`[` and the type parameters")
+
+    if !p.at(RBracket)
+        loop
+            val at = p.here()
+            val name = parse_name(p, "a name for the type parameter")
+
+            // **A type parameter that names one of slate's kinds would shadow it inside the whole
+            // definition**, so `f[string](x: string)` would check nothing at all -- which is the
+            // silent hole this repo refuses everywhere else.
+            type_test_named(name) match
+                Some(_) -> p.fault(at, s"`${name}` is one of slate's own types, so a type parameter of that name would make every `${name}` in this definition test nothing -- name it `T`")
+                None -> ()
+
+            names.push(name)
+
+            if !p.accept(Comma) then break
+            if p.at(RBracket) then break
+
+    p.expect(RBracket, "`]` after the type parameters")
+
+    names
+end type_parameters
+
 // One pattern, alternatives included.
 //
 // **`&` binds tighter than `|`**, so `A & B | C` is `(A & B) | C` -- the reading every language with
 // both gives it, and the useful one: a union of shapes is far commoner than an intersection with a
 // union in it, which wants its brackets anyway.
-parse_pattern(p: *Parser) -> Pattern
-    val first = parse_intersection(p)
+parse_pattern(p: *Parser) -> Pattern = parse_alternatives(p, false)
+
+// One type expression.
+//
+// **A TYPE IS A PATTERN PLUS THE THREE THINGS A PATTERN CANNOT HAVE**: a function type, brackets that
+// group, and type arguments. Everything else -- `{ a: T }`, `[T, U]`, `array of T`, a union, an
+// intersection, a literal -- is read by the very functions a `match` arm is read by, so the two can
+// never drift about the shape they share.
+//
+// **The fork exists because of one token.** `->` is the arm arrow, so an arm's `string -> "a"` would
+// read as a function type from `string` to the literal type `"a"` and swallow the body. A type
+// position has no such arrow of its own: an annotation ends at a `,`, a `)`, a `=` or the end of the
+// line, and a result type ends at the `=` or the block that follows it. So the arrow is read here and
+// refused there, rather than being disambiguated -- which it cannot be, both readings being legal.
+//
+// **The four type positions are the whole list**: a parameter's annotation, a result, the right of a
+// `type` declaration, and a class's `is` promises. A binding, a `for` head, an `is` test and a
+// `match` arm all read patterns.
+parse_type(p: *Parser) -> Pattern = parse_alternatives(p, true)
+
+private parse_alternatives(p: *Parser, types: bool) -> Pattern
+    val joined = parse_union(p, types)
+
+    // **The arrow is read after the union, which is what makes it the loosest thing in a type.**
+    // `string | null -> integer` is a function taking either, which is the reading a parameter wants;
+    // a union with a function in it says so with brackets, `(integer -> integer) | null`.
+    //
+    // **One bare parameter needs no brackets, mirroring the lambda it describes**: `n -> n + 1` has
+    // the type `integer -> integer`. Two or more are a bracketed list, and so is none.
+    if !types || !p.at(Arrow) then return joined
+
+    p.bump()
+
+    // **Right-associative**, so `A -> B -> C` is a function answering a function -- the reading every
+    // language with a curried arrow gives it, and the only one that is any use: the other grouping
+    // describes a function whose parameter is a function and would be written `(A -> B) -> C`.
+    val result = parse_alternatives(p, true)
+
+    var params: Buf[Pattern] = buf()
+
+    params.push(joined)
+
+    pattern(joined.span.to(result.span), FnPat(params, result))
+end parse_alternatives
+
+private parse_union(p: *Parser, types: bool) -> Pattern
+    val first = parse_intersection(p, types)
 
     if !p.at(Pipe) then return first
 
@@ -31,7 +142,7 @@ parse_pattern(p: *Parser) -> Pattern
     loop
         if !p.accept(Pipe) then break
 
-        alts.push(parse_intersection(p))
+        alts.push(parse_intersection(p, types))
 
     // **No alternative may bind.** `n | 0` would leave `n` bound down one path and not the other,
     // so every use of it below would be a name that may or may not exist -- and slate has no type
@@ -49,7 +160,7 @@ parse_pattern(p: *Parser) -> Pattern
             p.fault(alt.span, "an alternative of a pattern may not bind a name")
 
     pattern(first.span.to(alts.at(alts.len() - 1).span), OrPat(alts))
-end parse_pattern
+end parse_union
 
 // Whether this alternative is made only of bare names, which the parser cannot yet judge.
 //
@@ -76,8 +187,8 @@ end still_might_be_types
 // carry over: an alternative binds down one path only, and every part of this one runs. What is
 // refused is left to the passes that can see more -- `resolve_pattern` still complains about a bare
 // name that named no type, exactly as it does inside a union.
-private parse_intersection(p: *Parser) -> Pattern
-    val first = parse_primary_pattern(p)
+private parse_intersection(p: *Parser, types: bool) -> Pattern
+    val first = parse_primary_pattern(p, types)
 
     if !p.at(Amp) then return first
 
@@ -88,7 +199,7 @@ private parse_intersection(p: *Parser) -> Pattern
     loop
         if !p.accept(Amp) then break
 
-        parts.push(parse_primary_pattern(p))
+        parts.push(parse_primary_pattern(p, types))
 
     pattern(first.span.to(parts.at(parts.len() - 1).span), AndPat(parts))
 end parse_intersection
@@ -125,6 +236,27 @@ first_binding(pat: Pattern) -> Option[string]
         // ran last** -- a value nobody asked for. `resolve_pattern` is where that is refused, and
         // this is the question it asks.
         EveryPat(_, element) -> first_binding(element)
+
+        // **A name written in a function type is a binding like any other and is refused like one.**
+        // `(n) -> integer` reads as a function taking whatever `n` names, and where nothing names it
+        // the reader wrote a parameter's name in a place that has none.
+        FnPat(params, result) ->
+            for i in 0..<params.len()
+                first_binding(params.at(i)) match
+                    Some(n) -> return Some(n)
+                    None -> ()
+
+            first_binding(result)
+
+        // **A type given to a generic type is an ordinary type and is asked the ordinary question**,
+        // so `Pair[n, string]` is refused for naming a binding exactly as `{ x: n }` is.
+        AppliedPat(_, args) ->
+            for i in 0..<args.len()
+                first_binding(args.at(i)) match
+                    Some(n) -> return Some(n)
+                    None -> ()
+
+            None
         OrPat(alts) ->
             for i in 0..<alts.len()
                 first_binding(alts.at(i)) match
@@ -187,6 +319,16 @@ binds(pat: Pattern) -> bool
             false
         MadeFrom(_, inner) -> binds(inner)
         EveryPat(_, element) -> binds(element)
+        FnPat(params, result) ->
+            for i in 0..<params.len()
+                if binds(params.at(i)) then return true
+
+            binds(result)
+        AppliedPat(_, args) ->
+            for i in 0..<args.len()
+                if binds(args.at(i)) then return true
+
+            false
         _ -> false
 end binds
 
@@ -199,7 +341,7 @@ end binds
 //
 // `n @ pat` follows the name where one is given, which is the spelling sysl uses for the same thing
 // and is how a program tests and binds at once.
-private bare_name_pattern(p: *Parser, at: Span) -> Pattern
+private bare_name_pattern(p: *Parser, at: Span, types: bool) -> Pattern
     p.bump()
 
     val name = p.text(at)
@@ -215,7 +357,7 @@ private bare_name_pattern(p: *Parser, at: Span) -> Pattern
     if name == "any" then return pattern(at, Wild)
 
     if p.accept(At)
-        val inner = parse_primary_pattern(p)
+        val inner = parse_primary_pattern(p, types)
 
         return pattern(at.to(inner.span), At(name, inner))
     end if
@@ -239,7 +381,7 @@ private bare_name_pattern(p: *Parser, at: Span) -> Pattern
 
         if !p.at(RParen)
             loop
-                items.push(parse_pattern(p))
+                items.push(parse_alternatives(p, types))
 
                 if !p.accept(Comma) then break
 
@@ -253,9 +395,44 @@ private bare_name_pattern(p: *Parser, at: Span) -> Pattern
     // else this could begin. Which fields a declaration actually has is not known here either --
     // `resolve_pattern` checks the names against it, for the same reason it checks the arity.
     if p.at(LBrace)
-        val inner = object_pattern(p, p.here())
+        val inner = object_pattern(p, p.here(), types)
 
         return pattern(at.to(p.just_taken()), MadeFrom(name, inner))
+    end if
+
+    // **A type parameter is decided before anything else a name could be**, which is what makes it a
+    // parameter: inside `f[T]`, `T` is that parameter and not a type the file happens to declare.
+    if is_type_param(name)
+        if types then return pattern(at, TypeVarPat(name))
+
+        // **`x is T` CANNOT BE ASKED, and saying so is much better than answering it.** A type
+        // parameter is erased -- there is nothing at run time that knows what a call solved it to --
+        // so this would be a bare name binding `x`'s value and matching everything, which is a test
+        // the reader believes and does not get.
+        p.fault(at, s"`${name}` is a type parameter, and a type parameter is not there at run time -- so nothing can be tested against it. Test the type you expect, or take a `${name}` and let the caller's type say what it was")
+
+        return pattern(at, Wild)
+    end if
+
+    // `Pair[string, integer]` -- a generic type, given what it is generic over. **A `[` after a name
+    // begins nothing else, in a type or in a pattern**: an array pattern is `[a, b]` and an array
+    // type is `[T, U]` or `array of T`, and neither can follow a name, there being no juxtaposition
+    // in the grammar and no indexing in a pattern.
+    if p.at(LBracket)
+        p.bump()
+
+        var args: Buf[Pattern] = buf()
+
+        if !p.at(RBracket)
+            loop
+                args.push(parse_type(p))
+
+                if !p.accept(Comma) then break
+                if p.at(RBracket) then break
+
+        p.expect(RBracket, "`]` after the types a generic type is given")
+
+        return pattern(at.to(p.just_taken()), AppliedPat(name, args))
     end if
 
     type_test_named(name) match
@@ -267,7 +444,7 @@ private bare_name_pattern(p: *Parser, at: Span) -> Pattern
             if (test == IsArray || test == IsObject) && p.at(Ident) && p.text(p.here()) == "of"
                 p.bump()
 
-                val element = parse_primary_pattern(p)
+                val element = parse_primary_pattern(p, types)
 
                 pattern(at.to(element.span), EveryPat(test, element))
             else
@@ -275,11 +452,18 @@ private bare_name_pattern(p: *Parser, at: Span) -> Pattern
         None -> pattern(at, Bind(name))
 end bare_name_pattern
 
-private parse_primary_pattern(p: *Parser) -> Pattern
+private parse_primary_pattern(p: *Parser, types: bool) -> Pattern
     val at = p.here()
 
+    // **A `(` in a type begins two things and the token after the `)` says which**, which is one
+    // token of lookahead and no ambiguity: an arrow makes the brackets a parameter list, and anything
+    // else makes them grouping. Nothing needs deciding on the way in, so the list is read once either
+    // way. A pattern has no brackets at all -- a `match` arm groups with nothing, `|` and `&` being
+    // the only things that join two patterns and the tighter of them binding first.
+    if types && p.at(LParen) then return paren_type(p, at)
+
     p.peek() match
-        Ident -> bare_name_pattern(p, at)
+        Ident -> bare_name_pattern(p, at, types)
         IntLit ->
             p.bump()
             pattern(at, IntPat(read_int_at(p, at)))
@@ -299,13 +483,59 @@ private parse_primary_pattern(p: *Parser) -> Pattern
             p.bump()
             pattern(at, NullPat)
         Minus -> negative_number_pattern(p, at)
-        LBracket -> array_pattern(p, at)
-        LBrace -> object_pattern(p, at)
+        LBracket -> array_pattern(p, at, types)
+        LBrace -> object_pattern(p, at, types)
         _ ->
             p.report.add(expected(at, "a pattern", p.found(at)))
             p.bump()
             pattern(at, Wild)
 end parse_primary_pattern
+
+// `(A, B) -> C` and `() -> C` -- a function type's parameter list -- and `(A | B)`, one type grouped.
+//
+// **The list is read before anything is decided, so neither reading is speculative.** What follows
+// the `)` chooses: an arrow makes those types the parameters, and no arrow makes a single one of them
+// the type in brackets. Several with no arrow is neither, and says so.
+private paren_type(p: *Parser, at: Span) -> Pattern
+    p.bump()
+
+    var items: Buf[Pattern] = buf()
+
+    if !p.at(RParen)
+        loop
+            val item = parse_type(p)
+
+            // **A reader coming from TypeScript writes `(n: integer) -> integer`, and the parameter's
+            // name has nowhere to go here.** Left alone, the complaint is about the `)` that never
+            // arrived, which sends them to count brackets rather than to delete a word.
+            if p.at(Colon)
+                p.fault(item.span, "a function type says what its parameters ARE rather than what they are called -- write `(integer) -> string`")
+                p.bump()
+                items.push(parse_type(p))
+            else
+                items.push(item)
+
+            if !p.accept(Comma) then break
+            if p.at(RParen) then break
+
+    p.expect(RParen, "`)`")
+
+    val closed = at.to(p.just_taken())
+
+    if p.accept(Arrow)
+        val result = parse_type(p)
+
+        return pattern(closed.to(result.span), FnPat(items, result))
+
+    if items.len() == 1 then return items.at(0)
+
+    if items.is_empty()
+        p.fault(closed, "`()` is the parameter list of a function that takes nothing, so it needs `->` and what that function answers -- write `() -> string`")
+    else
+        p.fault(closed, "several types in brackets are a function type's parameter list, so they need `->` and what that function answers -- brackets around one type group it")
+
+    pattern(closed, Wild)
+end paren_type
 
 // `-1` and `-1.5`.
 //
@@ -329,7 +559,7 @@ private negative_number_pattern(p: *Parser, at: Span) -> Pattern
 end negative_number_pattern
 
 // `[a, b]`, `[]`, and `[first, ...rest]`.
-private array_pattern(p: *Parser, at: Span) -> Pattern
+private array_pattern(p: *Parser, at: Span, types: bool) -> Pattern
     p.bump()
 
     var items: Buf[Pattern] = buf()
@@ -354,7 +584,7 @@ private array_pattern(p: *Parser, at: Span) -> Pattern
                 break
             end if
 
-            val item = parse_pattern(p)
+            val item = parse_alternatives(p, types)
 
             items.push(item)
             defaults.push(parse_default(p, item))
@@ -379,7 +609,7 @@ private array_pattern(p: *Parser, at: Span) -> Pattern
 end array_pattern
 
 // `{ name: n }`, and `{ name }` as shorthand for `{ name: name }`.
-private object_pattern(p: *Parser, at: Span) -> Pattern
+private object_pattern(p: *Parser, at: Span, types: bool) -> Pattern
     p.bump()
 
     var keys: Buf[string] = buf()
@@ -407,7 +637,7 @@ private object_pattern(p: *Parser, at: Span) -> Pattern
             // would have to invent one, so it is refused here rather than at the point where the
             // invented name turned out not to exist.
             if p.accept(Colon)
-                values.push(parse_pattern(p))
+                values.push(parse_alternatives(p, types))
             elif quoted
                 p.fault(key_at, s"`${key}` is not a name, so this has to say what to bind it to -- write `\"${key}\": some_name`")
                 values.push(pattern(key_at, Bind("")))

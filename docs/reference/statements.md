@@ -10,6 +10,22 @@ var n = 0
 **`val` cannot be assigned to again; `var` can.** A `val` bound to an array or an object still allows
 that container to be changed — the binding is what is fixed, not the value.
 
+Either may say what it holds, and an annotated `var` is TypeScript's `let`: the declared type is what
+the name holds for its whole life, so every assignment is checked against it.
+
+```slate
+val name: string = "slate"
+var n: integer = 0
+
+n += 1
+
+print(name, n)
+```
+
+```output
+slate 1
+```
+
 A [definition](functions.md) is a statement too, and so are `type`, `class` and `data`, each of which
 belongs to the top level of a file.
 

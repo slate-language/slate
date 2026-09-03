@@ -86,7 +86,26 @@ forEach([1, 2, 3], x ->
 a `,` arriving there has nothing to mean. Every callback slate itself takes is last for that reason;
 `setTimeout(fn, ms)` keeps node's order and so takes a one-line function.
 
-A lambda's parameter cannot be annotated. What it answers is read off its body — see [Types](types.md).
+A lambda's parameters may be annotated; its result may not, the arrow already standing between the
+parameters and the body. What it answers is read off that body — see [Types](types.md).
+
+## Type parameters
+
+`[T]` after the name says the definition is generic over a type, and the answer is said in terms of
+what the call was given:
+
+```slate
+first[T](xs: array of T) -> T = xs[0]
+
+print(first(["ada", "grace"]), first([1, 2]))
+```
+
+```output
+ada 1
+```
+
+There are no type arguments at a call — they are solved from the arguments — and nothing is ever
+refused on account of one. [Types](types.md) says why.
 
 ## Defaults
 
