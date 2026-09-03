@@ -196,6 +196,11 @@ positional form by name**, with the named one offered instead.
 **Naming the class is what lets a misspelled field be caught**: a bare `{ raduis: r }` is a legal pattern
 that never matches, where `Circle { raduis: r }` is refused where it stands.
 
+**The class name is also a shape value**, so `Circle.test(v)` asks at run time what `v is Circle` asks
+where it is written, and `Circle.mismatch(v)` and `Circle.name()` answer too — see
+[Types](types.md#a-type-is-a-value-under-its-own-name). A static the class declares under one of those
+three names wins over it.
+
 ## `is` in the header
 
 `is` in a class header is TypeScript's `implements` — a promise, checked where the class is written:

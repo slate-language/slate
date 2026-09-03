@@ -41,8 +41,8 @@ main()
 | `rmdir(path)` | |
 | `rename(from, to)` | |
 
-**Every one has a blocking twin under a `Sync` suffix** — `readFileSync`, `writeFileSync`, `statSync` and
-the rest — which is node's arrangement and node's spelling:
+**Every one has a blocking twin under a `Sync` suffix** — `readFileSync`, `writeFileSync`,
+`appendFileSync`, `statSync` and the rest — which is node's arrangement and node's spelling:
 
 ```slate
 mkdirSync("scratch")

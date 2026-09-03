@@ -520,6 +520,42 @@ depend on the structure of a type. `is` is deliberately not extended to take one
 pattern position binds, so `v is s` would match everything — and `shape` is a type word, so `s is shape`
 asks whether `s` is one of these.
 
+**This covers all three declarations that name a type**, so a [class](classes.md) name and a
+[data](data-types.md) name answer the same three about themselves — the shape being the very pattern
+`is` tests, interned where the declaration stands:
+
+```slate
+class Point
+    var x
+    var y
+
+data Failure
+    NotFound(what)
+    Empty
+
+print(Point.name(), Point.test(Point(1, 2)), Point.test({ x: 1, y: 2 }))
+print(Failure.test(Empty), Failure.mismatch(3))
+print(NotFound.test(NotFound("a")), NotFound.test(Empty))
+```
+
+```output
+Point true false
+true [{path: "", wanted: "Failure", got: "integer"}]
+true false
+```
+
+A class and a variant ask a **nominal** question — was this value made from that declaration — so
+`test` is `is` and a `mismatch` against one names the type and stops. There is nothing more useful to
+say about a value that was made from something else.
+
+**A static the class itself declares wins over all three**, the shape answering only where the
+object's own fields and its whole proto chain have said nothing. So `test` and `name` are still words
+a class may use for its own purposes.
+
+`shape` as a type word takes all three, so `f(s: shape)` is how a function says it wants one — and
+`Point is shape` is true where `Point(1, 2) is shape` is not, a value being what the type describes
+rather than the type.
+
 ## Interfaces
 
 An interface, in the sense of a set of operations, needs nothing further — functions are values, so

@@ -82,6 +82,11 @@ and a `_` arm is how a program says it has finished listing.
 Variants take the same two forms a class does — `Circle(r)` by position, `Circle { r }` by name — and a
 field name the variant does not carry is refused where it is written. See [Patterns](patterns.md).
 
+**The data name and each variant name are shape values**, so `Figure.test(v)` asks whether `v` was made
+by one of the variants and `Circle.test(v)` asks about that one — the run-time form of the `is` above.
+`mismatch` and `name` come with them; see
+[Types](types.md#a-type-is-a-value-under-its-own-name).
+
 ## Encoding
 
 Without a `toJSON`, a variant encodes as its own fields: `Circle(3)` is `{"r":3}`, never the chain it

@@ -32,3 +32,9 @@ type Winged = Tweeter
 type Perched = { on: string, who: Animal }
 
 print(b is Winged, { on: "wire", who: b } is Perched, { on: "wire", who: 5 } is Perched)
+
+// **An imported class is a SHAPE VALUE under its alias**, the shape having been interned where the
+// class was declared -- so the name it reports is the declared one and the test still finds the
+// class in the module that wrote it, not in this file.
+print(Tweeter.name(), Tweeter.test(b), Tweeter.test(Animal.new("cat")))
+print(Speaker.test(b), Animal.mismatch(5))
