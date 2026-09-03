@@ -1008,9 +1008,22 @@ f(ns.filter(n -> n > 1))        // the same error
 ```
 
 A lambda's result is read off its body, which is what lets `map(ns, n -> string(n))` be an `array of
-string` — a lambda is the one function with no way to *say* what it answers. Its parameters are
-still `any`, so `map(ns, n -> n * 2)` is an `array of any` rather than of integer; tying a lambda's
-parameter to the array beside it is what a type variable would be for, and slate has none.
+string` — a lambda is the one function with no way to *say* what it answers.
+
+**And a callback knows what it is handed.** `map`, `filter`, `forEach` and the rest call their
+function with one element, `sorted` calls its comparator with two, and slate's checker says so — so a
+lambda written at the call gets its parameters typed from the array beside it, and what it *does*
+with them is checked:
+
+```
+g(ss: array of string) = map(ss, s -> s * 2)    // error: `*` does not apply to string and integer
+h(ns: array of integer) = map(ns, n -> n * 2)   // an array of integer, not of any
+sorted(ns, a -> a)                              // error: `sorted` takes (integer, integer) -> any
+```
+
+None of that is generics and slate has no type variables: a signature names an argument by
+*position*, and the type at that position is filled in at the call. What it costs a reader is
+nothing — there is no `<T>` to write anywhere.
 
 **The checker reads the rest of the block before it says what a name holds.** A `var` is the union of
 its initialiser and every value ever assigned to it, so a counter stays an integer through `+= 1` and
