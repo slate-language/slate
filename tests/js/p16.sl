@@ -61,8 +61,8 @@ print(has(Point(1, 2), "name"))
 
 // A tag is not a field, on either back end.
 print(keys(Point), keys(Failure), len(Point))
-// `Failure` itself is left out of this line: its shared object holds a method, and the two back ends
-// print a FUNCTION differently -- `<function of 1>` against `<function>`. That is a divergence of
-// its own and not this file's business; `keys` above is what says the tag is not a field.
-print(Point, Empty, NotFound("a"), Denied("a", "b"))
+// A data type, a variant's maker, a value made by one, a class and a function -- each of which the
+// two back ends said differently at some point, which is the whole reason this file runs on both.
+print(Point, Failure, NotFound, Empty, NotFound("a"), Denied("a", "b"))
+print(Point.test, fits, (x) -> x)
 print(NotFound("x").said(), Empty.said())

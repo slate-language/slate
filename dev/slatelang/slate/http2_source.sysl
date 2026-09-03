@@ -61,6 +61,14 @@ http2_source() -> string = raw"""
         // and the reason is the same: the client is told, and the fault reaches the loop and stops
         // the program as any other fault would.
         async answer(stream: integer, req: object)
+            // **Whether the failure came from WRITING the answer rather than from working it out**,
+            // which is the same distinction `answer` draws on the 1.1 connection and `streamed`
+            // draws mid-body. `h2Respond` answers an error for a stream the client has already
+            // reset -- a cancelled fetch, a closed tab -- and `slate:nghttp2` raises that as a
+            // fault; putting it back would let any client stop the server by giving up on a request
+            // it had just made.
+            var replying = false
+
             // **The whole of it is inside the `try`, and the refusal below is why.** A defect found
             // while reading the answer is a defect exactly as one raised while working it out is,
             // and a client that is told nothing waits forever.
@@ -87,12 +95,24 @@ http2_source() -> string = raw"""
                 for [k, hv] in r.headers
                     push(headers, [lower(k), hv])
 
+                replying = true
+
                 h2Respond(session, stream, headers, r.text ?? r.bytes)
                 flush()
             catch e
+                // The stream is gone: there is nobody to tell and nothing wrong with the program.
+                if replying then return
+
                 if !shut
-                    h2Respond(session, stream, [[":status", "500"]], "this request was not answered")
-                    flush()
+                    // **Telling a client that has gone is not something to complain about**, which
+                    // is `refuse`'s rule on the 1.1 connection. Without this a handler that faulted
+                    // on a stream the client had already reset raised a SECOND fault here, from
+                    // inside the `catch` -- and that one nothing was waiting for at all.
+                    try
+                        h2Respond(session, stream, [[":status", "500"]], "this request was not answered")
+                        flush()
+                    catch gone
+                        val told = gone
 
                 throw e
 
@@ -109,7 +129,31 @@ http2_source() -> string = raw"""
                     val key = string(e.stream)
 
                     if has(pending, key)
-                        pending[key] = pending[key] with { body: concat(pending[key].body, e.bytes) }
+                        val grown = concat(pending[key].body, e.bytes)
+
+                        // **THE SAME BOUND THE 1.1 SERVER APPLIES, AND FOR THE SAME REASON.** A
+                        // server that grows a buffer for as long as frames keep arriving is one
+                        // connection away from being over, and `serve` has refused a body past
+                        // `BodyBytes` with a `413` from the start -- while this path concatenated
+                        // whatever arrived, so a client could hold a gigabyte in a server that
+                        // refuses a megabyte over HTTP/1.1.
+                        //
+                        // **The answer goes out and the stream is NOT reset**, which was the first
+                        // thing tried: an `h2Reset` on the same turn cancels the stream before its
+                        // own response has left the session, so the client is told nothing at all --
+                        // it sees `rstStream` where a `413` should have been. What arrives after
+                        // this is consumed for its flow-control credit and dropped, which is what
+                        // the 1.1 server does with a body it has already refused.
+                        if len(grown) > BodyBytes
+                            pending = forgotten(pending, key)
+
+                            h2Respond(session, e.stream, [[":status", "413"]],
+                                "the body is larger than " + string(BodyBytes) + " bytes")
+                            h2Consume(session, e.stream, len(e.bytes))
+
+                            continue
+
+                        pending[key] = pending[key] with { body: grown }
 
                     // **Credit is returned when the work is done and not when the bytes land**, which
                     // is what a flow-control window is for: a server that acknowledged on arrival
@@ -125,6 +169,14 @@ http2_source() -> string = raw"""
                         pending = forgotten(pending, key)
 
                         answer(e.stream, requestOfH2(held.headers, held.body, streaming))
+
+                // **A STREAM THAT ENDS ANY OTHER WAY TAKES ITS PARTIAL BODY WITH IT.** Only
+                // `streamEnd` used to clear a slot, so a client that reset a stream mid-upload --
+                // a cancelled fetch, a browser tab closed, a timeout -- left the bytes it had sent
+                // held for the life of the connection, and a client doing it repeatedly kept every
+                // one of them.
+                elif e.kind == "rstStream" || e.kind == "streamClose"
+                    pending = forgotten(pending, string(e.stream))
                 elif e.kind == "goaway"
                     stop()
 
@@ -185,6 +237,14 @@ http2_source() -> string = raw"""
                 target = value
             elif name == ":authority"
                 headers["host"] = value
+            elif name == "cookie" && has(headers, "cookie")
+                // **RFC 9113 SS8.2.3: COOKIE FIELDS ARE JOINED WITH `"; "`.** HTTP/2 lets a client
+                // split its cookies one per field so that each compresses on its own, and browsers
+                // do -- so keeping the last of them, which is what every other repeated name gets
+                // here, silently dropped all but one cookie from every such request. Joined, the
+                // value is exactly what the same client sends over 1.1 and `parseCookies` reads it
+                // unchanged.
+                headers["cookie"] = headers["cookie"] + "; " + value
             elif !startsWith(name, ":")
                 headers[name] = value
 

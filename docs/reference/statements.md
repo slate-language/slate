@@ -65,6 +65,39 @@ print(a)
 reordered around anything: only the binding moves, and what it binds is a function that has not been
 called yet.
 
+**A definition may not take a name its own block has already declared**, whether by another
+definition or by a `val` or a `var`. The hoisting is the reason: the two would not run in the order
+they are written, so what the second one means depends on a rule the reader cannot see.
+
+```slate
+f() = 1
+
+print(f())
+
+f() = 2
+```
+
+```error
+`f` is declared twice in this block
+```
+
+A **nested** block is its own, so shadowing an outer name is untouched — and a `val` written *below*
+a definition is not a collision but the ordinary way to name a generator and then run it:
+
+```slate
+counting()
+    yield 1
+    yield 2
+
+val counting = counting()
+
+print(counting.next().value, counting.next().value)
+```
+
+```output
+1 2
+```
+
 ## Assignment
 
 Assignment is a **statement**, never an expression, so `=` cannot appear inside an expression and

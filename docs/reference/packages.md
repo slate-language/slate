@@ -49,8 +49,17 @@ hashed and pinned in `slate.sum` exactly as any other dependency when it is *you
 and a package you depend on has its own second section skipped, however deep it sits. So a package's suite
 may reach for whatever it likes without every consumer paying for it.
 
-**A package is in one section or the other**, and `slate add` refuses to put a name in both: two packages
-cannot share an import name, and one package cannot be in two places.
+**A package is in one section or the other**, and both `slate add` and the manifest reader refuse a name
+in both: two packages cannot share an import name, and one package cannot be in two places. A file
+written by hand that names one twice is a file saying two contradictory things, and it is answered with a
+caret rather than resolved twice.
+
+`slate deps` marks the ones a consumer would not get:
+
+```
+  parsing 0.4.0 (github.com/sysl-lang/parsing)
+  logger 0.1.0 (github.com/slate-language/logger) -- dev
+```
 
 ```
 slate add --dev github.com/slate-language/logger

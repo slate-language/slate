@@ -251,6 +251,7 @@ http_write_source() -> string = raw"""
         await send(conn, streamHead(r.status, extra, keep))
 
         var beating = false
+        var timer = null
 
         // **A comment while nothing is happening**, on the interval the response asked for. A line
         // beginning `:` is a comment every SSE client ignores, and it is what keeps an idle
@@ -263,19 +264,30 @@ http_write_source() -> string = raw"""
         // **The server writes it rather than the formatter.** A formatter pulling from a source
         // cannot interleave a heartbeat with it without racing two promises; the writer already has
         // the socket and a clock.
-        // **The comment goes through `sendChunk` rather than being framed by hand**, which is where
-        // the first version of this got it wrong: a size line counted in characters rather than
-        // bytes, or counted at all by eye, is a chunked stream no client can read past.
-        beat()
+        //
+        // **The comment is FRAMED rather than written by hand**, which is where the first version of
+        // this got it wrong: a size line counted in characters rather than bytes, or counted at all
+        // by eye, is a chunked stream no client can read past.
+        //
+        // **AND IT IS AWAITED, INSIDE A `try`.** An unawaited send is a promise nobody holds, so once
+        // the client has gone its rejection is an orphan -- and an orphaned failure stops the
+        // program, which is the very thing a departed client may not do. A heartbeat that cannot be
+        // written means there is nobody to keep the connection open for, so the beating stops and
+        // the response ends the way any other write failure ends it.
+        async beat()
             if !beating then return
 
-            sendChunk(conn, ": keep-alive\n\n")
-            setTimeout(beat, r.heartbeat * 1000)
+            try
+                await send(conn, framed(": keep-alive\n\n"))
+            catch gone
+                beating = false
+                return
+
+            if beating then timer = setTimeout(beat, r.heartbeat * 1000)
 
         if r.heartbeat > 0
             beating = true
-
-            setTimeout(beat, r.heartbeat * 1000)
+            timer = setTimeout(beat, r.heartbeat * 1000)
 
         // **A SOURCE THAT FAULTS IS PUT BACK ON THE LOOP RATHER THAN THROWN FROM HERE**, and that is
         // not fussiness: the server wraps this call in a `try` that reads a failure as *the client
@@ -285,11 +297,36 @@ http_write_source() -> string = raw"""
         //
         // What the client sees either way is a chunked body with no terminator, which is the only
         // thing HTTP can say once the status line has gone.
+        //
+        // **A SEND THAT FAILS IS NOT THAT, AND PUTTING IT BACK TOO WOULD LET ANY CLIENT STOP THE
+        // PROGRAM.** `answer` keeps the two apart for an ordinary response -- a handler that throws
+        // is a defect, a write that fails is a client that hung up -- and this had them sharing one
+        // `catch`, so a browser closing a tab mid-stream raised a fault nothing was waiting for.
+        // Streaming makes that the common case rather than a rare one, a response now being written
+        // over seconds or minutes. `sending` is what tells them apart: it is true only across the
+        // write, so everything else caught here came out of the source.
+        var sending = false
+
         try
             for await piece in r.source
-                await sendChunk(conn, piece)
+                // **Framed before the send rather than inside it**, so a piece that cannot be
+                // rendered is the source's fault and not read as a client that has gone.
+                val frame = framed(piece)
+
+                if frame != null
+                    sending = true
+
+                    await send(conn, frame)
+
+                    sending = false
         catch e
             beating = false
+
+            stopBeating(timer)
+
+            // The client has gone: the caller's own `try` ends the connection, as it does for a
+            // whole-body response whose write failed.
+            if sending then throw e
 
             setTimeout(() -> putBack(e), 0)
 
@@ -297,27 +334,42 @@ http_write_source() -> string = raw"""
 
         beating = false
 
+        stopBeating(timer)
+
         await send(conn, "0\r\n\r\n")
+
+    // **The heartbeat's timer is CLEARED when the response ends**, or the loop is kept alive by a
+    // beat for a connection that is finished with -- up to the whole interval, which for an SSE
+    // stream asking for thirty seconds is thirty seconds of a program that has nothing left to do.
+    // The idle timer on the 1.1 connection is cleared for the same reason.
+    stopBeating(timer)
+        if timer != null then clearTimeout(timer)
 
     // **A named function because `throw` is a statement**, so a lambda cannot be one.
     putBack(e)
         throw e
 
-    // One chunk: the byte count in hexadecimal, the bytes, and a blank line.
-    async sendChunk(conn, piece)
+    // One chunk, framed: the byte count in hexadecimal, the bytes, and a blank line -- as text where
+    // the piece is text and as bytes where it is bytes, since a slate byte array is one value per
+    // byte and rendering it as text would be neither.
+    //
+    // **`null` for a piece that is EMPTY, of either kind.** A zero-length chunk is the terminator, so
+    // a source answering `""` or `[]` would end the response with more to come -- and the array half
+    // of that was live: an empty array was framed and sent, writing `0\r\n\r\n` mid-stream, where
+    // the text half had been skipped from the start. It is skipped rather than refused, an empty
+    // piece being a thing to write nothing about.
+    framed(piece)
         if piece is array
-            await send(conn, concat(toBytes(hex(len(piece)) + "\r\n"), concat(piece, toBytes("\r\n"))))
-            return
+            if len(piece) == 0 then return null
+
+            return concat(toBytes(hex(len(piece)) + "\r\n"), concat(piece, toBytes("\r\n")))
 
         val text = if piece is string then piece else string(piece)
         val n = len(toBytes(text))
 
-        // **A zero-length chunk is the terminator**, so a source that answers an empty string would
-        // end the response with more to come. It is skipped rather than refused, an empty piece
-        // being a thing to write nothing about.
-        if n == 0 then return
+        if n == 0 then return null
 
-        await send(conn, hex(n) + "\r\n" + text + "\r\n")
+        hex(n) + "\r\n" + text + "\r\n"
 
     // The status line and the headers of a chunked response.
     streamHead(status: integer, extra: string, keep: boolean) -> string =

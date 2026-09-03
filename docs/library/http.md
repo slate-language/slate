@@ -155,6 +155,11 @@ serve({ port: 8443, cert: pem, key: keyPem, alpn: ["h2", "http/1.1"] }, app)
   bytes exactly as before — the same compression rule and the same header rules apply.
 - **`:authority` arrives as `host`**, so a handler reading `req.headers.host` need not know which
   version it was spoken to over.
+- **Repeated `cookie` fields are joined with `"; "`**, which RFC 9113 §8.2.3 asks for: HTTP/2 lets a
+  client split its cookies one per field so that each compresses on its own, and browsers do. Every
+  other repeated header name keeps the last, which is what the HTTP/1.1 path does with one.
+- **A body is bounded by the same megabyte the HTTP/1.1 server applies**, and one past it is answered
+  `413` — the limit a program thinks it has is the same limit on both versions of one listener.
 - **`keepAlive` is always `true`** and there is no pipelining question: a connection carries many
   streams at once and each is answered on its own.
 - **A header name goes out lowercased**, an upper-case field name being malformed in HTTP/2 rather

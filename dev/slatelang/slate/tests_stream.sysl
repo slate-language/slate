@@ -1,6 +1,7 @@
 module dev.slatelang.slate
 @tests
 
+import sh.sysl.libuv
 import sysl.text.Search
 
 // `serveStream` -- the server that hands a handler the head as soon as it is complete and the
@@ -372,3 +373,189 @@ A_SOURCE_THAT_FAULTS_MID_STREAM_ENDS_THE_RESPONSE_AND_THE_FAULT_IS_PUT_BACK()
     """
 
     assert(net_fails(text).contains("the source gave up"))
+
+// What both of the hang-up tests below are: a stream running, and a client that then makes the
+// server close the socket under it. **Nonsense on the same connection is how the socket really goes
+// away mid-response**, and it is the shape that matters -- the refusal path calls `stop()`, which
+// closes the socket while the response is still being written into it. A client simply hanging up
+// does NOT do this: writes to a peer that has closed keep succeeding until the kernel says
+// otherwise, and the server keeps `busy` connections open through an end-of-stream.
+private const CutOff: string = raw"""
+    import { serve, close, router, sse } from slate:http
+    import { connect, send, onData, close as shutSocket, localPort } from slate:net
+
+    val app = router()
+    """
+
+@test
+A_WRITE_THAT_FAILS_MID_STREAM_ENDS_THE_RESPONSE_AND_DOES_NOT_STOP_THE_PROGRAM()
+    // **A HANDLER THAT THROWS AND A WRITE THAT FAILS ARE NOT THE SAME THING**, which `answer` has
+    // kept apart for a whole-body response from the start -- and `streamed` had them sharing one
+    // `catch`, so every failure it saw was put back on the loop as a defect. What that made was a
+    // way for any client to stop the server: send a request, get a stream going, send nonsense on
+    // the same connection, and the refusal closes the socket under the response -- whose next write
+    // then faulted with *"this socket is closed, and `send` needs an open one"* and took the
+    // program with it. Confirmed against 0.0.23 before the fix.
+    val text = CutOff + raw"""
+
+    slow()
+        var n = 0
+
+        async pull()
+            if n >= 8 then return { done: true, value: null }
+
+            await sleep(300)
+
+            n = n + 1
+
+            { done: false, value: "piece " + string(n) }
+
+        { next: pull }
+
+    app.get("/slow", (req) -> sse(slow(), { heartbeat: 0 }))
+    app.get("/ok", (req) -> "still here")
+
+    val server = serve(0, app)
+
+    async main()
+        val port = localPort(server)
+        val c = (await connect("127.0.0.1", port)).value
+
+        onData(c, (chunk) -> anything(chunk))
+
+        await send(c, "GET /slow HTTP/1.1\r\nHost: h\r\n\r\n")
+        await sleep(700)
+        await send(c, "\x01\x02 not a request at all\r\n\r\n")
+        await sleep(1200)
+
+        val r = await fetch("http://127.0.0.1:" + string(port) + "/ok")
+
+        print("survived", r.value.body)
+
+        shutSocket(c)
+        close(server)
+        done()
+
+    main()
+    """
+
+    assert_eq(out(fused(6000, text)), "survived still here")
+
+@test
+A_HEARTBEAT_ON_A_SOCKET_THAT_HAS_GONE_IS_NOT_AN_ORPHANED_FAILURE()
+    // **An unawaited send is a promise nobody holds**, so its rejection was an orphan -- and an
+    // orphaned failure stops the program, which is exactly what a departed client may not be allowed
+    // to do. The source here is slower than the heartbeat, so the beat is what writes into the
+    // socket the refusal closed.
+    val text = CutOff + raw"""
+
+    slow()
+        var n = 0
+
+        async pull()
+            if n >= 2 then return { done: true, value: null }
+
+            await sleep(2000)
+
+            n = n + 1
+
+            { done: false, value: "piece " + string(n) }
+
+        { next: pull }
+
+    app.get("/slow", (req) -> sse(slow(), { heartbeat: 1 }))
+    app.get("/ok", (req) -> "still here")
+
+    val server = serve(0, app)
+
+    async main()
+        val port = localPort(server)
+        val c = (await connect("127.0.0.1", port)).value
+
+        onData(c, (chunk) -> anything(chunk))
+
+        await send(c, "GET /slow HTTP/1.1\r\nHost: h\r\n\r\n")
+        await sleep(700)
+        await send(c, "\x01\x02 not a request at all\r\n\r\n")
+        await sleep(1500)
+
+        val r = await fetch("http://127.0.0.1:" + string(port) + "/ok")
+
+        print("survived", r.value.body)
+
+        shutSocket(c)
+        close(server)
+        done()
+
+    main()
+    """
+
+    assert_eq(out(fused(6000, text)), "survived still here")
+
+@test
+AN_EMPTY_PIECE_OF_EITHER_KIND_IS_SKIPPED_RATHER_THAN_FRAMED()
+    // **A zero-length chunk is the TERMINATOR**, so an empty piece framed and sent ends the response
+    // with more to come. The text half was skipped from the start and the array half was not, so a
+    // source yielding `[]` truncated its own body -- the client saw `first ` and never `more`.
+    val text = Streaming + raw"""
+
+    gappy()
+        yield "first "
+        yield []
+        yield ""
+        yield "more"
+
+    app.get("/gappy", (req) -> gappy())
+
+    val server = serve(0, app)
+
+    async main()
+        val r = await fetch("http://127.0.0.1:" + string(localPort(server)) + "/gappy")
+
+        print(toJSON(r.value.body))
+
+        close(server)
+        done()
+
+    main()
+    """
+
+    assert_eq(net_out(text), "\"first more\"")
+
+@test
+A_FINISHED_RESPONSE_DOES_NOT_KEEP_THE_LOOP_ALIVE_UNTIL_THE_NEXT_BEAT()
+    // **The heartbeat's timer was never cleared**, so a program with nothing left to do sat waiting
+    // for a beat it would answer by doing nothing -- up to the whole interval. Thirty seconds is the
+    // ordinary ask for an SSE stream through a proxy, and this program took 30.0 seconds to exit
+    // against 0.0.23 and 0.02 with the timer cleared.
+    //
+    // **The assertion is the DURATION and it has to be**: what the bug does is invisible to the
+    // program, every timer of its own keeping the loop alive exactly as the leak does. The bound is
+    // generous -- what is being told apart is milliseconds from half a minute.
+    val text = Streaming + raw"""
+
+    quick()
+        yield "one"
+
+    app.get("/events", (req) -> sse(quick(), { heartbeat: 30 }))
+
+    val server = serve(0, app)
+
+    async main()
+        val r = await fetch("http://127.0.0.1:" + string(localPort(server)) + "/events")
+
+        print(contains(r.value.body, "data: one"))
+
+        close(server)
+        done()
+
+    main()
+    """
+
+    val began = libuv.hrtime()
+
+    assert_eq(out(fused(40000, NetImport + text)), "true")
+
+    val took = (libuv.hrtime() - began) / 1000000
+
+    assert(took < 5000, s"the program took ${took}ms to exit, which is the heartbeat's timer holding the loop open")
