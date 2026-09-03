@@ -21,7 +21,7 @@ What a program has without writing it.
 | [`slate:redis`](redis.md) | a Redis client |
 | [`slate:brotli`](brotli.md) | compression |
 | [`slate:llhttp`](llhttp.md) | the HTTP parser itself |
-| [`slate:h2`](h2.md) | HTTP/2 framing, and HPACK |
+| [`slate:nghttp2`](nghttp2.md) | HTTP/2 framing, and HPACK |
 | [`slate:dom`](dom.md) | the document — in a browser only |
 
 ## Why so many of these are modules rather than globals

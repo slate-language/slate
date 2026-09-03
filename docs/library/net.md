@@ -123,7 +123,7 @@ print(alpnProtocol(sock))
 offered nothing, and a handshake that has not finished — a server reads it inside its connection
 callback, by which time the handshake is long done.
 
-[`slate:h2`](h2.md) is what frames the bytes once `h2` is what was agreed.
+[`slate:nghttp2`](nghttp2.md) is what frames the bytes once `h2` is what was agreed.
 
 **An upgrade rather than a flag on `connect`, because that is what protocols actually do.** TLS from byte
 zero is one case and not the general one: PostgreSQL sends eight bytes in the clear and reads one back

@@ -1,9 +1,9 @@
-# `slate:h2`
+# `slate:nghttp2`
 
 HTTP/2: the framing layer, and HPACK on its own.
 
 ```slate
-import { h2Client, h2Server, h2Receive, h2Send, h2Next, h2Request, h2Respond, h2Close } from slate:h2
+import { h2Client, h2Server, h2Receive, h2Send, h2Next, h2Request, h2Respond, h2Close } from slate:nghttp2
 ```
 
 **Nothing here touches a socket.** Bytes that arrived go in at `h2Receive`, bytes to write come out of
@@ -12,7 +12,7 @@ bytes reach the wire stays your program's business — which is why the whole pr
 between two sessions in memory, with no port and nothing that can hang:
 
 ```slate
-import { h2Client, h2Server, h2Receive, h2Send, h2Next, h2Request, h2Respond, h2Close } from slate:h2
+import { h2Client, h2Server, h2Receive, h2Send, h2Next, h2Request, h2Respond, h2Close } from slate:nghttp2
 
 val c = h2Client()
 val s = h2Server()
@@ -148,7 +148,7 @@ h2Request(c, [[":method", "GET"], [":scheme", "https"], [":path", "/"],
 on the wire — and converting silently would make `true` a header value too:
 
 ```slate
-import { h2Client, h2Request } from slate:h2
+import { h2Client, h2Request } from slate:nghttp2
 
 h2Request(h2Client(), { ":path": 12 })
 ```
@@ -163,7 +163,7 @@ a header value is text
 a server deals with and a fault would take the server down with the connection:
 
 ```slate
-import { h2Server, h2Receive } from slate:h2
+import { h2Server, h2Receive } from slate:nghttp2
 
 val s = h2Server()
 
@@ -198,7 +198,7 @@ security-relevant half of HTTP/2, identical whoever drives the frames, and a dec
 input is a decompression bomb waiting for somebody to send it one.
 
 ```slate
-import { hpackDeflater, hpackInflater, hpackDeflate, hpackInflate, hpackClose } from slate:h2
+import { hpackDeflater, hpackInflater, hpackDeflate, hpackInflate, hpackClose } from slate:nghttp2
 
 val enc = hpackDeflater()
 val dec = hpackInflater()
@@ -229,7 +229,14 @@ the reason a session's refusal is.
 
 ## Where this sits
 
-**`slate:h2` is [`slate:llhttp`](llhttp.md)'s sibling**, and it is public for the same reason:
+**The module is named for the library and its names for the protocol**, which is
+[`slate:llhttp`](llhttp.md)'s arrangement exactly — that one is `llhttp` and exports `httpParser` and
+`httpFeed`. What the two have in common is the tier, a door onto somebody else's state machine, and
+naming them the same way is what says so. It also leaves HTTP/2's own short name free for whatever a
+program eventually wants to import, which is the reason the HTTP server is `slate:http` and not
+`slate:llhttp`.
+
+**`slate:nghttp2` is [`slate:llhttp`](llhttp.md)'s sibling**, and it is public for the same reason:
 [`slate:http`](http.md) is the server a program wants, and these are the layers under whatever speaks
 HTTP next. A server that takes both versions on one port, a client that keeps its connections, a
 proxy, a gRPC endpoint — every one of those is an ordinary package rather than a change to slate.
