@@ -1,0 +1,165 @@
+# Functions
+
+**There is no keyword on a function.** The shape is what identifies it: a name, a parameter list in
+brackets, and then either `=` and an expression or an indented block.
+
+```
+double(x) = x * 2
+
+add(a, b)
+    a + b
+
+grade(mark)
+    if mark >= 90
+        "A"
+    else
+        "C"
+end grade
+```
+
+A block's value is its trailing expression, so `return` is for leaving early and nothing else.
+
+Functions are values. A definition binds a name in the scope it is written in, so a nested definition
+is a closure over that scope:
+
+```
+counter()
+    var count = 0
+
+    bump()
+        count = count + 1
+        count
+
+    bump
+
+val c = counter()
+print(c(), c(), c())            // 1 2 3
+```
+
+## Lambdas
+
+`->` with the parameters on its left:
+
+```
+x -> x * 2
+(a, b) -> a + b
+() -> 0
+```
+
+`->` is the one right-associative operator, so `x -> y -> x + y` is a function answering a function.
+
+**A lambda's body may be a block, written where the lambda is passed.** A newline inside brackets
+normally means nothing, so a callback would otherwise have to be lifted out and named before the call
+that wanted it:
+
+```
+each([1, 2, 3], x ->
+    val doubled = x * 2
+    print(x, doubled))
+```
+
+`->` and `match` are the two tokens that suspend the bracket rule, and only where they end a line.
+**A block lambda has to be the last argument**, because its block runs to the end of its last line and
+a `,` arriving there has nothing to mean. Every callback slate itself takes is last for that reason;
+`setTimeout(fn, ms)` keeps node's order and so takes a one-line function.
+
+A lambda's parameter cannot be annotated. What it answers is read off its body — see [Types](types.md).
+
+## Defaults
+
+A parameter may carry what it is when nobody gives one, on a definition, a lambda, a method, or a
+class's `new`. The annotation comes first and the default after it:
+
+```
+greet(name, greeting = "hello") = greeting + ", " + name
+log(message, level = "info", at = now()) = ...
+f(n: integer = 0) = n
+```
+
+**The default is worked out at the call, not where the function was written.** Everything else follows
+from that:
+
+- `f(xs = [])` gives every call an array of its own.
+- A default may read the parameters to its left: `slice(xs, from, to = len(xs))`.
+- A default that would fault costs nothing to a call that gave the argument.
+
+**A parameter that may be left out has to come last**, or leaving it out would slide every later
+argument one place left. The parser says so where it is written, and an arity complaint then names a
+**range** rather than only its upper end.
+
+**A parameter nobody gave is not bound at all**, which is why there is no sentinel: slate refuses to
+store absence, so there is no "given, and the value was absence" to tell from "not given". `f(1, null)`
+therefore passes `null` and does **not** take the default — which is the simpler rule, JavaScript's
+`f(1, undefined)` doing the opposite.
+
+## Named arguments
+
+An argument may say which parameter it fills, which is what makes a default in the *middle* reachable:
+
+```
+greet("ada")
+greet("ada", punct = "?")           // greeting skipped
+greet(greeting = "hi", name = "ada")
+```
+
+**`=` and not `:`**, because the declaration already writes the default after an equals. Assignment is
+a statement in slate, so `=` never appears inside an expression and there is nothing for it to be
+confused with; `==` is its own token, so `f(ok == true)` is an ordinary positional argument.
+
+A name comes after every positional argument, and it may pick out any parameter. A class's `new` and a
+data variant's maker are ordinary functions, so `Rect(h = 4, w = 3)` and `Circle(r = 7)` read the same
+way. **A method names its parameters and not its receiver.**
+
+Naming a parameter twice, naming one the function does not have, naming an argument to a builtin, or
+naming one to a function that gathers with `...` are each refused with their own sentence — the second
+lists the parameters it does have.
+
+## `...rest`
+
+A function may gather what is left over:
+
+```
+total(first, ...others) = reduce(others, (a, b) -> a + b, first)
+
+total(1)                    // 1
+total(1, 2, 3)              // 6
+total(...xs)                // the spread it is the counterpart of
+```
+
+**`...rest` is always bound**, to an empty array where a call gave nothing past the fixed parameters,
+so there is no absence to test for. It must be last and takes no default — one could never fire. A
+default *before* it is fine.
+
+## Destructuring parameters
+
+A parameter may take its argument apart, on a definition or a lambda:
+
+```
+f({ n }) = n * 2
+({ n }) -> n * 2
+```
+
+The pattern is any [pattern](patterns.md) that binds.
+
+## Annotations
+
+Per parameter, and per result:
+
+```
+distance(a: Point, b: Point) = ...
+double(x: number) -> number = x * 2
+f(a, b: Point, c) = ...             // nothing has to be annotated for anything to be
+```
+
+An annotation is checked **at the call** for a parameter, and where the function answers for a result.
+See [Types](types.md) for what the compiler will say about one before the program runs.
+
+## `async` and generators
+
+`async` in front of a definition or a lambda makes it answer a promise; a function holding a `yield` is
+a generator, with no word on the definition. Both are in [Asynchrony](asynchrony.md).
+
+## Methods
+
+A function stored in an object field is a method. Whether it is handed a receiver depends on where it
+was found — see [Objects](objects.md).
