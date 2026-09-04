@@ -958,3 +958,134 @@ A_CONNECTION_THAT_ENDS_UNDER_A_RUNNING_STREAM_DOES_NOT_STOP_THE_SERVER()
     """
 
     assert_eq(net_out(prog), "streaming true\nthe server is still running")
+
+// -- an HTTP/2 connection's own lifetime ---------------------------------------------------------
+
+@test
+AN_HTTP_2_CONNECTION_NOBODY_IS_USING_IS_CLOSED_BY_THE_SERVERS_CLOCK()
+    // **The 1.1 speaker has closed a quiet connection after `IdleMillis` from the start and this one
+    // never did.** A client may keep a connection and then simply go away, and without a clock that
+    // socket is held for the life of the server -- and a socket is a handle the event loop waits on,
+    // so it is not only memory that pays. HTTP/2 makes it likelier rather than rarer, a connection
+    // there carrying many streams and being meant to be kept.
+    //
+    // **The fuse has to outlast the clock**, which is what `fused` is for: three seconds is the
+    // default and not a maximum, and a watchdog shorter than the thing being measured would report
+    // the measurement as a hang.
+    val prog = H2Server + raw"""
+
+    app.get("/ping", (req) -> "pong")
+
+    async main()
+        val c = (await connect("localhost", localPort(server))).value
+        val h = h2Client()
+
+        pump()
+            val out = h2Send(h)
+
+            if len(out) > 0 then send(c, out)
+
+        var status = ""
+
+        arrived(chunk)
+            if chunk == null
+                print("closed after", status)
+
+                close(c)
+                close(server)
+                done()
+
+                return
+
+            h2Receive(h, chunk)
+
+            loop
+                val e = h2Next(h)
+
+                if e == null then break
+
+                if e.kind == "headers" then status = e.headers[0][1]
+
+            pump()
+
+        onBytes(c, arrived)
+
+        await startTls(c, { host: "localhost", trust: theCert, alpn: ["h2"] })
+
+        h2Request(h, { ":method": "GET", ":scheme": "https", ":authority": "localhost", ":path": "/ping" })
+        pump()
+
+    main()
+    """
+
+    assert_eq(out(NetImport + fused(9000, prog)), "closed after 200")
+
+@test
+A_SERVER_THAT_TOOK_A_MEGABYTE_BODY_CAN_TAKE_ANOTHER_FIFTEEN()
+    // **The h2 server used to grow a request body by concatenating the whole of it to each DATA frame
+    // as it arrived**, which is quadratic -- and an array holds a value per byte, so a megabyte
+    // arriving in sixteen-kilobyte frames cost about 1.5 GB of peak footprint and a third of a second
+    // of pure copying. One body was survivable and is why nothing noticed; sixteen is not.
+    //
+    // **Sixteen bodies just under the limit, on one connection.** Held as the frames themselves and
+    // joined once at the end it is a fraction of a second; grown a frame at a time it is several
+    // seconds of copying and does not finish inside the watchdog. The sizes coming back are what says
+    // each body was reassembled whole and in order rather than merely fast.
+    val prog = H2Server + raw"""
+
+    app.post("/up", (req) -> "took " + string(len(req.body)))
+
+    async main()
+        val c = (await connect("localhost", localPort(server))).value
+        val h = h2Client()
+        val payload = repeat("z", 900000)
+
+        var closed = 0
+        var said = ""
+
+        arrived(chunk)
+            if chunk == null then return
+
+            h2Receive(h, chunk)
+
+            loop
+                loop
+                    val e = h2Next(h)
+
+                    if e == null then break
+
+                    if e.kind == "data" then said = said + fromBytes(e.bytes).value
+
+                    if e.kind == "streamClose"
+                        closed = closed + 1
+
+                        if closed == 16
+                            print(closed, said.contains("took 900000"), len(said))
+
+                            h2Close(h)
+                            close(c)
+                            close(server)
+                            done()
+
+                            return
+
+                val out = h2Send(h)
+
+                if len(out) == 0 then break
+
+                send(c, out)
+
+        onBytes(c, arrived)
+
+        await startTls(c, { host: "localhost", trust: theCert, alpn: ["h2"] })
+
+        for i in 0..<16
+            h2Request(h, { ":method": "POST", ":scheme": "https", ":authority": "localhost", ":path": "/up" },
+                payload)
+
+        arrived([])
+
+    main()
+    """
+
+    assert_eq(net_out(prog), "16 true 176")

@@ -23,7 +23,7 @@ http2_source() -> string = raw"""
     // **There is no keep-alive question and no pipelining question.** A connection carries many
     // streams at once and each is answered on its own, so the ordering machinery the 1.1 speaker
     // needs -- `busy`, the parser's queue, the `Connection` header -- has nothing to do here.
-    speakH2(conn, called, streaming: boolean, first)
+    speakH2(conn, called, streaming: boolean, first, slot)
         // **`autoWindowUpdate: false` is not an option, it is the only working setting.** nghttp2
         // answers `INVALID_STATE` to `h2Consume` without it, and `h2Consume` is the call that returns
         // flow-control credit once the work is done rather than when the bytes land.
@@ -34,6 +34,16 @@ http2_source() -> string = raw"""
         var pending = {}
 
         var shut = false
+
+        // Whether the server has been closed and this connection is finishing what it was doing.
+        var closing = false
+
+        // How many answers are being worked out or written. **A stream still receiving its body is
+        // counted by `pending` instead**, so the two together are what this connection has in flight.
+        var working = 0
+
+        // The clock that closes a connection nobody is using, or null while it is not running.
+        var idle = null
 
         // Everything the session wants written, written. **Called after every receive and after every
         // response**, because a session may have frames of its own to send -- settings, window
@@ -67,8 +77,70 @@ http2_source() -> string = raw"""
 
             shut = true
 
+            awake()
             h2Close(session)
+            slot.retire()
             shutSocket(conn)
+
+        // Stop the clock, a connection with something to do not being idle by definition.
+        awake()
+            if idle != null
+                clearTimeout(idle)
+
+                idle = null
+
+        // **A CONNECTION WITH NOTHING OUTSTANDING IS CLOSED AFTER `IdleMillis`, WHICH IS THE RULE THE
+        // 1.1 SPEAKER HAS ALWAYS HAD AND THIS ONE DID NOT.** A client may keep a connection and then
+        // simply go away, and without a clock that socket is held forever -- and a socket is a handle
+        // the loop waits on, so it is not only a server's memory that pays. HTTP/2 makes it likelier
+        // rather than rarer: a connection carries many streams and is meant to be kept.
+        quiet()
+            awake()
+
+            idle = setTimeout(stop, IdleMillis)
+
+        // Whether there is anything left to do on this connection, and what to do when there is not.
+        //
+        // **The clock runs while a CLOSING connection is still busy**, which it does not otherwise: a
+        // shutdown waits for what is in flight, and a request whose client has gone would never
+        // finish, so waiting for it without a clock would be the held connection again under a new
+        // name.
+        settled()
+            if working > 0 || len(keys(pending)) > 0
+                if closing then quiet()
+
+                return
+
+            if closing then stop() else quiet()
+
+        // What closing the server means to this connection: end now if there is nothing in flight, and
+        // otherwise write the answers being written and end after them.
+        finish()
+            if working > 0 || len(keys(pending)) > 0
+                closing = true
+
+                quiet()
+            else
+                stop()
+
+        // `answer` with the connection's own bookkeeping around it. **The count is kept here rather
+        // than inside `answer` because `answer` has several ways out** -- two returns, a catch and a
+        // re-throw -- and a count decremented on some of them is worse than none.
+        async served(stream: integer, req: object)
+            working = working + 1
+
+            try
+                await answer(stream, req)
+            catch e
+                working = working - 1
+
+                settled()
+
+                throw e
+
+            working = working - 1
+
+            settled()
 
         // What a handler answered, as a HEADERS frame and a DATA frame on the stream that asked.
         //
@@ -287,6 +359,12 @@ http2_source() -> string = raw"""
                 if e == null then break
 
                 if e.kind == "headers" && e.of == "request"
+                    // **A SERVER THAT HAS BEEN CLOSED SERVES NO NEW REQUEST.** The connection is
+                    // finishing what it had in flight and will close after it, so a stream opened now
+                    // would be answered on a connection about to go -- which is what "no keep-alive
+                    // after close" means where a connection carries many streams.
+                    if closing then continue
+
                     // **A STREAMING SERVER IS HANDED THE REQUEST AT ITS HEADERS, NOT AT ITS END.**
                     // That is the whole of what `serveStream` is for: a handler that means to write
                     // a gigabyte to disk as it arrives cannot be given the gigabyte first. The
@@ -297,9 +375,9 @@ http2_source() -> string = raw"""
 
                         pending[string(e.stream)] = { live: live }
 
-                        answer(e.stream, requestOfH2(e.headers, [], true, live))
+                        served(e.stream, requestOfH2(e.headers, [], true, live))
                     else
-                        pending[string(e.stream)] = { headers: e.headers, body: [] }
+                        pending[string(e.stream)] = { headers: e.headers, parts: [], size: 0 }
                 elif e.kind == "data"
                     val key = string(e.stream)
 
@@ -310,7 +388,7 @@ http2_source() -> string = raw"""
                         continue
 
                     if has(pending, key)
-                        val grown = concat(pending[key].body, e.bytes)
+                        val grown = pending[key].size + len(e.bytes)
 
                         // **THE SAME BOUND THE 1.1 SERVER APPLIES, AND FOR THE SAME REASON.** A
                         // server that grows a buffer for as long as frames keep arriving is one
@@ -325,7 +403,7 @@ http2_source() -> string = raw"""
                         // it sees `rstStream` where a `413` should have been. What arrives after
                         // this is consumed for its flow-control credit and dropped, which is what
                         // the 1.1 server does with a body it has already refused.
-                        if len(grown) > BodyBytes
+                        if grown > BodyBytes
                             pending = forgotten(pending, key)
 
                             h2Respond(session, e.stream, [[":status", "413"]],
@@ -334,7 +412,15 @@ http2_source() -> string = raw"""
 
                             continue
 
-                        pending[key] = pending[key] with { body: grown }
+                        // **THE FRAMES ARE KEPT AND JOINED ONCE, RATHER THAN A BODY GROWN A FRAME
+                        // AT A TIME.** Concatenating the whole body per DATA frame copies it again
+                        // for every frame, and an array holds a value per byte -- so a megabyte
+                        // arriving in sixteen-kilobyte frames cost 1.5 GB of peak footprint and
+                        // most of a second, for a megabyte of bytes. Held as the frames themselves
+                        // and flattened at the end it is 73 MB and a hundredth of a second.
+                        push(pending[key].parts, e.bytes)
+
+                        pending[key] = pending[key] with { size: grown }
 
                     // **Credit is returned when the work is done and not when the bytes land**, which
                     // is what a flow-control window is for: a server that acknowledged on arrival
@@ -352,7 +438,7 @@ http2_source() -> string = raw"""
                         // A streaming handler has been running since the headers arrived, so what
                         // the end of the stream means to it is that the body is complete.
                         if has(held, "live") then held.live.close()
-                        else answer(e.stream, requestOfH2(held.headers, held.body, false, null))
+                        else served(e.stream, requestOfH2(held.headers, flat(held.parts), false, null))
 
                 // **A STREAM THAT ENDS ANY OTHER WAY TAKES ITS PARTIAL BODY WITH IT.** Only
                 // `streamEnd` used to clear a slot, so a client that reset a stream mid-upload --
@@ -380,6 +466,8 @@ http2_source() -> string = raw"""
 
                 return
 
+            awake()
+
             // **Bytes the peer got wrong are an ANSWER and not a fault**, which is `slate:nghttp2`'s
             // rule: a peer that speaks nonsense is a condition a server handles, and the handling is
             // to say goodbye and hang up rather than to stop the program.
@@ -400,10 +488,19 @@ http2_source() -> string = raw"""
 
             flushed()
 
+            settled()
+
+        slot.finish = finish
+
         onBytes(conn, heard)
 
         // **The server's own SETTINGS go out first.** A client is entitled to them and will wait.
         flushed()
+
+        // **The clock starts before the first request, not after it**, which is the 1.1 speaker's rule
+        // and holds here for the same reason: a client that opens a connection and then says nothing is
+        // exactly as quiet as one that has stopped between streams.
+        quiet()
 
         // The bytes that chose this speaker -- the client's preface and its first frames.
         heard(first)

@@ -515,3 +515,136 @@ A_STAT_ANSWERS_WHEN_A_FILE_WAS_MODIFIED()
         "writeFileSync(\"<dir>/a.txt\", \"x\")\n" +
         "val s = statSync(\"<dir>/a.txt\").value\n" +
         "print(s.modified is instant, s.modified.epochMillis() > 1700000000000)"), "true true")
+
+// -- what closing a server does to the connections it accepted -----------------------------------
+
+// **Closing a server used to close its listening socket and nothing else**, so a connection already
+// accepted was held until its own idle clock ran out -- and over HTTP/2, which had no clock at all,
+// for the life of the program. A socket is a handle the event loop waits on, so a program that had
+// closed everything it owned could still not exit.
+
+@test
+CLOSING_A_SERVER_CLOSES_A_CONNECTION_IT_HAS_NOTHING_TO_DO_ON()
+    // **An idle connection goes at once.** The client here has been answered and is keeping the
+    // connection, which is what a keep-alive client does; nothing is in flight, so there is nothing
+    // to wait for and the connection ends with the server.
+
+    val prog = raw"""
+    val server = serve(0, (req) -> "hi")
+
+    async main()
+        val c = (await connect("127.0.0.1", localPort(server))).value
+
+        var answers = 0
+
+        heard(chunk)
+            if chunk == null
+                print("the server closed it")
+
+                shutSocket(c)
+                done()
+
+                return
+
+            answers = answers + 1
+
+            if answers == 1
+                print("answered")
+
+                close(server)
+
+        onData(c, heard)
+
+        await send(c, "GET / HTTP/1.1\r\nHost: h\r\n\r\n")
+
+    main()
+    """
+
+    assert_eq(wire_out(prog), "answered\nthe server closed it")
+
+@test
+A_REQUEST_IN_FLIGHT_WHEN_THE_SERVER_CLOSES_IS_STILL_ANSWERED()
+    // **The other half of the rule, and the reason closing is not simply abrupt.** A client that
+    // asked a moment before the shutdown is answered rather than cut off; the connection ends after
+    // the response it was writing, not in the middle of it.
+
+    val prog = raw"""
+    var theServer = null
+
+    val server = serve(0, async (req) ->
+        close(theServer)
+
+        await sleep(30)
+
+        "answered anyway")
+
+    theServer = server
+
+    async main()
+        val c = (await connect("127.0.0.1", localPort(server))).value
+
+        var got = ""
+
+        heard(chunk)
+            if chunk == null
+                print(got.contains("answered anyway"), "then closed")
+
+                shutSocket(c)
+                done()
+
+                return
+
+            got = got + chunk
+
+        onData(c, heard)
+
+        await send(c, "GET / HTTP/1.1\r\nHost: h\r\n\r\n")
+
+    main()
+    """
+
+    assert_eq(wire_out(prog), "true then closed")
+
+@test
+A_SECOND_REQUEST_ON_A_CONNECTION_THE_SERVER_HAS_CLOSED_IS_NOT_SERVED()
+    // **There is no keep-alive after `close`.** Both requests are written in one go, so the second is
+    // already in the parser when the shutdown happens -- and it is not answered: the connection ends
+    // with the response that was in flight. A server being shut down that went on serving whatever
+    // was already buffered would never finish shutting down.
+
+    val prog = raw"""
+    var theServer = null
+
+    val server = serve(0, async (req) ->
+        close(theServer)
+
+        await sleep(30)
+
+        "one")
+
+    theServer = server
+
+    async main()
+        val c = (await connect("127.0.0.1", localPort(server))).value
+
+        var got = ""
+
+        heard(chunk)
+            if chunk == null
+                print("answers", len(split(got, "HTTP/1.1 200")) - 1)
+
+                shutSocket(c)
+                done()
+
+                return
+
+            got = got + chunk
+
+        onData(c, heard)
+
+        await send(c, "GET /a HTTP/1.1\r\nHost: h\r\n\r\nGET /b HTTP/1.1\r\nHost: h\r\n\r\n")
+
+    main()
+    """
+
+    assert_eq(wire_out(prog), "answers 1")

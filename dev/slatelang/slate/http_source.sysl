@@ -119,7 +119,7 @@ http_head_source() -> string = raw"""
     // arrives, so the memory a request costs stops depending on how big the request is. It is the same
     // server otherwise: the same keep-alive rule, the same order, the same clock.
     //
-    import { listen, onBytes, send, close as shutSocket, alpnProtocol } from slate:net
+    import { listen, onBytes, send, close as shutSocket, alpnProtocol, localPort } from slate:net
     import { stat, readBytes } from slate:fs
 
     // **HTTP/2's framing, which this module drives and does not implement.** `slate:nghttp2` is bytes
@@ -150,12 +150,65 @@ http_head_source() -> string = raw"""
     // asks an object for its `handle` and calls that.
     export type Router = { get: function, post: function, put: function, patch: function, delete: function, head: function, options: function, any: function, notFound: function, handle: function }
 
+    // Every connection each server has accepted and has not finished with, so that closing a server
+    // can close them.
+    //
+    // **Keyed by the server's PORT, because that is what `close` has in its hand.** A listening socket
+    // is not an object key, and no two servers in one program can be listening on one port -- so the
+    // port names the table exactly.
+    var connsOf = {}
+
+    var nextConn = 0
+
+    // Take a connection into a server's table. The key is made by the caller, since the slot it puts
+    // in the table has to be able to take itself back out.
+    enrol(portKey: string, key: string, slot: object)
+        var table = if has(connsOf, portKey) then connsOf[portKey] else {}
+
+        table[key] = slot
+        connsOf[portKey] = table
+
+    retire(portKey: string, key: string)
+        if has(connsOf, portKey) then connsOf[portKey] = forgotten(connsOf[portKey], key)
+
     // `close(server)` -- and with it the program's last reason to stay alive.
     //
     // **A server is a socket, so this is the network's `close` under another name.** It is exported here
     // so that a program serving HTTP needs one import rather than two, and so that a later server that
     // is more than a socket can change what closing means without changing what programs write.
-    export close(server) = shutSocket(server)
+    //
+    // **CLOSING A SERVER CLOSES THE CONNECTIONS IT ACCEPTED, WHICH IS THE WHOLE OF WHY THIS IS NOT ONE
+    // LINE ANY MORE.** Closing the listening socket stops new connections arriving and does nothing at
+    // all to the ones already here, and a connection is a handle the loop waits on -- so a program that
+    // had closed everything it owned still could not exit, and waited on a connection whose client had
+    // gone and which nothing was ever going to read again. That is not a rare shape: it is what every
+    // server does at shutdown.
+    //
+    // **An IDLE connection is closed at once and one with a request in flight finishes that response
+    // and is then closed**, which is node's rule since v19 and is the one a shutdown needs: a client
+    // mid-request is answered rather than cut off, and nothing is kept alive for a request that has not
+    // arrived. There is no keep-alive after `close`, so a second request on a connection that was busy
+    // is not served -- the connection ends with the response it was writing.
+    export close(server)
+        // **The port is read BEFORE the socket is closed**, a closed socket having no address -- and
+        // closing a server twice has to stay the no-op that closing a socket twice is.
+        var portKey = null
+
+        try
+            portKey = string(localPort(server))
+        catch gone
+            portKey = null
+
+        shutSocket(server)
+
+        if portKey == null || !has(connsOf, portKey) then return
+
+        val live = connsOf[portKey]
+
+        connsOf = forgotten(connsOf, portKey)
+
+        for [k, slot] in entries(live)
+            slot.finish()
 
     // `serve(port, handler)` -- listen, and call `handler` with each request.
     //
@@ -203,6 +256,11 @@ http_head_source() -> string = raw"""
         // that one place to look for it is inside an object that says it has one.
         val called = if handler is object && has(handler, "handle") then handler.handle else handler
 
+        // The key this server's connections are filed under, filled in once the port is known. **A
+        // connection cannot arrive before `listen` has answered**, so nothing reads it while it is
+        // still empty.
+        var portKey = ""
+
         if !(called is function) then throw "`serve` needs a function to call with each request, or an object with a `handle` that is one"
 
         // **Checked here for the same reason the handler is**: a connection asking to upgrade may not
@@ -231,21 +289,38 @@ http_head_source() -> string = raw"""
         // both, which is the whole point of doing this here rather than making everybody write two
         // servers.
         accept(conn)
+            // **A connection is in the server's table from the moment it is accepted, before it has
+            // said which protocol it speaks.** A client that opens a connection and then says nothing
+            // is one `close` has to be able to end, and until the first byte arrives there is no
+            // speaker to hold it. The slot's `finish` is replaced by the speaker that takes over.
+            val key = string(nextConn)
+
+            nextConn = nextConn + 1
+
+            val slot = { finish: () -> shutSocket(conn), retire: () -> retire(portKey, key) }
+
+            enrol(portKey, key, slot)
+
             chosen(chunk)
-                // A connection that closed before saying anything: there is nothing to speak and
-                // nothing to close that the socket is not closing already.
-                if chunk == null then return
+                // A connection that closed before saying anything. **The socket is closed here, and
+                // saying there was nothing to close was wrong**: the end of a stream is not the end of
+                // a handle, so one left here is one the loop waits on for the rest of the run.
+                if chunk == null
+                    slot.retire()
+                    shutSocket(conn)
+
+                    return
 
                 if alpnProtocol(conn) == "h2"
-                    speakH2(conn, called, streaming, chunk)
+                    speakH2(conn, called, streaming, chunk, slot)
                 else
-                    speak11(conn, chunk)
+                    speak11(conn, chunk, slot)
 
             onBytes(conn, chosen)
 
         // **Each speaker installs a reader of its own over this one**, which is what `onBytes` being
         // a replacement rather than an addition is for.
-        speak11(conn, first)
+        speak11(conn, first, slot)
             // The parser this connection's bytes go through. **Nothing is buffered here**: what a
             // request is made of is llhttp's business, and this module asks only what it has ready.
             val parser = if streaming then httpStream(HeadBytes) else httpParser(HeadBytes, BodyBytes)
@@ -258,6 +333,10 @@ http_head_source() -> string = raw"""
             // Whether this connection is finished. Every way out sets it, so nothing writes to a closed
             // socket and no timer fires against one.
             var shut = false
+
+            // Whether the server has been closed and this connection is finishing its last response.
+            // **Nothing new is read once it is up**, which is what "no keep-alive after close" means.
+            var closing = false
 
             // Whether the client has stopped sending. A request completed by the end of the stream is
             // still answered, and the connection is not kept afterwards whatever it asked for.
@@ -301,7 +380,23 @@ http_head_source() -> string = raw"""
                 awake()
                 release()
                 httpClose(parser)
+                slot.retire()
                 shutSocket(conn)
+
+            // What closing the server means to this connection: end now if there is nothing in flight,
+            // and otherwise write the answer being written and end after it.
+            //
+            // **The clock runs while it finishes**, which it does not while an ordinary request is
+            // being answered: a shutdown waits for what is in flight, and a request whose client has
+            // gone would never finish -- so waiting for it without a clock would be a server that
+            // cannot be shut down.
+            finish()
+                if busy
+                    closing = true
+
+                    quiet()
+                else
+                    stop()
 
             // Stop being this connection's server, and leave the socket open.
             //
@@ -309,6 +404,9 @@ http_head_source() -> string = raw"""
             // connection to another protocol means: the clock is stopped, the parser is let go, and every
             // path back into this module is closed by `shut` -- but the socket belongs to somebody else
             // now and closing it is theirs to do.
+            //
+            // **AND IT LEAVES THE SERVER'S TABLE**, for the same reason it is not closed: a socket this
+            // module has given away is not one `close(server)` may take back.
             handOver()
                 if shut then return
 
@@ -317,6 +415,7 @@ http_head_source() -> string = raw"""
                 awake()
                 release()
                 httpClose(parser)
+                slot.retire()
 
             // Let go of a handler waiting for a body that is not going to finish arriving.
             //
@@ -397,7 +496,7 @@ http_head_source() -> string = raw"""
 
                 // **The next request may already be here**, where a client pipelined -- so this is not a
                 // wait for more bytes to arrive, it is the turn the second request has been waiting for.
-                if again
+                if again && !closing
                     quiet()
                     next()
                 else
@@ -665,7 +764,8 @@ http_head_source() -> string = raw"""
 
                 next()
 
-                if !busy then quiet()
+                if !busy
+                    if closing then stop() else quiet()
 
             // The request that asked to upgrade, taken from whichever parser this server is using.
             //
@@ -698,6 +798,8 @@ http_head_source() -> string = raw"""
 
                 onUpgrade(req, conn, chunk[upTo..])
 
+            slot.finish = finish
+
             onBytes(conn, arrived)
 
             // **The clock starts before the first request, not after it.** A client that opens a
@@ -707,6 +809,17 @@ http_head_source() -> string = raw"""
             // The bytes that chose this speaker, fed to it now that everything it needs is built.
             arrived(first)
 
-        listen(port, accept)
+        val sock = listen(port, accept)
+
+        portKey = string(localPort(sock))
+
+        // **The table is seeded empty rather than made by the first connection**, so that HAVING one
+        // is what says a socket is a server of this module's. `close` is exported for a server and is
+        // reached by sockets that are not one -- a program importing `close` from `slate:http` closes
+        // its client sockets with it too -- and a port number on its own would be a poor thing to
+        // decide that on.
+        connsOf[portKey] = {}
+
+        sock
 
     """

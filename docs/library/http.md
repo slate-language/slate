@@ -12,7 +12,7 @@ val server = serve(8080, req -> "hello")
 |---|---|
 | `serve(port, handler, onUpgrade = null)` | the whole request, body included |
 | `serveStream(port, handler, onUpgrade = null)` | the head, then the body in pieces |
-| `close(server)` | |
+| `close(server)` | stop serving, and end the connections |
 | `router()` | |
 | `files(root, options = {})` | a handler serving a directory |
 | `setCookie(name, value, options = {})` | a header value |
@@ -24,6 +24,21 @@ val server = serve(8080, req -> "hello")
 The third argument to either server is for a protocol upgrade — see [`slate:ws`](ws.md).
 
 **HTTPS is `listen` told a certificate**, so `serve` did not have to change: TLS lives one layer down.
+
+## `close(server)`
+
+**Closing a server stops it accepting, closes every idle connection it had accepted at once, and lets a
+connection with a request in flight finish that response before closing it.** There is no keep-alive
+after `close`: a second request on a connection that was busy is not served, and the connection ends
+with the response it was writing.
+
+That is what makes `close` the thing that lets a program exit. A connection is a handle the event loop
+waits on, so closing only the listening socket would leave a program that had shut everything down
+still waiting — on connections whose clients may already be gone.
+
+**A connection nobody is using is closed by the server anyway, after five seconds**, over either
+version. A client may keep a connection and then simply go away, and without that clock the socket
+would be held for the life of the server.
 
 ## The request
 
