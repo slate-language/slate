@@ -1,0 +1,167 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// Whether a chunk's names may live in numbered slots, which is one question asked of its body.
+//
+// **The rule is that NOTHING OUTSIDE THE CHUNK MAY BE ABLE TO REACH A NAME.** Two things can:
+//
+// - **A nested function**, which captures the scope chain by pointer and reads a name out of it
+//   whenever it is called -- possibly long after the frame that declared the name has returned. So a
+//   body holding a `Lambda` or a `Def` anywhere in it keeps every name in the chain. A `class` and a
+//   `data` declaration are covered by that already, both desugaring to an object of lambdas.
+// - **A pattern that outlives the block**, which is what a `type` declaration makes: `PushShape`
+//   captures the scope so that a `ProtoPat` inside the pattern can find the class it names, and the
+//   shape is a value that can be passed anywhere. So a body holding one keeps its names too.
+//
+// **This is deliberately a question about the WHOLE BODY rather than about each name.** Asking it
+// per name -- which names does this particular nested function actually reach? -- gives more chunks
+// their slots and is the next step; asking it once is the step that can be checked by reading, which
+// is what a change to how every local is found should start with.
+//
+// **AND IT REFUSES EVERY BINDING FORM BUT `val` AND `var` WITH A PLAIN NAME.** A pattern, a `for`
+// head, a `catch`, a `match` arm and a parameter's default all bind by putting a name into the scope
+// the machine is standing in, and each is a different piece of code doing it. Slotting a chunk while
+// one of them writes into the chain would give a name two homes -- the slot a later read finds, and
+// the binding the machine actually made -- which is silent and wrong rather than loud and wrong. So
+// they are refused here, together, and each is its own step afterwards.
+//
+// Not `private`: `compile.sysl` asks it of each chunk before emitting the body.
+may_slot(body: Expr, defaults: Buf[Expr]) -> bool = defaults.is_empty() && !expr_holds_capture(body)
+
+private expr_holds_capture(x: Expr) -> bool
+    *x.kind match
+        Lambda(_, _, _, _) -> true
+        ShapeLit(_, _) -> true
+
+        // The binding forms this stage does not follow. Each puts a name into the running scope from
+        // code of its own, so a chunk holding one keeps every name in the chain.
+        MatchExpr(_, _) -> true
+        TryCatch(_, _, _) -> true
+        For(_, _, _, _, _, _) -> true
+
+        Spread(inner) -> expr_holds_capture(inner)
+        Named(_, value) -> expr_holds_capture(value)
+        Unary(_, rhs) -> expr_holds_capture(rhs)
+        Binary(_, lhs, rhs) -> expr_holds_capture(lhs) || expr_holds_capture(rhs)
+        Call(callee, args) -> expr_holds_capture(callee) || any_expr(args)
+        Index(target, key) -> expr_holds_capture(target) || expr_holds_capture(key)
+        Field(target, _, _) -> expr_holds_capture(target)
+        ArrayLit(items) -> any_expr(items)
+        ArrayRepeat(value, count) -> expr_holds_capture(value) || expr_holds_capture(count)
+        Interp(pieces) -> any_expr(pieces)
+        WithFields(base, _, values) -> expr_holds_capture(base) || any_expr(values)
+        WithAll(base, other, _) -> expr_holds_capture(base) || expr_holds_capture(other)
+        ObjectLit(_, _, values) -> any_expr(values)
+        DataLit(inner) -> expr_holds_capture(inner)
+        Compare(operands, _) -> any_expr(operands)
+        Range(lo, hi, _) -> maybe_expr(lo) || maybe_expr(hi)
+        IsPattern(subject, _, _) -> expr_holds_capture(subject)
+        IncDec(target, _, _) -> expr_holds_capture(target)
+        Await(inner) -> expr_holds_capture(inner)
+        Yield(inner) -> expr_holds_capture(inner)
+        IfExpr(cond, then_branch, else_branch) ->
+            expr_holds_capture(cond) || expr_holds_capture(then_branch) || maybe_expr(else_branch)
+        While(_, cond, body, otherwise) ->
+            expr_holds_capture(cond) || expr_holds_capture(body) || maybe_expr(otherwise)
+        Loop(_, body) -> expr_holds_capture(body)
+        DoWhile(_, body, cond, otherwise) ->
+            expr_holds_capture(body) || expr_holds_capture(cond) || maybe_expr(otherwise)
+        Block(stmts) -> any_stmt(stmts)
+        Ensures(value, _, _) -> expr_holds_capture(value)
+
+        // Every literal and every bare name. **Written out rather than left to a wildcard on
+        // purpose**: a node added to the tree should make this stop compiling and be classified,
+        // because the cost of a new node quietly falling into "holds nothing" is a name in a slot
+        // that something outside the chunk can still reach.
+        IntLit(_) -> false
+        RealLit(_) -> false
+        StrLit(_) -> false
+        BoolLit(_) -> false
+        NullLit -> false
+        UndefinedLit -> false
+        Name(_) -> false
+
+        // A node the parser put down where it could not read one. Nothing is emitted for it, but a
+        // chunk that failed to parse is not one to reason about either.
+        Bad -> true
+end expr_holds_capture
+
+private stmt_holds_capture(s: Stmt) -> bool
+    *s.kind match
+        Def(_, _, _, _, _) -> true
+        TypeDecl(_, _) -> true
+
+        Val(_, init) -> expr_holds_capture(init)
+        Var(_, init) -> expr_holds_capture(init)
+        // A pattern binds from code of its own -- see the note on `may_slot`.
+        Unpack(_, _, _) -> true
+        Group(stmts) -> any_stmt(stmts)
+        Assign(_, target, value) -> expr_holds_capture(target) || expr_holds_capture(value)
+        MultiAssign(_, targets, values) -> any_expr(targets) || any_expr(values)
+        Eval(e) -> expr_holds_capture(e)
+        Return(value) -> maybe_expr(value)
+        Throw(value) -> expr_holds_capture(value)
+        Break(_, value) -> maybe_expr(value)
+        Continue(_) -> false
+
+        // An import binds names the module it names owns, and cannot appear inside a function
+        // anyway. Written out for the reason the literals above are.
+        ImportNames(_, _, _, _, _) -> true
+        ImportAll(_, _, _, _) -> true
+
+        CheckType(_, _, _) -> false
+end stmt_holds_capture
+
+private any_expr(xs: Buf[Expr]) -> bool
+    for i in 0..<xs.len()
+        if expr_holds_capture(xs.at(i)) then return true
+
+    false
+end any_expr
+
+private any_stmt(xs: Buf[Stmt]) -> bool
+    for i in 0..<xs.len()
+        if stmt_holds_capture(xs.at(i)) then return true
+
+    false
+end any_stmt
+
+private maybe_expr(x: Option[Expr]) -> bool = x match
+    Some(e) -> expr_holds_capture(e)
+    None -> false
+
+// -- emitting a name, one way or the other ----------------------------------------------------------
+
+// **These three are the ONLY places that decide between a slot and the chain**, which is what keeps
+// the two from disagreeing: a name is claimed here and looked up here, so a declaration and every
+// read of it read the same table.
+
+// Bind a name in the block being emitted.
+declare_name(u: *Unit, e: *Emit, name: string, at: Span, assignable: bool)
+    if e.slotting
+        push_n(e, DeclareSlot(claim_slot(e, name, assignable)), at, 1, 0)
+        return
+
+    push_n(e, if assignable then DeclareVar(intern_str(u, name)) else DeclareVal(intern_str(u, name)), at, 1, 0)
+
+// Read a name.
+load_name(u: *Unit, e: *Emit, name: string, at: Span)
+    slot_named(e, name) match
+        Some(i) -> push_n(e, LoadSlot(e.slot_of.at(i)), at, 0, 1)
+        None -> push_n(e, LoadName(intern_str(u, name)), at, 0, 1)
+
+// Write to a name.
+//
+// **A write to a slot holding a `val` still emits something that faults**, rather than being refused
+// here: the checker already complains about it before the machine runs, and the one path where it
+// does not should say what it has always said.
+store_name(u: *Unit, e: *Emit, name: string, at: Span)
+    slot_named(e, name) match
+        Some(i) ->
+            if slot_writable(e, i)
+                push_n(e, StoreSlot(e.slot_of.at(i)), at, 1, 0)
+            else
+                push_n(e, ImmutableSlot(intern_str(u, name)), at, 1, 0)
+        None -> push_n(e, StoreName(intern_str(u, name)), at, 1, 0)
