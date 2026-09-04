@@ -67,6 +67,9 @@ hello from h2
 | `h2Next(session)` | the next event, or `null` |
 | `h2Request(session, headers, body?)` | a client's; answers the stream number |
 | `h2Respond(session, stream, headers, body?)` | a server's |
+| `h2RequestStream(session, headers)` / `h2RespondStream(session, stream, headers)` | the same two with the body written afterwards |
+| `h2Push(session, stream, piece)` | more of a body that is still open; `{ error }` where the peer gave up |
+| `h2Finish(session, stream, trailers?)` | the body is complete and the stream ends |
 | `h2Settings(session, { … })` | |
 | `h2Goaway(session, lastStream, code?)` / `h2Reset(session, stream, code)` | giving up |
 | `h2WindowUpdate(session, stream, by)` / `h2Consume(session, stream, bytes)` | flow control |
@@ -176,6 +179,30 @@ true
 
 **A handle you have closed is a defect in the program**, exactly as a closed socket is, so that one
 faults — and says what was closed rather than naming an integer.
+
+## A body written a piece at a time
+
+`h2Request` and `h2Respond` take the bytes they are to send, which is right for a body a program
+already has. **A body produced as it goes — an event stream, a proxied response, a file read in
+pieces — is the other pair**, and the difference on the wire is *when the head goes out*: a response
+whose source never ends still has to say `200` before its first byte of body exists.
+
+```slate
+h2RespondStream(s, stream, { ":status": "200", "content-type": "text/event-stream" })
+
+// … whenever there is something to say:
+h2Push(s, stream, "data: hello\n\n")
+
+// … and at the end, which for an event stream may be never:
+h2Finish(s, stream)
+```
+
+**`h2Push` answers `{ error }` where the stream has no open body**, which is the ordinary way a
+program learns the peer gave up: a reset or a close drops the body, so the next push says so rather
+than writing into nothing. Trailers may be named at `h2Finish` and nowhere else — what was unknown
+until the body ended is exactly what a trailer is for.
+
+`h2RequestStream` is the same on the client side, and it is what an upload of unknown length is.
 
 ## Flow control, and back-pressure
 

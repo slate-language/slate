@@ -112,8 +112,8 @@ app.get("/big", req -> { status: 202, headers: { "X-Kind": "report" }, body: row
 - **A source that faults mid-stream ends the response and the fault is put back.** The client sees a
   chunked body with no terminator, which is the only thing HTTP can say once the status line has
   gone, and the defect stops the program as any other does.
-- **A streamed body needs HTTP/1.1.** Over HTTP/2 it is refused with a sentence saying so, rather
-  than drained — see below.
+- **Both versions carry one.** Over HTTP/1.1 the pieces are chunks and over HTTP/2 they are DATA
+  frames, and nothing a handler wrote says which.
 
 ## `sse(source)`
 
@@ -164,16 +164,11 @@ serve({ port: 8443, cert: pem, key: keyPem, alpn: ["h2", "http/1.1"] }, app)
   streams at once and each is answered on its own.
 - **A header name goes out lowercased**, an upper-case field name being malformed in HTTP/2 rather
   than merely unconventional. On HTTP/1.1 what you wrote is what is sent.
-- **`serveStream` hands the body over in one chunk**, because [`slate:nghttp2`](nghttp2.md) holds a
-  DATA frame's bytes rather than passing them on as they land. A handler written for it runs
-  unchanged and sees one arrival.
-- **A streamed RESPONSE is refused**, with a sentence naming the limitation and the way out — offer
-  only `"http/1.1"` in `alpn` for an endpoint that streams. That module has no data provider, so
-  `h2Respond` takes a whole body; draining the source instead would turn an event stream, whose
-  source never ends, into a request that hangs forever, and nothing on the client could diagnose it.
-
-**Those two are the same missing piece from its two ends** and are one piece of work in
-[`slate:nghttp2`](nghttp2.md) rather than here.
+- **A streamed response goes out as a DATA frame per piece**, and `sse` works with its heartbeat —
+  the head is sent before the source is asked for anything, which is what lets a response whose
+  source never ends say `200` at all.
+- **`serveStream` hands the body over as it lands**, one arrival per DATA frame, and a stream the
+  peer resets ends the body the handler is reading rather than leaving it waiting.
 
 **Without a certificate there is no ALPN and nothing changes** — `h2c`, which is HTTP/2 in the clear,
 is not spoken here. The framing layer on its own is [`slate:nghttp2`](nghttp2.md).

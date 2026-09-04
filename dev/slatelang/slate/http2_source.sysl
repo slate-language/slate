@@ -79,21 +79,22 @@ http2_source() -> string = raw"""
 
                 val r = shaped(req, reply)
 
-                // **A BODY THAT ARRIVES IN PIECES IS REFUSED OVER HTTP/2 RATHER THAN DRAINED**, and
-                // the difference matters more than it looks: an event stream's source never ends, so
-                // draining it would turn every browser that negotiated `h2` into a request that
-                // hangs forever -- a failure nothing on the client can diagnose.
-                //
-                // `sh.sysl.nghttp2` has no data provider, so `h2Respond` takes a whole body and
-                // there is nothing here to write a frame at a time with. It is the same missing
-                // piece the request side has, seen from the other end.
-                if r.source != null
-                    throw "a streamed body needs HTTP/1.1: `slate:nghttp2` cannot yet send a response a frame at a time, so offer only \"http/1.1\" in `alpn` for an endpoint that streams"
-
                 var headers = [[":status", string(r.status)]]
 
                 for [k, hv] in r.headers
                     push(headers, [lower(k), hv])
+
+                // **A BODY THAT ARRIVES IN PIECES GOES OUT AS DATA FRAMES AS THEY ARRIVE.** The
+                // head is sent at once and the frames follow, which is what an event stream needs
+                // and is why `sh.sysl.nghttp2` 0.3.0 exists: until it had a data provider there was
+                // nothing here to write a frame at a time with, and this refused the response
+                // outright rather than draining a source that never ends.
+                if r.source != null
+                    replying = true
+
+                    await sendStreamed(stream, r, headers)
+
+                    return
 
                 replying = true
 
@@ -116,6 +117,126 @@ http2_source() -> string = raw"""
 
                 throw e
 
+        // A response whose body arrives in pieces, as HEADERS and then a DATA frame per piece.
+        //
+        // **`streamed` on the 1.1 connection said in chunked framing; this says the same thing in
+        // frames**, and every decision it made is made again here for the same reason -- which is
+        // why the two read alike rather than sharing code they have almost no vocabulary in common
+        // with. The head goes out before the source is asked for anything, because a source that
+        // never ends would otherwise never let the `200` out.
+        async sendStreamed(stream: integer, r: object, headers)
+            h2RespondStream(session, stream, headers)
+
+            await flushed()
+
+            var beating = false
+            var timer = null
+
+            // **The heartbeat is a member of the response, not a guess from its content type**, and
+            // over HTTP/2 it is one DATA frame like any other -- there is no chunk framing to get
+            // wrong here, which was the 1.1 writer's first mistake.
+            //
+            // **A push that is refused ends the beating quietly.** The stream is gone, so there is
+            // nobody to keep a connection open for; raising here would be a fault nothing awaits.
+            async beat()
+                if !beating then return
+
+                val said = h2Push(session, stream, ": keep-alive\n\n")
+
+                if said != null
+                    beating = false
+
+                    return
+
+                try
+                    await flushed()
+                catch gone
+                    beating = false
+
+                    return
+
+                if beating then timer = setTimeout(beat, r.heartbeat * 1000)
+
+            if r.heartbeat > 0
+                beating = true
+                timer = setTimeout(beat, r.heartbeat * 1000)
+
+            // **A source that faults is put back on the loop and a WRITE that fails is not**, which
+            // is `streamed`'s rule and is what stops a client from ending the program by giving up
+            // on a stream: the enclosing `try` in `answer` reads a failure as a client that has
+            // gone, so a defect thrown from here would vanish into it. `sending` is true only
+            // across the write.
+            var sending = false
+
+            try
+                for await piece in r.source
+                    val part = framedH2(piece)
+
+                    // **An empty piece is skipped**, as it is on the 1.1 connection. It says
+                    // nothing there and would be a DATA frame carrying nothing here.
+                    if part != null
+                        sending = true
+
+                        // **A refusal means the peer gave up on this stream** -- a cancelled fetch,
+                        // a closed tab -- which `slate:nghttp2` answers rather than faults, the
+                        // client going away being a condition and not a defect. There is nothing
+                        // left to write to, so the response simply ends.
+                        val said = h2Push(session, stream, part)
+
+                        if said != null
+                            sending = false
+                            beating = false
+
+                            stopBeating(timer)
+
+                            return
+
+                        await flushed()
+
+                        sending = false
+            catch e
+                beating = false
+
+                stopBeating(timer)
+
+                if sending then throw e
+
+                setTimeout(() -> putBack(e), 0)
+
+                return
+
+            beating = false
+
+            stopBeating(timer)
+
+            h2Finish(session, stream)
+
+            await flushed()
+
+        // A piece as `h2Push` takes it, or `null` where there is nothing in it.
+        //
+        // **No chunk framing, which is the whole difference from the 1.1 writer's `framed`**: a DATA
+        // frame carries its own length, so a piece goes out as the bytes or the text it already is.
+        framedH2(piece)
+            if piece is array
+                return if len(piece) == 0 then null else piece
+
+            val text = if piece is string then piece else string(piece)
+
+            if len(toBytes(text)) == 0 then null else text
+
+        // `flush`, awaited.
+        //
+        // **A streamed response is written over minutes rather than milliseconds, which is what
+        // makes the difference matter.** An unawaited write whose client has gone is a rejection
+        // nobody holds, and an orphaned rejection stops the program -- exactly the defect the 1.1
+        // heartbeat had. Over a whole-body response the window is a moment; over an event stream it
+        // is the whole life of the connection.
+        async flushed()
+            val out = h2Send(session)
+
+            if len(out) > 0 then await send(conn, out)
+
         // Everything the peer did since the last read.
         drain()
             loop
@@ -124,9 +245,27 @@ http2_source() -> string = raw"""
                 if e == null then break
 
                 if e.kind == "headers" && e.of == "request"
-                    pending[string(e.stream)] = { headers: e.headers, body: [] }
+                    // **A STREAMING SERVER IS HANDED THE REQUEST AT ITS HEADERS, NOT AT ITS END.**
+                    // That is the whole of what `serveStream` is for: a handler that means to write
+                    // a gigabyte to disk as it arrives cannot be given the gigabyte first. The
+                    // frames that follow are delivered to the source below as they land, and the
+                    // server holds none of them.
+                    if streaming
+                        val live = liveBody()
+
+                        pending[string(e.stream)] = { live: live }
+
+                        answer(e.stream, requestOfH2(e.headers, [], true, live))
+                    else
+                        pending[string(e.stream)] = { headers: e.headers, body: [] }
                 elif e.kind == "data"
                     val key = string(e.stream)
+
+                    if has(pending, key) && has(pending[key], "live")
+                        pending[key].live.deliver(e.bytes)
+                        h2Consume(session, e.stream, len(e.bytes))
+
+                        continue
 
                     if has(pending, key)
                         val grown = concat(pending[key].body, e.bytes)
@@ -168,7 +307,10 @@ http2_source() -> string = raw"""
 
                         pending = forgotten(pending, key)
 
-                        answer(e.stream, requestOfH2(held.headers, held.body, streaming))
+                        // A streaming handler has been running since the headers arrived, so what
+                        // the end of the stream means to it is that the body is complete.
+                        if has(held, "live") then held.live.close()
+                        else answer(e.stream, requestOfH2(held.headers, held.body, false, null))
 
                 // **A STREAM THAT ENDS ANY OTHER WAY TAKES ITS PARTIAL BODY WITH IT.** Only
                 // `streamEnd` used to clear a slot, so a client that reset a stream mid-upload --
@@ -176,7 +318,15 @@ http2_source() -> string = raw"""
                 // held for the life of the connection, and a client doing it repeatedly kept every
                 // one of them.
                 elif e.kind == "rstStream" || e.kind == "streamClose"
-                    pending = forgotten(pending, string(e.stream))
+                    val key = string(e.stream)
+
+                    // **A handler reading a body the peer abandoned has to be told it has ended**,
+                    // or a `for await` over it waits for the rest of the run. What it sees is a
+                    // truncated body, which is the only thing either version of HTTP can say once
+                    // the request has stopped arriving.
+                    if has(pending, key) && has(pending[key], "live") then pending[key].live.close()
+
+                    pending = forgotten(pending, key)
                 elif e.kind == "goaway"
                     stop()
 
@@ -225,7 +375,7 @@ http2_source() -> string = raw"""
     //
     // **A body that is not text is the empty string**, exactly as it is on the 1.1 path, where
     // llhttp's bytes go through the same conversion and the same `unwrap_or("")`.
-    requestOfH2(pairs: array, bytes: array, streaming: boolean) -> object
+    requestOfH2(pairs: array, bytes: array, streaming: boolean, live) -> object
         var method = "GET"
         var target = "/"
         var headers = {}
@@ -262,41 +412,127 @@ http2_source() -> string = raw"""
                     keepAlive: true,
                     upgrade: false }
 
-        if streaming then return streamedH2(req, bytes)
+        if streaming then return streamingRequest(req, live)
 
         val text = fromBytes(bytes)
 
         req with { body: if text.ok then text.value else "" }
 
-    // A streamed request over HTTP/2, where the body is already whole.
+    // A body that is still arriving: what DATA frames are delivered to, and what a handler reads.
     //
-    // **`sh.sysl.nghttp2` HOLDS A DATA FRAME'S BYTES RATHER THAN HANDING THEM OVER AS THEY LAND**, so
-    // there is nothing here to stream yet and this delivers the body in one chunk. A handler written
-    // for `serveStream` therefore runs unchanged and sees one arrival -- which is the honest shape of
-    // what is underneath rather than an imitation of it.
+    // **Module level rather than inside `speakH2`, and the reason is one shadowed name.** The session
+    // loop keeps its streams in a `pending` object, which is the very name the promise builtin goes by --
+    // so a `pending()` written in there is a call of that object and is refused as one. Nothing here
+    // reaches into the connection anyway: what a body needs is a place to put chunks and somebody to
+    // give them to.
     //
-    // **It is the largest thing that binding is missing** and the reason is written down there: the
-    // deferred/resume path is unbound. When it is bound this function is what changes, and nothing a
-    // program wrote does.
-    streamedH2(req: object, bytes: array) -> object
-        var pulled = false
+    // **The push half only.** `next` is written over `each` in `streamingRequest`, exactly as the
+    // 1.1 server writes it over its own -- a second reader reaching into this state would be a
+    // second thing to keep in step with it.
+    //
+    // **Chunks that arrive before the handler asks are HELD rather than dropped**, because a
+    // handler is an ordinary function and its first `await` is later than the frame that woke
+    // it. What is not held is a body nobody ever asks for: `each` is what starts the delivery,
+    // and a handler that never calls it leaves its chunks here until the stream closes.
+    liveBody()
+        var sink = null
+        var held = []
+        var total = 0
+        var finished = false
+        val ending = pending()
 
-        // `each` answers a promise for the number of bytes the body turned out to be, which is the
-        // one number an upload handler usually wants.
-        async pushed(f)
-            if len(bytes) > 0 then f(bytes)
+        val live = {}
 
-            len(bytes)
+        live.deliver = (chunk) ->
+            total = total + len(chunk)
 
-        // `next` is the same bytes pulled instead of pushed, which is what `for await` drives.
-        pull()
-            if pulled || len(bytes) == 0 then return { done: true, value: null }
+            if sink == null then push(held, chunk) else sink(chunk)
 
-            pulled = true
+        // **The end is idempotent**, a stream ending and then closing being two events about one
+        // body -- and a reset arrives instead of an end rather than after it.
+        live.close = () ->
+            if finished then return
 
-            { done: false, value: bytes }
+            finished = true
 
-        req with { each: pushed, next: pull }
+            settle(ending, total)
+
+        // `each` answers a promise for the number of bytes the body turned out to be, which is
+        // the one number an upload handler usually wants.
+        live.each = (f) ->
+            sink = f
+
+            for c in held
+                f(c)
+
+            held = []
+
+            ending
+
+        live
+
+    // A streamed request over HTTP/2: the head, and the one way of asking for the rest.
+    //
+    // **The frames are handed over as they land**, which needed `sh.sysl.nghttp2`'s deferred/resume
+    // path to exist -- until 0.3.0 the binding held a body whole and this delivered it in one chunk,
+    // so a handler written to write a gigabyte to disk as it arrived got the gigabyte first.
+    //
+    // **`next` is written OVER `each` rather than beside it**, which is what the 1.1 server does and
+    // for the same reason: the push half already knows about held chunks, the sink and the ending
+    // promise, and a second reader reaching into that state would be a second thing to keep in step
+    // with it. So this is an ordinary queue and one pending promise.
+    streamingRequest(req: object, live: object) -> object
+        var queue = []
+        var waiting = null
+        var started = false
+        var finished = false
+
+        // A chunk goes to whoever is already asking for one, and to the queue otherwise.
+        deliver(c)
+            if waiting == null
+                push(queue, c)
+
+                return
+
+            val asked = waiting
+
+            waiting = null
+
+            settle(asked, { done: false, value: c })
+
+        // **The end has to wake a waiting `next` as well as be remembered**, or a handler that asked
+        // for one more chunk than the body had waits for the rest of the run.
+        async endedAt(whole)
+            await whole
+
+            finished = true
+
+            if waiting != null
+                val asked = waiting
+
+                waiting = null
+
+                settle(asked, { done: true, value: null })
+
+        val out = req with { each: live.each }
+
+        out.next = () ->
+            // **`each` drains what was held synchronously**, so the queue is checked after starting
+            // rather than before: frames that arrived before the handler asked are in `queue` by the
+            // time this line runs.
+            if !started
+                started = true
+
+                endedAt(out.each(deliver))
+
+            if len(queue) > 0 then return { done: false, value: shift(queue) }
+            if finished then return { done: true, value: null }
+
+            waiting = pending()
+
+            waiting
+
+        out
 
     // An object with one key gone. **A copy rather than a removal**, slate having no remover -- and a
     // stream table is small, being what is in flight rather than what has been.
