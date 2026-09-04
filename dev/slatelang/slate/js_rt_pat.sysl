@@ -1,0 +1,397 @@
+module dev.slatelang.slate
+
+// Patterns, the values a `catch` binds, and the table `$` finally is.
+//
+// **This block CLOSES the `$` IIFE `js_rt.sysl` opens**, the way `js_rt_host.sysl` closes the `$b`
+// one, so it is the last of the three and none of them is a program on its own. The `return` here
+// names what all three declared -- which is why a name lifted into any of them needs no other
+// change, and why the arrangement crosses nothing at the sysl level.
+
+// The pattern walk, the fault a `catch` is handed, and the object the emitted program calls into.
+js_runtime_pattern() -> string = raw"""
+        // -- patterns -------------------------------------------------------------------------------------
+
+        // A pattern is data, and this is the walk over it. It answers the values it bound, in the order
+        // the names were written, or null where the pattern does not hold.
+        const matchPattern = (v, pat, bound) => {
+            const kind = pat[0]
+
+            if (kind === "_") { bound.push(v); return true }
+            if (kind === "t") return test(v, pat[1])
+            if (kind === "v") return sameLiteral(v, pat[1])
+
+            if (kind === "@") {
+                bound.push(v)
+
+                return matchPattern(v, pat[1], bound)
+            }
+
+            if (kind === "arr") {
+                const items = pat[1]
+                const open = pat[2]
+                const rest = pat[3]
+
+                // How many of the elements are not optional. An element with a default may be missing
+                // and is left as `undefined` for the emitted code to fill in.
+                const least = pat[4]
+
+                if (!Array.isArray(v)) return false
+                if (v.length < least) return false
+                if (!(open || rest) && v.length > items.length) return false
+
+                const taken = Math.min(v.length, items.length)
+
+                for (let i = 0; i < taken; i++)
+                    if (!matchPattern(v[i], items[i], bound)) return false
+
+                // A defaulted element the array did not reach still owns its slot in `bound`, or every
+                // name after it would be read out of the wrong one.
+                for (let i = taken; i < items.length; i++) bound.push(undefined)
+
+                if (rest) bound.push(v.slice(taken))
+
+                return true
+            }
+
+            if (kind === "obj") {
+                const keys = pat[1]
+                const values = pat[2]
+                const optional = pat[3]
+
+                if (!(v instanceof SObj)) return false
+
+                // **Through the `proto` chain and not only the object's own fields**, which is what
+                // `field_through` does for the machine: an interface written as `{ speak: function }`
+                // is kept by a class whose method one link up supplies, and asking for own fields
+                // would answer no to the case the type was written for.
+                for (let i = 0; i < keys.length; i++) {
+                    // `lookup` walks `proto`, as the machine's `field_through` does, so an interface
+                    // kept by an inherited method is kept here too.
+                    const [held] = v.lookup(keys[i])
+
+                    if (held === undefined) {
+                        if (!optional[i]) return false
+
+                        // An absent field -- defaulted or marked `?` -- still owns its slot in
+                        // `bound`, or every name after it would be read out of the wrong one.
+                        bound.push(undefined)
+
+                        continue
+                    }
+
+                    if (!matchPattern(held, values[i], bound)) return false
+                }
+
+                return true
+            }
+
+            // **Every element, and an EMPTY container fits** -- every element of nothing fits
+            // anything, which is the reading a test wants. An object's VALUES are walked; its keys
+            // are the program's.
+            if (kind === "every") {
+                if (pat[1] === "array") {
+                    if (!Array.isArray(v)) return false
+
+                    for (const x of v) if (!matchPattern(x, pat[2], bound)) return false
+
+                    return true
+                }
+
+                if (!(v instanceof SObj)) return false
+
+                for (const [, x] of v.entries()) if (!matchPattern(x, pat[2], bound)) return false
+
+                return true
+            }
+
+            // **A function type asks two things and can ask no more**: is this callable, and is a
+            // call of this size one it takes. Every function this back end writes carries `$p` and
+            // `$q`; a builtin carries neither, and its parameters are nobody's business.
+            if (kind === "fn") {
+                if (typeof v !== "function") return false
+
+                const params = v.$p
+
+                if (params === undefined) return true
+
+                const rest = params.length > 0 && params[params.length - 1].startsWith("...")
+                const want = pat[1]
+                const required = v.$q === undefined ? params.length : v.$q
+
+                return want >= required && (rest || want <= params.length)
+            }
+
+            if (kind === "or") {
+                for (const alt of pat[1]) if (matchPattern(v, alt, bound)) return true
+
+                return false
+            }
+
+            // Every part, left to right, each pushing what it bound onto the one flat list --
+            // which is the order `pattern_names` gathered them in, and is the whole of the
+            // agreement between the two.
+            if (kind === "and") {
+                for (const part of pat[1]) if (!matchPattern(v, part, bound)) return false
+
+                return true
+            }
+
+            if (kind === "proto") return hasProto(v, pat[1])
+
+            // A variant that declared no fields IS the value, so the test is identity with that one
+            // object rather than a walk up a chain that would reach the data type instead.
+            if (kind === "one") return v === pat[1]
+
+            if (kind === "variant") {
+                if (!hasProto(v, pat[1])) return false
+
+                const keys = pat[2]
+                const items = pat[3]
+
+                if (items.length === 0) return true
+                if (!(v instanceof SObj)) return false
+
+                for (let i = 0; i < items.length; i += 1) {
+                    const [held] = v.lookup(keys[i])
+
+                    if (held === undefined) return false
+                    if (!matchPattern(held, items[i], bound)) return false
+                }
+
+                return true
+            }
+
+            // The nominal test and an ordinary object pattern, which is all `Point { x: a }` is.
+            if (kind === "made") {
+                if (!hasProto(v, pat[1])) return false
+
+                return matchPattern(v, pat[2], bound)
+            }
+
+            return false
+        }
+
+        // The variant a data value was made by, or null where it is not one.
+        //
+        // **The frozen flag is asked first**, so an ordinary object a program happened to give a
+        // maker as its `proto` prints as the object it is.
+        const variantName = (v) => {
+            if (!(v instanceof SObj) || !v.frozen) return null
+
+            const [tag] = v.lookup("(data)")
+
+            return typeof tag === "string" ? tag : null
+        }
+
+        // The class an object is an INSTANCE of, if it is one.
+        //
+        // **The walk starts at the proto and not at the object**, which is the whole distinction
+        // between a class and one of its instances: the tag is the class's own field. The
+        // interpreter's `class_name` says the same.
+        const className = (v) => {
+            if (!(v instanceof SObj)) return null
+
+            const up = v.getName("proto")
+
+            if (!(up instanceof SObj)) return null
+
+            const [tag] = up.lookup("(class)")
+
+            return typeof tag === "string" ? tag : null
+        }
+
+        // The name of a CLASS, asked of the class object itself.
+        const classOwnName = (v) => {
+            if (!(v instanceof SObj)) return null
+
+            const tag = v.getName("(class)")
+
+            return typeof tag === "string" ? tag : null
+        }
+
+        // Whether a key is a tag a declaration wrote rather than a field a program did.
+        const tagKey = (k) => k === "(data)" || k === "(class)" || k === "(shape)"
+
+        // Whether the value's `proto` chain reaches this very object, which is what `p is Point` asks.
+        //
+        // **Identity, walked up the chain**: `==` on objects is structural, so it would answer true for
+        // a different class holding the same fields.
+        const hasProto = (v, cls) => {
+            if (!(v instanceof SObj) || !(cls instanceof SObj)) return false
+
+            let up = v
+            let depth = 0
+
+            for (;;) {
+                const next = up.getName("proto")
+
+                if (!(next instanceof SObj)) return false
+                if (next === cls) return true
+
+                depth += 1
+
+                if (depth >= MaxProtoDepth) return false
+
+                up = next
+            }
+        }
+
+        const matched = (v, pat) => {
+            const bound = []
+
+            return matchPattern(v, pat, bound) ? bound : null
+        }
+
+        const matches = (v, pat) => matchPattern(v, pat, [])
+
+        // A binding that has to hold: `val [a, b] = xs`, and a `for` over a pattern.
+        const unpacked = (v, pat) => {
+            const bound = matched(v, pat)
+
+            if (bound === null) fault("this value does not have the shape this takes apart: " + plainShow(v))
+
+            return bound
+        }
+
+        const noArm = (v) => fault("no arm of this match applies to " + plain(v))
+
+        // The sentence a thrown value carries.
+        //
+        // **An object with a `message` is READ for that field rather than rendered**, which is what lets
+        // a library put a fault back with `throw e` without turning it into
+        // `{message: "...", line: 3, file: "..."}` -- a description of a fault rather than the fault.
+        const thrownMessage = (v) => {
+            if (isStr(v)) return v
+
+            if (v instanceof SObj) {
+                const said = v.getName("message")
+
+                if (isStr(said)) return said
+            }
+
+            return plain(v)
+        }
+
+        // What a `catch` binds: an ordinary object carrying the sentence, the line it was raised at and
+        // the file it was in.
+        //
+        // **A thrown value becomes one too**, which is the interpreter's rule and is easy to get wrong:
+        // `throw "gone wrong"` is caught as `{message: "gone wrong", line: 44, file: "p.sl"}` and not as
+        // the string.
+        const faultObject = (message, line, file) =>
+            new SObj([["message", message], ["line", BigInt(line)], ["file", file]])
+
+        const caught = (e) => {
+            if (e instanceof Thrown) return faultObject(thrownMessage(e.value), e.line, e.file)
+            if (e instanceof Fault) return faultObject(e.reason, e.line, e.file)
+
+            // A JavaScript error from inside the runtime is still a fault a program can read.
+            return faultObject(String(e && e.message ? e.message : e), $line, $file)
+        }
+
+        return {
+            Fault, Thrown, SObj, SRange, SShape, host,
+            i64, fault, truthy, present, keep, typeName, test, text, show, realText,
+            isInt, isReal, isNum, isStr, isGen,
+            arith, compare, neg, bitnot, eq, same: (a, b) => same(a, b, []), sameLiteral,
+            strLen, strAt, strSlice, wide, span,
+            index, setIndex, field, fieldOpt, setField, method, call, spread, awaited, iter, seal,
+            matched, matches, unpacked, noArm, caught, hasProto, variantName, plain, plainShow,
+            className, classOwnName, tagKey, identical, callHook, NO_HOOK, sig,
+
+            // What a `type` declaration binds. **The pattern is walked and never read back out**, so
+            // nothing downstream can grow to depend on the structure of a type.
+            shape: (pat, name) => new SShape(pat, name),
+
+
+            // Where the program is, for a fault to name. The emitted code sets it a statement at a
+            // time, and names the file by its index in the table below.
+            //
+            // **A program of several files stamps the file on every marker**, because a function
+            // defined in one module and called from another has to say where it was written -- and a
+            // marker in the caller has to put the caller's file back afterwards. A program of one
+            // file says it once and leaves it.
+            at(line, file) { $line = line; if (file !== undefined) $file = $files[file] },
+
+            // The files, named once at the head of the program.
+            files(names) { $files = names; $file = names[0] },
+
+            // An array literal, which may hold no `undefined`.
+            arr(items) {
+                for (const v of items) keep(v, "put in an array")
+
+                return items
+            },
+
+            // An object literal, in the order its keys were written.
+            obj(entries) {
+                for (const [, v] of entries) keep(v, "put in an object")
+
+                return new SObj(entries)
+            },
+
+            range(lo, hi, inclusive) {
+                if (lo !== undefined && !isInt(lo)) fault("a range runs between integers, and this is " + typeName(lo))
+                if (hi !== undefined && !isInt(hi)) fault("a range runs between integers, and this is " + typeName(hi))
+
+                return new SRange(lo === undefined ? 0n : lo, hi === undefined ? 0n : hi,
+                    inclusive, lo !== undefined, hi !== undefined)
+            },
+
+            // `x with { a: 1 }`: a new object, the base's fields first.
+            withFields(base, entries) {
+                if (!(base instanceof SObj)) fault("`with` takes an object, and this is " + typeName(base))
+
+                const made = SObj.copy(base)
+
+                for (const [k, v] of entries) made.setKey(k, keep(v, "put in an object"))
+
+                made.frozen = base.frozen
+
+                return made
+            },
+
+            // **`spread` picks the words and changes nothing else**, which is the machine's rule for the
+            // same operation: `{ ...o }` and `a with b` are one thing, and a message naming the spelling
+            // the reader did not write sends them looking for it.
+            //
+            // **`{ ...null }` is a fault and not `{}`**, where JavaScript ignores a null spread. slate's
+            // rule is that a value which does not fit is a fault rather than an `undefined` that
+            // travels, and the two back ends have to agree about it -- `{ ...maybeProps }` is written
+            // constantly.
+            withAll(base, other, spread) {
+                if (!(base instanceof SObj)) fault("`with` copies an object, and this is " + typeName(base))
+
+                if (!(other instanceof SObj))
+                    fault(spread
+                        ? "`...` spreads the fields of an object, and this is " + typeName(other)
+                        : "`with` copies the fields of an object, and this is " + typeName(other))
+
+                const made = SObj.copy(base)
+
+                for (const [k, v] of other.entries()) made.setKey(k, v)
+
+                made.frozen = base.frozen
+
+                return made
+            },
+
+            // `[v; n]`, an array of one value repeated.
+            repeat(v, n) {
+                if (!isInt(n)) fault("a repeat count is an integer, and this is " + typeName(n))
+                if (n < 0n) fault("a repeat count is not negative, and this is " + n)
+
+                return new Array(Number(n)).fill(keep(v, "put in an array"))
+            },
+
+            // The pieces of `s"..."`, each rendered as a program prints it.
+            interp(pieces) {
+                let out = ""
+
+                for (const p of pieces) out += typeof p === "string" ? p : text(p)
+
+                return out
+            }
+        }
+    })()
+    """
