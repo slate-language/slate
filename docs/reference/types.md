@@ -13,6 +13,12 @@ says nothing rather than guessing, and the machine still checks.
 What that costs against TypeScript is worth saying plainly: TS catches a mistake on a path you never
 ran, and this only fires where the pass can prove the value is wrong or where that path executes.
 
+**Three deliberate exceptions, each an annotation the machine cannot check for you.** An annotated
+`var` is held to its declared type at every assignment; every argument must fit the type a type
+parameter was solved to; and an object literal written where a shape is expected may carry only the
+fields that shape names. Each is a promise the program made in writing, and being held to it is what
+writing one is for.
+
 ## `type`
 
 A type is a shape with a name:
@@ -301,6 +307,49 @@ n = "later"
 
 An **unannotated** `var` is left as it always was — the union of its initialiser and every value ever
 assigned to it — so a program that deliberately reuses a name for another kind is untouched.
+
+### An object literal written where a shape is expected
+
+**A shape asks for *at least* its fields — except of a literal written at the spot, which may carry
+only the fields it names.** An object that arrives through a name is one other places hold, so the
+fields this parameter does not want are somebody else's business. A literal written here has no other
+reader, so a field the shape does not name is not a spare: it is a mistake, and the mistake it nearly
+always is is a misspelling.
+
+```slate
+type Style = { color: string, weight: integer }
+
+use(s: Style) = s.color
+
+print(use({ colour: "red", weight: 400 }))
+```
+
+```error
+`colour` is not a field of { color: string, weight: integer }, and an object literal written here may carry only the fields it names -- did you mean `color`?
+```
+
+It is **TypeScript's excess-property check**, drawn in the same place and for the same reason, and it
+applies to a literal at an annotated parameter — including one typed by a solved type parameter — and
+to the value of a binding that declared a type.
+
+**Only a literal standing at the spot.** A value reaching the same parameter through a name is
+structural as it always was; a literal built by a spread is a merge rather than a literal; and a
+literal nested inside one is the outer field's business rather than the annotation's.
+
+```slate
+type Spot = { x: number, y: number }
+
+area(p: Spot) = p.x * p.y
+
+val big = { x: 2, y: 3, z: 4 }
+val some = { x: 2, z: 9 }
+
+print(area(big), area({ ...some, y: 3 }))
+```
+
+```output
+6 6
+```
 
 ### A rest parameter
 

@@ -8,6 +8,8 @@
 type Handler = (string, integer) -> boolean
 type Pair[A, B] = { first: A, second: B }
 type MaybeFn = (integer -> integer) | null
+type Spot = { x: number, y: number }
+type Wrapper = { inner: object }
 
 anything(v) = v
 
@@ -130,3 +132,28 @@ a_type_is_a_value_and_a_generic_one_carries_the_shape_with_nothing_filled_in() =
     assert(Pair.test({ first: 1, second: "a" }))
     assert(!Pair.test({ first: 1 }))
     assertEq(len(Pair.mismatch({ first: 1 })), 1)
+
+@test
+an_object_shape_is_still_at_least_its_fields_when_the_program_runs() =
+    // **The excess-property check is the CHECKER's and the machine keeps none of it**, which is why
+    // every program here runs. An object pattern matches on the fields it names and ignores the
+    // rest, and that is what a value reaching a shape through a name relies on -- so a refusal of a
+    // literal is a claim about where the literal was WRITTEN, never about what the value is.
+    val big = { x: 2, y: 3, z: 4 }
+
+    assertEq(area(big), 6)
+    assert(big is Spot)
+
+    // A literal built by a spread is a merge rather than a literal, so it carries the other
+    // object's spare field here and is not refused for it.
+    val some = { x: 2, z: 9 }
+
+    assertEq(area({ ...some, y: 3 }), 6)
+    assertEq(area({ y: 3, ...some }), 6)
+
+    // And a literal nested inside one is the outer field's business, not the annotation's.
+    assertEq(inner({ inner: { a: 1, b: 2 } }), 1)
+
+area(p: Spot) = p.x * p.y
+
+inner(o: Wrapper) = o.inner.a
