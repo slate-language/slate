@@ -1,0 +1,467 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{str_builder, StrBuilder}
+
+// How a value is WRITTEN -- what `print` puts on a line, what a diagnostic quotes, and what a
+// `toString` hook is allowed to change about either.
+//
+// **Cut out of `builtin.sysl`, which is the dispatch and the `do_*` implementations.** The seam
+// crosses nothing: `quoted_text`, `rendered`, `user_text`, `fault_text`, `on_path`, `write_value`
+// and `ignore_signal` are all reached from inside this file only, and what the builtins call --
+// `printed`, `printed_quoted`, `value_text`, `show_value` -- was already public because the
+// evaluator and the checker call it too.
+// -- rendering ----------------------------------------------------------------------------------
+
+// Whether a key may be written without quotes in an object literal.
+//
+// A key is any value now, so most of them have to be quoted or bracketed to read back. The ones that
+// look like identifiers are the ones a program actually wrote as `{ name: ... }`.
+// A string as slate's own literal syntax writes it, quotes included.
+//
+// The printed form of a value has to be readable back, and until 2026-08-28 it was not: a `"` inside
+// a string was emitted raw, so `["a"b"]` came out and is not a program, and a string holding the two
+// characters `\` and `f` printed as `"e\f"` and reads back as a formfeed.
+//
+// **The escaping is `sh.sysl.parsing`'s `write_quoted` now**, which is the inverse of the
+// `read_quoted` slate's own lexer reads a literal with -- so the two halves of the round trip are
+// one module's rather than one of them being written out here. It leaves a backtick alone, which is
+// what slate wants: `escape_text` escapes one because a backtick would close the span a DIAGNOSTIC
+// quotes into, and `\`` is not an escape slate's lexer knows.
+private quoted_text(text: string) -> string = write_quoted(text, u8('"'))
+
+// Whether a word is SHAPED like a name -- a letter or `_` and then letters, digits and `_`.
+//
+// **This is the parser's question and `plain_name` is the printer's**, and since a keyword became an
+// acceptable FIELD name the two have different answers: `{ if: 1 }` is a program now, so `if` is
+// name-shaped, while the printer still writes that key quoted. Quoting a key that need not be
+// quoted costs two characters and stays readable back; the other direction would not.
+//
+// Not `private`: `define.sysl` reads a field's name with it.
+name_shaped(s: string) -> bool
+    val b = s.bytes
+
+    if b.len == 0 then return false
+
+    if !is_ident_start(b[0]) then return false
+
+    for i in 1..<b.len
+        if !is_ident_cont(b[i]) then return false
+
+    true
+end name_shaped
+
+// Whether a word is a name a program could write bare: name-shaped, and not one the lexer has its
+// own meaning for.
+//
+// **Public only because `private` is private to the FILE in sysl**; `add.sysl` asks the same
+// question about the key it is about to write into a manifest, and two answers to it would drift.
+plain_name(s: string) -> bool
+    val b = s.bytes
+
+    if b.len == 0 then return false
+
+    if !is_ident_start(b[0]) then return false
+
+    for i in 1..<b.len
+        if !is_ident_cont(b[i]) then return false
+
+    // **A word the lexer would hand back as anything but an `Ident` may not print bare**, however
+    // name-shaped it is. `{ if: 1 }` is not a program, so a key called `if` printed without quotes
+    // is text slate cannot read back -- which was the case this check was missing.
+    word_kind(b) == Tok.Ident
+end plain_name
+
+// A value as a program would print it.
+//
+// **A string prints bare at the top level and quoted inside a container**, which is what Python and
+// Ruby both do and is worth the extra parameter: `print("hi")` showing `"hi"` is noise, and
+// `print(["hi"])` showing `[hi]` loses the only thing that said it was a string.
+value_text(v: Value) -> string
+    var out = str_builder()
+    var path: Buf[*u8] = buf()
+
+    ignore_signal(write_value(&out, v, false, &path, None))
+    out.finish()
+
+// The same, with a string quoted rather than bare.
+//
+// **What a failed comparison needs and `value_text` will not give it.** `got hi, wanted hi` says
+// nothing about the two being a string and a number; `got "hi", wanted hi` says it at a glance.
+show_value(v: Value) -> string
+    var out = str_builder()
+    var path: Buf[*u8] = buf()
+
+    ignore_signal(write_value(&out, v, true, &path, None))
+    out.finish()
+
+// **A `write_value` told `None` cannot fail**, there being nothing in it that runs a program: every
+// `?` inside it is on a hook call, and a hook is only reached where a span was given. This is the one
+// place that is said, so the two infallible printers above stay one line each.
+private ignore_signal(r: Result[unit, Signal])
+    r match
+        Ok(_) -> ()
+        Err(_) -> ()
+
+// A value as the PROGRAM would render it, consulting a `toString` its class wrote.
+//
+// **This is what `print`, `string(v)` and an interpolation hole use, and `value_text` is what a
+// DIAGNOSTIC uses.** The split is deliberate and is the same one `same_literal` draws against `==`: a
+// message about a fault may not run the program's own code to render its values, because the hook can
+// fault in turn and the second fault is the one the reader would be shown.
+//
+// **The value is HELD for the walk.** A hook re-enters the interpreter and a `Value` in a sysl local
+// is not a root, so a collection inside a `toString` would free the very object being printed --
+// which is the trap `run_one_test` paid for. Holding the root holds everything reachable from it, so
+// the `path` addresses stay good too.
+printed(v: Value, at: Span) -> Result[string, Signal] = rendered(v, false, at)
+
+// The same, with a string quoted rather than bare.
+printed_quoted(v: Value, at: Span) -> Result[string, Signal] = rendered(v, true, at)
+
+private rendered(v: Value, quoted: bool, at: Span) -> Result[string, Signal]
+    var out = str_builder()
+    var path: Buf[*u8] = buf()
+    val mark = root_mark()
+
+    hold(v)
+
+    write_value(&out, v, quoted, &path, Some(at)) match
+        Ok(_) -> ()
+        Err(e) ->
+            release(mark)
+            return Err(e)
+
+    release(mark)
+    Ok(out.finish())
+end rendered
+
+// What a value's own `toString` says, where it has one.
+//
+// **The receiver rule, so a class writes `toString(self)` like every other method** -- and a captured
+// `{ toString: () -> "x" }` sitting on the object itself still takes none, which is what `call_hook`
+// answers for. A hook that gives back something other than a string is a fault naming what it gave:
+// silently rendering it would make a `toString` answering an object print an object, which is the
+// thing the hook was written to stop.
+//
+// **`quoted` is not passed on.** A class saying how it prints has said it; wrapping that in quotes
+// because it happened to appear inside an array would be the printer overruling the type.
+private user_text(v: Value, quoted: bool, at: Span) -> Result[Option[string], Signal]
+    var none: Buf[Value] = buf()
+
+    call_hook(v, "toString", none, at) match
+        Some(step) -> step? match
+            Str(p) -> Ok(Some(p.s))
+            other -> fault_text(at, s"`toString` says how a value prints, so it answers a string -- and this one gave ${other.type_name()}")
+        None -> Ok(None)
+end user_text
+
+private fault_text(at: Span, message: string) -> Result[Option[string], Signal] = Err(failure(at, message))
+
+// Whether a container is already being written, further up this same walk.
+//
+// **What is recorded is the PATH, not everything seen, and the difference is a correctness one.** A
+// value may appear twice over without the graph cycling at all -- `val x = [1]` and then
+// `print([x, x])` -- and a set of everything seen so far would render the second occurrence as
+// `[...]`, which is a lie about a perfectly finite structure. What makes a printer diverge is
+// re-entering a container it has not finished writing, so that is the question this asks. Python's
+// `repr` draws the line in the same place.
+private on_path(path: *Buf[*u8], p: *u8) -> bool
+    for i in 0..<path.len()
+        if path.at(i) == p then return true
+
+    false
+end on_path
+
+// The variant a data value was made by, where it is one at all.
+//
+// **Asked of the FROZEN flag first**, so an ordinary object whose `proto` a program happened to point
+// at a maker is untouched: what makes a value print this way is having been made by a variant's own
+// constructor, not merely being able to see one.
+//
+// Not `private`: `shape.sysl` names a data value by its variant in a `mismatch` report, for the
+// reason this exists at all -- `object` says nothing a reader can act on where `Sq` says everything.
+variant_name(o: *ObjectObj) -> Option[string]
+    if !o.frozen then return None
+
+    field_through(o, DataTag) match
+        Some(Str(p)) -> Some(p.s)
+        _ -> None
+end variant_name
+
+// The class an object is an INSTANCE of, if it is one.
+//
+// **The walk starts at the proto and not at the object**, and that is the whole of the distinction
+// between a class and one of its instances: the tag is the class's own field, so an instance reaches
+// it through the chain and the class itself does not. `Point` is therefore not an instance of
+// `Point`, which is the answer `is` already gives.
+class_name(o: *ObjectObj) -> Option[string]
+    obj_get_name(o, "proto") match
+        Some(Object(up)) -> field_through(up, ClassTag) match
+            Some(Str(p)) -> Some(p.s)
+            _ -> None
+        _ -> None
+end class_name
+
+// The name of a CLASS, asked of the class object itself.
+class_own_name(o: *ObjectObj) -> Option[string] = obj_get_name(o, ClassTag) match
+    Some(Str(p)) -> Some(p.s)
+    _ -> None
+
+// The keys a nominal value does not print: the chain it is reached through, and the two tags that
+// say what made it -- which would otherwise appear as a field of every singleton and every instance.
+//
+// Not `private`: `json.sysl` hides exactly these from an encoded class instance, and had its own
+// idea of the answer -- which is to say none at all, so every one of them was unencodable.
+hidden_key(k: Value) -> bool = k match
+    Str(p) -> p.s == "proto" || p.s == DataTag || p.s == ClassTag || p.s == ShapeTag
+    _ -> false
+
+// A value, as written at the top level or inside a container.
+//
+// **A cycle renders as `[...]` rather than crashing, and it could not arise before the collector.**
+// Reference counting could not free `a[0] = a`, so nothing in slate could build one; a tracing heap
+// makes it an ordinary thing to write, and a printer that descends structurally then runs out of
+// stack. That arrives as a bare SIGSEGV carrying no message and none of the output the program had
+// already produced, which is filed against sysl as card 0299 -- but the descent is this function's
+// to stop.
+private write_value(out: *StrBuilder, v: Value, quoted: bool, path: *Buf[*u8], hooks: Option[Span]) -> Result[unit, Signal]
+    // **A `toString` THE PROGRAM WROTE REPLACES EVERYTHING BELOW, AT EVERY DEPTH.** The hook is
+    // consulted here rather than at the top so that `print([d, d])` renders each element the way its
+    // own class says, which is the whole point of having one -- a rendering that applied only to a
+    // value printed on its own would be the case that matters least.
+    //
+    // **`hooks` IS THE SPAN AND THE PERMISSION AT ONCE, AND THAT IS DELIBERATE.** Calling a hook
+    // re-enters the interpreter, so it needs somewhere to report a failure from and it may not
+    // happen at all while slate is composing a DIAGNOSTIC: a message about a fault that runs the
+    // program's own code to render its values can fault again, and the second fault is the one the
+    // reader would be shown. So `None` means both "no span" and "no hooks", and the two cannot drift
+    // apart. `value_text` passes `None` and `text_of` passes a span.
+    hooks match
+        Some(at) -> user_text(v, quoted, at)? match
+            Some(text) ->
+                out.push(text)
+                return Ok(())
+            None -> ()
+        None -> ()
+
+    v match
+        Null -> out.push("null")
+        Undefined -> out.push("undefined")
+        Bool(b) -> out.push_bool(b)
+        Int(n) -> out.push_int(n)
+        Real(n) -> out.push_real(n)
+        Str(p) ->
+            if quoted then out.push(quoted_text(p.s)) else out.push(p.s)
+        Array(a) ->
+            val here: *u8 = ptr_cast(a)
+
+            if on_path(path, here)
+                out.push("[...]")
+            else
+                path.push(here)
+                out.push_char('[')
+
+                for i in 0..<a.items.len()
+                    if i > 0 then out.push(", ")
+
+                    write_value(out, a.items.at(i), true, path, hooks)?
+
+                out.push_char(']')
+                path.truncate(path.len() - 1)
+        Object(o) ->
+            val here: *u8 = ptr_cast(o)
+
+            if on_path(path, here)
+                out.push("{...}")
+            else
+                path.push(here)
+
+                // **A DATA VALUE PRINTS AS THE VARIANT THAT MADE IT**, which is what every language
+                // with these does and is most of what makes them readable: `Circle(3)` rather than
+                // `{r: 3, proto: {...}}`, and a proto chain that would otherwise be written out in
+                // full every time a value is printed. The name is read off the maker through the
+                // chain, which is where the declaration put it.
+                variant_name(o) match
+                    Some(name) ->
+                        out.push(name)
+
+                        var wrote: usize = 0
+
+                        for i in 0..<o.entries.len()
+                            val e = o.entries.at(i)
+
+                            if !e.dead && !hidden_key(e.key)
+                                out.push(if wrote == 0 then "(" else ", ")
+                                write_value(out, e.value, true, path, hooks)?
+                                wrote += 1
+
+                        // A variant that declared no fields is written as its bare name, which is how
+                        // it is written in a program -- `Empty`, never `Empty()`.
+                        if wrote != 0 then out.push_char(')')
+
+                        path.truncate(path.len() - 1)
+                        return Ok(())
+                    None -> ()
+
+                // **A CLASS INSTANCE PRINTS AS ITS CLASS AND ITS OWN FIELDS, WITH THE NAMES.** A
+                // class instance used to print the object it desugars to -- `{x: 1, y: 2, proto:
+                // {new: <function of 2>}}` -- which wrote out the whole class beside every value of
+                // it and buried the two numbers a reader wanted.
+                //
+                // **The names are written where a variant's are not**, and the difference is what
+                // the two declarations say. A variant's fields are positional by construction, so
+                // `Circle(3)` is how it was made and how it is matched; a class's are named, mutable
+                // and may be set after the fact, so `Rect(3, 4)` would leave a reader guessing which
+                // is the width.
+                class_name(o) match
+                    Some(name) ->
+                        out.push(name)
+
+                        var shown: usize = 0
+
+                        for i in 0..<o.entries.len()
+                            val e = o.entries.at(i)
+
+                            if !e.dead && !hidden_key(e.key)
+                                out.push(if shown == 0 then "(" else ", ")
+
+                                e.key match
+                                    Str(kp) -> if plain_name(kp.s) then out.push(kp.s) else write_value(out, e.key, true, path, hooks)?
+                                    _ -> write_value(out, e.key, true, path, hooks)?
+
+                                out.push(" = ")
+                                write_value(out, e.value, true, path, hooks)?
+                                shown += 1
+
+                        // A class that declares no fields is written as its bare name, as a variant
+                        // that carries none is -- `Empty`, never `Empty()`.
+                        if shown != 0 then out.push_char(')')
+
+                        path.truncate(path.len() - 1)
+                        return Ok(())
+                    None -> ()
+
+                // **The class OBJECT says it is one rather than printing its own members**, which
+                // are a constructor and a table of methods and are never what a reader printing
+                // `Point` wanted to see. Java prints `class Point` for the same reason.
+                class_own_name(o) match
+                    Some(name) ->
+                        out.push(s"<class ${name}>")
+                        path.truncate(path.len() - 1)
+                        return Ok(())
+                    None -> ()
+
+                // **A DATA TYPE'S OWN OBJECT SAYS WHAT IT IS**, for the reason the class object
+                // does: what it holds is whatever methods the variants share, which is never what a
+                // reader printing `Failure` wanted to see. It printed `{}` -- an empty object, which
+                // is the one thing a data type is not.
+                //
+                // **The shape tag is what names it**, the shared object carrying no other. A class
+                // is asked about first, a class having both tags.
+                obj_get_name(o, ShapeTag) match
+                    Some(Shape(id)) ->
+                        out.push(s"<data ${shape_name(id)}>")
+                        path.truncate(path.len() - 1)
+                        return Ok(())
+                    _ -> ()
+
+                out.push_char('{')
+
+                var first = true
+
+                // **A TAG IS NOT A FIELD HERE EITHER**, which is `tag_key`'s rule and which this
+                // walk did not follow -- the JavaScript back end's has from the start, and the two
+                // printing one value differently is a difference between the back ends. Nothing
+                // showed it while the only object carrying a tag was a class or a variant, each of
+                // which prints as its name above; a data type's shared object is a plain one and
+                // carries the shape its own name answers to.
+                for i in 0..<o.entries.len()
+                    val e = o.entries.at(i)
+
+                    if !e.dead && !tag_key(e.key)
+                        if !first then out.push(", ")
+
+                        // **A key prints bare when it is a plain name and quoted otherwise**, which
+                        // is what JavaScript does: `{a: 1}` reads better than `{"a": 1}`, and a key
+                        // that is not a name has to be distinguishable from one that is.
+                        e.key match
+                            Str(kp) -> if plain_name(kp.s) then out.push(kp.s) else write_value(out, e.key, true, path, hooks)?
+                            _ -> write_value(out, e.key, true, path, hooks)?
+
+                        out.push(": ")
+                        write_value(out, e.value, true, path, hooks)?
+                        first = false
+
+                out.push_char('}')
+                path.truncate(path.len() - 1)
+        RangeVal(lo, hi, inclusive, has_lo, has_hi) ->
+            if has_lo then out.push_int(lo)
+
+            out.push(if inclusive then ".." else "..<")
+
+            if has_hi then out.push_int(hi)
+        // **`<function>`, WITH NO ARITY AND NO NAME.** The JavaScript back end says this and could
+        // not say more -- a JavaScript function does not reliably know what it takes -- so the arity
+        // this used to print was a difference between the back ends about one value, which the
+        // differential corpus cannot even step around. What a reader learns from a number here is
+        // nothing they could not read off the declaration.
+        Fn(_) -> out.push("<function>")
+        Promise(p) ->
+            if !p.settled
+                out.push("<promise pending>")
+            elif p.failed
+                out.push(s"<promise failed: ${p.message}>")
+            else
+                out.push("<promise ")
+                write_value(out, p.value, true, path, hooks)?
+                out.push_char('>')
+        // **Shown by its generation and not its slot**, since the slot is a position two sockets
+        // may hold one after the other and the generation is the thing that names one of them.
+        Socket(_, gen) ->
+            out.push("<socket ")
+            out.push_int(long(gen))
+            out.push_char('>')
+
+        // **Shown as it was written, between slashes**, which is how every language that has them
+        // writes one and is the only rendering a reader can paste back.
+        RegexVal(id) ->
+            out.push_char('/')
+            out.push(regex_source(id))
+            out.push_char('/')
+            out.push(regex_flags(id))
+
+        // **Shown by its NAME and not by its shape**, which is the whole of what a shape lets a
+        // program see: `<shape NewNote>` says which type this is and nothing about what is in it.
+        Shape(id) ->
+            out.push("<shape ")
+            out.push(shape_name(id))
+            out.push_char('>')
+
+        // **Every temporal value prints as ISO 8601**, which is the one rendering that sorts as text
+        // in the order it sorts as time -- and, for the four with no zone in them, is exactly what
+        // `parseDate` and its siblings read back. A duration and a period have no ISO form worth
+        // printing (`PT1H30M` is for machines and nothing here reads it), so those two are written
+        // as a person states them.
+        InstantVal(_) -> out.push(temporal_text(v))
+        DurationVal(_) -> out.push(temporal_text(v))
+        DateVal(_) -> out.push(temporal_text(v))
+        TimeVal(_) -> out.push(temporal_text(v))
+        DateTimeVal(_, _) -> out.push(temporal_text(v))
+        ZoneVal(_) -> out.push(temporal_text(v))
+        ZonedVal(_, _) -> out.push(temporal_text(v))
+        PeriodVal(_, _) -> out.push(temporal_text(v))
+        // **Shown by its stamp rather than its slot**, as a socket is: a spent slot is taken by the
+        // next generator, and the stamp is the thing that names this one.
+        Gen(_, stamp) ->
+            out.push("<generator ")
+            out.push_int(long(stamp))
+            out.push_char('>')
+        // **A BUILTIN PRINTS AS A FUNCTION, WHICH IS WHAT IT IS.** `<builtin NPrint>` named a
+        // variant of an enum in the interpreter's own source -- a name from the compiler's insides
+        // in a program's output, which no reader of slate can look up and which the other back end
+        // does not have at all.
+        Native(_) -> out.push("<function>")
+    Ok(())
+end write_value
