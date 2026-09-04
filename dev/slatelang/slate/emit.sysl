@@ -54,17 +54,42 @@ struct Emit
 
     // -- the names this chunk resolved for itself --
 
-    // Whether a name declared here may take a slot at all. False for a module, whose names are read
-    // by name from outside it, and for any chunk holding a nested function, whose names that
-    // function may reach through the scope chain it captured.
+    // Whether this chunk needs no `EnvObj` AT ALL: its parameters are cells, no block pushes a
+    // scope, and `vm.scope` stays the one its closure captured. False for a module, whose names are
+    // read by name from outside it, and for any chunk one of whose own names something outside it
+    // can reach.
+    //
+    // **This is the STRONGER of the two questions and `cells` is the weaker one.** They were one
+    // flag while a chunk either slotted everything or nothing; a chunk holding a closure that reads
+    // one of its names keeps a scope for that name and puts every other one in a cell, and the two
+    // answers come apart there.
     slotting: bool
+
+    // Whether ANY name declared here may take a cell.
+    //
+    // **A chunk may have cells and still need its scope**, which is the whole of what per-name
+    // slotting buys: the names a nested body can reach stay in the chain and everything else moves
+    // into the frame. `slotting` implies this; the reverse does not hold.
+    cells: bool
+
+    // The names that may NOT take a cell, however ordinary they look.
+    //
+    // **Two things put a name here and both are about somebody reading it by NAME.** A nested
+    // function reaches it through the scope chain it captured, and a pattern looks a type up by it
+    // in the scope the match is running in. Either way a cell would be a second home the reader
+    // cannot see, so these keep `LoadName` exactly as they always did.
+    //
+    // **A name here is kept EVERYWHERE IN THE CHUNK, not only where it was captured**, which is
+    // what makes the analysis answerable by reading: a name is a cell or it is not, and no site has
+    // to work out which of two bindings of one spelling it is looking at.
+    kept: Buf[string]
 
     // How many slots the chunk reserves at entry, which is the high-water mark rather than the count
     // standing at any moment: a slot is not reused when its block ends, since working out that two
     // blocks cannot both be live is a second analysis and the cells are cheap.
     slots: usize
 
-    // The names that have a slot, innermost last, and the slot each was given.
+    // The names bound in this chunk, innermost last, and the slot each was given.
     //
     // **One flat pair of lists with a stack of block boundaries over it**, rather than a list per
     // block: a lookup walks it backwards and finds the innermost, which is the shadowing rule, and a
@@ -75,7 +100,16 @@ struct Emit
     // Whether each is a `var`. A write to one that is not says the sentence it always said.
     slot_var: Buf[bool]
 
-    // Where each open block's names begin in the three lists above.
+    // Whether each is a CELL rather than a name in the scope chain.
+    //
+    // **A chunk with cells records its scope-bound names here too, and that is not bookkeeping for
+    // its own sake.** A binding site whose pattern holds one kept name puts the WHOLE pattern in the
+    // scope, so an inner block can bind by name a spelling an outer block put in a cell -- and a
+    // lookup that stopped only at cells would walk past the inner binding and read the outer cell.
+    // So the walk stops at whichever is innermost and answers nothing where that one is a name.
+    in_cell: Buf[bool]
+
+    // Where each open block's names begin in the four lists above.
     blocks: Buf[usize]
 
 // Where `break` and `continue` have to get back to, and what they have to tidy on the way.
@@ -94,8 +128,8 @@ struct LoopFrame
     breaks: Buf[usize]
     continues: Buf[usize]
 
-fresh_emit(is_async: bool, is_gen: bool, slotting: bool) -> Emit =
-    Emit(buf(), 0, 0, buf(), 0, is_async, is_gen, slotting, 0, buf(), buf(), buf(), buf())
+fresh_emit(is_async: bool, is_gen: bool, slotting: bool, cells: bool, kept: Buf[string]) -> Emit =
+    Emit(buf(), 0, 0, buf(), 0, is_async, is_gen, slotting, cells, kept, 0, buf(), buf(), buf(), buf(), buf())
 
 // Open a block, in the code and in the compiler's own record of what is bound here.
 //
@@ -135,6 +169,7 @@ drop_block(e: *Emit)
     e.named.truncate(back)
     e.slot_of.truncate(back)
     e.slot_var.truncate(back)
+    e.in_cell.truncate(back)
 
 // Give a name a slot in the block being emitted, answering which one.
 //
@@ -148,9 +183,26 @@ claim_slot(e: *Emit, name: string, assignable: bool) -> usize
     e.named.push(name)
     e.slot_of.push(i)
     e.slot_var.push(assignable)
+    e.in_cell.push(true)
     i
 
-// Which slot a name means here, innermost first, or nothing where it is not a local of this chunk.
+// Record that this block binds a name IN THE SCOPE, so a lookup stops at it.
+//
+// **Only a chunk that has cells needs this**, and for the one reason: a chunk with no cells at all
+// has nothing for a lookup to find by mistake, so recording its names would be a list nobody reads.
+note_scope_name(e: *Emit, name: string)
+    if !e.cells then return
+
+    e.named.push(name)
+    e.slot_of.push(0)
+    e.slot_var.push(false)
+    e.in_cell.push(false)
+
+// Which slot a name means here, innermost first, or nothing where it is not a cell of this chunk.
+//
+// **The walk stops at the innermost binding of the name whether or not that one is a cell**, which
+// is the shadowing rule and is why a name in the scope has to be recorded as well: stopping only at
+// cells would answer about an outer cell a nearer binding had already covered.
 slot_named(e: *Emit, name: string) -> Option[usize]
     if e.named.is_empty() then return None
 
@@ -161,7 +213,17 @@ slot_named(e: *Emit, name: string) -> Option[usize]
 
         i = i - 1
 
-        if e.named.at(i) == name then return Some(i)
+        if e.named.at(i) == name then return if e.in_cell.at(i) then Some(i) else None
+
+// Whether a name declared here may take a cell, which is the question every binding site asks.
+may_cell(e: *Emit, name: string) -> bool
+    if !e.cells then return false
+
+    for i in 0..<e.kept.len()
+        if e.kept.at(i) == name then return false
+
+    true
+end may_cell
 
 // Whether the name at this index in the lists is one a program may write to.
 slot_writable(e: *Emit, i: usize) -> bool = e.slot_var.at(i)

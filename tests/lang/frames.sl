@@ -363,3 +363,61 @@ A_QUESTION_MARK_IN_A_match_ARM_LEAVES_ITS_NAME_UNBOUND()
     assertEq(read({ b: 1 }), "took 1")
     assertEq(read({ a: 5, b: 1 }), "took 1")
     assertEq(read({ c: 1 }), "no arm")
+
+@test
+AN_INNER_SCOPE_BINDING_SHADOWS_AN_OUTER_CELL()
+    // **A chunk can hold both kinds of binding now**, and the two have to obey one shadowing rule.
+    // The loop head binds `a` and `b`; `b` is read by a closure so the pair goes into the scope,
+    // while the outer `a` is a cell. A lookup that stopped only at cells would walk past the loop's
+    // `a` and read `100` on every turn -- and every assertion here would still be about a number.
+    count(pairs) =
+        var seen = 0
+        val a = 100
+
+        for [a, b] in pairs
+            val note = () -> b
+
+            seen = seen + a + note()
+
+        seen + a
+
+    assertEq(count([[1, 2], [3, 4]]), 110)
+    assertEq(count([]), 100)
+
+@test
+A_CLOSURE_STILL_SEES_A_NAME_ITS_NEIGHBOURS_KEPT_IN_CELLS()
+    // The name a closure reads stays in the scope and the ones it cannot reach move into the frame,
+    // so this is the case where a wrong analysis reads one binding out of the other's home.
+    tally(n) =
+        var total = 0
+        var turns = 0
+        val scale = n
+        val weigh = (v) -> v * scale
+
+        while turns < 4
+            total = total + weigh(turns)
+            turns = turns + 1
+
+        total
+
+    assertEq(tally(3), 18)
+    assertEq(tally(0), 0)
+
+    // Two calls, so a cell that outlived its frame would show up as the first call's total.
+    assertEq(tally(1), 6)
+
+@test
+A_CLOSURE_MADE_IN_A_LOOP_SEES_THE_TURN_IT_WAS_MADE_ON()
+    // Each turn's block is its own scope, so the closure a turn made reads that turn's binding --
+    // which is what `let` means in JavaScript and what slate has always answered.
+    made(xs) =
+        var out = []
+        var kept = 0
+
+        for x in xs
+            push(out, () -> x + kept)
+
+        kept = 10
+        map(out, (f) -> f())
+
+    assertEq(made([1, 2, 3]), [11, 12, 13])
