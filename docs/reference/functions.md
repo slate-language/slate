@@ -104,8 +104,9 @@ print(first(["ada", "grace"]), first([1, 2]))
 ada 1
 ```
 
-There are no type arguments at a call — they are solved from the arguments — and nothing is ever
-refused on account of one. [Types](types.md) says why.
+There are no type arguments at a call — they are solved from the arguments, and every argument has to
+fit the type the parameter was solved to, so `pair(1, "x")` for `pair[T](a: T, b: T)` is refused.
+[Types](types.md) says how the answer is picked and what a union does.
 
 ## Defaults
 

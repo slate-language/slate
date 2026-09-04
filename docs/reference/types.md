@@ -440,12 +440,12 @@ show(p: Pair) = p.first
 `Pair` is generic over 2 types, so it needs them here
 ```
 
-### What a type parameter does not do
+### Every argument must fit the type the parameter was solved to
 
-**Nothing is ever refused on account of one, and the reason is that nothing at run time could.** A type
-parameter is erased: the machine sees values, not the calls that will be made, so there is nothing
-there to say that two arguments were the same type. Where a call disagrees with itself the parameter
-widens into a union rather than becoming a complaint:
+**A type parameter is solved from the arguments, and every one of them has to be contained in the
+answer.** The candidates are gathered across the whole call and the one that every other candidate
+fits is chosen; where there is no such candidate the call is refused, naming the parameter, what it
+was taken to be, and the argument that disagrees:
 
 ```slate
 pair[T](a: T, b: T) -> array of T = [a, b]
@@ -453,9 +453,43 @@ pair[T](a: T, b: T) -> array of T = [a, b]
 print(pair(1, "x"))
 ```
 
+```error
+`T` is integer from an argument before this one, and this is string
+```
+
+**A union is still an answer where the PROGRAM declared one**, because then it is a candidate like any
+other and the value beside it fits:
+
+```slate
+pair[T](a: T, b: T) -> array of T = [a, b]
+
+val mixed: integer | string = 1
+
+print(pair(mixed, "x"))
+```
+
 ```output
 [1, "x"]
 ```
+
+**`fits` is the same relation used everywhere else on this page, so an integer does not fit a `real`.**
+`pair(1, 2.5)` is refused for that reason, and `number` is the type that takes both — which is what to
+annotate with where a call means to mix them:
+
+```slate
+pair[T](a: T, b: T) -> array of T = [a, b]
+
+print(pair(1, 2.5))
+```
+
+```error
+`T` is integer from an argument before this one, and this is real
+```
+
+### What a type parameter still does not do
+
+**It is erased, so nothing at run time knows it was there.** The machine sees values, not the calls
+that were made — which is exactly why the check above happens while compiling or not at all.
 
 **So `x is T` cannot be asked**, and it is refused where it is written rather than answering
 something. **There are no type arguments at a call either** — `first[string](xs)` is an index followed

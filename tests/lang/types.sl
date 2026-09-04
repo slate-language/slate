@@ -94,12 +94,16 @@ a_rest_parameter_is_annotated_as_the_array_it_gathers_into() =
 @test
 a_type_parameter_is_erased_so_it_tests_nothing() =
     // **This is what "solved in the checker" costs at run time, and it is the whole cost.** `T`
-    // matches anything, so a call the checker would have widened to a union runs untouched -- there
-    // is nothing here that could have refused it.
+    // matches anything, so nothing here tests that the two arguments agreed -- which is why a call
+    // that disagrees has to be refused while compiling or not at all.
     pair[T](a: T, b: T) -> array of T = [a, b]
 
     assertEq(pair(1, 2), [1, 2])
-    assertEq(pair(1, "x"), [1, "x"])
+
+    // A union the PROGRAM declared is one type, so this agrees and runs.
+    val mixed: integer | string = "x"
+
+    assertEq(pair(mixed, "y"), ["x", "y"])
 
     first[T](xs: array of T) -> T = xs[0]
 

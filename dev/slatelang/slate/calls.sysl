@@ -173,9 +173,9 @@ check_call(callee: Expr, args: Buf[Expr], env: *TypeEnv, at: Span)
             Spread(_) -> return
             _ -> ()
 
-    val shape = call_shape(callee, args, env)
+    val shape = call_shape(callee, args, env, true)
 
-    check_arguments(shape.sig, callee, shape.args, env, at, shape.unwritten)
+    check_arguments(shape.sig, callee, shape.args, env, at, shape.unwritten, shape.agreed)
 end check_call
 
 // What a call is going to, and the arguments in ITS coordinates.
@@ -190,12 +190,12 @@ end check_call
 // **`unwritten` is subtracted from every number a COMPLAINT says**, the reader not having written
 // the receiver: *"`filter` takes 2 arguments and this gives it 1"* about `xs.filter()` sends them
 // looking for an argument they can see two of.
-private call_shape(callee: Expr, args: Buf[Expr], env: *TypeEnv) -> CallShape
+private call_shape(callee: Expr, args: Buf[Expr], env: *TypeEnv, reporting: bool) -> CallShape
     *callee.kind match
         Field(target, name, optional) ->
             if !optional
                 method_signature(type_of_expr(target, env), name) match
-                    Some(sig) -> return CallShape(sig, with_receiver(target, args), 1)
+                    Some(sig) -> return CallShape(sig, with_receiver(target, args), 1, true)
                     None -> ()
         _ -> ()
 
@@ -204,15 +204,28 @@ private call_shape(callee: Expr, args: Buf[Expr], env: *TypeEnv) -> CallShape
     // **A generic signature is solved HERE, before anything is checked or quoted**, which is the
     // arrangement a marker already has: everything downstream reads one signature and none of it
     // learns that type parameters exist.
-    if has_typevar(sig) then return CallShape(solved_generics(sig, args, env), args, 0)
+    if has_typevar(sig)
+        var agreed = true
+        val solved = solved_generics(sig, args, env, reporting, &agreed)
 
-    CallShape(sig, args, 0)
+        return CallShape(solved, args, 0, agreed)
+    end if
+
+    CallShape(sig, args, 0, true)
 end call_shape
 
 struct CallShape
     sig: Type
     args: Buf[Expr]
     unwritten: usize
+
+    // Whether the arguments agreed on one type for every parameter they solved.
+    //
+    // **A call that did not is REFUSED ALREADY, so its arguments are not compared as well.** The
+    // signature it was solved to holds the first candidate, and every argument that disagreed would
+    // be measured against that one and complained about a second time -- which is the shape a
+    // wrong ARITY already steps aside from, and for its reason: one mistake, one sentence.
+    agreed: bool
 end CallShape
 
 // The arguments walked, a callback knowing what it is going to be handed.
@@ -229,7 +242,9 @@ end CallShape
 // an arity error inside an untaken branch included.
 // Not `private`: `check_expr`'s Call arm walks a call's arguments through this.
 check_args(callee: Expr, args: Buf[Expr], env: *TypeEnv)
-    val shape = call_shape(callee, args, env)
+    // **Silent, because `check_call` asks the same question and complaining is ITS job.** Both walk
+    // every call, so a refusal raised here would name one mistake twice.
+    val shape = call_shape(callee, args, env, false)
 
     // **The guard, and it is the same one `has_marker` is**: working an expectation out means typing
     // the arguments, and a handful of signatures have anything to say. Every other call walks its
@@ -261,7 +276,7 @@ end check_args
 // method spelling means a call with the receiver in front, so the check counts it -- but the reader
 // did not write it, and *"`filter` takes 2 arguments and this gives it 1"* about `xs.filter()` sends
 // them looking for an argument they can see two of.
-private check_arguments(sig: Type, callee: Expr, args: Buf[Expr], env: *TypeEnv, at: Span, unwritten: usize)
+private check_arguments(sig: Type, callee: Expr, args: Buf[Expr], env: *TypeEnv, at: Span, unwritten: usize, agreed: bool)
     *sig.kind match
         FunctionType(params, required, variadic, result) ->
             // A lambda's type has `Any` parameters and says nothing; a definition with no annotated
@@ -284,6 +299,9 @@ private check_arguments(sig: Type, callee: Expr, args: Buf[Expr], env: *TypeEnv,
             // opposite an argument to compare it to. Where there are FEWER, every argument still
             // has one, and the ones nobody gave are the defaults.
             if variadic || args.len() > params.len() then return
+
+            // The call has already been refused over a type parameter no argument could settle.
+            if !agreed then return
 
             // **A NAMED ARGUMENT IS NOT AT THE POSITION IT WAS WRITTEN AT, and this pass cannot say
             // where it IS.** `FunctionType` carries the parameter TYPES and not their names, so
@@ -445,19 +463,37 @@ end has_typevar
 // array, so the lambda's own parameter is typed before its body is read -- and `B` is then whatever
 // that body answered. It is `argument_types`' own order, for `argument_types`' own reason.
 //
-// **A CONFLICT WIDENS INTO A UNION AND REFUSES NOTHING.** `pair(1, "x")` makes `T` an
-// `integer | string` rather than a complaint, because a type parameter is erased: nothing at run
-// time could refuse that call, so nothing here may either.
+// **EVERY ARGUMENT MUST BE CONTAINED IN THE TYPE THE PARAMETER WAS SOLVED TO, and a call where none
+// of the candidates contains the rest is REFUSED.** `pair[T](a: T, b: T)` given `pair(1, "x")` is a
+// mistake, and TypeScript reads it as one; a union would have made it mean something instead. **A
+// union is still an answer where the PROGRAM declared one** -- `val x: integer | string` handed to
+// `pair(x, 1)` solves `T` to that union, because the other candidate fits it.
+//
+// **The candidates are gathered and then chosen between, rather than merged as they arrive.** The
+// two differ, and the case that separates them is real: `integer`, then `real`, then `number` has an
+// answer -- `number`, which the other two fit -- and an incremental merge refuses at the second
+// argument before it has seen the one that would have settled it.
 //
 // **An unsolved parameter is `Any`, and it may not be left standing.** A type nobody solved would
 // otherwise be quoted at a reader -- `takes T here` -- naming a thing they cannot act on, which is
 // the rule a marker already follows.
 //
+// **`reporting` IS WHAT KEEPS ONE MISTAKE FROM BEING NAMED TWICE.** Two passes solve every generic
+// call -- `call_shape` before anything is checked, and `type_of_expr` before anything is answered --
+// so the complaint belongs to the one whose job is complaining, and the other asks the same question
+// in silence.
+//
 // Not `private`: `call_shape` solves before anything is checked and `type_of_expr` before anything
 // is answered.
-solved_generics(sig: Type, args: Buf[Expr], env: *TypeEnv) -> Type
+solved_generics(sig: Type, args: Buf[Expr], env: *TypeEnv, reporting: bool, agreed: *bool) -> Type
     *sig.kind match
         FunctionType(params, required, variadic, result) ->
+            // **Every candidate any argument offered, with the argument it came from.** The span is
+            // carried because the complaint has to point at the argument that disagrees rather than
+            // at the call, which is where a reader can do something about it.
+            var seen: Buf[string] = buf()
+            var offered: Buf[Type] = buf()
+            var offered_at: Buf[Span] = buf()
             var names: Buf[string] = buf()
             var bound: Buf[Type] = buf()
             var stop = false
@@ -477,10 +513,24 @@ solved_generics(sig: Type, args: Buf[Expr], env: *TypeEnv) -> Type
                         Named(_, _) -> stop = true
                         Spread(_) -> stop = true
                         Lambda(ps, ds, body, is_async) ->
-                            val expect = wanted_params(instantiated(declared, names, bound))
+                            // **A lambda is told what it will be handed out of what the arguments
+                            // BEFORE it have already said**, so the parameters it declares get the
+                            // element type rather than `Any`. Chosen in silence: an argument still
+                            // to come may be the one that settles the parameter, so a complaint from
+                            // here would be about a call the walk has not finished reading.
+                            var so_far: Buf[string] = buf()
+                            var so_far_bound: Buf[Type] = buf()
 
-                            solve_into(declared, lambda_type(ps, ds, body, is_async, env, expect), &names, &bound)
-                        _ -> solve_into(declared, type_of_expr(args.at(i), env), &names, &bound)
+                            var quietly = true
+
+                            settled(seen, offered, offered_at, false, &quietly, &so_far, &so_far_bound)
+
+                            val expect = wanted_params(instantiated(declared, so_far, so_far_bound))
+
+                            solve_into(declared, lambda_type(ps, ds, body, is_async, env, expect), args.at(i).span, &seen, &offered, &offered_at)
+                        _ -> solve_into(declared, type_of_expr(args.at(i), env), args.at(i).span, &seen, &offered, &offered_at)
+
+            settled(seen, offered, offered_at, reporting, agreed, &names, &bound)
 
             var out: Buf[Type] = buf()
 
@@ -490,6 +540,63 @@ solved_generics(sig: Type, args: Buf[Expr], env: *TypeEnv) -> Type
             type_of(FunctionType(out, required, variadic, instantiated(result, names, bound)))
         _ -> sig
 end solved_generics
+
+// Every type parameter the arguments named, each given the one type they agree on.
+private settled(seen: Buf[string], offered: Buf[Type], offered_at: Buf[Span], reporting: bool, agreed: *bool,
+                names: *Buf[string], bound: *Buf[Type])
+    for i in 0..<seen.len()
+        val name = seen.at(i)
+        var already = false
+
+        for j in 0..<names.len()
+            if names.at(j) == name then already = true
+
+        if !already
+            names.push(name)
+            bound.push(agreed_type(name, seen, offered, offered_at, reporting, agreed))
+end settled
+
+// The candidate every other candidate for this parameter fits, and a complaint where there is none.
+//
+// **ONE WALK ANSWERS AND COMPLAINS**, for the reason `pattern_declares` is one question: an answer
+// worked out here and a refusal worked out somewhere else would be two readings of the same
+// arguments, and nothing would notice when they stopped agreeing.
+//
+// **Where nothing contains the rest the FIRST candidate is still answered**, so the pass carries on
+// with a type rather than an `Any` that would draw a second complaint about every use of it. The
+// program is already refused; what is left is to say one useful thing about it.
+private agreed_type(name: string, seen: Buf[string], offered: Buf[Type], offered_at: Buf[Span], reporting: bool, agreed: *bool) -> Type
+    for i in 0..<seen.len()
+        if seen.at(i) == name
+            val candidate = offered.at(i)
+            var contains = true
+
+            for j in 0..<seen.len()
+                if seen.at(j) == name && !fits(offered.at(j), candidate) then contains = false
+
+            if contains then return candidate
+
+    val first = first_offered(name, seen, offered)
+
+    *agreed = false
+
+    // **The complaint points at the argument that disagrees, not at the one that got there first.**
+    // A reader who believes it goes and looks at the argument they can change; naming the call would
+    // send them to the definition, which is not where the mistake is.
+    if reporting
+        for i in 0..<seen.len()
+            if seen.at(i) == name && !fits(offered.at(i), first)
+                complain_here(offered_at.at(i), s"`${name}` is ${show_type(first)} from an argument before this one, and this is ${show_type(offered.at(i))}")
+                return first
+
+    first
+end agreed_type
+
+private first_offered(name: string, seen: Buf[string], offered: Buf[Type]) -> Type
+    for i in 0..<seen.len()
+        if seen.at(i) == name then return offered.at(i)
+
+    type_of(Any)
 
 // What a callback of this type is handed, where the type is a function at all.
 private wanted_params(want: Type) -> Buf[Type]
@@ -502,67 +609,43 @@ private wanted_params(want: Type) -> Buf[Type]
 // **Structural and one-sided: it reads what the two have in common and ignores the rest.** A shape
 // that does not line up says nothing rather than complaining -- whether the argument FITS is a
 // separate question, asked afterwards and by `fits`, against a signature this has already solved.
-private solve_into(want: Type, got: Type, names: *Buf[string], bound: *Buf[Type])
+private solve_into(want: Type, got: Type, at: Span, seen: *Buf[string], offered: *Buf[Type], offered_at: *Buf[Span])
     *want.kind match
-        TypeVar(name) -> record_solved(name, got, names, bound)
+        TypeVar(name) -> note_candidate(name, got, at, seen, offered, offered_at)
         ArrayOf(element) -> *got.kind match
-            ArrayOf(had) -> solve_into(element, had, names, bound)
+            ArrayOf(had) -> solve_into(element, had, at, seen, offered, offered_at)
             _ -> ()
         ObjectWith(keys, values, _) -> *got.kind match
             ObjectWith(had_keys, had_values, _) ->
                 for i in 0..<keys.len()
                     for j in 0..<had_keys.len()
                         if keys.at(i) == had_keys.at(j)
-                            solve_into(values.at(i), had_values.at(j), names, bound)
+                            solve_into(values.at(i), had_values.at(j), at, seen, offered, offered_at)
             _ -> ()
         FunctionType(params, _, _, result) -> *got.kind match
             FunctionType(had, _, _, had_result) ->
                 for i in 0..<params.len()
-                    if i < had.len() then solve_into(params.at(i), had.at(i), names, bound)
+                    if i < had.len() then solve_into(params.at(i), had.at(i), at, seen, offered, offered_at)
 
-                solve_into(result, had_result, names, bound)
+                solve_into(result, had_result, at, seen, offered, offered_at)
             _ -> ()
         OneOf(_) -> ()
         _ -> ()
 end solve_into
 
-// One parameter's answer, widened where a second argument disagrees with the first.
+// One thing an argument said this parameter could be.
 //
 // **`Any` is not an answer and is dropped.** An argument nothing is known about says nothing about
-// `T`, and recording it would throw away what the argument beside it did say.
-private record_solved(name: string, t: Type, names: *Buf[string], bound: *Buf[Type])
+// `T`, and recording it would refuse a call over a value whose type nobody wrote down -- which is
+// the opposite of what this check is for.
+private note_candidate(name: string, t: Type, at: Span, seen: *Buf[string], offered: *Buf[Type], offered_at: *Buf[Span])
     *t.kind match
         Any -> return
         _ -> ()
 
-    for i in 0..<names.len()
-        if names.at(i) == name
-            val had = bound.at(i)
-
-            if fits(t, had) then return
-
-            if fits(had, t)
-                bound.set(i, t)
-                return
-
-            var alts: Buf[Type] = buf()
-
-            widen_into(&alts, had)
-            widen_into(&alts, t)
-            bound.set(i, type_of(OneOf(alts)))
-            return
-
-    names.push(name)
-    bound.push(t)
-end record_solved
-
-// A union built flat, a union never holding a union.
-private widen_into(alts: *Buf[Type], t: Type)
-    *t.kind match
-        OneOf(inner) ->
-            for i in 0..<inner.len()
-                alts.push(inner.at(i))
-        _ -> alts.push(t)
+    seen.push(name)
+    offered.push(t)
+    offered_at.push(at)
 
 // One type with every solved parameter put in and every unsolved one erased to `Any`.
 private instantiated(t: Type, names: Buf[string], bound: Buf[Type]) -> Type
