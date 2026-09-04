@@ -35,8 +35,16 @@ private thrown_message(v: Value) -> string = v match
 // written back only when a call pushes or pops one -- or when an `await` suspends. Reading them out of
 // a `Buf` on every instruction would copy a whole frame per step.
 //
+// **`entering` says whether this is the START of a call rather than the resumption of one**, which
+// is the difference between a slot window that has to be laid and one that is already standing.
+// **It is said rather than worked out from `from == 0`**, which was the same question by proxy and
+// stopped being one when a generator arrived: `start_generator` lays its slots and parks the machine
+// before a single instruction runs, so the first `gen_step` comes back here with `pc == 0` and its
+// arguments already in place.
+//
 // Not `private`: reached from `execute.sysl`.
-run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, outer_scope: *EnvObj) -> Step
+run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, outer_scope: *EnvObj,
+           entering: bool, args: Buf[Value], given0: usize) -> Step
     var chunk_ix = start
 
     // **The machine keeps `current_source` in step with the chunk it is running**, which is what
@@ -47,11 +55,15 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
     var base = base0
     var code = u.chunks.at(chunk_ix).code
 
-    // **A chunk entered at its head reserves its slots and one resumed does not.** The cells sit at
+    // **A chunk entered at its head lays its slots and one resumed does not.** The cells sit at
     // `base` and upward, below anything the body computes, so `Ret`'s truncate back to `base` is what
     // frees them and the collector walks them as part of the stack it already walks. A coroutine
-    // comes back here with `from` past zero and its slots still standing on the machine's own stack.
-    if from == 0 then reserve_slots(u, chunk_ix)
+    // comes back here with its slots still standing on the machine's own stack.
+    //
+    // **Which parameters arrived**, one bit each -- the answer `JumpIfGiven` wants. It is a local
+    // beside `pc` and `base` for their reason: reading it out of the top frame on every default
+    // would copy a frame per step.
+    var given = if entering then lay_frame(u, chunk_ix, args) else given0
 
     loop
         if pc >= code.len()
@@ -101,12 +113,16 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
 
             DefineTest(k) -> registered_tests.push(TestCase(u.strings.at(k), u.chunks.at(chunk_ix).source, pop()))
 
-            PushHandler(to) -> vm.handlers.push(Handler(chunk_ix, to, vm.stack.len(), vm.frames.len(), vm.scope, base))
+            PushHandler(to) -> vm.handlers.push(Handler(chunk_ix, to, vm.stack.len(), vm.frames.len(), vm.scope, base, given))
             PopHandler -> vm.handlers.truncate(vm.handlers.len() - 1)
             Raise -> return fault(at, thrown_message(pop()))
 
             // The head of a chunk with default parameters, and nowhere else.
             JumpIfBound(k, to) -> if bound_here(vm.scope, u.strings.at(k)) then pc = to
+
+            // The same, where that chunk's parameters are slots. One bit rather than a lookup, which
+            // is what the whole of this arrangement is.
+            JumpIfGiven(n, to) -> if (given >> n) & 1 == 1 then pc = to
 
             LoadSlot(i) -> vm.stack.push(vm.stack.at(base + i))
             DeclareSlot(i) ->
@@ -482,18 +498,25 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
 
                 invoke(u, callee, args, at, vm.frames.len())? match
                     Answered(v) -> vm.stack.push(v)
-                    Enter(body, called) ->
+                    Enter(body, called, laid) ->
+                        // **The arguments go down FIRST, before anything else in this arm.** They
+                        // are a sysl local until they are on the stack, and the mark phase cannot
+                        // see one -- so the fewer instructions between `invoke` releasing its hold
+                        // and this, the less there is to go wrong when one of them later learns to
+                        // allocate.
+                        val laid_base = vm.stack.len()
+                        val mask = lay_frame(u, body, laid)
+
                         // The frame this call is leaving is written back only here, which is what
                         // makes the ordinary instruction cheap.
-                        vm.frames.push(Frame(chunk_ix, pc, vm.scope, base, vm.handlers.len()))
+                        vm.frames.push(Frame(chunk_ix, pc, vm.scope, base, vm.handlers.len(), given))
                         chunk_ix = body
                         code = u.chunks.at(chunk_ix).code
                         current_source = u.chunks.at(chunk_ix).source
                         pc = 0
                         vm.scope = called
-                        base = vm.stack.len()
-
-                        reserve_slots(u, chunk_ix)
+                        base = laid_base
+                        given = mask
 
             // `f(...xs)` -- the arguments are an array the instruction above it built.
             //
@@ -501,12 +524,12 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
             // whole point: everything after that -- the keepable check, the truncate, `invoke` and
             // the two ways a call can go -- is the same code doing the same thing.
             CallSpread ->
-                val given = pop()
+                val spread = pop()
                 val callee = pop()
 
                 var args: Buf[Value] = buf()
 
-                given match
+                spread match
                     Array(a) ->
                         for i in 0..<a.items.len()
                             keepable(a.items.at(i), at, "passed to a function")?
@@ -515,16 +538,23 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
 
                 invoke(u, callee, args, at, vm.frames.len())? match
                     Answered(v) -> vm.stack.push(v)
-                    Enter(body, called) ->
-                        vm.frames.push(Frame(chunk_ix, pc, vm.scope, base, vm.handlers.len()))
+                    Enter(body, called, laid) ->
+                        // **The arguments go down FIRST, before anything else in this arm.** They
+                        // are a sysl local until they are on the stack, and the mark phase cannot
+                        // see one -- so the fewer instructions between `invoke` releasing its hold
+                        // and this, the less there is to go wrong when one of them later learns to
+                        // allocate.
+                        val laid_base = vm.stack.len()
+                        val mask = lay_frame(u, body, laid)
+
+                        vm.frames.push(Frame(chunk_ix, pc, vm.scope, base, vm.handlers.len(), given))
                         chunk_ix = body
                         code = u.chunks.at(chunk_ix).code
                         current_source = u.chunks.at(chunk_ix).source
                         pc = 0
                         vm.scope = called
-                        base = vm.stack.len()
-
-                        reserve_slots(u, chunk_ix)
+                        base = laid_base
+                        given = mask
 
             // The top `n` arrays, made into one. What builds a spread argument list.
             JoinArrays(n) ->
@@ -600,23 +630,30 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
 
                 invoke(u, found.0, placed, at, vm.frames.len())? match
                     Answered(v) -> vm.stack.push(v)
-                    Enter(body, called) ->
-                        vm.frames.push(Frame(chunk_ix, pc, vm.scope, base, vm.handlers.len()))
+                    Enter(body, called, laid) ->
+                        // **The arguments go down FIRST, before anything else in this arm.** They
+                        // are a sysl local until they are on the stack, and the mark phase cannot
+                        // see one -- so the fewer instructions between `invoke` releasing its hold
+                        // and this, the less there is to go wrong when one of them later learns to
+                        // allocate.
+                        val laid_base = vm.stack.len()
+                        val mask = lay_frame(u, body, laid)
+
+                        vm.frames.push(Frame(chunk_ix, pc, vm.scope, base, vm.handlers.len(), given))
                         chunk_ix = body
                         code = u.chunks.at(chunk_ix).code
                         current_source = u.chunks.at(chunk_ix).source
                         pc = 0
                         vm.scope = called
-                        base = vm.stack.len()
-
-                        reserve_slots(u, chunk_ix)
+                        base = laid_base
+                        given = mask
 
             // `o.m(...xs)`. The receiver rule is `CallMethod`'s and is not restated: what differs is
             // that the arguments arrive as an array, and the receiver goes in front of them where
             // the method was delegated to.
             CallMethodSpread(k) ->
                 val name = u.strings.at(k)
-                val given = pop()
+                val spread = pop()
                 val target = peek(0)
 
                 val looked = target match
@@ -640,7 +677,7 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
 
                 if found.1 then args.push(target)
 
-                given match
+                spread match
                     Array(a) ->
                         for i in 0..<a.items.len()
                             keepable(a.items.at(i), at, "passed to a function")?
@@ -654,16 +691,23 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
 
                 invoke(u, found.0, args, at, vm.frames.len())? match
                     Answered(v) -> vm.stack.push(v)
-                    Enter(body, called) ->
-                        vm.frames.push(Frame(chunk_ix, pc, vm.scope, base, vm.handlers.len()))
+                    Enter(body, called, laid) ->
+                        // **The arguments go down FIRST, before anything else in this arm.** They
+                        // are a sysl local until they are on the stack, and the mark phase cannot
+                        // see one -- so the fewer instructions between `invoke` releasing its hold
+                        // and this, the less there is to go wrong when one of them later learns to
+                        // allocate.
+                        val laid_base = vm.stack.len()
+                        val mask = lay_frame(u, body, laid)
+
+                        vm.frames.push(Frame(chunk_ix, pc, vm.scope, base, vm.handlers.len(), given))
                         chunk_ix = body
                         code = u.chunks.at(chunk_ix).code
                         current_source = u.chunks.at(chunk_ix).source
                         pc = 0
                         vm.scope = called
-                        base = vm.stack.len()
-
-                        reserve_slots(u, chunk_ix)
+                        base = laid_base
+                        given = mask
 
             // `yield e` -- stand still and let whoever is driving take the value.
             //
@@ -676,7 +720,7 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
             // **The value stays on the stack for `Await`'s reason**: the machine's own stack is a
             // root the tracer walks, and the sysl local this arm could have kept it in is not.
             Op.Yield ->
-                vm.frames.push(Frame(chunk_ix, pc, vm.scope, base, vm.handlers.len()))
+                vm.frames.push(Frame(chunk_ix, pc, vm.scope, base, vm.handlers.len(), given))
 
                 return Err(Wait)
 
@@ -695,7 +739,7 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
                 val awaited = peek(0)
 
                 // What `resume_chunk` will pick the loop up from.
-                vm.frames.push(Frame(chunk_ix, pc, vm.scope, base, vm.handlers.len()))
+                vm.frames.push(Frame(chunk_ix, pc, vm.scope, base, vm.handlers.len(), given))
 
                 val id = park()
 
@@ -742,12 +786,48 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
                 pc = back.pc
                 vm.scope = back.scope
                 base = back.base
+                given = back.given
                 vm.stack.push(v)
 end run_frames
 
-// Put a chunk's slot cells on the stack, empty, before its first instruction runs.
-private reserve_slots(u: *Unit, chunk_ix: usize)
-    val n = u.chunks.at(chunk_ix).slots
+// Put a chunk's slot cells on the stack before its first instruction runs, with the call's arguments
+// already in them, and answer which parameters arrived.
+//
+// **The window begins where the stack already stands.** A call has popped its callee and its
+// arguments and cut the stack back before it got here, so the top IS the callee's `base` -- which
+// makes laying an argument into slot `i` a push rather than a copy into a frame built elsewhere.
+//
+// **The rest rule is `bind_arguments`', and it is here because two copies of it is how they come to
+// disagree.** `gather_rest` appends the gathered array, and where a DEFAULTED parameter before the
+// rest went unfilled that position is the defaulted one -- so the last value goes to the last
+// parameter and everything before it is positional.
+//
+// **A HOLE IS NOT WRITTEN AND ITS BIT STAYS 0.** `arrange_named` marks a skipped parameter with
+// `Undefined`, and what it means to skip one is exactly what it means to leave one off the end: the
+// slot keeps the `Null` it was padded with, the head of the chunk works the default out, and no
+// sentinel value ever sits in a slot for a `LoadSlot` to have to check for.
+//
+// Not `private`: `generator.sysl` lays a generator's frame before parking its machine.
+lay_frame(u: *Unit, chunk_ix: usize, args: Buf[Value]) -> usize
+    val chunk = u.chunks.at(chunk_ix)
+    val n = chunk.slots
 
     for _ in 0..<n
         vm.stack.push(Null)
+
+    if !chunk.slotted then return 0
+
+    val base = vm.stack.len() - n
+    var given: usize = 0
+
+    for i in 0..<args.len()
+        val slot = if chunk.variadic && i == args.len() - 1 then chunk.params.len() - 1 else i
+
+        args.at(i) match
+            Undefined -> ()
+            v ->
+                vm.stack.set(base + slot, v)
+                given = given | (1usize << slot)
+
+    given
+end lay_frame

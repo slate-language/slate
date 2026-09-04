@@ -30,7 +30,11 @@ pop() -> Value
 peek(back: usize) -> Value = vm.stack.at(vm.stack.len() - 1 - back)
 
 // Run a chunk to completion and answer what it left.
-run_chunk(u: *Unit, start: usize, scope0: *EnvObj) -> Step
+//
+// **`args` is a slotted chunk's arguments and is empty for every other caller.** A chunk whose
+// parameters live in an `EnvObj` was given them before this was called; one whose parameters are
+// slots is given them here, because the slot window does not exist until the frame does.
+run_chunk(u: *Unit, start: usize, scope0: *EnvObj, args: Buf[Value]) -> Step
     // **Where this call stops unwinding.** A native can call back into slate -- a user `equals` does
     // exactly that -- so a nested run must hand back at its own depth rather than at an empty stack.
     val floor = vm.frames.len()
@@ -48,7 +52,7 @@ run_chunk(u: *Unit, start: usize, scope0: *EnvObj) -> Step
     vm.scope = scope0
 
     // A fresh run: the handlers standing here are somebody else's and stay theirs.
-    val answer = execute(u, start, 0, vm.stack.len(), floor, outer_scope, vm.handlers.len())
+    val answer = execute(u, start, 0, vm.stack.len(), floor, outer_scope, vm.handlers.len(), true, args, 0)
 
     current_source = outer_source
     answer
@@ -75,7 +79,11 @@ resume_chunk(u: *Unit) -> Step
     // **Everything this machine has is its own**, which is the same sentence `resume_failed` says
     // when it hands a fault to `guarded` with a floor of zero. A resumed coroutine's `try` blocks
     // came back from `parked` with it and every one of them is allowed the faults that follow.
-    val answer = execute(u, back.chunk, back.pc, back.base, 0, null, 0)
+    // **Not entering: this machine's slots are standing.** They were laid when it was started -- a
+    // generator's before it had run a single instruction -- and laying them again would put the
+    // arguments on top of themselves. That is why entering is said rather than guessed at from
+    // `pc == 0`, which a generator resumed for the first time also satisfies.
+    val answer = execute(u, back.chunk, back.pc, back.base, 0, null, 0, false, buf(), back.given)
 
     current_source = outer_source
     answer
@@ -114,8 +122,17 @@ enum Called
     // A native, or an `async` function -- there is a value already and no chunk to enter.
     Answered(v: Value)
 
-    // An ordinary slate function: the chunk to run and the scope to run it in.
-    Enter(chunk: usize, scope: *EnvObj)
+    // An ordinary slate function: the chunk to run, the scope to run it in, and the arguments.
+    //
+    // **The arguments travel only for a chunk whose parameters are SLOTS**, and for one whose
+    // parameters are not they are already in the scope and this is empty. A slotted chunk's scope is
+    // the closure's own, unchanged and unallocated -- which is the point of the whole exercise.
+    //
+    // **They are a sysl local between here and the frame, which the mark phase cannot see**, so the
+    // arm that receives one lays them onto the operand stack before it does anything else. Nothing
+    // between the two allocates on the collected heap today, and putting them down first is what
+    // makes that not need to stay true.
+    Enter(chunk: usize, scope: *EnvObj, args: Buf[Value])
 
 // A call's arguments in the order the callee's PARAMETERS are written.
 //
@@ -279,6 +296,15 @@ invoke(u: *Unit, callee: Value, args: Buf[Value], at: Span, depth: usize) -> Res
 
                 return Err(failure(at, s"this call is ${MaxCallDepth} deep, which is farther than slate will go -- a recursion this deep is usually one that never ends"))
 
+            // **A chunk whose parameters are slots is entered with NO SCOPE OF ITS OWN.** The
+            // closure's captured scope is what free names resolve against and is what it already
+            // holds, so a call allocates nothing at all: the arguments go into the frame's own
+            // cells, which the frame was going to reserve anyway.
+            if chunk.slotted
+                release(mark)
+
+                return Ok(Enter(c.body, c.scope, given))
+
             val called = new_env(c.scope)
 
             // **Only the arguments that were GIVEN are bound.** A parameter with a default and no
@@ -287,7 +313,7 @@ invoke(u: *Unit, callee: Value, args: Buf[Value], at: Span, depth: usize) -> Res
             // parameters to its left.
             bind_arguments(called, c, given, chunk.variadic)
             release(mark)
-            Ok(Enter(c.body, called))
+            Ok(Enter(c.body, called, buf()))
         // **An object with a `new` is callable, and the call IS that `new`.** `Circle(3)` and
         // `Circle.new(3)` are one thing said two ways, so the lookup is the one `.` does -- through
         // the proto chain, the same field the written form would have found. What it buys is that a
@@ -318,9 +344,9 @@ end invoke
 // inside a `try` was not caught by that `try`, and turned up as an unhandled rejection naming a line
 // three inside a block that was guarding it. It predates generators; driving one is what found it.
 private execute(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, outer_scope: *EnvObj,
-                handler_floor: usize) -> Step
+                handler_floor: usize, entering: bool, args: Buf[Value], given0: usize) -> Step
     val floor_of_handlers = handler_floor
-    val answer = guarded(u, run_frames(u, start, from, base0, floor, outer_scope), floor, outer_scope, floor_of_handlers)
+    val answer = guarded(u, run_frames(u, start, from, base0, floor, outer_scope, entering, args, given0), floor, outer_scope, floor_of_handlers)
 
     // **Not on a park.** `Await` swaps `vm` for a fresh machine before it raises `Wait`, so the
     // handlers standing here are the new machine's and the count means nothing against them. The
@@ -364,7 +390,10 @@ guarded(u: *Unit, first: Step, floor: usize, outer_scope: *EnvObj, floor_of_hand
         vm.stack.push(v)
         release(mark)
 
-        outcome = run_frames(u, h.chunk, h.pc, h.base, floor, outer_scope)
+        // **The `catch` gets the mask of the frame the `try` was written in, not the faulting
+        // one's.** It carries on in that chunk, and the fault may have been raised several chunks
+        // away -- which is the same reason the handler records a base.
+        outcome = run_frames(u, h.chunk, h.pc, h.base, floor, outer_scope, false, buf(), h.given)
 end guarded
 
 // What a `catch` binds: the sentence, and where it was raised.

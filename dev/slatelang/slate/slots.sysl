@@ -20,17 +20,63 @@ import sysl.buf.{Buf, buf}
 // their slots and is the next step; asking it once is the step that can be checked by reading, which
 // is what a change to how every local is found should start with.
 //
-// **AND IT REFUSES EVERY BINDING FORM BUT `val` AND `var` WITH A PLAIN NAME.** A pattern, a `for`
-// head, a `catch`, a `match` arm and a parameter's default all bind by putting a name into the scope
-// the machine is standing in, and each is a different piece of code doing it. Slotting a chunk while
-// one of them writes into the chain would give a name two homes -- the slot a later read finds, and
-// the binding the machine actually made -- which is silent and wrong rather than loud and wrong. So
-// they are refused here, together, and each is its own step afterwards.
+// **AND IT REFUSES EVERY BINDING FORM BUT `val`, `var` AND A PARAMETER.** A pattern, a `for` head, a
+// `catch` and a `match` arm all bind by putting a name into the scope the machine is standing in,
+// and each is a different piece of code doing it. Slotting a chunk while one of them writes into the
+// chain would give a name two homes -- the slot a later read finds, and the binding the machine
+// actually made -- which is silent and wrong rather than loud and wrong. So they are refused here,
+// together, and each is its own step afterwards.
+//
+// **A PARAMETER'S DEFAULT IS NO LONGER ONE OF THEM.** It was, while the question "was this argument
+// given" could only be asked of the scope; the frame carries a bitmask now and `JumpIfGiven` asks it
+// directly. What is still asked of a default is what is asked of the body -- whether it holds
+// anything that would capture -- because `f(g = () -> x)` puts a closure in the head of the chunk as
+// surely as the body could.
+//
+// **A chunk with more parameters than the mask has bits does not slot.** Nothing real has 64, and a
+// silent wrap would make `JumpIfGiven` answer about the wrong parameter.
+//
+// **AND IT REFUSES A CHUNK THAT TESTS AGAINST A NAME OF ITS OWN.** A class registers its name as a
+// type whose pattern is `ProtoPat(name)`, and that pattern looks the name up **in the scope the
+// match is running in** -- so `f(A) = a is A`, where the parameter shadows the class, is deliberately
+// false. A slotted name is not in that scope at all, so the lookup would walk past the shadow and
+// find the class, and the answer would quietly become true. **A name a pattern in the body mentions
+// and this chunk would slot is therefore a name the chunk may not slot**, and the cheap answer is not
+// to slot the chunk.
+//
+// It is asked of every name a pattern carries rather than only of the ones that turn out to be
+// types, because which names are types is not known here -- and refusing a chunk that would have been
+// fine costs speed, where allowing one that is not costs an answer.
 //
 // Not `private`: `compile.sysl` asks it of each chunk before emitting the body.
-may_slot(body: Expr, defaults: Buf[Expr]) -> bool = defaults.is_empty() && !expr_holds_capture(body)
+may_slot(params: Buf[string], defaults: Buf[Expr], body: Expr) -> bool
+    if params.len() > MaskBits then return false
 
-private expr_holds_capture(x: Expr) -> bool
+    // **The names this chunk would slot, and the names its patterns look up**, both filled by the
+    // one walk below rather than by two more of their own -- every arm that would collect them is an
+    // arm it already has.
+    var mine: Buf[string] = buf()
+    var tested: Buf[string] = buf()
+
+    for i in 0..<params.len()
+        mine.push(params.at(i))
+
+    for i in 0..<defaults.len()
+        if expr_holds_capture(defaults.at(i), &mine, &tested) then return false
+
+    if expr_holds_capture(body, &mine, &tested) then return false
+
+    for i in 0..<tested.len()
+        for j in 0..<mine.len()
+            if tested.at(i) == mine.at(j) then return false
+
+    true
+end may_slot
+
+// How many parameters a frame's mask can speak for, which is the width of the machine's own word.
+const MaskBits: usize = 64
+
+private expr_holds_capture(x: Expr, mine: *Buf[string], tested: *Buf[string]) -> bool
     *x.kind match
         Lambda(_, _, _, _) -> true
         ShapeLit(_, _) -> true
@@ -41,35 +87,39 @@ private expr_holds_capture(x: Expr) -> bool
         TryCatch(_, _, _) -> true
         For(_, _, _, _, _, _) -> true
 
-        Spread(inner) -> expr_holds_capture(inner)
-        Named(_, value) -> expr_holds_capture(value)
-        Unary(_, rhs) -> expr_holds_capture(rhs)
-        Binary(_, lhs, rhs) -> expr_holds_capture(lhs) || expr_holds_capture(rhs)
-        Call(callee, args) -> expr_holds_capture(callee) || any_expr(args)
-        Index(target, key) -> expr_holds_capture(target) || expr_holds_capture(key)
-        Field(target, _, _) -> expr_holds_capture(target)
-        ArrayLit(items) -> any_expr(items)
-        ArrayRepeat(value, count) -> expr_holds_capture(value) || expr_holds_capture(count)
-        Interp(pieces) -> any_expr(pieces)
-        WithFields(base, _, values) -> expr_holds_capture(base) || any_expr(values)
-        WithAll(base, other, _) -> expr_holds_capture(base) || expr_holds_capture(other)
-        ObjectLit(_, _, values) -> any_expr(values)
-        DataLit(inner) -> expr_holds_capture(inner)
-        Compare(operands, _) -> any_expr(operands)
-        Range(lo, hi, _) -> maybe_expr(lo) || maybe_expr(hi)
-        IsPattern(subject, _, _) -> expr_holds_capture(subject)
-        IncDec(target, _, _) -> expr_holds_capture(target)
-        Await(inner) -> expr_holds_capture(inner)
-        Yield(inner) -> expr_holds_capture(inner)
+        Spread(inner) -> expr_holds_capture(inner, mine, tested)
+        Named(_, value) -> expr_holds_capture(value, mine, tested)
+        Unary(_, rhs) -> expr_holds_capture(rhs, mine, tested)
+        Binary(_, lhs, rhs) -> expr_holds_capture(lhs, mine, tested) || expr_holds_capture(rhs, mine, tested)
+        Call(callee, args) -> expr_holds_capture(callee, mine, tested) || any_expr(args, mine, tested)
+        Index(target, key) -> expr_holds_capture(target, mine, tested) || expr_holds_capture(key, mine, tested)
+        Field(target, _, _) -> expr_holds_capture(target, mine, tested)
+        ArrayLit(items) -> any_expr(items, mine, tested)
+        ArrayRepeat(value, count) -> expr_holds_capture(value, mine, tested) || expr_holds_capture(count, mine, tested)
+        Interp(pieces) -> any_expr(pieces, mine, tested)
+        WithFields(base, _, values) -> expr_holds_capture(base, mine, tested) || any_expr(values, mine, tested)
+        WithAll(base, other, _) -> expr_holds_capture(base, mine, tested) || expr_holds_capture(other, mine, tested)
+        ObjectLit(_, _, values) -> any_expr(values, mine, tested)
+        DataLit(inner) -> expr_holds_capture(inner, mine, tested)
+        Compare(operands, _) -> any_expr(operands, mine, tested)
+        Range(lo, hi, _) -> maybe_expr(lo, mine, tested) || maybe_expr(hi, mine, tested)
+        IsPattern(subject, pat, _) ->
+            pattern_mentions(pat, tested)
+            expr_holds_capture(subject, mine, tested)
+        IncDec(target, _, _) -> expr_holds_capture(target, mine, tested)
+        Await(inner) -> expr_holds_capture(inner, mine, tested)
+        Yield(inner) -> expr_holds_capture(inner, mine, tested)
         IfExpr(cond, then_branch, else_branch) ->
-            expr_holds_capture(cond) || expr_holds_capture(then_branch) || maybe_expr(else_branch)
+            expr_holds_capture(cond, mine, tested) || expr_holds_capture(then_branch, mine, tested) || maybe_expr(else_branch, mine, tested)
         While(_, cond, body, otherwise) ->
-            expr_holds_capture(cond) || expr_holds_capture(body) || maybe_expr(otherwise)
-        Loop(_, body) -> expr_holds_capture(body)
+            expr_holds_capture(cond, mine, tested) || expr_holds_capture(body, mine, tested) || maybe_expr(otherwise, mine, tested)
+        Loop(_, body) -> expr_holds_capture(body, mine, tested)
         DoWhile(_, body, cond, otherwise) ->
-            expr_holds_capture(body) || expr_holds_capture(cond) || maybe_expr(otherwise)
-        Block(stmts) -> any_stmt(stmts)
-        Ensures(value, _, _) -> expr_holds_capture(value)
+            expr_holds_capture(body, mine, tested) || expr_holds_capture(cond, mine, tested) || maybe_expr(otherwise, mine, tested)
+        Block(stmts) -> any_stmt(stmts, mine, tested)
+        Ensures(value, _, pat) ->
+            pattern_mentions(pat, tested)
+            expr_holds_capture(value, mine, tested)
 
         // Every literal and every bare name. **Written out rather than left to a wildcard on
         // purpose**: a node added to the tree should make this stop compiling and be classified,
@@ -88,22 +138,27 @@ private expr_holds_capture(x: Expr) -> bool
         Bad -> true
 end expr_holds_capture
 
-private stmt_holds_capture(s: Stmt) -> bool
+private stmt_holds_capture(s: Stmt, mine: *Buf[string], tested: *Buf[string]) -> bool
     *s.kind match
         Def(_, _, _, _, _) -> true
         TypeDecl(_, _) -> true
 
-        Val(_, init) -> expr_holds_capture(init)
-        Var(_, init) -> expr_holds_capture(init)
+        // The two forms that take a slot, so their names are the ones a pattern must not also mean.
+        Val(name, init) ->
+            mine.push(name)
+            expr_holds_capture(init, mine, tested)
+        Var(name, init) ->
+            mine.push(name)
+            expr_holds_capture(init, mine, tested)
         // A pattern binds from code of its own -- see the note on `may_slot`.
         Unpack(_, _, _) -> true
-        Group(stmts) -> any_stmt(stmts)
-        Assign(_, target, value) -> expr_holds_capture(target) || expr_holds_capture(value)
-        MultiAssign(_, targets, values) -> any_expr(targets) || any_expr(values)
-        Eval(e) -> expr_holds_capture(e)
-        Return(value) -> maybe_expr(value)
-        Throw(value) -> expr_holds_capture(value)
-        Break(_, value) -> maybe_expr(value)
+        Group(stmts) -> any_stmt(stmts, mine, tested)
+        Assign(_, target, value) -> expr_holds_capture(target, mine, tested) || expr_holds_capture(value, mine, tested)
+        MultiAssign(_, targets, values) -> any_expr(targets, mine, tested) || any_expr(values, mine, tested)
+        Eval(e) -> expr_holds_capture(e, mine, tested)
+        Return(value) -> maybe_expr(value, mine, tested)
+        Throw(value) -> expr_holds_capture(value, mine, tested)
+        Break(_, value) -> maybe_expr(value, mine, tested)
         Continue(_) -> false
 
         // An import binds names the module it names owns, and cannot appear inside a function
@@ -111,25 +166,29 @@ private stmt_holds_capture(s: Stmt) -> bool
         ImportNames(_, _, _, _, _) -> true
         ImportAll(_, _, _, _) -> true
 
-        CheckType(_, _, _) -> false
+        // A parameter's annotation, which the parser puts at the top of the body. Its pattern names a
+        // type, and a type is a name looked up where the match runs.
+        CheckType(_, _, pat) ->
+            pattern_mentions(pat, tested)
+            false
 end stmt_holds_capture
 
-private any_expr(xs: Buf[Expr]) -> bool
+private any_expr(xs: Buf[Expr], mine: *Buf[string], tested: *Buf[string]) -> bool
     for i in 0..<xs.len()
-        if expr_holds_capture(xs.at(i)) then return true
+        if expr_holds_capture(xs.at(i), mine, tested) then return true
 
     false
 end any_expr
 
-private any_stmt(xs: Buf[Stmt]) -> bool
+private any_stmt(xs: Buf[Stmt], mine: *Buf[string], tested: *Buf[string]) -> bool
     for i in 0..<xs.len()
-        if stmt_holds_capture(xs.at(i)) then return true
+        if stmt_holds_capture(xs.at(i), mine, tested) then return true
 
     false
 end any_stmt
 
-private maybe_expr(x: Option[Expr]) -> bool = x match
-    Some(e) -> expr_holds_capture(e)
+private maybe_expr(x: Option[Expr], mine: *Buf[string], tested: *Buf[string]) -> bool = x match
+    Some(e) -> expr_holds_capture(e, mine, tested)
     None -> false
 
 // -- emitting a name, one way or the other ----------------------------------------------------------
@@ -165,3 +224,75 @@ store_name(u: *Unit, e: *Emit, name: string, at: Span)
             else
                 push_n(e, ImmutableSlot(intern_str(u, name)), at, 1, 0)
         None -> push_n(e, StoreName(intern_str(u, name)), at, 1, 0)
+
+// -- what a pattern in this body looks up -----------------------------------------------------------
+
+// Every bare name a pattern mentions, wherever it mentions one.
+//
+// **A name in pattern position is resolved to a TYPE while compiling, or bound while matching, and
+// this cannot tell which** -- the declared types are not in view here. So it collects both, and
+// `may_slot` refuses a chunk that would slot any of them. A name that turns out to have been an
+// ordinary binding costs that chunk its slots and nothing else; a name that turns out to have been a
+// class and was let through costs an `is` its answer.
+//
+// **`ProtoPat`, `DataPat`, `VariantPat`, `MadeFrom` and `AppliedPat` are in the list even though a
+// body's pattern has not been resolved yet.** They are what a resolved one becomes, and a walk that
+// is exhaustive over the kinds is a walk that stops compiling when a kind is added -- which is the
+// only reason any of this can be trusted.
+private pattern_mentions(pat: Pattern, into: *Buf[string])
+    *pat.kind match
+        Bind(name) -> note_mention(name, into)
+        At(name, inner) ->
+            note_mention(name, into)
+            pattern_mentions(inner, into)
+        TypeVarPat(name) -> note_mention(name, into)
+        AppliedPat(name, args) ->
+            note_mention(name, into)
+            each_mention(args, into)
+        ProtoPat(name, _, _) -> note_mention(name, into)
+        DataPat(name, _) -> note_mention(name, into)
+        VariantPat(name, items, _, _) ->
+            note_mention(name, into)
+            each_mention(items, into)
+        MadeFrom(name, inner) ->
+            note_mention(name, into)
+            pattern_mentions(inner, into)
+        GenericPat(params, inner) ->
+            for i in 0..<params.len()
+                note_mention(params.at(i), into)
+
+            pattern_mentions(inner, into)
+        ArrayPat(items, _, rest, _) ->
+            each_mention(items, into)
+
+            rest match
+                Some(name) -> note_mention(name, into)
+                None -> ()
+        ObjectPat(_, values, _, _) -> each_mention(values, into)
+        EveryPat(_, element) -> pattern_mentions(element, into)
+        FnPat(params, result) ->
+            each_mention(params, into)
+            pattern_mentions(result, into)
+        OrPat(alts) -> each_mention(alts, into)
+        AndPat(parts) -> each_mention(parts, into)
+
+        // The kinds that name nothing. Written out for the reason the expression walk's literals
+        // are: a kind added later should stop this compiling rather than fall through as harmless.
+        Wild -> ()
+        TypePat(_) -> ()
+        IntPat(_) -> ()
+        RealPat(_) -> ()
+        StrPat(_) -> ()
+        BoolPat(_) -> ()
+        NullPat -> ()
+end pattern_mentions
+
+private each_mention(xs: Buf[Pattern], into: *Buf[string])
+    for i in 0..<xs.len()
+        pattern_mentions(xs.at(i), into)
+
+private note_mention(name: string, into: *Buf[string])
+    for i in 0..<into.len()
+        if into.at(i) == name then return
+
+    into.push(name)
