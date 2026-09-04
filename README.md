@@ -261,9 +261,11 @@ A literate `.lsl` form, a raw string literal, a name resolver for `connect`, Uni
 standard library beyond the builtins. On the object side: `super`, and a check that a proto satisfies a
 `type` when it is attached to an object literal by hand.
 
-In the JavaScript back end: `slate:net`, `slate:time`, `slate:regex`, `fetch`, `run`, `slate:password`,
+In the JavaScript back end: `slate:net`, `slate:regex`, `fetch`, `run`, `slate:password`,
 `slate:crypto`, `slate:brotli`, `slate:llhttp`, and the modules written over them. Each one is a name that
-says *"not in the JavaScript back end yet"* rather than a name that is not there.
+says *"not in the JavaScript back end yet"* rather than a name that is not there. `slate:time` is whole
+there now, except for `abbrev` and `isDST` — two things a JavaScript host genuinely does not have, and
+`docs/reference/javascript.md` measures why.
 
 **`defer` is deliberately not here.** It earns its place in Go and in sysl because neither collects: a
 function that acquires something has to release it on every exit path. slate has a tracing collector, so

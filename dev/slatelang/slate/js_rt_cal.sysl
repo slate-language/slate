@@ -1,0 +1,802 @@
+module dev.slatelang.slate
+
+// The calendar, as JavaScript: a date, a time of day, a civil reading, a zone, a zoned reading and a
+// calendar length.
+//
+// **This is the half `js_rt_time.sysl` said it did not have.** That file holds the timeline -- an
+// instant, a duration and the arithmetic over both -- and its header used to say the calendar was
+// owed because a zone read from `Intl` and a zone read from the IANA database are two answers to one
+// question. **That was a worry and it has been measured.** Every zone this host has, 598 of them, at
+// six instants: the two agree on 2985 of 2985 offsets from 2000 through 2025, and the seven
+// disagreements at 2038 are a tzdata VERSION skew -- the host's database is a release ahead of the
+// one node's ICU carries -- rather than anything either back end does. So the numeric calendar can be
+// built over `Intl` and hold the interpreter's answers, and it is built here.
+//
+// **TWO NAMES ARE STILL OWED AND BOTH ARE THINGS A BROWSER DOES NOT HAVE**, which is the user's rule
+// for what may fail here. `docs/reference/javascript.md` carries the measurements.
+//
+// - **`abbrev`.** `Intl` has no IANA abbreviation at all: its `timeZoneName` options carry CLDR's
+//   English display data, which coincides with tzdata for American zones and nowhere else -- 67 of 84
+//   readings disagree, and `shortGeneric` is worse ("United Kingdom Time").
+// - **`isDST`.** `Intl` exposes no daylight-saving flag, and the offset-comparison rule every
+//   JavaScript date library uses instead is unsound in BOTH directions. Measured over 3582 readings
+//   it is wrong at 31 of them: it MISSES a zone that is permanently on daylight time (Casablanca and
+//   El Aaiun are `+01` all year with the flag set, and so was every Argentine zone in 2000), and it
+//   INVENTS one for a zone that moved its STANDARD offset mid-year (Almaty and Qostanay went `+06`
+//   to `+05` in March 2024, so January's offset exceeds May's and the rule reads January as daylight
+//   time). The second half is what settles it: the failure is an ordinary permanent offset change
+//   rather than an exotic zone, so there is no version of the rule that under-reports safely.
+//
+// **A TABLE OF ZONE RULES CARRIED IN THIS RUNTIME WAS CONSIDERED AND REFUSED**, so nobody proposes
+// it again without new evidence. It would answer both names, and that is what makes it worth writing
+// down as a decision rather than an oversight. It is refused because it is a **second copy of
+// tzdata**: an authority this file would hold against the one the interpreter reads from the system
+// database, kept in step by hand, in a place nobody looks until a zone changes and only one of the
+// two back ends notices. The measurement above is exactly the drift that copy would reintroduce.
+//
+// **The two halves sit in different scopes, as `js_rt_time.sysl`'s do and for its reason.** The value
+// model is script-level, beside the core rather than inside it, so `js_rt.sysl` and
+// `js_rt_ops.sysl` can reach the six classes by name; the builtins are inside the `$b` block every
+// builtin is declared in. `js_runtime` puts them in that order.
+//
+// **The arithmetic is `sysl.time`'s, ported rather than reinvented**, which is what makes the two
+// back ends agree by construction rather than by luck: `civil.sysl`'s `days_from_civil`,
+// `civil_from_days`, `plus_months` and `on_or_after`, `zone.sysl`'s `resolve`, and `parse.sysl`'s
+// four readers are each written out below beside the name they came from. Where one of them is
+// changed there, it is changed here, and `tests/js/p18.sl` is what says so.
+
+// The value model: the six kinds, the zone table, resolution, rendering and reading back.
+js_runtime_cal() -> string = raw"""
+    // -- the calendar values -------------------------------------------------------------------
+
+    // `value.sysl`'s `DateVal`, `TimeVal`, `DateTimeVal`, `ZoneVal`, `ZonedVal` and `PeriodVal`,
+    // spelled in JavaScript.
+    //
+    // **Every number in them is a `BigInt`, which is what a slate integer is**, so a day count, a
+    // month count and a microsecond reading all come back out of a field reader as the integer the
+    // interpreter answers rather than as something that has to be converted at the boundary. The one
+    // exception is a zone's fixed offset, which is minutes and never leaves this file as a number.
+    class SDate {
+        constructor(day) { this.day = day }
+    }
+
+    class STime {
+        constructor(us) { this.us = us }
+    }
+
+    class SDateTime {
+        constructor(day, us) { this.day = day; this.us = us }
+    }
+
+    // A zone: a region's rules, or a fixed offset from UTC.
+    //
+    // **`name` is what it is CALLED and `lookup` is what `Intl` is asked about**, and they differ for
+    // exactly one zone. `localZone()` answers a zone whose title is `local` -- which is what the
+    // interpreter calls the entry it built from `/etc/localtime` -- while the rules have to be
+    // fetched under the host's real IANA name. Every other zone has one name for both.
+    class SZone {
+        constructor(name, lookup, fixed, minutes) {
+            this.name = name
+            this.lookup = lookup
+            this.fixed = fixed
+            this.minutes = minutes
+        }
+    }
+
+    class SZoned {
+        constructor(us, zone) { this.us = us; this.zone = zone }
+    }
+
+    class SPeriod {
+        constructor(months, days) { this.months = months; this.days = days }
+    }
+
+    // -- the zone table ------------------------------------------------------------------------
+
+    // **A zone is interned by name and never released**, which is `time.sysl`'s arrangement and is
+    // what makes `zone("UTC") == zone("UTC")` true. There is no slot number here -- the interpreter
+    // needs one because a parsed zone may not live in its collected heap, and JavaScript has no such
+    // rule -- so the map holds the value itself and equality compares the name.
+    const ZONES = new Map()
+
+    const fixedZone = (name, minutes) => {
+        let z = ZONES.get(name)
+
+        if (z === undefined) {
+            z = new SZone(name, name, true, minutes)
+            ZONES.set(name, z)
+        }
+
+        return z
+    }
+
+    // `+05:30` and `-08:00`, which is the whole of what `sysl.time`'s `parse_offset` accepts: two
+    // digits, a colon, two digits, after a sign. **`Z` is handled by the caller** and a form without
+    // the colon is refused, exactly as it is under the interpreter.
+    const offsetMinutes = (s) => {
+        if (!/^[-+][0-9]{2}:[0-9]{2}$/.test(s)) return null
+
+        const h = Number(s.slice(1, 3))
+        const m = Number(s.slice(4, 6))
+
+        if (h > 23 || m > 59) return null
+
+        return (s[0] === "-" ? -1 : 1) * (h * 60 + m)
+    }
+
+    // The zone a name names, or the sentence saying why there is none. **Every sentence is
+    // `time.sysl`'s `zone_named` word for word**, so a program that names a zone it does not have
+    // reads the same complaint whichever back end ran it.
+    //
+    // **A name is refused before `Intl` is asked where it could not be a zone name**, which is the
+    // interpreter's rule and is there because `zone(name)` takes a string a program may have read out
+    // of a file. It matters less here -- `Intl` reaches no file system -- but a complaint that
+    // differed between the back ends would be a difference in the language rather than in the host.
+    const zoneNamed = (name) => {
+        const known = ZONES.get(name)
+
+        if (known !== undefined) return { zone: known, error: null }
+        if (name === "UTC" || name === "Z" || name === "GMT") return { zone: fixedZone("UTC", 0), error: null }
+
+        if (name.startsWith("+") || name.startsWith("-")) {
+            const minutes = offsetMinutes(name)
+
+            if (minutes === null)
+                return { zone: null, error: "`" + name + "` is not an offset -- an offset is written `+05:30`" }
+
+            return { zone: fixedZone(name, minutes), error: null }
+        }
+
+        if (name === "" || name.startsWith("/") || name.includes(".."))
+            return { zone: null, error: "`" + name + "` is not the name of a zone" }
+
+        // **`Intl` is what says whether the host has the zone**, and the way to ask is to build a
+        // formatter and see whether it throws. There is no list to consult: `supportedValuesOf`
+        // exists in newer engines and answers the canonical names only, so a link like
+        // `US/Eastern` -- which the interpreter reads happily -- would be refused by a check against
+        // it. Building the formatter is also the thing every later reading needs, so the cost is
+        // paid once either way.
+        let made = null
+
+        try {
+            made = zoneFormatter(name)
+        } catch (e) {
+            return { zone: null, error: "there is no zone called `" + name + "` on this host" }
+        }
+
+        const z = new SZone(name, name, false, 0)
+
+        ZONES.set(name, z)
+
+        return { zone: z, error: null }
+    }
+
+    // The zone this host is set to.
+    //
+    // **It is called `local` and not by its IANA name**, which is the interpreter's answer: that
+    // entry is built from `/etc/localtime`, a file that names no zone. A program wanting the name
+    // asks the host for it; a program wanting the rules has them either way.
+    const localZoneValue = () => {
+        const known = ZONES.get("local")
+
+        if (known !== undefined) return known
+
+        let lookup = "UTC"
+
+        try {
+            lookup = new Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"
+        } catch (e) {
+            lookup = "UTC"
+        }
+
+        const z = new SZone("local", lookup, false, 0)
+
+        ZONES.set("local", z)
+
+        return z
+    }
+
+    // -- what a zone's clocks read, over `Intl` ------------------------------------------------
+
+    // **One formatter per zone, kept**, because building one is far and away the expensive part of a
+    // reading and a program that formats a column of timestamps builds exactly one.
+    const ZONE_FORMATTERS = new Map()
+
+    const zoneFormatter = (name) => {
+        let f = ZONE_FORMATTERS.get(name)
+
+        if (f === undefined) {
+            // **`era` is asked for and it is not decoration**: without it a year before 1 comes back
+            // as a positive number and every offset in the first century is read from the wrong
+            // side of the epoch. `hourCycle: "h23"` is asked for so that midnight is `0` rather than
+            // the `24` an `h24` locale would give.
+            f = new Intl.DateTimeFormat("en-US", { timeZone: name, hourCycle: "h23", era: "short",
+                year: "numeric", month: "numeric", day: "numeric",
+                hour: "numeric", minute: "numeric", second: "numeric" })
+
+            ZONE_FORMATTERS.set(name, f)
+        }
+
+        return f
+    }
+
+    // A wall reading as a count of milliseconds, treating it as though it were UTC.
+    //
+    // **`setUTCFullYear` and not `Date.UTC`**, which is the trap in this corner of JavaScript:
+    // `Date.UTC` maps a year of 0 to 99 onto 1900 to 1999, silently, so every reading in the first
+    // century would be off by nineteen hundred years. The setter takes the year it is given.
+    const wallMsOf = (year, month, day, hour, minute, second) => {
+        const d = new Date(0)
+
+        d.setUTCFullYear(year, month - 1, day)
+        d.setUTCHours(hour, minute, second, 0)
+
+        return d.getTime()
+    }
+
+    // The widest instant a JavaScript `Date` holds. A reading past it is clamped rather than refused:
+    // no zone database has a rule that far out, so both back ends are reporting the last rule they
+    // know, and a fault here would be this back end refusing a value the other one answers for.
+    const MS_LIMIT = 8640000000000000
+
+    // How far a zone's clocks were set from UTC at that instant, in whole minutes.
+    //
+    // **The reading is taken and then undone**, which is the only route `Intl` offers: ask the zone
+    // what its clocks showed, rebuild that reading as though it were UTC, and the difference is the
+    // offset. There is no API that answers the offset directly.
+    const zoneOffsetAt = (z, us) => {
+        if (z.fixed) return z.minutes
+
+        const ms = Number(floorDiv(us, US_PER_MILLI))
+        const clamped = ms > MS_LIMIT ? MS_LIMIT : ms < -MS_LIMIT ? -MS_LIMIT : ms
+        const p = {}
+
+        for (const part of zoneFormatter(z.lookup).formatToParts(new Date(clamped))) p[part.type] = part.value
+
+        // `era` comes out as `AD`/`BC` in most engines and `A`/`B` in some; both are checked because
+        // the difference is an ICU version rather than anything a program can control.
+        let year = Number(p.year)
+
+        if (p.era === "BC" || p.era === "B") year = 1 - year
+
+        const wall = wallMsOf(year, Number(p.month), Number(p.day),
+            Number(p.hour) % 24, Number(p.minute), Number(p.second))
+
+        // **TRUNCATED TOWARD ZERO AND NOT ROUNDED, and a rounded one is wrong by a minute for every
+        // zone before it had a railway.** `sysl.time`'s `Offset` is whole MINUTES and tzdata carries
+        // local mean time in seconds, so `sysl.time.tzif` truncates -- Toronto's LMT is -5:17:32,
+        // which is -317 minutes there and would be -318 rounded. The two back ends then disagree
+        // about every reading before 1883 in that zone, which is exactly the class of silent
+        // difference this whole file exists to avoid. Found by a negative control: dropping the era
+        // handling above changed nothing in the corpus, which said the corpus had no reading old
+        // enough to reach it -- and adding one turned this up.
+        return Math.trunc((wall - clamped) / 60000)
+    }
+
+    // -- the civil calendar, which is `sysl.time`'s own arithmetic -------------------------------
+
+    const floorMod = (a, b) => a - floorDiv(a, b) * b
+
+    // Howard Hinnant's algorithm, which is `civil.sysl`'s `days_from_civil` line for line. Its
+    // inverse is `civilFromDays` below, and `js_rt_time.sysl`'s `civilText` is that same inverse
+    // written to print rather than to answer.
+    const daysFromCivil = (y0, m, d) => {
+        const y = m <= 2n ? y0 - 1n : y0
+        const era = floorDiv(y, 400n)
+        const yoe = y - era * 400n
+        const mp = m > 2n ? m - 3n : m + 9n
+        const doy = (153n * mp + 2n) / 5n + d - 1n
+        const doe = yoe * 365n + yoe / 4n - yoe / 100n + doy
+
+        return era * 146097n + doe - 719468n
+    }
+
+    const civilFromDays = (day) => {
+        const z = day + 719468n
+        const era = floorDiv(z, 146097n)
+        const doe = z - era * 146097n
+        const yoe = (doe - doe / 1460n + doe / 36524n - doe / 146096n) / 365n
+        const doy = doe - (365n * yoe + yoe / 4n - yoe / 100n)
+        const mp = (5n * doy + 2n) / 153n
+        const dayOfMonth = doy - (153n * mp + 2n) / 5n + 1n
+        const month = mp < 10n ? mp + 3n : mp - 9n
+
+        return { year: yoe + era * 400n + (month <= 2n ? 1n : 0n), month: month, day: dayOfMonth }
+    }
+
+    const leapYear = (y) => y % 4n === 0n && (y % 100n !== 0n || y % 400n === 0n)
+
+    const daysInMonth = (y, m) => {
+        if (m === 2n) return leapYear(y) ? 29n : 28n
+
+        return m === 4n || m === 6n || m === 9n || m === 11n ? 30n : 31n
+    }
+
+    const dayOfYear = (day) => {
+        const c = civilFromDays(day)
+
+        return day - daysFromCivil(c.year, 1n, 1n) + 1n
+    }
+
+    // 1970-01-01 was a Thursday, so shifting by four puts Sunday at zero.
+    const weekdayOf = (day) => floorMod(day + 4n, 7n)
+
+    const WEEKDAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+
+    const MONTH_NAMES = ["January", "February", "March", "April", "May", "June", "July", "August",
+        "September", "October", "November", "December"]
+
+    const monthName = (m) => (m >= 1n && m <= 12n ? MONTH_NAMES[Number(m) - 1] : "?")
+
+    // The first date on or after this one falling on the given weekday.
+    const onOrAfterDay = (day, wanted) => day + floorMod(wanted - weekdayOf(day), 7n)
+
+    // A date only where the calendar has one, which is `checked_date` and is the check `date(y, m, d)`
+    // makes. `daysFromCivil` on its own is pure arithmetic and answers the 2nd of March for the 30th
+    // of February.
+    const checkedDate = (y, m, d) => {
+        if (m < 1n || m > 12n) return null
+        if (d < 1n || d > daysInMonth(y, m)) return null
+
+        return daysFromCivil(y, m, d)
+    }
+
+    // Months are added by the calendar and the day is CLAMPED where the month it lands in is
+    // shorter, so the 31st of January plus a month is the 28th or 29th of February.
+    const plusMonths = (day, n) => {
+        const c = civilFromDays(day)
+        const total = c.year * 12n + (c.month - 1n) + n
+        const y = floorDiv(total, 12n)
+        const m = floorMod(total, 12n) + 1n
+        const last = daysInMonth(y, m)
+
+        return daysFromCivil(y, m, c.day < last ? c.day : last)
+    }
+
+    // **Months first and days after**, which is the order every calendar library settles on and which
+    // `time.sysl`'s `moved_date` states its reason for.
+    const movedDate = (day, months, days) => plusMonths(day, months) + days
+
+    // A wall reading as one number and back again, which is what lets a civil reading be moved by a
+    // length of timeline.
+    const wallUs = (day, us) => day * US_PER_DAY + us
+
+    const wallOf = (us) => {
+        const day = floorDiv(us, US_PER_DAY)
+
+        return { day: day, us: us - day * US_PER_DAY }
+    }
+
+    const atOffset = (us, minutes) => wallOf(us + BigInt(minutes) * US_PER_MINUTE)
+
+    const fromOffset = (day, us, minutes) => wallUs(day, us) - BigInt(minutes) * US_PER_MINUTE
+
+    // The wall reading a zoned value shows.
+    const zonedWall = (us, z) => atOffset(us, zoneOffsetAt(z, us))
+
+    // -- resolving a wall reading against a zone -------------------------------------------------
+
+    // `sysl.time`'s `resolve`, and its whole argument carried with it: a reading taken as though the
+    // offset were zero is within fourteen hours of the instant it names, so the offsets a day either
+    // side of that guess bracket every transition that could bear on the answer. Each candidate is
+    // applied and then checked against itself -- an offset still in force at the instant it produces
+    // is a real answer. One survivor is unique, two is ambiguous, none is a gap.
+    //
+    // **The assumption is that a zone does not change its offset twice inside forty-eight hours**, and
+    // no zone in the IANA database ever has. `zone.sysl` states it in the same words and neither
+    // implementation could detect one that did.
+    //
+    // **This is the one calendar answer `Intl` will not give directly and the reason it does not have
+    // to**: it is built out of offsets alone, which is exactly what was measured to agree.
+    const resolveWall = (day, us, z) => {
+        const guess = wallUs(day, us)
+        const before = zoneOffsetAt(z, guess - US_PER_DAY)
+        const after = zoneOffsetAt(z, guess + US_PER_DAY)
+
+        if (before === after) return { kind: "unique", at: fromOffset(day, us, before) }
+
+        const a = fromOffset(day, us, before)
+        const b = fromOffset(day, us, after)
+        const aOk = zoneOffsetAt(z, a) === before
+        const bOk = zoneOffsetAt(z, b) === after
+
+        // Ordered by the timeline rather than by which offset was in force first, so `earlier` means
+        // what it says whichever way the clocks went.
+        if (aOk && bOk)
+            return a < b ? { kind: "ambiguous", earlier: a, later: b }
+                : { kind: "ambiguous", earlier: b, later: a }
+
+        if (aOk) return { kind: "unique", at: a }
+        if (bOk) return { kind: "unique", at: b }
+
+        return { kind: "gap", before: before, after: after }
+    }
+
+    // A wall reading put back into its zone with the two awkward cases decided the way a calendar
+    // step means them: a repeated hour takes the earlier and a skipped one is pushed past the gap.
+    // `time.sysl`'s `calendar_moved` and `calendar_start` both do this.
+    const settledInZone = (day, us, z) => {
+        const r = resolveWall(day, us, z)
+
+        if (r.kind === "unique") return new SZoned(r.at, z)
+        if (r.kind === "ambiguous") return new SZoned(r.earlier, z)
+
+        return new SZoned(fromOffset(day, us, r.before), z)
+    }
+
+    // -- how a calendar value prints --------------------------------------------------------------
+
+    // An offset as a clock reading is written, `+05:30` or `-0400`, with `Z` for none of it.
+    const offsetWritten = (minutes, colon) => {
+        if (minutes === 0) return "Z"
+
+        const sign = minutes < 0 ? "-" : "+"
+        const n = minutes < 0 ? -minutes : minutes
+
+        return sign + twoDigits(BigInt(Math.trunc(n / 60))) + (colon ? ":" : "") + twoDigits(BigInt(n % 60))
+    }
+
+    // A calendar length: `1y 2mo 3d`, and `0d` for none of it.
+    //
+    // **Months and days are printed separately and never folded together**, which is the type's whole
+    // claim: `months(1)` and `days(30)` are different lengths.
+    const periodText = (months, days) => {
+        if (months === 0n && days === 0n) return "0d"
+
+        const y = months / 12n
+        const mo = months % 12n
+        const parts = []
+
+        if (y !== 0n) parts.push(y + "y")
+        if (mo !== 0n) parts.push(mo + "mo")
+        if (days !== 0n) parts.push(days + "d")
+
+        return parts.join(" ")
+    }
+
+    // ISO 8601 throughout, which is `time.sysl`'s `temporal_text` for the six kinds it holds.
+    //
+    // **A zoned reading prints its offset and then its zone in brackets**, which is Java's form and
+    // the only one that round-trips -- the offset alone loses which zone it was and the name alone
+    // loses which side of a transition the reading was on. **A zone that is a fixed offset does not
+    // name itself again**, `...Z[UTC]` saying one thing twice.
+    const calendarText = (v) => {
+        if (v instanceof SDate) return civilText(v.day)
+        if (v instanceof STime) return clockText(v.us)
+        if (v instanceof SDateTime) return civilText(v.day) + "T" + clockText(v.us)
+        if (v instanceof SZone) return v.name
+        if (v instanceof SPeriod) return periodText(v.months, v.days)
+
+        const off = zoneOffsetAt(v.zone, v.us)
+        const wall = atOffset(v.us, off)
+        const named = v.zone.fixed ? "" : "[" + v.zone.name + "]"
+
+        return civilText(wall.day) + "T" + clockText(wall.us) + offsetWritten(off, true) + named
+    }
+
+    const isCalendar = (v) => v instanceof SDate || v instanceof STime || v instanceof SDateTime ||
+        v instanceof SZone || v instanceof SZoned || v instanceof SPeriod
+
+    // -- what a calendar value IS, and what it does beside another one ---------------------------
+
+    // The wall reading any of the three calendar-shaped values carries, or `null` where the value is
+    // not one of them. **One question asked of three types**, which is what lets `year`, `month` and
+    // the rest be one implementation each.
+    const wallReading = (v) => {
+        if (v instanceof SDate) return { day: v.day, us: 0n }
+        if (v instanceof STime) return { day: 0n, us: v.us }
+        if (v instanceof SDateTime) return { day: v.day, us: v.us }
+        if (v instanceof SZoned) return zonedWall(v.us, v.zone)
+
+        return null
+    }
+
+    const hasDate = (v) => v instanceof SDate || v instanceof SDateTime || v instanceof SZoned
+
+    const hasTime = (v) => v instanceof STime || v instanceof SDateTime || v instanceof SZoned
+
+    // `+`, `-` and `*` where either side is a calendar value, and `undefined` for a pair this has
+    // nothing to say about -- `js_rt_ops.sysl` tries it after `temporalArith` and falls through to
+    // an object's own hook, which is `arith.sysl`'s ordering.
+    //
+    // **A duration may be added to anything and a period only to a calendar reading**, which is the
+    // rule that earns the two types: `t + days(1)` keeps the wall clock across a daylight saving
+    // change and `t + hours(24)` does not.
+    const calendarArith = (op, a, b) => {
+        const shifted = (forward, back) => op === "+" ? forward : op === "-" ? back : undefined
+
+        if (a instanceof SInstant && b instanceof SPeriod) {
+            if (op === "+" || op === "-")
+                $.fault("an instant has no calendar to move by -- read it in a zone first, with `t.at(zone)`")
+
+            return undefined
+        }
+
+        if (a instanceof SPeriod) {
+            if (b instanceof SPeriod) {
+                if (op === "+") return new SPeriod(a.months + b.months, a.days + b.days)
+                if (op === "-") return new SPeriod(a.months - b.months, a.days - b.days)
+
+                return undefined
+            }
+
+            if ($.isInt(b) && op === "*") return new SPeriod(a.months * b, a.days * b)
+
+            return undefined
+        }
+
+        if (a instanceof SDate) {
+            if (b instanceof SPeriod)
+                return shifted(new SDate(movedDate(a.day, b.months, b.days)),
+                    new SDate(movedDate(a.day, -b.months, -b.days)))
+
+            // **The difference of two dates is a period of DAYS and not of months**, because the
+            // number of months between two dates depends on which end you count from.
+            if (b instanceof SDate && op === "-") return new SPeriod(0n, a.day - b.day)
+
+            return undefined
+        }
+
+        if (a instanceof SDateTime) {
+            if (b instanceof SDuration) {
+                const forward = wallOf(wallUs(a.day, a.us) + b.us)
+                const back = wallOf(wallUs(a.day, a.us) - b.us)
+
+                return shifted(new SDateTime(forward.day, forward.us), new SDateTime(back.day, back.us))
+            }
+
+            if (b instanceof SPeriod)
+                return shifted(new SDateTime(movedDate(a.day, b.months, b.days), a.us),
+                    new SDateTime(movedDate(a.day, -b.months, -b.days), a.us))
+
+            if (b instanceof SDateTime && op === "-")
+                return new SDuration($.i64(wallUs(a.day, a.us) - wallUs(b.day, b.us)))
+
+            return undefined
+        }
+
+        if (a instanceof SZoned) {
+            // **A duration moves a zoned reading along the timeline and a period moves its
+            // calendar.** An hour after 01:30 on a night the clocks go forward is 03:30; a day after
+            // Saturday at 09:00 is Sunday at 09:00, whatever happened to the clocks in between.
+            if (b instanceof SDuration)
+                return shifted(new SZoned($.i64(a.us + b.us), a.zone), new SZoned($.i64(a.us - b.us), a.zone))
+
+            if (b instanceof SPeriod) {
+                const wall = zonedWall(a.us, a.zone)
+
+                return shifted(settledInZone(movedDate(wall.day, b.months, b.days), wall.us, a.zone),
+                    settledInZone(movedDate(wall.day, -b.months, -b.days), wall.us, a.zone))
+            }
+
+            if (b instanceof SZoned && op === "-") return new SDuration($.i64(a.us - b.us))
+
+            return undefined
+        }
+
+        if ($.isInt(a) && b instanceof SPeriod && op === "*") return new SPeriod(a * b.months, a * b.days)
+
+        return undefined
+    }
+
+    // The four orderings over two calendar values of one kind, and `undefined` for anything else.
+    //
+    // **Two zoned readings order by the INSTANT, where equality also compares the zone**: 09:00 in
+    // Toronto and 09:00 in Tokyo are neither before nor after each other and are not equal either,
+    // so the two questions genuinely have different answers. Java draws the line in the same place.
+    const calendarCompare = (op, a, b) => {
+        const ordered = (x, y) => op === "<" ? x < y : op === "<=" ? x <= y : op === ">" ? x > y : x >= y
+
+        if (a instanceof SDate && b instanceof SDate) return ordered(a.day, b.day)
+        if (a instanceof STime && b instanceof STime) return ordered(a.us, b.us)
+        if (a instanceof SDateTime && b instanceof SDateTime)
+            return ordered(wallUs(a.day, a.us), wallUs(b.day, b.us))
+        if (a instanceof SZoned && b instanceof SZoned) return ordered(a.us, b.us)
+
+        return undefined
+    }
+
+    // Whether two calendar values are equal, or `undefined` where neither side is one.
+    //
+    // **Each is equal to one of its own kind naming the same thing and to nothing else** -- a date
+    // and a dateTime at midnight are not equal, for the reason an integer and a string of digits are
+    // not. A period compares on its two scales and does not normalise between them, since it cannot.
+    const calendarSame = (a, b) => {
+        if (a instanceof SDate) return b instanceof SDate && a.day === b.day
+        if (a instanceof STime) return b instanceof STime && a.us === b.us
+        if (a instanceof SDateTime) return b instanceof SDateTime && a.day === b.day && a.us === b.us
+        if (a instanceof SZone) return b instanceof SZone && a.name === b.name
+        if (a instanceof SZoned)
+            return b instanceof SZoned && a.us === b.us && a.zone.name === b.zone.name
+        if (a instanceof SPeriod)
+            return b instanceof SPeriod && a.months === b.months && a.days === b.days
+
+        return undefined
+    }
+
+    // Where a calendar value sits in a table, or `null` for something that is not one.
+    //
+    // **Each kind is salted with its own letter**, as the timeline kinds are, so a date and a period
+    // holding the same number never collide. `table.sysl` salts for the same reason.
+    const calendarKey = (v) => {
+        if (v instanceof SDate) return "D" + v.day
+        if (v instanceof STime) return "T" + v.us
+        if (v instanceof SDateTime) return "W" + v.day + ":" + v.us
+        if (v instanceof SZone) return "Z" + v.name
+        if (v instanceof SZoned) return "N" + v.us + ":" + v.zone.name
+        if (v instanceof SPeriod) return "P" + v.months + ":" + v.days
+
+        return null
+    }
+
+    // -- reading a date, a time or a timestamp back out of text ----------------------------------
+
+    // `sysl.time`'s `parse.sysl`, whose three refusals are what the four builtins quote. **A parse
+    // checks the CALENDAR and not only the shape**: `2026-02-30` has the right digits in the right
+    // places and is not a date.
+    const badShape = (at) => ({ error: "not the expected shape at byte " + at })
+    const outOfRange = (what) => ({ error: what + " is out of range" })
+    const trailing = (at) => ({ error: "unexpected text at byte " + at })
+
+    // A run of exactly `n` digits, as a number. **Not a general integer reader**: one would take a
+    // leading sign, and `+12-31` is not a month.
+    const digitsAt = (s, at, n) => {
+        if (at + n > s.length) return badShape(at)
+
+        let v = 0
+
+        for (let i = at; i < at + n; i = i + 1) {
+            const c = s.charCodeAt(i)
+
+            if (c < 48 || c > 57) return badShape(i)
+
+            v = v * 10 + (c - 48)
+        }
+
+        return { value: v }
+    }
+
+    const dateFrom = (s, at) => {
+        const y = digitsAt(s, at, 4)
+
+        if (y.error !== undefined) return y
+        if (s.charCodeAt(at + 4) !== 45) return badShape(at + 4)
+
+        const m = digitsAt(s, at + 5, 2)
+
+        if (m.error !== undefined) return m
+        if (s.charCodeAt(at + 7) !== 45) return badShape(at + 7)
+
+        const d = digitsAt(s, at + 8, 2)
+
+        if (d.error !== undefined) return d
+        if (m.value < 1 || m.value > 12) return outOfRange("month")
+        if (d.value < 1 || BigInt(d.value) > daysInMonth(BigInt(y.value), BigInt(m.value)))
+            return outOfRange("day")
+
+        return { value: daysFromCivil(BigInt(y.value), BigInt(m.value), BigInt(d.value)), next: at + 10 }
+    }
+
+    // `HH:MM`, `HH:MM:SS` or `HH:MM:SS.ffffff`, the seconds and the fraction each optional. A
+    // seconds field is present only where a colon follows and a fraction only where a dot follows
+    // that, which is what lets a timestamp read an offset off the tail.
+    const timeFrom = (s, at) => {
+        const h = digitsAt(s, at, 2)
+
+        if (h.error !== undefined) return h
+        if (s.charCodeAt(at + 2) !== 58) return badShape(at + 2)
+
+        const mi = digitsAt(s, at + 3, 2)
+
+        if (mi.error !== undefined) return mi
+        if (h.value > 23) return outOfRange("hour")
+        if (mi.value > 59) return outOfRange("minute")
+
+        let us = BigInt(h.value) * US_PER_HOUR + BigInt(mi.value) * US_PER_MINUTE
+        let next = at + 5
+
+        if (next >= s.length || s.charCodeAt(next) !== 58) return { value: us, next: next }
+
+        const sec = digitsAt(s, next + 1, 2)
+
+        if (sec.error !== undefined) return sec
+        if (sec.value > 59) return outOfRange("second")
+
+        us = us + BigInt(sec.value) * US_PER_SECOND
+        next = next + 3
+
+        if (next >= s.length || s.charCodeAt(next) !== 46) return { value: us, next: next }
+
+        // Up to six digits of fraction, each worth ten times less than the last. Fewer than six is
+        // legal and means what it says: `.5` is half a second and not five microseconds.
+        let scale = US_PER_SECOND
+        let i = next + 1
+        let seen = 0
+
+        while (i < s.length && s.charCodeAt(i) >= 48 && s.charCodeAt(i) <= 57 && seen < 6) {
+            scale = scale / 10n
+            us = us + BigInt(s.charCodeAt(i) - 48) * scale
+            i = i + 1
+            seen = seen + 1
+        }
+
+        if (seen === 0) return badShape(next + 1)
+
+        return { value: us, next: i }
+    }
+
+    const offsetFrom = (s, at) => {
+        if (at >= s.length) return badShape(at)
+        if (s.charCodeAt(at) === 90) return { value: 0, next: at + 1 }
+        if (s.charCodeAt(at) !== 43 && s.charCodeAt(at) !== 45) return badShape(at)
+
+        const h = digitsAt(s, at + 1, 2)
+
+        if (h.error !== undefined) return h
+        if (s.charCodeAt(at + 3) !== 58) return badShape(at + 3)
+
+        const m = digitsAt(s, at + 4, 2)
+
+        if (m.error !== undefined) return m
+        if (h.value > 23) return outOfRange("offset hour")
+        if (m.value > 59) return outOfRange("offset minute")
+
+        const sign = s.charCodeAt(at) === 45 ? -1 : 1
+
+        return { value: sign * (h.value * 60 + m.value), next: at + 6 }
+    }
+
+    // A date and a time joined by a space or a `T`. **Both spellings are read because both are
+    // written**: ISO 8601 says `T` and a person writes a space.
+    const joinedAt = (s, at) => s.charCodeAt(at) === 32 || s.charCodeAt(at) === 84
+
+    const parseDateText = (s) => {
+        const d = dateFrom(s, 0)
+
+        if (d.error !== undefined) return d
+        if (d.next !== s.length) return trailing(d.next)
+
+        return { value: new SDate(d.value) }
+    }
+
+    const parseTimeText = (s) => {
+        const t = timeFrom(s, 0)
+
+        if (t.error !== undefined) return t
+        if (t.next !== s.length) return trailing(t.next)
+
+        return { value: new STime(t.value) }
+    }
+
+    const parseDateTimeText = (s) => {
+        const d = dateFrom(s, 0)
+
+        if (d.error !== undefined) return d
+        if (d.next >= s.length || !joinedAt(s, d.next)) return badShape(d.next)
+
+        const t = timeFrom(s, d.next + 1)
+
+        if (t.error !== undefined) return t
+        if (t.next !== s.length) return trailing(t.next)
+
+        return { value: new SDateTime(d.value, t.value) }
+    }
+
+    const parseTimestampText = (s) => {
+        const d = dateFrom(s, 0)
+
+        if (d.error !== undefined) return d
+        if (d.next >= s.length || !joinedAt(s, d.next)) return badShape(d.next)
+
+        const t = timeFrom(s, d.next + 1)
+
+        if (t.error !== undefined) return t
+
+        const o = offsetFrom(s, t.next)
+
+        if (o.error !== undefined) return o
+        if (o.next !== s.length) return trailing(o.next)
+
+        return { value: new SInstant($.i64(fromOffset(d.value, t.value, o.value))) }
+    }
+    """

@@ -36,10 +36,10 @@ The operators follow because the two languages disagree too often for the except
 says *"not in the JavaScript back end yet"* when a program reaches it, rather than a name that is not
 there — so a program is told which half of the world it is in.
 
-### `slate:time` is half here, and the half it is not is named
+### `slate:time` is whole, except for two things a JavaScript host does not have
 
-**The timeline is here and the calendar is not.** An instant, a duration, the clock that reads one and
-the arithmetic over both work exactly as they do under the interpreter:
+An instant, a duration, the clock that reads one and the arithmetic over both work exactly as they do
+under the interpreter:
 
 ```slate
 import { epochMillis, epochSeconds, seconds, minutes, hours, now } from slate:time
@@ -59,23 +59,48 @@ print(epochSeconds(t), now() is instant)
 1756900000 true
 ```
 
-**`date`, `time`, `dateTime`, `zone`, `zoned`, `period` and everything that formats or parses one still
-say they are not here** — so `date(2026, 1, 1)`, `t.at(zone("America/Toronto"))`, `days(1)` and
-`format` all refuse under `slate js`, each with that sentence.
+**And so does the calendar.** `date`, `time`, `dateTime`, `zone`, `zoned` and `period` are built over
+`Intl` — the value model, the arithmetic, `startOf`, `onOrAfter`, `format` and the four parsers — and
+answer what the interpreter answers:
 
-Half-doing the calendar is what this avoids. A zone read from `Intl` and a zone read from the IANA
-database are two answers to one question, and a program that says what time a meeting is in Toronto may
-not get a different answer for having been compiled rather than interpreted.
+```slate
+import { date, dateTime, zone, epochSeconds, days, hours, months, parseDate } from slate:time
 
-**That was a worry rather than a measurement, and it has now been measured.** Twelve zones — including
-half-hour and three-quarter-hour offsets, both directions of DST, a zone that changed its mind about
-the date line, a reading in 2000 and one in 2038 — against seven instants each, is **84 offsets, and
-`Intl` and the IANA database agree on all 84**. So the numeric calendar can be built here and hold
-its answers.
+val toronto = zone("America/Toronto").value
+val t = epochSeconds(1719792000).at(toronto)
 
-**`abbrev` is the one that cannot, and it is not a version skew.** `Intl` has no IANA abbreviation at
-all: what its `timeZoneName` options carry is CLDR's English *display* data, which agrees with tzdata
-for American zones by coincidence and nowhere else. Measured on one instant:
+// The Saturday evening before the clocks go forward, which is where a day and twenty-four hours
+// stop being the same length.
+val night = dateTime(2024, 3, 9, 20, 0).at(toronto).value
+
+print(t)
+print(t.year(), t.monthName(), t.weekday(), t.hour())
+print(t.format("WWWW, MMMM D, Y |at| h12:mm a"))
+print(date(2024, 1, 31) + months(1), night + days(1), night + hours(24))
+print(dateTime(2024, 3, 10, 2, 30).at(toronto).error)
+print(parseDate("2024-02-30").error)
+```
+
+```output
+2024-06-30T20:00:00-04:00[America/Toronto]
+2024 June Sunday 20
+Sunday, June 30, 2024 at 8:00 pm
+2024-02-29 2024-03-10T20:00:00-04:00[America/Toronto] 2024-03-10T21:00:00-04:00[America/Toronto]
+2024-03-10T02:30:00 never happens in America/Toronto -- the clocks go from -05:00 to -04:00 -- say `.at(zone, "after")` to take the reading past the gap
+cannot read "2024-02-30" as a date: day is out of range
+```
+
+The worry that kept the calendar out was that a zone read from `Intl` and a zone read from the IANA
+database are two answers to one question, and a program saying what time a meeting is in Toronto may
+not get a different answer for having been compiled rather than interpreted. **That was a worry rather
+than a measurement, and it has been measured**: every zone this machine has, 598 of them, at six
+instants. The two agree on **all 2985 readings from 2000 through 2025**.
+
+**Two names still refuse, and neither is owed work — they are things the host does not have.**
+
+**`abbrev`, because `Intl` has no IANA abbreviation at all.** What its `timeZoneName` options carry is
+CLDR's English *display* data, which agrees with tzdata for American zones by coincidence and nowhere
+else. Measured on one instant:
 
 | zone | IANA | `short` | `long` |
 |---|---|---|---|
@@ -84,10 +109,37 @@ for American zones by coincidence and nowhere else. Measured on one instant:
 | `Asia/Kolkata` | `IST` | `GMT+5:30` | India Standard Time |
 | `Africa/Cairo` | `EEST` | `GMT+3` | Eastern European Summer Time |
 
-67 of the same 84 readings disagree. A table carried in the runtime would be a second copy of tzdata
-going stale in a file nobody looks at, so **`abbrev` stays owed in the JavaScript back end** and says
-so in the same sentence every other owed name says. It is the honest case for that list: a browser
-does not have this, rather than slate not having got to it.
+67 of 84 readings disagree, and `shortGeneric` is worse — "United Kingdom Time". `zzz` in a `format`
+pattern is the same name under another spelling and refuses with the same sentence.
+
+**`isDST`, because `Intl` exposes no daylight-saving flag**, and the offset-comparison rule every
+JavaScript date library uses instead is unsound in *both* directions. Over 3582 readings it is wrong at
+31 of them:
+
+- it **misses** a zone that is permanently on daylight time. `Africa/Casablanca` and `Africa/El_Aaiun`
+  are `+01` all year with tzdata's flag set, and every Argentine zone was in 2000. No comparison of
+  offsets can see a flag that never changes.
+- it **invents** one for a zone that moved its *standard* offset mid-year. `Asia/Almaty` and
+  `Asia/Qostanay` went `+06` to `+05` in March 2024, so January's offset exceeds May's and the rule
+  reads January as daylight time.
+
+The second half is what settles it: the failure is an ordinary permanent offset change rather than an
+exotic zone, so there is no version of the rule that under-reports safely.
+
+**The alternative to both — a table of zone rules carried in slate's own JavaScript runtime — was
+considered and refused.** It would answer them, which is what makes it a decision rather than an
+oversight. It is refused because it is a *second copy of tzdata*: an authority the runtime would hold
+against the one the interpreter reads from the system database, kept in step by hand, in a place nobody
+looks until a zone changes and only one of the two back ends notices. The measurement above is exactly
+the drift that copy would reintroduce.
+
+**One thing the measurement DID find, and it is nobody's defect.** The two back ends read two copies of
+tzdata — the interpreter reads the host's `/usr/share/zoneinfo` and a JavaScript engine reads the
+release bundled into its ICU — and those are not always the same release. On this machine they were
+2026c and 2025c, and the seven readings out of 3582 where the offsets disagreed were all at 2038-01-01,
+in zones whose *future* rules changed in the release between. Each back end reads the database its host
+has, which is what both are supposed to do; a program that pins a projected offset decades out is
+pinning the skew rather than the calendar.
 
 **An instant is a whole number of milliseconds from the clock on both back ends**, `Date.now()` having
 nothing finer — the interpreter drops its microseconds to match. An instant a program *builds* keeps
