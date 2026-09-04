@@ -1,0 +1,118 @@
+module dev.slatelang.slate
+@tests
+
+import sh.sysl.parsing.*
+
+// Which chunks put their names in numbered slots, and what a slotted chunk still gets right.
+//
+// **THESE ARE THE TESTS THAT WOULD OTHERWISE PASS VACUOUSLY.** Slotting is an optimisation, so every
+// question about what a program ANSWERS is green whether the chunk slotted or not -- which means a
+// change that quietly stopped slotting anything would break no test at all, and so would one that
+// slotted a chunk it must not. `tests/lang/` covers the answers on both back ends; this file covers
+// the decision, by compiling a program and asking the chunk.
+//
+// The behaviour that goes with each of these is in `tests/lang/frames.sl`, where it runs under the
+// JavaScript back end too.
+
+// Whether the chunk of that name slotted its names, after running the program.
+//
+// **`current_unit` is module state and outlives `run`**, which is what makes this possible without a
+// second entry point into the compiler. A name no chunk has is a failure rather than a false: asking
+// about a function that is not there is a test that has rotted, and answering "no" would hide it.
+private slotting(program: string, name: string) -> bool
+    out(program)
+
+    for i in 0..<current_unit.chunks.len()
+        if current_unit.chunks.at(i).name == name then return current_unit.chunks.at(i).slotted
+
+    assert(false, s"no chunk is called `${name}`")
+    false
+end slotting
+
+// How many cells that chunk reserves.
+private slot_count(program: string, name: string) -> usize
+    out(program)
+
+    for i in 0..<current_unit.chunks.len()
+        if current_unit.chunks.at(i).name == name then return current_unit.chunks.at(i).slots
+
+    assert(false, s"no chunk is called `${name}`")
+    0
+end slot_count
+
+@test
+A_PLAIN_FUNCTION_SLOTS_ITS_PARAMETERS_AND_ITS_LOCALS()
+    assert(slotting("f(a, b)\n    val c = a + b\n    c\nprint(f(1, 2))", "f"))
+
+    // Two parameters and one local.
+    assert_eq(slot_count("f(a, b)\n    val c = a + b\n    c\nprint(f(1, 2))", "f"), 3)
+end A_PLAIN_FUNCTION_SLOTS_ITS_PARAMETERS_AND_ITS_LOCALS
+
+@test
+A_MODULE_NEVER_SLOTS_BECAUSE_AN_IMPORT_READS_ITS_NAMES_BY_NAME()
+    assert_eq(slot_count("val a = 1\nprint(a)", "t"), 0)
+end A_MODULE_NEVER_SLOTS_BECAUSE_AN_IMPORT_READS_ITS_NAMES_BY_NAME
+
+@test
+A_CHUNK_HOLDING_A_NESTED_FUNCTION_KEEPS_EVERY_NAME_IN_THE_CHAIN()
+    // A closure captures the scope chain by pointer and may read a name long after the frame that
+    // declared it has returned.
+    assert(!slotting("f(a)\n    val g = () -> a\n    g()\nprint(f(1))", "f"))
+    assert(!slotting("f(a)\n    g() = a\n    g()\nprint(f(1))", "f"))
+end A_CHUNK_HOLDING_A_NESTED_FUNCTION_KEEPS_EVERY_NAME_IN_THE_CHAIN
+
+@test
+A_CHUNK_WHOSE_OWN_NAME_A_PATTERN_MENTIONS_DOES_NOT_SLOT()
+    // **`ProtoPat` looks a class name up in the scope the match is RUNNING in**, so a parameter
+    // shadowing a class makes the test false -- and a slotted name is not in that scope at all, so
+    // the lookup would walk past the shadow and find the class. Refusing the chunk is what keeps the
+    // answer the one `tests_classes.sysl` pins.
+    val prog = "class A\n    new(x) = { x: x }\nval a = A.new(1)\nf(A) = a is A\nprint(f(A))"
+
+    assert(!slotting(prog, "f"))
+
+    // The same function without the shadow slots as usual.
+    assert(slotting("class A\n    new(x) = { x: x }\nval a = A.new(1)\nf(v) = v is A\nprint(f(a))", "f"))
+end A_CHUNK_WHOSE_OWN_NAME_A_PATTERN_MENTIONS_DOES_NOT_SLOT
+
+@test
+A_catch_BINDS_ONE_NAME_AND_NO_PATTERN_SO_ITS_CHUNK_STILL_SLOTS()
+    // The binding form with no ordering question in it, which is why it is the one taught first.
+    val prog = "boom()\n    throw \"no\"\nf()\n    val v = boom() catch e ->\n        e.message\n\n    v\nprint(f())"
+
+    assert(slotting(prog, "f"))
+
+    // The local and the handler's name are two cells.
+    assert_eq(slot_count(prog, "f"), 2)
+    assert_eq(out(prog), "no")
+end A_catch_BINDS_ONE_NAME_AND_NO_PATTERN_SO_ITS_CHUNK_STILL_SLOTS
+
+@test
+TWO_catch_BLOCKS_USING_ONE_NAME_TAKE_TWO_CELLS()
+    // **A slot is never reused when its block ends**, so two handlers spelling their name the same
+    // way are two cells rather than one written twice -- which is what makes the second one's value
+    // its own however the first one went.
+    val prog = "one()\n    throw \"one\"\ntwo()\n    throw \"two\"\nf()\n    val a = one() catch e ->\n        e.message\n\n    val b = two() catch e ->\n        e.message\n\n    a + \" \" + b\nprint(f())"
+
+    assert(slotting(prog, "f"))
+    assert_eq(out(prog), "one two")
+end TWO_catch_BLOCKS_USING_ONE_NAME_TAKE_TWO_CELLS
+
+@test
+A_catch_NAME_SHADOWS_AN_OUTER_ONE_AND_GIVES_IT_BACK()
+    val prog = "boom()\n    throw \"inner\"\nf()\n    val e = \"outer\"\n    val caught = boom() catch e ->\n        e.message\n\n    caught + \" \" + e\nprint(f())"
+
+    assert(slotting(prog, "f"))
+    assert_eq(out(prog), "inner outer")
+end A_catch_NAME_SHADOWS_AN_OUTER_ONE_AND_GIVES_IT_BACK
+
+@test
+A_FAULT_RAISED_IN_A_CALL_IS_CAUGHT_WITH_THE_CATCHERS_OWN_SLOTS_INTACT()
+    // **The handler runs in the frame the `try` was written in**, which may be several calls above
+    // where the fault was raised -- so its slots have to be exactly what they were. `guarded` cuts
+    // the stack back to the height `PushHandler` recorded, which sits above the slot window.
+    val prog = "deep(n)\n    if n == 0 then throw \"bottom\"\n\n    deep(n - 1)\nf()\n    val marker = 42\n    val said = deep(3) catch e ->\n        e.message\n\n    said + \" \" + string(marker)\nprint(f())"
+
+    assert(slotting(prog, "f"))
+    assert_eq(out(prog), "bottom 42")
+end A_FAULT_RAISED_IN_A_CALL_IS_CAUGHT_WITH_THE_CATCHERS_OWN_SLOTS_INTACT
