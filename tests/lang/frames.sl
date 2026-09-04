@@ -165,3 +165,120 @@ AN_is_THAT_BINDS_A_NAME_DOES_NOT_LEAVE_IT_BEHIND_AFTER_THE_CALL()
 
     named(9)
     assertEq(n, 0)
+
+@test
+A_for_HEAD_THAT_TAKES_ITS_ELEMENT_APART_BINDS_A_TURN_AT_A_TIME()
+    // Each turn writes the head's names again, so what the last turn left is what is read after it
+    // and nothing carries over from the turn before.
+    seen(pairs) =
+        var out = []
+
+        for [a, b] in pairs
+            push(out, a * 10 + b)
+
+        out
+
+    assertEq(seen([[1, 2], [3, 4], [5, 6]]), [12, 34, 56])
+
+@test
+A_for_HEAD_SHADOWS_AN_OUTER_NAME_AND_GIVES_IT_BACK()
+    shadowed() =
+        val a = "outer"
+        var last = ""
+
+        for [a, b] in [["x", "y"]]
+            last = a + b
+
+        last + " " + a
+
+    assertEq(shadowed(), "xy outer")
+
+@test
+A_DESTRUCTURING_BINDING_IS_READ_AFTER_THE_STATEMENT_THAT_MADE_IT()
+    taken(o) =
+        val { name, count } = o
+        val [head, ...rest] = [1, 2, 3]
+
+        name + string(count) + string(head) + string(len(rest))
+
+    assertEq(taken({ name: "n", count: 7 }), "n712")
+
+@test
+A_DESTRUCTURING_BINDING_SHADOWS_AN_OUTER_NAME_OF_THE_SAME_SPELLING()
+    shadowed() =
+        val name = "outer"
+        var inner = ""
+
+        if true
+            val { name } = { name: "inner" }
+
+            inner = name
+
+        inner + " " + name
+
+    assertEq(shadowed(), "inner outer")
+
+@test
+ONE_NAME_BOUND_BY_TWO_ARMS_OF_A_match_IS_TWO_BINDINGS_AND_NOT_ONE()
+    // **Two cells rather than one written twice**, which is what makes the second arm's value its
+    // own however the first arm went -- and the arm that misses must leave nothing behind.
+    read(v) = v match
+        [n] -> "one " + string(n)
+        [n, m] -> "two " + string(n + m)
+        { n } -> "field " + string(n)
+        _ -> "none"
+
+    assertEq(read([5]), "one 5")
+    assertEq(read([5, 6]), "two 11")
+    assertEq(read({ n: 9 }), "field 9")
+    assertEq(read("x"), "none")
+
+@test
+A_match_ARM_SHADOWS_AN_OUTER_NAME_AND_GIVES_IT_BACK()
+    shadowed(v) =
+        val n = "outer"
+
+        val said = v match
+            [n] -> string(n)
+            _ -> "no arm"
+
+        said + " " + n
+
+    assertEq(shadowed([3]), "3 outer")
+    assertEq(shadowed(4), "no arm outer")
+
+@test
+AN_ARM_THAT_MISSED_LEAVES_NOTHING_FOR_THE_NEXT_ONE_TO_READ()
+    // The first arm binds `a` and then its guard turns it down, so the arm that takes has to answer
+    // with what IT bound rather than with what the arm before it left standing.
+    read(v) = v match
+        [a] if a > 10 -> "big " + string(a)
+        [a] -> "small " + string(a)
+        _ -> "none"
+
+    assertEq(read([3]), "small 3")
+    assertEq(read([30]), "big 30")
+
+@test
+A_NAME_A_PATTERN_BINDS_IS_THE_ONE_A_NESTED_BLOCK_READS()
+    // A `for` inside a `match` arm inside a `for`: three binding sites, three sets of cells, and the
+    // innermost is what a read finds.
+    walk(rows) =
+        var out = []
+
+        for [tag, items] in rows
+            val said = tag match
+                "sum" ->
+                    var total = 0
+
+                    for n in items
+                        total = total + n
+
+                    total
+                _ -> 0
+
+            push(out, said)
+
+        out
+
+    assertEq(walk([["sum", [1, 2, 3]], ["other", [9]]]), [6, 0])

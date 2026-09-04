@@ -418,19 +418,46 @@ end unpack_complaint
 // **It answers a bare `bool` rather than a `Step`, and that is deliberate**: nothing a pattern does
 // can fail at runtime. There is no arithmetic in one, no call, and no index that could be out of
 // range -- a pattern that does not fit simply does not fit, which is an answer and not a fault.
-match_pattern(pat: Pattern, v: Value, scope: *EnvObj, assignable: bool) -> bool
+match_pattern(pat: Pattern, v: Value, scope: *EnvObj, assignable: bool) -> bool =
+    match_walk(pat, v, scope, assignable, false)
+
+// The same walk, gathering what it bound onto the OPERAND STACK instead of into a scope.
+//
+// **`collecting` is what a chunk whose names are numbered slots needs**, there being no scope to
+// declare into: the machine takes the values back off the stack and writes them into the slots the
+// compiler claimed. The values go on the stack rather than into a list of sysl's own because the
+// stack is a root the collector already walks -- a `rest` pattern builds an array, and one held only
+// by a sysl local would be invisible to a mark that happened while the match was still running.
+//
+// **The ORDER is `pattern_names`' order, which is what the compiler claimed its slots in.** There is
+// exactly one place the two could disagree and it is `At`: the binding walk below runs the
+// sub-pattern first and declares the name after it, deliberately, so a failed arm leaves nothing
+// bound -- while `pattern_names` writes the name first. Into a scope that difference is invisible,
+// a scope having no order; into a flat list it is a silent mis-binding. So a collecting walk pushes
+// `At`'s name BEFORE matching the inner pattern, which is safe for exactly the reason the other
+// order was chosen: a failed match has its whole list discarded, so nothing is left half-bound
+// either way.
+//
+// Not `private`: `run_frames.sysl` is the only caller that collects.
+match_walk(pat: Pattern, v: Value, scope: *EnvObj, assignable: bool, collecting: bool) -> bool
     *pat.kind match
         Wild -> true
         Bind(name) ->
             // Bound as a `val`: a name a pattern introduced is not a place to write to.
-            declare(scope, name, v, assignable)
+            if collecting then vm.stack.push(v) else declare(scope, name, v, assignable)
+
             true
         TypePat(test) -> is_kind(v, test)
         At(name, inner) ->
             // **The sub-pattern runs first, and the whole value is bound only if it took.** The
             // other order would leave the name bound after a failed arm -- which the arm's own
             // scope would throw away anyway, but only by accident rather than by rule.
-            if !match_pattern(inner, v, scope, assignable) then return false
+            if collecting
+                vm.stack.push(v)
+                return match_walk(inner, v, scope, assignable, true)
+            end if
+
+            if !match_walk(inner, v, scope, assignable, false) then return false
 
             declare(scope, name, v, assignable)
             true
@@ -445,11 +472,11 @@ match_pattern(pat: Pattern, v: Value, scope: *EnvObj, assignable: bool) -> bool
         NullPat -> v match
             Null -> true
             _ -> false
-        ArrayPat(items, open, rest, defaults) -> match_array(items, open, rest, defaults, v, scope, assignable)
-        ObjectPat(keys, values, defaults, optional) -> match_object(keys, values, defaults, optional, v, scope, assignable)
+        ArrayPat(items, open, rest, defaults) -> match_array(items, open, rest, defaults, v, scope, assignable, collecting)
+        ObjectPat(keys, values, defaults, optional) -> match_object(keys, values, defaults, optional, v, scope, assignable, collecting)
         OrPat(alts) ->
             for i in 0..<alts.len()
-                if match_pattern(alts.at(i), v, scope, assignable) then return true
+                if match_walk(alts.at(i), v, scope, assignable, collecting) then return true
 
             false
 
@@ -459,7 +486,7 @@ match_pattern(pat: Pattern, v: Value, scope: *EnvObj, assignable: bool) -> bool
         // arm that did not match does not run.
         AndPat(parts) ->
             for i in 0..<parts.len()
-                if !match_pattern(parts.at(i), v, scope, assignable) then return false
+                if !match_walk(parts.at(i), v, scope, assignable, collecting) then return false
 
             true
 
@@ -479,12 +506,12 @@ match_pattern(pat: Pattern, v: Value, scope: *EnvObj, assignable: bool) -> bool
         MadeFrom(name, inner) ->
             if !match_proto(name, v, scope) then return false
 
-            match_pattern(inner, v, scope, assignable)
+            match_walk(inner, v, scope, assignable, collecting)
 
         // A data type asks exactly what a class does: was this made from that, or from something
         // descended from it. The variant list it carries is the checker's and nothing runs on it.
         DataPat(name, _) -> match_proto(name, v, scope)
-        VariantPat(name, items, keys, singleton) -> match_variant(name, items, keys, singleton, v, scope, assignable)
+        VariantPat(name, items, keys, singleton) -> match_variant(name, items, keys, singleton, v, scope, assignable, collecting)
 
         // **Every element, and an EMPTY container fits.** Every element of nothing is a string,
         // which is the reading a test wants: a shape refusing `[]` would refuse the ordinary answer
@@ -523,18 +550,18 @@ match_pattern(pat: Pattern, v: Value, scope: *EnvObj, assignable: bool) -> bool
                 if container != IsArray then return false
 
                 for i in 0..<xs.items.len()
-                    if !match_pattern(element, xs.items.at(i), scope, assignable) then return false
+                    if !match_walk(element, xs.items.at(i), scope, assignable, collecting) then return false
 
                 true
             Object(o) ->
                 if container != IsObject then return false
 
                 for i in 0..<o.entries.len()
-                    if !o.entries.at(i).dead && !match_pattern(element, o.entries.at(i).value, scope, assignable) then return false
+                    if !o.entries.at(i).dead && !match_walk(element, o.entries.at(i).value, scope, assignable, collecting) then return false
 
                 true
             _ -> false
-end match_pattern
+end match_walk
 
 // Whether `v` is the variant `name` names, and whether what it carries fits.
 //
@@ -542,7 +569,7 @@ end match_pattern
 // `Empty` is the singleton itself rather than something made from a maker, and a walk up its chain
 // would ask about the data type instead. Everything else is the class question plus the fields, read
 // by the names the declaration gave them and in the order it gave them.
-private match_variant(name: string, items: Buf[Pattern], keys: Buf[string], singleton: bool, v: Value, scope: *EnvObj, assignable: bool) -> bool
+private match_variant(name: string, items: Buf[Pattern], keys: Buf[string], singleton: bool, v: Value, scope: *EnvObj, assignable: bool, collecting: bool) -> bool
     if singleton
         val want: *u8 = lookup(scope, name) match
             Some(Object(o)) -> ptr_cast(o)
@@ -574,7 +601,7 @@ private match_variant(name: string, items: Buf[Pattern], keys: Buf[string], sing
             Some(x) -> x
             None -> return false
 
-        if !match_pattern(items.at(i), got, scope, assignable) then return false
+        if !match_walk(items.at(i), got, scope, assignable, collecting) then return false
 
     true
 end match_variant
@@ -611,7 +638,7 @@ private match_proto(name: string, v: Value, scope: *EnvObj) -> bool
 end match_proto
 
 // `[a, b]` and `[first, ...rest]`.
-private match_array(items: Buf[Pattern], open: bool, rest: Option[string], defaults: Buf[Option[Expr]], v: Value, scope: *EnvObj, assignable: bool) -> bool
+private match_array(items: Buf[Pattern], open: bool, rest: Option[string], defaults: Buf[Option[Expr]], v: Value, scope: *EnvObj, assignable: bool, collecting: bool) -> bool
     v match
         Array(xs) ->
             // A closed pattern must agree on length exactly; an open one treats the fixed patterns
@@ -633,7 +660,7 @@ private match_array(items: Buf[Pattern], open: bool, rest: Option[string], defau
             val taken = if xs.items.len() < fixed then xs.items.len() else fixed
 
             for i in 0..<taken
-                if !match_pattern(items.at(i), xs.items.at(i), scope, assignable) then return false
+                if !match_walk(items.at(i), xs.items.at(i), scope, assignable, collecting) then return false
 
             // The tail is only gathered where it is named. `[a, ...]` allocates nothing.
             rest match
@@ -643,7 +670,9 @@ private match_array(items: Buf[Pattern], open: bool, rest: Option[string], defau
                     for i in taken..<xs.items.len()
                         tail.push(xs.items.at(i))
 
-                    declare(scope, name, Array(new_array(tail)), assignable)
+                    val gathered = Array(new_array(tail))
+
+                    if collecting then vm.stack.push(gathered) else declare(scope, name, gathered, assignable)
                 None -> ()
 
             true
@@ -670,7 +699,7 @@ private trailing_defaults(defaults: Buf[Option[Expr]]) -> usize
 // program writes after matching -- and every subclass failed the interface its base implements, which
 // is what `type Drawable = { draw: function }` is for. JavaScript splits the same seam and puts `in`
 // on this side of it; `hasOwnProperty` is the other question, and slate has never had syntax for it.
-private match_object(keys: Buf[string], values: Buf[Pattern], defaults: Buf[Option[Expr]], optional: Buf[bool], v: Value, scope: *EnvObj, assignable: bool) -> bool
+private match_object(keys: Buf[string], values: Buf[Pattern], defaults: Buf[Option[Expr]], optional: Buf[bool], v: Value, scope: *EnvObj, assignable: bool, collecting: bool) -> bool
     v match
         Object(fields) ->
             for i in 0..<keys.len()
@@ -680,7 +709,7 @@ private match_object(keys: Buf[string], values: Buf[Pattern], defaults: Buf[Opti
                     // where it was a `?`, nothing does and nothing is meant to. A field with
                     // neither is still the fault it always was.
                     None -> if defaults.at(i).is_none() && !optional.at(i) then return false
-                    Some(field) -> if !match_pattern(values.at(i), field, scope, assignable) then return false
+                    Some(field) -> if !match_walk(values.at(i), field, scope, assignable, collecting) then return false
 
             true
         _ -> false

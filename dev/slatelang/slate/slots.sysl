@@ -20,12 +20,16 @@ import sysl.buf.{Buf, buf}
 // their slots and is the next step; asking it once is the step that can be checked by reading, which
 // is what a change to how every local is found should start with.
 //
-// **AND IT REFUSES EVERY BINDING FORM BUT `val`, `var` AND A PARAMETER.** A pattern, a `for` head, a
-// `catch` and a `match` arm all bind by putting a name into the scope the machine is standing in,
-// and each is a different piece of code doing it. Slotting a chunk while one of them writes into the
-// chain would give a name two homes -- the slot a later read finds, and the binding the machine
-// actually made -- which is silent and wrong rather than loud and wrong. So they are refused here,
-// together, and each is its own step afterwards.
+// **EVERY BINDING FORM IS FOLLOWED NOW, AND THE ONES THAT BIND THROUGH A PATTERN SHARE ONE
+// MECHANISM.** A `for` head, a `match` arm and a destructuring `val` all go through the matcher, and
+// the matcher gathers what it bound onto the operand stack where the compiler claimed cells for it;
+// a `catch` binds one name and no pattern and is a plain `declare_name`. What each contributes here
+// is the same two things: the names it binds join this chunk's own, and the names its pattern looks
+// a TYPE up by join the ones a slotted name may not collide with.
+//
+// **A pattern whose two walks could disagree is what is refused instead**, which is `slottable_pattern`
+// -- a default, a `?`, and the handful of kinds `pattern_names` gathers nothing from that could
+// still bind. The chunk keeps its scope and nothing else changes.
 //
 // **A PARAMETER'S DEFAULT IS NO LONGER ONE OF THEM.** It was, while the question "was this argument
 // given" could only be asked of the scope; the frame carries a bitmask now and `JumpIfGiven` asks it
@@ -88,10 +92,29 @@ private expr_holds_capture(x: Expr, mine: *Buf[string], tested: *Buf[string]) ->
         Lambda(_, _, _, _) -> true
         ShapeLit(_, _) -> true
 
-        // The binding forms this stage does not follow. Each puts a name into the running scope from
-        // code of its own, so a chunk holding one keeps every name in the chain.
-        MatchExpr(_, _) -> true
-        For(_, _, _, _, _, _) -> true
+        // **The three forms that bind through a PATTERN.** Each is followed rather than refused
+        // now: the names its pattern binds join this chunk's own, and the names its pattern looks a
+        // type up by join the ones a slotted name may not collide with.
+        MatchExpr(subject, arms) ->
+            for i in 0..<arms.len()
+                val arm = arms.at(i)
+
+                if !slottable_pattern(arm.pattern) then return true
+
+                pattern_binders(arm.pattern, mine)
+                pattern_mentions(arm.pattern, tested)
+
+                if maybe_expr(arm.guard, mine, tested) then return true
+
+                if expr_holds_capture(arm.body, mine, tested) then return true
+
+            expr_holds_capture(subject, mine, tested)
+        For(_, binding, iter, body, otherwise, _) ->
+            if !slottable_pattern(binding) then return true
+
+            pattern_binders(binding, mine)
+            pattern_mentions(binding, tested)
+            expr_holds_capture(iter, mine, tested) || expr_holds_capture(body, mine, tested) || maybe_expr(otherwise, mine, tested)
 
         // **A `catch` binds ONE name and no pattern**, which is what makes it the binding form that
         // can be taught first: `compile_try` emits the binding itself rather than handing a pattern
@@ -168,8 +191,12 @@ private stmt_holds_capture(s: Stmt, mine: *Buf[string], tested: *Buf[string]) ->
         Var(name, init) ->
             mine.push(name)
             expr_holds_capture(init, mine, tested)
-        // A pattern binds from code of its own -- see the note on `may_slot`.
-        Unpack(_, _, _) -> true
+        Unpack(pat, init, _) ->
+            if !slottable_pattern(pat) then return true
+
+            pattern_binders(pat, mine)
+            pattern_mentions(pat, tested)
+            expr_holds_capture(init, mine, tested)
         Group(stmts) -> any_stmt(stmts, mine, tested)
         Assign(_, target, value) -> expr_holds_capture(target, mine, tested) || expr_holds_capture(value, mine, tested)
         MultiAssign(_, targets, values) -> any_expr(targets, mine, tested) || any_expr(values, mine, tested)
@@ -245,6 +272,60 @@ store_name(u: *Unit, e: *Emit, name: string, at: Span)
                 push_n(e, ImmutableSlot(intern_str(u, name)), at, 1, 0)
         None -> push_n(e, StoreName(intern_str(u, name)), at, 1, 0)
 
+// -- a binding site that takes a pattern apart -------------------------------------------------------
+
+// **These two are the ONLY places that decide how a PATTERN binds**, for the reason the three above
+// are the only places that decide how a name does: the slots are claimed here and the instruction
+// that fills them is emitted here, so a site cannot claim one thing and fill another.
+//
+// **THE PATTERN IS RESOLVED ONCE.** `resolve_pattern` complains about a generic type used without
+// its arguments, so resolving a second time to count the names would report that twice -- and a
+// report that names one mistake twice is a report a reader stops trusting.
+
+// `val [a, b] = xs`, a `for` head, and a parameter that takes its argument apart.
+bind_pattern(u: *Unit, e: *Emit, pat: Pattern, at: Span, assignable: bool)
+    val resolved = resolve_pattern(pat, 0)
+    val k = intern_pattern(u, resolved)
+
+    if !e.slotting
+        push_n(e, Unpack(k, !assignable), at, 1, 0)
+        return
+    end if
+
+    push_n(e, UnpackSlots(k, claim_pattern_slots(e, resolved, assignable)), at, 1, 0)
+
+// A `match` arm, which reads the subject where it lies and answers whether it took.
+test_pattern(u: *Unit, e: *Emit, pat: Pattern, at: Span)
+    val resolved = resolve_pattern(pat, 0)
+    val k = intern_pattern(u, resolved)
+
+    if !e.slotting
+        push_n(e, TestPat(k), at, 0, 1)
+        return
+    end if
+
+    push_n(e, TestSlots(k, claim_pattern_slots(e, resolved, false)), at, 0, 1)
+
+// One slot per name, in the order the machine hands their values back, answering the first.
+//
+// **`pattern_names` is the order, and it is the JavaScript back end's own** -- both back ends read a
+// pattern's bindings out of one flat list, so reusing that walk is what keeps the two from drifting
+// about which value is which. A pattern that binds nothing claims nothing and the first is not read.
+private claim_pattern_slots(e: *Emit, resolved: Pattern, assignable: bool) -> usize
+    var names: Buf[string] = buf()
+
+    pattern_names(resolved, &names)
+
+    var first: usize = 0
+
+    for i in 0..<names.len()
+        val got = claim_slot(e, names.at(i), assignable)
+
+        if i == 0 then first = got
+
+    first
+end claim_pattern_slots
+
 // -- what a pattern in this body binds ---------------------------------------------------------------
 
 // Whether matching this pattern would put a name into the scope the machine is standing in.
@@ -293,6 +374,123 @@ private pattern_binds(pat: Pattern) -> bool
         NullPat -> false
 end pattern_binds
 
+// The names a pattern binds, which is `pattern_binds` again with the answers kept.
+//
+// **The same set `pattern_names` gathers off the RESOLVED pattern, and it can be because a declared
+// type may not bind.** `type Pair = [a, b]` is refused in as many words -- *"a type is a shape, so
+// `Pair` may not bind `a`"* -- so replacing a name that stands for a type can never introduce a
+// binding that was not written here. That refusal is what lets this walk answer before the pattern
+// is resolved, and it is the whole of why the two agree.
+//
+// The ORDER is not read here: `may_slot` wants the set, and the compiler claims its slots off
+// `pattern_names` at the site itself.
+private pattern_binders(pat: Pattern, into: *Buf[string])
+    *pat.kind match
+        Bind(name) -> if !names_a_type(name) then note_mention(name, into)
+        At(name, inner) ->
+            note_mention(name, into)
+            pattern_binders(inner, into)
+        ArrayPat(items, _, rest, _) ->
+            each_binder(items, into)
+
+            rest match
+                Some(name) -> note_mention(name, into)
+                None -> ()
+        ObjectPat(_, values, _, _) -> each_binder(values, into)
+        VariantPat(_, items, _, _) -> each_binder(items, into)
+        MadeFrom(_, inner) -> pattern_binders(inner, into)
+        GenericPat(_, inner) -> pattern_binders(inner, into)
+        AppliedPat(_, args) -> each_binder(args, into)
+        EveryPat(_, element) -> pattern_binders(element, into)
+        FnPat(params, result) ->
+            each_binder(params, into)
+            pattern_binders(result, into)
+        OrPat(alts) -> each_binder(alts, into)
+        AndPat(parts) -> each_binder(parts, into)
+        Wild -> ()
+        TypePat(_) -> ()
+        TypeVarPat(_) -> ()
+        ProtoPat(_, _, _) -> ()
+        DataPat(_, _) -> ()
+        IntPat(_) -> ()
+        RealPat(_) -> ()
+        StrPat(_) -> ()
+        BoolPat(_) -> ()
+        NullPat -> ()
+end pattern_binders
+
+private each_binder(xs: Buf[Pattern], into: *Buf[string])
+    for i in 0..<xs.len()
+        pattern_binders(xs.at(i), into)
+
+// Whether a binding site written with this pattern may take slots.
+//
+// **The question is whether the machine's collecting walk and `pattern_names` agree, value for
+// value, in order.** The compiler claims one slot per name `pattern_names` gathers and the machine
+// writes one cell per value the walk pushes; a pattern where the two counts could differ would put
+// every binding after the disagreement into the wrong cell, silently. So this refuses the two shapes
+// where they can:
+//
+// - **A DEFAULT or a `?`.** The matcher leaves such a name unbound and still matches -- that is what
+//   makes a default a default -- so the walk pushes nothing where `pattern_names` counted one, and
+//   everything after it shifts. Answering that properly wants a per-name mask of what arrived, which
+//   is what a call already carries for its parameters and is the next step here.
+// - **A kind `pattern_names` gathers nothing from that could still bind.** An alternative may not
+//   bind, `array of T` says nothing about names, and a function type is a shape -- so where one of
+//   those does bind, the two walks are already out of step and this is not the place to reconcile
+//   them.
+//
+// **Everything else recurses**, and the kinds that bind nothing at all are written out rather than
+// left to a wildcard for the reason every exhaustive walk in this file is.
+private slottable_pattern(pat: Pattern) -> bool
+    *pat.kind match
+        At(_, inner) -> slottable_pattern(inner)
+        ArrayPat(items, _, _, defaults) ->
+            if any_default(defaults) then return false
+
+            all_slottable(items)
+        ObjectPat(_, values, defaults, optional) ->
+            if any_default(defaults) then return false
+
+            for i in 0..<optional.len()
+                if optional.at(i) then return false
+
+            all_slottable(values)
+        VariantPat(_, items, _, _) -> all_slottable(items)
+        MadeFrom(_, inner) -> slottable_pattern(inner)
+        AndPat(parts) -> all_slottable(parts)
+
+        // The four `pattern_names` has no arm for, allowed only while they bind nothing.
+        OrPat(alts) -> !any_binds(alts)
+        EveryPat(_, element) -> !pattern_binds(element)
+        FnPat(params, result) -> !any_binds(params) && !pattern_binds(result)
+        GenericPat(_, inner) -> !pattern_binds(inner)
+        AppliedPat(_, args) -> !any_binds(args)
+        Bind(_) -> true
+        Wild -> true
+        TypePat(_) -> true
+        TypeVarPat(_) -> true
+        ProtoPat(_, _, _) -> true
+        DataPat(_, _) -> true
+        IntPat(_) -> true
+        RealPat(_) -> true
+        StrPat(_) -> true
+        BoolPat(_) -> true
+        NullPat -> true
+end slottable_pattern
+
+private all_slottable(xs: Buf[Pattern]) -> bool
+    for i in 0..<xs.len()
+        if !slottable_pattern(xs.at(i)) then return false
+
+    true
+
+private any_default(defaults: Buf[Option[Expr]]) -> bool
+    for i in 0..<defaults.len()
+        if defaults.at(i).is_some() then return true
+
+    false
+
 private any_binds(xs: Buf[Pattern]) -> bool
     for i in 0..<xs.len()
         if pattern_binds(xs.at(i)) then return true
@@ -315,10 +513,14 @@ private any_binds(xs: Buf[Pattern]) -> bool
 // only reason any of this can be trusted.
 private pattern_mentions(pat: Pattern, into: *Buf[string])
     *pat.kind match
-        Bind(name) -> note_mention(name, into)
-        At(name, inner) ->
-            note_mention(name, into)
-            pattern_mentions(inner, into)
+        // **A bare name is looked up only where it names a TYPE**, which is `resolve_pattern`'s own
+        // rule -- so `v is Point` is a lookup and `v is n` is a binding, and only the first belongs
+        // here. Asking `names_a_type` rather than assuming the worst is what lets a `match` arm on a
+        // class stand in a chunk that slots.
+        Bind(name) -> if names_a_type(name) then note_mention(name, into)
+
+        // `p @ Point` names the binding on the left and looks up whatever the sub-pattern names.
+        At(_, inner) -> pattern_mentions(inner, into)
         TypeVarPat(name) -> note_mention(name, into)
         AppliedPat(name, args) ->
             note_mention(name, into)
@@ -336,12 +538,11 @@ private pattern_mentions(pat: Pattern, into: *Buf[string])
                 note_mention(params.at(i), into)
 
             pattern_mentions(inner, into)
-        ArrayPat(items, _, rest, _) ->
-            each_mention(items, into)
-
-            rest match
-                Some(name) -> note_mention(name, into)
-                None -> ()
+        // **The tail's name is a BINDING and never a lookup**, so it belongs in the other list.
+        // Noting it here made every `[head, ...rest]` collide with itself: the name went into the
+        // chunk's own names and into the names its patterns look up, and the overlap check refused
+        // the chunk over a name that was only ever written once.
+        ArrayPat(items, _, _, _) -> each_mention(items, into)
         ObjectPat(_, values, _, _) -> each_mention(values, into)
         EveryPat(_, element) -> pattern_mentions(element, into)
         FnPat(params, result) ->
