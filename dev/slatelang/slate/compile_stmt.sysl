@@ -1,0 +1,685 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// Statements, as bytecode: a run of them, an assignment, a jump out of a loop, the loops themselves
+// and a `try`.
+//
+// **Cut out of `compile.sysl`, which keeps the entry points and the types.** Reached from there only
+// through `compile_stmts`, and reaching back into it for `emit_pattern_defaults`, `refuse_optionals`
+// and `module_index`, each of which says so where it is declared.
+// -- statements -----------------------------------------------------------------------------------
+
+// A run of statements, leaving the last one's value.
+//
+// **A FUNCTION DECLARATION IS HOISTED TO THE TOP OF THE RUN, AS JAVASCRIPT'S IS.** `val sink =
+// written` above `written(r) = …` is what a module with a default in it writes, and it answered
+// *"`written` is not defined"* -- while the same two lines the other way round worked, and so did a
+// call to `written` from inside another function, because that is resolved when it runs. The rule
+// nobody could state was *a definition is in scope from the line it is written on, unless the thing
+// that wants it is itself a function*.
+//
+// **`val` and `var` initialisers stay sequential**, which is JavaScript's rule too and is the half
+// that matters: a binding may read what is above it and not what is below, so nothing here makes a
+// program's data flow depend on where a function happens to sit.
+//
+// **The chunk is compiled ONCE**, here, and the statement that declared it leaves the null every
+// statement leaves. Compiling it again where it stands would double every complaint its body makes.
+compile_stmts(u: *Unit, e: *Emit, stmts: Buf[Stmt], at: Span)
+    push_n(e, PushNull, at, 0, 1)
+
+    hoist_defs(u, e, stmts)
+
+    for i in 0..<stmts.len()
+        push_n(e, Discard, stmts.at(i).span, 1, 0)
+        push_n(e, Tick, stmts.at(i).span, 0, 0)
+        compile_stmt(u, e, stmts.at(i), true)
+end compile_stmts
+
+// Every definition in a run of statements, bound before the run begins.
+//
+// **A `Group` is walked into**, its statements landing in the scope around it rather than in one of
+// their own -- so a definition inside one is a definition of this block and is hoisted with the rest.
+private hoist_defs(u: *Unit, e: *Emit, stmts: Buf[Stmt])
+    for i in 0..<stmts.len()
+        *stmts.at(i).kind match
+            Def(name, params, defaults, body, is_async) ->
+                val c = compile_chunk(u, params, defaults, body_at(body), name, is_async, body_is_gen(body))
+
+                push_n(e, DefineFn(intern_str(u, name), c), stmts.at(i).span, 0, 0)
+            Group(inner) -> hoist_defs(u, e, inner)
+            _ -> ()
+end hoist_defs
+
+private compile_stmt(u: *Unit, e: *Emit, s: Stmt, hoisted: bool)
+    val at = s.span
+
+    *s.kind match
+        Val(name, init) ->
+            compile_expr(u, e, init)
+            push_n(e, DeclareVal(intern_str(u, name)), at, 1, 0)
+            push_n(e, PushNull, at, 0, 1)
+        Var(name, init) ->
+            compile_expr(u, e, init)
+            push_n(e, DeclareVar(intern_str(u, name)), at, 1, 0)
+            push_n(e, PushNull, at, 0, 1)
+        Unpack(pat, init, immutable) ->
+            compile_expr(u, e, init)
+
+            // **A parameter that takes its argument apart reaches this arm too**, the parser having
+            // desugared it into an `Unpack` at the top of the body -- so refusing `?` here covers a
+            // binding, a `var`, and every parameter, in one place.
+            refuse_optionals(pat, "and this one binds")
+
+            // Interned through `resolve_pattern` like every other pattern, so a declared type
+            // stands in a destructuring binding exactly as it stands in a `match` arm.
+            push_n(e, Unpack(intern_resolved(u, pat), immutable), at, 1, 0)
+            emit_pattern_defaults(u, e, pat, immutable)
+            push_n(e, PushNull, at, 0, 1)
+        // **`hoist_defs` has already bound it**, so what is left here is the null every statement
+        // leaves. A definition reached any other way still binds itself.
+        Def(name, params, defaults, body, is_async) ->
+            if !hoisted
+                val c = compile_chunk(u, params, defaults, body_at(body), name, is_async, body_is_gen(body))
+
+                push_n(e, DefineFn(intern_str(u, name), c), at, 0, 0)
+
+            push_n(e, PushNull, at, 0, 1)
+        // **Each is compiled where the group stands**, which is what makes it not a `Block`: the
+        // names land in the scope around them. Every statement leaves one value, so each is popped
+        // and one null stands for the group.
+        Group(stmts) ->
+            for i in 0..<stmts.len()
+                compile_stmt(u, e, stmts.at(i), hoisted)
+                push_n(e, Discard, stmts.at(i).span, 1, 0)
+
+            push_n(e, PushNull, at, 0, 1)
+        Eval(x) -> compile_expr(u, e, x)
+        Assign(op, target, value) -> compile_assign(u, e, op, target, value, at)
+        MultiAssign(op, targets, values) -> compile_multi_assign(u, e, op, targets, values, at)
+        Return(value) ->
+            value match
+                Some(x) -> compile_expr(u, e, x)
+                None -> push_n(e, PushNull, at, 0, 1)
+
+            put(e, Ret, at)
+
+            // Nothing after a `return` runs, but the block it sits in still has to typecheck as
+            // leaving one value, so the counter is told what the machine would have had.
+            e.sp = e.sp - 1
+            push_n(e, PushNull, at, 0, 1)
+        Throw(x) ->
+            compile_expr(u, e, x)
+            put(e, Raise, at)
+
+            // The same bookkeeping a `return` needs, and for the same reason: nothing after this
+            // runs, and the block still has to leave one value behind for the counter.
+            e.sp = e.sp - 1
+            push_n(e, PushNull, at, 0, 1)
+        // **A TYPE IS A VALUE UNDER ITS OWN NAME**, the way a class, a data type and a variant
+        // already were -- a `type` name was the only one in the language that bound nothing, which
+        // is why adding this breaks no program.
+        //
+        // The *resolution* still happened while this was compiled and the shape is still opaque:
+        // what the name binds answers `test`, `mismatch` and `name` and lets nothing read its
+        // fields back out. So "a type costs nothing at run time" survives in the sense that
+        // mattered -- there is no structure here for a program, or for a later pass, to depend on.
+        TypeDecl(name, pat) ->
+            push_n(e, PushShape(intern_resolved(u, pat), intern_str(u, name)), at, 0, 1)
+            push_n(e, DeclareVal(intern_str(u, name)), at, 1, 0)
+            push_n(e, PushNull, at, 0, 1)
+        CheckType(name, declared, pat) ->
+            // **AN ANNOTATION THAT NAMES NOTHING WOULD CHECK NOTHING, SILENTLY.** A bare name in
+            // pattern position is a binding where it names no type, and a binding matches anything --
+            // so `f(x: string)` accepted every value and bound `string` inside `f`, `str` being
+            // slate's word. A check that quietly passes is worse than no check, because the reader
+            // believes it.
+            val shape = resolve_pattern(pat, 0)
+
+            first_binding(shape) match
+                Some(loose) -> complain_here(at, s"`${loose}` is not a type, so checking `${name}` against it would check nothing${instead_of(loose)}")
+                None -> ()
+
+            push_n(e, Op.CheckType(intern_str(u, name), intern_str(u, declared), intern_pattern(u, shape)), at, 0, 0)
+            push_n(e, PushNull, at, 0, 1)
+        Break(label, value) -> jump_out(u, e, at, true, label, value)
+        Continue(label) -> jump_out(u, e, at, false, label, None)
+
+        // **An import is three ordinary instructions per name and no new machinery.** The module is
+        // already an object sitting in a slot, so taking a name out of it is the same `GetField` a
+        // program writes for itself, and binding it is the same `DeclareVal` a `val` uses.
+        //
+        // Every path here resolved while loading -- a file that did not, or that does not export
+        // what was asked of it, has already stopped the run with a diagnostic -- so a lookup that
+        // fails now is a compiler bug and is emitted as one.
+        ImportNames(path, _, origin, names, locals) ->
+            module_index(u, path, origin) match
+                Some(m) ->
+                    // **Every name, including a type.** A type used to be skipped here, the
+                    // module having no field of that name -- and that hole was the `class` trap
+                    // written up in the repo's own notes, since a class is a type as well and does
+                    // have one. A type is a value now, so there is one rule and no list.
+                    for i in 0..<names.len()
+                        push_n(e, PushModule(m), at, 0, 1)
+                        push_n(e, GetField(intern_str(u, names.at(i))), at, 1, 1)
+                        push_n(e, DeclareVal(intern_str(u, locals.at(i))), at, 1, 0)
+                None -> push_n(e, FailWith(intern_str(u, s"the module `${path}` was never loaded")), at, 0, 0)
+
+            push_n(e, PushNull, at, 0, 1)
+        ImportAll(path, _, origin, alias) ->
+            module_index(u, path, origin) match
+                Some(m) ->
+                    push_n(e, PushModule(m), at, 0, 1)
+                    push_n(e, DeclareVal(intern_str(u, alias)), at, 1, 0)
+                None -> push_n(e, FailWith(intern_str(u, s"the module `${path}` was never loaded")), at, 0, 0)
+
+            push_n(e, PushNull, at, 0, 1)
+end compile_stmt
+// `x = e`, and `x += e` and the rest.
+//
+// **A compound form evaluates its place ONCE**, which is the whole reason it is not desugared into
+// `x = x + e`: `xs[next()] += 1` calls `next` a single time. The place's parts are computed, copied
+// with `DupAt` for the read, and the copies underneath are what the write consumes.
+private compile_assign(u: *Unit, e: *Emit, op: Tok, target: Expr, value: Expr, at: Span)
+    val plain = op == Assign
+
+    *target.kind match
+        Name(n) ->
+            val k = intern_str(u, n)
+
+            if !plain then push_n(e, LoadName(k), target.span, 0, 1)
+
+            compile_expr(u, e, value)
+
+            if !plain then push_n(e, BinaryOp(op), at, 2, 1)
+
+            push_n(e, StoreName(k), target.span, 1, 0)
+        Field(obj, name, _) ->
+            val k = intern_str(u, name)
+
+            compile_expr(u, e, obj)
+
+            if !plain
+                push_n(e, Dup, target.span, 0, 1)
+                push_n(e, GetField(k), target.span, 1, 1)
+
+            compile_expr(u, e, value)
+
+            if !plain then push_n(e, BinaryOp(op), at, 2, 1)
+
+            push_n(e, SetField(k), target.span, 2, 0)
+        Index(t, key) ->
+            compile_expr(u, e, t)
+            compile_expr(u, e, key)
+
+            if !plain
+                push_n(e, DupAt(1), target.span, 0, 1)
+                push_n(e, DupAt(1), target.span, 0, 1)
+                push_n(e, GetIndex, target.span, 2, 1)
+
+            compile_expr(u, e, value)
+
+            if !plain then push_n(e, BinaryOp(op), at, 2, 1)
+
+            push_n(e, SetIndex, target.span, 3, 0)
+        _ -> push_n(e, FailWith(intern_str(u, "this cannot be assigned to")), at, 0, 0)
+
+    push_n(e, PushNull, at, 0, 1)
+end compile_assign
+
+// `a, b = b, a`.
+//
+// **Every value is computed before any place is written**, which is what makes the swap a swap. They
+// stay on the stack while the writes happen, and each write reaches back down to the one it wants --
+// so nothing needs a temporary the program could name.
+private compile_multi_assign(u: *Unit, e: *Emit, op: Tok, targets: Buf[Expr], values: Buf[Expr], at: Span)
+    val n = values.len()
+
+    for i in 0..<n
+        compile_expr(u, e, values.at(i))
+
+    // How far below the top the value for target `i` sits, before that target's own parts are pushed.
+    for i in 0..<targets.len()
+        if i >= n then break
+
+        val deep = n - 1 - i
+        val target = targets.at(i)
+
+        *target.kind match
+            Name(name) ->
+                val k = intern_str(u, name)
+
+                if op != Assign
+                    push_n(e, LoadName(k), target.span, 0, 1)
+                    push_n(e, DupAt(deep + 1), target.span, 0, 1)
+                    push_n(e, BinaryOp(op), at, 2, 1)
+                else
+                    push_n(e, DupAt(deep), target.span, 0, 1)
+
+                push_n(e, StoreName(k), target.span, 1, 0)
+            Field(obj, name, _) ->
+                val k = intern_str(u, name)
+
+                compile_expr(u, e, obj)
+
+                if op != Assign
+                    push_n(e, Dup, target.span, 0, 1)
+                    push_n(e, GetField(k), target.span, 1, 1)
+                    push_n(e, DupAt(deep + 2), target.span, 0, 1)
+                    push_n(e, BinaryOp(op), at, 2, 1)
+                else
+                    push_n(e, DupAt(deep + 1), target.span, 0, 1)
+
+                push_n(e, SetField(k), target.span, 2, 0)
+            Index(t, key) ->
+                compile_expr(u, e, t)
+                compile_expr(u, e, key)
+
+                if op != Assign
+                    push_n(e, DupAt(1), target.span, 0, 1)
+                    push_n(e, DupAt(1), target.span, 0, 1)
+                    push_n(e, GetIndex, target.span, 2, 1)
+                    push_n(e, DupAt(deep + 3), target.span, 0, 1)
+                    push_n(e, BinaryOp(op), at, 2, 1)
+                else
+                    push_n(e, DupAt(deep + 2), target.span, 0, 1)
+
+                push_n(e, SetIndex, target.span, 3, 0)
+            _ -> push_n(e, FailWith(intern_str(u, "this cannot be assigned to")), at, 0, 0)
+
+    for i in 0..<n
+        push_n(e, Pop, at, 1, 0)
+
+    push_n(e, PushNull, at, 0, 1)
+end compile_multi_assign
+
+// `break` and `continue`, which have to leave the loop as they found it.
+//
+// **A `break` leaves its value where the loop's own would have gone**, which is why the value is
+// compiled AFTER the unwind: everything the loop had is dropped first, and what is pushed onto the
+// bare stack is what the loop answers.
+private jump_out(u: *Unit, e: *Emit, at: Span, breaking: bool, label: string, value: Option[Expr])
+    val which = loop_named(e, label)
+
+    if which == 0
+        val word = if label != ""
+            s"no enclosing loop is called `'${label}`"
+        elif breaking then
+            "`break` outside a loop"
+        else
+            "`continue` outside a loop"
+
+        push_n(e, FailWith(intern_str(u, word)), at, 0, 0)
+        push_n(e, PushNull, at, 0, 1)
+        return
+    end if
+
+    val slot = which - 1
+    var frame = e.loops.at(slot)
+    val sp = e.sp
+    val scopes = e.scopes
+    val handlers = e.handlers
+
+    if breaking
+        // **The value is compiled BEFORE anything is unwound**, and that is not an optimisation: the
+        // scopes the unwind is about to close are the ones holding the names it may use, so
+        // `for x in xs do if p(x) then break x` would find `x` already gone. It is then slid beneath
+        // the values the loop had and they are dropped from above it.
+        value match
+            Some(x) -> compile_expr(u, e, x)
+            None -> push_n(e, PushNull, at, 0, 1)
+
+        val extra = sp - frame.sp
+
+        if extra > 0
+            push_n(e, RotUp(extra), at, 0, 0)
+
+            for i in 0..<extra
+                push_n(e, Pop, at, 1, 0)
+
+        var d = e.scopes
+
+        while d > frame.scopes
+            put(e, PopScope, at)
+            d -= 1
+
+        e.scopes = frame.scopes
+
+        var k = e.handlers
+
+        while k > frame.handlers
+            put(e, PopHandler, at)
+            k -= 1
+
+        e.handlers = frame.handlers
+    else
+        unwind_to(e, frame.sp, frame.scopes, frame.handlers, at)
+
+    val j = put(e, Jump(0), at)
+
+    if breaking then frame.breaks.push(j) else frame.continues.push(j)
+    e.loops.set(slot, frame)
+
+    // Control never falls through, so the counters go back to what the following code expects.
+    e.sp = sp
+    e.scopes = scopes
+    e.handlers = handlers
+    push_n(e, PushNull, at, 0, 1)
+end jump_out
+
+private open_loop(e: *Emit, label: string)
+    e.loops.push(LoopFrame(e.sp, e.scopes, e.handlers, label, buf(), buf()))
+
+// Which enclosing loop a `break` or a `continue` means, counted from the innermost.
+//
+// **The empty string means "the nearest one", not "the one with no name"**, so a labelled loop is
+// still what an unlabelled `break` inside it leaves.
+private loop_named(e: *Emit, label: string) -> usize
+    if e.loops.len() == 0 then return 0
+
+    var i = e.loops.len()
+
+    while i > 0
+        i -= 1
+
+        if label == "" || e.loops.at(i).label == label then return i + 1
+
+    0
+end loop_named
+
+private close_loop(e: *Emit, continue_to: usize, break_to: usize)
+    val frame = e.loops.at(e.loops.len() - 1)
+
+    for i in 0..<frame.breaks.len()
+        patch(e, frame.breaks.at(i), break_to)
+
+    for i in 0..<frame.continues.len()
+        patch(e, frame.continues.at(i), continue_to)
+
+    e.loops.truncate(e.loops.len() - 1)
+end close_loop
+
+// **A loop is an expression, and a `break` is what gives it a value other than null.** The two exits
+// therefore meet at one place with one value already on the stack: the normal one runs any `else` and
+// pushes null, and a `break` arrives with its own value already pushed.
+//
+// Not `private`: reached from `compile_expr.sysl` -- every loop is an EXPRESSION.
+compile_while(u: *Unit, e: *Emit, label: string, cond: Expr, body: Expr, otherwise: Option[Expr], at: Span)
+    val top = here(e)
+
+    open_loop(e, label)
+    compile_expr(u, e, cond)
+
+    val out = push_n(e, JumpIfFalse(0), at, 1, 0)
+
+    compile_body(u, e, body)
+    put(e, Jump(top), at)
+    patch(e, out, here(e))
+    compile_else(u, e, otherwise, at)
+
+    // **A `break` lands just past what the normal exit pushed, having pushed its own value instead.**
+    // Both exits therefore leave exactly one value and no jump is needed to join them.
+    close_loop(e, top, here(e))
+end compile_while
+
+// What a loop answers when it finished on its own.
+//
+// **The `else`'s value IS the loop's**, which was checked against sysl rather than assumed: a `for`
+// over nothing with an `else -1` answers `-1` there. That is what makes the search idiom read --
+// `break` gives the answer that was found and `else` gives the one for having found none -- and it
+// is why this leaves a value where a Python-style clause run for effect would not.
+private compile_else(u: *Unit, e: *Emit, otherwise: Option[Expr], at: Span)
+    otherwise match
+        Some(x) -> compile_expr(u, e, x)
+        None -> push_n(e, PushNull, at, 0, 1)
+
+// Not `private`: reached from `compile_expr.sysl` -- every loop is an EXPRESSION.
+compile_loop(u: *Unit, e: *Emit, label: string, body: Expr, at: Span)
+    val top = here(e)
+
+    open_loop(e, label)
+    compile_body(u, e, body)
+    put(e, Jump(top), at)
+
+    // There is no normal exit from a `loop`, so the only way out already carries a value -- and the
+    // counter is told about it here, there being no instruction that pushed one.
+    close_loop(e, top, here(e))
+    e.sp += 1
+end compile_loop
+
+// **`continue` goes to the TEST, not to the top**, which is the whole reason this is not desugared
+// into a `while`: the body has already run once by the time the condition is first asked.
+//
+// Not `private`: reached from `compile_expr.sysl` -- every loop is an EXPRESSION.
+compile_do_while(u: *Unit, e: *Emit, label: string, body: Expr, cond: Expr, otherwise: Option[Expr], at: Span)
+    val top = here(e)
+
+    open_loop(e, label)
+    compile_body(u, e, body)
+
+    val test = here(e)
+
+    compile_expr(u, e, cond)
+
+    val out = push_n(e, JumpIfFalse(0), at, 1, 0)
+
+    put(e, Jump(top), at)
+    patch(e, out, here(e))
+    compile_else(u, e, otherwise, at)
+    close_loop(e, test, here(e))
+end compile_do_while
+
+// Not `private`: reached from `compile_expr.sysl` -- every loop is an EXPRESSION.
+compile_for(u: *Unit, e: *Emit, label: string, binding: Pattern, iter: Expr, body: Expr, otherwise: Option[Expr], waits: bool, at: Span)
+    if waits
+        compile_for_await(u, e, label, binding, iter, body, otherwise, at)
+        return
+
+    compile_expr(u, e, iter)
+
+    // **`IterInit` KEEPS the subject and pushes a counter beside it**, so it gives one and takes
+    // none. Accounting it as taking the subject left the counter unmatched: the compiler believed
+    // the stack was one shallower than it was, the single `Pop` below removed only the counter, and
+    // every `for` a program ran stranded its subject for the rest of the enclosing chunk. Fifty
+    // thousand turns of a loop containing one was a SIGSEGV with no output.
+    push_n(e, IterInit, at, 0, 1)
+
+    val top = here(e)
+
+    open_loop(e, label)
+
+    // Answers the next element, or jumps out when there is none.
+    val out = push_n(e, IterNext(0), at, 0, 1)
+
+    push_n(e, PushScope, at, 0, 0)
+    e.scopes += 1
+    // **One name costs one instruction, as it always did.** Only a head that takes the element
+    // apart pays for the pattern machinery, and a `for` that binds one name emits nothing new.
+    *binding.kind match
+        Bind(name) -> push_n(e, DeclareVal(intern_str(u, name)), at, 1, 0)
+        _ ->
+            refuse_optionals(binding, "and a `for` head binds")
+            push_n(e, Unpack(intern_resolved(u, binding), true), at, 1, 0)
+            emit_pattern_defaults(u, e, binding, true)
+
+    compile_stmt_body(u, e, body)
+
+    push_n(e, PopScope, at, 0, 0)
+    e.scopes -= 1
+    put(e, Jump(top), at)
+    patch(e, out, here(e))
+
+    // The counter and the subject both go -- two values, which is what `IterInit` left -- and they go
+    // *before* the answer is built, so that the two Pops cannot take it.
+    push_n(e, Pop, at, 1, 0)
+    push_n(e, Pop, at, 1, 0)
+    compile_else(u, e, otherwise, at)
+
+    val done = put(e, Jump(0), at)
+
+    // **A `break` arrives with the walk still on the stack under its value**, having unwound only to
+    // the frame's own height -- so the value is slid beneath them and they are dropped from above it.
+    val brk = here(e)
+    val after = e.sp
+
+    push_n(e, RotUp(2), at, 0, 0)
+    push_n(e, Pop, at, 1, 0)
+    push_n(e, Pop, at, 1, 0)
+
+    // The two paths meet, so the counter follows the one that fell through rather than this one.
+    e.sp = after
+    close_loop(e, top, brk)
+    patch(e, done, here(e))
+end compile_for
+
+// `for await x in source` -- ask the subject for its next value, await the answer, and stop when it
+// says it is done.
+//
+// **The subject is asked with `next()` and nothing else, which is what lets ONE rule cover both
+// kinds of source.** A generator's `next()` answers `{value, done}` outright and an asynchronous one
+// answers a promise of the same shape -- and `await` of a plain value answers it, so the synchronous
+// case needs no fallback branch and no second protocol name. slate's well-known names are fields
+// (`proto`, `equals`, `hash`, `toString`, `toJSON`), and this is that mechanism once more rather than
+// a new one.
+//
+// **The shape is a `while` and not the counted walk above.** There is no counter, because what says
+// whether another value is coming is the subject; and there is one value on the stack through the
+// loop -- the subject -- where the ordinary `for` keeps two.
+private compile_for_await(u: *Unit, e: *Emit, label: string, binding: Pattern, iter: Expr, body: Expr, otherwise: Option[Expr], at: Span)
+    compile_expr(u, e, iter)
+
+    val top = here(e)
+
+    open_loop(e, label)
+
+    // **The subject is kept and copied**, `CallMethod` taking its receiver: the loop asks the same
+    // object every turn, so what is duplicated is the thing being walked rather than the answer.
+    push_n(e, IterAwaitCheck, at, 0, 0)
+    push_n(e, Dup, at, 0, 1)
+    push_n(e, CallMethod(intern_str(u, "next"), 0, 0), at, 1, 1)
+
+    // **Refused here rather than at the head**, so the complaint points at the line the awaiting
+    // happens on -- which is the whole loop, and is where a reader would put the `async`.
+    if e.is_async
+        push_n(e, Op.Await, at, 1, 1)
+    else
+        push_n(e, FailWith(intern_str(u, "`for await` belongs in an `async` function")), at, 1, 1)
+
+    // `{ value, done }`, read without being taken apart: `done` decides and `value` is what binds.
+    push_n(e, Dup, at, 0, 1)
+    push_n(e, GetField(intern_str(u, "done")), at, 1, 1)
+
+    // **Two jumps because there is no `JumpIfTrue` that pops**, and inverting is the honest way to
+    // spell it with what the instruction set has: fall into the body while `done` is false, and take
+    // the second jump out when it is not.
+    val into = push_n(e, JumpIfFalse(0), at, 1, 0)
+    val out = put(e, Jump(0), at)
+
+    patch(e, into, here(e))
+    push_n(e, GetField(intern_str(u, "value")), at, 1, 1)
+    push_n(e, PushScope, at, 0, 0)
+    e.scopes += 1
+
+    *binding.kind match
+        Bind(name) -> push_n(e, DeclareVal(intern_str(u, name)), at, 1, 0)
+        _ ->
+            refuse_optionals(binding, "and a `for await` head binds")
+            push_n(e, Unpack(intern_resolved(u, binding), true), at, 1, 0)
+            emit_pattern_defaults(u, e, binding, true)
+
+    compile_stmt_body(u, e, body)
+
+    push_n(e, PopScope, at, 0, 0)
+    e.scopes -= 1
+    put(e, Jump(top), at)
+    patch(e, out, here(e))
+
+    // The step that said `done` is still standing, and the subject under it. Both go before the
+    // answer is built, so that neither Pop can take it.
+    push_n(e, Pop, at, 1, 0)
+    push_n(e, Pop, at, 1, 0)
+    compile_else(u, e, otherwise, at)
+
+    val done = put(e, Jump(0), at)
+
+    // A `break` arrives with the subject still under its value, having unwound only to the frame's
+    // own height -- one value here where the counted walk leaves two.
+    val brk = here(e)
+    val after = e.sp
+
+    push_n(e, RotUp(1), at, 0, 0)
+    push_n(e, Pop, at, 1, 0)
+
+    e.sp = after
+    close_loop(e, top, brk)
+    patch(e, done, here(e))
+end compile_for_await
+
+// A loop body, run for effect: its value is discarded each turn.
+private compile_body(u: *Unit, e: *Emit, body: Expr)
+    push_n(e, PushScope, body.span, 0, 0)
+    e.scopes += 1
+    compile_stmt_body(u, e, body)
+    push_n(e, PopScope, body.span, 0, 0)
+    e.scopes -= 1
+end compile_body
+
+// The inside of a loop body, with its own scope already open.
+private compile_stmt_body(u: *Unit, e: *Emit, body: Expr)
+    *body.kind match
+        Block(stmts) ->
+            compile_stmts(u, e, stmts, body.span)
+            push_n(e, Pop, body.span, 1, 0)
+        _ ->
+            compile_expr(u, e, body)
+            push_n(e, Pop, body.span, 1, 0)
+end compile_stmt_body
+
+// `try ... catch e ...`, and the `x catch e -> y` that is the same thing.
+//
+// **The two branches meet at one stack height and one scope depth**, which is the whole of the
+// bookkeeping: the body leaves a value and so does the handler, and the machine restores everything
+// else from the record `PushHandler` wrote.
+//
+//     PushHandler(catch)   the world here is what a fault is given back
+//     <body>               leaves one value
+//     PopHandler           nothing faulted, so nothing is owed
+//     Jump(end)
+//   catch:                 the machine has cut back and pushed the fault
+//     PushScope            the handler's name is its own
+//     DeclareVal(e)        which takes the fault off the stack
+//     <handler>            leaves one value
+//     PopScope
+//   end:
+//
+// Not `private`: reached from `compile_expr.sysl` -- `try` is an expression as well as a statement.
+compile_try(u: *Unit, e: *Emit, body: Expr, name: string, handler: Expr, at: Span)
+    val guard = push_n(e, PushHandler(0), at, 0, 0)
+    val sp = e.sp
+    val scopes = e.scopes
+
+    e.handlers += 1
+
+    compile_expr(u, e, body)
+    push_n(e, PopHandler, at, 0, 0)
+    e.handlers -= 1
+
+    val over = put(e, Jump(0), at)
+
+    patch(e, guard, here(e))
+
+    // **The counters are set to what the MACHINE will have at the handler, not to what fell through
+    // here.** Control does not reach this point by running the instruction before it: the machine
+    // arrives having cut the stack back to where `PushHandler` stood and pushed the fault on top.
+    e.sp = sp + 1
+    e.scopes = scopes
+
+    push_n(e, PushScope, at, 0, 0)
+    e.scopes += 1
+    push_n(e, DeclareVal(intern_str(u, name)), at, 1, 0)
+    compile_expr(u, e, handler)
+    push_n(e, PopScope, at, 0, 0)
+    e.scopes -= 1
+    patch(e, over, here(e))
+end compile_try
