@@ -12,6 +12,7 @@ program and the machine are the same both times -- an absolute number here means
 | `loops.sl` | a `for` over an array with a destructuring head, which is what ordinary slate looks like |
 | `options.sl` | a function taking an options object apart WITH DEFAULTS, called in a loop |
 | `closures.sl` | a loop calling a small closure that captures ONE of the function's names |
+| `nested.sl` | the same loop as `loops.sl` in a chunk that keeps a scope for one captured name |
 | `globals.sl` | the CONTROL: `arith.sl`'s loop at module level, where the names are not locals |
 
 **THE FIRST FOUR PUT THEIR LOOP INSIDE A FUNCTION AND THAT IS DELIBERATE.** A name written at the

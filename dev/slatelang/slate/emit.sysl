@@ -112,6 +112,13 @@ struct Emit
     // Where each open block's names begin in the four lists above.
     blocks: Buf[usize]
 
+    // Whether each open block actually pushed an `EnvObj`.
+    //
+    // **`scopes` counts the scopes that were PUSHED and nothing else**, which is the invariant every
+    // unwind depends on: a `break` out of a loop emits one `PopScope` per level between here and the
+    // loop's, and a level that pushed nothing must not be counted or it would pop somebody else's.
+    scoped: Buf[bool]
+
 // Where `break` and `continue` have to get back to, and what they have to tidy on the way.
 struct LoopFrame
     sp: usize
@@ -129,7 +136,7 @@ struct LoopFrame
     continues: Buf[usize]
 
 fresh_emit(is_async: bool, is_gen: bool, slotting: bool, cells: bool, kept: Buf[string]) -> Emit =
-    Emit(buf(), 0, 0, buf(), 0, is_async, is_gen, slotting, cells, kept, 0, buf(), buf(), buf(), buf(), buf())
+    Emit(buf(), 0, 0, buf(), 0, is_async, is_gen, slotting, cells, kept, 0, buf(), buf(), buf(), buf(), buf(), buf())
 
 // Open a block, in the code and in the compiler's own record of what is bound here.
 //
@@ -147,16 +154,37 @@ fresh_emit(is_async: bool, is_gen: bool, slotting: bool, cells: bool, kept: Buf[
 // were still in view after it ended, and a name resolved to the wrong slot is the one mistake this
 // whole arrangement may not make. The unwinding a `break` does is the exception and emits the bare
 // op: it leaves scopes it is jumping out of, and the compiler is not leaving them.
-open_scope(e: *Emit, at: Span)
-    if !e.slotting then push_n(e, PushScope, at, 0, 0)
+// **A MIXED CHUNK OPENS A SCOPE ONLY WHERE THE BLOCK DECLARES A NAME INTO ONE**, which is the same
+// finding once more and the last place it was left standing. A chunk keeping its scope for one
+// captured name still built an `EnvObj` for every block in it -- a loop body that declares nothing,
+// a `for` head whose names are all cells -- and threw it away a turn later. **Skipping it is sound
+// because a closure made in such a block captures `vm.scope` and every name that block bound is a
+// cell**: if a closure could want one, that name would be kept and the block would push.
+//
+// **`scoped` is the caller's answer and not this function's**, because what a block binds is known
+// where it is compiled and not here. The three `scoped_*` questions below are the only ways to ask.
+//
+// **The scope COUNT is kept here now rather than by each caller.** It has to be, the two having to
+// agree exactly: `unwind_to` and `break` both emit one `PopScope` per counted level, so a level that
+// pushed nothing and was counted anyway would pop a scope belonging to somebody else.
+open_scope(e: *Emit, at: Span, scoped: bool)
+    if scoped
+        push_n(e, PushScope, at, 0, 0)
+        e.scopes += 1
 
     e.blocks.push(e.named.len())
+    e.scoped.push(scoped)
 
 // Shut the block `open_scope` opened, dropping what it bound.
 shut_scope(e: *Emit, at: Span)
-    if !e.slotting then push_n(e, PopScope, at, 0, 0)
+    if block_scoped(e)
+        push_n(e, PopScope, at, 0, 0)
+        e.scopes -= 1
 
     drop_block(e)
+
+// Whether the innermost open block pushed a scope, for a caller emitting its own matching `PopScope`.
+block_scoped(e: *Emit) -> bool = if e.scoped.is_empty() then false else e.scoped.at(e.scoped.len() - 1)
 
 // Forget an open block's names without emitting anything, for a caller that has already put its own
 // `PopScope` down.
@@ -166,6 +194,7 @@ drop_block(e: *Emit)
     val back = e.blocks.at(e.blocks.len() - 1)
 
     e.blocks.truncate(e.blocks.len() - 1)
+    e.scoped.truncate(e.scoped.len() - 1)
     e.named.truncate(back)
     e.slot_of.truncate(back)
     e.slot_var.truncate(back)
@@ -214,6 +243,116 @@ slot_named(e: *Emit, name: string) -> Option[usize]
         i = i - 1
 
         if e.named.at(i) == name then return if e.in_cell.at(i) then Some(i) else None
+
+// -- whether a block needs an `EnvObj` of its own -----------------------------------------------------
+
+// **These five are the only ways to answer `open_scope`'s question**, and they all read the same
+// three cases: a WHOLE chunk never opens a scope, a chunk with NO cells always does -- nothing about
+// it has changed -- and a MIXED chunk opens one exactly where the block declares a name into it.
+//
+// **A block's own statements are what decide it, and a nested block decides for itself.** A `Group`
+// is a flattening rather than a block, so its statements bind here and it is walked into; everything
+// else that binds either opens a scope of its own or takes a cell.
+
+// An ordinary block, a lambda's body, a chunk's body.
+scoped_block(e: *Emit, stmts: Buf[Stmt]) -> bool
+    if e.slotting then return false
+    if !e.cells then return true
+
+    block_declares(e, stmts)
+
+// A loop, whose ONE scope holds its head's names and its body's own -- `compile_stmt_body` puts a
+// block's statements into the scope already open rather than opening a second.
+scoped_loop(e: *Emit, binding: Pattern, body: Expr) -> bool
+    if e.slotting then return false
+    if !e.cells then return true
+    if pattern_declares(e, binding) then return true
+
+    body_declares(e, body)
+end scoped_loop
+
+// A loop body with no head of its own.
+scoped_body(e: *Emit, body: Expr) -> bool
+    if e.slotting then return false
+    if !e.cells then return true
+
+    body_declares(e, body)
+
+// A `match` arm, which binds through a pattern before its body runs.
+//
+// **The BODY is not asked about, where a loop's is.** An arm's body is compiled as an ordinary
+// expression, so a block one opens a scope of its own and decides for itself; a loop's body is put
+// into the scope already open, `compile_stmt_body` inlining its statements rather than opening a
+// second. So the two questions differ, and they differ for that reason alone.
+scoped_arm(e: *Emit, pat: Pattern) -> bool
+    if e.slotting then return false
+    if !e.cells then return true
+
+    pattern_declares(e, pat)
+
+// A `catch`, which binds one name and no pattern.
+scoped_catch(e: *Emit, name: string) -> bool
+    if e.slotting then return false
+    if !e.cells then return true
+
+    !may_cell(e, name)
+
+// An `if` branch, which binds NOTHING of its own.
+//
+// **That is a claim about the language rather than about this block**, and it is checked: the only
+// expression that declares into the scope the machine is standing in is an `is` whose pattern binds,
+// and `slot_plan` refuses a chunk holding one outright — so a chunk with cells has none. A branch
+// that is a block opens a scope of its own and decides for itself.
+scoped_branch(e: *Emit) -> bool = !e.slotting && !e.cells
+
+// Whether any statement of this block declares a name into the scope.
+//
+// **Exhaustive over `StmtKind` on purpose and it must stay so.** A statement added later that
+// declares by name and fell through as harmless would have its `DeclareVal` land in the scope of
+// whatever block is open OUTSIDE this one — a binding that outlives its block, silently.
+block_declares(e: *Emit, stmts: Buf[Stmt]) -> bool
+    for i in 0..<stmts.len()
+        if stmt_declares(e, stmts.at(i)) then return true
+
+    false
+
+private stmt_declares(e: *Emit, s: Stmt) -> bool
+    *s.kind match
+        Val(name, _) -> !may_cell(e, name)
+        Var(name, _) -> !may_cell(e, name)
+        Unpack(pat, _, _) -> pattern_declares(e, pat)
+
+        // A definition and a type declaration both write their name into the scope by hand --
+        // `DefineFn` and a `DeclareVal` after a `PushShape` — and `slot_plan` keeps both names for
+        // that reason, so this is the answer those two already gave.
+        Def(_, _, _, _, _) -> true
+        TypeDecl(_, _) -> true
+
+        // A flattening rather than a block: its statements bind where it stands.
+        Group(inner) -> block_declares(e, inner)
+
+        // An import binds by name, and cannot appear in a function anyway. Written out for the
+        // reason the rest are.
+        ImportNames(_, _, _, _, _) -> true
+        ImportAll(_, _, _, _) -> true
+
+        // The statements that bind nothing here. A `for`, a `match`, a `try` and a lambda all bind
+        // inside a block of their own, which asks this question again for itself.
+        Assign(_, _, _) -> false
+        MultiAssign(_, _, _) -> false
+        Eval(_) -> false
+        Return(_) -> false
+        Throw(_) -> false
+        Break(_, _) -> false
+        Continue(_) -> false
+        CheckType(_, _, _) -> false
+end stmt_declares
+
+// Whether a block used as a body declares a name into the scope. A body that is not a block is an
+// expression, and an expression declares nothing -- see `scoped_branch`.
+private body_declares(e: *Emit, body: Expr) -> bool = *body.kind match
+    Block(stmts) -> block_declares(e, stmts)
+    _ -> false
 
 // Whether a name declared here may take a cell, which is the question every binding site asks.
 may_cell(e: *Emit, name: string) -> bool
@@ -279,11 +418,13 @@ unwind_to(e: *Emit, sp: usize, scopes: usize, handlers: usize, at: Span)
         put(e, Pop, at)
         n -= 1
 
+    // **One `PopScope` per level that PUSHED one.** `scopes` counts nothing else, so this needs no
+    // question about the chunk: a whole chunk's count is zero and never moves, and a mixed one's
+    // counts only the blocks that declared a name into a scope.
     var d = e.scopes
 
     while d > scopes
-        if !e.slotting then put(e, PopScope, at)
-
+        put(e, PopScope, at)
         d -= 1
 
     // **A `break` out of a `try` body drops its handler on the way.** Left behind, it would name an
