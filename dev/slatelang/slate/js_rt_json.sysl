@@ -1,0 +1,401 @@
+module dev.slatelang.slate
+
+// Reading and writing JSON, as JavaScript, and the two byte functions beside it.
+//
+// **One JavaScript block continued, not a program of its own.** It stands inside the `$b` IIFE
+// `js_rt_builtins.sysl` opens and `js_rt_host.sysl` closes, so nothing crosses at the sysl level:
+// this file contributes one `js_runtime_*` function and `js_runtime` concatenates it in place.
+//
+// **JSON is its own file because it is its own subject**, and a long one -- a reader and a writer
+// that have to agree with the interpreter's on which of slate's two numeric kinds a number is.
+
+js_runtime_json() -> string = raw"""
+        // -- JSON ----------------------------------------------------------------------------------------
+
+        // A real as JSON spells it, which is NOT how `print` spells one.
+        //
+        // **The interpreter's rendering is C's `%.Ng` at the first N of 15, 16, 17 that reads back
+        // equal**, then a `.0` where neither a point nor an exponent got written — because `1` is an
+        // integer to a JSON reader and `1.0` is not, and slate's two numeric kinds are only worth
+        // having if a round trip keeps them apart. **`String(x)` is JavaScript's own shortest form
+        // and agrees with almost none of it**: `1.0` came out `1`, so `parseJSON(toJSON(1.0))` was an
+        // integer under `slate js` and a real under the interpreter; `1e20` came out as twenty-one
+        // digits, `1e-5` as `0.00001`, and every exponent unpadded.
+        const trimmedZeros = (s) => (s.indexOf(".") < 0 ? s : s.replace(/0+$/, "").replace(/\.$/, ""))
+
+        // `%.pg`: an exponent below -4 or at least the precision picks the exponential form, and a
+        // C exponent is signed and at least two digits.
+        const gFormat = (x, p) => {
+            const said = x.toExponential(p - 1)
+            const [head, tail] = said.split("e")
+            const exp = Number(tail)
+
+            if (exp < -4 || exp >= p)
+                return trimmedZeros(head) + "e" + (exp < 0 ? "-" : "+") +
+                    String(Math.abs(exp)).padStart(2, "0")
+
+            return trimmedZeros(x.toFixed(p - 1 - exp))
+        }
+
+        // **A NaN or an infinity is `null` rather than a fault**, which is `sh.sysl.json`'s decision
+        // and therefore the interpreter's: JSON's grammar has no spelling for either, and it is what
+        // `JSON.stringify` writes, so a reader on the other end expects it.
+        const jsonReal = (x) => {
+            if (!Number.isFinite(x)) return "null"
+            if (x === 0) return Object.is(x, -0) ? "-0.0" : "0.0"
+
+            for (let p = 15; p <= 17; p++) {
+                const said = gFormat(x, p)
+
+                if (Number(said) === x) return said.indexOf(".") < 0 && said.indexOf("e") < 0 ? said + ".0" : said
+            }
+
+            const last = gFormat(x, 17)
+
+            return last.indexOf(".") < 0 && last.indexOf("e") < 0 ? last + ".0" : last
+        }
+
+        B.toJSON = (v, indent) => {
+            const step = indent === undefined ? 0 : wantInt(indent, "toJSON")
+
+            return writeJson(v, step, 0, [])
+        }
+
+        // **The keys a nominal value does not encode**, which is the printer's list and the
+        // interpreter's `hidden_key`: the chain it is reached through and the tag that says what
+        // made it. Without it the walk reaches the class object and complains about `new`.
+        const hiddenKey = (k) => k === "proto" || $.tagKey(k)
+
+        // **`path` IS THE WHOLE CYCLE GUARD, and this back end had none.** A value that holds itself
+        // is an ordinary thing to build under a tracing collector, and `writeJson` descended it until
+        // node ran out of stack -- which arrives as a `RangeError` naming a line of the runtime, not
+        // as anything slate said. The interpreter has answered this with a sentence from the start.
+        const writeJson = (v, step, depth, path) => {
+            if (v === null) return "null"
+            if (typeof v === "boolean") return v ? "true" : "false"
+            if ($.isInt(v)) return v.toString()
+            if ($.isReal(v)) return jsonReal(v)
+            if ($.isStr(v)) return JSON.stringify(v)
+
+            const gap = step === 0 ? "" : "\n" + " ".repeat(step * (depth + 1))
+            const close = step === 0 ? "" : "\n" + " ".repeat(step * depth)
+            const comma = step === 0 ? "," : "," + gap
+
+            if (Array.isArray(v)) {
+                if (path.indexOf(v) >= 0)
+                    fault("this array holds itself, so there is no JSON for it -- a document has no way to point back at what contains it")
+
+                if (v.length === 0) return "[]"
+
+                path.push(v)
+
+                const out = "[" + gap + v.map((x) => writeJson(x, step, depth + 1, path)).join(comma) + close + "]"
+
+                path.pop()
+
+                return out
+            }
+
+            if (v instanceof $.SObj) {
+                if (path.indexOf(v) >= 0)
+                    fault("this object holds itself, so there is no JSON for it -- a document has no way to point back at what contains it")
+
+                // **A `toJSON` the program wrote replaces everything below, at every depth** -- the
+                // rule `toString` already has, and node's own. The receiver rule applies, so a class
+                // writes `toJSON(self)` like every other method.
+                const said = $.callHook(v, "toJSON", [])
+
+                if (said !== $.NO_HOOK) {
+                    if (said === v)
+                        fault("`toJSON` says what a value encodes as, so it answers something else -- and this one gave the value back")
+
+                    path.push(v)
+
+                    const out = writeJson(said, step, depth, path)
+
+                    path.pop()
+
+                    return out
+                }
+
+                // **A class is a declaration rather than data**, so it has no more of a JSON form
+                // than a function does -- and saying so names it, where the walk below reached `new`
+                // and complained about a function nobody wrote.
+                const own = $.classOwnName(v)
+
+                if (own !== null) fault("there is no JSON for the class `" + own + "`")
+
+                // **A nominal value encodes its own fields and not the chain it hangs from.**
+                const nominal = $.variantName(v) !== null || $.className(v) !== null
+                const parts = []
+
+                path.push(v)
+
+                for (const [k, x] of v.entries()) {
+                    if (nominal && hiddenKey(k)) continue
+
+                    // **A JSON name is a string and a slate key is any value**, so a key that is not
+                    // one has no encoding. `JSON.stringify` of an object key wrote `{}` and of an
+                    // integer key wrote a quoted number, either of which is a document the program
+                    // did not mean; the interpreter has refused both from the start.
+                    if (typeof k !== "string")
+                        fault("a JSON name is a string, and this object has a key that is " + typeName(k))
+
+                    parts.push(JSON.stringify(k) + (step === 0 ? ":" : ": ") + writeJson(x, step, depth + 1, path))
+                }
+
+                path.pop()
+
+                if (parts.length === 0) return "{}"
+
+                return "{" + gap + parts.join(comma) + close + "}"
+            }
+
+            // **The interpreter's sentence, word for word.** The two back ends said different things
+            // about the same value -- *"`toJSON` cannot write a function"* here and *"there is no
+            // JSON for a function"* there -- which a suite that runs on both now notices.
+            fault("there is no JSON for " + typeName(v))
+        }
+
+        // `parseJSON(text)` -- `{ ok: true, value }`, or `{ ok: false, error }`.
+        //
+        // **A document that will not parse is a RESULT, and a value that will not render is a fault.**
+        // That is slate's two-channel rule applied to the two directions, and they genuinely differ:
+        // text arriving from a file, a socket or a person is a condition every caller was always going
+        // to handle, and a circle in a value the program built itself is a defect in that program.
+        //
+        // **Read here rather than by `JSON.parse`, and the reason is the two kinds of number**: JSON has
+        // one and slate has two, and the distinction is in the TEXT -- `1` is an integer and `1.0` is a
+        // real. `JSON.parse` answers a double for both and the difference cannot be recovered from it.
+        B.parseJSON = (s) => {
+            wantString(s, "parseJSON")
+
+            try {
+                const reader = { text: s, at: 0 }
+
+                skipBlanks(reader)
+
+                const value = readJson(reader)
+
+                skipBlanks(reader)
+
+                if (reader.at < s.length) throw new SyntaxError("unexpected text after the document")
+
+                return new $.SObj([["ok", true], ["value", value]])
+            } catch (e) {
+                if (e instanceof SyntaxError) return new $.SObj([["ok", false], ["error", e.message]])
+
+                throw e
+            }
+        }
+
+        const skipBlanks = (r) => {
+            while (r.at < r.text.length && " \t\n\r".indexOf(r.text[r.at]) >= 0) r.at += 1
+        }
+
+        const wanted = (r, what) => {
+            throw new SyntaxError(what + " expected at character " + (r.at + 1))
+        }
+
+        const readJson = (r) => {
+            if (r.at >= r.text.length) wanted(r, "a value")
+
+            const c = r.text[r.at]
+
+            if (c === "{") return readObject(r)
+            if (c === "[") return readArray(r)
+            if (c === '"') return readString(r)
+
+            if (r.text.startsWith("true", r.at)) { r.at += 4; return true }
+            if (r.text.startsWith("false", r.at)) { r.at += 5; return false }
+            if (r.text.startsWith("null", r.at)) { r.at += 4; return null }
+
+            return readNumber(r)
+        }
+
+        const readObject = (r) => {
+            const entries = []
+
+            r.at += 1
+            skipBlanks(r)
+
+            if (r.text[r.at] === "}") { r.at += 1; return new $.SObj(entries) }
+
+            for (;;) {
+                skipBlanks(r)
+
+                if (r.text[r.at] !== '"') wanted(r, "a key")
+
+                const key = readString(r)
+
+                skipBlanks(r)
+
+                if (r.text[r.at] !== ":") wanted(r, "`:`")
+
+                r.at += 1
+
+                skipBlanks(r)
+                entries.push([key, readJson(r)])
+                skipBlanks(r)
+
+                if (r.text[r.at] === ",") { r.at += 1; continue }
+                if (r.text[r.at] === "}") { r.at += 1; return new $.SObj(entries) }
+
+                wanted(r, "`,` or `}`")
+            }
+        }
+
+        const readArray = (r) => {
+            const items = []
+
+            r.at += 1
+            skipBlanks(r)
+
+            if (r.text[r.at] === "]") { r.at += 1; return items }
+
+            for (;;) {
+                skipBlanks(r)
+                items.push(readJson(r))
+                skipBlanks(r)
+
+                if (r.text[r.at] === ",") { r.at += 1; continue }
+                if (r.text[r.at] === "]") { r.at += 1; return items }
+
+                wanted(r, "`,` or `]`")
+            }
+        }
+
+        const readString = (r) => {
+            const end = findStringEnd(r)
+            const raw = r.text.slice(r.at, end)
+
+            r.at = end
+
+            return JSON.parse(raw)
+        }
+
+        // Where the string that starts here ends, an escaped quote not counting.
+        const findStringEnd = (r) => {
+            let i = r.at + 1
+
+            for (;;) {
+                if (i >= r.text.length) wanted(r, "the end of a string")
+
+                if (r.text[i] === "\\") { i += 2; continue }
+                if (r.text[i] === '"') return i + 1
+
+                i += 1
+            }
+        }
+
+        // **The text decides the kind**: a number written with no point and no exponent is an integer,
+        // and any other is a real.
+        const readNumber = (r) => {
+            const rest = r.text.slice(r.at)
+            const found = /^-?(0|[1-9][0-9]*)((\.[0-9]+)?([eE][+-]?[0-9]+)?)/.exec(rest)
+
+            if (found === null) wanted(r, "a value")
+
+            r.at += found[0].length
+
+            return found[2] === "" ? BigInt(found[0]) : Number(found[0])
+        }
+
+        // UTF-8, written out rather than taken from `TextEncoder`.
+        //
+        // **NOTHING THE PRELUDE NEEDS MAY BE A FEATURE AN ENGINE MIGHT NOT HAVE**, and these two are
+        // exactly that: node and a browser have `TextEncoder`, an embedded quickjs realm does not, so
+        // `len(toBytes(s))` — which is how a slate program counts a body's length — died with
+        // `TextEncoder is not defined` on the host slate's own test runner uses.
+        //
+        // **The decoder is strict, because the interpreter's is.** `from_utf8` refuses an overlong
+        // form, a surrogate, anything past U+10FFFF and a sequence that stops early; `TextDecoder`
+        // replaces each of them with U+FFFD and answers a string, which would have made `fromBytes`
+        // succeed under node for bytes the interpreter says are not text.
+        const bytesOfText = (s) => {
+            const out = []
+
+            for (const ch of s) {
+                const c = ch.codePointAt(0)
+
+                if (c < 0x80) out.push(c)
+                else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f))
+                else if (c < 0x10000) out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f))
+                else out.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 0x3f), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f))
+            }
+
+            return out
+        }
+
+        // The text those bytes spell, or null where they spell none.
+        const textOfBytes = (bytes) => {
+            let out = ""
+            let i = 0
+
+            while (i < bytes.length) {
+                const b = bytes[i]
+
+                if (b < 0x80) {
+                    out += String.fromCharCode(b)
+                    i += 1
+
+                    continue
+                }
+
+                let need = 0
+                let c = 0
+
+                // 0xc0 and 0xc1 are missing on purpose: they can only begin an overlong form.
+                if (b >= 0xc2 && b <= 0xdf) { need = 1; c = b & 0x1f }
+                else if (b >= 0xe0 && b <= 0xef) { need = 2; c = b & 0x0f }
+                else if (b >= 0xf0 && b <= 0xf4) { need = 3; c = b & 0x07 }
+                else return null
+
+                if (i + need >= bytes.length) return null
+
+                for (let k = 1; k <= need; k++) {
+                    const n = bytes[i + k]
+
+                    if (n < 0x80 || n > 0xbf) return null
+
+                    c = (c << 6) | (n & 0x3f)
+                }
+
+                if (need === 2 && c < 0x800) return null
+                if (need === 3 && c < 0x10000) return null
+                if (c >= 0xd800 && c <= 0xdfff) return null
+                if (c > 0x10ffff) return null
+
+                out += String.fromCodePoint(c)
+                i += need + 1
+            }
+
+            return out
+        }
+
+        B.toBytes = (s) => bytesOfText(wantString(s, "toBytes")).map((b) => BigInt(b))
+
+        // **A RESULT, because arbitrary bytes are not text**, which is the interpreter's rule and was
+        // not this back end's: it answered the string itself, so every `fromBytes(bs).value` in every
+        // program was `undefined` under `slate js`.
+        B.fromBytes = (xs) => {
+            wantArray(xs, "fromBytes")
+
+            const bytes = []
+
+            for (let i = 0; i < xs.length; i++) {
+                const b = xs[i]
+
+                if (!$.isInt(b)) fault("`fromBytes` takes an array of numbers, and one of these is " + typeName(b))
+                if (b < 0n || b > 255n) fault("a byte is between 0 and 255, and this is " + b)
+
+                bytes.push(Number(b))
+            }
+
+            const said = textOfBytes(bytes)
+
+            return said === null
+                ? new $.SObj([["ok", false], ["error", "these bytes are not text -- they are not valid UTF-8"]])
+                : new $.SObj([["ok", true], ["value", said]])
+        }
+    """
