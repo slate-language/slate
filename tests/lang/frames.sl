@@ -149,3 +149,19 @@ A_GENERATOR_IS_PREPARED_WITH_ITS_ARGUMENTS_LONG_BEFORE_IT_RUNS()
     assertEq(next(h).value, 0)
     assertEq(next(h).value, 5)
     assertEq(next(h).value, 10)
+
+@test
+AN_is_THAT_BINDS_A_NAME_DOES_NOT_LEAVE_IT_BEHIND_AFTER_THE_CALL()
+    // **A bare name in pattern position binds**, so `v is n` names the subject -- and the binding is
+    // the call's, not the module's. A function whose parameters and locals are numbered cells has no
+    // scope object of its own to write it into, so this pins that such a function is not given one
+    // and the name is left alone outside it.
+    var n = 0
+
+    named(v) = v is n
+
+    assert(named(7))
+    assertEq(n, 0)
+
+    named(9)
+    assertEq(n, 0)
