@@ -6,6 +6,17 @@ HTTP/2: the framing layer, and HPACK on its own.
 import { h2Client, h2Server, h2Receive, h2Send, h2Next, h2Request, h2Respond, h2Close } from slate:nghttp2
 ```
 
+**DRAIN `h2Next` AFTER `h2Send`, NOT ONLY AFTER `h2Receive`.** A session queues an event when it
+*writes* as much as when it reads: the last frame of a request going out is what ends that stream, so
+`streamClose` is waiting in the session the moment the write is made. A loop shaped as *receive,
+drain, write* — which is the shape a socket callback naturally takes — leaves that event sitting
+until the peer happens to send something else. Where the peer has nothing more to say, nothing ever
+arrives to shake it out and the program waits forever.
+
+It is the client still uploading when its answer comes back that meets this, because that is the one
+whose stream ends on a write rather than on a read. **Alternate until neither side has anything**:
+drain, write, drain again, and stop when a drain yields no event and a write yields no bytes.
+
 **Nothing here touches a socket.** Bytes that arrived go in at `h2Receive`, bytes to write come out of
 `h2Send`, and what happened in between is read off with `h2Next`. HTTP/2 is a *transformation*, so how
 bytes reach the wire stays your program's business — which is why the whole protocol can be driven
