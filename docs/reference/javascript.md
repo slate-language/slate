@@ -67,6 +67,28 @@ Half-doing the calendar is what this avoids. A zone read from `Intl` and a zone 
 database are two answers to one question, and a program that says what time a meeting is in Toronto may
 not get a different answer for having been compiled rather than interpreted.
 
+**That was a worry rather than a measurement, and it has now been measured.** Twelve zones — including
+half-hour and three-quarter-hour offsets, both directions of DST, a zone that changed its mind about
+the date line, a reading in 2000 and one in 2038 — against seven instants each, is **84 offsets, and
+`Intl` and the IANA database agree on all 84**. So the numeric calendar can be built here and hold
+its answers.
+
+**`abbrev` is the one that cannot, and it is not a version skew.** `Intl` has no IANA abbreviation at
+all: what its `timeZoneName` options carry is CLDR's English *display* data, which agrees with tzdata
+for American zones by coincidence and nowhere else. Measured on one instant:
+
+| zone | IANA | `short` | `long` |
+|---|---|---|---|
+| `America/Toronto` | `EDT` | `EDT` | Eastern Daylight Time |
+| `Europe/London` | `BST` | `GMT+1` | British Summer Time |
+| `Asia/Kolkata` | `IST` | `GMT+5:30` | India Standard Time |
+| `Africa/Cairo` | `EEST` | `GMT+3` | Eastern European Summer Time |
+
+67 of the same 84 readings disagree. A table carried in the runtime would be a second copy of tzdata
+going stale in a file nobody looks at, so **`abbrev` stays owed in the JavaScript back end** and says
+so in the same sentence every other owed name says. It is the honest case for that list: a browser
+does not have this, rather than slate not having got to it.
+
 **An instant is a whole number of milliseconds from the clock on both back ends**, `Date.now()` having
 nothing finer — the interpreter drops its microseconds to match. An instant a program *builds* keeps
 every digit: `epochMicros(1000000001)` is exact wherever it runs.
