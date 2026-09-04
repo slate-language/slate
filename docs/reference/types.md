@@ -65,7 +65,7 @@ the compiler resolves and the value the name binds.
 |---|---|
 | `any` | anything, and what an unannotated thing is |
 | `number` `integer` `real` `string` `boolean` `array` `object` `function` `null` | a kind |
-| `{ a: T, b?: U }` | an object with at least those fields |
+| `{ a: T, b?: U }` | an object with at least those fields — except a literal written at the spot, which may carry no others |
 | `[T, U]` | an array whose first elements fit |
 | `array of T` | an array every element of which fits `T` |
 | `object of T` | an object every value of which fits `T` |
