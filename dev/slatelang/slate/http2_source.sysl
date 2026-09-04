@@ -38,10 +38,29 @@ http2_source() -> string = raw"""
         // Everything the session wants written, written. **Called after every receive and after every
         // response**, because a session may have frames of its own to send -- settings, window
         // updates, an acknowledgement -- that no handler asked for.
-        flush()
+        //
+        // **THE WRITE IS AWAITED AND ITS FAILURE IS THE CLIENT HAVING GONE.** An unawaited write is
+        // a promise nobody holds, so once the peer is away its rejection is an orphan -- and an
+        // orphaned rejection stops the program, which is the one thing a departed client may not be
+        // able to do. That is the defect the 1.1 heartbeat had, and every site here had the same
+        // shape: over a whole-body response the window is a moment and over an event stream it is
+        // the life of the connection, but a moment is still a window.
+        //
+        // **So the failure is handled HERE rather than raised**, which is what lets a caller that
+        // is not `async` -- the read callback, the drain loop -- go on calling it: this cannot
+        // reject, so an unawaited call of it is not an orphan either. What a write failure means is
+        // that there is nobody left to say anything to, so the connection ends.
+        async flushed()
+            if shut then return
+
             val out = h2Send(session)
 
-            if len(out) > 0 then send(conn, out)
+            if len(out) == 0 then return
+
+            try
+                await send(conn, out)
+            catch gone
+                stop()
 
         stop()
             if shut then return
@@ -99,7 +118,8 @@ http2_source() -> string = raw"""
                 replying = true
 
                 h2Respond(session, stream, headers, r.text ?? r.bytes)
-                flush()
+
+                await flushed()
             catch e
                 // The stream is gone: there is nobody to tell and nothing wrong with the program.
                 if replying then return
@@ -111,7 +131,8 @@ http2_source() -> string = raw"""
                     // inside the `catch` -- and that one nothing was waiting for at all.
                     try
                         h2Respond(session, stream, [[":status", "500"]], "this request was not answered")
-                        flush()
+
+                        await flushed()
                     catch gone
                         val told = gone
 
@@ -148,9 +169,11 @@ http2_source() -> string = raw"""
 
                     return
 
-                try
-                    await flushed()
-                catch gone
+                await flushed()
+
+                // **A beat that could not be written means there is nobody to keep a connection
+                // open for**, so the beating stops. `flushed` has already ended the connection.
+                if shut
                     beating = false
 
                     return
@@ -170,6 +193,18 @@ http2_source() -> string = raw"""
 
             try
                 for await piece in r.source
+                    // **The connection may have gone while the source was being asked**, which for
+                    // a stream running over minutes is the ordinary end rather than a rare one: a
+                    // refusal on the same connection, a GOAWAY, a client that hung up. The session
+                    // is closed by then, so pushing into it would be a fault about a session where
+                    // what happened is that nobody is listening.
+                    if shut
+                        beating = false
+
+                        stopBeating(timer)
+
+                        return
+
                     val part = framedH2(piece)
 
                     // **An empty piece is skipped**, as it is on the 1.1 connection. It says
@@ -224,18 +259,6 @@ http2_source() -> string = raw"""
             val text = if piece is string then piece else string(piece)
 
             if len(toBytes(text)) == 0 then null else text
-
-        // `flush`, awaited.
-        //
-        // **A streamed response is written over minutes rather than milliseconds, which is what
-        // makes the difference matter.** An unawaited write whose client has gone is a rejection
-        // nobody holds, and an orphaned rejection stops the program -- exactly the defect the 1.1
-        // heartbeat had. Over a whole-body response the window is a moment; over an event stream it
-        // is the whole life of the connection.
-        async flushed()
-            val out = h2Send(session)
-
-            if len(out) > 0 then await send(conn, out)
 
         // Everything the peer did since the last read.
         drain()
@@ -345,19 +368,23 @@ http2_source() -> string = raw"""
 
             if bad != null
                 h2Goaway(session, 0)
-                flush()
+
+                // **Not awaited, and it does not need to be**: `flushed` answers a write failure
+                // itself, so there is no rejection for a caller to hold. The read callback is not
+                // `async` and making it one would be a promise nothing awaits either.
+                flushed()
                 stop()
 
                 return
 
             drain()
 
-            if !shut then flush()
+            flushed()
 
         onBytes(conn, heard)
 
         // **The server's own SETTINGS go out first.** A client is entitled to them and will wait.
-        flush()
+        flushed()
 
         // The bytes that chose this speaker -- the client's preface and its first frames.
         heard(first)
