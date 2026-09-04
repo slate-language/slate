@@ -99,7 +99,7 @@ private expr_holds_capture(x: Expr, mine: *Buf[string], tested: *Buf[string]) ->
             for i in 0..<arms.len()
                 val arm = arms.at(i)
 
-                if !slottable_pattern(arm.pattern) then return true
+                if !slottable_pattern(arm.pattern, false) then return true
 
                 pattern_binders(arm.pattern, mine)
                 pattern_mentions(arm.pattern, tested)
@@ -110,10 +110,8 @@ private expr_holds_capture(x: Expr, mine: *Buf[string], tested: *Buf[string]) ->
 
             expr_holds_capture(subject, mine, tested)
         For(_, binding, iter, body, otherwise, _) ->
-            if !slottable_pattern(binding) then return true
+            if !bindable_here(binding, mine, tested) then return true
 
-            pattern_binders(binding, mine)
-            pattern_mentions(binding, tested)
             expr_holds_capture(iter, mine, tested) || expr_holds_capture(body, mine, tested) || maybe_expr(otherwise, mine, tested)
 
         // **A `catch` binds ONE name and no pattern**, which is what makes it the binding form that
@@ -192,10 +190,8 @@ private stmt_holds_capture(s: Stmt, mine: *Buf[string], tested: *Buf[string]) ->
             mine.push(name)
             expr_holds_capture(init, mine, tested)
         Unpack(pat, init, _) ->
-            if !slottable_pattern(pat) then return true
+            if !bindable_here(pat, mine, tested) then return true
 
-            pattern_binders(pat, mine)
-            pattern_mentions(pat, tested)
             expr_holds_capture(init, mine, tested)
         Group(stmts) -> any_stmt(stmts, mine, tested)
         Assign(_, target, value) -> expr_holds_capture(target, mine, tested) || expr_holds_capture(value, mine, tested)
@@ -283,16 +279,56 @@ store_name(u: *Unit, e: *Emit, name: string, at: Span)
 // report that names one mistake twice is a report a reader stops trusting.
 
 // `val [a, b] = xs`, a `for` head, and a parameter that takes its argument apart.
+//
+// **The defaults belong here rather than to the caller**, because which instruction guards them is
+// the same decision as which instruction binds: a chunk with cells asks its own mask and one with a
+// scope asks the scope, and splitting the two across two files is how they would come to disagree.
 bind_pattern(u: *Unit, e: *Emit, pat: Pattern, at: Span, assignable: bool)
     val resolved = resolve_pattern(pat, 0)
     val k = intern_pattern(u, resolved)
 
     if !e.slotting
         push_n(e, Unpack(k, !assignable), at, 1, 0)
+        emit_pattern_defaults(u, e, pat, !assignable)
         return
     end if
 
-    push_n(e, UnpackSlots(k, claim_pattern_slots(e, resolved, assignable)), at, 1, 0)
+    val masked = pattern_defaults(resolved)
+    val first = claim_pattern_slots(e, resolved, assignable)
+
+    push_n(e, UnpackSlots(k, first, masked), at, 1, if masked then 1 else 0)
+
+    if !masked then return
+
+    emit_slot_defaults(u, e, resolved, first, at)
+    push_n(e, Pop, at, 1, 0)
+
+// One guarded assignment per defaulted name, indexed by the walk the cells were claimed with.
+//
+// **`pattern_names` and `pattern_default_exprs` are the pair, and `emit_pattern_defaults` may NOT be
+// used here.** The two in `js_pat.sysl` mirror each other line for line and are what the cells and
+// the mask are both numbered by; the one in `compile.sysl` walks the pattern its own way and does
+// not visit `At`'s name, an array's rest, a variant or an `and`, so its positions are a different
+// numbering that happens to agree wherever a default is legal today.
+private emit_slot_defaults(u: *Unit, e: *Emit, resolved: Pattern, first: usize, at: Span)
+    var names: Buf[string] = buf()
+    var defaults: Buf[Option[Expr]] = buf()
+
+    pattern_names(resolved, &names)
+    pattern_default_exprs(resolved, &defaults)
+
+    for i in 0..<names.len()
+        if i >= defaults.len() then break
+
+        defaults.at(i) match
+            Some(given) ->
+                val over = put(e, JumpIfSet(i, 0), given.span)
+
+                compile_expr(u, e, given)
+                push_n(e, StoreSlot(first + i), given.span, 1, 0)
+                patch(e, over, here(e))
+            None -> ()
+end emit_slot_defaults
 
 // A `match` arm, which reads the subject where it lies and answers whether it took.
 test_pattern(u: *Unit, e: *Emit, pat: Pattern, at: Span)
@@ -384,17 +420,20 @@ end pattern_binds
 //
 // The ORDER is not read here: `may_slot` wants the set, and the compiler claims its slots off
 // `pattern_names` at the site itself.
+// **It does NOT collapse a repeat, where `pattern_mentions` does**, and the difference is the point:
+// this walk's COUNT has to be `pattern_names`' count, because that is how many cells a site claims
+// and how many bits its mask has. A name written twice in one pattern is two cells.
 private pattern_binders(pat: Pattern, into: *Buf[string])
     *pat.kind match
-        Bind(name) -> if !names_a_type(name) then note_mention(name, into)
+        Bind(name) -> if !names_a_type(name) then into.push(name)
         At(name, inner) ->
-            note_mention(name, into)
+            into.push(name)
             pattern_binders(inner, into)
         ArrayPat(items, _, rest, _) ->
             each_binder(items, into)
 
             rest match
-                Some(name) -> note_mention(name, into)
+                Some(name) -> into.push(name)
                 None -> ()
         ObjectPat(_, values, _, _) -> each_binder(values, into)
         VariantPat(_, items, _, _) -> each_binder(items, into)
@@ -431,10 +470,11 @@ private each_binder(xs: Buf[Pattern], into: *Buf[string])
 // every binding after the disagreement into the wrong cell, silently. So this refuses the two shapes
 // where they can:
 //
-// - **A DEFAULT or a `?`.** The matcher leaves such a name unbound and still matches -- that is what
-//   makes a default a default -- so the walk pushes nothing where `pattern_names` counted one, and
-//   everything after it shifts. Answering that properly wants a per-name mask of what arrived, which
-//   is what a call already carries for its parameters and is the next step here.
+// - **A DEFAULT, where the site carries no mask.** The matcher leaves such a name unbound and still
+//   matches -- that is what makes a default a default -- so the walk would push nothing where
+//   `pattern_names` counted one and everything after it would shift. A binding site answers that
+//   with a per-name mask and a placeholder, exactly as a call does for its parameters, and passes
+//   `masked`; a `match` arm has no mask and refuses defaults outright anyway.
 // - **A kind `pattern_names` gathers nothing from that could still bind.** An alternative may not
 //   bind, `array of T` says nothing about names, and a function type is a shape -- so where one of
 //   those does bind, the two walks are already out of step and this is not the place to reconcile
@@ -442,23 +482,28 @@ private each_binder(xs: Buf[Pattern], into: *Buf[string])
 //
 // **Everything else recurses**, and the kinds that bind nothing at all are written out rather than
 // left to a wildcard for the reason every exhaustive walk in this file is.
-private slottable_pattern(pat: Pattern) -> bool
+private slottable_pattern(pat: Pattern, masked: bool) -> bool
     *pat.kind match
-        At(_, inner) -> slottable_pattern(inner)
+        At(_, inner) -> slottable_pattern(inner, masked)
         ArrayPat(items, _, _, defaults) ->
-            if any_default(defaults) then return false
+            if !masked && any_default(defaults) then return false
 
-            all_slottable(items)
+            all_slottable(items, masked)
         ObjectPat(_, values, defaults, optional) ->
-            if any_default(defaults) then return false
+            if !masked && any_default(defaults) then return false
 
+            // **A `?` is never slottable, mask or no mask.** A default fills its name in where the
+            // subject supplied nothing; a `?` says the name is simply absent, and there is nothing
+            // to fill a cell with -- so a read of it would find whatever the cell held before, where
+            // a scope had nothing and said so. It cannot reach a BINDING site at all
+            // (`refuse_optionals`); a `match` arm is where one can be written.
             for i in 0..<optional.len()
                 if optional.at(i) then return false
 
-            all_slottable(values)
-        VariantPat(_, items, _, _) -> all_slottable(items)
-        MadeFrom(_, inner) -> slottable_pattern(inner)
-        AndPat(parts) -> all_slottable(parts)
+            all_slottable(values, masked)
+        VariantPat(_, items, _, _) -> all_slottable(items, masked)
+        MadeFrom(_, inner) -> slottable_pattern(inner, masked)
+        AndPat(parts) -> all_slottable(parts, masked)
 
         // The four `pattern_names` has no arm for, allowed only while they bind nothing.
         OrPat(alts) -> !any_binds(alts)
@@ -479,11 +524,28 @@ private slottable_pattern(pat: Pattern) -> bool
         NullPat -> true
 end slottable_pattern
 
-private all_slottable(xs: Buf[Pattern]) -> bool
+private all_slottable(xs: Buf[Pattern], masked: bool) -> bool
     for i in 0..<xs.len()
-        if !slottable_pattern(xs.at(i)) then return false
+        if !slottable_pattern(xs.at(i), masked) then return false
 
     true
+
+// A binding site's pattern: slottable, within the mask's width, and its two lists of names taken.
+//
+// **The width is counted here rather than left to `slottable_pattern`**, which asks about one node
+// at a time and cannot see a total -- and a mask shifted by 64 is not a mask.
+private bindable_here(pat: Pattern, mine: *Buf[string], tested: *Buf[string]) -> bool
+    if !slottable_pattern(pat, true) then return false
+
+    val before = mine.len()
+
+    pattern_binders(pat, mine)
+
+    if mine.len() - before > MaskBits then return false
+
+    pattern_mentions(pat, tested)
+    true
+end bindable_here
 
 private any_default(defaults: Buf[Option[Expr]]) -> bool
     for i in 0..<defaults.len()

@@ -7,7 +7,7 @@ set -e
 slate=${1:?usage: bench/run.sh <path-to-slate>}
 dir=$(dirname "$0")
 
-for b in arith calls strings loops globals; do
+for b in arith calls strings loops options globals; do
     best=""
 
     for _ in 1 2 3; do

@@ -282,3 +282,84 @@ A_NAME_A_PATTERN_BINDS_IS_THE_ONE_A_NESTED_BLOCK_READS()
         out
 
     assertEq(walk([["sum", [1, 2, 3]], ["other", [9]]]), [6, 0])
+
+@test
+A_PATTERN_DEFAULT_IS_TAKEN_WHERE_THE_SUBJECT_SUPPLIED_NOTHING()
+    read(o) =
+        val { title = "Untitled", tag } = o
+
+        title + " " + tag
+
+    assertEq(read({ tag: "a" }), "Untitled a")
+    assertEq(read({ title: "Given", tag: "b" }), "Given b")
+
+@test
+TWO_DEFAULTS_WITH_A_HOLE_BETWEEN_THEM_ARE_ANSWERED_ONE_AT_A_TIME()
+    // **The case a COUNT gets wrong and a per-name record gets right.** The subject supplied the
+    // second of two defaulted names and not the first, so "how many arrived" says nothing useful --
+    // it is the same question a call with named arguments poses, and it is answered the same way.
+    read(o) =
+        val { title = "Untitled", count = 0, tag } = o
+
+        title + " " + string(count) + " " + tag
+
+    assertEq(read({ tag: "a" }), "Untitled 0 a")
+    assertEq(read({ title: "T", tag: "b" }), "T 0 b")
+    assertEq(read({ count: 9, tag: "c" }), "Untitled 9 c")
+    assertEq(read({ title: "T", count: 9, tag: "d" }), "T 9 d")
+
+@test
+AN_ARRAY_PATTERN_DEFAULT_FILLS_AN_ELEMENT_THE_ARRAY_NEVER_REACHED()
+    read(xs) =
+        val [first, second = 20, third = 30] = xs
+
+        first + second + third
+
+    assertEq(read([1]), 51)
+    assertEq(read([1, 2]), 33)
+    assertEq(read([1, 2, 3]), 6)
+
+@test
+A_DEFAULT_MAY_READ_A_NAME_BOUND_TO_ITS_LEFT()
+    // A default is worked out where the binding is, so the names before it are already in their
+    // cells by the time it runs.
+    read(o) =
+        val { width, height = width * 2 } = o
+
+        string(width) + "x" + string(height)
+
+    assertEq(read({ width: 3 }), "3x6")
+    assertEq(read({ width: 3, height: 4 }), "3x4")
+
+@test
+A_DEFAULT_IS_NOT_WORKED_OUT_WHERE_THE_SUBJECT_SUPPLIED_THE_NAME()
+    // **A design that filled the cell first and overwrote it would pass every test above and fail
+    // this one**, the default's own work being the only thing that can tell the two apart.
+    var ran = 0
+
+    counted() =
+        ran = ran + 1
+        99
+
+    read(o) =
+        val { n = counted() } = o
+
+        n
+
+    assertEq(read({ n: 1 }), 1)
+    assertEq(ran, 0)
+    assertEq(read({}), 99)
+    assertEq(ran, 1)
+
+@test
+A_QUESTION_MARK_IN_A_match_ARM_LEAVES_ITS_NAME_UNBOUND()
+    // `?` says a field may be missing and says nothing about what to bind, so there is nothing to
+    // fill a cell with -- which is why a chunk holding one keeps its scope. A binding position
+    // refuses `?` outright and tells the reader to write a default instead.
+    read(o) = o match
+        { a?, b } -> "took " + string(b)
+        _ -> "no arm"
+
+    assertEq(read({ b: 1 }), "took 1")
+    assertEq(read({ a: 5, b: 1 }), "took 1")
+    assertEq(read({ c: 1 }), "no arm")
