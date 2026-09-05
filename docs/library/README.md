@@ -24,7 +24,7 @@ What a program has without writing it.
 | [`slate:gzip`](gzip.md) | gzip and zlib — the compression every host has |
 | [`slate:brotli`](brotli.md) | brotli — smaller, and not in a browser |
 | [`slate:zstd`](zstd.md) | Zstandard — faster than both, and not in a browser |
-| [`slate:image`](image.md) | PNG, JPEG and GIF in, PNG and JPEG out, and a resampler |
+| [`slate:image`](image.md) | PNG, JPEG, GIF and WebP in, PNG, JPEG and WebP out, and a resampler |
 | [`slate:lmdb`](lmdb.md) | LMDB — an ordered key-value store on disk |
 | [`slate:llhttp`](llhttp.md) | the HTTP parser itself |
 | [`slate:nghttp2`](nghttp2.md) | HTTP/2 framing, and HPACK |
