@@ -30,7 +30,7 @@ module dev.slatelang.slate
 ws_source() -> string = raw"""
     // A WebSocket server, written in slate on the upgrade `slate:http` hands over.
 
-    import { send, onBytes, close as shutSocket } from slate:net
+    import { connect, send, onBytes, startTls, close as shutSocket } from slate:net
 
     // RFC 6455's own constant. It is in the protocol so that a server answering the handshake proves it
     // understood WebSocket rather than having echoed a header back -- a cache or a proxy replaying an
@@ -44,7 +44,7 @@ ws_source() -> string = raw"""
     val PingFrame = 9
     val PongFrame = 10
 
-    // How much of a message this server will hold before closing the connection.
+    // How much of a message a connection will hold before closing.
     //
     // **A frame states its own length before it sends a byte**, so an oversized one is refused on its
     // header rather than after it has arrived -- but a fragmented message states nothing, and the only
@@ -116,6 +116,42 @@ ws_source() -> string = raw"""
 
         for b in payload
             push(out, b)
+
+        out
+
+    // One frame written by a CLIENT, which is the same frame masked.
+    //
+    // **Masking is not secrecy and the key is sent beside the payload.** It exists so that a page
+    // cannot steer an intermediary into reading payload bytes as a request of its own: a cache in
+    // front of a server sees traffic it cannot predict, and a browser is the only direction that can
+    // be told what to send by a hostile document. So a client masks and a server does not, and each
+    // fails the connection when the other gets it wrong.
+    export maskedFrame(opcode: integer, payload: array) -> array
+        val mask = randomBytes(4)
+
+        var out = [0x80 | opcode]
+        val n = len(payload)
+
+        if n < 126
+            push(out, 0x80 | n)
+        else if n < 65536
+            push(out, 0x80 | 126)
+            push(out, (n >> 8) & 0xFF)
+            push(out, n & 0xFF)
+        else
+            push(out, 0x80 | 127)
+
+            for i in 0..<8
+                push(out, (n >> ((7 - i) * 8)) & 0xFF)
+
+        for b in mask
+            push(out, b)
+
+        var i = 0
+
+        for b in payload
+            push(out, b ^ mask[i % 4])
+            i = i + 1
 
         out
 
@@ -204,7 +240,7 @@ ws_source() -> string = raw"""
 
         send(socket, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accepting(key) + "\r\n\r\n")
 
-        { ok: true, value: connected(socket, head) }
+        { ok: true, value: connected(socket, head, false) }
 
     declined(socket, why: string) -> Accepted
         send(socket, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
@@ -212,7 +248,14 @@ ws_source() -> string = raw"""
 
         { ok: false, error: why }
 
-    connected(socket, head: array) -> Connection
+    // A live connection, whichever end of it this program is.
+    //
+    // **`masking` is the whole of the difference between a client and a server here**, and it decides
+    // two things that are the same rule read from two ends: what this end writes, and what it will
+    // accept. A client masks every frame it sends and fails the connection on a masked frame it
+    // receives; a server does the exact opposite. Everything else -- the reassembly, the control
+    // frames, the close handshake, the UTF-8 check -- is the protocol and not the direction.
+    connected(socket, head: array, masking: boolean) -> Connection
         var buf = []
         var heardText = null
         var heardBytes = null
@@ -230,6 +273,11 @@ ws_source() -> string = raw"""
         // as the handshake, and those bytes have already been read off the socket by the HTTP parser.
         for b in head
             push(buf, b)
+
+        // **One place decides whether a frame is masked**, so no site that writes one has to
+        // remember which end this is.
+        outgoing(opcode: integer, payload: array) -> array =
+            if masking then maskedFrame(opcode, payload) else framed(opcode, payload)
 
         write(bs: array)
             if !shut then send(socket, bs)
@@ -257,7 +305,7 @@ ws_source() -> string = raw"""
             for b in toBytes(why)
                 push(payload, b)
 
-            write(framed(CloseFrame, payload))
+            write(outgoing(CloseFrame, payload))
             finish(code, why)
 
         deliver(f: Frame)
@@ -270,7 +318,7 @@ ws_source() -> string = raw"""
                     return
 
             if f.opcode == PingFrame
-                write(framed(PongFrame, f.payload))
+                write(outgoing(PongFrame, f.payload))
 
                 return
 
@@ -284,7 +332,7 @@ ws_source() -> string = raw"""
                 if !closing
                     closing = true
 
-                    write(framed(CloseFrame, f.payload))
+                    write(outgoing(CloseFrame, f.payload))
 
                 finish(code, "the peer closed the connection")
 
@@ -307,12 +355,12 @@ ws_source() -> string = raw"""
                 partialOp = f.opcode
                 partial = f.payload
             else
-                goodbye(1002, "this server does not know opcode " + string(f.opcode))
+                goodbye(1002, "this connection does not know opcode " + string(f.opcode))
 
                 return
 
             if len(partial) > MessageBytes
-                goodbye(1009, "that message is larger than this server will hold")
+                goodbye(1009, "that message is larger than this connection will hold")
 
                 return
 
@@ -346,14 +394,17 @@ ws_source() -> string = raw"""
                 if f == null then return
 
                 if f.tooBig
-                    goodbye(1009, "that message is larger than this server will hold")
+                    goodbye(1009, "that message is larger than this connection will hold")
 
                     return
 
-                // **Every frame a client sends is masked**, and one that is not did not come from a
-                // browser. The protocol says to fail the connection rather than read it.
-                if !f.masked
-                    goodbye(1002, "a frame sent to a server must be masked")
+                // **Every frame a client sends is masked and no frame a server sends is**, and one
+                // that has it the wrong way round did not come from something following the
+                // protocol. RFC 6455 says to fail the connection rather than read it, in both
+                // directions and for the same reason.
+                if masking == f.masked
+                    goodbye(1002, if masking then "a frame sent to a client must not be masked"
+                        else "a frame sent to a server must be masked")
 
                     return
 
@@ -384,13 +435,13 @@ ws_source() -> string = raw"""
             gone = f
 
         sendText(m: string)
-            write(framed(TextFrame, toBytes(m)))
+            write(outgoing(TextFrame, toBytes(m)))
 
         sendBytes(bs: array)
-            write(framed(BinaryFrame, bs))
+            write(outgoing(BinaryFrame, bs))
 
         ping()
-            write(framed(PingFrame, []))
+            write(outgoing(PingFrame, []))
 
         bye(code: integer = 1000, why: string = "")
             goodbye(code, why)
@@ -410,4 +461,300 @@ ws_source() -> string = raw"""
         c.ping = ping
         c.close = bye
         c
+
+    // -- the client ---------------------------------------------------------------------------------
+
+    // **A client is TWO implementations of one `Connection`, and `hostHas` is what chooses.** Where
+    // the host provides a WebSocket of its own -- a browser, and node since it grew the global -- the
+    // work is handed to it, because a browser has no socket at all and the framing above has nothing
+    // to write onto. Everywhere else the protocol is spoken here, over `slate:net`, which is the same
+    // framing the server uses read from the other end.
+    //
+    // **What a program gets is one object either way**, and that is the point of putting the choice
+    // here rather than in front of it. A program that branched on its host would be two programs.
+
+    // What `open` answers: the connection under `value`, or why there is not one.
+    export type Opened = { ok: boolean, value?: object, error?: string }
+
+    // How much of a handshake answer this will read before giving up on it. **A server that answers
+    // headers for ever is the one failure a client cannot time out of by itself**, the bytes being
+    // perfectly well-formed as they arrive.
+    val HandshakeBytes = 16384
+
+    // `open(url)` -- a promise of a result carrying the connection.
+    //
+    // **A promise of a RESULT and not a promise that fails**, which is `connect`'s shape in
+    // `slate:net` and is the rule this whole language follows: a server that is not there is an
+    // outside condition a client was always going to deal with, and a fault is for a defect in the
+    // program.
+    export open(url: string) = opening(url)
+
+    async opening(url: string)
+        if !(url is string) then throw "`open` takes a url, and this is not one"
+
+        // **The url is read HERE, above the branch, and that is not tidiness.** A host's own
+        // WebSocket refuses a url it does not like in its own words, so leaving the check to it
+        // would make `open("http://x")` answer one sentence in the interpreter and another in a
+        // browser -- for a mistake that has nothing to do with either host.
+        val target = parsedUrl(url)
+
+        if !target.ok then return target
+
+        if hostHas("websocket") then return await hostClient(url)
+
+        await ownClient(target.value)
+
+    // -- the host's own client ------------------------------------------------------------------------
+
+    // **One handler for both kinds of message, because the host has one event.** A browser's
+    // `message` carries text or bytes and says which by what it hands over, so the two slate handlers
+    // are told apart here rather than by asking the host twice.
+    async hostClient(url: string)
+        val made = await wsOpen(url)
+
+        if !made.ok then return made
+
+        val id = made.value
+
+        var heardText = null
+        var heardBytes = null
+        var gone = null
+
+        arrived(m)
+            if m is string
+                if heardText != null then heardText(m)
+            else
+                if heardBytes != null then heardBytes(m)
+
+        ended(code: integer, why: string)
+            if gone != null then gone(code, why)
+
+        wsOnMessage(id, arrived)
+        wsOnClose(id, ended)
+
+        onMessage(f: function)
+            heardText = f
+
+        onBinary(f: function)
+            heardBytes = f
+
+        onClose(f: function)
+            gone = f
+
+        sendText(m: string)
+            wsSend(id, m)
+
+        sendBytes(bs: array)
+            wsSendBytes(id, bs)
+
+        // **A browser's WebSocket cannot send a ping, and this says so rather than doing nothing.**
+        // The protocol has one and the object does not expose it: a page has no way to write a
+        // control frame, the browser answering the server's pings on the page's behalf. So the
+        // method is here to be refused well -- leaving it out would answer "a connection cannot
+        // `ping`", which sends a reader to look for a spelling mistake.
+        ping()
+            throw "this host's WebSocket cannot send a ping -- a browser writes the control frames itself and gives a page no way to, so a program that needs one has to send an ordinary message instead"
+
+        bye(code: integer = 1000, why: string = "")
+            wsClose(id, code, why)
+
+        val c = { }
+
+        c.onMessage = onMessage
+        c.onBinary = onBinary
+        c.onClose = onClose
+        c.send = sendText
+        c.sendBytes = sendBytes
+        c.ping = ping
+        c.close = bye
+
+        { ok: true, value: c }
+
+    // -- the client this program speaks itself --------------------------------------------------------
+
+    // Where a url points, or why it points nowhere.
+    type Target = { ok: boolean, value?: object, error?: string }
+
+    // **`ws://` and `wss://` and nothing else.** An `http://` url is not a WebSocket url even though
+    // the handshake is HTTP, and taking one would be accepting a mistake rather than reporting it.
+    parsedUrl(url: string) -> Target
+        var rest = ""
+        var secure = false
+
+        if startsWith(url, "wss://")
+            rest = url[6..<len(url)]
+            secure = true
+        else if startsWith(url, "ws://")
+            rest = url[5..<len(url)]
+        else
+            return { ok: false, error: "a websocket url begins `ws://` or `wss://`, and this one is " + url }
+
+        val slash = indexOf(rest, "/")
+        val authority = if slash == null then rest else rest[0..<slash]
+        val path = if slash == null then "/" else rest[slash..<len(rest)]
+
+        if authority == "" then return { ok: false, error: "this url names no host: " + url }
+
+        // **An IPv6 address is in brackets and its colons are its own**, so the port is looked for
+        // after the bracket rather than at the last colon of the whole authority.
+        val bracket = if startsWith(authority, "[") then indexOf(authority, "]") else null
+
+        if startsWith(authority, "[") && bracket == null
+            return { ok: false, error: "this url opens a bracket it never closes: " + url }
+
+        val from = if bracket == null then 0 else bracket + 1
+        val colon = indexOf(authority[from..<len(authority)], ":")
+        val host = if colon == null then authority else authority[0..<(from + colon)]
+        val given = if colon == null then "" else authority[(from + colon + 1)..<len(authority)]
+
+        if colon != null && given == ""
+            return { ok: false, error: "this url ends in a colon with no port: " + url }
+
+        // **`number` and not `integer`**: `integer` converts a number and this is text off a url, so
+        // a port that is not digits comes back as null rather than faulting where it is read.
+        val port = if given == "" then (if secure then 443 else 80) else number(given)
+
+        if !(port is integer) || port < 1 || port > 65535
+            return { ok: false, error: "`" + given + "` is not a port" }
+
+        // **The brackets come off the host and stay on the `Host` header**, which is what each of the
+        // two wants: a resolver is given an address and a header is given the authority as written.
+        val named = if bracket == null then host else host[1..<bracket]
+
+        { ok: true, value: { host: named, port: port, path: path, authority: authority, secure: secure } }
+
+    async ownClient(t: object)
+        val made = await connect(t.host, t.port)
+
+        if !made.ok then return made
+
+        val sock = made.value
+
+        if t.secure
+            val up = await startTls(sock, { host: t.host })
+
+            if !up.ok
+                shutSocket(sock)
+
+                return { ok: false, error: up.error }
+
+        // **Sixteen random bytes, base64'd, and the server proves it understood by hashing them
+        // back.** It is not a secret and nothing is authenticated by it: what it rules out is a cache
+        // or a proxy replaying an answer it gave to something else.
+        val key = base64(randomBytes(16))
+
+        send(sock, "GET " + t.path + " HTTP/1.1\r\n" +
+            "Host: " + t.authority + "\r\n" +
+            "Upgrade: websocket\r\n" +
+            "Connection: Upgrade\r\n" +
+            "Sec-WebSocket-Key: " + key + "\r\n" +
+            "Sec-WebSocket-Version: 13\r\n\r\n")
+
+        val answered = await handshake(sock, key)
+
+        if !answered.ok
+            shutSocket(sock)
+
+            return answered
+
+        { ok: true, value: connected(sock, answered.value, true) }
+
+    // The bytes just past the first blank line, or `null` while it has not arrived.
+    headerEnd(buf: array) -> integer | null
+        for i in 0..<(len(buf) - 3)
+            if buf[i] == 13 && buf[i + 1] == 10 && buf[i + 2] == 13 && buf[i + 3] == 10
+                return i + 4
+
+        null
+
+    // Read the server's answer to the handshake, and hand back whatever came behind it.
+    //
+    // **The leftover bytes matter for the same reason they do on the server side**: a server may put
+    // its first frame in the same packet as the 101, and those bytes are already off the socket. They
+    // seed the connection's buffer exactly as `accept`'s do.
+    handshake(sock, key: string)
+        val p = pending()
+
+        var buf = []
+        var done = false
+
+        finish(answer)
+            if done then return
+
+            done = true
+
+            settle(p, answer)
+
+        heard(chunk: array | null)
+            if done then return
+
+            if chunk == null
+                finish({ ok: false, error: "the connection closed before the handshake was answered" })
+
+                return
+
+            for b in chunk
+                push(buf, b)
+
+            val end = headerEnd(buf)
+
+            if end == null
+                if len(buf) > HandshakeBytes
+                    finish({ ok: false, error: "this handshake answer is longer than a handshake answer is" })
+
+                return
+
+            val head = fromBytes(buf[0..<end])
+
+            if !head.ok
+                finish({ ok: false, error: "this handshake answer is not text" })
+
+                return
+
+            finish(checked(head.value, key, buf[end..<len(buf)]))
+
+        onBytes(sock, heard)
+
+        p
+
+    // What reading the handshake answer produced: the bytes behind it, or why it was not an answer.
+    //
+    // **Its own type and not `Opened`**, which the annotation caught: what this carries is the
+    // LEFTOVER BYTES and what `open` carries is the connection, so one type for both would be a
+    // shape that is sometimes an array and sometimes an object.
+    type Handshake = { ok: boolean, value?: array, error?: string }
+
+    // Whether that answer is the one RFC 6455 says a server gives.
+    checked(head: string, key: string, rest: array) -> Handshake
+        val lines = split(head, "\r\n")
+        val status = split(lines[0], " ")
+
+        if len(status) < 2 || status[1] != "101"
+            return { ok: false, error: "this server answered `" + lines[0] + "` rather than 101" }
+
+        var accept = null
+        var upgraded = false
+
+        for i in 1..<len(lines)
+            val at = indexOf(lines[i], ":")
+
+            if at != null
+                val name = lower(trim(lines[i][0..<at]))
+                val value = trim(lines[i][(at + 1)..<len(lines[i])])
+
+                if name == "sec-websocket-accept" then accept = value
+                if name == "upgrade" then upgraded = lower(value) == "websocket"
+
+        if !upgraded
+            return { ok: false, error: "this server answered 101 without `Upgrade: websocket`" }
+
+        // **The one check that says the server understood rather than echoed.** A wrong value here is
+        // an intermediary answering out of a cache, which is exactly what the key exists to catch.
+        if accept == null
+            return { ok: false, error: "this server answered 101 with no `Sec-WebSocket-Accept`" }
+
+        if accept != accepting(key)
+            return { ok: false, error: "this server's `Sec-WebSocket-Accept` is not the one this handshake asked for" }
+
+        { ok: true, value: rest }
     """

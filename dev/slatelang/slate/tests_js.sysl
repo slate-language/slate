@@ -2,7 +2,9 @@ module dev.slatelang.slate
 @tests
 
 import sh.sysl.parsing.*
-import sysl.text.Search
+import sysl.fs.{read_bytes, remove_file, write_text}
+import sysl.process.capture
+import sysl.text.{Search, from_utf8_unchecked}
 
 // The JavaScript back end -- what a program compiles to.
 //
@@ -860,3 +862,80 @@ a_class_pattern_emits_the_nominal_test_beside_the_fields()
     // **The declared name travels at the end of each nominal form and nothing that MATCHES reads
     // it.** It is there so a `mismatch` report can say `Point`, a JavaScript class knowing no name
     // of its own where the interpreter reads one off the pattern.
+
+// -- what the emitted program does to its host ------------------------------------------------------
+
+// **A builtin is a PARAMETER of the program and not a name in the host's global scope**, and these
+// are what say so. The mechanism they replaced installed every builtin onto `globalThis`, which made
+// slate the owner of `setTimeout`, `fetch` and two hundred other names for the whole process -- so a
+// host API calling one got slate's. node's own `WebSocket` does exactly that and could not open a
+// socket; in a browser the same thing takes those names from every other script on the page.
+//
+// **These run a JavaScript PROBE appended to the emitted program**, which is the only way to ask a
+// question about the host's globals: a slate program cannot see them, and that is the whole point.
+
+// What node says when a probe is run after the emitted program has loaded.
+private probed(program: string, probe: string) -> string
+    val src = "tests/js-probe.tmp.sl"
+    val out_js = src + ".js"
+
+    write_text(src, program).unwrap()
+
+    val wrote = cli_status(["slate", "js", src, "-o", out_js])
+
+    remove_file(src)
+
+    if wrote != 0 then return s"`slate js` exited ${wrote}"
+
+    val emitted = from_utf8_unchecked(read_bytes(out_js).unwrap())
+
+    write_text(out_js, emitted + "\n" + probe).unwrap()
+
+    val ran = capture("node", [out_js], "", [], true)
+
+    remove_file(out_js)
+
+    ran match
+        Err(e) -> s"node could not be started: ${e}"
+        Ok(o) -> if o.status.ok() then o.text.trim() else o.err.unwrap_or("").trim()
+end probed
+
+@test
+THE_EMITTED_PROGRAM_LEAVES_THE_HOSTS_OWN_GLOBALS_ALONE()
+    // **`print` is the one to ask about, because it is the plainest.** A host that has a `print` of
+    // its own -- quickjs does -- would have had it taken; a host that has none, as node does, would
+    // have grown one. Either way the program on the page is not the only thing running.
+    val probe = "console.log(typeof globalThis.print, typeof globalThis.len)\n" +
+        "console.log(globalThis.setTimeout === require(\"timers\").setTimeout)\n"
+
+    assert_eq(probed("print(\"ready\")\n", probe), "ready\nundefined undefined\ntrue")
+end THE_EMITTED_PROGRAM_LEAVES_THE_HOSTS_OWN_GLOBALS_ALONE
+
+@test
+A_HOST_API_THAT_CALLS_A_GLOBAL_GETS_THE_HOSTS_OWN()
+    // **node's `WebSocket` is the host API that found this**, and it is the regression test rather
+    // than a demonstration: its handshake calls `setTimeout` and calls `.unref()` on what comes back,
+    // where slate answers its own integer id -- which has no such method, so the socket never opened
+    // and nothing anywhere named a timer. Nothing of `slate:ws` is involved; this is the emitted
+    // program's effect on a host that was minding its own business.
+    val probe = "const ws = new WebSocket(\"ws://127.0.0.1:1/\")\n" +
+        "ws.onerror = () => { console.log(\"refused, and by the socket rather than by a timer\"); process.exit(0) }\n" +
+        "ws.onopen = () => { console.log(\"opened, which nothing is listening for\"); process.exit(0) }\n"
+
+    // **Port 1 refuses, which is the point**: what is asserted is that the failure is the CONNECTION
+    // and not a `TypeError` raised inside undici by slate's own `setTimeout`.
+    assert_eq(probed("print(\"ready\")\n", probe),
+              "ready\nrefused, and by the socket rather than by a timer")
+end A_HOST_API_THAT_CALLS_A_GLOBAL_GETS_THE_HOSTS_OWN
+
+@test
+A_PROGRAM_MAY_STILL_DECLARE_A_NAME_A_BUILTIN_HAS()
+    // **Two scopes are what keeps this true.** The builtins are the outer function's parameters and
+    // the program is the inner one, so a program's own `setTimeout` is ordinary shadowing -- where
+    // one scope would have made it a redeclaration and a `SyntaxError` that takes the whole program
+    // with it. The global scheme gave this for free and it had to be kept.
+    val text = "val setTimeout = 7\nval say = print\nsay(setTimeout)\n"
+
+    assert_eq(out(text), "7")
+    assert_eq(node_said(text), "7")
+end A_PROGRAM_MAY_STILL_DECLARE_A_NAME_A_BUILTIN_HAS

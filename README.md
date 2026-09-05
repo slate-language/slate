@@ -262,7 +262,8 @@ standard library beyond the builtins. On the object side: `super`, and a check t
 `type` when it is attached to an object literal by hand.
 
 In the JavaScript back end: `slate:net`, `fetch`, `run`, `slate:password`,
-`slate:brotli`, `slate:llhttp`, and the modules written over them. Each one is a name that
+`slate:brotli`, `slate:llhttp`, and the servers written over them — `slate:ws` has its **client**
+there, over the host's own `WebSocket`, and cannot have its server, a browser being unable to listen. Each one is a name that
 says *"not in the JavaScript back end yet"* rather than a name that is not there. `slate:time` is whole
 there now, except for `abbrev` and `isDST`; so is `slate:crypto`, except for the RSA and ECDSA half of
 JWS; and so is `slate:regex`, whose patterns are translated into `RegExp` and which refuses the handful

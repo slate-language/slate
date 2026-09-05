@@ -275,6 +275,51 @@ of the subject, which is what `regex.sysl` does for the other back end.
   does not match stops answering rather than complaining. That is a thing a JavaScript host does not
   have.
 
+### `slate:ws` is a CLIENT here, and the server half is what a browser cannot have
+
+A browser has no socket, so nothing that listens can exist there: `accept` and the upgrade seam it
+sits on refuse under `slate js`, because `listen` does. **What a page can have is a client**, and it
+has one already — the `WebSocket` object — so that is what `open(url)` becomes here.
+
+**It is the same `Connection` either way** and the module chooses which implementation answers.
+Everything about the protocol that needs no socket is slate's on both hosts: the framing, the
+masking, the fragment reassembly, the accept value and the reading of a url. What differs is only who
+owns the bytes.
+
+**`ping` refuses here, and it is the shape case rather than a missing feature.** The protocol has a
+ping and the browser's object does not expose one: a page cannot write a control frame at all, the
+browser answering the server's pings on the page's behalf. So `ping` says that, and a program needing
+a round trip sends an ordinary message.
+
+**A `Blob` is never handed to a program.** A browser's `message` event carries binary as a `Blob` by
+default and a Blob is read *asynchronously*, which would make `onBinary` answer at some later turn
+here and at once in the interpreter; the connection sets `binaryType` to `arraybuffer` on the way in.
+
+**`hostHas(name)` is how the module asks, and it is not a name a program can write.** It is declared
+into the scope a built-in module's source compiles in — the same place `sha1` and `jwsSign` live — and
+answers whether the host provides a thing ITSELF, which is a different question from whether slate has
+one. The interpreter answers no to all of them: it speaks WebSocket over its own socket, compresses
+with miniz and fetches over OpenSSL, and in each case there is nobody else's implementation to use.
+
+## A builtin is a parameter, not a name taken from the host
+
+**The emitted program is a function whose parameters are the builtins**, applied to the runtime's own
+table. It is not a script that installs two hundred names into the host's global scope, which is what
+it used to be.
+
+That change is a browser-parity decision rather than a tidying. A page's other scripts and the
+browser's own APIs share `setTimeout`, `fetch` and `close`; a slate program that took those names took
+them from everybody, for as long as the page lived. **node's own `WebSocket` is what found it**: its
+handshake calls `setTimeout` and calls `.unref()` on what comes back, and slate answers its own
+integer id — which has no such method, so the socket never opened and nothing anywhere named a timer.
+
+**A program may still declare a name a builtin has.** The builtins are the outer function's parameters
+and the program is an inner function, so `val print = 1` shadows exactly as it did when the names were
+globals — two scopes are what keeps that from being a redeclaration.
+
+**The names come from the same scope the interpreter's builtins are installed into**, so a builtin
+added to the language is a parameter on the next build and there is no second list to go stale.
+
 ## Blocks and order
 
 JavaScript has no block expression, so `val x = if c then 1 else 2` becomes an `if` statement over a

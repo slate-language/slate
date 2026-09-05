@@ -1,0 +1,218 @@
+module dev.slatelang.slate
+
+// What the host provides itself, and the one such thing a browser has that the interpreter does not.
+//
+// **`hostHas` is the question and the six `ws*` calls are the one answer that is true anywhere yet.**
+// A built-in module written in slate asks `hostHas("websocket")` to decide which of two
+// implementations of one surface to use: `slate:ws` speaks the protocol itself over `slate:net`
+// where the answer is no, and hands the work to the host's own client where it is yes. **A browser
+// is the case that forces it** -- there is no socket there at all, so the framing `ws_source.sysl`
+// writes has nothing to write onto, and the `WebSocket` object is the only door.
+//
+// **The interpreter answers false to all four names and that is not a gap.** It speaks WebSocket
+// over its own socket, compresses with miniz and fetches over OpenSSL; what a module is asking is
+// whether somebody else's implementation is there to use, and there is not one.
+//
+// **A handle is a number that is never reused, so it carries no generation** -- which is
+// `RegexVal`'s rule and for its reason. A socket's slot needs a generation because `close` gives the
+// slot back and the next occupant would answer to the old number; nothing here is ever given back,
+// a closed connection simply leaving its entry behind until the program ends.
+//
+// Inside the `$b` block, after the crypto builtins and before the DOM's.
+
+js_runtime_ws() -> string = raw"""
+        // -- what this host provides -------------------------------------------------------------------
+
+        // The names a host is asked for. **A fixed set, and an unknown one is a fault** -- a
+        // misspelling that answered false for ever would send a module down the path it was asking
+        // how to avoid. `host.sysl` carries the same list for the interpreter and a test pins that
+        // the two agree.
+        const HOST_THINGS = ["websocket", "compression", "fetch", "document"]
+
+        B.hostHas = (...args) => {
+            wantArgs(args.length, 1, 1, "hostHas", "the name of a thing a host may provide")
+
+            const name = wantString(args[0], "hostHas")
+
+            if (name === "websocket") return $.host.webSocket !== null
+            if (name === "compression") return $.host.compression !== null
+            if (name === "fetch") return $.host.fetch !== null
+            if (name === "document") return $.host.document !== null
+
+            fault("`" + name + "` is not something a host is asked for -- the names are " +
+                HOST_THINGS.map((s) => "`" + s + "`").join(", ").replace(/, ([^,]*)$/, " and $1"))
+        }
+
+        // -- the host's own WebSocket ------------------------------------------------------------------
+
+        const WS_HELD = new Map()
+        let wsCounter = 0n
+
+        const wsOk = (v) => $.obj([["ok", true], ["value", v]])
+        const wsBad = (message) => $.obj([["ok", false], ["error", message]])
+
+        const wsWanted = (id, name) => {
+            const held = WS_HELD.get(id)
+
+            if (held === undefined)
+                fault("`" + name + "` was given a connection that is not open")
+
+            return held
+        }
+
+        // A message as slate sees it: text stays text, and binary is the array of numbers every
+        // other byte surface in the language uses.
+        //
+        // **`binaryType` is set to `arraybuffer` on the way in**, because a browser's default is a
+        // `Blob` and a Blob is read asynchronously -- which would make `onBinary` answer at some
+        // later turn on one host and at once on the other.
+        const wsPayload = (data) => {
+            if (typeof data === "string") return data
+
+            const bytes = new Uint8Array(data)
+            const out = []
+
+            for (let i = 0; i < bytes.length; i = i + 1) out.push(BigInt(bytes[i]))
+
+            return out
+        }
+
+        const wsBytesOut = (v, name) => {
+            if (!Array.isArray(v)) fault("`" + name + "` takes an array of numbers, and this is " + typeName(v))
+
+            const out = new Uint8Array(v.length)
+
+            for (let i = 0; i < v.length; i = i + 1) {
+                const b = v[i]
+
+                if (!$.isInt(b))
+                    fault("`" + name + "` takes an array of numbers, and one of these is " + typeName(b))
+
+                if (b < 0n || b > 255n) fault("a byte is between 0 and 255, and this is " + b)
+
+                out[i] = Number(b)
+            }
+
+            return out
+        }
+
+        // `wsOpen(url)` -- a promise of a result carrying the connection.
+        //
+        // **The same shape `connect` has in `slate:net`**, and for its reason: a connection that is
+        // refused is the ordinary thing a client deals with, so it comes back as `{ ok: false,
+        // error }` rather than as a fault. That is what lets `slate:ws`'s two clients answer one
+        // thing.
+        //
+        // **The promise settles on the FIRST of open and error and never twice.** A browser fires
+        // `error` and then `close` for a connection that never opened, and a `close` after a
+        // successful open is an ordinary end rather than a failure of the open.
+        B.wsOpen = (...args) => {
+            wantArgs(args.length, 1, 1, "wsOpen", "a url")
+
+            const url = wantString(args[0], "wsOpen")
+
+            if ($.host.webSocket === null)
+                fault("`wsOpen` needs the host's own WebSocket, and this JavaScript host has none")
+
+            return new Promise((answer) => {
+                let sock = null
+
+                // **A bad url is refused by the constructor**, which is the one failure that is not
+                // an event and would otherwise leave the promise pending for ever.
+                try {
+                    sock = new $.host.webSocket(url)
+                } catch (e) {
+                    answer(wsBad(String(e !== null && e !== undefined && e.message !== undefined ? e.message : e)))
+
+                    return
+                }
+
+                sock.binaryType = "arraybuffer"
+
+                wsCounter = wsCounter + 1n
+
+                const id = wsCounter
+                const held = { sock: sock, heard: null, gone: null, settled: false }
+
+                WS_HELD.set(id, held)
+
+                sock.onopen = () => {
+                    if (held.settled) return
+
+                    held.settled = true
+                    answer(wsOk(id))
+                }
+
+                sock.onerror = () => {
+                    if (held.settled) return
+
+                    held.settled = true
+                    WS_HELD.delete(id)
+                    answer(wsBad("the connection to " + url + " could not be opened"))
+                }
+
+                sock.onmessage = (e) => {
+                    if (held.heard !== null) $.call(held.heard, [wsPayload(e.data)])
+                }
+
+                sock.onclose = (e) => {
+                    WS_HELD.delete(id)
+
+                    if (held.gone !== null) $.call(held.gone, [BigInt(e.code), e.reason])
+                }
+            })
+        }
+
+        B.wsSend = (...args) => {
+            wantArgs(args.length, 2, 2, "wsSend", "a connection and a message")
+
+            wsWanted(args[0], "wsSend").sock.send(wantString(args[1], "wsSend"))
+
+            return null
+        }
+
+        B.wsSendBytes = (...args) => {
+            wantArgs(args.length, 2, 2, "wsSendBytes", "a connection and its bytes")
+
+            wsWanted(args[0], "wsSendBytes").sock.send(wsBytesOut(args[1], "wsSendBytes"))
+
+            return null
+        }
+
+        // **One handler for both kinds of message, and the module tells them apart by what arrives.**
+        // A browser's `message` event carries either, so two setters here would be two names for one
+        // event and a module holding only one of them would drop half the traffic.
+        B.wsOnMessage = (...args) => {
+            wantArgs(args.length, 2, 2, "wsOnMessage", "a connection and a function")
+
+            wsWanted(args[0], "wsOnMessage").heard = args[1]
+
+            return null
+        }
+
+        B.wsOnClose = (...args) => {
+            wantArgs(args.length, 2, 2, "wsOnClose", "a connection and a function")
+
+            wsWanted(args[0], "wsOnClose").gone = args[1]
+
+            return null
+        }
+
+        // **Closing a connection that has already gone is not an error**, which is `slate:net`'s rule
+        // for `close` and is what lets a program close on its way out without asking first.
+        B.wsClose = (...args) => {
+            wantArgs(args.length, 1, 3, "wsClose", "a connection, and optionally a code and a reason")
+
+            const held = WS_HELD.get(args[0])
+
+            if (held === undefined) return null
+
+            const code = args.length > 1 ? Number(wantInt(args[1], "wsClose")) : 1000
+            const why = args.length > 2 ? wantString(args[2], "wsClose") : ""
+
+            WS_HELD.delete(args[0])
+            held.sock.close(code, why)
+
+            return null
+        }
+    """
