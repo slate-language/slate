@@ -175,3 +175,10 @@ val r = await fetch(url, options)
 node's name and the browser's, and it **answers a result** rather than throwing — which is slate's rule
 for anything that reaches the network, not a disagreement with either. It is native because HTTPS needs
 OpenSSL; the *server* half is [`slate:http`](http.md) and is written in slate.
+
+**It is the interpreter's alone so far, which the name does not warn you about.** Under `slate js` this
+one still says it is not in the JavaScript back end yet — and it is the last name in this file that
+does, so it is worth stating here rather than leaving to
+[JavaScript](../reference/javascript.md). A browser *has* `fetch`, so this is work owed rather than
+something the host lacks: what has to be written is the wrapper that shapes the host's answer into
+slate's `{ ok, value }`, with the headers, the body and the redirect rule the interpreter's follows.
