@@ -38,9 +38,15 @@ The cost is that **a handle is held until `release` gives it back**.
 
 ## An event arrives as a slate object
 
-`{ type, value, checked, key, stop, prevent }`, built when the handler fires. A `MouseEvent` has no
-representation in slate, and inventing one would mean inventing a value that could not be printed, compared
-or stored.
+`{ type, value, checked, key, mods, button, stop, prevent }`, built when the handler fires. A `MouseEvent`
+has no representation in slate, and inventing one would mean inventing a value that could not be printed,
+compared or stored.
+
+**`mods` is `{ meta, ctrl, shift, alt }` and `button` is an integer or `null`** — `0` for the left button,
+`1` for the middle, `2` for the right, and `null` for every event that is not a mouse event. They are here
+because **a link cannot be written without them**: a framework that intercepts a click has to let a
+cmd-click, a ctrl-click, a shift-click and a middle click through to the browser, or it swallows the most
+ordinary thing anybody does to a link.
 
 **`value` and `checked` are set as properties and not attributes**, and an input is where the difference
 shows: the attribute says what the field started as and the property says what it holds now, so a re-render

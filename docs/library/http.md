@@ -17,9 +17,14 @@ val server = serve(8080, req -> "hello")
 | `files(root, options = {})` | a handler serving a directory |
 | `setCookie(name, value, options = {})` | a header value |
 | `parseQuery(s)`, `parseForm(body)`, `parseCookies(header)` | |
-| `encodeComponent(s)`, `percentDecode(s, plusIsSpace)` | |
+| `encodeComponent(s)`, `percentDecode(s, plusIsSpace)` | [`slate:url`](url.md)'s, forwarded |
 
 `Request`, `Response` and `Router` are exported as [types](../reference/types.md) too.
+
+**`parseQuery`, `encodeComponent` and `percentDecode` are [`slate:url`](url.md)'s** and are exported
+here as well, so nothing written against this module changed. **Import them from `slate:url` in
+anything that is not a server** — a browser page importing this module to reach them grows by 239 KB,
+which is a file server and an HTTP/2 speaker downloaded to read a query string.
 
 The third argument to either server is for a protocol upgrade — see [`slate:ws`](ws.md).
 

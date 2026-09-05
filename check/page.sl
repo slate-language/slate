@@ -65,8 +65,23 @@ val curious = createElement("button")
 
 setAttribute(quiet, "id", "quiet")
 setAttribute(curious, "id", "curious")
-setChildren(app, [quiet, curious])
+
+// -- which modifiers were down, and which button ---------------------------------------------------
+
+// **A LINK CANNOT BE WRITTEN WITHOUT THESE.** A framework intercepting a click has to let a
+// cmd-click, a ctrl-click, a shift-click and a middle click through to the browser, or it swallows
+// the most ordinary thing anybody does to a link. The driver sends a plain left click and then a
+// cmd-click on the middle button, and the two lines are what says the record carries the difference.
+val marked = createElement("button")
+
+setAttribute(marked, "id", "marked")
+setChildren(app, [quiet, curious, marked])
+
+sawClick(e)
+    print("click button " + toJSON(e.button) + " mods " + toJSON(e.mods))
+
 on(quiet, "click", () -> print("clicked, reading nothing"))
 on(curious, "click", (e) -> print("clicked, and the event says " + e.type))
+on(marked, "click", sawClick)
 
 print("ready")

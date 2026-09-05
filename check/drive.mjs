@@ -39,6 +39,13 @@ w.eval(readFileSync(process.argv[2], "utf8"))
 for (const id of ["quiet", "curious"])
     w.document.getElementById(id).dispatchEvent(new w.MouseEvent("click", { bubbles: true }))
 
+// **A plain left click and then a cmd-click on the middle button.** These two are what a router has
+// to tell apart: the first it may intercept, the second it must let the browser have.
+const marked = w.document.getElementById("marked")
+
+marked.dispatchEvent(new w.MouseEvent("click", { bubbles: true, button: 0 }))
+marked.dispatchEvent(new w.MouseEvent("click", { bubbles: true, button: 1, metaKey: true, shiftKey: true }))
+
 // **Back is asynchronous in a browser and in jsdom**, the navigation being queued rather than done
 // on the spot, so the `popstate` line cannot be read until the queue has turned.
 w.history.back()
@@ -81,6 +88,14 @@ want("the program reached the end", line(15), "ready")
 // The two clicks, in the order the driver made them.
 want("a handler that declares nothing is called", line(16), "clicked, reading nothing")
 want("and one that declares the event is given it", line(17), "clicked, and the event says click")
+
+// **The two a router has to tell apart.** A plain left click is one it may intercept; a cmd-click on
+// the middle button is one it must hand to the browser, and without these fields the two are the
+// same event.
+want("a plain left click reads as button 0 with nothing down", line(18),
+    'click button 0 mods {"meta":false,"ctrl":false,"shift":false,"alt":false}')
+want("a cmd-shift middle click says so", line(19),
+    'click button 1 mods {"meta":true,"ctrl":false,"shift":true,"alt":false}')
 
 // **The push above must NOT have raised `onNavigate`** -- so the only `navigated` line there can be
 // is the one the driver's `back()` caused.
