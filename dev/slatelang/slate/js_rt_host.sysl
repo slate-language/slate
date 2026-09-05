@@ -259,7 +259,15 @@ js_runtime_host() -> string = raw"""
         const bad = (message) => $.obj([["ok", false], ["error", message]])
 
         const asBytes = (raw) => Array.from(raw, (b) => BigInt(b))
-        const asStat = (st) => $.obj([["size", BigInt(st.size)], ["isFile", st.isFile()], ["isDir", st.isDirectory()]])
+        // **`modified` is a field and not an extra**, and leaving it out made `files(root)` in
+        // `slate:http` die here rather than in `slate:fs`: an `etag` is the size and the
+        // modification time, so `info.modified.epochMillis()` reached a missing field and said
+        // "`epochMillis` is not something undefined can do" -- a sentence about the wrong module.
+        // An `SInstant` of MICROSECONDS is what the interpreter answers, and `mtimeMs` is the
+        // finest reading node gives without asking for `BigInt` stats and changing `size` with it.
+        const asStat = (st) => $.obj([["size", BigInt(st.size)], ["isFile", st.isFile()],
+            ["isDir", st.isDirectory()],
+            ["modified", new SInstant(BigInt(Math.round(st.mtimeMs * 1000)))]])
 
         // The ten blocking ones. Each is its node call, its answer shape, and the sentence for a
         // failure -- and nothing else, which is what the pairing is worth.
@@ -413,6 +421,85 @@ js_runtime_host() -> string = raw"""
             } catch (e) {
                 return bad("cannot write " + args[0] + ": " + uvText(e))
             }
+        }
+
+        // **Bytes on the writing side, and a value that is not bytes FAULTS here where `writeFile`
+        // renders it.** The sentences are `with_bytes`'s in `builtin.sysl`, word for word, because
+        // the two hosts have to refuse the same program the same way.
+        const twinOf = { writeBytes: "writeFile", appendBytes: "appendFile",
+            writeBytesSync: "writeFileSync", appendBytesSync: "appendFileSync" }
+
+        const bytesOf = (args, name) => {
+            if (args.length !== 2)
+                fault("`" + name + "` takes a path and its bytes, and was given " + args.length +
+                    (args.length === 1 ? " argument" : " arguments"))
+
+            if (!$.isStr(args[0])) fault("`" + name + "` takes a path, and this is " + typeName(args[0]))
+
+            const given = args[1]
+
+            if (!Array.isArray(given))
+                fault("`" + name + "` takes an array of numbers, and this is " + typeName(given) +
+                    " -- `" + twinOf[name] + "` is what writes anything else")
+
+            const out = new Uint8Array(given.length)
+
+            for (let i = 0; i < given.length; i = i + 1) {
+                const b = given[i]
+
+                if (!$.isInt(b))
+                    fault("`" + name + "` takes an array of numbers, and one of these is " + typeName(b))
+
+                if (b < 0n || b > 255n) fault("a byte is between 0 and 255, and this is " + b)
+
+                out[i] = Number(b)
+            }
+
+            return out
+        }
+
+        B.writeBytesSync = (...args) => {
+            const raw = bytesOf(args, "writeBytesSync")
+            const fs = fsOf("writeBytesSync")
+
+            try {
+                fs.writeFileSync(args[0], raw)
+
+                return ok(null)
+            } catch (e) {
+                return bad("cannot write " + args[0] + ": " + uvText(e))
+            }
+        }
+
+        B.appendBytesSync = (...args) => {
+            const raw = bytesOf(args, "appendBytesSync")
+            const fs = fsOf("appendBytesSync")
+
+            try {
+                fs.appendFileSync(args[0], raw)
+
+                return ok(null)
+            } catch (e) {
+                return bad("cannot write " + args[0] + ": " + uvText(e))
+            }
+        }
+
+        B.writeBytes = (...args) => {
+            const raw = bytesOf(args, "writeBytes")
+            const fs = fsOf("writeBytes")
+
+            return fs.promises.writeFile(args[0], raw).then(
+                () => ok(null),
+                (e) => bad("cannot write " + args[0] + ": " + uvText(e)))
+        }
+
+        B.appendBytes = (...args) => {
+            const raw = bytesOf(args, "appendBytes")
+            const fs = fsOf("appendBytes")
+
+            return fs.promises.appendFile(args[0], raw).then(
+                () => ok(null),
+                (e) => bad("cannot write " + args[0] + ": " + uvText(e)))
         }
 
         const twoPaths = (args, name) => {
@@ -630,6 +717,104 @@ js_runtime_host() -> string = raw"""
             if ($.host.exit !== null) $.host.exit(failed === 0 ? 0 : 1)
         }
 
+        // -- signals ---------------------------------------------------------------------------
+
+        // **`onSignal` and `offSignal`, over `process.on` and `process.off`.** The interpreter's
+        // half is `signals.sysl` and every sentence below is that file's, word for word: which
+        // names there are, which two of them cannot be caught, and what an id that names nothing
+        // means. A program asking to be told about `SIGTERM` is the same program on either host.
+        //
+        // **THE LISTENER IS STORED UNDER THE ID BECAUSE `process.off` REMOVES BY IDENTITY.** A
+        // fresh wrapper handed to it would remove nothing and the handler would keep firing, which
+        // is `slate:dom`'s `on`/`off` trap arriving on a different host object.
+        //
+        // **A watcher does not keep the program alive, and node gives that for free** -- which is
+        // the rule the interpreter reaches by calling `unref` on the libuv handle, so nothing here
+        // has to say it.
+        const CATCHABLE = ["SIGHUP", "SIGINT", "SIGQUIT", "SIGABRT", "SIGPIPE", "SIGALRM",
+            "SIGTERM", "SIGCHLD", "SIGCONT", "SIGTSTP", "SIGUSR1", "SIGUSR2", "SIGWINCH"]
+
+        const CATCHABLE_SAID = "SIGHUP, SIGINT, SIGQUIT, SIGABRT, SIGPIPE, SIGALRM, SIGTERM, " +
+            "SIGCHLD, SIGCONT, SIGTSTP, SIGUSR1, SIGUSR2 and SIGWINCH"
+
+        const signals = new Map()
+        let nextSignal = 0n
+
+        // The host's own signal door, or nothing where there is none. **A browser has no
+        // `process`**, and a page that could be sent `SIGTERM` is not a thing.
+        const signalHost = () => {
+            if (typeof process === "undefined") return null
+            if (typeof process.on !== "function" || typeof process.off !== "function") return null
+
+            return process
+        }
+
+        B.onSignal = (...args) => {
+            if (args.length !== 2)
+                fault("`onSignal` takes a signal name and a function, and was given " + args.length +
+                    (args.length === 1 ? " argument" : " arguments"))
+
+            if (!$.isStr(args[0]))
+                fault("`onSignal` takes a signal name, and this is " + typeName(args[0]))
+
+            const f = args[1]
+
+            if (typeof f !== "function")
+                fault("`onSignal` needs a function to call, and this is " + typeName(f))
+
+            const name = args[0]
+
+            // **Refused by name, before the host is asked.** node throws its own error for these
+            // two and the interpreter refuses them before libuv sees them; what a program needs to
+            // hear is that nothing of its own will run, which neither host's own message says.
+            if (name === "SIGKILL" || name === "SIGSTOP")
+                fault("`" + name + "` cannot be caught: the kernel acts on it itself, and nothing " +
+                    "this program says will run first")
+
+            if (CATCHABLE.indexOf(name) < 0)
+                fault("there is no signal called `" + name + "`; the ones a program may catch are " +
+                    CATCHABLE_SAID)
+
+            const host = signalHost()
+
+            if (host === null)
+                fault("`onSignal` needs a process to be signalled, and this JavaScript host is not one")
+
+            // **The handler is given nothing**, where node hands its listener the signal's name and
+            // a number: slate checks the count of a call's arguments, so a name passed through
+            // would be a parameter every program had to write.
+            const listener = () => $.callback(f, [], "onSignal")
+            const id = ++nextSignal
+
+            signals.set(id, { name: name, listener: listener })
+            host.on(name, listener)
+
+            return id
+        }
+
+        B.offSignal = (...args) => {
+            if (args.length !== 1)
+                fault("`offSignal` takes the id `onSignal` answered, and was given " + args.length +
+                    (args.length === 1 ? " argument" : " arguments"))
+
+            if (!$.isInt(args[0]))
+                fault("a signal handler is stopped by its id, and this is " + typeName(args[0]))
+
+            const held = signals.get(args[0])
+
+            // **An id that names nothing is not an error**, which is `clearTimeout`'s rule: a
+            // program stopping a handler twice has said something true about what it wants.
+            if (held === undefined) return null
+
+            signals.delete(args[0])
+
+            const host = signalHost()
+
+            if (host !== null) host.off(held.name, held.listener)
+
+            return null
+        }
+
         // **`slate:time` IS WHOLE NOW EXCEPT FOR `abbrev` AND `isDST`**, and those two are not owed
         // work -- they are things a JavaScript host does not have. `js_rt_cal.sysl` carries the
         // measurements and `js_rt_cal_builtins.sysl` refuses both with a sentence saying which, so
@@ -651,7 +836,7 @@ js_runtime_host() -> string = raw"""
         const OWED = ["listen", "connect", "onData", "onBytes", "onError", "send",
             "close", "localPort", "remoteAddress", "startTls", "alpnProtocol",
             "utc", "hash", "hashStrong", "check", "needsRehash",
-            "run", "onSignal", "offSignal",
+            "run",
             "httpParser", "httpStream", "httpFeed", "httpTake", "httpTakePart", "httpFinish",
             "httpClose", "httpUpgraded",
             "redisReader", "redisFeed", "redisTake", "redisCommand", "redisClose",

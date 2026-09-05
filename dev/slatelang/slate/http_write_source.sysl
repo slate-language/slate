@@ -55,7 +55,12 @@ http_write_source() -> string = raw"""
     // **A bare array answers bytes too**, for the same consistency: `req -> [72, 105]` is the byte
     // form of `req -> "Hi"`. A handler that means an array of DATA writes `toJSON(xs)`, which is what
     // it had to write anyway -- rendering a slate array as its own text was never a JSON document.
-    write(conn, req: object | null, v, keep: boolean) =
+    // **`watching` IS HOW A SHUTDOWN REACHES A RESPONSE THAT IS STILL BEING WRITTEN.** A streamed
+    // body lives entirely inside `streamed`'s own locals, so a connection asked to close had no
+    // handle on the source and could only close the socket and wait for the next write to fail --
+    // which for a source that never yields again is never. The writer hands its cut back through
+    // this, and hands `null` back when the response has ended.
+    write(conn, req: object | null, v, keep: boolean, watching = null) =
         val r = shaped(req, v)
         var extra = ""
 
@@ -63,7 +68,7 @@ http_write_source() -> string = raw"""
             extra = extra + k + ": " + hv + "\r\n"
 
         if r.source != null
-            streamed(conn, r, extra, keep)
+            streamed(conn, r, extra, keep, watching)
         elif r.text == null
             replyBytes(conn, r.status, extra, r.bytes, keep)
         else
@@ -247,11 +252,43 @@ http_write_source() -> string = raw"""
     // the server does for a handler that faults: the client sees a truncated body -- which is what a
     // chunked response with no terminator means, and is the only thing HTTP can say once the status
     // line has gone -- and the defect still stops the program.
-    async streamed(conn, r: object, extra: string, keep: boolean)
+    async streamed(conn, r: object, extra: string, keep: boolean, watching = null)
         await send(conn, streamHead(r.status, extra, keep))
 
         var beating = false
         var timer = null
+
+        // Whether the source has been told its reader has gone. **Once per response, whichever way
+        // out got there first**: a source counting its own readers goes negative if two of them say
+        // so, and there are three ways out now rather than two.
+        var told = false
+
+        // Whether the connection was cut under this response, which is a third thing from a write
+        // that failed and a source that faulted -- and the only one of the three where there is
+        // nobody left to tell and nothing to put back.
+        var stopped = false
+
+        tellSource()
+            if told then return
+
+            told = true
+
+            closeSource(r.source)
+
+        // What `close(server)` does to a response that is still being written. **The source is told
+        // AT ONCE rather than after a clock**, which is the whole of the fix: a shutdown used to
+        // wait `IdleMillis` for a stream that was never going to end, and then reached the source
+        // only as a by-product of the socket being torn out from under the writer.
+        cutHere()
+            if stopped then return
+
+            stopped = true
+            beating = false
+
+            stopBeating(timer)
+            tellSource()
+
+        if watching != null then watching(cutHere)
 
         // **A comment while nothing is happening**, on the interval the response asked for. A line
         // beginning `:` is a comment every SSE client ignores, and it is what keeps an idle
@@ -309,6 +346,10 @@ http_write_source() -> string = raw"""
 
         try
             for await piece in r.source
+                // **A source that yields again after the cut is not written**, which is the same
+                // poll the h2 speaker has always had at the top of its loop.
+                if stopped then return
+
                 // **Framed before the send rather than inside it**, so a piece that cannot be
                 // rendered is the source's fault and not read as a client that has gone.
                 val frame = framed(piece)
@@ -327,7 +368,13 @@ http_write_source() -> string = raw"""
             // **The source is told before anything is decided about the failure**, because both
             // readings of it end this response with the source unexhausted: a write that failed is
             // a reader that has gone, and a source that faulted is one nothing will ask again.
-            closeSource(r.source)
+            tellSource()
+
+            if watching != null then watching(null)
+
+            // The server closed under this response and the socket has already gone, so whatever
+            // came out of the source or out of the write is about a connection nobody is holding.
+            if stopped then return
 
             // The client has gone: the caller's own `try` ends the connection, as it does for a
             // whole-body response whose write failed.
@@ -340,6 +387,10 @@ http_write_source() -> string = raw"""
         beating = false
 
         stopBeating(timer)
+
+        if stopped then return
+
+        if watching != null then watching(null)
 
         await send(conn, "0\r\n\r\n")
 

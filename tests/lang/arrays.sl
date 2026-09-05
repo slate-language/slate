@@ -61,6 +61,21 @@ searching_answers_null_for_a_miss() =
     assertEq(find([1, 2], (x) -> x > 5), null)
 
 @test
+a_search_may_be_told_where_to_start() =
+    assertEq(indexOf([1, 2, 1, 2], 2, 2), 3)
+    assertEq(lastIndexOf([1, 2, 1, 2], 1, 1), 0)
+    assertEq(indexOf([1, 2], 1, 1), null)
+    assertEq(lastIndexOf([1, 2], 2, 0), null)
+
+    // A negative counts back from the end, which is how `slice` and `at` read one too.
+    assertEq(indexOf([1, 2, 1], 1, -1), 2)
+    assertEq(lastIndexOf([1, 2, 1], 1, -1), 2)
+    assertEq(indexOf([1, 2, 1], 1, -99), 0)
+    assertEq(lastIndexOf([1, 2, 1], 1, -99), null)
+    assertEq(indexOf([1, 2, 1], 1, 99), null)
+    assertEq(lastIndexOf([1, 2, 1], 1, 99), 2)
+
+@test
 the_operations_that_change_an_array_answer_nothing() =
     var xs = [1]
 

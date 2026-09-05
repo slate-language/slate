@@ -32,7 +32,11 @@ statSaid(r) =
 
     val v = r.value
 
-    s"ok {size: ${v.size}, isFile: ${v.isFile}, isDir: ${v.isDir}}"
+    // **The FIELD is compared even though the value cannot be.** `modified` was absent from the
+    // JavaScript host's stat for three releases and this corpus passed over it, because dropping
+    // the whole record was read as dropping the reading rather than the name. What is stable is
+    // that it is an instant and that it is after the day this was written.
+    s"ok {size: ${v.size}, isFile: ${v.isFile}, isDir: ${v.isDir}, modified: ${v.modified is instant} ${v.modified.epochMillis() > 1700000000000}}"
 
 blocking()
     print("-- blocking")

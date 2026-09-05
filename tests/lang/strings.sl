@@ -45,6 +45,33 @@ searching_answers_null_for_a_miss_and_not_a_negative_number() =
     assert(endsWith("abc", "bc"))
 
 @test
+a_search_may_be_told_where_to_start() =
+    // A negative counts back from the end, and past the end there is nothing at or after it. That
+    // is one rule for a string and for an array, where JavaScript reads the same argument two ways.
+    assertEq(indexOf("abcabc", "b", 2), 4)
+    assertEq(indexOf("abcabc", "b", 5), null)
+    assertEq(lastIndexOf("abcabc", "b", 3), 1)
+    assertEq(lastIndexOf("abcabc", "b", 0), null)
+    assertEq(indexOf("abcabc", "b", -3), 4)
+    assertEq(lastIndexOf("abcabc", "b", -3), 1)
+    assertEq(indexOf("abc", "a", 99), null)
+    assertEq(lastIndexOf("abc", "a", 99), 0)
+
+    // In characters, exactly as the answer is.
+    assertEq("héllé".indexOf("l", 3), 3)
+    assertEq("héllé".lastIndexOf("l", 2), 2)
+
+@test
+a_subsequence_is_found_where_the_haystack_keeps_almost_matching() =
+    val h = repeat("aaab", 400) + "aaac"
+
+    assertEq(indexOf(h, "aaac"), 1600)
+    assertEq(lastIndexOf(h, "aaab"), 1596)
+    assertEq(indexOf(h, "aaad"), null)
+    assert(contains(h, "aaac"))
+    assert(!contains(h, "aaad"))
+
+@test
 an_index_counts_characters_here_as_well() =
     assertEq(indexOf("héllo", "llo"), 2)
 

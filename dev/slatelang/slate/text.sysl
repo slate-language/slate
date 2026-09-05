@@ -165,26 +165,173 @@ do_contains(args: Buf[Value], at: Span) -> Step
     val s = text_of(args.at(0), at, "contains", "a string")?
     val sub = text_of(args.at(1), at, "contains", "what to look for")?
 
-    Ok(Bool(s.contains(sub)))
+    Ok(Bool(find_forward(s.bytes, sub.bytes, 0).is_some()))
 
-// `indexOf(s, sub)` -- where it is, IN CHARACTERS, or null.
+// `indexOf(s, sub)` and `indexOf(s, sub, from)` -- where it is, IN CHARACTERS, or null.
 //
 // **Null rather than -1**, because slate has a null and the operators that go with it: `indexOf(s,
 // x) ?? 0` says what a sentinel makes a reader work out.
+//
+// **A POSITION IS WHAT A PROGRAM WAS SLICING TO GET.** Without one, finding the second occurrence
+// of something meant cutting a fresh string and adding the offset back on -- which allocates a copy
+// of the tail per search and is how a scan over a document becomes quadratic. `slate:ws` and
+// `slate:url` both had that shape in them.
 do_index_of(args: Buf[Value], at: Span, last: bool) -> Step
     val name = if last then "lastIndexOf" else "indexOf"
 
-    wants(args, 2, at, name, "a string and what to look for")?
+    if args.len() != 2 && args.len() != 3
+        return fault(at, s"`${name}` takes a string, what to look for and an optional position, and was given ${counted(args.len(), "argument")}")
 
     val s = text_of(args.at(0), at, name, "a string")?
     val sub = text_of(args.at(1), at, name, "what to look for")?
+    val n = char_count(s)
 
-    val found = if last then s.last_index_of(sub) else s.index_of(sub)
+    // **Given no position a forward search starts at the beginning and a backward one at the end**,
+    // which is what the two-argument form has always meant and is why the default is not one number.
+    val asked = if args.len() == 3
+        from_either_end(args.at(2), at, name, n)?
+    else
+        if last then long(n) else long(0)
 
-    found match
-        Some(b) -> Ok(Int(long(char_of_byte(s, b))))
-        None -> Ok(Null)
+    if last
+        // A position below the start of the string, after counting a negative one back from the
+        // end, is a search over nothing.
+        if asked < 0 then return Ok(Null)
+
+        val start = if asked > long(n) then n else usize(asked)
+
+        find_backward(s.bytes, sub.bytes, char_span(s, start, n).0) match
+            Some(b) -> Ok(Int(long(char_of_byte(s, b))))
+            None -> Ok(Null)
+    else
+        // Past the end there is nothing at or after it.
+        if asked > long(n) then return Ok(Null)
+
+        val start = if asked < 0 then 0 else usize(asked)
+
+        find_forward(s.bytes, sub.bytes, char_span(s, start, n).0) match
+            Some(b) -> Ok(Int(long(char_of_byte(s, b))))
+            None -> Ok(Null)
 end do_index_of
+
+// -- searching bytes -------------------------------------------------------------------------------
+
+// **A BYTE SEARCH OVER UTF-8 IS CORRECT AND NOT A SHORTCUT.** UTF-8 is self-synchronizing -- a
+// continuation byte is distinguishable from a lead byte -- so a well-formed needle cannot match
+// starting anywhere but at a character boundary. The offsets in and out are bytes; the caller turns
+// them into characters.
+//
+// **BOYER-MOORE-HORSPOOL RATHER THAN THE NAIVE SCAN, AND THE MEASUREMENT IS WHY.** `sysl.text`'s
+// `Search` says of its own two searches that "a sub-linear one may replace them without anything
+// observable changing"; this is that replacement, made here because the trait is the standard
+// library's and slate owns its own builtin. `sluice` measured a megabyte at 633 ms through the
+// naive scan and 48 ms through this one.
+//
+// The table is skipped for a needle of one byte, where building 256 entries costs more than the
+// scan it saves.
+private find_forward(h: []const u8, n: []const u8, from: usize) -> Option[usize]
+    if from > h.len then return None
+    if n.len == 0 then return Some(from)
+    if n.len > h.len then return None
+    if from > h.len - n.len then return None
+
+    val last = h.len - n.len
+
+    if n.len == 1
+        val want = n[0]
+        var i = from
+
+        while i <= last
+            if h[i] == want then return Some(i)
+
+            i += 1
+
+        return None
+
+    // How far the window may jump when the byte at its end is not the needle's last: the distance
+    // from that byte's rightmost other occurrence to the end, or the whole needle where it does not
+    // occur at all.
+    var shift: [256]usize = [n.len; 256]
+    var k: usize = 0
+
+    while k < n.len - 1
+        shift[usize(n[k])] = n.len - 1 - k
+        k += 1
+
+    var i = from
+
+    while i <= last
+        var j = n.len
+        var same = true
+
+        while j > 0
+            j -= 1
+
+            if h[i + j] != n[j]
+                same = false
+                break
+
+        if same then return Some(i)
+
+        i += shift[usize(h[i + n.len - 1])]
+
+    None
+end find_forward
+
+// The same walk from the other end: where `n` last occurs in `h` starting at or before `upto`.
+//
+// **The table is the mirror and not the same table.** A backward search compares from the window's
+// start, so what a mismatch there says is where that byte occurs *nearest the front* of the needle.
+private find_backward(h: []const u8, n: []const u8, upto: usize) -> Option[usize]
+    if n.len > h.len then return None
+
+    val last = h.len - n.len
+    val top = if upto > last then last else upto
+
+    if n.len == 0 then return Some(top)
+
+    if n.len == 1
+        val want = n[0]
+        var i = top
+
+        loop
+            if h[i] == want then return Some(i)
+            if i == 0 then break
+
+            i -= 1
+
+        return None
+
+    var shift: [256]usize = [n.len; 256]
+    var k = n.len - 1
+
+    while k > 0
+        shift[usize(n[k])] = k
+        k -= 1
+
+    var i = top
+
+    loop
+        var j: usize = 0
+        var same = true
+
+        while j < n.len
+            if h[i + j] != n[j]
+                same = false
+                break
+
+            j += 1
+
+        if same then return Some(i)
+
+        val step = shift[usize(h[i])]
+
+        if i < step then break
+
+        i -= step
+
+    None
+end find_backward
 
 do_edge(args: Buf[Value], at: Span, start: bool) -> Step
     val name = if start then "startsWith" else "endsWith"

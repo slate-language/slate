@@ -24,6 +24,21 @@ print([1, 2, 3].findIndex(x -> x > 2), [1, 2, 3].findIndex(x -> x > 5))
 // value would still pass while the comparison it exists for did not.
 print(["br", "img"].indexOf("div") != null, ["br", "img"].indexOf("br") != null)
 
+// -- and a position is read ONE way, where JavaScript reads it two ------------------------------
+
+// `Array.prototype.indexOf` counts a negative back from the end and `String.prototype.indexOf`
+// clamps it to zero. slate dispatches one builtin over both kinds, so one of those readings had to
+// go and counting back is the one `slice` and `at` already use.
+print("abcabc".indexOf("b", 2), "abcabc".indexOf("b", 5))
+print("abcabc".lastIndexOf("b", 3), "abcabc".lastIndexOf("b", 0))
+print("abcabc".indexOf("b", -3), "abcabc".lastIndexOf("b", -3))
+print("abcabc".indexOf("b", -99), "abcabc".lastIndexOf("b", -99))
+print("abc".indexOf("a", 99), "abc".lastIndexOf("a", 99))
+print("héllé".indexOf("l", 3), "héllé".lastIndexOf("l", 2))
+print([1, 2, 1, 2].indexOf(2, 2), [1, 2, 1, 2].lastIndexOf(1, 1))
+print([1, 2, 1].indexOf(1, -1), [1, 2, 1].lastIndexOf(1, -99))
+print([1, 2, 1].indexOf(1, 99), [1, 2, 1].lastIndexOf(1, 99))
+
 // -- `number` reads text, and answers `null` when the text is not a number --------------------------
 
 // **The integer path is strict and the fallback is `strtod`'s**, which is why a leading blank is

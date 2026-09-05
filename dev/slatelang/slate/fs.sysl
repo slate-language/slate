@@ -75,7 +75,7 @@ end read_bytes_promise
 // `write_file_sync` and no asynchronous whole-file write. Each step's callback carries only the id
 // and the span, so the chain needs nothing rooted that the slot does not already root.
 write_file_promise(path: string, text: string, at: Span) -> Step =
-    put_file_promise(path, text, libuv.O_TRUNC, at)
+    put_file_promise(path, held_bytes(text.bytes), libuv.O_TRUNC, at)
 
 // `appendFile(path, text)` -- the same, with the text added to what is there.
 //
@@ -84,27 +84,55 @@ write_file_promise(path: string, text: string, at: Span) -> Step =
 // overwrite one another and nothing has to hold the whole file to add a line to it. A log is what
 // this is for.
 append_file_promise(path: string, text: string, at: Span) -> Step =
-    put_file_promise(path, text, libuv.O_APPEND, at)
+    put_file_promise(path, held_bytes(text.bytes), libuv.O_APPEND, at)
 
-// The two of them, differing in one flag.
-private put_file_promise(path: string, text: string, mode: int, at: Span) -> Step
+// `writeBytes(path, bytes)` -- the whole of a file, replaced, given the bytes themselves.
+//
+// **What a program had to do without this was encode.** `writeFile` renders anything that is not a
+// string the way `print` would, so an array of numbers reached the disk as the characters `[72,
+// 105]` -- which meant a program holding an image, a compressed body or a digest either encoded it
+// as text or could not write it at all. `send` already read an array as bytes and this is the same
+// reading on the other side of the machine.
+write_bytes_promise(path: string, payload: Buf[u8], at: Span) -> Step =
+    put_file_promise(path, payload, libuv.O_TRUNC, at)
+
+// `appendBytes(path, bytes)` -- the same bytes at the end of a file.
+append_bytes_promise(path: string, payload: Buf[u8], at: Span) -> Step =
+    put_file_promise(path, payload, libuv.O_APPEND, at)
+
+// A slice copied into a buffer the chain below can hold on to.
+//
+// **A `Buf` is what the closure captures, and a slice would not do.** A capture is by value, and a
+// `Buf` copied that way carries the `[]u8` it is over -- which is counted, so the storage outlives
+// the frame that made it. A bare `[]const u8` read off a string would go the moment the caller
+// returned, and the write happens inside a callback that runs long afterwards.
+private held_bytes(xs: []const u8) -> Buf[u8]
+    var out: Buf[u8] = buf()
+
+    out.extend(xs)
+    out
+end held_bytes
+
+// The four of them, differing in one flag and in where the bytes came from.
+private put_file_promise(path: string, payload: Buf[u8], mode: int, at: Span) -> Step
     val id = begin_request()
     val what = s"cannot write ${path}"
     val flags = libuv.O_WRONLY | libuv.O_CREAT | mode
+    val wanted = payload.len()
 
     request_started(id, at, what, libuv.open(path, (opened) ->
         opened match
             Err(e) -> refuse_request(id, at, what, e)
             Ok(f) ->
-                request_continued(id, at, what, libuv.write(f, text.bytes, (written) ->
+                request_continued(id, at, what, libuv.write(f, payload.view(), (written) ->
                     written match
                         Err(e) ->
                             libuv.close(f)
                             refuse_request(id, at, what, e)
                         Ok(n) ->
-                            if n != text.bytes.len
+                            if n != wanted
                                 libuv.close(f)
-                                deny_request(id, at, s"${what}: only ${n} of ${text.bytes.len} bytes were taken")
+                                deny_request(id, at, s"${what}: only ${n} of ${wanted} bytes were taken")
                             else
                                 // The file is closed either way, and the answer waits for it: a
                                 // program that writes and then reads back would otherwise race its
@@ -267,20 +295,32 @@ write_file_sync(path: string, text: string, at: Span) -> Step
 //
 // **The file is closed whatever the write answered**, a descriptor left behind by a failed write
 // being a leak for as long as the program runs.
-append_file_sync(path: string, text: string, at: Span) -> Step
+append_file_sync(path: string, text: string, at: Span) -> Step = add_to_file_sync(path, text.bytes)
+
+// `writeBytesSync(path, bytes)` -- the whole of a file, replaced, given the bytes themselves.
+write_bytes_sync(path: string, payload: Buf[u8], at: Span) -> Step
+    libuv.write_file_sync(path, payload.view()) match
+        Err(e) -> Ok(err_value(s"cannot write ${path}: ${e}"))
+        Ok(_) -> Ok(ok_value(Null))
+
+// `appendBytesSync(path, bytes)` -- the same bytes at the end of a file.
+append_bytes_sync(path: string, payload: Buf[u8], at: Span) -> Step = add_to_file_sync(path, payload.view())
+
+// The open, the write and the close both appending forms share.
+private add_to_file_sync(path: string, payload: []const u8) -> Step
     val what = s"cannot write ${path}"
 
     libuv.open_sync(path, libuv.O_WRONLY | libuv.O_CREAT | libuv.O_APPEND) match
         Err(e) -> Ok(err_value(s"${what}: ${e}"))
         Ok(f) ->
-            val wrote = f.write_all_sync(text.bytes)
+            val wrote = f.write_all_sync(payload)
 
             f.close_sync()
 
             wrote match
                 Err(e) -> Ok(err_value(s"${what}: ${e}"))
                 Ok(_) -> Ok(ok_value(Null))
-end append_file_sync
+end add_to_file_sync
 
 // `readDirSync(path)` -- the names in a directory, without `.` and `..`.
 read_dir_sync(path: string, at: Span) -> Step

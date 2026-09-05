@@ -4,7 +4,9 @@ module dev.slatelang.slate
 import sh.sysl.libuv
 import sh.sysl.libuv.Handle
 import sh.sysl.parsing.*
-import sysl.text.Search
+import sysl.fs.{read_bytes, remove_file, write_text}
+import sysl.process.capture
+import sysl.text.{Search, from_utf8_unchecked}
 
 // Being asked to stop, which is `onSignal` and `offSignal` in `slate:process`.
 //
@@ -163,3 +165,104 @@ a_handler_stopped_by_something_that_is_not_an_id_says_so()
     val said = fails(SignalImport + "stop(x) = offSignal(x)\nstop(\"SIGTERM\")")
 
     assert(said.contains("stopped by its id"), s"a handler is stopped by its id and not by its name: ${said}")
+
+// -- the same pair under node ----------------------------------------------------------------------
+
+// A program compiled to JavaScript and run under node with a preface in front of it.
+//
+// **The preface is how a signal is delivered at all here.** `raised` above sends one with libuv's
+// `kill` in this process, and node is a child -- so what arms the delivery has to be JavaScript
+// running beside the program, and it has to be there before the program loads.
+//
+// It is `tests_dom.sysl`'s `prefaced` written a second time because `private` in sysl is per file;
+// what a third caller should do is lift it into `tests_kit.sysl`.
+private under_node(program: string, preface: string) -> string
+    val src = "tests/js-signal.tmp.sl"
+    val out_js = src + ".js"
+
+    write_text(src, program).unwrap()
+
+    val wrote = cli_status(["slate", "js", src, "-o", out_js])
+
+    remove_file(src)
+
+    if wrote != 0 then return s"`slate js` exited ${wrote}"
+
+    val emitted = from_utf8_unchecked(read_bytes(out_js).unwrap())
+
+    write_text(out_js, preface + "\n" + emitted).unwrap()
+
+    val ran = capture("node", [out_js], "", [], true)
+
+    remove_file(out_js)
+
+    ran match
+        Err(e) -> s"node could not be started: ${e}"
+        Ok(o) -> if o.status.ok() then o.text.trim() else o.err.unwrap_or("").trim()
+end under_node
+
+// What sends the program the signal, once it has had a moment to register for it.
+private val Raiser: string = "setTimeout(() => process.kill(process.pid, \"SIGWINCH\"), 80)"
+
+@test
+A_HANDLER_RUNS_UNDER_NODE_WHEN_THE_SIGNAL_ARRIVES()
+    // **Owed since 0.0.29**, when both names went on the `OWED` list: a server compiled with
+    // `slate js` and run under node could not be told to stop, which is the one thing a deployment
+    // ever asks of one.
+    val program = SignalImport +
+        "val t = setTimeout(() -> print(\"gave up\"), 3000)\n" +
+        "onSignal(\"SIGWINCH\", () ->\n" +
+        "    print(\"stopping\")\n" +
+        "    clearTimeout(t))\n"
+
+    assert_eq(under_node(program, Raiser), "stopping")
+
+@test
+A_HANDLER_STOPPED_UNDER_NODE_DOES_NOT_RUN()
+    // **`process.off` removes by listener IDENTITY**, so the wrapper handed to `process.on` has to
+    // be the one handed back -- a fresh closure would remove nothing and the handler would keep
+    // firing with the program believing it had stopped.
+    val program = SignalImport +
+        "val id = onSignal(\"SIGWINCH\", () -> print(\"caught\"))\n" +
+        "offSignal(id)\n" +
+        "setTimeout(() -> print(\"done\"), 200)\n"
+
+    assert_eq(under_node(program, Raiser), "done")
+
+    // And an id that names nothing is not an error, which is `clearTimeout`'s rule.
+    assert_eq(node_said(SignalImport + "offSignal(99)\nprint(\"fine\")\n"), "fine")
+
+@test
+A_WATCHER_DOES_NOT_KEEP_A_NODE_PROGRAM_ALIVE_EITHER()
+    // node's own rule, which is the one the interpreter reaches by `unref`ing the libuv handle: a
+    // program that registers a handler out of habit still ends.
+    assert_eq(node_said(SignalImport + "onSignal(\"SIGTERM\", () -> print(\"caught\"))\nprint(\"registered\")"),
+        "registered")
+
+@test
+THE_TWO_HOSTS_REFUSE_THE_SAME_SIGNAL_NAMES_IN_THE_SAME_WORDS()
+    // **A sentence written twice is a sentence that drifts**, and these are the ones a program is
+    // most likely to meet -- so each is asserted against the interpreter's own answer rather than
+    // against a copy of the words.
+    val kill = SignalImport + "onSignal(\"SIGKILL\", () -> print(\"caught\"))"
+    val nope = SignalImport + "onSignal(\"SIGNOPE\", () -> print(\"caught\"))"
+    val given = SignalImport + "onSignal(\"SIGTERM\", 3)"
+
+    assert(node_said(kill).contains("`SIGKILL` cannot be caught: the kernel acts on it itself"))
+    assert(fails(kill).contains("`SIGKILL` cannot be caught: the kernel acts on it itself"))
+
+    assert(node_said(nope).contains("there is no signal called `SIGNOPE`; the ones a program may catch are SIGHUP, SIGINT"))
+    assert(fails(nope).contains("there is no signal called `SIGNOPE`; the ones a program may catch are SIGHUP, SIGINT"))
+
+    assert(node_said(nope).contains("SIGUSR1, SIGUSR2 and SIGWINCH"))
+    assert(fails(nope).contains("SIGUSR1, SIGUSR2 and SIGWINCH"))
+
+    assert(node_said(given).contains("`onSignal` needs a function to call, and this is an integer"))
+    assert(fails(given).contains("`onSignal` needs a function to call, and this is an integer"))
+
+    // A handler stopped by something that is not an id, reached through a parameter the checker
+    // cannot see the type of, so both refusals are the run time's.
+    val stopped = SignalImport + "stop(x) = offSignal(x)\nstop(\"SIGTERM\")"
+
+    assert(node_said(stopped).contains("a signal handler is stopped by its id, and this is a string"))
+    assert(fails(stopped).contains("a signal handler is stopped by its id, and this is a string"))
