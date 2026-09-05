@@ -1,0 +1,759 @@
+module dev.slatelang.slate
+
+// Regular expressions, as JavaScript.
+//
+// **`RegExp` is not PCRE2, and the whole of this file is the difference between them.** slate's
+// patterns are Perl's, which is what `regex.sysl` gets from `sh.sysl.pcre2`; a browser has one
+// regular expression engine and it is `RegExp`. So a pattern is TRANSLATED on its way in rather
+// than handed over, and where a translation would be a guess the pattern is refused NAMING THE
+// CONSTRUCT -- which is the rule the whole back end is built on, said for one library.
+//
+// **The three ways a construct can differ, and what each one gets.** A construct spelled
+// differently and meaning the same thing is TRANSLATED: `(?P<n>...)` is `(?<n>...)`, `\z` is
+// `(?![\s\S])`, `[[:alpha:]]` is `[A-Za-z]`. A construct `RegExp` does not have at all is REFUSED:
+// an atomic group, a possessive quantifier, recursion, `\K`. **And a construct both engines accept
+// while MEANING DIFFERENT THINGS is refused too, and it is the dangerous kind** -- `\s` is the one
+// that matters and it is measured below.
+//
+// **The `u` flag is always set, and that decision buys and costs.** Without it `RegExp` counts a
+// string in UTF-16 code units, so `.` matches half of an emoji and `^.$` says an astral character
+// is two; PCRE2 is in UTF mode and counts characters, so nothing else agrees. With it `RegExp` also
+// gets stricter -- `[\d-x]`, a range with a class at one end, is refused by `u` exactly as PCRE2
+// refuses it, which closes one of the two places `RegExp` was the more permissive engine for free.
+// What it costs is that a few PCRE2 spellings become syntax errors rather than literals, so the
+// translator writes them out: a lone `{`, a lone `]`, `\%` and its family.
+//
+// **The measurements that decided the translations**, taken through this project's own PCRE2 and
+// through node, both at 2026-09-04:
+//
+//   - **`\s` IS NOT `\s`.** PCRE2 here is not in UCP mode, so `\s` is the six ASCII spaces;
+//     `RegExp` reads it as every Unicode space, twenty-five of them. A pattern using `\s` to split
+//     fields would quietly cut on a non-breaking space in a browser and not in the interpreter.
+//     `\s`, `\S` and their in-class forms are written out.
+//   - **`.` IS NOT `.`.** PCRE2's excludes the newline; `RegExp`'s also excludes `\r`, ` ` and
+//     ` `. So `.` becomes `[^\n]`, and `[\s\S]` where `s` was asked for.
+//   - **`^` AND `$` UNDER `m` ARE NOT `^` AND `$` UNDER `m`**, for the same reason and in the same
+//     three characters. They become lookarounds, and `RegExp`'s own `m` is never set.
+//   - **A lookbehind is where `RegExp` is the LOOSER engine.** PCRE2 refuses one whose length is
+//     unlimited -- `(?<=ab*)` is "length of lookbehind assertion is not limited" -- and takes a
+//     bounded one, `(?<=ab?)` and `(?<=a{2,3})` both compiling. `RegExp` takes all of them. So an
+//     unbounded quantifier inside a lookbehind is refused HERE, and the two engines agree again.
+//   - **`\w` under `i` is left alone and is the one difference that is documented rather than
+//     closed.** `RegExp` with `u` and `i` folds `U+017F` and `U+212A` into `s` and `k`, so it counts
+//     them as word characters where PCRE2 does not. It is exactly two code points and only under
+//     `i`; closing it would mean rewriting every character class through the `v` flag's set
+//     subtraction, which is a much newer thing to require of a browser than the difference is worth.
+//     `docs/reference/javascript.md` names them.
+//
+// **The two halves of this file sit in different scopes**, as `js_rt_time.sysl`'s do: the value
+// model and the translator are script-level, and the builtins are in `js_rt_regex_builtins.sysl`
+// inside the `$b` block.
+
+// The value model, the table of compiled patterns, and the translator.
+js_runtime_regex() -> string = raw"""
+    // -- the value ---------------------------------------------------------------------------------
+
+    // A compiled pattern. **A SLOT and not the `RegExp` itself**, which is `value.sysl`'s
+    // `RegexVal` and is what makes two identically written patterns equal: the table is keyed by
+    // the source and the flags, so `regex("a") == regex("a")` without comparing any text.
+    class SRegex {
+        constructor(id) { this.id = id }
+    }
+
+    // What a slot holds: what the program wrote, and what node was given.
+    const REGEX_TABLE = []
+    const REGEX_IDS = new Map()
+
+    // The six ASCII spaces PCRE2 calls `\s`, and everything else. **Both are needed because a class
+    // cannot be negated from inside another one**: `[^...]` is the whole class or nothing, so
+    // `[\S]` has to be written as the ranges that are not `\s` rather than as a negation.
+    const RE_SPACE_IN = "\\t\\n\\x0B\\f\\r "
+    const RE_SPACE_OUT = "\\x00-\\x08\\x0E-\\x1F\\x21-\\u{10FFFF}"
+
+    // PCRE2's horizontal and vertical whitespace, measured rather than read off a manual: `\h` is
+    // the tab, the space, the no-break space, the ogham space mark, the Mongolian vowel separator,
+    // the six-per-em run, the narrow and medium mathematical spaces and the ideographic space;
+    // `\v` is the four ASCII line breaks, the next-line character and the two Unicode separators.
+    const RE_HSPACE_IN = "\\t \\xA0\\u1680\\u180E\\u2000-\\u200A\\u202F\\u205F\\u3000"
+    const RE_HSPACE_OUT = "\\x00-\\x08\\x0A-\\x1F\\x21-\\x9F\\xA1-\\u167F\\u1681-\\u180D" +
+        "\\u180F-\\u1FFF\\u200B-\\u202E\\u2030-\\u205E\\u2060-\\u2FFF\\u3001-\\u{10FFFF}"
+    const RE_VSPACE_IN = "\\n\\x0B\\f\\r\\x85\\u2028\\u2029"
+    const RE_VSPACE_OUT = "\\x00-\\x09\\x0E-\\x84\\x86-\\u2027\\u202A-\\u{10FFFF}"
+
+    // A line break as one thing, which is what `\R` is for: a CRLF pair counts once.
+    const RE_ANYCRLF = "(?:\\r\\n|[" + RE_VSPACE_IN + "])"
+
+    // The POSIX classes, each measured over the whole of ASCII through this project's own PCRE2.
+    // **They are ASCII and their negations are NOT**, which is the trap: `[[:^alpha:]]` matches
+    // `é`, because `é` is not one of the letters `[:alpha:]` names. So a negation is written as the
+    // ranges of every code point outside the set rather than as `[^...]`, which is also what lets
+    // it appear beside other members -- `[x[:^digit:]]` is a class PCRE2 accepts.
+    const POSIX_IN = {
+        alpha: "A-Za-z",
+        digit: "0-9",
+        alnum: "0-9A-Za-z",
+        upper: "A-Z",
+        lower: "a-z",
+        space: "\\t\\n\\x0B\\f\\r ",
+        blank: "\\t ",
+        punct: "!-\\/:-@\\[-`{-~",
+        print: " -~",
+        graph: "!-~",
+        cntrl: "\\x00-\\x1F\\x7F",
+        xdigit: "0-9A-Fa-f",
+        word: "0-9A-Z_a-z",
+        ascii: "\\x00-\\x7F"
+    }
+
+    const POSIX_OUT = {
+        alpha: "\\x00-\\x40\\x5B-\\x60\\x7B-\\u{10FFFF}",
+        digit: "\\x00-\\x2F\\x3A-\\u{10FFFF}",
+        alnum: "\\x00-\\x2F\\x3A-\\x40\\x5B-\\x60\\x7B-\\u{10FFFF}",
+        upper: "\\x00-\\x40\\x5B-\\u{10FFFF}",
+        lower: "\\x00-\\x60\\x7B-\\u{10FFFF}",
+        space: "\\x00-\\x08\\x0E-\\x1F\\x21-\\u{10FFFF}",
+        blank: "\\x00-\\x08\\x0A-\\x1F\\x21-\\u{10FFFF}",
+        punct: "\\x00-\\x20\\x30-\\x39\\x41-\\x5A\\x61-\\x7A\\x7F-\\u{10FFFF}",
+        print: "\\x00-\\x1F\\x7F-\\u{10FFFF}",
+        graph: "\\x00-\\x20\\x7F-\\u{10FFFF}",
+        cntrl: "\\x20-\\x7E\\u0080-\\u{10FFFF}",
+        xdigit: "\\x00-\\x2F\\x3A-\\x40\\x47-\\x60\\x67-\\u{10FFFF}",
+        word: "\\x00-\\x2F\\x3A-\\x40\\x5B-\\x5E\\x60\\x7B-\\u{10FFFF}",
+        ascii: "\\u0080-\\u{10FFFF}"
+    }
+
+    // The general categories `\p{...}` may name. **Anything else that is a word is taken for a
+    // SCRIPT and written `\p{Script=...}`**, which is the only spelling `RegExp` has for one and
+    // exactly what PCRE2 means by the bare name: `\p{Greek}` compiles here and refuses there, and
+    // the two say the same thing once it is written out.
+    const UNICODE_CATEGORIES = new Set(["C", "Cc", "Cf", "Cn", "Co", "Cs", "L", "Ll", "Lm", "Lo",
+        "Lt", "Lu", "M", "Mc", "Me", "Mn", "N", "Nd", "Nl", "No", "P", "Pc", "Pd", "Pe", "Pf", "Pi",
+        "Po", "Ps", "S", "Sc", "Sk", "Sm", "So", "Z", "Zl", "Zp", "Zs"])
+
+    // -- the refusals ------------------------------------------------------------------------------
+
+    // **A construct a JavaScript host does not have, refused where the pattern is written.** The
+    // sentence names the construct first, because a reader holding a pattern needs to find it in
+    // the text before anything else is useful.
+    const reGone = (what, why) =>
+        $.fault("`" + what + "` is not something a JavaScript host's regular expressions have -- " +
+            why + ", so this pattern is refused here rather than quietly meaning something else")
+
+    // **The refusal for the one construct `RegExp` DOES have, and the sentence has to be its own.**
+    // A lookbehind of unlimited length is a thing a browser is perfectly happy with; what is wrong
+    // with it is that PCRE2 is not, so a pattern carrying one would compile in a browser and not in
+    // the interpreter. Saying "a JavaScript host does not have this" would be false and would send
+    // the reader looking for a missing feature.
+    const reLoose = (written) =>
+        $.fault("`" + written + "` leaves this lookbehind with no limit on its length, and PCRE2 " +
+            "refuses one of those -- so it is refused here too, rather than compiling in a browser " +
+            "and not in the interpreter")
+
+    // -- the translator ----------------------------------------------------------------------------
+
+    const RE_DIGITS = "0123456789"
+    const isDigitChar = (c) => c !== undefined && RE_DIGITS.indexOf(c) >= 0
+    const isWordChar = (c) => c !== undefined && /[0-9A-Za-z_]/.test(c)
+
+    // Whether what starts at `i` is a quantifier's braces -- `{2}`, `{2,}` or `{2,3}`. **PCRE2 reads
+    // a `{` that is not one as a literal and `RegExp` under `u` refuses it**, so this is what tells
+    // the two apart, and the literal gets written `\{`.
+    const braceQuantifier = (src, i) => {
+        let j = i + 1
+        let low = ""
+        let high = ""
+        let comma = false
+
+        while (isDigitChar(src[j])) low += src[j++]
+
+        if (src[j] === ",") {
+            comma = true
+            j++
+
+            while (isDigitChar(src[j])) high += src[j++]
+        }
+
+        if (low === "" || src[j] !== "}") return null
+
+        return { end: j + 1, low: low, high: comma ? high : low, open: comma && high === "" }
+    }
+
+    // A code point as an escape `RegExp` accepts under `u`, whatever it is. **Used wherever a
+    // PCRE2 spelling has to become a plain character** -- `\%` is `%` there and a syntax error
+    // here, and writing the code point rather than the character means nothing has to know which
+    // characters are special where.
+    const reCodePoint = (c) => "\\u{" + c.codePointAt(0).toString(16) + "}"
+
+    // Everything in `text` as itself. `\Q...\E`'s whole job.
+    const reQuoted = (text) => {
+        let out = ""
+
+        for (const c of text) out += reCodePoint(c)
+
+        return out
+    }
+
+    // `\p{...}` and `\P{...}`, which survive translation when `RegExp` has the name and are refused
+    // when it does not. **`Any` is the one that has to be written out**, PCRE2 spelling "every code
+    // point" as a property and `RegExp` not having it at all.
+    const unicodeProperty = (negated, name, inClass) => {
+        if (name === "Any") {
+            if (negated) reGone("\\P{Any}", "a class that matches nothing is not a thing to write")
+
+            return inClass ? "\\s\\S" : "[\\s\\S]"
+        }
+
+        if (name === "L&" || name === "Lc" || name.charAt(0) === "X")
+            reGone("\\p{" + name + "}",
+                "`" + name + "` is one of PCRE2's own property names rather than a Unicode one")
+
+        const head = negated ? "\\P{" : "\\p{"
+
+        if (UNICODE_CATEGORIES.has(name)) return head + name + "}"
+        if (name.indexOf("=") >= 0) return head + name + "}"
+        if (/^[A-Za-z][A-Za-z_ ]*$/.test(name)) return head + "Script=" + name + "}"
+
+        reGone("\\p{" + name + "}", "`" + name + "` is not a property name a JavaScript host knows")
+    }
+
+    // What a pattern becomes on its way to `RegExp`. **One left-to-right pass with two states** --
+    // inside a character class or not -- which is enough because every difference between the two
+    // engines is local to the construct that carries it.
+    //
+    // `lookbehind` counts the lookbehinds this position is inside, and is what makes an unbounded
+    // quantifier a refusal rather than a translation.
+    const regexTranslate = (src, flags) => {
+        const extended = flags.indexOf("x") >= 0
+        const multiline = flags.indexOf("m") >= 0
+        const dotall = flags.indexOf("s") >= 0
+        const closers = []
+        let out = ""
+        let i = 0
+        let lookbehind = 0
+
+        while (i < src.length) {
+            const c = src[i]
+
+            // **Extended mode is stripped here rather than handed over, `RegExp` having no `x`.**
+            // Whitespace and a `#` comment are ignored outside a class, which is PCRE2's rule; an
+            // escaped space is not whitespace and is reached below.
+            if (extended && (c === " " || c === "\t" || c === "\n" || c === "\r" || c === "\f")) {
+                i++
+                continue
+            }
+
+            if (extended && c === "#") {
+                while (i < src.length && src[i] !== "\n") i++
+
+                continue
+            }
+
+            if (c === "\\") {
+                const r = regexEscape(src, i, false)
+
+                out += r.text
+                i = r.end
+                continue
+            }
+
+            if (c === "[") {
+                const r = regexClass(src, i, extended)
+
+                out += r.text
+                i = r.end
+                continue
+            }
+
+            if (c === ".") {
+                out += dotall ? "[\\s\\S]" : "[^\\n]"
+                i++
+                continue
+            }
+
+            // **`^` and `$` under `m` are written as lookarounds and `RegExp`'s own `m` is never
+            // set**, because its idea of a line break is four characters and PCRE2's is one.
+            if (c === "^") {
+                out += multiline ? "(?:(?<![\\s\\S])|(?<=\\n))" : "^"
+                i++
+                continue
+            }
+
+            if (c === "$") {
+                out += multiline ? "(?:(?![\\s\\S])|(?=\\n))" : "$"
+                i++
+                continue
+            }
+
+            if (c === "(") {
+                const r = regexGroup(src, i)
+
+                out += r.text
+                i = r.end
+
+                // **A comment and a named backreference are whole**, having eaten their own `)`, so
+                // they leave nothing on the stack for a later one to close.
+                if (r.opened) {
+                    closers.push(r.lookbehind)
+
+                    if (r.lookbehind) lookbehind++
+                }
+
+                continue
+            }
+
+            if (c === ")") {
+                out += ")"
+                i++
+
+                if (closers.pop()) lookbehind--
+
+                continue
+            }
+
+            if (c === "*" || c === "+" || c === "?") {
+                i = regexQuantifier(src, i, i + 1, c, lookbehind, c !== "?")
+                out += c + (src[i] === "?" ? "?" : "")
+
+                if (src[i] === "?") i++
+
+                continue
+            }
+
+            if (c === "{") {
+                const q = braceQuantifier(src, i)
+
+                if (q === null) {
+                    out += "\\{"
+                    i++
+                    continue
+                }
+
+                // **Only an OPEN brace count is unbounded**, and that is the whole of what a
+                // lookbehind refuses: PCRE2 compiles `(?<=a{2,3})` and refuses `(?<=a{2,})`.
+                const written = "{" + q.low + (q.open ? "," : (q.low === q.high ? "" : "," + q.high)) + "}"
+
+                i = regexQuantifier(src, i, q.end, written, lookbehind, q.open)
+                out += written
+
+                if (src[i] === "?") {
+                    out += "?"
+                    i++
+                }
+
+                continue
+            }
+
+            // **A lone `}` or `]` is a literal in PCRE2 and a syntax error under `u`**, so both are
+            // written out. Everything else goes through as itself.
+            if (c === "}") {
+                out += "\\}"
+                i++
+                continue
+            }
+
+            if (c === "]") {
+                out += "\\]"
+                i++
+                continue
+            }
+
+            out += c
+            i += c.length
+        }
+
+        return out
+    }
+
+    // What follows a quantifier: `+` makes it possessive and `?` makes it lazy. **The possessive
+    // form is the refusal**, `RegExp` having no way to say "and never give these back"; the lazy one
+    // is left for the caller to copy. This also refuses an unbounded quantifier inside a lookbehind,
+    // which is where PCRE2 is the stricter engine and the two would otherwise part company.
+    const regexQuantifier = (src, at, after, written, lookbehind, unbounded) => {
+        if (src[after] === "+")
+            reGone(written + "+", "a possessive quantifier is PCRE2's and `RegExp` has nothing that means it")
+
+        if (lookbehind > 0 && unbounded) reLoose(written)
+
+        return after
+    }
+
+    // A backslash and what follows it, outside a class or inside one.
+    //
+    // **The in-class form of a set escape is its members and the out-of-class form is a class**,
+    // which is the whole reason this takes a flag: `[\S]` cannot be written `[[^...]]`, so what goes
+    // inside a class is the ranges rather than the negation.
+    const regexEscape = (src, at, inClass) => {
+        const c = src[at + 1]
+        const two = (text) => ({ text: text, end: at + 2 })
+
+        if (c === undefined) $.fault("this pattern ends in a backslash")
+
+        // The sets, measured above.
+        if (c === "s") return two(inClass ? RE_SPACE_IN : "[" + RE_SPACE_IN + "]")
+        if (c === "S") return two(inClass ? RE_SPACE_OUT : "[" + RE_SPACE_OUT + "]")
+        if (c === "h") return two(inClass ? RE_HSPACE_IN : "[" + RE_HSPACE_IN + "]")
+        if (c === "H") return two(inClass ? RE_HSPACE_OUT : "[" + RE_HSPACE_OUT + "]")
+        if (c === "v") return two(inClass ? RE_VSPACE_IN : "[" + RE_VSPACE_IN + "]")
+        if (c === "V") return two(inClass ? RE_VSPACE_OUT : "[" + RE_VSPACE_OUT + "]")
+
+        // **`\R` is a SEQUENCE and not a set**, a CRLF pair being one line break, so it has no
+        // in-class form at all -- and PCRE2 refuses it in a class for the same reason.
+        if (c === "R") {
+            if (inClass) reGone("\\R in a character class", "a line break is a sequence rather than a character")
+
+            return two(RE_ANYCRLF)
+        }
+
+        // The anchors, written so that they survive whatever `RegExp` thinks a line is.
+        if (c === "A") return two(inClass ? reCodePoint("A") : "(?<![\\s\\S])")
+        if (c === "z") return two(inClass ? reCodePoint("z") : "(?![\\s\\S])")
+        if (c === "Z") return two(inClass ? reCodePoint("Z") : "(?=\\n?(?![\\s\\S]))")
+        if (c === "N") {
+            if (inClass) reGone("\\N in a character class", "PCRE2 does not allow it there either")
+
+            return two("[^\\n]")
+        }
+
+        // The two characters PCRE2 names and `RegExp` reads as a letter.
+        if (c === "a") return two("\\x07")
+        if (c === "e") return two("\\x1B")
+
+        // `\Q ... \E`, which is everything between them as itself.
+        if (c === "Q") {
+            let j = at + 2
+            let text = ""
+
+            while (j < src.length && !(src[j] === "\\" && src[j + 1] === "E")) text += src[j++]
+
+            return { text: reQuoted(text), end: j < src.length ? j + 2 : j }
+        }
+
+        if (c === "E") return two("")
+
+        if (c === "K")
+            reGone("\\K", "resetting where a match started is PCRE2's and `RegExp` has nothing that means it")
+
+        if (c === "G")
+            reGone("\\G", "an anchor at the end of the previous match is PCRE2's and `RegExp` has no such anchor")
+
+        if (c === "C")
+            reGone("\\C", "a single byte of a character is PCRE2's and a JavaScript string has no bytes to take")
+
+        if (c === "X")
+            reGone("\\X", "an extended grapheme cluster is PCRE2's and `RegExp` has nothing that means it")
+
+        if (c === "g")
+            reGone("\\g", "PCRE2's numbered and relative backreferences are written `\\1` and `\\k<name>` here, " +
+                "and a relative one has no spelling at all")
+
+        // `\p{...}` and `\P{...}`.
+        if (c === "p" || c === "P") {
+            if (src[at + 2] !== "{") reGone("\\" + c, "a one-letter property name has no spelling in `RegExp`")
+
+            const close = src.indexOf("}", at + 3)
+
+            if (close < 0) $.fault("this pattern has a `\\" + c + "{` that is never closed")
+
+            return { text: unicodeProperty(c === "P", src.slice(at + 3, close), inClass), end: close + 1 }
+        }
+
+        // `\x{263A}` is `\u{263A}`; `\xHH` and a bare `\x` go through as they are written.
+        if (c === "x" && src[at + 2] === "{") {
+            const close = src.indexOf("}", at + 3)
+
+            if (close < 0) $.fault("this pattern has a `\\x{` that is never closed")
+
+            return { text: "\\u{" + src.slice(at + 3, close) + "}", end: close + 1 }
+        }
+
+        if (c === "x") {
+            if (!/[0-9A-Fa-f]/.test(src[at + 2] ?? "")) return two("\\0")
+
+            return { text: src.slice(at, at + 4), end: at + 4 }
+        }
+
+        // `\o{101}` is an octal code point, which `\u{...}` says in hexadecimal.
+        if (c === "o") {
+            if (src[at + 2] !== "{") reGone("\\o", "an octal escape is written `\\o{...}` in PCRE2 and not at all here")
+
+            const close = src.indexOf("}", at + 3)
+
+            if (close < 0) $.fault("this pattern has a `\\o{` that is never closed")
+
+            const n = parseInt(src.slice(at + 3, close), 8)
+
+            if (!Number.isFinite(n)) $.fault("this pattern has a `\\o{...}` that is not octal")
+
+            return { text: "\\u{" + n.toString(16) + "}", end: close + 1 }
+        }
+
+        // `\k<n>`, `\k'n'` and `\k{n}` are one backreference written three ways; `RegExp` has the
+        // first.
+        if (c === "k" && (src[at + 2] === "'" || src[at + 2] === "{")) {
+            const close = src.indexOf(src[at + 2] === "'" ? "'" : "}", at + 3)
+
+            if (close < 0) $.fault("this pattern has a `\\k` that is never closed")
+
+            return { text: "\\k<" + src.slice(at + 3, close) + ">", end: close + 1 }
+        }
+
+        // **A numbered backreference goes through and an octal escape does not.** PCRE2 reads
+        // `\101` as a code point where no group 101 exists, which `RegExp` under `u` refuses; a
+        // pattern meaning the character writes `\o{101}` and reaches the arm above.
+        if (isDigitChar(c)) {
+            if (c === "0") {
+                if (isDigitChar(src[at + 2]))
+                    reGone("\\0 followed by a digit", "an octal escape is written `\\o{...}` in PCRE2 and not at all here")
+
+                return two("\\0")
+            }
+
+            let j = at + 1
+            let digits = ""
+
+            while (isDigitChar(src[j])) digits += src[j++]
+
+            if (inClass)
+                reGone("\\" + digits + " in a character class",
+                    "a backreference cannot be a member of a class, and an octal escape has no spelling here")
+
+            return { text: "\\" + digits, end: j }
+        }
+
+        // **An identity escape becomes the code point it names.** PCRE2 lets a backslash precede
+        // any punctuation and `RegExp` under `u` allows it only before its own syntax characters,
+        // so `\%` would be a syntax error where it is a literal `%`.
+        if (!isWordChar(c)) {
+            if ("^$\\.*+?()[]{}|/".indexOf(c) >= 0) return two("\\" + c)
+            if (inClass && c === "-") return two("\\-")
+
+            // **The code point and not the unit**, an escaped astral character being two of them.
+            const point = src.codePointAt(at + 1)
+
+            return { text: "\\u{" + point.toString(16) + "}", end: at + 1 + (point > 0xFFFF ? 2 : 1) }
+        }
+
+        // What is left is a letter both engines know -- `\d`, `\w`, `\b`, `\n`, `\cX` and the rest
+        // -- and it goes through untouched.
+        if (c === "c") return { text: src.slice(at, at + 3), end: at + 3 }
+
+        return two("\\" + c)
+    }
+
+    // A character class, `[` to its matching `]`.
+    const regexClass = (src, at, extended) => {
+        let i = at + 1
+        let out = "["
+
+        if (src[i] === "^") {
+            out += "^"
+            i++
+        }
+
+        // **A `]` in the first position is a member and not the end**, which is PCRE2's rule and
+        // not `RegExp`'s under `u`, so it is written out.
+        if (src[i] === "]") {
+            out += "\\]"
+            i++
+        }
+
+        while (i < src.length && src[i] !== "]") {
+            const c = src[i]
+
+            if (c === "\\") {
+                const r = regexEscape(src, i, true)
+
+                out += r.text
+                i = r.end
+                continue
+            }
+
+            // `[:alpha:]` and `[:^alpha:]`, which are members of the class around them rather than
+            // classes of their own.
+            if (c === "[" && src[i + 1] === ":") {
+                const close = src.indexOf(":]", i + 2)
+
+                if (close < 0) $.fault("this pattern has a `[:` that is never closed")
+
+                const negated = src[i + 2] === "^"
+                const name = src.slice(i + (negated ? 3 : 2), close)
+                const known = Object.prototype.hasOwnProperty.call(POSIX_IN, name)
+                const set = known ? (negated ? POSIX_OUT[name] : POSIX_IN[name]) : undefined
+
+                if (set === undefined)
+                    $.fault("`[:" + name + ":]` is not a POSIX class -- the classes are " +
+                        Object.keys(POSIX_IN).join(", "))
+
+                out += set
+                i = close + 2
+                continue
+            }
+
+            if (c === "[") {
+                out += "\\["
+                i++
+                continue
+            }
+
+            out += c
+            i += c.length
+        }
+
+        if (i >= src.length) $.fault("this pattern has a `[` that is never closed")
+
+        return { text: out + "]", end: i + 1 }
+    }
+
+    // What follows a `(`.
+    const regexGroup = (src, at) => {
+        const plain = { text: "(", end: at + 1, lookbehind: false, opened: true }
+
+        // **A backtracking verb is `(*` and nothing else starts that way**, so it is caught before
+        // the `(?` forms rather than among them.
+        if (src[at + 1] === "*") {
+            const close = src.indexOf(")", at + 1)
+            const verb = close < 0 ? "(*" : src.slice(at, close + 1)
+
+            reGone(verb, "a backtracking control verb is PCRE2's and `RegExp` has nothing that means it")
+        }
+
+        if (src[at + 1] !== "?") return plain
+
+        const c = src[at + 2]
+
+        if (c === ":") return { text: "(?:", end: at + 3, lookbehind: false, opened: true }
+        if (c === "=") return { text: "(?=", end: at + 3, lookbehind: false, opened: true }
+        if (c === "!") return { text: "(?!", end: at + 3, lookbehind: false, opened: true }
+
+        if (c === "<" && (src[at + 3] === "=" || src[at + 3] === "!"))
+            return { text: "(?<" + src[at + 3], end: at + 4, lookbehind: true, opened: true }
+
+        if (c === "<") return { text: "(?<", end: at + 3, lookbehind: false, opened: true }
+
+        // `(?'name'` and `(?P<name>` are `(?<name>` written two other ways.
+        if (c === "'") {
+            const close = src.indexOf("'", at + 3)
+
+            if (close < 0) $.fault("this pattern has a `(?'` that is never closed")
+
+            return { text: "(?<" + src.slice(at + 3, close) + ">", end: close + 1, lookbehind: false,
+                opened: true }
+        }
+
+        if (c === "P" && src[at + 3] === "<")
+            return { text: "(?<", end: at + 4, lookbehind: false, opened: true }
+
+        // **These two are WHOLE**, having eaten their own `)`: a named backreference is one atom
+        // however PCRE2 spells it, and a comment leaves nothing behind at all.
+        if (c === "P" && src[at + 3] === "=") {
+            const close = src.indexOf(")", at + 4)
+
+            if (close < 0) $.fault("this pattern has a `(?P=` that is never closed")
+
+            return { text: "\\k<" + src.slice(at + 4, close) + ">", end: close + 1, lookbehind: false,
+                opened: false }
+        }
+
+        if (c === "#") {
+            const close = src.indexOf(")", at + 3)
+
+            if (close < 0) $.fault("this pattern has a `(?#` that is never closed")
+
+            return { text: "", end: close + 1, lookbehind: false, opened: false }
+        }
+
+        if (c === ">")
+            reGone("(?>", "an atomic group is PCRE2's and `RegExp` has nothing that means it")
+
+        if (c === "|")
+            reGone("(?|", "a branch reset numbers two alternatives' groups alike, and `RegExp` numbers them in order")
+
+        if (c === "(")
+            reGone("(?(", "a conditional group is PCRE2's and `RegExp` has nothing that means it")
+
+        if (c === "C")
+            reGone("(?C", "a callout runs the host's own code and there is nothing here for it to run")
+
+        if (c === "R" || c === "&" || isDigitChar(c) || c === "+" || c === "-" ||
+            (c === "P" && src[at + 3] === ">"))
+            reGone("(?" + c, "recursion into a pattern is PCRE2's and `RegExp` has nothing that means it")
+
+        // **A scoped modifier goes through and a bare one does not.** `(?i:...)` is a group and
+        // `RegExp` has it; `(?i)` changes the rest of the pattern from where it stands, which
+        // `RegExp` cannot say -- and neither can be translated into the other.
+        const close = src.indexOf(")", at + 2)
+        const colon = src.indexOf(":", at + 2)
+
+        if (colon >= 0 && (close < 0 || colon < close)) {
+            const mods = src.slice(at + 2, colon)
+
+            if (!/^[im-]*$/.test(mods))
+                reGone("(?" + mods + ":",
+                    "`RegExp` scopes only `i`, and `m` and `s` mean different things in the two engines")
+
+            return { text: src.slice(at, colon + 1), end: colon + 1, lookbehind: false, opened: true }
+        }
+
+        reGone("(?" + (close < 0 ? "" : src.slice(at + 2, close)) + ")",
+            "a modifier that runs to the end of the pattern is PCRE2's and `RegExp` has nothing that means it")
+    }
+
+    // -- the table -----------------------------------------------------------------------------------
+
+    // The flags a program may write. **`regex.sysl`'s words, so a refusal reads the same on both
+    // back ends** -- and `g` is refused by name because it is the one people will try.
+    const regexOptions = (flags) => {
+        for (const c of flags) {
+            if (c === "g")
+                $.fault("there is no `g` flag -- `replace` already replaces every match and " +
+                    "`findAll` already finds every one")
+
+            if ("imsx".indexOf(c) < 0)
+                $.fault("`" + c + "` is not a regular expression flag -- the flags are `i`, `m`, `s` and `x`")
+        }
+    }
+
+    // The slot for this pattern, compiling it the first time it is asked for.
+    //
+    // **Keyed by the pattern and its flags, so an identical pattern compiles once** -- which is
+    // `regex.sysl`'s table and its reason: nothing is ever released, so a slot always names the
+    // pattern it named and one number is the whole value.
+    // **The VALUE is interned and not only the slot**, which is what makes `regex("a") ==
+    // regex("a")` true here as it is there. The interpreter's `RegexVal` is one number, so two of
+    // them naming one slot are the same value by construction; a `new SRegex` each time would be
+    // two objects and equality would fall through to comparing addresses.
+    const regexSlot = (source, flags) => {
+        const key = flags + ":" + source
+        const found = REGEX_IDS.get(key)
+
+        if (found !== undefined) return found
+
+        regexOptions(flags)
+
+        // **`g` is always set and `m` and `s` never are.** The walk that finds every match needs a
+        // pattern it can start anywhere, and the other two have been translated away above.
+        const translated = regexTranslate(source, flags)
+        let re = null
+
+        try {
+            re = new RegExp(translated, flags.indexOf("i") >= 0 ? "gui" : "gu")
+        } catch (e) {
+            $.fault("this is not a regular expression: " + e.message)
+        }
+
+        const made = new SRegex(REGEX_TABLE.length)
+
+        REGEX_TABLE.push({ source: source, flags: flags, re: re })
+        REGEX_IDS.set(key, made)
+
+        return made
+    }
+
+    // **Shown as it was written, between slashes**, which is `render.sysl`'s rendering: what a
+    // reader is shown is what they wrote, not what node was given.
+    const regexText = (v) => "/" + REGEX_TABLE[v.id].source + "/" + REGEX_TABLE[v.id].flags
+
+    // Its own letter as a table key, for the reason every other kind has one: two values holding
+    // the same number must not collide.
+    const regexKey = (v) => (v instanceof SRegex ? "R" + v.id : null)
+    """

@@ -31,7 +31,7 @@ The operators follow because the two languages disagree too often for the except
 
 ## What is not there yet
 
-**`slate:net`, `slate:regex`, `slate:password`, `slate:brotli`,
+**`slate:net`, `slate:password`, `slate:brotli`,
 `slate:llhttp`, `slate:process`'s `run`, `fetch`, and the modules written over them.** Each is a name that
 says *"not in the JavaScript back end yet"* when a program reaches it, rather than a name that is not
 there — so a program is told which half of the world it is in.
@@ -201,6 +201,79 @@ every digit: `epochMicros(1000000001)` is exact wherever it runs.
 **`slate:dom` is the other way round**: it works only here. Under the interpreter every one of its names
 faults with a sentence naming the *command* rather than the code, because the same program is correct in a
 browser and it is the command that is wrong.
+
+### `slate:regex` is whole here, and a pattern is TRANSLATED rather than handed over
+
+`RegExp` is not PCRE2. slate's patterns are Perl's — that is the whole reason `regex.sysl` is on
+`sh.sysl.pcre2` rather than on POSIX — and a browser has one regular expression engine. So every
+pattern is read through a translator on its way in, and what a construct gets depends on how the two
+engines differ over it: an exact equivalent is **translated**, something `RegExp` does not have is
+**refused naming the construct**, and something both engines accept while meaning different things is
+**translated too**, because that is the one kind a program could get wrong with nothing refusing it.
+
+```slate
+import { regex } from slate:regex
+
+print(regex("(?<y>\\d{4})-(\\d{2})").find("on 2026-08").named.y)
+print(regex("[[:alpha:]]+").find("42abc!").text)
+print(regex("\\p{Greek}+").find("ab\u{3b1}\u{3b2}!").text)
+print(regex("\\s").test("\u{a0}"), regex("a.b").test("a\rb"))
+print(regex("(\\w+)@(\\w+)").replace("a@b and c@d", "$2 at $1"))
+print(len(regex("$").findAll("abc")), regex("a*").split("bb").join("|"))
+```
+
+```output
+2026
+abc
+αβ
+false true
+b at a and d at c
+1 |b|b|
+```
+
+**Three constructs mean different things in the two engines, and every one is a silent wrong answer
+rather than an error.** They were measured through this project's own PCRE2 and through node:
+
+- **`\s`.** PCRE2 here is not in UCP mode, so `\s` is the six ASCII spaces; `RegExp` reads it as
+  every Unicode space, twenty-five of them. A record split on `\s` would cut on a no-break space in a
+  browser and not in the interpreter. `\s`, `\S`, `\h`, `\H`, `\v`, `\V` and every POSIX class are
+  written out as their ranges.
+- **`.`.** PCRE2's excludes the newline. `RegExp`'s also excludes the carriage return and the two
+  Unicode line separators, so it becomes `[^\n]`.
+- **`^` and `$` under `m`**, for the same reason and in the same three characters. They become
+  lookarounds, and `RegExp`'s own `m` is never set.
+
+**What is refused, and why none of it is work owed.** A browser's regular expressions have no
+possessive quantifier `a*+`, no atomic group `(?>…)`, no branch reset `(?|…)`, no recursion `(?R)`, no
+conditional `(?(1)…)`, no `\K`, `\G`, `\C` or `\X`, and no modifier that runs to the end of a pattern
+(`(?i)` — the scoped `(?i:…)` does work). Each is refused where the pattern is written, in a sentence
+naming the construct.
+
+**A lookbehind is the one place `RegExp` is the LOOSER engine**, and it is refused here so that the two
+agree: PCRE2 will not compile a lookbehind whose length is unlimited — `(?<=ab*)c` is *"length of
+lookbehind assertion is not limited"* — and `RegExp` takes anything. A **bounded** one compiles on both,
+`(?<=ab?)c` and `(?<=a{2,3})c` included. The other place `RegExp` used to be looser closed itself: a
+range with a class at one end, `[\d-x]`, is refused by the `u` flag exactly as PCRE2 refuses it.
+
+**`u` is always set, and that is what makes an offset a character.** Without it `RegExp` counts a
+subject in UTF-16 code units, so `^.$` says an emoji is two and every offset after one is too big;
+PCRE2 is in UTF mode and counts characters. The offsets a match reports are converted back in one walk
+of the subject, which is what `regex.sysl` does for the other back end.
+
+**Three differences are left standing and are named here rather than closed.**
+
+- **A backreference to a group that took no part in the match** fails under PCRE2 and matches the empty
+  string under `RegExp` — `(?:(?<n>a)|b)\k<n>` is false against `"b"` in the interpreter and true here.
+  It is a property of the run rather than of the pattern text, so nothing could be scanned for; refusing
+  every pattern with a backreference in it would refuse most real ones.
+- **Under `i`, a JavaScript host counts `U+017F` and `U+212A` as word characters**, its `u` mode folding
+  them into `s` and `k` where PCRE2's `\w` stays ASCII. That is exactly two code points and only under
+  `i`. Closing it would mean rewriting every character class through the `v` flag's set subtraction,
+  which is a much newer thing to require of a browser than the difference is worth.
+- **There is no backtracking budget here.** PCRE2 gives up on a pattern that would backtrack forever and
+  raises a fault naming it; `RegExp` has no such limit in any browser, so `(a+)+$` against a subject that
+  does not match stops answering rather than complaining. That is a thing a JavaScript host does not
+  have.
 
 ## Blocks and order
 

@@ -1,0 +1,336 @@
+module dev.slatelang.slate
+
+// What a program calls: `regex` and the eight methods a pattern answers to.
+//
+// **Inside the `$b` block, and its methods go through `OVERRIDES` rather than through `B`.** Three
+// of the eight -- `find`, `replace` and `split` -- are names an array or a string already has as a
+// global builtin, and the method table is built by looking each name up in `B`. `OVERRIDES` is the
+// mechanism `js_rt_method.sysl` kept for exactly this, keyed `kind.name`, so a regular expression's
+// `replace` and a string's reach different implementations and complain in different words --
+// which is `method.sysl`'s own arrangement said in JavaScript.
+//
+// **The walk that finds every match is written out rather than left to `matchAll`.** `sh.sysl.pcre2`
+// advances by one character after an EMPTY match and by the match's length otherwise, which is what
+// makes `findAll`'s count equal the number of substitutions `replace` makes; the loop here is that
+// rule, so the two back ends count alike over `$`, `^`, `\b` and the empty pattern.
+//
+// **And the replacement text is expanded here rather than handed to `String.replace`.** PCRE2 and
+// JavaScript disagree about nearly every form: `$0` and `$name` are PCRE2's and not JavaScript's,
+// `$<name>` is JavaScript's and not PCRE2's, and a lone `$` is a literal there and an error here.
+
+js_runtime_regex_builtins() -> string = raw"""
+        // -- reading the arguments -------------------------------------------------------------------
+
+        // A lead surrogate says a string holds a character `RegExp` counts as two.
+        const RE_ASTRAL = /[\uD800-\uDBFF]/
+
+        const wantRegex = (v, name) => {
+            if (!(v instanceof SRegex))
+                fault("`" + name + "` takes a regular expression, and this is " + typeName(v))
+
+            return REGEX_TABLE[v.id]
+        }
+
+        const wantSubject = (v, name, which) => {
+            if (!$.isStr(v)) fault("`" + name + "` takes " + which + ", and this is " + typeName(v))
+
+            return v
+        }
+
+        // **UTF-16 offsets into CHARACTER positions, in ONE walk of the subject.** `RegExp` under
+        // `u` matches by code point and still reports in code units, so an astral character before
+        // a match makes every offset after it one too many. `regex.sysl`'s `char_positions` is the
+        // interpreter's copy of this and costs the same: one walk per match.
+        //
+        // **A subject with no lead surrogate in it needs no walk at all**, a unit and a character
+        // being the same thing there, which is every subject most programs ever hand this.
+        const rePositions = (subject, offsets) => {
+            if (!RE_ASTRAL.test(subject)) return offsets
+
+            const out = offsets.slice()
+            let n = 0
+            let i = 0
+
+            while (i < subject.length) {
+                for (let k = 0; k < offsets.length; k++) if (offsets[k] === i) out[k] = n
+
+                i += subject.codePointAt(i) > 0xFFFF ? 2 : 1
+                n++
+            }
+
+            // An offset at the very end of the subject falls on no character, so the walk never
+            // reaches it.
+            for (let k = 0; k < offsets.length; k++) if (offsets[k] === subject.length) out[k] = n
+
+            return out
+        }
+
+        // -- finding ---------------------------------------------------------------------------------
+
+        // Every match, left to right and non-overlapping, or the leftmost one where `first`.
+        //
+        // **The advance after an EMPTY match is by one CHARACTER and this is the whole of the rule.**
+        // Advancing by the match's length would find the same empty match forever; advancing by a
+        // code UNIT would stop in the middle of an astral character and match nothing there.
+        const reMatches = (entry, subject, first) => {
+            const re = entry.re
+            const found = []
+            let at = 0
+
+            while (at <= subject.length) {
+                re.lastIndex = at
+
+                const m = re.exec(subject)
+
+                if (m === null) break
+
+                found.push(m)
+
+                if (first) break
+
+                at = m.index + m[0].length
+
+                if (m[0].length === 0) at += subject.codePointAt(m.index) > 0xFFFF ? 2 : 1
+            }
+
+            return found
+        }
+
+        // What a program is handed for a match: the text, where it landed, its groups and its named
+        // groups.
+        //
+        // **`groups` holds the whole match at 0** and **`named` is always here, empty where the
+        // pattern names nothing** -- both `regex.sysl`'s rules, and the second one is what stops the
+        // shape of a match depending on the pattern that made it.
+        //
+        // **A group that took no part is `null` and not `undefined`**, slate's absence being a thing
+        // that may not be stored in a container at all.
+        const reMatchValue = (m, subject) => {
+            const where = rePositions(subject, [m.index, m.index + m[0].length])
+            const groups = []
+
+            for (let i = 0; i < m.length; i++) groups.push(m[i] === undefined ? null : m[i])
+
+            const named = []
+
+            if (m.groups !== undefined)
+                for (const name of Object.keys(m.groups))
+                    named.push([name, m.groups[name] === undefined ? null : m.groups[name]])
+
+            return $.obj([["text", m[0]], ["start", BigInt(where[0])], ["end", BigInt(where[1])],
+                ["groups", groups], ["named", $.obj(named)]])
+        }
+
+        // -- replacing -------------------------------------------------------------------------------
+
+        // **PCRE2's word for word, which is not JavaScript's.** `$0` and `$&` are the whole match,
+        // `$1` and `${1}` a numbered group, `$name` and `${name}` a named one, `$$` a dollar --
+        // and **a `$` in front of anything else is an error rather than a literal**, which is
+        // PCRE2's rule and the one thing here a program is most likely to be surprised by.
+        const reBadReplacement = (entry, name) =>
+            fault("`" + name + "` could not match /" + entry.source + "/: invalid replacement string (-35)")
+
+        const reNoSuchGroup = (entry, name) =>
+            fault("`" + name + "` could not match /" + entry.source + "/: unknown substring (-49)")
+
+        const reNumbered = (entry, m, n, name) => {
+            if (n >= m.length) reNoSuchGroup(entry, name)
+
+            return m[n] === undefined ? "" : m[n]
+        }
+
+        const reNamed = (entry, m, key, name) => {
+            if (m.groups === undefined || !(key in m.groups)) reNoSuchGroup(entry, name)
+
+            return m.groups[key] === undefined ? "" : m.groups[key]
+        }
+
+        const reExpand = (entry, m, spec, name) => {
+            let out = ""
+            let i = 0
+
+            while (i < spec.length) {
+                const c = spec[i]
+
+                if (c !== "$") {
+                    out += c
+                    i++
+                    continue
+                }
+
+                const next = spec[i + 1]
+
+                if (next === "$") {
+                    out += "$"
+                    i += 2
+                    continue
+                }
+
+                if (next === "&") {
+                    out += m[0]
+                    i += 2
+                    continue
+                }
+
+                if (next === "{") {
+                    const close = spec.indexOf("}", i + 2)
+
+                    if (close < 0) reBadReplacement(entry, name)
+
+                    const key = spec.slice(i + 2, close)
+
+                    out += /^[0-9]+$/.test(key) ? reNumbered(entry, m, Number(key), name)
+                        : reNamed(entry, m, key, name)
+                    i = close + 1
+                    continue
+                }
+
+                if (next !== undefined && /[0-9]/.test(next)) {
+                    let j = i + 1
+                    let digits = ""
+
+                    while (j < spec.length && /[0-9]/.test(spec[j])) digits += spec[j++]
+
+                    out += reNumbered(entry, m, Number(digits), name)
+                    i = j
+                    continue
+                }
+
+                if (next !== undefined && /[A-Za-z_]/.test(next)) {
+                    let j = i + 1
+                    let key = ""
+
+                    while (j < spec.length && /[0-9A-Za-z_]/.test(spec[j])) key += spec[j++]
+
+                    out += reNamed(entry, m, key, name)
+                    i = j
+                    continue
+                }
+
+                reBadReplacement(entry, name)
+            }
+
+            return out
+        }
+
+        const reSubstitute = (args, name, every) => {
+            wantArgs(args.length, 3, 3, name, "a regular expression, a subject and a replacement")
+
+            const entry = wantRegex(args[0], name)
+            const subject = wantSubject(args[1], name, "a subject")
+            const spec = wantSubject(args[2], name, "a replacement")
+            const found = reMatches(entry, subject, !every)
+            let out = ""
+            let last = 0
+
+            for (const m of found) {
+                out += subject.slice(last, m.index) + reExpand(entry, m, spec, name)
+                last = m.index + m[0].length
+            }
+
+            return out + subject.slice(last)
+        }
+
+        // -- what a program calls ----------------------------------------------------------------------
+
+        // `regex(pattern)` and `regex(pattern, flags)`.
+        B.regex = (...args) => {
+            wantArgs(args.length, 1, 2, "regex", "a pattern and optionally its flags")
+
+            const source = wantSubject(args[0], "regex", "a pattern")
+            const flags = args.length > 1 ? wantSubject(args[1], "regex", "its flags") : ""
+
+            return regexSlot(source, flags)
+        }
+
+        // `re.test(s)` -- whether the subject matches anywhere.
+        B.$reTest = (...args) => {
+            wantArgs(args.length, 2, 2, "test", "a regular expression and a subject")
+
+            const entry = wantRegex(args[0], "test")
+            const subject = wantSubject(args[1], "test", "a subject")
+
+            // **`lastIndex` is set on every use and never read**, which is how a pattern here
+            // carries no position: `RegExp`'s `g` is what the walk needs and its mutable cursor is
+            // the surprise `regex.sysl` exists not to have.
+            entry.re.lastIndex = 0
+
+            return entry.re.test(subject)
+        }
+
+        // `re.find(s)` -- the leftmost match, or null.
+        B.$reFind = (...args) => {
+            wantArgs(args.length, 2, 2, "find", "a regular expression and a subject")
+
+            const entry = wantRegex(args[0], "find")
+            const subject = wantSubject(args[1], "find", "a subject")
+            const found = reMatches(entry, subject, true)
+
+            return found.length === 0 ? null : reMatchValue(found[0], subject)
+        }
+
+        // `re.findAll(s)` -- every match, left to right and non-overlapping.
+        B.$reFindAll = (...args) => {
+            wantArgs(args.length, 2, 2, "findAll", "a regular expression and a subject")
+
+            const entry = wantRegex(args[0], "findAll")
+            const subject = wantSubject(args[1], "findAll", "a subject")
+
+            return reMatches(entry, subject, false).map((m) => reMatchValue(m, subject))
+        }
+
+        // `re.replace(s, with)` -- **every** match replaced -- and `re.replaceFirst(s, with)`, which
+        // stops at the leftmost.
+        B.$reReplace = (...args) => reSubstitute(args, "replace", true)
+        B.$reReplaceFirst = (...args) => reSubstitute(args, "replaceFirst", false)
+
+        // `re.split(s)` -- the pieces between the matches. **The captured groups are not among
+        // them**, which is where JavaScript's `String.split` differs and `regex.sysl` does not.
+        B.$reSplit = (...args) => {
+            wantArgs(args.length, 2, 2, "split", "a regular expression and a subject")
+
+            const entry = wantRegex(args[0], "split")
+            const subject = wantSubject(args[1], "split", "a subject")
+            const pieces = []
+            let last = 0
+
+            for (const m of reMatches(entry, subject, false)) {
+                pieces.push(subject.slice(last, m.index))
+                last = m.index + m[0].length
+            }
+
+            pieces.push(subject.slice(last))
+
+            return pieces
+        }
+
+        // `re.pattern()` and `re.flags()` -- what it was written as, and what it was made with.
+        B.$rePattern = (...args) => {
+            wantArgs(args.length, 1, 1, "pattern", "a regular expression")
+
+            return wantRegex(args[0], "pattern").source
+        }
+
+        B.$reFlags = (...args) => {
+            wantArgs(args.length, 1, 1, "flags", "a regular expression")
+
+            return wantRegex(args[0], "flags").flags
+        }
+
+        // **Every one of the eight goes through `OVERRIDES` and not through its own name in `B`.**
+        // Three of them collide with a builtin an array or a string already answers to, and the
+        // other five would become globals a program cannot then use for its own -- `pattern` and
+        // `flags` being exactly the words somebody names a variable.
+        OVERRIDES.set("regex.test", B.$reTest)
+        OVERRIDES.set("regex.find", B.$reFind)
+        OVERRIDES.set("regex.findAll", B.$reFindAll)
+        OVERRIDES.set("regex.replace", B.$reReplace)
+        OVERRIDES.set("regex.replaceFirst", B.$reReplaceFirst)
+        OVERRIDES.set("regex.split", B.$reSplit)
+        OVERRIDES.set("regex.pattern", B.$rePattern)
+        OVERRIDES.set("regex.flags", B.$reFlags)
+
+        // `method.sysl`'s `regex_method`, name for name.
+        KINDS.regex = ["test", "find", "findAll", "replace", "replaceFirst", "split", "pattern",
+            "flags"]
+    """

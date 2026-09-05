@@ -65,9 +65,18 @@ instead — a flag silently ignored would make `replace` look like it had worked
 ## Two dialect points
 
 **`$` is the very end** rather than also the position before a final newline, and **`\d` is `[0-9]`**
-rather than every decimal digit in Unicode. Those are the two places PCRE2 and JavaScript disagree
-silently: both compile either way and merely match something else. A program wanting Unicode digits writes
-`\p{Nd}`, which works regardless.
+rather than every decimal digit in Unicode. Both are settled here so that a pattern means one thing
+wherever it runs — each is a place PCRE2 and JavaScript would otherwise disagree silently, compiling
+either way and merely matching something else. A program wanting Unicode digits writes `\p{Nd}`, which
+works regardless.
+
+**Under `slate js` a pattern is translated into `RegExp`**, and the same rule decides everything there:
+`\s`, `.` and `^`/`$` under `m` all mean something else to a browser and are written out so that they do
+not. A handful of PCRE2 constructs a browser has nothing to mean — a possessive quantifier, an atomic
+group, recursion, `\K` — are refused where the pattern is written, naming the construct.
+[The JavaScript page](../reference/javascript.md) has the measurements and the three differences that
+are left standing, of which the backtracking budget above is one: `RegExp` has no such limit in any
+browser.
 
 ## Equality
 
