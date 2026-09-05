@@ -262,9 +262,10 @@ standard library beyond the builtins. On the object side: `super`, and a check t
 `type` when it is attached to an object literal by hand.
 
 In the JavaScript back end: `slate:net`, `slate:regex`, `fetch`, `run`, `slate:password`,
-`slate:crypto`, `slate:brotli`, `slate:llhttp`, and the modules written over them. Each one is a name that
+`slate:brotli`, `slate:llhttp`, and the modules written over them. Each one is a name that
 says *"not in the JavaScript back end yet"* rather than a name that is not there. `slate:time` is whole
-there now, except for `abbrev` and `isDST` — two things a JavaScript host genuinely does not have, and
+there now, except for `abbrev` and `isDST`, and so is `slate:crypto`, except for the RSA and ECDSA half
+of JWS — all three being things a JavaScript host genuinely does not have synchronously, and
 `docs/reference/javascript.md` measures why.
 
 **`defer` is deliberately not here.** It earns its place in Go and in sysl because neither collects: a

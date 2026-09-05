@@ -31,10 +31,63 @@ The operators follow because the two languages disagree too often for the except
 
 ## What is not there yet
 
-**`slate:net`, `slate:regex`, `slate:crypto`, `slate:password`, `slate:brotli`,
+**`slate:net`, `slate:regex`, `slate:password`, `slate:brotli`,
 `slate:llhttp`, `slate:process`'s `run`, `fetch`, and the modules written over them.** Each is a name that
 says *"not in the JavaScript back end yet"* when a program reaches it, rather than a name that is not
 there — so a program is told which half of the world it is in.
+
+### `slate:crypto` is whole here, and WebCrypto is not how
+
+The five digests, `hmac`, `pbkdf2`, `randomBytes` and `timingSafeEqual` all work, and answer what the
+interpreter answers:
+
+```slate
+import { md5, sha1, sha256, sha512, hmac, pbkdf2, randomBytes, timingSafeEqual } from slate:crypto
+
+val digits = "0123456789abcdef"
+
+hex(bs) = join(map(bs, b -> digits[b / 16] + digits[b % 16]), "")
+
+print(hex(sha256("abc")))
+print(hex(md5("abc")), hex(sha1("abc")))
+print(hex(hmac("SHA-256", "key", "message")))
+print(hex(pbkdf2("SHA-1", "password", "salt", 4096, 20)))
+print(len(randomBytes(32)), timingSafeEqual("abc", "abc"), timingSafeEqual("abc", "abd"))
+```
+
+```output
+ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+900150983cd24fb0d6963f7d28e17f72 a9993e364706816aba3e25717850c26c9cd0d89d
+6e9ef29b75fffc5b7abae527d58fdadb2fe42e7219011976917343065f58ed4a
+4b007901b765489abead49d926f721d065a429c1
+32 true false
+```
+
+**`crypto.subtle` IS NOT USED, AND THAT IS THE DECISION EVERYTHING HERE FOLLOWS FROM.** The web
+platform's only digest is asynchronous and always has been — there is no synchronous hash in a browser
+at all — so a `sha256` built on it would answer a *promise* here and a byte array under the
+interpreter. **Two back ends disagreeing about the shape of an answer is worse than either being
+slow**, and it would have taken a breaking change to the interpreter to fix, over a call that costs
+microseconds. So the digests are written out in JavaScript and stay synchronous. `md5` would have had
+to be anyway — WebCrypto has never carried it — so four asynchronous digests and one synchronous was
+never on offer.
+
+**What that costs, measured on node:** PBKDF2-HMAC-SHA256 at 100,000 iterations is 176 ms here against
+7 ms for a native library, and SHA-256 runs at about 280 MiB/s against 3 GiB/s. Roughly 25× either
+way. It matters for exactly one call — **a key derivation, which is the one thing here designed to be
+slow** — so an iteration count is worth choosing with a browser in mind: 600,000, which is OWASP's
+current recommendation for SHA-256, is about a second of a page's main thread.
+
+**`randomBytes` is the one name that reaches for the host, and the host has it.**
+`crypto.getRandomValues` is synchronous everywhere, which is what lets the whole module stay
+synchronous — the half of `slate:crypto` that cannot be written out at any price is the half a browser
+does supply.
+
+**The asymmetric half of JWS is the one thing that refuses.** `slate:jwt`'s `HS256`, `HS384` and
+`HS512` are HMAC under a JOSE name and work here in full; `RS*`, `PS*` and `ES*` are RSA and ECDSA,
+whose only implementation in a browser is `crypto.subtle`'s and answers a promise where `jwsSign`
+answers bytes. That refusal names the algorithm and the reason, so a reader knows the fix is a choice
+rather than a wait.
 
 ### `slate:time` is whole, except for two things a JavaScript host does not have
 
