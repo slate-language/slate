@@ -59,6 +59,14 @@ anything and looks a hook up through `field_from`, and the emitted program uses 
 `...` and `SObj.lookup` — so what they print is the only thing that says they agree. It carries the
 refusals too, an operator with no hook still having to name itself.
 
+**`p29.sl` is about what `files(root)` REFUSES, and it writes its request lines onto a socket for a
+reason.** A traversal is a question about the path a client wrote, and no URL parser will carry one:
+`fetch` resolves `..` and reads `%2e%2e` as a dotted segment before a byte leaves the process, which
+is why `curl` needs `--path-as-is` to ask the same question. So the program is `p26.sl`'s
+arrangement — a server and a client in one program — with the request written as text. Every answer
+says whether the file it planted *above* the root came back, so a refusal is checked against what it
+was refusing rather than only against its own status line.
+
 **`dom/` is a run of its own and needs jsdom** — see `dom/README.md`.
 
 **`p8.sl` writes into `tests/js/scratch/` and takes it away again**, so that running it twice says
