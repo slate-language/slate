@@ -14,6 +14,10 @@ import { byId, setText, on } from slate:dom
 | `on(node, event, fn)`, `off(node, id)` | |
 | `setChildren(node, kids)`, `setText(node, s)` | |
 | `byId(id)`, `query(selector)` | |
+| `children(node)` | the child nodes, as handles, in order |
+| `tagName(node)` | the tag in lower case, or `null` for a text node |
+| `nodeText(node)` | what the node says, as text |
+| `attribute(node, name)` | one attribute, or `null` where there is none |
 | `markup(node)` | |
 | `release(node)` | give a handle back |
 | `location()` | where the page is, as a record |
@@ -51,6 +55,40 @@ ordinary thing anybody does to a link.
 **`value` and `checked` are set as properties and not attributes**, and an input is where the difference
 shows: the attribute says what the field started as and the property says what it holds now, so a re-render
 that set the attribute would leave a typed-in field alone and the page would appear frozen.
+
+## Reading a page that is already there
+
+**Four of the names above read rather than write, and they exist because hydration needs exactly
+them.** Everything else either makes a node or changes one; a program adopting markup a server
+rendered has to walk what is there and ask what it found.
+
+```slate
+import { byId, children, tagName, nodeText, attribute } from slate:dom
+
+val app = byId("app")
+
+for kid in children(app)
+    if tagName(kid) == null
+        print("text: " + nodeText(kid))
+    else
+        print("<" + tagName(kid) + "> class=" + string(attribute(kid, "class")))
+```
+
+- **`children` answers EVERY child node and not only the elements**, because a text node between two
+  elements is a position: a reconciler counting children has to count what the browser counts, or it
+  adopts the wrong node. `tagName` answering `null` is how the two are told apart.
+- **`tagName` is lower case**, because that is what a program wrote — the DOM answers `DIV` for HTML.
+- **`attribute` answers `true` for a bare attribute**, which is the reading `setAttribute` writes: it
+  puts the empty string for `true`, so a program comparing what it would set against what is there
+  gets the same value back.
+- **A handle from `children` is released like any other, and `release` gives back the HANDLE and not
+  the node.** The element stays exactly where it is in the page. That reads oddly the first time and
+  is the rule handles have always followed: `byId` and `query` have minted one for an element the
+  program never created since this module shipped.
+
+**`parent`, the siblings and an `innerHTML` reader are deliberately absent.** A page is walked
+downwards from something the program already holds; the rest is a general traversal API, which is a
+different thing to want and a much larger one.
 
 ## Where the page is, where it has been, and what it remembers
 

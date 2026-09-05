@@ -83,18 +83,28 @@ want("unstore takes one away", line(13),
     'unstore {"ok":true,"value":null} then {"ok":true,"value":null}')
 want("clear takes them all", line(14),
     'clear {"ok":true,"value":null} then {"ok":true,"value":[]}')
-want("the program reached the end", line(15), "ready")
+// **The read side, against a document jsdom built rather than one written beside the code.**
+want("children counts every child node and not only the elements", line(15), "kids 3")
+want("a text node's tag is null, which is how the two are told apart", line(16),
+    'tags ["li",null,"li"]')
+want("text comes back as text", line(17), 'texts ["apple"," ","pear"]')
+want("an attribute comes back", line(18), 'class "one"')
+want("a bare attribute is true, which is what setAttribute writes", line(19), "bare true")
+want("an attribute that is not there is null", line(20), "absent null")
+want("an element says everything under it", line(21), "whole apple pear")
+
+want("the program reached the end", line(22), "ready")
 
 // The two clicks, in the order the driver made them.
-want("a handler that declares nothing is called", line(16), "clicked, reading nothing")
-want("and one that declares the event is given it", line(17), "clicked, and the event says click")
+want("a handler that declares nothing is called", line(23), "clicked, reading nothing")
+want("and one that declares the event is given it", line(24), "clicked, and the event says click")
 
 // **The two a router has to tell apart.** A plain left click is one it may intercept; a cmd-click on
 // the middle button is one it must hand to the browser, and without these fields the two are the
 // same event.
-want("a plain left click reads as button 0 with nothing down", line(18),
+want("a plain left click reads as button 0 with nothing down", line(25),
     'click button 0 mods {"meta":false,"ctrl":false,"shift":false,"alt":false}')
-want("a cmd-shift middle click says so", line(19),
+want("a cmd-shift middle click says so", line(26),
     'click button 1 mods {"meta":true,"ctrl":false,"shift":true,"alt":false}')
 
 // **The push above must NOT have raised `onNavigate`** -- so the only `navigated` line there can be

@@ -6,7 +6,8 @@
 // `slate-language/lath` keeps its own DOM check the same way and for the same reason.
 
 import { location, pushPath, replacePath, back, onNavigate } from slate:dom
-import { byId, createElement, setAttribute, setChildren, on } from slate:dom
+import { byId, createElement, createText, setAttribute, setChildren, on } from slate:dom
+import { children, tagName, nodeText, attribute } from slate:dom
 import { stored, store, unstore, storedKeys, clearStored } from slate:dom
 
 heard(path) = print("navigated " + path)
@@ -83,5 +84,32 @@ sawClick(e)
 on(quiet, "click", () -> print("clicked, reading nothing"))
 on(curious, "click", (e) -> print("clicked, and the event says " + e.type))
 on(marked, "click", sawClick)
+
+// -- reading a page that is already there ----------------------------------------------------------
+
+// **The read side, against a document somebody else built.** These four are what hydration walks a
+// server's markup with, and a fake document written beside them would agree with them by
+// construction -- which is the whole reason this file is run under jsdom.
+val shelf = createElement("ul")
+val first = createElement("li")
+val gap = createText(" ")
+val second = createElement("li")
+
+setAttribute(first, "class", "one")
+setAttribute(first, "hidden", true)
+setChildren(first, [createText("apple")])
+setChildren(second, [createText("pear")])
+setChildren(shelf, [first, gap, second])
+setChildren(app, [quiet, curious, marked, shelf])
+
+val kids = children(shelf)
+
+print("kids " + string(len(kids)))
+print("tags " + toJSON([tagName(kids[0]), tagName(kids[1]), tagName(kids[2])]))
+print("texts " + toJSON([nodeText(kids[0]), nodeText(kids[1]), nodeText(kids[2])]))
+print("class " + toJSON(attribute(kids[0], "class")))
+print("bare " + toJSON(attribute(kids[0], "hidden")))
+print("absent " + toJSON(attribute(kids[0], "title")))
+print("whole " + nodeText(shelf))
 
 print("ready")

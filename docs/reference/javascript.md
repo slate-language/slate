@@ -423,6 +423,19 @@ why that global is looked at at all — it is quickjs's writer and has no relati
 of the same name — and **a document is what tells the two apart**. `check/` in slate's own repo drives
 all of this against jsdom.
 
+### And four that READ the page, for a program adopting markup it did not write
+
+`children(node)`, `tagName(node)`, `nodeText(node)` and `attribute(node, name)` are the read side, and
+they refuse under the interpreter exactly as the write side does and for the same reason. They exist
+because **hydration cannot be written without them**: a framework adopting a server's markup has to
+walk what is there and ask what it found, and until 0.0.28 `slate:dom` could build a page and could
+not read one.
+
+**A handle for an element the program never created is not new** — `byId` and `query` have minted one
+since the module shipped — so what these add is the walk rather than a kind of value. `parent`, the
+siblings and an `innerHTML` reader are deliberately absent: a page is walked downwards from something
+the program already holds, and the rest is a general traversal API.
+
 ### Arity is checked here too, and until 0.0.28 it was not
 
 A JavaScript function ignores an argument it was not expecting and binds `undefined` for one it was
