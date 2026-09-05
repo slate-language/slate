@@ -1,0 +1,133 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sh.sysl.zstd
+import sysl.buf.{Buf, buf}
+
+// Zstandard -- the encoding a browser asks for after brotli, and the one both ends of a private
+// protocol should be using.
+//
+// **It is here because `slate:brotli` and `slate:gzip` leave a gap between them.** brotli at quality
+// 5 is what a response goes out as and is the slow end of what a request handler can afford; deflate
+// is the fast end and compresses worse than either. zstd at level 3 is several times faster than
+// deflate and compresses better than it, so it is the first encoding that is worth reaching for on a
+// hot path -- and at 19 it is in brotli's range for something built once and served many times.
+//
+// ## The names are the format's own verbs, and that is `slate:gzip`'s rule
+//
+// **`zstd` and `unzstd` rather than `compress` and `decompress`**, which `slate:brotli` already has:
+// every built-in module's names are declared into one scope, so two modules cannot both own a word.
+// gzip settled this before -- `gzip`, `gunzip`, `deflate`, `inflate` -- and these are what the
+// command line calls them.
+//
+// ## Synchronous, which is `slate:brotli`'s shape and not `slate:gzip`'s
+//
+// **`slate:http` is what decides it.** A response worth compressing goes out compressed with nothing
+// asked of the handler, and the writer that does it is not an `async` function -- so an encoder it
+// can reach has to answer on the spot. `slate:brotli` is synchronous for that reason and this is
+// beside it; `slate:gzip` is promise-shaped because a browser's `CompressionStream` is a
+// `TransformStream` and there was nothing already written to break.
+//
+// **A JavaScript host has `zstdCompressSync`**, node having carried Zstandard in `zlib` since 22.15,
+// so the shape costs nothing there. A browser has neither that nor a `CompressionStream("zstd")` --
+// no browser does -- and refuses naming zstd, which is `slate:brotli`'s case rather than a promise
+// nobody can keep.
+//
+// ## The limit is not optional, and that is the whole safety story
+//
+// A zstd frame is entitled to say nothing about how large it becomes, and where the header does
+// carry a size that number is the frame's claim rather than a fact. So `unzstd` is told how large an
+// answer the caller is prepared to hold and there is no form that omits it -- which is
+// `sh.sysl.zstd`'s own decision one layer down, and `slate:brotli`'s beside it.
+
+private zstd_source(v: Value, at: Span, name: string) -> Result[Buf[u8], Signal]
+    v match
+        // **Text crosses as its UTF-8**, which is what `toBytes` would have made of it and what goes
+        // on a wire either way.
+        Str(p) ->
+            var out: Buf[u8] = buf()
+
+            for i in 0..<p.s.bytes.len
+                out.push(p.s.bytes[i])
+
+            Ok(out)
+        Array(a) -> bytes_of(a, at, name)
+        other -> Err(failure(at, s"`${name}` takes text or bytes, and this is ${other.type_name()}"))
+
+private zstd_whole(v: Value, at: Span, name: string, what: string) -> Result[long, Signal]
+    v match
+        Int(n) -> Ok(n)
+        other -> Err(failure(at, s"`${name}` takes ${what} as a whole number, and this is ${other.type_name()}"))
+
+private zstd_bytes(bytes: []const u8) -> Value
+    var items: Buf[Value] = buf()
+
+    for i in 0..<bytes.len
+        items.push(Int(long(bytes[i])))
+
+    Array(new_array(items))
+end zstd_bytes
+
+// `zstd(data, level)` -- the compressed frame.
+//
+// **The level is written at every call**, which is `slate:brotli`'s decision and is the same one: it
+// is the number a caller has to think about, and no single value is right often enough to be the
+// quiet one. 3 is the default the library would take, 1 is for a hot path, and 19 is for something
+// compressed once.
+do_zstd(args: Buf[Value], at: Span) -> Step
+    if args.len() != 2
+        return fault(at, s"`zstd` takes what to compress and a level, and was given ${counted(args.len(), "argument")}")
+
+    val source = zstd_source(args.at(0), at, "zstd")?
+    val level = zstd_whole(args.at(1), at, "zstd", "the level")?
+
+    if level < long(zstd.min_level()) || level > long(zstd.max_level())
+        return fault(at, s"a zstd level runs from ${zstd.min_level()} to ${zstd.max_level()} and this is ${level}")
+
+    // **The frame carries its own checksum**, which costs four bytes and is what tells a damaged
+    // stream from one that was never zstd -- the same distinction gzip's CRC buys and the reason
+    // `slate:gzip` computes one.
+    zstd.compress(source.view(), int(level), true) match
+        Ok(small) ->
+            val mark = root_mark()
+            val made = zstd_bytes(small.view())
+
+            hold(made)
+            release(mark)
+            Ok(made)
+        Err(e) -> fault(at, s"this could not be compressed: ${e}")
+end do_zstd
+
+// `unzstd(data, limit)` -- a result carrying the bytes, or the sentence saying why not.
+do_unzstd(args: Buf[Value], at: Span) -> Step
+    if args.len() != 2
+        return fault(at, s"`unzstd` takes what to decompress and the most it may become, and was given ${counted(args.len(), "argument")}")
+
+    val source = zstd_source(args.at(0), at, "unzstd")?
+    val limit = zstd_whole(args.at(1), at, "unzstd", "the limit")?
+
+    if limit < 0
+        return fault(at, s"a limit is a number of bytes and this is ${limit}")
+
+    zstd.decompress(source.view(), usize(limit)) match
+        Ok(whole_thing) ->
+            val mark = root_mark()
+            val made = ok_value(zstd_bytes(whole_thing.view()))
+
+            hold(made)
+            release(mark)
+            Ok(made)
+
+        // **Which failure it was is worth saying**, the three meaning three different things to
+        // whoever sent the bytes: too large is a body that would not fit, truncated is a transfer
+        // that stopped, and corrupt is not zstd at all.
+        Err(e) -> Ok(err_value(why_not_zstd(e, limit)))
+end do_unzstd
+
+private why_not_zstd(e: zstd.Error, limit: long) -> string = e match
+    zstd.Error.TooLarge(n) -> s"this expands past the ${n} bytes it was allowed"
+    zstd.Error.Short(_) -> s"this expands past the ${limit} bytes it was allowed"
+    zstd.Error.Truncated -> "this zstd frame ends in the middle"
+    zstd.Error.Corrupt(code, why) -> s"this is not a zstd frame: ${why}"
+    zstd.Error.NoMemory -> "the decoder could not allocate its state"
+    other -> "this zstd frame could not be read"

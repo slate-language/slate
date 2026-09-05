@@ -48,6 +48,13 @@ a socket stands on — see the section below. What is still owed of the transpor
 refuses naming it, and `listen` given a `cert` and a `key` refuses in the same words, so an HTTPS
 server is the interpreter's for now.
 
+**`slate:zstd` is WHOLE here on node and absent in a browser, which is the same rule read twice.** node
+has carried Zstandard in `zlib` since 22.15, so `zstd` and `unzstd` are the host's own there; no browser
+has a `CompressionStream("zstd")` and none is coming, so both refuse in a page naming zstd. **The frames
+are not compared between the back ends and cannot be** — node links its own copy of libzstd and the
+interpreter links the machine's, so two encoders at one level may frame the same input differently and
+both be right. `tests/js/p27.sl` compares the round trip and every refusal instead.
+
 **`slate:brotli` is NOT on that list, and the difference matters.** No JavaScript host has a brotli
 encoder and none is coming, so *"not yet"* would be a promise nobody can keep. `compress` and
 `decompress` say that they are brotli, that a JavaScript host has none, and that

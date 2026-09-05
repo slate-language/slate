@@ -22,6 +22,7 @@ What a program has without writing it.
 | [`slate:redis`](redis.md) | a Redis client |
 | [`slate:gzip`](gzip.md) | gzip and zlib — the compression every host has |
 | [`slate:brotli`](brotli.md) | brotli — smaller, and not in a browser |
+| [`slate:zstd`](zstd.md) | Zstandard — faster than both, and not in a browser |
 | [`slate:llhttp`](llhttp.md) | the HTTP parser itself |
 | [`slate:nghttp2`](nghttp2.md) | HTTP/2 framing, and HPACK |
 | [`slate:dom`](dom.md) | the document — in a browser only |

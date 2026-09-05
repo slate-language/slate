@@ -1,0 +1,136 @@
+module dev.slatelang.slate
+@tests
+
+import sysl.text.Search
+
+// `slate:zstd`, and the `Content-Encoding: zstd` `slate:http` writes without being asked.
+//
+// **`tests/js/p27.sl` is where the two back ends are compared**, this being a module whose whole
+// implementation is different on each: libzstd through `sh.sysl.zstd` here, node's `zlib` there. So
+// what is checked in this file is the interpreter's half and the server that reaches for it, and
+// what is checked in the corpus is that neither back end can tell the other's frames from its own.
+//
+// **The compressed BYTES are deliberately not asserted anywhere.** node links its own copy of
+// libzstd and the interpreter links the machine's, so two encoders at one level may frame the same
+// input differently and both be right. A round trip is the only claim a format supports.
+
+// The same body `tests_brotli.sysl` uses, for the same reason: long enough to be worth compressing
+// and repetitive enough to compress well.
+private val ARepetitiveBody: string = "repeat(\"the quick brown fox jumps over the lazy dog, \", 25)"
+
+@test
+WHAT_zstd_MADE_IS_WHAT_unzstd_GIVES_BACK()
+    val text = "val text = " + ARepetitiveBody +
+        "\nval small = zstd(text, 3)\nprint(fromBytes(unzstd(small, 65536).value).value == text)\n" +
+        "print(len(small) < len(toBytes(text)) / 10)\n"
+
+    assert_eq(zstd_out(text), "true\ntrue")
+
+@test
+TEXT_AND_ITS_BYTES_ARE_THE_SAME_INPUT_TO_zstd()
+    // **Text crosses as its UTF-8**, which is what `toBytes` would have made of it and what goes on
+    // a wire either way -- so a program holding a string need not convert it first.
+    assert_eq(zstd_out("print(zstd(\"a page of text\", 3) == zstd(toBytes(\"a page of text\"), 3))\n"), "true")
+
+@test
+A_HIGHER_LEVEL_COMPRESSES_HARDER_AND_READS_BACK_THE_SAME()
+    // **The level is a dial and not a format**, so a frame written at 19 is read by the same
+    // decoder that reads one written at 1 -- which is what makes the number safe to change.
+    val text = "val text = " + ARepetitiveBody +
+        "\nprint(len(zstd(text, 19)) <= len(zstd(text, 1)))\n" +
+        "print(fromBytes(unzstd(zstd(text, 19), 65536).value).value == text)\n"
+
+    assert_eq(zstd_out(text), "true\ntrue")
+
+@test
+RUBBISH_A_TRUNCATION_AND_AN_OVERLONG_ANSWER_ARE_THREE_DIFFERENT_SENTENCES_HERE_TOO()
+    // **`unzstd` answers a result and `zstd` faults**, which is `parseJSON` against `toJSON` and for
+    // the same reason: what is being decompressed came from somewhere else.
+    val text = "val text = " + ARepetitiveBody + "\nval small = zstd(text, 3)\n" +
+        "print(unzstd(toBytes(\"not zstd at all\"), 1024).error)\n" +
+        "print(unzstd(small[0..<(len(small) / 2)], 65536).error)\n" +
+        "print(unzstd(small, 100).error)\n"
+
+    val said = zstd_out(text)
+
+    assert(said.contains("this is not a zstd frame"))
+    assert(said.contains("this zstd frame ends in the middle"))
+    assert(said.contains("this expands past the 100 bytes it was allowed"))
+
+@test
+A_LEVEL_OUTSIDE_WHAT_ZSTD_ACCEPTS_IS_REFUSED()
+    val said = zstd_fails("zstd(\"x\", 23)")
+
+    assert(said.contains("a zstd level runs from"))
+    assert(said.contains("and this is 23"))
+
+@test
+THE_TWO_ZSTD_NAMES_SAY_WHAT_THEY_TAKE()
+    assert(zstd_fails("zstd(\"x\")").contains("`zstd` takes what to compress and a level, and was given 1 argument"))
+    assert(zstd_fails("zstd(42, 3)").contains("`zstd` takes text or bytes, and this is an integer"))
+    assert(zstd_fails("zstd(\"x\", \"hard\")").contains("`zstd` takes the level as a whole number, and this is a string"))
+    assert(zstd_fails("unzstd(\"x\")").contains("`unzstd` takes what to decompress and the most it may become, and was given 1 argument"))
+    assert(zstd_fails("unzstd(\"x\", 0 - 1)").contains("a limit is a number of bytes and this is -1"))
+
+@test
+A_CLIENT_THAT_ASKS_FOR_ZSTD_GETS_ZSTD_AND_NOT_BROTLI()
+    // **The order is the only decision in the negotiation**: both are offered by every current
+    // browser, and zstd at level 3 compresses about as well as brotli at 5 in a fraction of the
+    // time -- which is what matters for a body being encoded on the way out.
+    val said = zstd_wire_out(zstd_probe("Accept-Encoding: zstd, br, gzip", ARepetitiveBody))
+
+    assert(said.contains("Content-Encoding: zstd"))
+    assert(said.contains("Vary: Accept-Encoding"))
+    assert(said.contains("the quick brown fox jumps over the lazy dog, the quick"))
+    assert(!said.contains("Content-Length: 1125"))
+
+@test
+A_CLIENT_THAT_REFUSES_ZSTD_STILL_GETS_BROTLI()
+    // **Asked once per name**, which is what makes `zstd;q=0` mean *not that one* rather than *no
+    // compression at all* -- the shape a client uses to say it would rather have the other.
+    val said = zstd_wire_out(zstd_probe("Accept-Encoding: zstd;q=0, br", ARepetitiveBody))
+
+    assert(said.contains("Content-Encoding: br"))
+    assert(!said.contains("Content-Encoding: zstd"))
+
+@test
+A_CLIENT_THAT_ASKS_FOR_NEITHER_GETS_THE_BODY_AS_IT_WAS()
+    val said = zstd_wire_out(zstd_probe("Accept-Encoding: gzip, deflate", ARepetitiveBody))
+
+    assert(!said.contains("Content-Encoding"))
+    assert(said.contains("Content-Length: 1125"))
+
+// The same wire probe `tests_brotli.sysl` writes, reading the socket as BYTES and undoing whichever
+// encoding the server chose. **A compressed body is not UTF-8**, so a test reading the wire as text
+// would be asserting on whatever the decoder made of the bytes.
+private zstd_probe(ask: string, answer: string) -> string =
+    "val server = serve(0, req -> (" + answer + "))\n" +
+    "cut(bs) =\n" +
+    "    var i = 0\n" +
+    "    while i + 3 < len(bs)\n" +
+    "        if bs[i] == 13 && bs[i + 1] == 10 && bs[i + 2] == 13 && bs[i + 3] == 10 then return i\n" +
+    "        i = i + 1\n" +
+    "    0 - 1\n" +
+    "async main()\n" +
+    "    val c = (await connect(\"127.0.0.1\", localPort(server))).value\n" +
+    "    var got = []\n" +
+    "    heard(chunk)\n" +
+    "        if chunk == null\n" +
+    "            val at = cut(got)\n" +
+    "            val head = fromBytes(got[0..<at]).value\n" +
+    "            val body = got[(at + 4)..<len(got)]\n" +
+    "            print(join(split(head, \"\\r\\n\"), \"|\"))\n" +
+    "            if contains(head, \"Content-Encoding: zstd\")\n" +
+    "                print(fromBytes(unzstd(body, 65536).value).value)\n" +
+    "            elif contains(head, \"Content-Encoding: br\")\n" +
+    "                print(fromBytes(decompress(body, 65536).value).value)\n" +
+    "            else\n" +
+    "                print(fromBytes(body).value)\n" +
+    "            shutSocket(c)\n" +
+    "            close(server)\n" +
+    "            done()\n" +
+    "        else\n" +
+    "            got = concat(got, chunk)\n" +
+    "    onBytes(c, heard)\n" +
+    "    await send(c, \"GET / HTTP/1.1\\r\\nHost: h\\r\\nConnection: close\\r\\n" + ask + "\\r\\n\\r\\n\")\n" +
+    "main()\n"

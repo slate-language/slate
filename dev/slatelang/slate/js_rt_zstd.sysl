@@ -1,0 +1,197 @@
+module dev.slatelang.slate
+
+// `slate:zstd` in the JavaScript back end, which is node's `zlib` and nothing in a browser.
+//
+// **node has carried Zstandard in `zlib` since 22.15** -- `zstdCompressSync` and
+// `zstdDecompressSync`, with the level given as a libzstd parameter rather than as a `level` field.
+// So the module is the host's here exactly as `slate:gzip`'s deflate is, and the whole of what is
+// written out is the shaping.
+//
+// **A BROWSER HAS NO ZSTD AND NONE IS COMING.** `CompressionStream` takes `gzip`, `deflate` and
+// `deflate-raw`, and no engine has proposed a fourth; a page that reached for this would be reaching
+// for something that will not arrive, so the refusal names zstd and points at `slate:gzip` -- which
+// is `slate:brotli`'s case and not an `OWED` stub's.
+//
+// **The frame's bytes are NOT compared between the two back ends and cannot be.** node links its own
+// copy of libzstd and the interpreter links the machine's, so two encoders at one level may frame
+// the same input differently and both be right. What is compared is the round trip and what each
+// makes of the other's output, which is the only claim a format supports.
+
+js_runtime_zstd() -> string = raw"""
+        // -- zstd --------------------------------------------------------------------------------------
+
+        // node's `zlib`, or nothing where there is none.
+        const zstdHost = (() => {
+            if (typeof process === "undefined" || typeof require !== "function") return null
+
+            try {
+                const zlib = require("node:zlib")
+
+                return typeof zlib.zstdCompressSync === "function" ? zlib : null
+            } catch (e) {
+                return null
+            }
+        })()
+
+        const noZstd = (name) =>
+            fault("`" + name + "` is Zstandard, which this JavaScript host has not got -- no browser " +
+                "has a `CompressionStream(\"zstd\")` and none is coming, and `slate:gzip` is the " +
+                "compression a page does have")
+
+        // What either name was given, as bytes. **Text crosses as its UTF-8**, which is what
+        // `toBytes` would have made of it and what goes on a wire either way.
+        const zstdSource = (v, name) => {
+            if ($.isStr(v)) return Buffer.from(v, "utf8")
+
+            if (Array.isArray(v)) {
+                const bytes = []
+
+                for (const b of v) {
+                    if (!$.isInt(b)) fault("`" + name + "` takes an array of numbers, and one of these is " + typeName(b))
+
+                    const n = Number(b)
+
+                    if (n < 0 || n > 255) fault("a byte is between 0 and 255, and this is " + n)
+
+                    bytes.push(n)
+                }
+
+                return Buffer.from(bytes)
+            }
+
+            fault("`" + name + "` takes text or bytes, and this is " + typeName(v))
+        }
+
+        const zstdWhole = (v, name, what) => {
+            if (!$.isInt(v)) fault("`" + name + "` takes " + what + " as a whole number, and this is " + typeName(v))
+
+            return Number(v)
+        }
+
+        const zstdBytes = (buf) => {
+            const out = []
+
+            for (const b of buf) out.push(BigInt(b))
+
+            return out
+        }
+
+        // libzstd's own range, which node exposes as constants rather than as numbers to be guessed.
+        const zstdMin = () => zstdHost.constants.ZSTD_minCLevel === undefined ? -131072 : zstdHost.constants.ZSTD_minCLevel
+        const zstdMax = () => zstdHost.constants.ZSTD_maxCLevel === undefined ? 22 : zstdHost.constants.ZSTD_maxCLevel
+
+        B.zstd = (...args) => {
+            if (args.length !== 2)
+                fault("`zstd` takes what to compress and a level, and was given " + args.length +
+                    (args.length === 1 ? " argument" : " arguments"))
+
+            if (zstdHost === null) noZstd("zstd")
+
+            const source = zstdSource(args[0], "zstd")
+            const level = zstdWhole(args[1], "zstd", "the level")
+
+            if (level < zstdMin() || level > zstdMax())
+                fault("a zstd level runs from " + zstdMin() + " to " + zstdMax() + " and this is " + level)
+
+            const params = {}
+
+            params[zstdHost.constants.ZSTD_c_compressionLevel] = level
+
+            // **The frame carries its own checksum**, which is what the interpreter asks for and is
+            // the difference between a damaged stream and one that was never zstd.
+            params[zstdHost.constants.ZSTD_c_checksumFlag] = 1
+
+            try {
+                return zstdBytes(zstdHost.zstdCompressSync(source, { params: params }))
+            } catch (e) {
+                fault("this could not be compressed: " + String(e && e.message ? e.message : e))
+            }
+        }
+
+        // What a frame's header says it holds, or `null` where it says nothing.
+        //
+        // **THIS EXISTS BECAUSE node's DECOMPRESSOR IS SILENT ABOUT A FRAME THAT ENDS IN THE
+        // MIDDLE.** `zstdDecompressSync` on half a frame answers an EMPTY buffer and throws nothing,
+        // where libzstd's one-shot call -- which is what the interpreter reaches -- answers
+        // `srcSize_wrong`. A wrong answer with no error is the worst shape a difference can take, so
+        // the header is read and what came back is measured against what it claimed.
+        //
+        // **The header is four bytes of magic, a descriptor, and up to thirteen bytes of fields**,
+        // and only the last of them is wanted. `Single_Segment_Flag` decides whether a window
+        // descriptor is there; the dictionary id is 0, 1, 2 or 4 bytes; and the content size is
+        // 0, 1, 2, 4 or 8, the two-byte form carrying an offset of 256.
+        const zstdDeclared = (b) => {
+            if (b.length < 5) return null
+            if (b[0] !== 0x28 || b[1] !== 0xb5 || b[2] !== 0x2f || b[3] !== 0xfd) return null
+
+            const flags = b[4]
+            const field = flags >> 6
+            const single = (flags >> 5) & 1
+            const wide = field === 0 ? (single === 1 ? 1 : 0) : (field === 1 ? 2 : (field === 2 ? 4 : 8))
+
+            if (wide === 0) return null
+
+            let at = 5 + (single === 1 ? 0 : 1) + [0, 1, 2, 4][flags & 3]
+
+            if (at + wide > b.length) return null
+
+            if (wide === 1) return b[at]
+            if (wide === 2) return b.readUInt16LE(at) + 256
+            if (wide === 4) return b.readUInt32LE(at)
+
+            const held = b.readBigUInt64LE(at)
+
+            return held > BigInt(Number.MAX_SAFE_INTEGER) ? null : Number(held)
+        }
+
+        B.unzstd = (...args) => {
+            if (args.length !== 2)
+                fault("`unzstd` takes what to decompress and the most it may become, and was given " + args.length +
+                    (args.length === 1 ? " argument" : " arguments"))
+
+            if (zstdHost === null) noZstd("unzstd")
+
+            const source = zstdSource(args[0], "unzstd")
+            const limit = zstdWhole(args[1], "unzstd", "the limit")
+
+            if (limit < 0) fault("a limit is a number of bytes and this is " + limit)
+
+            // **`maxOutputLength` is node's own bound and it is what makes the limit real.** Without
+            // it a crafted frame of a few hundred bytes expands until the process dies, which is the
+            // whole reason the argument exists and has no form that omits it.
+            try {
+                const back = zstdHost.zstdDecompressSync(source, { maxOutputLength: limit })
+                const claimed = zstdDeclared(source)
+
+                // **A frame that ends in the middle is what node answers nothing about**, so the
+                // claim in its header is what says so. A frame that declared no size cannot be
+                // checked this way and is the one case the two back ends read differently; the
+                // module's page says so.
+                if (claimed !== null && back.length !== claimed)
+                    return $.obj([["ok", false], ["error", "this zstd frame ends in the middle"]])
+
+                return $.obj([["ok", true], ["value", zstdBytes(back)]])
+            } catch (e) {
+                return $.obj([["ok", false], ["error", zstdWhy(e, limit)]])
+            }
+        }
+
+        // What node objected to, said in the interpreter's words.
+        //
+        // **The two libraries answer the same three things and spell them differently**, so this is
+        // the mapping rather than a passing on: too large is a body that would not fit, truncated is
+        // a transfer that stopped, and corrupt is not zstd at all.
+        const zstdWhy = (e, limit) => {
+            const said = String(e && e.message ? e.message : e)
+
+            if (e && (e.code === "ERR_BUFFER_TOO_LARGE" || e.code === "ERR_ZSTD_OUTPUT_TOO_LARGE") ||
+                said.indexOf("maxOutputLength") >= 0 || said.indexOf("too large") >= 0)
+                return "this expands past the " + limit + " bytes it was allowed"
+
+            if (said.indexOf("Src size is incorrect") >= 0 || said.indexOf("srcSize") >= 0 ||
+                said.indexOf("truncated") >= 0)
+                return "this zstd frame ends in the middle"
+
+            return "this is not a zstd frame: " + said
+        }
+"""

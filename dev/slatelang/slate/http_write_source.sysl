@@ -35,6 +35,13 @@ http_write_source() -> string = raw"""
     val CompressBytes = 1024
     val CompressQuality = 5
 
+    // **zstd level 3 where a client takes it, and brotli otherwise.** Level 3 is the library's own
+    // default and is several times faster than deflate while compressing better than it, which is
+    // what makes zstd the first encoding worth reaching for on a request that is being answered now
+    // -- brotli at quality 5 is the slow end of what a handler can afford. Browsers send `zstd` in
+    // `Accept-Encoding` and have for two years; anything that does not simply gets `br` as before.
+    val ZstdLevel = 3
+
     // What a handler answered, written to the socket.
     //
     // **A string is a whole response**, which is what makes the first program somebody writes one line
@@ -157,7 +164,9 @@ http_write_source() -> string = raw"""
         // **A body whose type says it is already compressed is not compressed again.** The check
         // below would catch it -- a PNG comes back larger and is sent as it was -- but a static
         // server would then run brotli over every image on every request and throw the answer away.
-        if encoded || alreadyPacked(said) || len(raw) < CompressBytes || !wantsBrotli(req)
+        val how = chosenEncoding(req)
+
+        if encoded || alreadyPacked(said) || len(raw) < CompressBytes || how == null
             return answered(status, pairs, body, bytes)
 
         // **`Vary` goes on whether or not this one was compressed**, because what a cache must not do is
@@ -165,14 +174,14 @@ http_write_source() -> string = raw"""
         // every response whose content depended on `Accept-Encoding` says so.
         push(pairs, ["Vary", "Accept-Encoding"])
 
-        val small = compress(raw, CompressQuality)
+        val small = if how == "zstd" then zstd(raw, ZstdLevel) else compress(raw, CompressQuality)
 
-        // **A body that does not get smaller is sent as it was.** Brotli frames its input, so something
-        // already compressed -- a PNG, a zip, an asset built ahead of time -- comes back slightly larger,
-        // and sending that would cost the client a decode for nothing.
+        // **A body that does not get smaller is sent as it was.** Both encodings frame their input, so
+        // something already compressed -- a PNG, a zip, an asset built ahead of time -- comes back
+        // slightly larger, and sending that would cost the client a decode for nothing.
         if len(small) >= len(raw) then return answered(status, pairs, body, bytes)
 
-        push(pairs, ["Content-Encoding", "br"])
+        push(pairs, ["Content-Encoding", how])
 
         { status: status, headers: pairs, text: null, bytes: small, source: null, heartbeat: 0 }
 
@@ -191,19 +200,31 @@ http_write_source() -> string = raw"""
     // itself is one on the same terms.
     isSource(v) -> boolean = v is generator || (v is object && has(v, "next") && v.next is function)
 
-    // Whether this client asked for brotli, reading the header rather than looking for the two letters.
+    // Which encoding to answer in, or `null` where the client asked for neither.
+    //
+    // **zstd first, and the order is the only decision here.** Both are offered by every current
+    // browser; zstd at level 3 compresses about as well as brotli at 5 and takes a fraction of the
+    // time, which is what matters for a body being encoded on the way out rather than built ahead.
+    chosenEncoding(req: object | null) -> string | null =
+        if wantsEncoding(req, "zstd") then return "zstd"
+        if wantsEncoding(req, "br") then return "br"
+
+        null
+
+    // Whether this client asked for one encoding, reading the header rather than looking for letters.
     //
     // **`br;q=0` is a client saying it would rather not**, which is not the same as not mentioning it,
     // and `deflate` contains no `br` but a future token might -- so the field is split into its tokens
-    // the way the specification says it is.
-    wantsBrotli(req: object | null) -> boolean =
+    // the way the specification says it is. **Asked once per name**, so a client that refuses zstd and
+    // takes brotli gets brotli rather than nothing.
+    wantsEncoding(req: object | null, want: string) -> boolean =
         if req == null then return false
         if !has(req.headers, "accept-encoding") then return false
 
         for part in split(lower(req.headers["accept-encoding"]), ",")
             val token = trim(part)
 
-            if token == "br" || startsWith(token, "br;")
+            if token == want || startsWith(token, want + ";")
                 if contains(token, "q=0") && !contains(token, "q=0.") then return false
 
                 return true

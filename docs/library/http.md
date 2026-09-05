@@ -276,12 +276,15 @@ Serves a directory.
 
 ## Compression
 
-**A response is compressed without asking the handler.** Every browser sends `Accept-Encoding: br` before
-`gzip`, and a server that made this a per-handler choice would be making everybody write the same three
-lines.
+**A response is compressed without asking the handler.** Every browser sends `Accept-Encoding: zstd, br`
+before `gzip`, and a server that made this a per-handler choice would be making everybody write the same
+three lines.
 
-- **Over a kilobyte, at quality 5.** Below that [brotli](brotli.md) usually makes a body *larger*, having a
-  frame to write.
+- **[zstd](zstd.md) at level 3 where the client takes it, and [brotli](brotli.md) at quality 5
+  otherwise.** The order is the only decision: zstd at 3 compresses about as well as brotli at 5 in a
+  fraction of the time, which is what matters for a body being encoded on the way out rather than built
+  ahead of time. `Content-Encoding` says which one it was.
+- **Over a kilobyte.** Below that either encoding usually makes a body *larger*, having a frame to write.
 - **A body that does not get smaller is sent as it was.**
 - **`Vary: Accept-Encoding` goes on whether or not this one was compressed**, on every response that
   consulted the header. What a cache must not do is hand a compressed body to a client that did not ask,
@@ -289,4 +292,5 @@ lines.
 - **The escape hatch is to set `Content-Encoding` yourself**, which says the body is already encoded. It is
   the only one.
 - **`Accept-Encoding` is split into tokens** rather than searched for two letters, so `br;q=0` is a client
-  saying it would rather not — which is not the same as not mentioning it.
+  saying it would rather not — which is not the same as not mentioning it. **It is asked once per name**,
+  so `zstd;q=0, br` gets brotli rather than nothing.
