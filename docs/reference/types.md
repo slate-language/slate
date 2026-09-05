@@ -417,7 +417,7 @@ g(ss: array of string) = map(ss, s -> s * 2)
 ```
 
 and so is its arity — in one direction. **A callback may declare FEWER parameters than the builtin
-hands it**, because a native passes as many as the callback declares; see
+hands it**, a native passing as many as the callback declares; see
 [Callbacks](functions.md#callbacks-take-as-many-arguments-as-they-declare). Declaring **more** is
 refused, there being nothing to fill them with:
 
@@ -428,6 +428,10 @@ q(ns: array of integer) = map(ns, (a, b) -> a)
 ```error
 `map` takes (integer) -> any here, and this is (integer, any) -> integer
 ```
+
+**It is the CALLER that makes the relaxation sound, so it stops at a builtin.** A parameter the
+program annotated is compared strictly in both directions: a call the program wrote passes what the
+program wrote, and nothing adapts.
 
 **None of that is a type variable.** A builtin's signature names an argument by *position*, and the
 type at that position is filled in at the call — no binding, no scope, nothing to write anywhere. What

@@ -242,8 +242,21 @@ That is the checker, which knows what `map` hands over. Reached through a value 
 machine says the same thing in its own words — *"`map` calls this with 1 argument and it takes 2
 arguments"*.
 
-TypeScript draws the line in the same place, and for the same reason: a function of fewer parameters
-is usable wherever more are supplied, while a direct call with the wrong count is an error.
+TypeScript draws the line in nearly the same place, and the difference is worth knowing: there a
+function of fewer parameters is usable wherever more are supplied, *including* through a type you
+declared yourself, because the call that follows ignores the extra argument. **A slate call does
+not** — it passes what you wrote — so the relaxation holds only where the caller is a builtin that
+adapts to the callee. A parameter you annotated is compared strictly:
+
+```slate
+apply(f: (integer, integer) -> integer) = f(1, 2)
+
+print(apply(n -> n))
+```
+
+```error
+`apply` takes (integer, integer) -> integer here, and this is (any) -> any
+```
 
 ## Destructuring parameters
 
