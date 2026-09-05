@@ -1,0 +1,186 @@
+module dev.slatelang.slate
+@tests
+
+import sysl.fs.{remove_file, write_text}
+import sysl.text.Search
+
+// `fetch` on both back ends, against one server.
+//
+// **`fetch` is native and has no corpus file, because a corpus file is one program run twice and a
+// client needs a server.** So the arrangement is `tests_ws.sysl`'s: the server runs under the
+// interpreter, and the client runs twice -- once in that same process and once as node started as
+// its child, compiled from the same source. What the two say is the assertion.
+//
+// **The probe is written ONCE and wrapped twice.** The only difference between the halves is how
+// each learns the port: the interpreter's client is in the process holding the server, and node's
+// reads it off its arguments. Everything the test is about is the same text.
+
+// The server both halves are pointed at.
+private val ServerText: string =
+    "import { serve, close as stop } from slate:http\n" +
+    "import { localPort } from slate:net\n" +
+    "\n" +
+    "val server = serve(0, (req) ->\n" +
+    "    if req.path == \"/away\" then { status: 302, headers: { Location: \"/there\" }, body: \"\" }\n" +
+    "    elif req.path == \"/there\" then \"arrived\"\n" +
+    "    elif req.path == \"/gone\" then { status: 404, body: \"no\" }\n" +
+    "    elif req.path == \"/dup\" then { headers: { \"X-Thing\": [\"one\", \"two\"] }, body: \"dup\" }\n" +
+    "    elif req.path == \"/bytes\" then { headers: { \"Content-Type\": \"application/octet-stream\" }, body: [0, 159, 146, 150, 255] }\n" +
+    "    else req.method + \" \" + req.path + \" [\" + req.body + \"] \" + (req.headers[\"x-from\"] ?? \"-\"))\n"
+
+// What both clients ask. `base` is however that half got the port and `finish` is what each does at
+// the end, which is the whole of the difference between them.
+private val ProbeText: string =
+    "anything(v) = v\n" +
+    "\n" +
+    "async main()\n" +
+    "    val a = await fetch(base + \"/thing\")\n" +
+    "\n" +
+    "    print(a.ok, a.value.status, a.value.body)\n" +
+    "\n" +
+    "    val b = await fetch(base + \"/p?a=1\", { method: \"POST\", body: \"sent\", headers: { \"X-From\": \"a test\" } })\n" +
+    "\n" +
+    "    print(b.ok, b.value.status, b.value.body)\n" +
+    "\n" +
+    "    val c = await fetch(base + \"/gone\")\n" +
+    "\n" +
+    "    print(c.ok, c.value.status, c.value.body)\n" +
+    "\n" +
+    "    val d = await fetch(base + \"/away\")\n" +
+    "\n" +
+    "    print(d.ok, d.value.status, d.value.body)\n" +
+    "\n" +
+    "    val e = await fetch(base + \"/dup\")\n" +
+    "\n" +
+    "    print(e.value.headers[\"x-thing\"])\n" +
+    "\n" +
+    "    val f = await fetch(base + \"/bytes\")\n" +
+    "\n" +
+    "    print(f.ok, len(f.value.body))\n" +
+    "\n" +
+    "    print((await fetch(\"gopher://x/\")).error)\n" +
+    "    print((await fetch(\"http:///nowhere\")).error)\n" +
+    "    print((await fetch(\"http://127.0.0.1:9/\")).ok)\n" +
+    "    print(anything(fetch)() catch g -> g.message)\n" +
+    "    print(anything(fetch)(base, 5) catch g -> g.message)\n" +
+    "    print(fetch(base, { method: anything(5) }) catch g -> g.message)\n" +
+    "    print(fetch(base, { headers: anything(5) }) catch g -> g.message)\n" +
+    "\n" +
+    "    val numbered = {}\n" +
+    "\n" +
+    "    numbered[1] = \"x\"\n" +
+    "\n" +
+    "    print(fetch(base, { headers: numbered }) catch g -> g.message)\n" +
+    "    finish()\n" +
+    "\n" +
+    "main()\n"
+
+// The two answers this pins, so that a change breaks the shared assertion AND the written one.
+private val Expected: string =
+    "true 200 GET /thing [] -\n" +
+    "true 200 POST /p [sent] a test\n" +
+    "true 404 no\n" +
+    "true 200 arrived\n" +
+    "one, two\n" +
+    "true 0\n" +
+    "`gopher://x/` is not an http or https URL\n" +
+    "`http:///nowhere` names no host\n" +
+    "false\n" +
+    "`fetch` takes a URL and optionally some options, and was given 0 arguments\n" +
+    "`fetch` takes its options as an object, and this is an integer\n" +
+    "`method` is a string, and this is an integer\n" +
+    "`headers` is an object of names and values, and this is an integer\n" +
+    "a header is named by a string, and this is an integer"
+
+// The probe with the server in the same program, which is what the interpreter runs.
+private under_slate() -> string =
+    ServerText +
+    "val base = \"http://127.0.0.1:\" + string(localPort(server))\n" +
+    "finish() = stop(server)\n" +
+    ProbeText
+
+// The probe as a program of its own, reading the port it was given.
+private under_node() -> string =
+    "import { args } from slate:process\n" +
+    "val base = \"http://127.0.0.1:\" + args[0]\n" +
+    "finish() = null\n" +
+    ProbeText
+
+// The server under the interpreter with node started as its child, which is what keeps slate's loop
+// turning while node is fetching.
+private fetch_serving(client_js: string) -> string =
+    ServerText +
+    "import { run } from slate:process\n" +
+    "async main()\n" +
+    s"    val r = await run(\"node\", [\"${client_js}\", string(localPort(server))], " +
+    "{ timeout: 20000 })\n" +
+    "    stop(server)\n" +
+    "    if !r.ok\n" +
+    "        print(\"node could not run: \" + r.error)\n" +
+    "    else\n" +
+    "        print(trim(r.value.out + r.value.err))\n" +
+    "main()\n"
+
+private node_fetch_said() -> string
+    val src = "tests/fetch-client.tmp.sl"
+    val out_js = src + ".js"
+
+    write_text(src, under_node()).unwrap()
+
+    val wrote = cli_status(["slate", "js", src, "-o", out_js])
+
+    if wrote != 0
+        remove_file(src)
+
+        return s"`slate js` exited ${wrote}"
+
+    val said = out(fetch_serving(out_js))
+
+    remove_file(src)
+    remove_file(out_js)
+    said
+end node_fetch_said
+
+// **The whole of the item, in one assertion each side of one written answer.** A status, a body, a
+// method and a header that went out, a 404 that is a success, a redirect followed, a repeated header,
+// a body that is not text, two urls read before either host sees them, a server that is not there,
+// and five ways a call can be wrong.
+@test
+fetch_ANSWERS_THE_SAME_THING_ON_BOTH_BACK_ENDS()
+    assert_eq(out(under_slate()).trim(), Expected)
+    assert_eq(node_fetch_said().trim(), Expected)
+
+// **`trust` is the one option a JavaScript host cannot honour**, and it refuses rather than being
+// ignored -- a program that believes it pinned a certificate and did not is worse off than one told
+// it cannot. `ping` in `slate:ws` is the same shape.
+@test
+trust_REFUSES_ON_A_JAVASCRIPT_HOST_BECAUSE_A_PAGE_HAS_NO_TRUST_STORE_TO_ADD_TO()
+    val said = node_said("print(fetch(\"https://example.invalid/\", { trust: \"PEM\" }))")
+
+    assert(said.contains("`trust` names a certificate to trust as well as the machine's own"))
+    assert(said.contains("what a host trusts is the host's own store"))
+
+// **The option is still read the same way on both**, which is what makes the refusal above a
+// statement about the host rather than about the option. `tests_tls.sysl` is where the interpreter
+// actually reaches a private certificate authority with it.
+@test
+trust_IS_READ_AS_TEXT_ON_BOTH_BACK_ENDS_BEFORE_EITHER_DECIDES_WHAT_TO_DO_WITH_IT()
+    val probe = "async main()\n    print(await fetch(\"https://x.invalid/\", { trust: anything(5) }))\nmain()"
+
+    assert(fails(Opaque + probe).contains("`trust` is a string, and this is an integer"))
+    assert(node_said(Opaque + probe).contains("`trust` is a string, and this is an integer"))
+
+// **`fetch` was the last GLOBAL the JavaScript back end owed**, and the test that said so lived in
+// `tests_time.sysl` written to fail the day the wrapper landed. This is what it became: the call
+// reaches the host rather than the stub, and the stub's sentence appears nowhere.
+//
+// **Called rather than merely named.** The stub `OWED` installs is a function, so printing the name
+// succeeds and says nothing; what used to refuse was the call.
+@test
+fetch_REACHES_THE_HOSTS_OWN_AND_IS_NO_LONGER_A_NAME_THAT_SAYS_IT_IS_OWED()
+    val said = node_said("async main()\n" +
+        "    print((await fetch(\"http://127.0.0.1:1/\")).ok)\n" +
+        "main()")
+
+    assert(!said.contains("not in the JavaScript back end yet"))
+    assert_eq(said, "false")

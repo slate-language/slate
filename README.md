@@ -261,14 +261,15 @@ A literate `.lsl` form, a raw string literal, a name resolver for `connect`, Uni
 standard library beyond the builtins. On the object side: `super`, and a check that a proto satisfies a
 `type` when it is attached to an object literal by hand.
 
-In the JavaScript back end: `slate:net`, `fetch`, `run`, `slate:password`, `slate:llhttp`, and the
+In the JavaScript back end: `slate:net`, `run`, `slate:password`, `slate:llhttp`, and the
 servers written over them — `slate:ws` has its **client** there, over the host's own `WebSocket`, and
 cannot have its server, a browser being unable to listen. Each one is a name that
 says *"not in the JavaScript back end yet"* rather than a name that is not there. `slate:time` is whole
 there now, except for `abbrev` and `isDST`; so is `slate:crypto`, except for the RSA and ECDSA half of
 JWS; so is `slate:regex`, whose patterns are translated into `RegExp` and which refuses the handful
-of PCRE2 constructs a browser has nothing to mean; and so is `slate:gzip`, over the host's own
-`CompressionStream` — all of them things a JavaScript host genuinely does or does not have, and
+of PCRE2 constructs a browser has nothing to mean; so is `slate:gzip`, over the host's own
+`CompressionStream`; and so is `fetch`, over the host's own, except that `trust` refuses and the
+redirect rule is the host's — all of them things a JavaScript host genuinely does or does not have, and
 `docs/reference/javascript.md` measures why. **`slate:brotli` is the clearest of the second kind**: no
 browser has a brotli encoder, so it refuses there naming brotli and pointing at `slate:gzip`.
 

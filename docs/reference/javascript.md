@@ -29,11 +29,19 @@ The operators follow because the two languages disagree too often for the except
 | `[1] == [1]` | true | false |
 | `1 << 40` | 2^40 | 256 |
 
+**One thing `print` says differently, and it is not closable cheaply.** A promise prints as
+`<promise pending>`, `<promise 5>` or `<promise failed: …>` in the interpreter and as `<promise>`
+here: a JavaScript promise does not expose its state synchronously, and wrapping every promise in the
+runtime so that `print` could read one would cost every `await` in every program to improve a
+debugging accident. Printing a promise is not something a program's output should depend on either
+way.
+
 ## What is not there yet
 
-**`slate:net`, `slate:password`, `slate:llhttp`, `slate:process`'s `run`, `fetch`, and the modules
-written over them.** Each is a name that says *"not in the JavaScript back end yet"* when a program
-reaches it, rather than a name that is not there — so a program is told which half of the world it is in.
+**`slate:net`, `slate:password`, `slate:llhttp`, `slate:process`'s `run`, and the modules written
+over them.** Each is a name that says *"not in the JavaScript back end yet"* when a program reaches
+it, rather than a name that is not there — so a program is told which half of the world it is in.
+**No global is on that list any more**; `fetch` was the last and has its own section below.
 
 **`slate:brotli` is NOT on that list, and the difference matters.** No JavaScript host has a brotli
 encoder and none is coming, so *"not yet"* would be a promise nobody can keep. `compress` and
@@ -350,6 +358,41 @@ with miniz and fetches over OpenSSL, and in each case there is nobody else's imp
 
 **`compression` is two globals and one question.** A host with a `CompressionStream` and no
 `DecompressionStream` does not compress, so `hostHas("compression")` wants both.
+
+### `fetch` is the host's own, and two things about it are the host's too
+
+A browser *has* `fetch`, so this was work owed rather than something the host lacks. What had to be
+written is the shaping: the host answers a `Response` and slate answers `{ ok, value }` with a
+`status`, a `headers` object of lower-cased names, and a `body`. A server that cannot be reached is
+`{ ok: false, error }`, never a rejection — which is `fetch`'s rule in slate whichever host answers.
+
+**The URL is read here and not left to the host.** `gopher://x/` is a mistake neither host has
+anything to do with, so both back ends answer *"`gopher://x/` is not an http or https URL"* rather
+than slate's sentence in one place and the browser's in the other. That is `slate:ws`'s rule for
+`open`, drawn the same way.
+
+**`trust` refuses**, and it is the shape case rather than a missing feature. It names a certificate to
+trust as well as the machine's own, and no JavaScript host lets a program add a trust anchor for one
+request. A refusal is the only safe answer: a program that believes it pinned a certificate and did
+not is worse off than one told it cannot.
+
+**The redirect rule is the host's here.** The interpreter follows at most five and refuses one that
+leaves `https` for `http`. A browser follows redirects itself, and `redirect: "manual"` does not hand
+a page the location back — a cross-origin redirect comes back opaque, with no status and no headers
+to read — so a page cannot implement that rule at all, and doing it on node alone would make the two
+JavaScript hosts disagree with each other. This is `ping`'s case in `slate:ws`: the host does the
+thing and gives the program no way in.
+
+**A body that is not UTF-8 is `""` on both**, which took a decision here: a host's `text()` replaces
+every bad byte with U+FFFD, so the response would come back as replacement characters here and as
+`""` there. The bytes are decoded strictly instead and the failure is caught.
+
+**A response header that repeats is joined with `", "` on both, and the interpreter changed to
+match.** It used to keep the last, which silently threw one away — an object has one value per name
+and HTTP does not. A `Headers` object is what a JavaScript host hands over, already combined and with
+no way to ask for the lines back, so combining is the only reading both can give; RFC 9110 allows it
+in as many words. In a browser, which response headers are readable at all is CORS's decision and
+not slate's.
 
 ## A builtin is a parameter, not a name taken from the host
 
