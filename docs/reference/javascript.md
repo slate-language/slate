@@ -423,6 +423,19 @@ why that global is looked at at all — it is quickjs's writer and has no relati
 of the same name — and **a document is what tells the two apart**. `check/` in slate's own repo drives
 all of this against jsdom.
 
+### A diagnostic about a function names it, and the emitter says what to call it
+
+`` `Counter` takes 0 arguments and was given 1 `` rather than *"this function"*. The caret is on the
+**call**, which is very often somewhere the reader has never opened — a framework invoking a
+component, a sort given a comparison — so a sentence with nothing to grep for left them stranded.
+
+**A lambda, a method and a generated `new` have no name to give**, all three being compiled as
+lambdas, and all three say *"this function"*. That takes saying here because the two hosts would
+otherwise offer two different wrong names: the interpreter's chunk is called `a function`, which is
+what `print` calls a function value, and a JavaScript function's own `name` is the emitter's
+temporary — `$t21`, a name nobody wrote. So the emitter states the name to show alongside the
+signature it already attaches, and says nothing for those three.
+
 ## A builtin is a parameter, not a name taken from the host
 
 **The emitted program is a function whose parameters are the builtins**, applied to the runtime's own
