@@ -8,6 +8,7 @@
 import { location, pushPath, replacePath, back, onNavigate } from slate:dom
 import { byId, createElement, createText, setAttribute, setChildren, on } from slate:dom
 import { children, tagName, nodeText, attribute } from slate:dom
+import { nodeKind, property, createComment, splitText, setProperty } from slate:dom
 import { insertBefore, dispatch, observe, events } from slate:dom
 import { stored, store, unstore, storedKeys, clearStored } from slate:dom
 
@@ -183,5 +184,49 @@ print("resume " + (events("http://example.test/e", { lastEventId: "7" }) catch e
 
 // An observer that watches nothing is refused here rather than by a browser's own `TypeError`.
 print("nothing " + (observe(watched, {}, heardChanges) catch e -> e.message))
+
+// -- what a node HOLDS, what KIND it is, and cutting one run of text in two ---------------------------
+
+// **`attribute` is what the markup said and `property` is what is there now**, which is the pair a
+// form turns on: a field somebody has typed into keeps the attribute it started with for ever.
+val field = createElement("input")
+
+setAttribute(field, "id", "field")
+setAttribute(field, "value", "written")
+insertBefore(app, field, null)
+setProperty(field, "value", "typed")
+
+print("attr " + toJSON(attribute(field, "value")) + " prop " + toJSON(property(field, "value")))
+print("checked " + toJSON(property(field, "checked")))
+print("absent property " + toJSON(property(field, "nosuchthing")))
+
+// **A comment and a text node both answer `null` to `tagName`**, which is what made a walk over a
+// server's markup adopt the wrong node; `nodeKind` is the question that tells them apart.
+val note = createComment("here")
+val words = createText("apple pear")
+val holder = createElement("p")
+
+setChildren(holder, [words, note])
+insertBefore(app, holder, null)
+
+print("kinds " + toJSON([nodeKind(holder), nodeKind(words), nodeKind(note)]))
+
+// **The offset is in characters and the DOM counts UTF-16 units**, so a cut written after an emoji
+// would land inside one there and does not here.
+val tail = splitText(words, 6)
+
+print("split " + toJSON([nodeText(words), nodeText(tail)]))
+print("split kinds " + toJSON([nodeKind(tail), string(len(children(holder)))]))
+
+val wide = createText("ab\u{1f600}cd")
+
+setChildren(holder, [wide])
+
+val rest = splitText(wide, 3)
+
+print("wide " + toJSON([nodeText(wide), nodeText(rest)]))
+
+print("not text " + (splitText(holder, 1) catch e -> e.message))
+print("past the end " + (splitText(rest, 99) catch e -> e.message))
 
 print("ready")

@@ -158,29 +158,56 @@ want("a lastEventId is refused rather than ignored", line(30),
 want("an observer that watches nothing is refused here rather than by a TypeError", line(31),
     "nothing `observe` watches for at least one of `children`, `attributes` and `text`, and this asks for none")
 
-want("the program reached the end", line(32), "ready")
+// **The three hydration could not ask for, and one it could not make.** `attribute` answers what the
+// markup said and goes on answering it however much has been typed since, which is why a reconciler
+// comparing what it would set against what is there needs `property`.
+want("an attribute is what the markup said and a property is what is there now", line(32),
+    'attr "written" prop "typed"')
+want("a boolean property comes back as a boolean", line(33), "checked false")
+want("a property the node does not carry is null, as an absent attribute is", line(34),
+    "absent property null")
+
+// **A comment and a text node both answer `null` to `tagName`**, which is the confusion this exists
+// to end: a walk over a server's markup counted a comment as a piece of text.
+want("a comment is told from a text node", line(35), 'kinds ["element","text","comment"]')
+
+want("a text node splits in two", line(36), 'split ["apple ","pear"]')
+want("the tail is a text node and the parent now has three children", line(37),
+    'split kinds ["text","3"]')
+
+// **The offset is in CHARACTERS**, so a cut written after an emoji does not land inside one -- which
+// is what `Text.splitText`, counting UTF-16 units, would have done with the same number.
+want("the offset is counted in characters and not in UTF-16 units", line(38),
+    'wide ["ab\u{1f600}","cd"]')
+
+want("splitting something that is not text says which kind it is", line(39),
+    "not text `splitText` takes a text node, and this is element -- `nodeKind` is what asks")
+want("splitting past the end says how long the text is", line(40),
+    "past the end `splitText` was given 99 and the text is 2 characters long")
+
+want("the program reached the end", line(41), "ready")
 
 // The stub's message and its error, delivered after the program registered for them.
-want("a message carries its data, its id and its type", line(33),
+want("a message carries its data, its id and its type", line(42),
     'message {"data":"hello","lastEventId":"7","type":"message"}')
-want("an error says whether it is over rather than a retry", line(34), 'error {"closed":true}')
+want("an error says whether it is over rather than a retry", line(43), 'error {"closed":true}')
 
 // The two clicks, in the order the driver made them.
-want("a handler that declares nothing is called", line(35), "clicked, reading nothing")
-want("and one that declares the event is given it", line(36), "clicked, and the event says click")
+want("a handler that declares nothing is called", line(44), "clicked, reading nothing")
+want("and one that declares the event is given it", line(45), "clicked, and the event says click")
 
 // **The two a router has to tell apart.** A plain left click is one it may intercept; a cmd-click on
 // the middle button is one it must hand to the browser, and without these fields the two are the
 // same event.
-want("a plain left click reads as button 0 with nothing down", line(35 + 2),
+want("a plain left click reads as button 0 with nothing down", line(46),
     'click button 0 mods {"meta":false,"ctrl":false,"shift":false,"alt":false}')
-want("a cmd-shift middle click says so", line(35 + 3),
+want("a cmd-shift middle click says so", line(47),
     'click button 1 mods {"meta":true,"ctrl":false,"shift":true,"alt":false}')
 
 // **Both mutations in ONE batch and neither of them carrying a node**, which is the record's own
 // decision: a handle per added node is a table slot the program would have to give back, and a
 // re-render makes hundreds of records.
-want("an observer is told what changed and how much", line(35 + 4),
+want("an observer is told what changed and how much", line(48),
     'changed [{"type":"attributes","attribute":"data-state","added":0,"removed":0},' +
     '{"type":"children","attribute":null,"added":2,"removed":0}]')
 

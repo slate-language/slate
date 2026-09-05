@@ -9,7 +9,7 @@ import { byId, setText, on } from slate:dom
 
 | | |
 |---|---|
-| `createElement(tag)`, `createText(s)` | |
+| `createElement(tag)`, `createText(s)`, `createComment(s)` | |
 | `setAttribute`, `removeAttribute`, `setProperty` | |
 | `on(node, event, fn)`, `off(node, id)` | |
 | `setChildren(node, kids)`, `setText(node, s)` | |
@@ -20,6 +20,9 @@ import { byId, setText, on } from slate:dom
 | `tagName(node)` | the tag in lower case, or `null` for a text node |
 | `nodeText(node)` | what the node says, as text |
 | `attribute(node, name)` | one attribute, or `null` where there is none |
+| `nodeKind(node)` | `"element"`, `"text"`, `"comment"`, `"fragment"`, `"document"` or `"other"` |
+| `property(node, name)` | what the node HOLDS, or `null` |
+| `splitText(node, at)` | cut a text node in two; answers the tail |
 | `markup(node)` | |
 | `release(node)` | give a handle back |
 | `dispatch(node, event)` | send an event; answers whether nothing cancelled it |
@@ -35,6 +38,38 @@ import { byId, setText, on } from slate:dom
 **`on` and `off` rather than `addEventListener`**, and `byId` rather than `getElementById`. The DOM's names
 are long because JavaScript had no modules when they were chosen; these are reached through an import that
 already says `dom`.
+
+## Reading a page somebody else rendered
+
+**`children`, `tagName`, `nodeText` and `attribute` are what hydration walks with**, and three more
+are what it walks with once the markup came from a server rather than from the same program.
+
+**`nodeKind(node)` tells a comment from a text node**, which `tagName` calls `null` alike — so a
+reconciler counting children read a comment as a piece of text and adopted the wrong node from there
+on. It is asked outright rather than by widening what `tagName` answers: a program reading `null` as
+*not an element* is right and stays right.
+
+**`property(node, name)` is what the node HOLDS, where `attribute` is what its markup said.** They are
+the pair a form turns on: setting the `value` attribute says what a field started as and setting the
+property says what is in it now, so a re-render comparing what it would set against what is there has
+to read the property. Only a value slate can hold comes back — a string, a boolean or a number — and
+anything else answers `null`, exactly as a name the node does not carry does.
+
+```slate
+setAttribute(field, "value", "written")
+setProperty(field, "value", "typed")
+
+print(attribute(field, "value"), property(field, "value"))
+```
+
+**`splitText(node, at)` cuts one text node in two and answers a handle for the tail.** A component
+rendering `{a}{b}` writes two text nodes and a server's markup carries the one string they made, so a
+hydrating reconciler that cannot split has to throw the text away and rebuild it. **The offset is in
+characters**, which is slate's rule wherever a string is measured and is not the DOM's — `splitText`
+counts UTF-16 units there, so a cut written after an emoji would land inside one.
+
+`createComment(s)` is the other half of `nodeKind`: a comment is what a server writes to mark a place
+a component's output begins, and a page could read one and not write one.
 
 ## Sending an event, and watching for a change
 

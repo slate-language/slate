@@ -107,3 +107,10 @@ a perfectly good slate program.
 
 `slate.sum` records what was fetched. **The hash is over the extracted tree, not over the download**, so
 it is a statement about the code a build actually compiled rather than about one particular archive of it.
+
+**It records the WHOLE graph and not the packages the project happens to name.** A package reached
+through another one is compiled exactly as one the manifest wrote, so it is pinned exactly as one.
+That takes saying because a package's own dependencies are written in its own manifest, which arrives
+*with* the package: `slate add` and `slate fetch` resolve, fetch, and then resolve again — until a
+round arrives with nothing new — because the first pass over an empty cache can only see what the
+project itself declared.

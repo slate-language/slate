@@ -36,6 +36,7 @@ slate test --js .               ... in the JavaScript engine instead
 slate js hello.sl -o hello.js   the same program, as JavaScript
 slate add github.com/owner/pkg  add a package
 slate --version                 which slate this is
+slate --help                    the whole list
 ```
 
 From a clone, with no `slate` on the path yet:

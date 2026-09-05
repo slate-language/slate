@@ -83,7 +83,17 @@ fetch_package(pkg: Package) -> Result[string, string]
     Ok(hash)
 end fetch_package
 
-// Fetch everything a project needs that is not there yet, and record what is there.
+// What a fetch came to: how many arrived, how many were already in the cache, what it has to say,
+// and whether any of it went wrong.
+struct Fetched
+    got: usize
+    already: usize
+    notes: Buf[string]
+    failed: bool
+end Fetched
+
+// One pass over a resolution: fetch what is missing and record the hash of everything, answering
+// whether anything was written into the sums.
 //
 // **A package already in the cache is not fetched again**, re-downloading what is already present
 // being what makes a package manager slow. **It is still HASHED and still RECORDED**, which is the
@@ -94,24 +104,13 @@ end fetch_package
 // The symptom is worth knowing because it reads as a defect in `slate deps`: the add says `added
 // greet 2.0.0` and nothing else, `slate.sum` has no line for it, and `slate deps` then reports the
 // package "is not recorded" and prints the very hash the add declined to write.
-struct Fetched
-    got: usize
-    already: usize
-    notes: Buf[string]
-    failed: bool
-end Fetched
-
-fetch_packages(root: string, packages: Packages) -> Fetched
-    var f = Fetched(0, 0, buf(), false)
-    var sums = read_sums(root)
+private fetch_round(root: string, packages: Packages, sums: *Sums, f: *Fetched) -> bool
     var added = false
 
     for i in 0..<packages.found.len()
         val pkg = packages.found.at(i)
 
         if is_fetched(pkg)
-            f.already += 1
-
             // **The tree that is already there is hashed against the record, exactly as an arrival
             // is.** A disagreement here is the same disagreement and stops the same way -- the copy
             // in the cache has been edited, or the published version changed under a machine that
@@ -153,12 +152,71 @@ fetch_packages(root: string, packages: Packages) -> Fetched
                         sums.entries.push(SumEntry(pkg.git, pkg.version, hash))
                         added = true
 
+    added
+end fetch_round
+
+// How many times the graph may deepen before slate calls it a circle. A round only happens where the
+// one before it fetched something, so this is a bound on the DEPTH of the dependency graph and not
+// on its size.
+private val MaxFetchRounds: usize = 32
+
+// Fetch the whole graph a project needs, which takes more than one pass.
+//
+// **A PACKAGE'S OWN DEPENDENCIES ARRIVE WITH IT, so the first resolution of a cold cache sees only
+// what the project itself declares.** `resolve_packages` reads each package's manifest out of the
+// package's directory, and a package that has never been fetched has no directory -- so the walk
+// stops at the project's own list, one round downloads exactly that, and nothing anywhere
+// learns what those packages want in turn.
+//
+// **The symptom is a `slate.sum` that is permanently incomplete**, and it reads as a defect in
+// `slate deps`: `slate add github.com/slate-language/mortar` in an empty directory says `added
+// mortar 0.1.0`, fetches mortar alone, and records mortar alone. The next command resolves again --
+// mortar's manifest is on the disk now -- finds `lath 0.5.1` under it, and reports for ever that
+// lath *is not recorded in `slate.sum`*, because the command that records is the command that
+// fetches and it has already run.
+//
+// **So the resolution is repeated until it stops growing.** A round can only add packages named by
+// a manifest that arrived in the round before it, the graph is finite, and a warm cache is one
+// round -- which is every run after the first.
+fetch_graph(root: string, project: Project) -> (Packages, Fetched)
+    var f = Fetched(0, 0, buf(), false)
+    var sums = read_sums(root)
+    var added = false
+    var packages = resolve_packages(root, project)
+    var rounds: usize = 0
+
+    loop
+        val before = f.got
+
+        if fetch_round(root, packages, &sums, &f) then added = true
+        if f.failed then break
+
+        // **Nothing arrived, so nothing this program has not already read can name anything.** This
+        // is the ordinary exit and it is taken on the first round by every warm cache.
+        if f.got == before then break
+
+        rounds += 1
+
+        if rounds > MaxFetchRounds
+            f.notes.push(s"error: gave up fetching after ${MaxFetchRounds} rounds -- the manifests may depend on each other in a circle")
+            f.failed = true
+            break
+        end if
+
+        packages = resolve_packages(root, project)
+
+    // **What was already there is what the WHOLE graph holds less what this run downloaded**, rather
+    // than a count kept per round: a package fetched in the first round is "already there" to the
+    // second, and adding the rounds up would report it twice.
+    f.already = packages.found.len() - f.got
+
     // **The sum file is written only where nothing went wrong**, so a failed run cannot record a
-    // hash for something it also complained about.
+    // hash for something it also complained about -- and it is written once, here, rather than once
+    // per round.
     if added && !f.failed
         write_text(s"${root}/${SumFile}", render_sums(sums)) match
             Err(e) -> f.notes.push(s"error: cannot write ${root}/${SumFile}: ${e}")
             Ok(_) -> f.notes.push(s"recorded what this project uses in ${SumFile}")
 
-    f
-end fetch_packages
+    (packages, f)
+end fetch_graph
