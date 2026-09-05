@@ -22,6 +22,9 @@ import { byId, setText, on } from slate:dom
 | `attribute(node, name)` | one attribute, or `null` where there is none |
 | `markup(node)` | |
 | `release(node)` | give a handle back |
+| `dispatch(node, event)` | send an event; answers whether nothing cancelled it |
+| `observe(node, options, fn)` | be told what changed; answers `{ disconnect }` |
+| `events(url, options)` | read a server's event stream; answers `{ close }` |
 | `location()` | where the page is, as a record |
 | `pushPath(url)`, `replacePath(url)` | move the address bar without a reload |
 | `back()`, `forward()` | move through what the page has visited |
@@ -32,6 +35,63 @@ import { byId, setText, on } from slate:dom
 **`on` and `off` rather than `addEventListener`**, and `byId` rather than `getElementById`. The DOM's names
 are long because JavaScript had no modules when they were chosen; these are reached through an import that
 already says `dom`.
+
+## Sending an event, and watching for a change
+
+**`dispatch(node, event)` sends what `on` reads**, which is the whole of why its shape is the event
+record's fields and not the DOM's constructors: `type`, and optionally `key`, `button`, `mods`,
+`bubbles` and `cancelable`. A string is the ordinary spelling.
+
+```slate
+dispatch(button, "click")
+dispatch(button, { type: "click", button: 1, mods: { meta: true } })
+dispatch(field, { type: "keydown", key: "Enter" })
+```
+
+It answers `true` where nothing cancelled the event, which is what the DOM's own `dispatchEvent`
+answers and is all a sender can learn. **The event's class is chosen from its name** — a `click` is
+a `MouseEvent` and a `keydown` a `KeyboardEvent` — because a handler reading `e.button` off a plain
+`Event` gets `null`, and a router telling a left click from a middle one would let every dispatched
+click through to the browser.
+
+**`observe(node, options, fn)` is a `MutationObserver`**, and it answers an object whose
+`disconnect` is the one thing that stops it. The options are `children`, `attributes`, `text` and
+`subtree`, and at least one of the first three has to be asked for.
+
+```slate
+val watcher = observe(list, { children: true, subtree: true }, (records) -> redraw(records))
+
+watcher.disconnect()
+```
+
+**A record carries no nodes**, which is the decision an event record already makes: a handle is a
+table slot the program has to give back, and a re-render makes hundreds of records. What a record
+says is `type` (`"children"`, `"attributes"` or `"text"`), `attribute` (the name, or `null`), and
+`added` and `removed` as counts. A program that needs the nodes asks the page with `children` or
+`query`.
+
+## Reading a server's event stream
+
+**`events(url, options)` is the reading end of [`slate:http`](http.md)'s `sse`**, which slate could
+write and had no way at all to consume. It answers an object whose `close` ends the subscription.
+
+```slate
+val feed = events("/updates", {
+    onMessage: (m) -> apply(m.data),
+    onError: (e) -> if e.closed then warn("the stream is over") })
+
+feed.close()
+```
+
+A message is `{ data, lastEventId, type }`. An error record says only `closed`: an `EventSource`
+reconnects by itself, so nearly every error a page sees is a retry in progress, and a program that
+stopped on those would stop on a hiccup.
+
+**A `lastEventId` is refused rather than ignored.** A browser's `EventSource` sends the last id it
+saw on its own reconnections and gives a page no way to set one on the first request — so taking the
+option and dropping it would be a program that believed it had resumed and had not. What a program
+resuming after a reload does instead is keep the `lastEventId` it read off each message and ask the
+server for what it missed.
 
 ## A node is a slate integer
 

@@ -8,6 +8,7 @@
 import { location, pushPath, replacePath, back, onNavigate } from slate:dom
 import { byId, createElement, createText, setAttribute, setChildren, on } from slate:dom
 import { children, tagName, nodeText, attribute } from slate:dom
+import { insertBefore, dispatch, observe, events } from slate:dom
 import { stored, store, unstore, storedKeys, clearStored } from slate:dom
 
 heard(path) = print("navigated " + path)
@@ -111,5 +112,76 @@ print("class " + toJSON(attribute(kids[0], "class")))
 print("bare " + toJSON(attribute(kids[0], "hidden")))
 print("absent " + toJSON(attribute(kids[0], "title")))
 print("whole " + nodeText(shelf))
+
+// -- watching the page change ----------------------------------------------------------------------
+
+// **A framework's own tests reached jsdom's `MutationObserver` directly until this existed**, which
+// is somebody else's API leaking into code written against this one. The records carry no nodes on
+// purpose -- see the runtime -- so what is checked is the kind, the attribute's name and the counts.
+val watched = createElement("div")
+
+setAttribute(watched, "id", "watched")
+insertBefore(app, watched, null)
+
+// **The callback disconnects itself**, which is what makes the driver's later mutation a check of
+// `disconnect` rather than a second helping of the same records. Disconnecting where the observer
+// was made would have been earlier than the first delivery -- a browser queues the records as a
+// microtask -- and would have thrown them away with nothing to say it had.
+heardChanges(records)
+    print("changed " + toJSON(records))
+
+    watcher.disconnect()
+
+val watcher = observe(watched, { children: true, attributes: true }, heardChanges)
+
+setAttribute(watched, "data-state", "on")
+setChildren(watched, [createText("one"), createText("two")])
+
+// -- sending an event ------------------------------------------------------------------------------
+
+// **What `dispatch` may send is what `on` may read**, which is the whole of why the shape is the
+// event record's four fields and not the DOM's constructors.
+val poked = createElement("button")
+
+setAttribute(poked, "id", "poked")
+insertBefore(app, poked, null)
+
+on(poked, "click", (e) -> print("poked " + toJSON(e.button) + " " + toJSON(e.mods)))
+on(poked, "keydown", (e) -> print("typed " + toJSON(e.key)))
+
+print("plain " + toJSON(dispatch(poked, "click")))
+print("modified " + toJSON(dispatch(poked, { type: "click", button: 1, mods: { meta: true, shift: true } })))
+print("keyed " + toJSON(dispatch(poked, { type: "keydown", key: "Enter" })))
+
+// A handler that prevents the default makes `dispatch` answer false, which is what the DOM's own
+// `dispatchEvent` answers and is the only thing a sender can learn.
+val vetoed = createElement("button")
+
+setAttribute(vetoed, "id", "vetoed")
+insertBefore(app, vetoed, null)
+
+on(vetoed, "click", (e) -> e.prevent())
+
+print("prevented " + toJSON(dispatch(vetoed, "click")))
+
+// -- reading a stream of events from a server --------------------------------------------------------
+
+// **The reading end of `slate:http`'s `sse`, which slate could write and could not consume.** jsdom
+// has no `EventSource`, so the driver supplies the smallest one that can be wrong -- which proves
+// the SHAPING and nothing about a browser's own: what the record's fields are called, that a
+// message reaches the handler, and that `close` reaches the source. What a real browser does is
+// still checked by the refusal below, which is what jsdom says without the stub.
+val feed = events("http://example.test/e", {
+    onMessage: (m) -> print("message " + toJSON(m)),
+    onError: (e) -> print("error " + toJSON(e)) })
+
+print("closed " + toJSON(feed.close()))
+
+// A `lastEventId` is refused rather than ignored: a browser sends the last id it saw itself and
+// gives a page no way to set one on the first request.
+print("resume " + (events("http://example.test/e", { lastEventId: "7" }) catch e -> e.message))
+
+// An observer that watches nothing is refused here rather than by a browser's own `TypeError`.
+print("nothing " + (observe(watched, {}, heardChanges) catch e -> e.message))
 
 print("ready")

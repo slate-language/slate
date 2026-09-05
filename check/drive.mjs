@@ -28,10 +28,45 @@ const dom = new JSDOM("<!doctype html><html><body><div id=\"app\"></div></body><
 const w = dom.window
 const said = []
 
+// **jsdom has no `EventSource`, and this is the smallest one that can be wrong.** It proves the
+// SHAPING and nothing about a browser's own: what the record's fields are called, that a message
+// reaches the handler, and that `close` reaches the source. A shim agrees with the code it checks by
+// construction, which is why every other name on this page is driven against jsdom's own DOM and
+// this one is not -- what a real host does with `events` is a thing to check in a browser.
+const closed = []
+
+w.EventSource = class {
+    constructor(url) {
+        this.url = url
+        this.readyState = 1
+        this.onmessage = null
+        this.onerror = null
+        eventSources.push(this)
+    }
+
+    close() {
+        this.readyState = 2
+        closed.push(this.url)
+    }
+}
+
+const eventSources = []
+
 // The program prints with `print`, which the runtime writes through the host's console.
 w.console = { ...w.console, log: (...parts) => said.push(parts.join(" ")) }
 
 w.eval(readFileSync(process.argv[2], "utf8"))
+
+// One message and one error through the stub, delivered after the program has registered for them.
+for (const source of eventSources) {
+    if (source.onmessage !== null)
+        source.onmessage({ data: "hello", lastEventId: "7", type: "message" })
+
+    if (source.onerror !== null) {
+        source.readyState = 2
+        source.onerror({})
+    }
+}
 
 // **A handler that declares nothing and one that declares the event**, both clicked, which is the
 // callback rule where a person actually meets it: `onClick={() -> ...}` is what gets written for a
@@ -49,6 +84,13 @@ marked.dispatchEvent(new w.MouseEvent("click", { bubbles: true, button: 1, metaK
 // **Back is asynchronous in a browser and in jsdom**, the navigation being queued rather than done
 // on the spot, so the `popstate` line cannot be read until the queue has turned.
 w.history.back()
+
+await new Promise((r) => setTimeout(r, 50))
+
+// **A mutation AFTER the observer disconnected itself**, which is the whole of what `disconnect`
+// has to be checked by: the records are queued as a microtask, so an observer that had not really
+// stopped would report this one and the count below would be two.
+w.document.getElementById("watched").appendChild(w.document.createTextNode("three"))
 
 await new Promise((r) => setTimeout(r, 50))
 
@@ -93,19 +135,60 @@ want("a bare attribute is true, which is what setAttribute writes", line(19), "b
 want("an attribute that is not there is null", line(20), "absent null")
 want("an element says everything under it", line(21), "whole apple pear")
 
-want("the program reached the end", line(22), "ready")
+// **What `dispatch` sends is what `on` reads**, which is why each of these is a pair: the line the
+// handler printed and the line saying whether the event was cancelled.
+want("a dispatched click is a MouseEvent, so button 0 and not null", line(22),
+    'poked 0 {"meta":false,"ctrl":false,"shift":false,"alt":false}')
+want("and dispatch answers that nothing cancelled it", line(23), "plain true")
+want("a button and modifiers go where a handler reads them", line(24),
+    'poked 1 {"meta":true,"ctrl":false,"shift":true,"alt":false}')
+want("and that one was not cancelled either", line(25), "modified true")
+want("a key goes where a handler reads it", line(26), 'typed "Enter"')
+want("and a keydown is a KeyboardEvent", line(27), "keyed true")
+
+// **The one thing a sender can learn**, and it is the DOM's own answer: a handler that prevented
+// the default makes `dispatchEvent` false.
+want("a handler that prevents the default says so through dispatch", line(28), "prevented false")
+
+want("close reaches the source", line(29), "closed null")
+want("a lastEventId is refused rather than ignored", line(30),
+    "resume `events` cannot be given a `lastEventId`: a browser's `EventSource` sends the last id " +
+    "it saw itself and gives a page no way to set one -- read `lastEventId` off each message and " +
+    "ask the server for what was missed")
+want("an observer that watches nothing is refused here rather than by a TypeError", line(31),
+    "nothing `observe` watches for at least one of `children`, `attributes` and `text`, and this asks for none")
+
+want("the program reached the end", line(32), "ready")
+
+// The stub's message and its error, delivered after the program registered for them.
+want("a message carries its data, its id and its type", line(33),
+    'message {"data":"hello","lastEventId":"7","type":"message"}')
+want("an error says whether it is over rather than a retry", line(34), 'error {"closed":true}')
 
 // The two clicks, in the order the driver made them.
-want("a handler that declares nothing is called", line(23), "clicked, reading nothing")
-want("and one that declares the event is given it", line(24), "clicked, and the event says click")
+want("a handler that declares nothing is called", line(35), "clicked, reading nothing")
+want("and one that declares the event is given it", line(36), "clicked, and the event says click")
 
 // **The two a router has to tell apart.** A plain left click is one it may intercept; a cmd-click on
 // the middle button is one it must hand to the browser, and without these fields the two are the
 // same event.
-want("a plain left click reads as button 0 with nothing down", line(25),
+want("a plain left click reads as button 0 with nothing down", line(35 + 2),
     'click button 0 mods {"meta":false,"ctrl":false,"shift":false,"alt":false}')
-want("a cmd-shift middle click says so", line(26),
+want("a cmd-shift middle click says so", line(35 + 3),
     'click button 1 mods {"meta":true,"ctrl":false,"shift":true,"alt":false}')
+
+// **Both mutations in ONE batch and neither of them carrying a node**, which is the record's own
+// decision: a handle per added node is a table slot the program would have to give back, and a
+// re-render makes hundreds of records.
+want("an observer is told what changed and how much", line(35 + 4),
+    'changed [{"type":"attributes","attribute":"data-state","added":0,"removed":0},' +
+    '{"type":"children","attribute":null,"added":2,"removed":0}]')
+
+const changes = said.filter((s) => s.startsWith("changed "))
+
+want("and it is told once, the observer having disconnected itself", changes.length, 1)
+want("the source that was closed is the one the page opened", closed.join(","),
+    "http://example.test/e")
 
 // **The push above must NOT have raised `onNavigate`** -- so the only `navigated` line there can be
 // is the one the driver's `back()` caused.
