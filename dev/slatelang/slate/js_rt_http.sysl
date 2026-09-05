@@ -1,0 +1,530 @@
+module dev.slatelang.slate
+
+// `slate:llhttp` in the JavaScript back end -- the HTTP/1.1 request parser, written out.
+//
+// **This is the one place the two back ends do not share an implementation of a thing they both
+// have.** The interpreter's parser is llhttp, a C state machine generated from a grammar;
+// `http_parse.sysl` is the door onto it. A JavaScript host has no llhttp and node's own parser is
+// behind `internalBinding('http_parser')`, which is exactly the seam node hid and undici had to
+// route around by carrying llhttp compiled to wasm. So this is a parser rather than a binding.
+//
+// **What that costs is that two readings of one grammar have to agree, and what pays for it is
+// `slate:http`.** The server, the router, the response writer and the whole of what a handler is
+// given are written in slate and shared; only the recognising of bytes is here. Without it `listen`
+// would be a socket nothing could speak HTTP over, which is not what a consumer asked for.
+//
+// ## The three refusals, and why they are three
+//
+// **A refusal is an ANSWER and not a fault**, which is the contract `slate:http` already reads: it
+// is the ordinary thing a server does about a bad client, and a fault would take the server down
+// with the request.
+//
+// - **`400` is bytes that were not HTTP.** A request line that is not one, a header that is not one,
+//   a version this does not speak, and the request-smuggling shapes -- two `Content-Length` headers,
+//   or one beside a `Transfer-Encoding` -- which llhttp refuses by construction and this refuses by
+//   name. One hop reads a body where the next reads two requests.
+// - **`431` is a HEAD larger than the limit**, which is HTTP this server has decided not to hold
+//   rather than a client that is broken.
+// - **`413` is a BODY larger than the limit**, for the same reason and about the other half.
+//
+// ## What is deliberately not here
+//
+// **Responses.** `httpParser` and `httpStream` both parse REQUESTS, which is what the interpreter's
+// two make and what `slate:http` asks for; a client that keeps its connections would want the other
+// direction and nothing in slate has one yet.
+//
+// **Obsolete line folding.** A header continued on the next line with leading whitespace has been
+// forbidden since RFC 7230 and is a smuggling primitive of its own; llhttp refuses it without
+// `lenient` and so does this.
+
+js_runtime_http() -> string = raw"""
+        // -- the HTTP/1.1 request parser -------------------------------------------------------------
+
+        // **The id is an index and is never reused**, so a stale or invented one answers emptily
+        // rather than reaching a live connection. A program may hold an integer it made up.
+        const parsers = []
+
+        // **The count is checked before the kind**, which is the interpreter's order and matters:
+        // four type errors for one missing argument is the commonest way a diagnostic becomes noise.
+        const wantParserArgs = (args, want, name, takes) => {
+            if (args.length !== want)
+                fault("`" + name + "` takes " + takes + ", and was given " + args.length +
+                    (args.length === 1 ? " argument" : " arguments"))
+        }
+
+        const parserAt = (v, name) => {
+            if (typeof Buffer === "undefined")
+                fault("`" + name + "` needs a host with sockets, and this JavaScript host has none")
+
+            if (!$.isInt(v)) fault("`" + name + "` takes a parser, and this is " + typeName(v))
+
+            const p = parsers[Number(v)]
+
+            return p === undefined || p === null ? null : p
+        }
+
+        const wantLimit = (v, name) => {
+            if (!$.isInt(v)) fault("`" + name + "` takes its limits as numbers of bytes, and one of them is " + typeName(v))
+
+            return Number(v)
+        }
+
+        const newParser = (streaming, headLimit, bodyLimit) => {
+            parsers.push({
+                streaming: streaming,
+                headLimit: headLimit,
+                bodyLimit: bodyLimit,
+                buf: Buffer.alloc(0),
+                done: [],
+                parts: [],
+                upgraded: null,
+                stopped: false,
+                state: "head",
+                head: null,
+                body: null,
+                need: 0,
+                chunked: false
+            })
+
+            return BigInt(parsers.length - 1)
+        }
+
+        // -- reading a head ---------------------------------------------------------------------------
+
+        // A refusal, as the object `httpFeed` answers with.
+        const httpRefusal = (status, message) => $.obj([["status", BigInt(status)], ["message", message]])
+
+        // The tokens of a comma-separated header field, lower-cased and trimmed.
+        const httpTokens = (value) => value.toLowerCase().split(",").map((t) => t.trim())
+
+        // Whether a header name is one at all. **RFC 9110's `token`**, and a name outside it is a
+        // request that was not HTTP -- a space before the colon is the oldest smuggling trick there
+        // is.
+        const httpName = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/
+
+        // What a head says, or the status that refuses it.
+        //
+        // **The head is ASCII by the grammar** and is read as latin1 rather than as UTF-8, which is
+        // what keeps a byte that is not text out of the parse: every byte becomes exactly one
+        // character and nothing is replaced.
+        const readHead = (text) => {
+            const lines = text.split("\r\n")
+            const line = lines[0].split(" ")
+
+            if (line.length !== 3) return { status: 400, message: "this is not a request line" }
+
+            const method = line[0]
+            const target = line[1]
+            const version = line[2]
+
+            if (!httpName.test(method)) return { status: 400, message: "this is not a method" }
+            if (target.length === 0) return { status: 400, message: "this request line has no target" }
+
+            if (version !== "HTTP/1.1" && version !== "HTTP/1.0")
+                return { status: 400, message: "this server speaks HTTP/1.1 and HTTP/1.0, and this says " + version }
+
+            const names = []
+            const values = []
+            let length = null
+            let encoded = false
+            let connection = []
+
+            for (let i = 1; i < lines.length; i++) {
+                const at = lines[i]
+
+                if (at.length === 0) continue
+
+                // **A continuation line is refused rather than joined.** Obsolete folding has been
+                // forbidden since RFC 7230 and is a smuggling primitive of its own.
+                if (at.startsWith(" ") || at.startsWith("\t"))
+                    return { status: 400, message: "a header continued onto the next line, which is not allowed" }
+
+                const cut = at.indexOf(":")
+
+                if (cut < 1) return { status: 400, message: "this is not a header" }
+
+                const name = at.slice(0, cut)
+
+                if (!httpName.test(name)) return { status: 400, message: "`" + name + "` is not a header name" }
+
+                const value = at.slice(cut + 1).trim()
+                const lower = name.toLowerCase()
+
+                if (lower === "content-length") {
+                    // **A SECOND `Content-Length` IS THE CLASSIC SMUGGLING SHAPE**, and llhttp
+                    // refuses it whatever the two say.
+                    if (length !== null) return { status: 400, message: "this request has two `Content-Length` headers" }
+                    if (!/^[0-9]+$/.test(value)) return { status: 400, message: "`Content-Length` is not a number" }
+
+                    length = Number(value)
+                } else if (lower === "transfer-encoding") {
+                    const codings = httpTokens(value)
+
+                    for (const coding of codings)
+                        if (coding !== "chunked" && coding !== "identity")
+                            return { status: 400, message: "this server reads `chunked` and no other transfer encoding, and this says " + coding }
+
+                    if (codings[codings.length - 1] === "chunked") encoded = true
+                } else if (lower === "connection") connection = connection.concat(httpTokens(value))
+
+                names.push(name)
+                values.push(value)
+            }
+
+            // **`Content-Length` BESIDE A `Transfer-Encoding` is the other half of the same
+            // primitive**, one hop framing by the length and the next by the chunks.
+            if (encoded && length !== null)
+                return { status: 400, message: "this request has both a `Content-Length` and a `Transfer-Encoding`" }
+
+            const keepAlive = version === "HTTP/1.1"
+                ? !connection.includes("close")
+                : connection.includes("keep-alive")
+
+            return {
+                method: method,
+                target: target,
+                names: names,
+                values: values,
+                keepAlive: keepAlive,
+                upgrade: connection.includes("upgrade") || method === "CONNECT",
+                length: length,
+                chunked: encoded
+            }
+        }
+
+        // -- what a program is handed -----------------------------------------------------------------
+
+        const httpRequestObject = (head, body) => {
+            const headers = new $.SObj()
+
+            for (let i = 0; i < head.names.length; i++)
+                headers.setName(head.names[i].toLowerCase(), head.values[i])
+
+            const cut = head.target.indexOf("?")
+            const entries = [
+                ["method", head.method],
+                ["path", cut < 0 ? head.target : head.target.slice(0, cut)],
+                ["search", cut < 0 ? "" : head.target.slice(cut + 1)],
+                ["headers", headers]
+            ]
+
+            if (body !== null) {
+                // **`body` IS THE TEXT AND `bytes` IS WHAT ARRIVED**, and a body that is not UTF-8
+                // makes the first `""` and leaves the second exact -- a PNG posted to a route is
+                // otherwise the same value as a request with no body at all.
+                let text = ""
+
+                try {
+                    text = new TextDecoder("utf-8", { fatal: true }).decode(body)
+                } catch (e) {
+                    text = ""
+                }
+
+                const bytes = []
+
+                for (const b of body) bytes.push(BigInt(b))
+
+                entries.push(["body", text])
+                entries.push(["bytes", bytes])
+            }
+
+            entries.push(["keepAlive", head.keepAlive])
+            entries.push(["upgrade", head.upgrade])
+
+            return $.obj(entries)
+        }
+
+        // -- feeding ------------------------------------------------------------------------------------
+
+        // One message has finished. A whole-request parser queues the request; a streaming one has
+        // already handed the head and the body over and says only that it is over.
+        const httpFinished = (p) => {
+            if (p.streaming) p.parts.push($.obj([["kind", "end"]]))
+            else p.done.push(httpRequestObject(p.head, p.body === null ? Buffer.alloc(0) : p.body))
+
+            p.head = null
+            p.body = null
+            p.state = "head"
+            p.chunked = false
+            p.need = 0
+        }
+
+        // Hand a piece of a body to a streaming parser's queue.
+        const httpChunkPart = (piece) => {
+            const bytes = []
+
+            for (const b of piece) bytes.push(BigInt(b))
+
+            return $.obj([["kind", "body"], ["chunk", bytes]])
+        }
+
+        // Everything the buffer holds, as far as it goes. **Answers a refusal or nothing**, and
+        // leaves whatever it could not use in `p.buf`.
+        const httpAdvance = (p) => {
+            for (;;) {
+                if (p.stopped) return null
+
+                if (p.state === "head") {
+                    const end = p.buf.indexOf("\r\n\r\n", 0, "latin1")
+
+                    if (end < 0) {
+                        if (p.buf.length > p.headLimit)
+                            return httpRefusal(431, "the head is larger than " + p.headLimit + " bytes")
+
+                        return null
+                    }
+
+                    if (end + 4 > p.headLimit)
+                        return httpRefusal(431, "the head is larger than " + p.headLimit + " bytes")
+
+                    const head = readHead(p.buf.toString("latin1", 0, end))
+
+                    if (head.status !== undefined) return httpRefusal(head.status, head.message)
+
+                    p.buf = p.buf.subarray(end + 4)
+                    p.head = head
+                    p.body = p.streaming ? null : Buffer.alloc(0)
+
+                    if (p.streaming) {
+                        const kept = httpRequestObject(head, null)
+
+                        kept.setName("kind", "head")
+                        p.parts.push(kept)
+                    }
+
+                    // **An upgrade STOPS the parse where the HTTP stopped**, everything after it
+                    // belonging to whatever protocol was upgraded to.
+                    if (head.upgrade) {
+                        p.stopped = true
+                        httpFinished(p)
+
+                        return null
+                    }
+
+                    if (head.chunked) {
+                        p.state = "chunkSize"
+                        p.chunked = true
+                    } else if (head.length !== null && head.length > 0) {
+                        if (!p.streaming && head.length > p.bodyLimit)
+                            return httpRefusal(413, "the body is larger than " + p.bodyLimit + " bytes")
+
+                        p.state = "body"
+                        p.need = head.length
+                    } else httpFinished(p)
+
+                    continue
+                }
+
+                if (p.state === "body") {
+                    if (p.buf.length === 0) return null
+
+                    const take = Math.min(p.need, p.buf.length)
+                    const piece = p.buf.subarray(0, take)
+
+                    p.buf = p.buf.subarray(take)
+                    p.need -= take
+
+                    if (p.streaming) p.parts.push(httpChunkPart(piece))
+                    else {
+                        p.body = Buffer.concat([p.body, piece])
+
+                        if (p.body.length > p.bodyLimit)
+                            return httpRefusal(413, "the body is larger than " + p.bodyLimit + " bytes")
+                    }
+
+                    if (p.need === 0) httpFinished(p)
+
+                    continue
+                }
+
+                if (p.state === "chunkSize") {
+                    const end = p.buf.indexOf("\r\n", 0, "latin1")
+
+                    if (end < 0) {
+                        if (p.buf.length > p.headLimit)
+                            return httpRefusal(400, "this chunk size is not one")
+
+                        return null
+                    }
+
+                    // **The extensions after a `;` are read and thrown away**, which is what the
+                    // grammar says to do with them.
+                    const said = p.buf.toString("latin1", 0, end).split(";")[0].trim()
+
+                    if (!/^[0-9a-fA-F]+$/.test(said)) return httpRefusal(400, "this chunk size is not one")
+
+                    const size = parseInt(said, 16)
+
+                    p.buf = p.buf.subarray(end + 2)
+
+                    if (size === 0) {
+                        p.state = "trailer"
+
+                        continue
+                    }
+
+                    p.state = "chunk"
+                    p.need = size
+
+                    continue
+                }
+
+                if (p.state === "chunk") {
+                    if (p.buf.length === 0) return null
+
+                    const take = Math.min(p.need, p.buf.length)
+                    const piece = p.buf.subarray(0, take)
+
+                    p.buf = p.buf.subarray(take)
+                    p.need -= take
+
+                    if (p.streaming) p.parts.push(httpChunkPart(piece))
+                    else {
+                        p.body = Buffer.concat([p.body, piece])
+
+                        if (p.body.length > p.bodyLimit)
+                            return httpRefusal(413, "the body is larger than " + p.bodyLimit + " bytes")
+                    }
+
+                    if (p.need === 0) p.state = "chunkEnd"
+
+                    continue
+                }
+
+                if (p.state === "chunkEnd") {
+                    if (p.buf.length < 2) return null
+                    if (p.buf.toString("latin1", 0, 2) !== "\r\n") return httpRefusal(400, "this chunk did not end where it said it would")
+
+                    p.buf = p.buf.subarray(2)
+                    p.state = "chunkSize"
+
+                    continue
+                }
+
+                // The trailer, which ends at the blank line after the last chunk.
+                const end = p.buf.indexOf("\r\n", 0, "latin1")
+
+                if (end < 0) return null
+
+                if (end === 0) {
+                    p.buf = p.buf.subarray(2)
+
+                    httpFinished(p)
+
+                    continue
+                }
+
+                p.buf = p.buf.subarray(end + 2)
+            }
+        }
+
+        // -- the eight names ----------------------------------------------------------------------------
+
+        B.httpParser = (...args) => {
+            wantParserArgs(args, 2, "httpParser", "a head limit and a body limit")
+
+            if (typeof Buffer === "undefined")
+                fault("`httpParser` needs a host with sockets, and this JavaScript host has none")
+
+            return newParser(false, wantLimit(args[0], "httpParser"), wantLimit(args[1], "httpParser"))
+        }
+
+        B.httpStream = (...args) => {
+            wantParserArgs(args, 1, "httpStream", "a head limit")
+
+            if (typeof Buffer === "undefined")
+                fault("`httpStream` needs a host with sockets, and this JavaScript host has none")
+
+            return newParser(true, wantLimit(args[0], "httpStream"), Number.MAX_SAFE_INTEGER)
+        }
+
+        B.httpFeed = (...args) => {
+            wantParserArgs(args, 2, "httpFeed", "a parser and some bytes")
+
+            const v = args[0]
+            const bytes = args[1]
+            const p = parserAt(v, "httpFeed")
+
+            if (p === null) return null
+
+            if (!Array.isArray(bytes)) fault("`httpFeed` takes the bytes as an array, and this is " + typeName(bytes))
+
+            const raw = []
+
+            for (const b of bytes) {
+                if (!$.isInt(b)) fault("`httpFeed` takes an array of numbers, and one of these is " + typeName(b))
+
+                const n = Number(b)
+
+                if (n < 0 || n > 255) fault("a byte is between 0 and 255, and this is " + n)
+
+                raw.push(n)
+            }
+
+            // **`httpUpgraded` counts bytes of the LAST feed**, so what was already buffered before
+            // this one arrived does not count towards it.
+            const held = p.buf.length
+
+            p.buf = Buffer.concat([p.buf, Buffer.from(raw)])
+            p.upgraded = null
+
+            const before = p.buf.length
+            const refused = httpAdvance(p)
+
+            if (p.stopped && p.upgraded === null) {
+                const consumed = before - p.buf.length
+
+                p.upgraded = Math.max(0, consumed - held)
+            }
+
+            return refused
+        }
+
+        B.httpTake = (...args) => {
+            wantParserArgs(args, 1, "httpTake", "a parser")
+
+            const p = parserAt(args[0], "httpTake")
+
+            if (p === null || p.done.length === 0) return null
+
+            return p.done.shift()
+        }
+
+        B.httpTakePart = (...args) => {
+            wantParserArgs(args, 1, "httpTakePart", "a parser")
+
+            const p = parserAt(args[0], "httpTakePart")
+
+            if (p === null || p.parts.length === 0) return null
+
+            return p.parts.shift()
+        }
+
+        // **The peer has stopped sending**, so a request whose body ends at end-of-file completes.
+        // A request never has one -- every framing here is a length or a set of chunks -- so this
+        // finishes nothing and is here because the seam has it.
+        B.httpFinish = (...args) => {
+            wantParserArgs(args, 1, "httpFinish", "a parser")
+            parserAt(args[0], "httpFinish")
+
+            return null
+        }
+
+        // **Zero is representable, so a caller tests `!= null` and never truthiness.** A boundary at
+        // the very start of a chunk would otherwise read as no upgrade at all.
+        B.httpUpgraded = (...args) => {
+            wantParserArgs(args, 1, "httpUpgraded", "a parser")
+
+            const p = parserAt(args[0], "httpUpgraded")
+
+            return p === null || p.upgraded === null ? null : BigInt(p.upgraded)
+        }
+
+        B.httpClose = (...args) => {
+            wantParserArgs(args, 1, "httpClose", "a parser")
+
+            if (parserAt(args[0], "httpClose") !== null) parsers[Number(args[0])] = null
+
+            return null
+        }
+"""

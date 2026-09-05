@@ -40,6 +40,10 @@ main()
 | `startTls(sock, options)` | a promise that settles when the handshake finishes |
 | `alpnProtocol(conn)` | which application protocol was agreed, or `null` |
 
+**Under [`slate js`](../reference/javascript.md) this is node's own TCP**, and everything above is the
+same. TLS is the exception: `startTls`, and a `listen` given a `cert` and a `key`, both refuse there
+naming TLS. A browser has no sockets at all and says so.
+
 ## Promises and callbacks
 
 **`connect` and `send` answer promises of a result; `listen`, `onData` and `onBytes` take callbacks.**

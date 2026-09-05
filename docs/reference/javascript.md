@@ -38,10 +38,15 @@ way.
 
 ## What is not there yet
 
-**`slate:net`, `slate:password`, `slate:llhttp`, `slate:process`'s `run`, and the modules written
-over them.** Each is a name that says *"not in the JavaScript back end yet"* when a program reaches
-it, rather than a name that is not there — so a program is told which half of the world it is in.
-**No global is on that list any more**; `fetch` was the last and has its own section below.
+**`slate:password`, `slate:process`'s `run`, `slate:redis`, `slate:nghttp2`, and TLS.** Each is a
+name that says *"not in the JavaScript back end yet"* when a program reaches it, rather than a name
+that is not there — so a program is told which half of the world it is in. **No global is on that
+list any more**; `fetch` was the last and has its own section below.
+
+**`slate:net` and `slate:llhttp` came OFF that list in 0.0.31**, and they are what everything above
+a socket stands on — see the section below. What is still owed of the transport is TLS: `startTls`
+refuses naming it, and `listen` given a `cert` and a `key` refuses in the same words, so an HTTPS
+server is the interpreter's for now.
 
 **`slate:brotli` is NOT on that list, and the difference matters.** No JavaScript host has a brotli
 encoder and none is coming, so *"not yet"* would be a promise nobody can keep. `compress` and
@@ -329,6 +334,44 @@ of the subject, which is what `regex.sysl` does for the other back end.
   raises a fault naming it; `RegExp` has no such limit in any browser, so `(a+)+$` against a subject that
   does not match stops answering rather than complaining. That is a thing a JavaScript host does not
   have.
+
+### `slate:net` is node's own TCP, and the request parser is written out
+
+**This is the floor everything else stands on, and it was missing.** `slate:http` is written in slate
+over `listen`, `onBytes`, `send` and `close`, so a server could not be started under `slate js` at
+all — and a framework checking its router by rendering a page through a real request had two tests
+skipping on every run for want of a listener.
+
+**A socket is a slot and a generation, exactly as it is in the interpreter**, so nothing of node's
+crosses into a slate value: `==` compares what slate says it compares, `print` answers `<socket 3>`,
+and a socket held across a `close` never comes to mean whatever opens next.
+
+**A BROWSER HAS NO SOCKETS AND NEVER WILL**, so this is node's half of the JavaScript world. Nothing
+in a page may listen and nothing in one may open a TCP connection; the refusal there names the host
+rather than promising anything, which is `slate:brotli`'s case and not `run`'s.
+
+**The reader is installed at the first `onData` or `onBytes` and never at accept.** A node socket is
+paused until something listens for `data`, and slate's rule is that a connection handed to a program
+is the program's to read when it is ready — installing earlier would drain the first packets of every
+connection into a callback nobody had registered, which is a request lost with nothing to say so.
+
+**`alpnProtocol` is here and answers `null` for a plain socket**, which is what the interpreter
+answers and is what `slate:http` reads at the first byte of every connection to tell HTTP/2 from
+HTTP/1.1. A name that refused would make every `serve` fault over a question whose answer is *no*.
+
+**`slate:llhttp` is a PARSER here rather than a binding**, and it is the one place the two back ends
+do not share an implementation of something they both have. The interpreter's is llhttp, a C state
+machine generated from a grammar; node's own is behind `internalBinding('http_parser')` — the seam
+node hid, and the reason undici carries llhttp compiled to wasm. So the HTTP/1.1 request grammar is
+written out, and `tests/js/p26.sl` is what says the two readings agree: the request line, the
+headers, `Content-Length` and `chunked` framing, pipelining, a head split across two arrivals, an
+upgrade and where the HTTP stopped, and the three refusals — `400` for bytes that were not HTTP
+(including two `Content-Length` headers, and one beside a `Transfer-Encoding`), `431` for a head
+over the limit and `413` for a body over it.
+
+**A message's own error text is the host's**, which is the one thing that cannot be made to match: a
+refused connection carries node's `ECONNREFUSED: …` where the interpreter carries libuv's. The
+*code* is the same word on both, that being the operating system's.
 
 ### `slate:ws` is a CLIENT here, and the server half is what a browser cannot have
 

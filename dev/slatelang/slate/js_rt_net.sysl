@@ -1,0 +1,416 @@
+module dev.slatelang.slate
+
+// `slate:net` in the JavaScript back end -- TCP, over node's own `net`.
+//
+// **The whole module was OWED until now, and what that cost is not `slate:net` itself.**
+// `slate:http` is written in slate over these names, so a server could not be started under
+// `slate js` at all -- and `slate-language/lath`, whose router is checked by rendering a page
+// through a real request, had two tests skipping on every run because the host had no listener.
+// Everything above the socket was already there; this is the floor it stands on.
+//
+// **A BROWSER HAS NO SOCKETS AND NEVER WILL**, so this is node's half of the JavaScript world and
+// says so by name. Nothing in a page may listen and nothing in one may open a TCP connection; that
+// is not a gap a future release closes, which is why the sentence names the host rather than
+// promising anything.
+//
+// ## What is here and what is still owed
+//
+// **TLS is not.** `startTls` and a listener told a certificate both refuse, naming TLS, because a
+// handshake in this back end is node's `tls` and not OpenSSL -- a different trust store, a different
+// set of sentences for a certificate that does not verify, and nothing here has been run against
+// either. `alpnProtocol` IS here and answers `null`, which is what a plain socket answers on both
+// back ends and is what `slate:http` reads to tell HTTP/2 from HTTP/1.1: without it every `serve`
+// would fault at its first byte over a question whose answer is *no*.
+//
+// ## A socket is a SLOT and a GENERATION
+//
+// `$.SSocket` is the interpreter's `Socket(id, gen)` word for word, and for its reason: the value a
+// program holds carries the generation that claimed the slot, so a socket held across a `close`
+// never comes to mean whatever opens next. Nothing of node's crosses into a slate value.
+//
+// **THE READER IS INSTALLED LATE AND ON PURPOSE.** A node socket is paused until something listens
+// for `data`, and slate's rule is that a connection handed to a program is the program's to read
+// when it is ready -- so the `data` listener goes on at the first `onData` or `onBytes` and never at
+// accept. Installing it earlier would drain the first packets of every connection into a callback
+// that had not been registered yet, which is a request lost with nothing to say so.
+
+js_runtime_net() -> string = raw"""
+        // -- sockets ---------------------------------------------------------------------------------
+
+        // node's own TCP, or nothing where there is none.
+        //
+        // **`require` rather than a global, because there is no global to read.** A browser has
+        // neither, and the two conditions are asked separately so that a host with `process` and no
+        // module loader answers the same *no* rather than throwing.
+        const netHost = (() => {
+            if (typeof process === "undefined" || typeof require !== "function") return null
+
+            try {
+                return require("node:net")
+            } catch (e) {
+                return null
+            }
+        })()
+
+        const noSockets = (name) =>
+            fault("`" + name + "` needs a host with sockets, and this JavaScript host has none")
+
+        const noTls = (name) =>
+            fault("`" + name + "` needs TLS, which is not in the JavaScript back end yet")
+
+        // One slot per socket, and a slot is given back by `close` and reused. **The generation is
+        // what stops the value a program still holds from coming to mean its successor**, which is
+        // the same arrangement the timers and `slate:dom`'s handles run on.
+        const socks = []
+        const spareSocks = []
+        let socketGen = 0
+
+        const takeSocket = (handle, listening) => {
+            socketGen += 1
+
+            const slot = {
+                handle: handle,
+                listening: listening,
+                gen: socketGen,
+                reader: null,
+                asText: true,
+                onError: null,
+                reading: false,
+                closed: false
+            }
+
+            const spare = spareSocks.pop()
+
+            if (spare !== undefined) {
+                socks[spare] = slot
+
+                return new $.SSocket(spare, socketGen)
+            }
+
+            socks.push(slot)
+
+            return new $.SSocket(socks.length - 1, socketGen)
+        }
+
+        // What a program is holding, or the sentence saying it is not that.
+        //
+        // **The two refusals are the interpreter's own, word for word.** One is about the kind of
+        // value and the other about a socket that has been given back, and a program telling them
+        // apart is a program that knows whether it wrote the wrong name or closed too early.
+        const socketOf = (v, name) => {
+            if (!(v instanceof $.SSocket)) fault("`" + name + "` takes a socket, and this is " + typeName(v))
+
+            const slot = socks[v.id]
+
+            if (slot === undefined || slot === null || slot.gen !== v.gen || slot.closed)
+                fault("this socket is closed, and `" + name + "` needs an open one")
+
+            return slot
+        }
+
+        // A function to call back, checked the way the interpreter checks one.
+        const wantHandler = (v, sentence) => {
+            if (typeof v !== "function") fault(sentence + typeName(v))
+
+            return v
+        }
+
+        // What node calls an error, as one sentence. **node's `code` and libuv's spelling are the
+        // same word** -- `ECONNREFUSED`, `ENOTFOUND` -- so the two back ends name the same cause even
+        // where the rest of the sentence differs, which is the most that can be promised about an
+        // operating system's own message.
+        const netWhy = (e) => {
+            if (e === null || e === undefined) return "unknown error"
+            if (e.code !== undefined && e.message !== undefined) return e.code + ": " + e.message
+
+            return String(e.message === undefined ? e : e.message)
+        }
+
+        // An IPv4 client of a dual-stack listener is written the way it dialled.
+        //
+        // **Not cosmetic**: node binds `::` for a listener with no host, so every IPv4 peer arrives
+        // as `::ffff:127.0.0.1` -- and an allow-list or a rate limit keyed on `127.0.0.1` would match
+        // nothing at all. The interpreter takes the same prefix off for the same reason.
+        const unmapped = (ip) => ip.startsWith("::ffff:") ? ip.slice(7) : ip
+
+        // Hand one chunk, or the end of the stream, to whoever is reading.
+        //
+        // **The end of a stream is `null` and not a failure**, which is the right distinction and not
+        // merely libuv's: a peer closing its half is how a request ordinarily ends.
+        const deliverChunk = (slot, value) => {
+            const f = slot.reader
+
+            if (f === null) return
+
+            $.callback(f, [value], slot.asText ? "onData" : "onBytes")
+        }
+
+        // A socket failed. **The reason goes to `onError` where there is one and the stream ends
+        // either way**, which is the interpreter's rule: a reset is something any peer can produce,
+        // so it arrives as the same `null` a peer that finished sends and `onError` is how a program
+        // tells the two apart.
+        const failStream = (slot, why) => {
+            if (slot.onError !== null) $.callback(slot.onError, [why], "onError")
+            else deliverChunk(slot, null)
+        }
+
+        // Start delivering what arrives, once. **A second `onData` swaps the slate callback and does
+        // not add a second node listener**, which is what makes a protocol that changes what it
+        // expects halfway through writable at all -- and is why the flow is not started twice.
+        const startReading = (slot) => {
+            if (slot.reading || slot.listening) return
+
+            slot.reading = true
+
+            slot.handle.on("data", (buf) => {
+                if (slot.asText) {
+                    // **A chunk is a chunk and not a message**, so this can split a character in half
+                    // where a peer sends one across two packets -- and a chunk that is not text at
+                    // all fails the connection rather than arriving as replacement characters.
+                    const said = new TextDecoder("utf-8", { fatal: true })
+
+                    let text = null
+
+                    try {
+                        text = said.decode(buf)
+                    } catch (e) {
+                        failStream(slot, "this chunk is not text -- `onBytes` reads a socket that carries something else")
+
+                        return
+                    }
+
+                    deliverChunk(slot, text)
+
+                    return
+                }
+
+                const bytes = []
+
+                for (const b of buf) bytes.push(BigInt(b))
+
+                deliverChunk(slot, bytes)
+            })
+
+            slot.handle.on("end", () => deliverChunk(slot, null))
+            slot.handle.on("error", (e) => failStream(slot, "this connection failed: " + netWhy(e)))
+        }
+
+        // A listener's own options, which is a port or a record carrying one.
+        const listenPort = (v) => {
+            if ($.isInt(v)) return Number(v)
+
+            if (v instanceof $.SObj) {
+                if (v.hasName("cert") || v.hasName("key")) noTls("listen")
+
+                const port = v.getName("port")
+
+                if (!$.isInt(port)) fault("`listen` takes a port, and this is " + typeName(port))
+
+                return Number(port)
+            }
+
+            fault("`listen` takes a port or a record of options, and this is " + typeName(v))
+        }
+
+        B.listen = (where, f) => {
+            if (netHost === null) noSockets("listen")
+
+            wantHandler(f, "`listen` needs a function to call with each connection, and this is ")
+
+            const port = listenPort(where)
+
+            if (port < 0 || port > 65535) fault("a port is between 0 and 65535, and this is " + port)
+
+            const server = netHost.createServer()
+            const value = takeSocket(server, true)
+
+            server.on("connection", (conn) => {
+                // **The connection gets a slot of its own and no reader**, exactly as it does in the
+                // interpreter: it is the program's to read from, write to and close.
+                const held = takeSocket(conn, false)
+
+                conn.pause()
+                $.callback(f, [held], "listen")
+            })
+
+            // **A listener that cannot bind is a fault and not a result**, which is the interpreter's
+            // reading: a port already taken is a mistake in the program or in what is running beside
+            // it, where a refused *connection* is the ordinary thing a client handles.
+            server.on("error", (e) => fault("cannot listen on port " + port + ": " + netWhy(e)))
+            server.listen(port)
+
+            return value
+        }
+
+        B.connect = (host, port) => {
+            if (netHost === null) noSockets("connect")
+
+            wantString(host, "connect")
+
+            if (!$.isInt(port)) fault("`connect` takes a port, and this is " + typeName(port))
+
+            const n = Number(port)
+
+            if (n < 0 || n > 65535) fault("a port is between 0 and 65535, and this is " + n)
+
+            // **A refused connection is a settled promise and not a thrown complaint**, a peer that
+            // is not there being the ordinary thing a client deals with.
+            return new Promise((resolve) => {
+                const conn = netHost.connect({ host: host, port: n })
+                const held = takeSocket(conn, false)
+                let settled = false
+
+                conn.pause()
+
+                conn.once("connect", () => {
+                    if (settled) return
+
+                    settled = true
+
+                    resolve($.obj([["ok", true], ["value", held]]))
+                })
+
+                conn.once("error", (e) => {
+                    if (settled) return
+
+                    settled = true
+
+                    dropSocket(held.id, held.gen)
+                    resolve($.obj([["ok", false], ["error", "cannot connect to " + host + ":" + n + ": " + netWhy(e)]]))
+                })
+            })
+        }
+
+        const readSocket = (v, f, asText) => {
+            const name = asText ? "onData" : "onBytes"
+
+            wantHandler(f, "`" + name + "` needs a function to call with each chunk, and this is ")
+
+            const slot = socketOf(v, name)
+
+            slot.reader = f
+            slot.asText = asText
+
+            startReading(slot)
+
+            if (!slot.listening) slot.handle.resume()
+
+            return null
+        }
+
+        B.onData = (v, f) => readSocket(v, f, true)
+        B.onBytes = (v, f) => readSocket(v, f, false)
+
+        B.onError = (v, f) => {
+            wantHandler(f, "`onError` needs a function to call with the reason, and this is ")
+
+            socketOf(v, "onError").onError = f
+
+            return null
+        }
+
+        // `send(sock, v)` -- a promise that settles when the bytes have gone. **An array is sent as
+        // bytes**, which is the one thing about this call a program has to know.
+        B.send = (v, data) => {
+            const slot = socketOf(v, "send")
+
+            let payload = null
+
+            if ($.isStr(data)) payload = Buffer.from(data, "utf8")
+            else if (Array.isArray(data)) {
+                const bytes = []
+
+                for (const b of data) {
+                    if (!$.isInt(b)) fault("`send` takes an array of numbers, and one of these is " + typeName(b))
+
+                    const n = Number(b)
+
+                    if (n < 0 || n > 255) fault("a byte is between 0 and 255, and this is " + n)
+
+                    bytes.push(n)
+                }
+
+                payload = Buffer.from(bytes)
+            } else fault("`send` takes a string or an array of numbers, and this is " + typeName(data))
+
+            return new Promise((resolve) => {
+                slot.handle.write(payload, (e) => {
+                    if (e === null || e === undefined) resolve($.obj([["ok", true], ["value", null]]))
+                    else resolve($.obj([["ok", false], ["error", "cannot send: " + netWhy(e)]]))
+                })
+            })
+        }
+
+        // Give a slot back, which is what lets the program exit.
+        const dropSocket = (id, gen) => {
+            const slot = socks[id]
+
+            if (slot === undefined || slot === null || slot.gen !== gen || slot.closed) return
+
+            slot.closed = true
+            slot.reader = null
+            slot.onError = null
+            socks[id] = null
+            spareSocks.push(id)
+
+            try {
+                if (slot.listening) slot.handle.close()
+                else slot.handle.destroy()
+            } catch (e) {
+                // **A socket the host has already torn down is nothing to say about**, which is the
+                // same reading closing twice gets below.
+            }
+        }
+
+        B.close = (v) => {
+            if (!(v instanceof $.SSocket)) fault("`close` takes a socket, and this is " + typeName(v))
+
+            // **Closing a socket twice is not an error.** A server closing its connections and a read
+            // callback closing its own on end-of-stream is the ordinary way to write this, and making
+            // the second one a failure would make the ordinary way wrong.
+            dropSocket(v.id, v.gen)
+
+            return null
+        }
+
+        B.localPort = (v) => {
+            const slot = socketOf(v, "localPort")
+
+            const port = slot.listening
+                ? (slot.handle.address() === null ? null : slot.handle.address().port)
+                : slot.handle.localPort
+
+            if (port === null || port === undefined) fault("this socket has no address")
+
+            return BigInt(port)
+        }
+
+        // **`null` where the socket has no other end**, which is a listener and a socket that has
+        // been closed. That is an answer rather than a fault: a program asking who connected is
+        // asking about a thing that may not be there.
+        B.remoteAddress = (v) => {
+            const slot = socketOf(v, "remoteAddress")
+
+            if (slot.listening) return null
+
+            const ip = slot.handle.remoteAddress
+
+            return ip === null || ip === undefined ? null : unmapped(ip)
+        }
+
+        // **`null` on a plain socket, which is what both back ends answer and is why this is here
+        // rather than on the owed list.** `slate:http` reads it at the first byte of every connection
+        // to tell HTTP/2 from HTTP/1.1, so a name that refused would make every `serve` fault over a
+        // question whose answer is *no*.
+        B.alpnProtocol = (v) => {
+            const chosen = socketOf(v, "alpnProtocol").handle.alpnProtocol
+
+            return chosen === null || chosen === undefined || chosen === false ? null : chosen
+        }
+
+        B.startTls = (...args) => {
+            if (args.length > 0) socketOf(args[0], "startTls")
+
+            noTls("startTls")
+        }
+"""
