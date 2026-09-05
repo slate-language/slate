@@ -151,7 +151,14 @@ private nud(t: Spanned[Tok], p: *Parser) -> Expr
         False -> expr(t.span, BoolLit(false))
         Null -> expr(t.span, NullLit)
         Undefined -> expr(t.span, UndefinedLit)
-        Ident -> expr(t.span, Name(p.text(t.span)))
+        Ident ->
+            // **`_` where a value goes is a parameter of a function nobody wrote**, and it is told
+            // from an ordinary name here because the lexer has no reason to know the difference --
+            // `_` is an identifier, and in a pattern it still is one. `placeholder.sysl` says which
+            // function it becomes a parameter of.
+            val word = p.text(t.span)
+
+            if word == "_" then placeholder_expr(p, t.span) else expr(t.span, Name(word))
         SlxOpen -> parse_element(p, t)
         Minus -> prefix(p, t, Minus)
         Bang -> prefix(p, t, Bang)
@@ -231,13 +238,17 @@ private parenthesised(p: *Parser, t: Spanned[Tok]) -> Expr
             // it. What is left is to parse the brackets as what they look like.
             None -> ()
 
+    // **Brackets are one of the three places a `_` may become a function**, which is what lets
+    // `(_ + 1)(2)` be written at all and what makes `f((_ + 1)(2))` say something different from
+    // `f(_ + 1)`.
+    val mark = ph_open(p)
     val inner = parse_expr(p)
 
     p.expect(RParen, "`)`")
 
     // A grouping is not a node: it exists to change how its contents parse, and it has already done
     // that by the time this returns.
-    inner
+    ph_close(p, mark, inner)
 end parenthesised
 
 // Whether the bracket just opened is closed by a `)` with an arrow after it.
@@ -282,6 +293,11 @@ end closes_on_an_arrow
 // there, and wound back to the opening bracket if it is not.
 private lambda_params(p: *Parser) -> Option[(Buf[string], Buf[Expr], Buf[Stmt])]
     val m = p.toks.mark()
+
+    // A default is an expression, so the attempt can read a `_` and then give up -- and a
+    // placeholder left behind by a parse that never happened would be claimed by whatever scope
+    // closed next.
+    val ph = ph_mark(p)
     var params: Buf[string] = buf()
     var defaults: Buf[Expr] = buf()
     var unpacks: Buf[Stmt] = buf()
@@ -305,6 +321,7 @@ private lambda_params(p: *Parser) -> Option[(Buf[string], Buf[Expr], Buf[Stmt])]
                 params.push(unpacked_param(p, &unpacks, params.len()))
             elif !p.at(Ident)
                 p.toks.reset(m)
+                ph_rewind(p, ph)
                 return None
             else
                 named = s"`${p.text(p.here())}`"
@@ -335,6 +352,7 @@ private lambda_params(p: *Parser) -> Option[(Buf[string], Buf[Expr], Buf[Stmt])]
 
     if !p.accept(RParen) || !p.accept(Arrow)
         p.toks.reset(m)
+        ph_rewind(p, ph)
         return None
 
     Some((params, defaults, unpacks))
@@ -755,7 +773,8 @@ private call(p: *Parser, callee: Expr) -> Expr
 
                 p.bump()
 
-                val inner = parse_expr(p)
+                val mark = ph_open(p)
+                val inner = ph_close(p, mark, parse_expr(p))
 
                 args.push(expr(at.to(inner.span), Spread(inner)))
             else if p.at(Ident) && p.peek_kind_at(1) == Assign
@@ -774,11 +793,16 @@ private call(p: *Parser, callee: Expr) -> Expr
 
                 p.expect(Assign, "`=`")
 
-                val value = parse_expr(p)
+                val nmark = ph_open(p)
+                val value = ph_close(p, nmark, parse_expr(p))
 
                 args.push(expr(at.to(value.span), Named(name, value)))
             else
-                args.push(parse_expr(p))
+                // **An argument is the commonest scope a `_` becomes a function in**, and the one
+                // the feature is for: `map(xs, _.length)` is `map(xs, x -> x.length)`.
+                val mark = ph_open(p)
+
+                args.push(ph_close(p, mark, parse_expr(p)))
 
             if !p.accept(Comma) then break
             if p.at(RParen) then break
@@ -858,7 +882,7 @@ private hole_expr(p: *Parser, at: Span) -> Expr
     val lexed = lex(sub)
     // A hole is an expression and never a statement, so the depth it starts at only has to be
     // somewhere `export` is refused. One says that and needs no thought.
-    var inner = Parser(lexed.tokens, sub, lexed.report, buf(), buf(), buf(), buf(), buf(), 0, 1)
+    var inner = Parser(lexed.tokens, sub, lexed.report, buf(), buf(), buf(), buf(), buf(), 0, 1, buf(), buf(), 0, 0)
 
     // **The blanking is indentation as far as the layout pass is concerned**, so the hole opens a
     // block before its first token. Stepping over that is what makes the offsets free: everything
@@ -875,6 +899,11 @@ private hole_expr(p: *Parser, at: Span) -> Expr
         return expr(at, Bad)
 
     val e = parse_expr(&inner)
+
+    // A hole is a parser of its own, so nothing outside it can be the function a `_` in it wanted to
+    // be a parameter of -- and saying so here is what stops it reaching the checker as a name that
+    // was never bound.
+    ph_unbound(&inner)
 
     // Whatever the hole complained about is the program's complaint.
     p.report.absorb(inner.report)

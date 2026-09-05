@@ -34,6 +34,11 @@ Three placements are worth knowing because they decide what a line means:
 Prefix operators are `-`, `!`, `~`, `++` and `--`, all binding tighter than any infix operator and
 looser than a call — `-f(x)` negates the result.
 
+**`_` where a value goes is not an operator and is not in the table**, because what it reaches is
+decided by the nearest enclosing argument, bracketed group or right-hand side rather than by a
+binding power: `map(xs, _ * 2)` is `map(xs, n -> n * 2)`. See
+[Functions](functions.md).
+
 ## Arithmetic and bitwise
 
 `+ - * / %` over integers and reals; see [Values](values.md) for what `/` does between two integers.

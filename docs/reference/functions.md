@@ -89,6 +89,77 @@ a `,` arriving there has nothing to mean. Every callback slate itself takes is l
 A lambda's parameters may be annotated; its result may not, the arrow already standing between the
 parameters and the body. What it answers is read off that body — see [Types](types.md).
 
+## `_`, a lambda with its parameter left out
+
+A `_` where a value goes is the parameter of a function nobody wrote. What that function's *body* is
+is the smallest thing around the `_`: a call's argument, a bracketed group, or the value of a
+binding, an assignment or a `return`.
+
+```slate
+val ns = [1, 2, 5, 9]
+
+print(map(ns, _ * 2))
+print(filter(ns, _ > 3))
+print(map(["ada", "grace"], upper(_)))
+```
+
+```output
+[2, 4, 10, 18]
+[5, 9]
+["ADA", "GRACE"]
+```
+
+**Every `_` is a parameter of its own, left to right.** Two of them make a function of two
+parameters, which is exactly what a comparator wants:
+
+```slate
+val people = [{ name: "grace", age: 45 }, { name: "ada", age: 36 }]
+
+print(map(sorted(people, _.age < _.age), _.name))
+```
+
+```output
+["ada", "grace"]
+```
+
+**That rule is also this notation's one surprise.** `_ > 3 && _ < 9` is a function of *two*
+parameters and not one test of one number, so it is refused where a callback taking one was wanted.
+Write the parameter out when you mean to mention it twice: `n -> n > 3 && n < 9`.
+
+**A lone `_` is handed outward to the thing around it**, which is what makes `f(_)` a way of naming
+`f` rather than a way of handing it an identity — and what makes `add(_, 1)` the partial application
+it reads as. Where there is nothing around it, a `_` on its own is the identity function:
+
+```slate
+add(a, b) = a + b
+
+print(map([1, 2, 3], add(_, 1)))
+
+val id = _
+
+print(id(7))
+```
+
+```output
+[2, 3, 4]
+7
+```
+
+A `_` with no argument, no group and no right-hand side around it has nothing for its function to
+be, and is refused where it stands:
+
+```slate
+_.length
+```
+
+```error
+`_` stands for the parameter of a function
+```
+
+**`_` in a pattern is untouched.** A match arm's `_`, a destructuring's and the name in `val _ =
+f()` all mean the wildcard they always did — the notation here is about `_` standing where a
+*value* goes.
+
 ## Type parameters
 
 `[T]` after the name says the definition is generic over a type, and the answer is said in terms of

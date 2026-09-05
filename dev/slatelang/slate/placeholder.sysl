@@ -1,0 +1,113 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// `_` where a value goes, and the function it stands for.
+//
+// `map(xs, _.length)` is `map(xs, x -> x.length)`. The `_` is a parameter of a function nobody
+// wrote, and what says how much of the line that function covers is the **scope** it is standing
+// in: a call's argument, a parenthesised group, or the right-hand side of a binding, an assignment
+// or a `return`. Each of those opens a scope while it reads its expression and closes it after,
+// and the smallest one that properly contains the `_` is the one that becomes the function.
+//
+// **The desugaring makes exactly the node a written lambda makes**, so nothing downstream learns
+// anything: the checker, the machine and the JavaScript back end all see a `Lambda` with a
+// parameter and a body, and the only thing peculiar about it is a parameter name no program could
+// have typed.
+//
+// **Every `_` is a parameter of its own, left to right**, which is Scala's rule and is the one
+// surprise worth knowing about -- `_ > 3 && _ < 9` is a function of *two* parameters, because the
+// two `_`s are two placeholders and not two mentions of one. `docs/reference/functions.md` says so
+// with an example and points at `n -> n > 3 && n < 9`, which is what somebody writing that meant.
+//
+// **`_` in PATTERN position is untouched.** A match arm's `_`, a destructuring's, and the name in
+// `val _ = f()` are all read by `pattern.sysl` and by `parse_name`, neither of which comes here.
+
+// A `_` read where an expression was expected.
+//
+// **The name is made now rather than when the scope closes**, because the parser reads left to
+// right and that is the order the parameters are wanted in. It is unspellable on purpose --
+// `unpacked_param` makes `(0)` for a destructured parameter the same way -- so nothing a person
+// wrote can shadow it and nothing it shadows can be reached.
+placeholder_expr(p: *Parser, at: Span) -> Expr
+    p.ph_count += 1
+
+    val name = s"(_${p.ph_count})"
+
+    p.ph_names.push(name)
+    p.ph_spans.push(at)
+    expr(at, Name(name))
+end placeholder_expr
+
+// Open a scope a `_` may become a function in, and answer the mark that closes it.
+ph_open(p: *Parser) -> usize
+    p.ph_depth += 1
+    p.ph_names.len()
+
+// Close the scope opened at `mark`, answering `e` wrapped in the function its placeholders asked
+// for -- or `e` itself, where there were none.
+//
+// **A `_` standing as the WHOLE of a scope is handed OUTWARD to the scope around it**, so what
+// becomes the function is the smallest scope that properly contains it. That single rule is what
+// makes `map(xs, f(_))` a way of naming `f` -- `map(xs, x -> f(x))` rather than handing `f` an
+// identity -- and what makes `map(xs, add(_, 1))` the partial application it reads as.
+//
+// **Where there is no scope around it at all, a lone `_` is the identity function.** `val same = _`
+// is `x -> x`, which is the only thing a `_` alone could sensibly mean.
+ph_close(p: *Parser, mark: usize, e: Expr) -> Expr
+    p.ph_depth -= 1
+
+    if p.ph_names.len() == mark then return e
+
+    if p.ph_depth > 0 && p.ph_names.len() == mark + 1 && is_named(e, p.ph_names.at(mark))
+        return e
+
+    var params: Buf[string] = buf()
+
+    for i in mark..<p.ph_names.len()
+        params.push(p.ph_names.at(i))
+
+    p.ph_names.truncate(mark)
+    p.ph_spans.truncate(mark)
+
+    expr(e.span, Lambda(params, buf(), intern_body(e, false), false))
+end ph_close
+
+// The placeholders read so far, so that a speculative parse can be wound back with the tokens.
+//
+// **A parse that is undone must undo these too.** `lambda_params` reads a default and gives up, and
+// `parse_multi_assign` reads targets and gives up; a placeholder left behind by either would be
+// claimed by whatever scope closed next, in an expression that was never parsed.
+ph_mark(p: *Parser) -> usize = p.ph_names.len()
+
+ph_rewind(p: *Parser, mark: usize)
+    p.ph_names.truncate(mark)
+    p.ph_spans.truncate(mark)
+
+// Complain about a `_` that no scope took in.
+//
+// **Checked where a statement ends**, which is the point past which no scope can still open. A bare
+// `_.foo` on a line of its own is the case: there is no argument, no brackets and no `=`, so the
+// function has nowhere to begin and nothing to be handed.
+//
+// **A BLOCK IS STATEMENTS, so this also stops a `_` escaping one** -- a lambda's block body and a
+// match arm's each end in a statement, and a `_` written as the whole of one belongs to a scope that
+// block does not have. That is the right answer rather than a limitation: a `_` claimed by an
+// argument two blocks out would be a parameter of a function nothing in between mentions.
+ph_unbound(p: *Parser)
+    if p.ph_names.len() == 0 then return
+
+    p.fault(p.ph_spans.at(0),
+        "`_` stands for the parameter of a function, and there is no argument, bracketed group or " +
+        "right-hand side around it for that function to be -- write the parameter out, as in " +
+        "`x -> x.length`")
+
+    p.ph_names.clear()
+    p.ph_spans.clear()
+end ph_unbound
+
+// Whether an expression is exactly this name and nothing else.
+private is_named(e: Expr, name: string) -> bool = *e.kind match
+    Name(n) -> n == name
+    _ -> false

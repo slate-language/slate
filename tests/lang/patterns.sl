@@ -146,3 +146,21 @@ an_is_binds_into_the_surrounding_scope() =
 
     assert(v is { name })
     assertEq(name, "ada")
+
+@test
+A_WILDCARD_BESIDE_A_BINDING_BINDS_NOTHING_AND_SHIFTS_NOTHING() =
+    // A `_` takes a position and gives no value back, so a name written after one in the same
+    // pattern must still get its own element rather than its neighbour's.
+    val [_, second] = [1, 2]
+    val [third, _, first] = [3, 9, 1]
+    val { a: _, b } = { a: 1, b: 2 }
+
+    assertEq(second, 2)
+    assertEq([third, first], [3, 1])
+    assertEq(b, 2)
+
+    val said = [1, 2, 3] match
+        [_, x, _] -> x
+        _ -> 0
+
+    assertEq(said, 2)
