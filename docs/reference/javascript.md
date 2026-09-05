@@ -61,6 +61,13 @@ encoder and none is coming, so *"not yet"* would be a promise nobody can keep. `
 [`slate:gzip`](../library/gzip.md) is the compression a browser does have. That is `abbrev`'s case
 below, drawn the same way.
 
+**[`slate:lmdb`](../library/lmdb.md) is not on that list either, and all nineteen of its names
+refuse.** A browser has no memory-mapped file at all — `IndexedDB` and the Origin Private File System
+are what a page stores things in, and neither is an ordered B+tree walked with a cursor — and node
+has no LMDB in its standard library: every binding on npm is a native addon, so a program compiled by
+`slate js` would depend on something the tool cannot see and did not install. Each refusal names the
+call, says it is LMDB, and says the module runs in the interpreter only.
+
 ### `slate:gzip` is whole here, and the container is read by slate rather than by the host
 
 **This is the module the parity rule was written for.** A browser has `CompressionStream` and

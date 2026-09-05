@@ -1,0 +1,722 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sh.sysl.lmdb
+import sysl.buf.{Buf, buf}
+
+// LMDB -- an ordered key-value store in a memory-mapped file, and the one place a slate server can
+// keep something across a restart without another process being up.
+//
+// **IT IS HERE BECAUSE EVERY SERVER slate IS AIMED AT NEEDS THE SAME THREE THINGS AND HAS NOWHERE TO
+// PUT THEM**: a session store, a rate-limit bucket per client, and a replay ring for the events a
+// reconnecting browser missed. Every one of them is small, is read far more often than it is
+// written, and is worthless if it evaporates when the process restarts -- and until this module the
+// only answers were a file rewritten by hand or `slate:redis`, which is a second process to run and
+// a network hop for a lookup that should cost a page fault.
+//
+// **A read takes no lock and blocks nothing**, which is what makes it the right shape for a request
+// handler: readers never block writers, writers never block readers, and there is exactly one
+// writer at a time across the whole environment and across every process using it. That last part
+// is the trade -- LMDB is not the store for a write-heavy queue -- and it is exactly right for the
+// three uses above, where a write is a session being created and a read is every request after it.
+//
+// ## The names keep their `lmdb` prefix, which is `slate:llhttp`'s rule
+//
+// **This is a door onto somebody else's store and it is named as one.** `slate:llhttp` exports
+// `httpParser` and `httpFeed`, `slate:nghttp2` exports `h2Client`; the tier is the same here -- a
+// conversion at the boundary and no policy of its own -- so the naming is too. A `kv` prefix would
+// have promised an abstraction over key-value stores in general, which is a guess made from one
+// implementation.
+//
+// **What sits on top is a package's job.** A session store with an expiry sweep, a token bucket, a
+// replay ring that trims itself: each is a policy, each wants its own key layout, and none of them
+// belongs in the compiler.
+//
+// ## A handle is an integer, which is what every handle in slate is
+//
+// An environment, a transaction, a database and a cursor are each a number into a table on this
+// side, so no foreign object ever becomes a slate value: `==` compares what slate says it compares,
+// `print` has something to say, and the collector has nothing new to walk. A number from one table
+// handed to a call that wants another is refused by the table it is looked up in.
+//
+// ## `noTls` is always on and is not an option
+//
+// **Without it a thread may hold only ONE read transaction**, and the second is refused with
+// `BadRslot` -- whose own message, *"Invalid reuse of reader locktable slot"*, reads as a damaged
+// lock file rather than the deliberate design it is. LMDB's default puts a reader's slot in
+// thread-local storage; `MDB_NOTLS` moves it onto the transaction instead.
+//
+// slate is one thread with an event loop on it, and two request handlers each holding a reader is
+// the ordinary case rather than an exotic one -- so there is no setting here, and a program cannot
+// turn on the thing that would break it.
+//
+// ## `mapSize` is a hard ceiling and never a hint
+//
+// LMDB reserves that much address space when the environment is opened and **never grows it**; a
+// write past it fails and the store has to be reopened larger. It costs nothing until it is used,
+// the map being sparse, so naming a figure far larger than the data is the normal thing to do.
+// `lmdbInfo` is what a program watches if it wants to know how close it is.
+
+// -- the tables ------------------------------------------------------------------------------------
+
+// A transaction, and the environment it was begun from.
+//
+// **The environment's id is kept so that a database from another environment is refused.** An
+// `MDB_dbi` is an index into one environment's table, so handing one to a transaction of a different
+// environment reads a database that is not the one named -- which LMDB cannot detect and this can.
+private struct OpenTxn
+    t: &lmdb.Txn
+    env: usize
+    writing: bool
+end OpenTxn
+
+// A cursor and the transaction it walks in. **Ending a transaction spends every cursor in it**, so
+// the id is what lets `lmdbCommit` and `lmdbAbort` put those slots back before LMDB reclaims the
+// storage underneath them.
+private struct OpenCursor
+    c: &lmdb.Cursor
+    txn: usize
+end OpenCursor
+
+// A database handle and the environment it belongs to. **There is no `Option` here**: an `MDB_dbi`
+// outlives every transaction, and the whole of LMDB's design for one is that it never needs closing.
+private struct OpenDb
+    db: lmdb.Db
+    env: usize
+end OpenDb
+
+private var envs: Buf[Option[&lmdb.Env]] = buf()
+private var txns: Buf[Option[OpenTxn]] = buf()
+private var cursors: Buf[Option[OpenCursor]] = buf()
+private var dbs: Buf[OpenDb] = buf()
+
+// Give every handle back between runs, which is what the socket table does and for the same reason:
+// the next program starts with nothing of this one's still reachable.
+//
+// **The order is the one thing that matters here.** A cursor holds a share of its transaction and a
+// transaction holds a share of its environment, so cursors go first, then transactions, then
+// environments -- and a dropped transaction aborts, which is the safe way round for a program that
+// ended without committing.
+forget_lmdb()
+    cursors.clear()
+    txns.clear()
+    dbs.clear()
+    envs.clear()
+
+// -- what a program calls --------------------------------------------------------------------------
+
+// `lmdbOpen(path, { mapSize, maxDbs, readOnly, noSubdir, noSync })` -- an environment.
+//
+// `path` is a **directory** that LMDB writes two files into and it must already exist, which is what
+// `noSubdir` turns off: with it the path is a single file, which is what a small embedded store
+// usually wants.
+do_lmdb_open(args: Buf[Value], at: Span) -> Step
+    if args.len() < 1 || args.len() > 2
+        return fault(at, s"`lmdbOpen` takes a path and an optional object of options, and was given ${counted(args.len(), "argument")}")
+
+    val path = args.at(0) match
+        Str(p) -> p.s
+        other -> return fault(at, s"`lmdbOpen` takes the path as text, and this is ${other.type_name()}")
+
+    val how = if args.len() == 2 then open_options(args.at(1), at)? else default_options()
+
+    // **`no_tls` is passed and is not read off the options**, for the reason at the top of the file:
+    // a second reader on this thread is the ordinary case here, and the setting that refuses it is
+    // not one a program is offered.
+    lmdb.env(path, map_size = how.map_size, max_dbs = how.max_dbs, read_only = how.read_only,
+             no_subdir = how.no_subdir, no_sync = how.no_sync, no_tls = true) match
+        Ok(e) ->
+            envs.push(Some(e))
+            Ok(Int(long(envs.len() - 1)))
+        Err(why) -> fault(at, s"`${path}` could not be opened as an LMDB store: ${why_lmdb(why)}")
+end do_lmdb_open
+
+// `lmdbClose(env)` -- give the environment back.
+//
+// **Every transaction still open on it is aborted first**, in the order LMDB wants: a cursor before
+// its transaction, a transaction before its environment. A program that closes its store with work
+// in flight has lost that work either way, and the alternative -- refusing -- would leave a server
+// unable to shut down because one handler was mid-write.
+do_lmdb_close(args: Buf[Value], at: Span) -> Step
+    if args.len() != 1 then return fault(at, s"`lmdbClose` takes an environment, and was given ${counted(args.len(), "argument")}")
+
+    val id = handle_of(args.at(0), at, "lmdbClose", "an environment")?
+
+    if id >= envs.len() then return fault(at, "`lmdbClose` was given something that is not an environment")
+
+    var i: usize = 0
+
+    while i < txns.len()
+        val belongs = txns.at(i) match
+            Some(open) -> open.env == id
+            None -> false
+
+        if belongs then end_txn(i, false)
+
+        i += 1
+
+    envs.set(id, None)
+    Ok(Null)
+end do_lmdb_close
+
+// `lmdbInfo(env)` -- `{ mapSize, used, maxReaders, readers, lastTransaction }`.
+//
+// **`used` is the answer to the only question the ceiling raises.** `mapSize` never moves, so what a
+// program watching for a full store wants is the fraction -- and that is pages written against the
+// map, not the number of keys, which says nothing about how much room is left.
+do_lmdb_info(args: Buf[Value], at: Span) -> Step
+    if args.len() != 1 then return fault(at, s"`lmdbInfo` takes an environment, and was given ${counted(args.len(), "argument")}")
+
+    val id = handle_of(args.at(0), at, "lmdbInfo", "an environment")?
+    val e = live_env(id, at, "lmdbInfo")?
+
+    val info = e.info() match
+        Ok(i) -> i
+        Err(why) -> return fault(at, s"this store could not be asked about itself: ${why_lmdb(why)}")
+
+    val page = e.stat() match
+        Ok(s) -> s.page_size
+        Err(why) -> return fault(at, s"this store could not be asked about itself: ${why_lmdb(why)}")
+
+    val o = new_object()
+
+    hold(Object(o))
+    obj_put_name(o, "mapSize", Int(long(info.map_size)))
+    obj_put_name(o, "used", Int(long(info.last_page) * long(page)))
+    obj_put_name(o, "maxReaders", Int(long(info.max_readers)))
+    obj_put_name(o, "readers", Int(long(info.readers)))
+    obj_put_name(o, "lastTransaction", Int(long(info.last_txn)))
+    Ok(Object(o))
+end do_lmdb_info
+
+// `lmdbRead(env)` -- a read transaction, which takes no lock and blocks nothing.
+//
+// It sees the store as it was at this moment and keeps seeing that however long it is held.
+// **Holding one open for a long time is how an LMDB file grows without bound**, the pages it can
+// still see being pages that cannot be reused -- so a handler that has finished reading ends it.
+do_lmdb_read(args: Buf[Value], at: Span) -> Step = begin_txn(args, at, "lmdbRead", false)
+
+// `lmdbWrite(env)` -- a write transaction. **There is one writer at a time** across the whole
+// environment and across every process using it, so this waits for the current one to finish.
+do_lmdb_write(args: Buf[Value], at: Span) -> Step = begin_txn(args, at, "lmdbWrite", true)
+
+private begin_txn(args: Buf[Value], at: Span, name: string, writing: bool) -> Step
+    if args.len() != 1 then return fault(at, s"`${name}` takes an environment, and was given ${counted(args.len(), "argument")}")
+
+    val id = handle_of(args.at(0), at, name, "an environment")?
+    val e = live_env(id, at, name)?
+
+    val begun = if writing then e.write() else e.read()
+
+    begun match
+        Ok(t) ->
+            txns.push(Some(OpenTxn(t, id, writing)))
+            Ok(Int(long(txns.len() - 1)))
+        Err(why) -> fault(at, s"`${name}` could not begin a transaction: ${why_lmdb(why)}")
+end begin_txn
+
+// `lmdbCommit(txn)` -- keep everything this transaction wrote.
+//
+// After it the transaction is spent and so is every cursor opened in it, which is why both go back
+// here rather than waiting for the program to end.
+do_lmdb_commit(args: Buf[Value], at: Span) -> Step
+    val id = ending(args, at, "lmdbCommit")?
+
+    end_txn(id, true) match
+        Ok(_) -> Ok(Null)
+        Err(why) -> fault(at, s"this transaction could not be committed: ${why_lmdb(why)}")
+end do_lmdb_commit
+
+// `lmdbAbort(txn)` -- throw everything this transaction wrote away.
+//
+// **A transaction that is merely dropped aborts**, which is the safe way round and is what the end of
+// a program does; calling this is how a handler says so on purpose.
+do_lmdb_abort(args: Buf[Value], at: Span) -> Step
+    val id = ending(args, at, "lmdbAbort")?
+
+    end_txn(id, false) match
+        Ok(_) -> Ok(Null)
+        Err(why) -> fault(at, s"this transaction could not be ended: ${why_lmdb(why)}")
+end do_lmdb_abort
+
+// The transaction `lmdbCommit` or `lmdbAbort` was handed, checked for being one and for being live.
+//
+// **Both refusals are separate sentences**, because they are different mistakes: a number that was
+// never a transaction is a value from somewhere else, and one that has ended is a handler carrying a
+// transaction past the request it belonged to.
+private ending(args: Buf[Value], at: Span, name: string) -> Result[usize, Signal]
+    if args.len() != 1 then return Err(failure(at, s"`${name}` takes a transaction, and was given ${counted(args.len(), "argument")}"))
+
+    val id = handle_of(args.at(0), at, name, "a transaction")?
+
+    if id >= txns.len() then return Err(failure(at, s"`${name}` was given something that is not a transaction"))
+
+    val live = txns.at(id) match
+        Some(_) -> true
+        None -> false
+
+    if !live then return Err(failure(at, s"this transaction has ended, and `${name}` needs a live one"))
+
+    Ok(id)
+end ending
+
+// Ends a transaction and puts back every cursor that was walking in it.
+//
+// **The cursors go first and that is not tidiness.** LMDB frees the transaction structure when a
+// transaction ends and a cursor holds a pointer into it, so a cursor still in this table afterwards
+// is a handle onto storage that has been reclaimed.
+private end_txn(id: usize, committing: bool) -> Result[unit, lmdb.Error]
+    var i: usize = 0
+
+    while i < cursors.len()
+        val belongs = cursors.at(i) match
+            Some(open) -> open.txn == id
+            None -> false
+
+        if belongs then cursors.set(i, None)
+
+        i += 1
+
+    val slot = txns.at(id)
+
+    txns.set(id, None)
+
+    slot match
+        None -> Ok(())
+        Some(open) ->
+            var t = open.t
+
+            if committing
+                t.commit()
+            else
+                t.abort()
+                Ok(())
+end end_txn
+
+// `lmdbDb(txn, name)` -- a database inside the environment, named or not.
+//
+// **`null` is the environment's unnamed database**, which is always there and needs nothing said at
+// open time. A named one needs `maxDbs` to have been large enough, and -- the first time -- a write
+// transaction, since making it writes.
+//
+// **Whether it is created is decided by which transaction this is** rather than by an option: a read
+// transaction cannot write, so asking one to create a database is a mistake with only one sensible
+// answer, and a write transaction asked for a database that is not there wanted it made.
+do_lmdb_db(args: Buf[Value], at: Span) -> Step
+    if args.len() < 1 || args.len() > 2
+        return fault(at, s"`lmdbDb` takes a transaction and an optional name, and was given ${counted(args.len(), "argument")}")
+
+    val id = handle_of(args.at(0), at, "lmdbDb", "a transaction")?
+    val open = live_txn(id, at, "lmdbDb")?
+
+    val name = if args.len() == 1 then None else
+        args.at(1) match
+            Null -> None
+            Str(p) -> Some(p.s)
+            other -> return fault(at, s"`lmdbDb` takes the name as text or `null`, and this is ${other.type_name()}")
+
+    open.t.db(name, create = open.writing) match
+        Ok(db) ->
+            dbs.push(OpenDb(db, open.env))
+            Ok(Int(long(dbs.len() - 1)))
+        Err(why) -> why match
+            lmdb.Error.NotFound ->
+                val which = name match
+                    Some(n) -> s"database called `${n}`"
+                    None -> "unnamed database"
+
+                fault(at, s"this store has no ${which}, and a read transaction cannot make one -- open it inside an `lmdbWrite` first")
+            lmdb.Error.DbsFull ->
+                fault(at, "this store has no room for another named database -- `maxDbs` at `lmdbOpen` says how many it may hold")
+            other -> fault(at, s"this database could not be opened: ${why_lmdb(other)}")
+end do_lmdb_db
+
+// `lmdbGet(txn, db, key)` -- the value under a key, or `null` where there is none.
+//
+// **A missing key is an ANSWER and not a failure**, which is the whole reason this is `null` rather
+// than a result: a store is asked about keys that are not in it as a matter of course, and a lookup
+// that faulted would make the ordinary case the exceptional one.
+//
+// **What comes back is a copy.** LMDB hands out a pointer into the memory map that is valid only
+// until the transaction ends; the bytes are copied here, inside the transaction, so a value read in
+// one handler and kept by another is bytes rather than a page LMDB has reused.
+do_lmdb_get(args: Buf[Value], at: Span) -> Step
+    val asked = keyed(args, at, "lmdbGet", 3)?
+
+    asked.txn.t.find(asked.db, asked.key.view()) match
+        Ok(None) -> Ok(Null)
+        Ok(Some(bytes)) -> Ok(lmdb_bytes(bytes))
+        Err(why) -> fault(at, s"this key could not be read: ${why_lmdb(why)}")
+end do_lmdb_get
+
+// `lmdbHas(txn, db, key)` -- whether a key is there, without reading what is under it.
+do_lmdb_has(args: Buf[Value], at: Span) -> Step
+    val asked = keyed(args, at, "lmdbHas", 3)?
+
+    asked.txn.t.has(asked.db, asked.key.view()) match
+        Ok(there) -> Ok(Bool(there))
+        Err(why) -> fault(at, s"this key could not be read: ${why_lmdb(why)}")
+end do_lmdb_has
+
+// `lmdbPut(txn, db, key, value)` -- write a key, replacing whatever was under it.
+//
+// **A full map is the failure worth knowing about**, and its sentence says which knob raises it:
+// `mapSize` is reserved at `lmdbOpen` and LMDB never grows it on its own.
+do_lmdb_put(args: Buf[Value], at: Span) -> Step
+    val asked = keyed(args, at, "lmdbPut", 4)?
+    val value = lmdb_source(args.at(3), at, "lmdbPut", "a value")?
+
+    if !asked.txn.writing
+        return fault(at, "`lmdbPut` needs a write transaction, and this one is a reader -- `lmdbWrite` is what begins one")
+
+    asked.txn.t.put(asked.db, asked.key.view(), value.view()) match
+        Ok(_) -> Ok(Null)
+        Err(why) -> why match
+            lmdb.Error.MapFull ->
+                fault(at, "this store is full -- `mapSize` at `lmdbOpen` is a ceiling LMDB reserves and never grows, so the store has to be reopened larger")
+            lmdb.Error.BadValSize ->
+                val e = live_env(asked.txn.env, at, "lmdbPut")?
+
+                fault(at, s"this key is not a size LMDB will store: a key runs from 1 to ${e.max_key_size()} bytes here")
+            other -> fault(at, s"this key could not be written: ${why_lmdb(other)}")
+end do_lmdb_put
+
+// `lmdbDelete(txn, db, key)` -- take a key out, answering whether it was there.
+//
+// **A key that was not there is `false` rather than a failure**, which is `lmdbGet`'s rule: deleting
+// something twice is what a sweep of expired sessions does on every pass.
+do_lmdb_delete(args: Buf[Value], at: Span) -> Step
+    val asked = keyed(args, at, "lmdbDelete", 3)?
+
+    if !asked.txn.writing
+        return fault(at, "`lmdbDelete` needs a write transaction, and this one is a reader -- `lmdbWrite` is what begins one")
+
+    asked.txn.t.delete(asked.db, asked.key.view()) match
+        Ok(_) -> Ok(Bool(true))
+        Err(why) -> why match
+            lmdb.Error.NotFound -> Ok(Bool(false))
+            other -> fault(at, s"this key could not be deleted: ${why_lmdb(other)}")
+end do_lmdb_delete
+
+// `lmdbClear(txn, db)` -- empty a database and keep the handle.
+do_lmdb_clear(args: Buf[Value], at: Span) -> Step
+    val pair = database(args, at, "lmdbClear")?
+
+    if !pair.txn.writing
+        return fault(at, "`lmdbClear` needs a write transaction, and this one is a reader -- `lmdbWrite` is what begins one")
+
+    pair.txn.t.clear(pair.db) match
+        Ok(_) -> Ok(Null)
+        Err(why) -> fault(at, s"this database could not be emptied: ${why_lmdb(why)}")
+end do_lmdb_clear
+
+// `lmdbStat(txn, db)` -- `{ entries, depth, pageSize, branchPages, leafPages, overflowPages }`.
+//
+// **`entries` is the one most callers want** and it is exact rather than an estimate, LMDB keeping
+// the count in the tree's root page.
+do_lmdb_stat(args: Buf[Value], at: Span) -> Step
+    val pair = database(args, at, "lmdbStat")?
+
+    pair.txn.t.stat(pair.db) match
+        Err(why) -> fault(at, s"this database could not be asked about itself: ${why_lmdb(why)}")
+        Ok(s) ->
+            val o = new_object()
+
+            hold(Object(o))
+            obj_put_name(o, "entries", Int(long(s.entries)))
+            obj_put_name(o, "depth", Int(long(s.depth)))
+            obj_put_name(o, "pageSize", Int(long(s.page_size)))
+            obj_put_name(o, "branchPages", Int(long(s.branch_pages)))
+            obj_put_name(o, "leafPages", Int(long(s.leaf_pages)))
+            obj_put_name(o, "overflowPages", Int(long(s.overflow_pages)))
+            Ok(Object(o))
+end do_lmdb_stat
+
+// `lmdbCursor(txn, db)` -- a position in a database, and the way to walk one in key order.
+//
+// **This is what a range is for**, and it is the reason a cursor is worth having over repeated
+// lookups: keys come out in byte order, so a prefix is a contiguous run and everything after a
+// marker is one walk.
+do_lmdb_cursor(args: Buf[Value], at: Span) -> Step
+    val pair = database(args, at, "lmdbCursor")?
+
+    pair.txn.t.cursor(pair.db) match
+        Ok(c) ->
+            cursors.push(Some(OpenCursor(c, pair.id)))
+            Ok(Int(long(cursors.len() - 1)))
+        Err(why) -> fault(at, s"this cursor could not be opened: ${why_lmdb(why)}")
+end do_lmdb_cursor
+
+// `lmdbFirst(cursor)` -- the first entry in key order, or `null` where the database is empty.
+do_lmdb_first(args: Buf[Value], at: Span) -> Step
+    val c = walked(args, at, "lmdbFirst")?
+
+    stepped(c.first(), at)
+end do_lmdb_first
+
+// `lmdbNext(cursor)` -- the entry after this one, or `null` at the end of the walk.
+do_lmdb_next(args: Buf[Value], at: Span) -> Step
+    val c = walked(args, at, "lmdbNext")?
+
+    stepped(c.next(), at)
+end do_lmdb_next
+
+// `lmdbSeek(cursor, key)` -- the entry at that key or the first one **after** it.
+//
+// **At-or-after rather than exactly**, because that is what starts a range: `lmdbSeek(c, "u:")` and
+// then `lmdbNext` until the key stops beginning with `u:` is the whole of a prefix scan, and it
+// works whether or not `u:` is itself a key.
+do_lmdb_seek(args: Buf[Value], at: Span) -> Step
+    if args.len() != 2 then return fault(at, s"`lmdbSeek` takes a cursor and a key, and was given ${counted(args.len(), "argument")}")
+
+    val id = handle_of(args.at(0), at, "lmdbSeek", "a cursor")?
+    val c = live_cursor(id, at, "lmdbSeek")?
+    val key = lmdb_source(args.at(1), at, "lmdbSeek", "a key")?
+
+    if key.len() == 0 then return fault(at, "`lmdbSeek` was given an empty key, and LMDB has no such key")
+
+    stepped(c.seek_range(key.view()), at)
+end do_lmdb_seek
+
+// `lmdbCursorClose(cursor)` -- give a cursor back before its transaction ends.
+//
+// **A cursor does not have to be closed**, ending its transaction closes it; this is for a reader
+// held open across many walks, where the cursors would otherwise pile up until it committed.
+do_lmdb_cursor_close(args: Buf[Value], at: Span) -> Step
+    if args.len() != 1 then return fault(at, s"`lmdbCursorClose` takes a cursor, and was given ${counted(args.len(), "argument")}")
+
+    val id = handle_of(args.at(0), at, "lmdbCursorClose", "a cursor")?
+
+    if id >= cursors.len() then return fault(at, "`lmdbCursorClose` was given something that is not a cursor")
+
+    cursors.set(id, None)
+    Ok(Null)
+end do_lmdb_cursor_close
+
+// -- what a value is, on the way in and on the way out ------------------------------------------------
+
+// What `lmdbOpen` was told, with the defaults where it was told nothing.
+private struct OpenOptions
+    map_size: usize
+    max_dbs: uint
+    read_only: bool
+    no_subdir: bool
+    no_sync: bool
+end OpenOptions
+
+// **10 MB and sixteen databases**, and the second is the one that is a decision. LMDB's own default
+// is *no* named databases at all, so a program that asked for one by name would be refused with
+// `DbsFull` on its very first call -- a trap for everybody, in exchange for a table of sixteen slots
+// costing a few hundred bytes. The map is small on purpose: it is the number that has to be got
+// right for real data, and one large enough to be quietly wrong is worse than one that says so early.
+private default_options() -> OpenOptions = OpenOptions(10 * 1024 * 1024, 16, false, false, false)
+
+private open_options(v: Value, at: Span) -> Result[OpenOptions, Signal]
+    val o = v match
+        Object(o) -> o
+        Null -> return Ok(default_options())
+        other -> return Err(failure(at, s"`lmdbOpen` takes an object of options, and this is ${other.type_name()}"))
+
+    var map_size: usize = 10 * 1024 * 1024
+    var max_dbs: uint = 16
+    var read_only = false
+    var no_subdir = false
+    var no_sync = false
+
+    for i in 0..<o.entries.len()
+        val entry = o.entries.at(i)
+
+        if !entry.dead
+            val key = entry.key match
+                Str(k) -> k.s
+                other -> return Err(failure(at, s"an option is named, and this is ${other.type_name()}"))
+
+            if key == "mapSize"
+                map_size = usize(whole(entry.value, at, "mapSize")?)
+            elif key == "maxDbs"
+                max_dbs = uint(whole(entry.value, at, "maxDbs")?)
+            elif key == "readOnly"
+                read_only = flag(entry.value, at, "readOnly")?
+            elif key == "noSubdir"
+                no_subdir = flag(entry.value, at, "noSubdir")?
+            elif key == "noSync"
+                no_sync = flag(entry.value, at, "noSync")?
+            else
+                return Err(failure(at, s"`lmdbOpen` has no option called `${key}` -- it takes `mapSize`, `maxDbs`, `readOnly`, `noSubdir` and `noSync`"))
+
+    Ok(OpenOptions(map_size, max_dbs, read_only, no_subdir, no_sync))
+end open_options
+
+private whole(v: Value, at: Span, name: string) -> Result[long, Signal]
+    v match
+        Int(n) ->
+            if n < 0 then return Err(failure(at, s"`${name}` is never negative, and this is ${n}"))
+
+            Ok(n)
+        other -> Err(failure(at, s"`${name}` is a whole number, and this is ${other.type_name()}"))
+
+private flag(v: Value, at: Span, name: string) -> Result[bool, Signal]
+    v match
+        Bool(b) -> Ok(b)
+        other -> Err(failure(at, s"`${name}` is true or false, and this is ${other.type_name()}"))
+
+// A handle, which is always a number into one of the four tables.
+private handle_of(v: Value, at: Span, name: string, what: string) -> Result[usize, Signal]
+    v match
+        Int(n) ->
+            if n < 0 then return Err(failure(at, s"`${name}` was given something that is not ${what}"))
+
+            Ok(usize(n))
+        other -> Err(failure(at, s"`${name}` takes ${what}, and this is ${other.type_name()}"))
+
+private live_env(id: usize, at: Span, name: string) -> Result[&lmdb.Env, Signal]
+    if id >= envs.len() then return Err(failure(at, s"`${name}` was given something that is not an environment"))
+
+    envs.at(id) match
+        Some(e) -> Ok(e)
+        None -> Err(failure(at, s"this store has been closed, and `${name}` needs an open one"))
+end live_env
+
+private live_txn(id: usize, at: Span, name: string) -> Result[OpenTxn, Signal]
+    if id >= txns.len() then return Err(failure(at, s"`${name}` was given something that is not a transaction"))
+
+    txns.at(id) match
+        Some(open) -> Ok(open)
+        None -> Err(failure(at, s"this transaction has ended, and `${name}` needs a live one"))
+end live_txn
+
+private live_cursor(id: usize, at: Span, name: string) -> Result[&lmdb.Cursor, Signal]
+    if id >= cursors.len() then return Err(failure(at, s"`${name}` was given something that is not a cursor"))
+
+    cursors.at(id) match
+        Some(open) -> Ok(open.c)
+        None -> Err(failure(at, s"this cursor's transaction has ended, and `${name}` needs a live one"))
+end live_cursor
+
+private walked(args: Buf[Value], at: Span, name: string) -> Result[&lmdb.Cursor, Signal]
+    if args.len() != 1 then return Err(failure(at, s"`${name}` takes a cursor, and was given ${counted(args.len(), "argument")}"))
+
+    val id = handle_of(args.at(0), at, name, "a cursor")?
+
+    live_cursor(id, at, name)
+end walked
+
+// A transaction and a database, which is what four of these calls take and nothing else.
+private struct Pair
+    txn: OpenTxn
+    id: usize
+    db: lmdb.Db
+end Pair
+
+private database(args: Buf[Value], at: Span, name: string) -> Result[Pair, Signal]
+    if args.len() != 2
+        return Err(failure(at, s"`${name}` takes a transaction and a database, and was given ${counted(args.len(), "argument")}"))
+
+    val id = handle_of(args.at(0), at, name, "a transaction")?
+    val open = live_txn(id, at, name)?
+    val db = db_of(args.at(1), open.env, at, name)?
+
+    Ok(Pair(open, id, db))
+end database
+
+// A database handle, refused where it belongs to another environment.
+private db_of(v: Value, env: usize, at: Span, name: string) -> Result[lmdb.Db, Signal]
+    val id = handle_of(v, at, name, "a database")?
+
+    if id >= dbs.len() then return Err(failure(at, s"`${name}` was given something that is not a database"))
+
+    val open = dbs.at(id)
+
+    if open.env != env
+        return Err(failure(at, s"this database belongs to another store, and `${name}` was given a transaction of this one"))
+
+    Ok(open.db)
+end db_of
+
+// A transaction, a database and a key -- which is what four of these calls begin with.
+private struct Keyed
+    txn: OpenTxn
+    db: lmdb.Db
+    key: Buf[u8]
+end Keyed
+
+private keyed(args: Buf[Value], at: Span, name: string, takes: usize) -> Result[Keyed, Signal]
+    if args.len() != takes
+        val what = if takes == 4 then "a transaction, a database, a key and a value" else "a transaction, a database and a key"
+
+        return Err(failure(at, s"`${name}` takes ${what}, and was given ${counted(args.len(), "argument")}"))
+
+    val id = handle_of(args.at(0), at, name, "a transaction")?
+    val open = live_txn(id, at, name)?
+    val db = db_of(args.at(1), open.env, at, name)?
+    val key = lmdb_source(args.at(2), at, name, "a key")?
+
+    if key.len() == 0
+        return Err(failure(at, s"`${name}` was given an empty key, and LMDB has no such key"))
+
+    Ok(Keyed(open, db, key))
+end keyed
+
+// **Text crosses as its UTF-8 and bytes cross as themselves**, which is `slate:zstd`'s rule and the
+// same one: what goes into the store is what would have gone onto a wire, and a program holding a
+// string need not convert it first.
+//
+// **What comes back is always bytes**, because LMDB stores bytes and records nothing about which of
+// the two it was given -- `fromBytes` is how a program that wrote text reads it back.
+private lmdb_source(v: Value, at: Span, name: string, what: string) -> Result[Buf[u8], Signal]
+    v match
+        Str(p) ->
+            var out: Buf[u8] = buf()
+
+            for i in 0..<p.s.bytes.len
+                out.push(p.s.bytes[i])
+
+            Ok(out)
+        Array(a) -> bytes_of(a, at, name)
+        other -> Err(failure(at, s"`${name}` takes ${what} as text or bytes, and this is ${other.type_name()}"))
+
+private lmdb_bytes(bytes: []const u8) -> Value
+    var items: Buf[Value] = buf()
+
+    for i in 0..<bytes.len
+        items.push(Int(long(bytes[i])))
+
+    Array(new_array(items))
+end lmdb_bytes
+
+// One entry a walk landed on, or `null` where the walk is over.
+//
+// **Both halves are copied here.** A cursor hands out two pointers into the memory map, and a
+// program is entitled to keep what it was given past the transaction that produced it.
+private stepped(found: Result[Option[lmdb.Entry], lmdb.Error], at: Span) -> Step
+    found match
+        Err(why) -> fault(at, s"this walk could not go on: ${why_lmdb(why)}")
+        Ok(None) -> Ok(Null)
+        Ok(Some(e)) ->
+            val k = lmdb_bytes(e.key)
+
+            hold(k)
+
+            val v = lmdb_bytes(e.value)
+
+            hold(v)
+
+            val o = new_object()
+
+            hold(Object(o))
+            obj_put_name(o, "key", k)
+            obj_put_name(o, "value", v)
+            Ok(Object(o))
+end stepped
+
+// What LMDB said, as a sentence.
+//
+// **Mostly the library's own words, and deliberately.** `mdb_strerror` answers for LMDB's own codes
+// and defers to `strerror` for an `errno`, so a store on a full disk or in a directory nobody may
+// write says exactly that. The three arms written out here are the ones whose own words send a
+// reader to the wrong place.
+private why_lmdb(e: lmdb.Error) -> string = e match
+    lmdb.Error.MapFull -> "the store is full, and `mapSize` at `lmdbOpen` is the ceiling that says how full"
+    lmdb.Error.BadRslot -> "a reader slot was reused, which slate opens every store to prevent -- this is a defect in the compiler rather than in the program"
+    lmdb.Error.DbsFull -> "there is no room for another named database, and `maxDbs` at `lmdbOpen` says how many there may be"
+    other -> other.message()
