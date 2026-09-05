@@ -391,8 +391,16 @@ every bad byte with U+FFFD, so the response would come back as replacement chara
 match.** It used to keep the last, which silently threw one away — an object has one value per name
 and HTTP does not. A `Headers` object is what a JavaScript host hands over, already combined and with
 no way to ask for the lines back, so combining is the only reading both can give; RFC 9110 allows it
-in as many words. In a browser, which response headers are readable at all is CORS's decision and
-not slate's.
+in as many words.
+
+**`Set-Cookie` is excluded from that by the same section, and is a list of the lines on both.** A
+cookie carries commas of its own, so a joined value cannot be taken apart again; `Headers` has
+`getSetCookie()` for exactly this reason and that is what is read here. **In a browser it is absent
+however many arrived** — `Set-Cookie` is a forbidden response-header name and a page never reads one,
+though the browser still applies the cookie. That is `ping`'s case again: the host does the thing and
+gives the program no way in.
+
+Which response headers are readable at all in a browser is CORS's decision and not slate's.
 
 ## A builtin is a parameter, not a name taken from the host
 

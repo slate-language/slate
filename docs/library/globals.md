@@ -186,8 +186,14 @@ rule is the host's** — the interpreter follows at most five and refuses one th
 `http`, where a browser follows them itself and gives a page no way in.
 
 **A response header that repeats is joined with `", "`**, on both. An object has one value per name
-and HTTP does not: `Set-Cookie`, `Link`, `Vary` and `Via` all repeat, and combining them is what RFC
-9110 allows and what a browser's `Headers` hands over already done.
+and HTTP does not: `Link`, `Vary` and `Via` all repeat, and combining them is what RFC 9110 allows
+and what a browser's `Headers` hands over already done.
+
+**`Set-Cookie` is the exception and is a LIST**, of the lines as they arrived, absent when there were
+none. The same section of RFC 9110 excludes it and the reason is arithmetic: a cookie carries commas
+inside itself — `Expires=Wed, 21 Oct 2026 07:28:00 GMT` — so two cookies joined by commas cannot be
+taken apart again by anything. In a browser it is absent however many arrived: `Set-Cookie` is a
+forbidden response-header name, so a page never reads one. The browser still applies the cookie.
 
 **A body that is not UTF-8 is `""`** rather than a string of replacement characters, which is the same
 answer `run` gives and for the same reason: slate has no byte value for it to be.
