@@ -276,6 +276,8 @@ browser has a brotli encoder, so it refuses there naming brotli and pointing at 
 **`slate:image` is that case reached by two different roads**: node has no image support in its standard
 library at all, and a browser's is asynchronous where these five names answer on the spot — so images are
 a server's job and the refusal says so.
+**`slate:sqlite` is the other way round**: node has carried `node:sqlite` since 22.5, so the module is
+whole there over node's own copy of SQLite, and it is a browser alone that has nothing for it to be.
 
 **`defer` is deliberately not here.** It earns its place in Go and in sysl because neither collects: a
 function that acquires something has to release it on every exit path. slate has a tracing collector, so
