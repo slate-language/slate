@@ -1,0 +1,442 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sh.sysl.sqlite
+import sysl.buf.{Buf, buf}
+
+// SQLite, which is the database a program does not have to install.
+//
+// **THE NATIVES ARE THE FLOOR AND `slate:sqlite` IS THE MODULE**, exactly as `redis_parse.sysl` is
+// the floor under `slate:redis`: the connection, the prepared statement and the row are C's, and
+// everything a program touches -- the statement cache, the transaction, the object with a `query`
+// on it -- is slate, in `sqlite_source.sysl`. Nothing here is exported by any module, so these names
+// are reachable from that source and from nowhere else.
+//
+// ## A handle is an INTEGER, which is the arrangement every handle in slate uses
+//
+// A socket, a timer, a compiled regular expression, an llhttp parser and an HTTP/2 session are all a
+// number into a table on this side, so no foreign object ever becomes a slate value: `==` compares
+// what slate says it compares, `print` has something to say, and the collector has nothing new to
+// walk.
+//
+// **The two tables are separate for `nghttp2.sysl`'s reason** -- nothing ever holds a database where
+// a statement is wanted, and the table a handle is looked up in is the whole of the check.
+//
+// ## The ORDER the two tables are given back in is SQLite's rule, and this file keeps it
+//
+// `sqlite3_close` on a connection that still has a live statement answers `SQLITE_BUSY` and closes
+// nothing. `sh.sysl.sqlite` makes that unreachable by having a `Query` *hold* the `Db` it was
+// compiled by, so the connection cannot be released while a statement from it is alive -- and this
+// file has to do the same thing one level up: `sqliteClose` drops the connection's slot, and the
+// module drops every statement it cached before it calls that.
+//
+// ## Faults rather than results, and it is the one place slate's rule reads the other way
+//
+// **`readFile("/gone")` answers and `readFile(42)` faults**, the line being text from outside the
+// program against a value the program built itself. A database is on the second side of that line
+// nearly everywhere it can fail: the SQL is written in the program, the parameter count is a
+// property of that SQL, and a statement run against a closed connection is a mistake in the order
+// the program did things. So every one of these faults with a sentence, `slate:sqlite`'s page says
+// so, and a program that wants an answer instead writes `catch`.
+
+// Every open connection, and every statement compiled by one.
+//
+// **The statements are given back FIRST wherever both are** -- see the header. A statement holds the
+// connection it came from, so clearing the connections while a statement is live would drop a
+// reference that is not the last one and close nothing.
+private var databases: Buf[Option[&sqlite.Db]] = buf()
+private var statements: Buf[Option[&sqlite.Query]] = buf()
+
+// Forget every database. Called when a new program is run, exactly as the socket table is.
+//
+// **SQLite's own storage goes when the boxes do**, which is what clearing these buffers does -- and
+// in this order, so that no connection is dropped while one of its statements is still holding it.
+forget_sqlite()
+    statements.clear()
+    databases.clear()
+
+// -- what the module calls -------------------------------------------------------------------------
+
+// `sqliteOpen(path, options)` -- a connection, as an integer.
+//
+// **The path is SQLite's and not a file name this checks**: `:memory:` is a private database living
+// as long as the connection and `""` is a temporary one on disk, neither of which is a path at all.
+do_sqlite_open(args: Buf[Value], at: Span) -> Step
+    if args.len() < 1 || args.len() > 2
+        return fault(at, s"`sqlite` takes a path and an optional object of options, and was given ${counted(args.len(), "argument")}")
+
+    val path = args.at(0) match
+        Str(p) -> p.s
+        other -> return fault(at, s"`sqlite` takes the path as text, and this is ${other.type_name()}")
+
+    val options: Value = if args.len() == 2 then args.at(1) else Value.Null
+
+    option_names(options, at)?
+
+    val read_only = option_bool(options, "readOnly", false, at)?
+    val wait = option_int(options, "busyTimeout", 0, at)?
+
+    // **`Read` fails where there is no file and `Create` makes one**, which is the difference the
+    // option is for: a reader that silently created an empty database would answer nothing at all
+    // rather than saying the database it was pointed at is not there.
+    val access = if read_only then sqlite.Access.Read else sqlite.Access.Create
+
+    sqlite.open_with(path, access) match
+        Err(why) -> fault(at, s"`${path}` could not be opened: ${why.message}")
+        Ok(db) ->
+            // **The busy timeout is how long to wait for a lock before answering `SQLITE_BUSY`**, and
+            // zero -- SQLite's own default -- means answer at once. It is worth setting on anything
+            // more than one process is going to write to.
+            if wait > 0
+                db.busy_timeout(int(wait)) match
+                    Err(why) -> return fault(at, s"`${path}` would not take a busy timeout: ${why.message}")
+                    Ok(_) -> ()
+
+            databases.push(Some(db))
+            Ok(Int(long(databases.len() - 1)))
+end do_sqlite_open
+
+// `sqliteClose(db)` -- the connection is given back.
+//
+// **Every statement the module cached is finalized before this runs**, which is the module's half of
+// the ordering rule the header describes. Closing twice is the module's business too: it stops at
+// its own flag and never calls this a second time.
+do_sqlite_close(args: Buf[Value], at: Span) -> Step
+    if args.len() != 1 then return fault(at, s"`sqliteClose` takes a database, and was given ${counted(args.len(), "argument")}")
+
+    val id = handle_of(args.at(0), at, "sqliteClose")?
+
+    if id < databases.len() then databases.set(id, None)
+
+    Ok(Null)
+end do_sqlite_close
+
+// `sqliteExec(db, sql)` -- run every statement in the text, answering nothing.
+//
+// **Every statement, which is not what `sqlite3_prepare` does on its own.** SQLite compiles the
+// FIRST statement in a piece of text and hands back a pointer to what is left, so a schema of six
+// `CREATE TABLE`s run through `prepare` creates one table and says nothing about the other five.
+// `exec_all` walks that tail pointer, which is why this is the call a schema goes through and
+// `sqliteQuery` is not.
+do_sqlite_exec(args: Buf[Value], at: Span) -> Step
+    if args.len() != 2 then return fault(at, s"`sqliteExec` takes a database and some SQL, and was given ${counted(args.len(), "argument")}")
+
+    val id = handle_of(args.at(0), at, "sqliteExec")?
+    var db = live_database(id, at, "sqliteExec")?
+
+    val sql = args.at(1) match
+        Str(p) -> p.s
+        other -> return fault(at, s"`exec` takes the SQL as text, and this is ${other.type_name()}")
+
+    db.exec_all(sql) match
+        Err(why) -> fault(at, refused(why))
+        Ok(_) -> Ok(Null)
+end do_sqlite_exec
+
+// `sqlitePrepare(db, sql)` -- a compiled statement, as an integer.
+//
+// **ONE statement, and a second in the same text is dropped with nothing said.** That is SQLite's
+// own behaviour -- `sqlite3_prepare` compiles the first statement and hands back a pointer to what
+// is left -- and node's `DatabaseSync.prepare` does exactly the same thing, so it is a fact about
+// the library rather than a difference between the back ends. `exec` is the call that runs them all,
+// and the module's page says so at the place a reader is deciding between the two.
+do_sqlite_prepare(args: Buf[Value], at: Span) -> Step
+    if args.len() != 2 then return fault(at, s"`sqlitePrepare` takes a database and some SQL, and was given ${counted(args.len(), "argument")}")
+
+    val id = handle_of(args.at(0), at, "sqlitePrepare")?
+    var db = live_database(id, at, "sqlitePrepare")?
+
+    val sql = args.at(1) match
+        Str(p) -> p.s
+        other -> return fault(at, s"this takes the SQL as text, and this is ${other.type_name()}")
+
+    db.prepare(sql) match
+        Err(why) -> fault(at, refused(why))
+        Ok(q) ->
+            statements.push(Some(q))
+            Ok(Int(long(statements.len() - 1)))
+end do_sqlite_prepare
+
+// `sqliteFinalize(stmt)` -- the statement is given back.
+do_sqlite_finalize(args: Buf[Value], at: Span) -> Step
+    if args.len() != 1 then return fault(at, s"`sqliteFinalize` takes a statement, and was given ${counted(args.len(), "argument")}")
+
+    val id = handle_of(args.at(0), at, "sqliteFinalize")?
+
+    if id < statements.len() then statements.set(id, None)
+
+    Ok(Null)
+end do_sqlite_finalize
+
+// `sqliteQuery(stmt, params)` -- every row, each an object keyed by column name.
+//
+// **The whole result rather than a cursor**, which is `slate-language/pg`'s shape and is what makes
+// the two databases read alike: a program that has asked for rows gets rows. A query whose answer is
+// larger than memory is a `LIMIT` away from one that is not, and a cursor would put a step-and-read
+// protocol in front of every ordinary query to pay for it.
+do_sqlite_query(args: Buf[Value], at: Span) -> Step
+    if args.len() != 2 then return fault(at, s"`sqliteQuery` takes a statement and its parameters, and was given ${counted(args.len(), "argument")}")
+
+    val id = handle_of(args.at(0), at, "sqliteQuery")?
+    var q = live_statement(id, at, "sqliteQuery")?
+
+    val params = args.at(1) match
+        Array(p) -> p
+        other -> return fault(at, s"`sqliteQuery` takes the parameters as an array, and this is ${other.type_name()}")
+
+    bind_all(q, params, at)?
+
+    val cols = q.columns()
+    val mark = root_mark()
+    var rows: Buf[Value] = buf()
+
+    loop
+        q.step() match
+            Err(why) ->
+                release(mark)
+
+                return fault(at, refused(why))
+            Ok(more) ->
+                if !more then break
+
+                val o = new_object()
+
+                hold(Object(o))
+
+                for i in 0..<cols
+                    // **A column with no name of its own is `columnN`.** SQLite names a column after
+                    // the expression that made it wherever it can, so this is the case where it
+                    // cannot -- and a row missing a field would be worse than one with a made-up
+                    // name, `undefined` being a thing slate will not carry.
+                    val name = q.name_at(i).unwrap_or(s"column${i}")
+                    val cell = column_value(q, i, at)?
+
+                    hold(cell)
+                    obj_put_name(o, name, cell)
+
+                rows.push(Object(o))
+
+    val made = Array(new_array(rows))
+
+    hold(made)
+    release(mark)
+    Ok(made)
+end do_sqlite_query
+
+// `sqliteRun(stmt, params)` -- what an `INSERT`, an `UPDATE` or a `DELETE` did.
+//
+// **Both numbers are the CONNECTION's and are read straight after the step that made them.**
+// `changes` is how many rows the statement touched -- 0 for one that matched nothing, which is not an
+// error and is invisible without asking -- and `lastInsertRowid` is the key SQLite chose, read as 64
+// bits because a rowid outgrows 32 of them.
+do_sqlite_run(args: Buf[Value], at: Span) -> Step
+    if args.len() != 2 then return fault(at, s"`sqliteRun` takes a statement and its parameters, and was given ${counted(args.len(), "argument")}")
+
+    val id = handle_of(args.at(0), at, "sqliteRun")?
+    var q = live_statement(id, at, "sqliteRun")?
+
+    val params = args.at(1) match
+        Array(p) -> p
+        other -> return fault(at, s"`sqliteRun` takes the parameters as an array, and this is ${other.type_name()}")
+
+    bind_all(q, params, at)?
+
+    // **Stepped to completion rather than once**, since a statement with a `RETURNING` clause has
+    // rows and `changes` is only final when it has run out of them.
+    loop
+        q.step() match
+            Err(why) -> return fault(at, refused(why))
+            Ok(more) -> if !more then break
+
+    val mark = root_mark()
+    val o = new_object()
+
+    hold(Object(o))
+    obj_put_name(o, "changes", Int(long(q.db.changes())))
+    obj_put_name(o, "lastInsertRowid", Int(q.db.last_insert_rowid()))
+    release(mark)
+    Ok(Object(o))
+end do_sqlite_run
+
+// `sqliteCompiled(db, option)` -- whether this SQLite was built with a named option.
+//
+// **It is a property of the machine and not of the connection**, SQLite being the library the
+// machine supplies rather than one slate carries -- but it is asked of a database because a
+// JavaScript host has no door to the question except SQL, and a question that could only be asked on
+// one host would not be one a program could write.
+do_sqlite_compiled(args: Buf[Value], at: Span) -> Step
+    if args.len() != 2 then return fault(at, s"`compiledWith` takes a database and the name of an option, and was given ${counted(args.len(), "argument")}")
+
+    val id = handle_of(args.at(0), at, "sqliteCompiled")?
+
+    if id >= databases.len() then return fault(at, "`compiledWith` was given something that is not a database")
+
+    databases.at(id) match
+        None -> return fault(at, "this database is closed")
+        Some(_) -> ()
+
+    val option = args.at(1) match
+        Str(p) -> p.s
+        other -> return fault(at, s"`compiledWith` takes the name of an option as text, and this is ${other.type_name()}")
+
+    Ok(Bool(sqlite.compiled_with(option)))
+end do_sqlite_compiled
+
+// -- what a value is, on the way in and on the way out ----------------------------------------------
+
+// The sentence for SQL the database would not take.
+//
+// **SQLite's own message and nothing added to it**, so that `no such table: notes` reaches the
+// person who wrote the table name. The two back ends say the same words here because both are
+// quoting the same library's message rather than composing one.
+private refused(why: sqlite.Error) -> string = s"the database refused this SQL: ${why.message}"
+
+// The integer a handle is, checked as far as its shape.
+private handle_of(v: Value, at: Span, name: string) -> Result[usize, Signal]
+    v match
+        Int(n) ->
+            if n < 0 then return Err(failure(at, s"`${name}` was given something that is not a database"))
+
+            Ok(usize(n))
+        other -> Err(failure(at, s"`${name}` takes a database, and this is ${other.type_name()}"))
+
+// The connection behind an id, which must still be open.
+private live_database(id: usize, at: Span, name: string) -> Result[&sqlite.Db, Signal]
+    if id >= databases.len() then return Err(failure(at, s"`${name}` was given something that is not a database"))
+
+    databases.at(id) match
+        Some(db) -> Ok(db)
+        None -> Err(failure(at, "this database is closed"))
+end live_database
+
+// The statement behind an id, which must still be compiled.
+private live_statement(id: usize, at: Span, name: string) -> Result[&sqlite.Query, Signal]
+    if id >= statements.len() then return Err(failure(at, s"`${name}` was given something that is not a statement"))
+
+    statements.at(id) match
+        Some(q) -> Ok(q)
+        None -> Err(failure(at, "this database is closed"))
+end live_statement
+
+// Whether an options object holds anything but the two names there are.
+//
+// **Named rather than ignored**, which is `h2Client`'s rule: an option spelled wrongly and dropped
+// silently is a setting a program believes it made.
+private option_names(v: Value, at: Span) -> Result[unit, Signal]
+    val o = v match
+        Object(o) -> o
+        Null -> return Ok(())
+        other -> return Err(failure(at, s"`sqlite` takes an object of options, and this is ${other.type_name()}"))
+
+    for i in 0..<o.entries.len()
+        val entry = o.entries.at(i)
+
+        if !entry.dead
+            val key = entry.key match
+                Str(k) -> k.s
+                other -> return Err(failure(at, s"an option is named, and this is ${other.type_name()}"))
+
+            if key != "readOnly" && key != "busyTimeout"
+                return Err(failure(at, s"`${key}` is not one of a database's options -- there are two, `readOnly` and `busyTimeout`"))
+
+    Ok(())
+end option_names
+
+private option_bool(v: Value, key: string, fallback: bool, at: Span) -> Result[bool, Signal]
+    val o = v match
+        Object(o) -> o
+        _ -> return Ok(fallback)
+
+    obj_get_name(o, key) match
+        None -> Ok(fallback)
+        Some(Bool(b)) -> Ok(b)
+        Some(other) -> Err(failure(at, s"`${key}` is true or false, and this is ${other.type_name()}"))
+end option_bool
+
+private option_int(v: Value, key: string, fallback: long, at: Span) -> Result[long, Signal]
+    val o = v match
+        Object(o) -> o
+        _ -> return Ok(fallback)
+
+    obj_get_name(o, key) match
+        None -> Ok(fallback)
+        Some(Int(n)) ->
+            if n < 0 then return Err(failure(at, s"`${key}` is a number of milliseconds, and this is ${n}"))
+
+            Ok(n)
+        Some(other) -> Err(failure(at, s"`${key}` is a whole number of milliseconds, and this is ${other.type_name()}"))
+end option_int
+
+// Put the statement back where it started and bind what this call was given.
+//
+// **The count is checked here rather than left to SQLite**, and that is the one place this refuses
+// something the library would have taken. `sqlite3_bind` numbers parameters from 1 and a `?` nobody
+// bound is SQL NULL -- so a query written with two parameters and called with one runs, matches
+// nothing, and says nothing at all. That is the mistake worth a sentence.
+private bind_all(q: &sqlite.Query, params: *ArrayObj, at: Span) -> Result[unit, Signal]
+    bound(q.reset(), at)?
+    bound(q.clear_bindings(), at)?
+
+    val wanted = usize(q.parameters())
+
+    if wanted != params.items.len()
+        return Err(failure(at, s"this SQL takes ${counted(wanted, "parameter")} and was given ${params.items.len()}"))
+
+    for i in 0..<params.items.len()
+        val index = int(i) + 1
+
+        params.items.at(i) match
+            Null -> bound(q.bind_null(index), at)?
+            Int(n) -> bound(q.bind_long(index, n), at)?
+            Real(x) -> bound(q.bind_real(index, x), at)?
+            Str(p) -> bound(q.bind_text(index, p.s), at)?
+
+            // **A boolean is 0 or 1, which is what the column would have held anyway.** SQLite has
+            // no boolean storage class -- `true` in SQL is the integer 1 -- so this is the same
+            // value the database would have kept, said in slate.
+            Bool(b) -> bound(q.bind_long(index, if b then 1 else 0), at)?
+
+            // **An array is a BLOB and there is nothing to choose**, which is the one thing simpler
+            // here than in PostgreSQL: that has both `int[]` and `bytea` and needs `bytea(bs)` to
+            // say which, and SQLite has one kind of bytes.
+            Array(a) ->
+                val bytes = bytes_of(a, at, "a parameter")?
+
+                bound(q.bind_blob(index, bytes.view()), at)?
+            other -> return Err(failure(at, s"a parameter is text, a number, a boolean, bytes or null, and this is ${other.type_name()}"))
+
+    Ok(())
+end bind_all
+
+private bound(r: Result[&sqlite.Query, sqlite.Error], at: Span) -> Result[unit, Signal]
+    r match
+        Ok(_) -> Ok(())
+        Err(why) -> Err(failure(at, s"a parameter could not be bound: ${why.message}"))
+
+// One column of the row the statement is sitting on.
+//
+// **`type_at` is asked per ROW and not per column declaration.** SQLite is dynamically typed, so the
+// type belongs to the value: a column declared `INTEGER` holds whatever was put in it, and two rows
+// of one column may differ. Every reader coerces rather than refusing -- `int_at` on the text
+// `"apple"` is 0 -- so asking first is the only way to tell a stored zero from a stored word.
+private column_value(q: &sqlite.Query, col: int, at: Span) -> Result[Value, Signal]
+    q.type_at(col) match
+        sqlite.ColumnType.Integer -> Ok(Int(q.long_at(col)))
+        sqlite.ColumnType.Real -> Ok(Real(q.real_at(col)))
+        sqlite.ColumnType.Text ->
+            q.text_at(col) match
+                Err(why) -> Err(failure(at, s"a text column could not be read: ${why.message}"))
+                Ok(None) -> Ok(Null)
+                Ok(Some(s)) -> Ok(str_value(s))
+        sqlite.ColumnType.Blob ->
+            q.blob_at(col) match
+                None -> Ok(Null)
+                Some(bytes) ->
+                    var items: Buf[Value] = buf()
+
+                    for i in 0..<bytes.len()
+                        items.push(Int(long(bytes.at(i))))
+
+                    Ok(Array(new_array(items)))
+        sqlite.ColumnType.Null -> Ok(Null)
+end column_value

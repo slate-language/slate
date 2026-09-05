@@ -1,0 +1,228 @@
+module dev.slatelang.slate
+
+// slate's SQLite module, written in slate and carried in the binary.
+//
+// **THE FIFTH BUILT-IN MODULE WRITTEN IN SLATE**, after `slate:http`, `slate:jwt`, `slate:redis` and
+// `slate:url`; `stdlib.sysl` says how that kind differs from an export list over natives, which is in
+// `take_builtin` and nowhere else. What makes this one worth writing in slate is that everything a
+// program touches -- the object with the methods on it, the statement cache, the transaction that
+// undoes itself -- is ordinary slate over eight calls that have to be C.
+//
+// **A RAW TEXT BLOCK, SO WHAT IS WRITTEN HERE IS WHAT SLATE READS.** `raw"""` takes no escapes and
+// strips only the incidental indentation, so the module sits below at four spaces and reaches the
+// lexer at the margin -- and a quote or a `${...}` in it means itself.
+
+// The module's source, as slate will read it.
+sqlite_source() -> string = raw"""
+    // SQLite, written in slate over the connection, the statement and the row.
+    //
+    // **It is the database that needs no server**, and that is what it is here for: a program that
+    // wants to keep something between runs -- a queue, a cache, a session table, a log worth
+    // querying -- can have all of SQL without asking anybody to install anything. `slate-language/pg`
+    // is the other half of the same story, for the case where the database is somebody else's
+    // machine, and the two are deliberately spelled alike.
+    //
+    // ## One export, because a database is one object
+    //
+    // `sqlite(path)` answers the database, and everything else is a method on it -- the same shape
+    // `slate:redis` and `slate:regex` have.
+    //
+    //     val db = sqlite("notes.db")
+    //
+    //     db.exec("create table if not exists notes (id integer primary key, title text)")
+    //     db.run("insert into notes (title) values (?)", "a note")
+    //
+    //     for row in db.query("select id, title from notes")
+    //         print(row.id, row.title)
+    //
+    //     db.close()
+    //
+    // **The methods are methods and not exports**, and that is not only style: `close` is
+    // `slate:net`'s name, `query` is `slate:dom`'s and `run` is `slate:process`'s, every built-in
+    // module declaring into one scope. A vocabulary of five words was never available; one noun with
+    // five methods is what a program wanted anyway.
+    //
+    // ## Faults, and the one place slate's rule reads the other way
+    //
+    // **Everything here faults with a sentence.** slate's rule is that text from outside the program
+    // is an answer and a value the program built itself is a fault -- and a local database is on the
+    // second side of that line nearly everywhere it can fail: the SQL is in the program, the number
+    // of parameters is a property of that SQL, and a call on a closed database is a mistake in the
+    // order the program did things. `slate-language/pg` answers a result instead, and the difference
+    // is the machine: a server that is down, a password that is wrong and a role that does not exist
+    // are all conditions a program was always going to handle.
+    //
+    // A program that wants an answer rather than a fault writes `catch`, which is what it is for:
+    //
+    //     val rows = db.query(sql) catch e -> []
+    //
+    // ## The parameters are the arguments after the SQL
+    //
+    // `db.query(sql, ...params)`, which is `pg`'s spelling. **A parameter is never interpolated into
+    // the SQL**: SQLite compiles the statement before it is given a value, so nothing a parameter
+    // holds can become part of the query, and there is no escaping function here because there is
+    // nothing to escape.
+
+    // What `run` answers: what the statement changed, and the key SQLite chose for the last row it
+    // inserted on this connection.
+    export type Ran = { changes: integer, lastInsertRowid: integer }
+
+    // A database, and everything a program does with one.
+    export type Db = { exec: function, query: function, run: function, transaction: function,
+        compiledWith: function, close: function }
+
+    // How many prepared statements one connection keeps.
+    //
+    // **A cache with no bound is a leak wearing a good name.** Statements are kept because the
+    // ordinary case is a handful of queries run many times, and a program that builds its SQL as text
+    // in a loop would otherwise hold a compiled statement for every string it ever made. The oldest
+    // goes when the room runs out, which for the ordinary case never happens.
+    val Kept = 64
+
+    // `sqlite(path, options)` -- an open database.
+    //
+    // **The path is SQLite's own and is not always a file.** `:memory:` is a private database living
+    // as long as the connection, which is what a test wants, and `""` is a temporary one on disk that
+    // is deleted when the connection goes.
+    //
+    // `{ readOnly: true }` opens a database that is already there and fails where there is none,
+    // rather than making an empty one; `{ busyTimeout: 5000 }` is how long to wait for a lock before
+    // giving up, and is worth setting on anything more than one process writes to.
+    export sqlite(path: string, options = null) = opened(path, options)
+
+    opened(path, options)
+        val h = sqliteOpen(path, options)
+
+        // The statements this connection has compiled, by the SQL they came from, oldest first in
+        // `order` so that the one to give up is `order[0]`.
+        var cache = { }
+        var order = []
+        var shut = false
+
+        live(what: string)
+            if shut then throw "this database is closed, and `" + what + "` needs an open one"
+
+        // The statement this SQL compiles to, made once and kept.
+        //
+        // **This is the whole of what "prepared" buys**, and it is why `query` takes the SQL rather
+        // than a statement object: parsing and planning happen once per piece of SQL for the life of
+        // the connection, and a program gets that without holding anything.
+        held(sql: string)
+            if has(cache, sql) then return cache[sql]
+
+            val made = sqlitePrepare(h, sql)
+
+            cache[sql] = made
+            push(order, sql)
+
+            if len(order) > Kept
+                val oldest = order[0]
+
+                removeAt(order, 0)
+                sqliteFinalize(cache[oldest])
+
+                cache = without(cache, oldest)
+
+            made
+
+        // `db.exec(sql)` -- run every statement in the text, for its effect.
+        //
+        // **This is the one that takes SEVERAL statements**, which is what a schema is. `query` and
+        // `run` take one: SQLite's own `prepare` compiles the first statement in a piece of text and
+        // drops the rest with nothing said, so a schema run through either would create its first
+        // table and stop.
+        runAll(sql: string)
+            live("exec")
+
+            sqliteExec(h, sql)
+
+        // `db.query(sql, ...params)` -- the rows, each an object keyed by column name.
+        //
+        // **The whole answer rather than a cursor**, which is `pg`'s shape: a program that has asked
+        // for rows gets rows, and one whose answer would not fit in memory writes a `limit`.
+        ask(sql: string, ...params)
+            live("query")
+
+            sqliteQuery(held(sql), params)
+
+        // `db.run(sql, ...params)` -- what an insert, an update or a delete did.
+        //
+        // **`changes` is 0 for a statement that matched nothing**, which is not an error and is
+        // invisible without asking -- an `update ... where id = ?` against an id that is not there
+        // succeeds and does nothing.
+        did(sql: string, ...params)
+            live("run")
+
+            sqliteRun(held(sql), params)
+
+        // `db.transaction(work)` -- everything `work` did, or nothing of it.
+        //
+        // **The rollback path is the one a program forgets**, and that is the whole argument for this
+        // method: a failure between `begin` and `commit` that simply returns leaves the transaction
+        // open, holding its locks, until the connection closes. Here the fault is caught, the
+        // transaction is undone, and the fault carries on with its own words.
+        //
+        // **SQLite has no nested transactions**, so a `transaction` inside a `transaction` is refused
+        // by the database rather than counted.
+        within(work: function)
+            live("transaction")
+
+            sqliteExec(h, "BEGIN")
+
+            var answer = null
+
+            try
+                answer = work()
+            catch e
+                sqliteExec(h, "ROLLBACK")
+
+                throw e
+
+            sqliteExec(h, "COMMIT")
+
+            answer
+
+        // `db.compiledWith(option)` -- whether this SQLite was built with a named option.
+        //
+        // **SQLite is the machine's library rather than one slate carries**, so what it can do is a
+        // property of the machine: `db.compiledWith("ENABLE_FTS5")` is how a program asks before it
+        // reaches for full-text search, and the alternative is finding out at the `create virtual
+        // table`, which fails with `no such module: fts5`. The `SQLITE_` prefix is optional.
+        built(option: string)
+            live("compiledWith")
+
+            sqliteCompiled(h, option)
+
+        // `db.close()` -- the statements go, and then the connection.
+        //
+        // **The order is SQLite's rule.** Closing a connection that still holds a live statement
+        // answers `SQLITE_BUSY` and closes nothing, so everything this cached is finalized first --
+        // which is the one piece of bookkeeping a program would have had to do itself.
+        //
+        // **Closing twice is not an error**, a database being a thing a program closes on a path it
+        // may reach more than once.
+        bye()
+            if shut then return null
+
+            shut = true
+
+            for sql in order
+                sqliteFinalize(cache[sql])
+
+            cache = { }
+            order = []
+
+            sqliteClose(h)
+
+        val db = { }
+
+        // **Stored on the object rather than reached through a proto**, so calling one passes it what
+        // it was given and nothing else -- `db.query(sql, x)` is `ask(sql, x)` and no receiver.
+        db.exec = runAll
+        db.query = ask
+        db.run = did
+        db.transaction = within
+        db.compiledWith = built
+        db.close = bye
+        db
+    """

@@ -20,6 +20,7 @@ What a program has without writing it.
 | [`slate:jwt`](jwt.md) | JSON Web Tokens |
 | [`slate:ws`](ws.md) | WebSockets |
 | [`slate:redis`](redis.md) | a Redis client |
+| [`slate:sqlite`](sqlite.md) | SQLite — the database that needs no server |
 | [`slate:gzip`](gzip.md) | gzip and zlib — the compression every host has |
 | [`slate:brotli`](brotli.md) | brotli — smaller, and not in a browser |
 | [`slate:zstd`](zstd.md) | Zstandard — faster than both, and not in a browser |

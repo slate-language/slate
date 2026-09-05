@@ -1,0 +1,427 @@
+module dev.slatelang.slate
+
+// `slate:sqlite` in the JavaScript back end, which is node's own SQLite and nothing in a browser.
+//
+// **node has carried `node:sqlite` since 22.5** -- `DatabaseSync` and `StatementSync`, synchronous by
+// design and linking node's own copy of SQLite -- so this module is the host's here exactly as
+// `slate:zstd` is, and the whole of what is written out is the shaping. The module ABOVE these names
+// is slate source carried in the binary, so a program gets the same object with the same five
+// methods on both back ends and only this floor differs.
+//
+// **A BROWSER HAS NO SQLITE AND `node:sqlite` IS NOT COMING TO ONE.** What a page has instead is
+// IndexedDB and the long-deprecated Web SQL, neither of which is this -- so the refusal names node's
+// module and the version it arrived in, which is `slate:brotli`'s case rather than an `OWED` stub's.
+//
+// ## The one thing this has to do that the interpreter gets for free
+//
+// **node exposes no `sqlite3_bind_parameter_count`, so `sqliteWants` reads the count off the SQL.**
+// Without it the two back ends would disagree about the commonest mistake there is: node binds SQL
+// NULL for a `?` nobody gave -- so `where id = ?` called with nothing runs, matches nothing, and says
+// nothing -- while it throws *"column index out of range"* for one too many. The interpreter asks
+// SQLite and refuses both with a sentence, and this is what lets that sentence be the same here.
+//
+// The scanner is SQLite's own tokenizer as far as the question goes: a `'...'` literal, a `"..."`,
+// a `` `...` `` or a `[...]` identifier, a `--` line comment and a `/* */` block comment are all
+// stepped over, a bare `?` takes the next index, `?NNN` names one, and `:a`, `@a` and `$a` take one
+// index per distinct name. That is the whole of what `sqlite3_bind_parameter_count` answers.
+
+js_runtime_sqlite() -> string = raw"""
+        // -- sqlite ------------------------------------------------------------------------------------
+
+        // node's own SQLite, or nothing where there is none.
+        //
+        // **`require` rather than a global, because there is no global to read**, and the two
+        // conditions are asked separately so that a host with `process` and no module loader answers
+        // the same *no* rather than throwing.
+        const sqliteHost = (() => {
+            if (typeof process === "undefined" || typeof require !== "function") return null
+
+            try {
+                const mod = require("node:sqlite")
+
+                return typeof mod.DatabaseSync === "function" ? mod : null
+            } catch (e) {
+                return null
+            }
+        })()
+
+        const noSqlite = (name) =>
+            fault("`" + name + "` is SQLite, which this JavaScript host has not got -- node has " +
+                "carried `node:sqlite` since 22.5, and a browser has no database of this kind at all")
+
+        // One slot per connection and one per statement, which is the interpreter's arrangement word
+        // for word: a handle is an integer into a table on this side, so nothing of node's ever
+        // becomes a slate value.
+        const sqliteDbs = []
+        const sqliteStmts = []
+
+        const sqliteDbOf = (v, name) => {
+            if (!$.isInt(v)) fault("`" + name + "` takes a database, and this is " + typeName(v))
+
+            const held = sqliteDbs[Number(v)]
+
+            if (held === undefined || held === null) fault("this database is closed")
+
+            return held
+        }
+
+        const sqliteStmtOf = (v, name) => {
+            if (!$.isInt(v)) fault("`" + name + "` takes a database, and this is " + typeName(v))
+
+            const held = sqliteStmts[Number(v)]
+
+            if (held === undefined || held === null) fault("this database is closed")
+
+            return held
+        }
+
+        // How many parameters this SQL takes. See the header: node has no door to the count, and
+        // without one the two back ends disagree about a `?` nobody bound.
+        const sqliteWants = (sql) => {
+            const named = new Map()
+            let i = 0
+            let next = 1
+            let most = 0
+
+            const quoted = (end) => {
+                i += 1
+
+                while (i < sql.length) {
+                    if (sql[i] === end) {
+                        // **A doubled quote is the quote itself**, which is SQL's only escape.
+                        if (sql[i + 1] === end) i += 2
+                        else {
+                            i += 1
+
+                            return
+                        }
+                    } else i += 1
+                }
+            }
+
+            while (i < sql.length) {
+                const c = sql[i]
+
+                if (c === "'" || c === '"' || c === "`") quoted(c)
+                else if (c === "[") quoted("]")
+                else if (c === "-" && sql[i + 1] === "-") {
+                    while (i < sql.length && sql[i] !== "\n") i += 1
+                } else if (c === "/" && sql[i + 1] === "*") {
+                    i += 2
+
+                    while (i < sql.length && !(sql[i] === "*" && sql[i + 1] === "/")) i += 1
+
+                    i += 2
+                } else if (c === "?") {
+                    i += 1
+
+                    let digits = ""
+
+                    while (i < sql.length && sql[i] >= "0" && sql[i] <= "9") {
+                        digits += sql[i]
+                        i += 1
+                    }
+
+                    const at = digits === "" ? next : Number(digits)
+
+                    if (at >= next) next = at + 1
+                    if (at > most) most = at
+                } else if (c === ":" || c === "@" || c === "$") {
+                    let j = i + 1
+
+                    while (j < sql.length && /[A-Za-z0-9_]/.test(sql[j])) j += 1
+
+                    if (j === i + 1) {
+                        i += 1
+
+                        continue
+                    }
+
+                    const key = sql.slice(i, j)
+
+                    i = j
+
+                    // **A name used twice is ONE parameter**, which is the whole reason a named one
+                    // is worth having.
+                    if (named.has(key)) continue
+
+                    named.set(key, next)
+
+                    if (next > most) most = next
+
+                    next += 1
+                } else i += 1
+            }
+
+            return most
+        }
+
+        // What a parameter binds as. **An array is a BLOB and there is nothing to choose**, SQLite
+        // having one kind of bytes where PostgreSQL has `int[]` and `bytea` both.
+        const sqliteParam = (v) => {
+            if (v === null) return null
+            if ($.isInt(v) || $.isReal(v) || $.isStr(v)) return v
+
+            // **A boolean is 0 or 1**, which is what the column would have held anyway: SQLite has no
+            // boolean storage class and `true` in SQL is the integer 1.
+            if (typeof v === "boolean") return v ? 1n : 0n
+
+            if (Array.isArray(v)) {
+                const bytes = []
+
+                for (const b of v) {
+                    if (!$.isInt(b))
+                        fault("`a parameter` takes an array of numbers, and one of these is " + typeName(b))
+
+                    const n = Number(b)
+
+                    if (n < 0 || n > 255) fault("a byte is between 0 and 255, and this is " + n)
+
+                    bytes.push(n)
+                }
+
+                return new Uint8Array(bytes)
+            }
+
+            fault("a parameter is text, a number, a boolean, bytes or null, and this is " + typeName(v))
+        }
+
+        // One cell of a row. **`setReadBigInts` is what makes the five storage classes tell
+        // themselves apart here**: without it node answers a JavaScript number for an INTEGER as well
+        // as for a REAL, and slate's two number types would be one.
+        const sqliteCell = (v) => {
+            if (v === null || typeof v === "bigint" || typeof v === "number" || typeof v === "string")
+                return v
+
+            const out = []
+
+            for (const b of v) out.push(BigInt(b))
+
+            return out
+        }
+
+        const sqliteBound = (stmt, args, name) => {
+            const params = args[1]
+
+            if (!Array.isArray(params))
+                fault("`" + name + "` takes the parameters as an array, and this is " + typeName(params))
+
+            if (stmt.wants !== params.length)
+                fault("this SQL takes " + stmt.wants + (stmt.wants === 1 ? " parameter" : " parameters") +
+                    " and was given " + params.length)
+
+            return params.map(sqliteParam)
+        }
+
+        // What node objected to, said the way the interpreter says it. **Both are quoting SQLite's own
+        // message** -- `no such table: notes` reaches the person who wrote the table name either way --
+        // so this is a prefix rather than a translation.
+        const sqliteWhy = (e) =>
+            "the database refused this SQL: " + String(e && e.message ? e.message : e)
+
+        B.sqliteOpen = (...args) => {
+            if (args.length < 1 || args.length > 2)
+                fault("`sqlite` takes a path and an optional object of options, and was given " +
+                    args.length + (args.length === 1 ? " argument" : " arguments"))
+
+            if (sqliteHost === null) noSqlite("sqlite")
+
+            if (!$.isStr(args[0]))
+                fault("`sqlite` takes the path as text, and this is " + typeName(args[0]))
+
+            const options = args.length === 2 ? args[1] : null
+            let readOnly = false
+            let wait = 0n
+
+            if (options !== null) {
+                if (!(options instanceof $.SObj))
+                    fault("`sqlite` takes an object of options, and this is " + typeName(options))
+
+                for (const [k, v] of options.entries()) {
+                    if (k !== "readOnly" && k !== "busyTimeout")
+                        fault("`" + k + "` is not one of a database's options -- there are two, " +
+                            "`readOnly` and `busyTimeout`")
+                }
+
+                if (options.hasName("readOnly")) {
+                    readOnly = options.getName("readOnly")
+
+                    if (typeof readOnly !== "boolean")
+                        fault("`readOnly` is true or false, and this is " + typeName(readOnly))
+                }
+
+                if (options.hasName("busyTimeout")) {
+                    wait = options.getName("busyTimeout")
+
+                    if (!$.isInt(wait))
+                        fault("`busyTimeout` is a whole number of milliseconds, and this is " + typeName(wait))
+
+                    if (wait < 0n) fault("`busyTimeout` is a number of milliseconds, and this is " + wait)
+                }
+            }
+
+            let db = null
+
+            try {
+                db = new sqliteHost.DatabaseSync(args[0], { readOnly: readOnly })
+            } catch (e) {
+                fault("`" + args[0] + "` could not be opened: " + String(e && e.message ? e.message : e))
+            }
+
+            // **The busy timeout is a PRAGMA here and `sqlite3_busy_timeout` there**, which is the
+            // same setting: SQLite implements the pragma by making that call.
+            if (wait > 0n) {
+                try {
+                    db.exec("PRAGMA busy_timeout = " + wait)
+                } catch (e) {
+                    fault("`" + args[0] + "` would not take a busy timeout: " +
+                        String(e && e.message ? e.message : e))
+                }
+            }
+
+            sqliteDbs.push(db)
+
+            return BigInt(sqliteDbs.length - 1)
+        }
+
+        B.sqliteClose = (...args) => {
+            if (args.length !== 1)
+                fault("`sqliteClose` takes a database, and was given " + args.length +
+                    (args.length === 1 ? " argument" : " arguments"))
+
+            const at = Number(args[0])
+            const held = sqliteDbs[at]
+
+            if (held !== undefined && held !== null) {
+                sqliteDbs[at] = null
+
+                try {
+                    held.close()
+                } catch (e) {
+                    // A connection already shut by the host is one this had nothing left to do about.
+                }
+            }
+
+            return null
+        }
+
+        B.sqliteExec = (...args) => {
+            if (args.length !== 2)
+                fault("`sqliteExec` takes a database and some SQL, and was given " + args.length +
+                    (args.length === 1 ? " argument" : " arguments"))
+
+            const db = sqliteDbOf(args[0], "sqliteExec")
+
+            if (!$.isStr(args[1]))
+                fault("`exec` takes the SQL as text, and this is " + typeName(args[1]))
+
+            try {
+                db.exec(args[1])
+            } catch (e) {
+                fault(sqliteWhy(e))
+            }
+
+            return null
+        }
+
+        B.sqlitePrepare = (...args) => {
+            if (args.length !== 2)
+                fault("`sqlitePrepare` takes a database and some SQL, and was given " + args.length +
+                    (args.length === 1 ? " argument" : " arguments"))
+
+            const db = sqliteDbOf(args[0], "sqlitePrepare")
+
+            if (!$.isStr(args[1]))
+                fault("this takes the SQL as text, and this is " + typeName(args[1]))
+
+            let stmt = null
+
+            try {
+                stmt = db.prepare(args[1])
+            } catch (e) {
+                fault(sqliteWhy(e))
+            }
+
+            stmt.setReadBigInts(true)
+            sqliteStmts.push({ stmt: stmt, db: db, wants: sqliteWants(args[1]) })
+
+            return BigInt(sqliteStmts.length - 1)
+        }
+
+        B.sqliteFinalize = (...args) => {
+            if (args.length !== 1)
+                fault("`sqliteFinalize` takes a statement, and was given " + args.length +
+                    (args.length === 1 ? " argument" : " arguments"))
+
+            const at = Number(args[0])
+
+            if (sqliteStmts[at] !== undefined) sqliteStmts[at] = null
+
+            return null
+        }
+
+        B.sqliteQuery = (...args) => {
+            if (args.length !== 2)
+                fault("`sqliteQuery` takes a statement and its parameters, and was given " + args.length +
+                    (args.length === 1 ? " argument" : " arguments"))
+
+            const held = sqliteStmtOf(args[0], "sqliteQuery")
+            const params = sqliteBound(held, args, "sqliteQuery")
+
+            let rows = null
+
+            try {
+                rows = held.stmt.all(...params)
+            } catch (e) {
+                fault(sqliteWhy(e))
+            }
+
+            return rows.map((row) => {
+                const entries = []
+
+                for (const name of Object.keys(row)) entries.push([name, sqliteCell(row[name])])
+
+                return $.obj(entries)
+            })
+        }
+
+        B.sqliteRun = (...args) => {
+            if (args.length !== 2)
+                fault("`sqliteRun` takes a statement and its parameters, and was given " + args.length +
+                    (args.length === 1 ? " argument" : " arguments"))
+
+            const held = sqliteStmtOf(args[0], "sqliteRun")
+            const params = sqliteBound(held, args, "sqliteRun")
+
+            let did = null
+
+            try {
+                did = held.stmt.run(...params)
+            } catch (e) {
+                fault(sqliteWhy(e))
+            }
+
+            const whole = (n) => typeof n === "bigint" ? n : BigInt(n)
+
+            return $.obj([["changes", whole(did.changes)],
+                ["lastInsertRowid", whole(did.lastInsertRowid)]])
+        }
+
+        // **A property of the machine's SQLite, asked of a connection**, because SQL is the only door
+        // to it here -- `sqlite_compileoption_used` is the same C function the interpreter calls, so
+        // the `SQLITE_` prefix is optional in both.
+        B.sqliteCompiled = (...args) => {
+            if (args.length !== 2)
+                fault("`compiledWith` takes a database and the name of an option, and was given " +
+                    args.length + (args.length === 1 ? " argument" : " arguments"))
+
+            const db = sqliteDbOf(args[0], "sqliteCompiled")
+
+            if (!$.isStr(args[1]))
+                fault("`compiledWith` takes the name of an option as text, and this is " + typeName(args[1]))
+
+            const asked = db.prepare("select sqlite_compileoption_used(?) as used")
+
+            return asked.all(args[1])[0].used === 1
+        }
+"""

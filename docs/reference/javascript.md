@@ -55,6 +55,19 @@ are not compared between the back ends and cannot be** — node links its own co
 interpreter links the machine's, so two encoders at one level may frame the same input differently and
 both be right. `tests/js/p27.sl` compares the round trip and every refusal instead.
 
+**`slate:sqlite` is WHOLE here on node and absent in a browser**, which is `slate:zstd`'s answer read
+again. node has carried `node:sqlite` since 22.5, so the module's floor is `DatabaseSync` there and the
+machine's libsqlite3 here, with one piece of slate source above both — the same object with the same five
+methods either way. A page has no SQLite of any kind (IndexedDB is not this, and Web SQL is long
+deprecated), so every name refuses there naming node's module.
+
+**The one thing the JavaScript floor has to compute that the interpreter is told** is how many parameters
+a statement takes: node exposes no `sqlite3_bind_parameter_count`, and without it the two would disagree
+about the commonest mistake there is — node binds SQL NULL for a `?` nobody gave, so `where id = ?` called
+with nothing runs, matches nothing and says nothing. `js_rt_sqlite.sysl` reads the count off the SQL, which
+is what lets both back ends refuse it with one sentence. `tests/js/p28.sl` compares the storage classes,
+the transaction, the full-text search and every refusal.
+
 **`slate:brotli` is NOT on that list, and the difference matters.** No JavaScript host has a brotli
 encoder and none is coming, so *"not yet"* would be a promise nobody can keep. `compress` and
 `decompress` say that they are brotli, that a JavaScript host has none, and that
