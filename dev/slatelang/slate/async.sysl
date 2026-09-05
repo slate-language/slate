@@ -3,6 +3,7 @@ module dev.slatelang.slate
 import sh.sysl.gc
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
+import sysl.text.Search
 
 // Promises, and the queue that hands their answers back.
 //
@@ -69,10 +70,104 @@ mark_scheduler(h: *gc.Heap)
     for i in 0..<rejections.len()
         gc.mark(h, ptr_cast(rejections.at(i)))
 
+    for i in 0..<fault_watches.len()
+        gc.mark(h, ptr_cast(fault_watches.at(i).watched))
+        gc.mark(h, ptr_cast(fault_watches.at(i).out))
+
+// A promise `assertFaults` is watching, and the promise it hands the verdict to.
+//
+// **A native cannot `await`, so the verdict is written down and taken when the promise settles.**
+// `assertFaults` is handed an `async` function as readily as an ordinary one, and what an `async`
+// function answers is a promise that has not failed yet -- so reading it where it was answered would
+// call every asynchronous fault a value. The test awaits what this settles instead.
+struct FaultWatch
+    // The promise that has to fail.
+    watched: *PromiseObj
+
+    // The one the test is awaiting: `null` where the call faulted as it was meant to, and a
+    // complaint where it did not.
+    out: *PromiseObj
+
+    // What the complaint has to contain, empty where the call said nothing about it.
+    wanted: string
+
+    // Where `assertFaults` was written, so the complaint points at the call rather than at whatever
+    // line the promise happened to settle on.
+    at: Span
+
+// The watches still owed an answer.
+//
+// **A root the collector has to walk**, for `rejections`' reason and more sharply: between the native
+// answering and the promise settling, nothing else holds either of these.
+var fault_watches: Buf[FaultWatch] = buf()
+
+// Watch a promise for the failure a test asked it for, and answer nothing -- the caller already holds
+// the promise to hand back.
+//
+// **The watched promise is marked handled here.** A promise that fails exactly as it was asked to is
+// dealt with by definition, and left unmarked it would be reported at the end of the run as a
+// rejection nobody was waiting for.
+watch_for_fault(watched: *PromiseObj, out: *PromiseObj, wanted: string, at: Span)
+    watched.handled = true
+    fault_watches.push(FaultWatch(watched, out, wanted, at))
+
+    // **A promise that had already settled wakes nothing later**, `reject(...)` being one a program
+    // can write, so the verdict is taken now rather than never.
+    if watched.settled then settle_watches(watched)
+end watch_for_fault
+
+// Hand the verdict to everything watching this promise.
+//
+// **The watches are taken off the list BEFORE any of them is answered**, because settling `out` wakes
+// it in turn and a second walk of a list this one is halfway through has nothing to make it agree
+// with the first.
+private settle_watches(pr: *PromiseObj)
+    var taken: Buf[FaultWatch] = buf()
+    var left: Buf[FaultWatch] = buf()
+
+    for i in 0..<fault_watches.len()
+        val w = fault_watches.at(i)
+
+        if w.watched == pr then taken.push(w) else left.push(w)
+
+    if taken.is_empty() then return
+
+    fault_watches = left
+
+    for i in 0..<taken.len()
+        answer_watch(taken.at(i), pr)
+end settle_watches
+
+private answer_watch(w: FaultWatch, pr: *PromiseObj)
+    if !pr.failed
+        settle_err(w.out, s"expected a fault, got a value: ${show_value(pr.value)}", w.at)
+        return
+    end if
+
+    if w.wanted != "" && !pr.message.contains(w.wanted)
+        settle_err(w.out, s"the fault said \"${pr.message}\", wanted it to contain \"${w.wanted}\"", w.at)
+        return
+    end if
+
+    settle_ok(w.out, Null)
+end answer_watch
+
 // Give the queues back between runs.
 reset_async()
     ready.clear()
     ready_head = 0
+    rejections.clear()
+    fault_watches.clear()
+
+// Every failure that has been reported, marked as dealt with and forgotten.
+//
+// **So that one rejection is not reported twice.** `slate test` asks `unhandled_rejection` once per
+// phase of a test -- the `@setup`, the test itself, the `@teardown` -- and a rejection left on the
+// list would be found again by the next of them and reported as that one's failure.
+forget_rejections()
+    for i in 0..<rejections.len()
+        rejections.at(i).handled = true
+
     rejections.clear()
 
 // -- settling ---------------------------------------------------------------------------------------
@@ -129,6 +224,9 @@ private wake(pr: *PromiseObj)
 
     pr.waiters.clear()
 
+    // **And whatever a test is watching this one for**, which is the other kind of waiter and needs
+    // no machine put back -- see `FaultWatch`.
+    settle_watches(pr)
 end wake
 
 // **A NATIVE COULD ONCE BE TOLD WHEN A PROMISE SETTLED, AND NOTHING NEEDS IT ANY MORE.** The one

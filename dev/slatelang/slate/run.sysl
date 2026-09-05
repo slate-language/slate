@@ -3,7 +3,7 @@ module dev.slatelang.slate
 import sh.sysl.libuv
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
-import sysl.text.str_builder
+import sysl.text.{str_builder, Search}
 
 // Loading a program, running it, and running the tests a file declared.
 //
@@ -174,7 +174,18 @@ end Tested
 // **The top level runs first and its faults are the file's, not any test's.** A file whose module
 // body fails has no working tests to speak of, so that is reported as the file failing to load
 // rather than as every test failing for the same reason.
-run_tests(src: Source) -> Tested
+run_tests(src: Source) -> Tested = run_tests_named(src, "")
+
+// The same, running only the tests whose name contains `only` -- everything where it is empty.
+//
+// **The file still LOADS whatever the filter says**, a test's name being a thing the file has to run
+// to declare. So a filter narrows what is run and never what is compiled, and a file that will not
+// load is a failure under a filter exactly as it is without one.
+//
+// **`@setupAll` runs only where something was chosen.** A filter that picks nothing out of a file has
+// no test for it to prepare, and preparing anyway would start a database for a file nobody asked to
+// run.
+run_tests_named(src: Source, only: string) -> Tested
     val started = prepare(src)
 
     if started != "" then return Tested(started, buf())
@@ -182,12 +193,27 @@ run_tests(src: Source) -> Tested
     // The tests were registered as the entry module ran, and the closures in `registered_tests` are
     // what keep their module's scope -- and everything they can see -- alive.
     var results: Buf[TestRan] = buf()
+    var chosen: Buf[TestCase] = buf()
 
     for i in 0..<registered_tests.len()
-        results.push(run_one_test(registered_tests.at(i)))
+        val t = registered_tests.at(i)
 
+        if only == "" || t.name.contains(only) then chosen.push(t)
+
+    if chosen.is_empty() then return Tested("", results)
+
+    output.clear()
+
+    val opened = run_hook(HookSetupAll)
+
+    for i in 0..<chosen.len()
+        run_guarded(chosen.at(i), opened, &results)
+
+    // **`@teardownAll` runs even where `@setupAll` faulted**, which is what a teardown is for: the
+    // state it gives back is exactly the state a setup that stopped halfway left behind.
+    hook_verdict(HookTeardownAll, run_hook(HookTeardownAll), &results)
     Tested("", results)
-end run_tests
+end run_tests_named
 
 // Everything `run` does up to and including the modules, answering a rendered complaint or nothing.
 private prepare(src: Source) -> string
@@ -319,26 +345,104 @@ private complaint(sig: Signal) -> string
     Ran(Null, rep, srcs, current_unit.sources, output, 0).render()
 end complaint
 
-// One test: call it, let the loop settle, and read the verdict.
+// One test with whatever the file wrote around it, and the verdicts that came of it.
 //
-// **An `async` test is waited for rather than refused.** Calling one starts a coroutine and hands
-// back a promise that has not settled, so a runner that read the answer straight away would call
-// every asynchronous test a pass. The promise is marked handled first, so that a failure is reported
-// here as this test's rather than at the end of the drain as the file's.
-private run_one_test(t: TestCase) -> TestRan
+// **The `@teardown` runs however the test went -- passed, failed, or left out -- and however the
+// `@setup` went.** What a teardown gives back is exactly what a setup that stopped halfway had
+// already taken, so the one case where skipping it would be tempting is the one where it matters.
+private run_guarded(t: TestCase, opened: HookRan, results: *Buf[TestRan])
     val began = libuv.hrtime()
-    var args: Buf[Value] = buf()
 
     output.clear()
 
-    // The verdict a `skip` leaves behind, cleared before every test rather than after -- a test that
-    // never called it must not inherit the last one's reason.
-    skip_asked = false
-    skip_reason = ""
+    // **`@setupAll` decided for every test in the file at once**, so a fault in it is this test's
+    // failure and its `skip` is this test's skip -- and neither the per-test hooks nor the test run.
+    if opened.left_out
+        results.push(TestRan(t.name, false, true, opened.reason, "", 0))
+        return
+    end if
 
-    val outcome = apply_callback(t.fn, args, point(0), "a test")
+    if opened.said != ""
+        results.push(TestRan(t.name, false, false, guarded_by(HookSetupAll, opened.said), "", 0))
+        return
+    end if
 
-    outcome match
+    val before = run_hook(HookSetup)
+
+    if before.left_out
+        results.push(TestRan(t.name, false, true, before.reason, printed_so_far(), elapsed(began)))
+    elif before.said != ""
+        results.push(TestRan(t.name, false, false, guarded_by(HookSetup, before.said), printed_so_far(), elapsed(began)))
+    else
+        // The verdict a `skip` leaves behind, cleared before every test rather than after -- a test
+        // that never called it must not inherit the last one's reason.
+        skip_asked = false
+        skip_reason = ""
+
+        results.push(finished(t, settled_call(t.fn, "a test"), began))
+    end if
+
+    hook_verdict(HookTeardown, run_hook(HookTeardown), results)
+end run_guarded
+
+// How a `@setup`, `@teardown`, `@setupAll` or `@teardownAll` went.
+struct HookRan
+    // The failure it left, rendered against the file that raised it. Empty where it did not fault.
+    said: string
+
+    // Whether it asked for the test to be left out, and why.
+    left_out: bool
+    reason: string
+end HookRan
+
+// Call one of them, where the file wrote one at all.
+private run_hook(kind: usize) -> HookRan
+    val fn = hook_fns.at(kind)
+
+    fn match
+        Null -> HookRan("", false, "")
+        _ ->
+            skip_asked = false
+            skip_reason = ""
+
+            val said = settled_call(fn, hook_names.at(kind))
+
+            if !skip_asked then return HookRan(said, false, "")
+
+            // **A `skip` in a teardown has no test left to leave out**, the verdict having been
+            // given, so it is a complaint about the teardown rather than a third state.
+            if kind == HookTeardown || kind == HookTeardownAll
+                return HookRan(s"`${hook_names.at(kind)}` called `skip`, and a teardown has no test to leave out", false, "")
+
+            HookRan("", true, skip_reason)
+end run_hook
+
+// A teardown's own failure, kept as a verdict of its own.
+//
+// **Never swallowed, and never folded into the test's verdict.** A test that passed and a teardown
+// that broke are two things a reader needs told apart, and a teardown that fails after a test that
+// already failed is the case where folding would lose it altogether -- so it is counted on the last
+// line as the failure it is.
+private hook_verdict(kind: usize, ran: HookRan, results: *Buf[TestRan])
+    if ran.said == "" then return
+
+    results.push(TestRan(hook_names.at(kind), false, false, ran.said, printed_so_far(), 0))
+end hook_verdict
+
+// A failure a test never reached, named after the thing that was supposed to prepare it.
+private guarded_by(kind: usize, said: string) -> string =
+    s"`${hook_names.at(kind)}` failed before this test ran\n${said}"
+
+// One call of no arguments: make it, let the loop settle, and read the verdict.
+//
+// **An `async` one is waited for rather than refused.** Calling it starts a coroutine and hands back
+// a promise that has not settled, so a runner that read the answer straight away would call every
+// asynchronous test a pass. The promise is marked handled first, so that a failure is reported here
+// as this call's rather than at the end of the drain as the file's.
+private settled_call(fn: Value, what: string) -> string
+    var args: Buf[Value] = buf()
+
+    val said = apply_callback(fn, args, point(0), what) match
         Ok(v) ->
             // **THE PROMISE IS ROOTED ACROSS THE DRAIN, AND A sysl LOCAL IS NOT A ROOT.** The
             // collector walks the machine, the slots and this shadow stack; it cannot see a `Value`
@@ -366,9 +470,15 @@ private run_one_test(t: TestCase) -> TestRan
                     None -> awaited_verdict(v)
 
             release(mark)
-            finished(t, after, began)
-        Err(sig) -> finished(t, complaint(sig), began)
-end run_one_test
+            after
+        Err(sig) -> complaint(sig)
+
+    // **What was reported here is not reported again by the next phase.** A test is three calls now
+    // -- its `@setup`, itself, its `@teardown` -- each of which asks `unhandled_rejection`, and a
+    // rejection left on the list would fail all three for one fault.
+    forget_rejections()
+    said
+end settled_call
 
 // What an `async` test's promise came to, once the loop has run it to the end.
 private awaited_verdict(v: Value) -> string
@@ -392,6 +502,19 @@ private said_at(message: string, at: Span) -> string
 end said_at
 
 private finished(t: TestCase, said: string, began: u64) -> TestRan
+    val printed = printed_so_far()
+    val ms = elapsed(began)
+
+    // **A skip beats whatever the unwind came out as**, which is what makes the asynchronous case
+    // work: a `skip` inside an `async` test arrives here as a rejected promise, and the reason was
+    // written down where it was called.
+    if skip_asked then return TestRan(t.name, false, true, skip_reason, printed, ms)
+
+    TestRan(t.name, said == "", false, said, printed, ms)
+end finished
+
+// Everything printed since the output was last cleared, which is at the top of each test.
+private printed_so_far() -> string
     var out = str_builder()
 
     for i in 0..<output.len()
@@ -399,15 +522,10 @@ private finished(t: TestCase, said: string, began: u64) -> TestRan
 
         out.push(output.at(i))
 
-    val ms = (libuv.hrtime() - began) / 1000000
+    out.finish()
+end printed_so_far
 
-    // **A skip beats whatever the unwind came out as**, which is what makes the asynchronous case
-    // work: a `skip` inside an `async` test arrives here as a rejected promise, and the reason was
-    // written down where it was called.
-    if skip_asked then return TestRan(t.name, false, true, skip_reason, out.finish(), ms)
-
-    TestRan(t.name, said == "", false, said, out.finish(), ms)
-end finished
+private elapsed(began: u64) -> u64 = (libuv.hrtime() - began) / 1000000
 
 // Every module in turn, each in a scope of its own under the builtins.
 //
