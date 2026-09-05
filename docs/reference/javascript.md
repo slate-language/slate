@@ -436,6 +436,44 @@ since the module shipped — so what these add is the walk rather than a kind of
 siblings and an `innerHTML` reader are deliberately absent: a page is walked downwards from something
 the program already holds, and the rest is a general traversal API.
 
+### Case, whitespace and the normal forms are one operation, and that took proving
+
+**Nothing in this section is a difference**, which is worth saying in a chapter that is otherwise a
+list of them. `upper`, `lower` and `normalize` are the host's own here — `toUpperCase`,
+`toLowerCase` and `String.prototype.normalize` — and the interpreter's side was written to reach the
+same answers rather than defensible ones: every code point there is was run through both back ends
+and compared. So `upper("ß")` is `SS` on each, `İ` lowercases to two characters on each, and a sigma
+ending a word is `ς` on each.
+
+That is not what a per-character walk over a case table gives. A hundred and two characters uppercase
+to more than one, so the interpreter carries a table for those; `İ` and the final sigma are the two
+cases going the other way, and the second is context rather than a table.
+
+**`trim` calls neither host's own**, and it is the one of the four that could have. ECMAScript's
+whitespace is not the database's `White_Space`: it takes `U+FEFF` off, which the database does not
+call a space at all, and leaves `U+0085` on, which it does. Both back ends spell the twenty-five
+characters out instead.
+
+**`casefold` is written out here**, no JavaScript host having case folding at all. It is
+`NFC(fold(NFD(s)))` — the standard's own caseless match — and what stands between it and
+`toLowerCase` is a table of two hundred and nine code points: the ones that fold to more than one
+character, the ones that fold *across* an alphabet rather than down it (`µ` to a Greek mu, `ſ` to
+`s`, a combining iota to a letter), and Cherokee, the one script in the database whose fold is to
+**upper** case.
+
+`tests/js/p25.sl` is the corpus that keeps all of this honest, and it is a corpus rather than a set
+of expectations for the reason every file under `tests/js/` is: it is run by both and diffed.
+
+### `onSignal` needs a process, so node has it and a browser does not
+
+`slate:process`'s signals are `process.on` and `process.off` here, with the interpreter's own list of
+names and its own refusal of `SIGKILL` and `SIGSTOP`. A host with no `process` is not a thing that
+can be signalled, and says so in those words rather than installing a handler nothing will ever call.
+
+`stat` answers `modified` here as it does under the interpreter — an instant in microseconds, from
+node's `mtimeMs`. It was missing for one release, which nothing noticed until a program walking a
+directory tree asked a file for its modification time and reached a field that was not there.
+
 ### Arity is checked here too, and until 0.0.28 it was not
 
 A JavaScript function ignores an argument it was not expecting and binds `undefined` for one it was

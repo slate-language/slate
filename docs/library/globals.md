@@ -38,18 +38,38 @@ true
 ## Text
 
 `chars  split  join  contains  indexOf  lastIndexOf  startsWith  endsWith`
-`trim  trimStart  trimEnd  upper  lower  replace  repeat`
+`trim  trimStart  trimEnd  upper  lower  normalize  casefold  replace  repeat`
 
 Every position is **in characters**, never in bytes.
 
 - **`indexOf` answers `null`** rather than `-1`, because slate has a null and the operators that go with
   it: `indexOf(s, x) ?? 0` says what a sentinel makes a reader work out.
+- **A search may be told where to start.** `indexOf(s, x, from)` and `lastIndexOf(s, x, from)` take a
+  third position, and a negative one counts back from the end.
 - **`split` on an empty separator splits into characters.**
-- **`upper` and `lower` are ASCII**; `é` comes back as it went in. That is a known limit with a test on
-  it rather than a surprise.
+- **Case is the whole Unicode database**, so `upper("Straße")` is `STRASSE` and `lower("ΟΔΟΣ")` ends in
+  a final sigma. A case mapping may change a string's length; both back ends answer the same thing.
+- **`trim` is Unicode's `White_Space`**, so a no-break space comes off and a zero-width no-break space
+  — which the database does not call a space — stays.
+- **`normalize(s, form)` takes one of `"NFC"`, `"NFD"`, `"NFKC"` and `"NFKD"`** and faults on anything
+  else rather than falling to a default.
+- **`casefold` is not `lower`.** It is the key to store beside a name somebody will search for: `ß`
+  folds to `ss`, folding is idempotent, and what it answers is composed.
+
+```slate
+print(upper("Straße"), lower("ΟΔΟΣ"))
+print(casefold("STRASSE") == casefold("Straße"), lower("STRASSE") == lower("Straße"))
+print(normalize("e\u{301}", "NFC") == "é")
+```
+
+```output
+STRASSE οδος
+true false
+true
+```
 
 As methods, a string answers: `len chars split contains indexOf lastIndexOf startsWith endsWith trim
-trimStart trimEnd upper lower replace repeat number integer real boolean string`.
+trimStart trimEnd upper lower normalize casefold replace repeat number integer real boolean string`.
 
 ## Numbers
 

@@ -1,4 +1,4 @@
-// Strings: counted in characters, and ASCII where a case or a space rule has to draw a line.
+// Strings: counted in characters, and Unicode wherever a case or a space rule has to decide.
 
 @test
 a_string_is_counted_in_characters_and_not_in_bytes() =
@@ -18,21 +18,68 @@ slicing_is_by_character_too() =
     assertEq("héllo"[1..<3], "él")
 
 @test
-case_is_ascii_only_and_that_is_deliberate() =
-    // A case mapping that is right needs a table, a locale and a rule for the characters whose
-    // upper case is two characters. slate says where its line is instead of half-doing it.
-    assertEq(upper("héllo"), "HéLLO")
-    assertEq(lower("HÉLLO"), "hÉllo")
+case_is_the_whole_database_and_not_the_ascii_range() =
+    assertEq(upper("héllo"), "HÉLLO")
+    assertEq(lower("HÉLLO"), "héllo")
     assertEq(upper("abc123"), "ABC123")
 
 @test
-trimming_is_ascii_whitespace_only() =
+a_case_mapping_may_change_a_strings_length() =
+    // A hundred and two characters uppercase to more than one, and one lowercases to more than one.
+    // A per-character walk would answer a single letter for each and disagree with every other
+    // language that has a case table.
+    assertEq(upper("ß"), "SS")
+    assertEq(upper("ﬁ"), "FI")
+    assertEq(len(lower("İ")), 2)
+
+@test
+a_sigma_at_the_end_of_a_word_is_written_differently() =
+    // Which is context rather than a table: the letter is the same one and the shape it takes
+    // depends on what stands either side of it.
+    assertEq(lower("ΟΔΟΣ"), "οδος")
+    assertEq(lower("ΟΔΟΣΑ"), "οδοσα")
+
+@test
+trimming_is_unicode_whitespace() =
     assertEq(trim("  x\t\n"), "x")
     assertEq(trimStart("  x  "), "x  ")
     assertEq(trimEnd("  x  "), "  x")
 
-    // A non-breaking space is not ASCII whitespace, so it stays.
-    assertEq(trim(" \u{a0}x "), "\u{a0}x")
+    // A non-breaking space is whitespace and comes off; a zero-width no-break space is not one
+    // and stays, which is the pair every host's own `trim` gets the other way round.
+    assertEq(trim(" \u{a0}x\u{a0} "), "x")
+    assertEq(trim("\u{feff}x\u{feff}"), "\u{feff}x\u{feff}")
+
+@test
+normalizing_is_what_makes_two_spellings_of_one_word_equal() =
+    // The same text typed on two machines is routinely two different sequences of characters, and
+    // nothing about comparing them says so.
+    assert("é" != "e\u{301}")
+    assertEq(normalize("e\u{301}", "NFC"), "é")
+    assertEq(normalize("é", "NFD"), "e\u{301}")
+
+    // The compatibility forms throw information away, which is what makes them for matching.
+    assertEq(normalize("ﬁ", "NFKC"), "fi")
+
+@test
+a_form_nobody_knows_is_refused_naming_all_four() =
+    val said = (normalize("x", "nfc") catch e -> e.message)
+
+    assert(contains(said, "NFC"))
+    assert(contains(said, "NFKD"))
+
+@test
+folding_is_for_comparing_and_lowering_is_for_showing() =
+    // `ß` folds to `ss` where it lowercases to itself, so folding is what answers *is this the same
+    // word* and lowering is not.
+    assert(casefold("STRASSE") == casefold("Straße"))
+    assert(lower("STRASSE") != lower("Straße"))
+
+    // And folding is idempotent, which is what makes it the thing to store.
+    assertEq(casefold(casefold("Straße")), casefold("Straße"))
+
+    // It composes what it answers, so a decomposed spelling folds to the composed one.
+    assert(casefold("ÉCOLE") == casefold("e\u{301}cole"))
 
 @test
 searching_answers_null_for_a_miss_and_not_a_negative_number() =

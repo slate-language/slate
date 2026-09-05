@@ -116,7 +116,31 @@ and `split` all hand back the same kind of thing.
 `toBytes(s)` answers an array of numbers and `fromBytes(bs)` answers a [result](faults.md); those two
 are the only place a slate program sees UTF-8, and `len(toBytes(s))` is the byte count.
 
-**`upper` and `lower` are ASCII.** `é` comes back as it went in.
+**Case and whitespace are the whole database and not the ASCII range.** `upper` and `lower` answer
+what any other language with a case table answers, which is not always one character out for one
+character in, and `trim` takes off Unicode's `White_Space` — so a no-break space pasted out of a form
+comes off and a zero-width no-break space, which is not a space at all, stays.
+
+```slate
+print(upper("Straße"), len(lower("İ")))
+print(lower("ΟΔΟΣ"), lower("ΟΔΟΣΑ"))
+print("[" + trim(" \u{a0}x\u{a0} ") + "]")
+```
+
+```output
+STRASSE 2
+οδος οδοσα
+[x]
+```
+
+The second line is Unicode's own rule that a sigma ending a word is written `ς`, which is context
+rather than a table; the first is `ß` uppercasing to two letters and `İ` lowercasing to two.
+
+`normalize(s, form)` puts text into one of `"NFC"`, `"NFD"`, `"NFKC"` and `"NFKD"`, which is what two
+strings have to go through before `==` between them means what a reader thinks it means — the same
+word typed on two machines is routinely two different sequences of characters. `casefold(s)` is what
+two strings differing only in case both come to, and is **not** `lower`: `ß` folds to `ss`, so
+`casefold("STRASSE") == casefold("Straße")` where lowering leaves them different.
 
 ## Conversion
 

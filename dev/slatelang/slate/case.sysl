@@ -1,0 +1,361 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.str_builder
+import sysl.unicode.{Category, Form, category, fold, is_lower, is_space, is_upper, normalize as normalize_unicode, to_lower as lower_char, to_upper as upper_char}
+
+// Case and whitespace, which is where Unicode lives.
+//
+// **CUT OUT OF `text.sysl` BY SUBJECT.** Everything else in that file counts and cuts characters and
+// is Unicode-correct by construction; these four are the ones that have to know what a character
+// MEANS -- which of them is a letter with another case, and which of them is a space -- and that is
+// a database rather than a walk. `sysl.unicode` is that database, vendored utf8proc in the standard
+// library, and this file is the whole of slate's use of it.
+//
+// ## What changed, and it is a behaviour change rather than a feature
+//
+// **`upper` and `lower` were ASCII and are not now.** `upper("héllo")` answered `HéLLO`; it answers
+// `HÉLLO`. The old answer was a decision at the time and the comment that stood here said so: a case
+// mapping that is right needs a table, and a language that half-does it is worse than one that says
+// where its line is. What moved is that the table arrived -- `sysl.unicode` is in the standard
+// library as of sysl 0.0.101 -- so the line is no longer worth drawing.
+//
+// **`trim` was ASCII whitespace and is Unicode's `White_Space` now**, so a no-break space at the end
+// of a line coming out of a form comes off.
+//
+// ## THE TWO HOSTS HAVE TO AGREE, AND THAT IS WHAT DECIDES EVERY DETAIL HERE
+//
+// A JavaScript host answers all of this natively and its answers are the Unicode ones -- so what is
+// written here is written to reach the SAME answer rather than to reach a defensible one. Three
+// places that costs more than a call:
+//
+// - **`upper` IS NOT A PER-CHARACTER MAP.** A hundred and two characters uppercase to more than one:
+//   `ß` to `SS`, `ﬁ` to `FI`, `ΐ` to three. utf8proc's `to_upper` is the *simple* mapping and answers
+//   one character for each of them, so a per-character walk gives `upper("ß")` as `ẞ` where every
+//   JavaScript engine gives `SS`. `SPECIAL_UPPER` below is that table, generated from what a host
+//   actually answers rather than transcribed.
+// - **`lower` HAS TWO CASES OF ITS OWN**: `İ` lowercases to two characters, and a final sigma is `ς`
+//   rather than `σ`. The second is context and not a table -- Unicode's `Final_Sigma` condition --
+//   and a JavaScript host implements it, so a walk that did not would disagree on every Greek word
+//   ending in one.
+// - **`trim` IS WRITTEN OUT ON BOTH HOSTS AND NEITHER USES THE HOST'S OWN.** JavaScript's `trim`
+//   takes `U+FEFF` off, which is not `White_Space` at all, and leaves `U+0085` on, which is. So both
+//   hosts spell the class rather than calling `String.prototype.trim`.
+//
+// `tests/js/p25.sl` is the differential corpus over all four, and `docs/reference/javascript.md`
+// names what is left standing.
+
+// `upper(s)` and `lower(s)`.
+do_case(args: Buf[Value], at: Span, up: bool) -> Step
+    val name = if up then "upper" else "lower"
+
+    wants(args, 1, at, name, "one string")?
+
+    val s = text_argument(args.at(0), at, name, "a string")?
+
+    Ok(str_value(if up then upper_cased(s) else lower_cased(s)))
+
+// Every character's upper case, and the hundred and two that are more than one character.
+private upper_cased(s: string) -> string
+    var out = str_builder()
+
+    for c in s.chars
+        val wider = special_upper(u32(c))
+
+        if wider.len == 0
+            out.push_char(upper_char(c))
+        else
+            for i in 0..<wider.len
+                out.push_char(char(wider[i]))
+
+    out.finish()
+end upper_cased
+
+// Every character's lower case, with the two cases that are not one character each.
+//
+// **The characters are collected first because a final sigma is a question about its NEIGHBOURS**,
+// and there is no way to look either way along a string of characters without having them.
+private lower_cased(s: string) -> string
+    var chars: Buf[char] = buf()
+
+    for c in s.chars
+        chars.push(c)
+
+    var out = str_builder()
+
+    for i in 0..<chars.len()
+        val c = chars.at(i)
+        val cp = u32(c)
+
+        if cp == 0x0130
+            // **`İ` lowercases to `i` and a combining dot**, which is the only lower case in the
+            // whole database that is longer than what it came from.
+            out.push_char(char(0x0069))
+            out.push_char(char(0x0307))
+        elif cp == 0x03A3 && final_sigma(chars, i)
+            out.push_char(char(0x03C2))
+        else
+            out.push_char(lower_char(c))
+
+    out.finish()
+end lower_cased
+
+// Whether a capital sigma at `i` is the last letter of its word, which is what makes it `ς`.
+//
+// **Unicode's `Final_Sigma` condition, written out**: something cased before it, nothing cased after
+// it, and characters that are neither -- an accent, a format character, an apostrophe -- looked
+// through in both directions.
+private final_sigma(chars: Buf[char], i: usize) -> bool
+    var before = false
+    var j = i
+
+    while j > 0
+        j -= 1
+
+        val c = chars.at(j)
+
+        if case_ignorable(c) then continue
+
+        before = cased(c)
+        break
+
+    if !before then return false
+
+    var k = i + 1
+
+    while k < chars.len()
+        val c = chars.at(k)
+
+        k += 1
+
+        if case_ignorable(c) then continue
+
+        return !cased(c)
+
+    true
+end final_sigma
+
+// A letter that has a case, which is the `Cased` property read off the two utf8proc answers plus
+// title case -- the one category neither of them counts.
+private cased(c: char) -> bool = is_upper(c) || is_lower(c) || category(c) == Category.Lt
+
+// A character a case rule looks THROUGH: a mark, a format character, a modifier letter, and the
+// seventeen punctuation marks that sit inside a word.
+//
+// **The seventeen are written out because they are a word-break property rather than a category**,
+// and `sysl.unicode` answers categories. An apostrophe is the one anybody meets: `ΟΔΟΣ'` ends in a
+// final sigma and `ΟΔΟΣΑ` does not.
+private case_ignorable(c: char) -> bool
+    val cp = u32(c)
+
+    if cp == 0x0027 || cp == 0x002E || cp == 0x003A || cp == 0x00B7 || cp == 0x0387 then return true
+    if cp == 0x055F || cp == 0x05F4 || cp == 0x2018 || cp == 0x2019 || cp == 0x2024 then return true
+    if cp == 0x2027 || cp == 0xFE13 || cp == 0xFE52 || cp == 0xFE55 || cp == 0xFF07 then return true
+    if cp == 0xFF0E || cp == 0xFF1A then return true
+
+    category(c) match
+        Category.Mn -> true
+        Category.Me -> true
+        Category.Cf -> true
+        Category.Lm -> true
+        Category.Sk -> true
+        _ -> false
+end case_ignorable
+
+// `trim(s)`, `trimStart(s)`, `trimEnd(s)`.
+//
+// **`White_Space` and no longer the six ASCII spaces**, so a no-break space at the end of a pasted
+// line comes off -- which is the commonest thing anybody meets that the ASCII rule left on.
+do_trim(args: Buf[Value], at: Span, front: bool, back: bool) -> Step
+    val name = if front && back then "trim" elif front then "trimStart" else "trimEnd"
+
+    wants(args, 1, at, name, "one string")?
+
+    val s = text_argument(args.at(0), at, name, "a string")?
+
+    var chars: Buf[char] = buf()
+
+    for c in s.chars
+        chars.push(c)
+
+    val n = chars.len()
+    var lo: usize = 0
+    var hi = n
+
+    if front
+        loop
+            if lo >= hi then break
+            if !is_space(chars.at(lo)) then break
+
+            lo += 1
+
+    if back
+        loop
+            if hi <= lo then break
+            if !is_space(chars.at(hi - 1)) then break
+
+            hi -= 1
+
+    Ok(str_value(char_slice(s, lo, hi)))
+end do_trim
+
+// `normalize(s, form)` -- the same text written the one way of four.
+//
+// **A STRING AND NOT FOUR BUILTINS**, because what a program picks between is data: a manifest, a
+// column in a database and a header all say which form they want, and four names would make reading
+// one into a call a `match` over nothing.
+//
+// **A form nobody knows is refused naming all four**, rather than falling to a default -- a program
+// that asked for `"nfc"` and got NFD would produce text that compares equal to nothing.
+do_normalize(args: Buf[Value], at: Span) -> Step
+    wants(args, 2, at, "normalize", "a string and a form")?
+
+    val s = text_argument(args.at(0), at, "normalize", "a string")?
+    val form = text_argument(args.at(1), at, "normalize", "a form")?
+
+    val wanted = form match
+        "NFC" -> Form.Nfc
+        "NFD" -> Form.Nfd
+        "NFKC" -> Form.Nfkc
+        "NFKD" -> Form.Nfkd
+        else return fault(at, s"`normalize` takes one of \"NFC\", \"NFD\", \"NFKC\" and \"NFKD\", and this is \"${form}\"")
+
+    Ok(str_value(normalize_unicode(wanted, s)))
+end do_normalize
+
+// `casefold(s)` -- what two strings that differ only in case both come to.
+//
+// **It is not `lower`.** `lower("STRASSE")` and `lower("STRAßE")` are different strings and
+// `casefold` makes them the same one, `ß` folding to `ss`; and folding is idempotent where lowering
+// is not, which is what makes it the thing to store beside a name a person will search for.
+//
+// **THE `Nfd` PASS IN FRONT IS NOT DECORATION AND THE TWO HOSTS DISAGREE WITHOUT IT.** The standard
+// defines a caseless match as `NFD(fold(NFD(x)))`, and the inner one is load-bearing for exactly one
+// character: `U+0345`, the combining iota, is a mark of class 240 that folds to a LETTER of class 0.
+// Ordering the marks first puts a class-230 accent written after it in front of it, which is where a
+// reader put it; folding first turns the iota into a starter and the accent then attaches to the
+// iota instead. `sysl.unicode.fold` orders after mapping, so `casefold("ᾤ͐")` came out
+// `ὤι͐` here and `ὤ͐ι` under every JavaScript host. Normalizing first
+// is what makes the two one answer, and it is the standard's own reading.
+do_casefold(args: Buf[Value], at: Span) -> Step
+    wants(args, 1, at, "casefold", "one string")?
+
+    val s = text_argument(args.at(0), at, "casefold", "a string")?
+
+    Ok(str_value(fold(normalize_unicode(Form.Nfd, s))))
+
+// The characters whose upper case is longer than one character.
+//
+// **GENERATED FROM WHAT A HOST ANSWERS, not transcribed from `SpecialCasing.txt`.** What this table
+// is for is that the two back ends agree, so the thing to read it off is the back end that is not
+// written here -- every code point run through `String.prototype.toUpperCase` under node, keeping
+// the hundred and two whose answer is more than one code point.
+//
+// **A `match` rather than a table in module storage**, which costs nothing at run time for the
+// characters that are not in it: nearly every character falls to the `else` in a jump.
+private special_upper(cp: u32) -> []const u32 =
+    cp match
+        0x00DF -> [0x0053, 0x0053]
+        0x0149 -> [0x02BC, 0x004E]
+        0x01F0 -> [0x004A, 0x030C]
+        0x0390 -> [0x0399, 0x0308, 0x0301]
+        0x03B0 -> [0x03A5, 0x0308, 0x0301]
+        0x0587 -> [0x0535, 0x0552]
+        0x1E96 -> [0x0048, 0x0331]
+        0x1E97 -> [0x0054, 0x0308]
+        0x1E98 -> [0x0057, 0x030A]
+        0x1E99 -> [0x0059, 0x030A]
+        0x1E9A -> [0x0041, 0x02BE]
+        0x1F50 -> [0x03A5, 0x0313]
+        0x1F52 -> [0x03A5, 0x0313, 0x0300]
+        0x1F54 -> [0x03A5, 0x0313, 0x0301]
+        0x1F56 -> [0x03A5, 0x0313, 0x0342]
+        0x1F80 -> [0x1F08, 0x0399]
+        0x1F81 -> [0x1F09, 0x0399]
+        0x1F82 -> [0x1F0A, 0x0399]
+        0x1F83 -> [0x1F0B, 0x0399]
+        0x1F84 -> [0x1F0C, 0x0399]
+        0x1F85 -> [0x1F0D, 0x0399]
+        0x1F86 -> [0x1F0E, 0x0399]
+        0x1F87 -> [0x1F0F, 0x0399]
+        0x1F88 -> [0x1F08, 0x0399]
+        0x1F89 -> [0x1F09, 0x0399]
+        0x1F8A -> [0x1F0A, 0x0399]
+        0x1F8B -> [0x1F0B, 0x0399]
+        0x1F8C -> [0x1F0C, 0x0399]
+        0x1F8D -> [0x1F0D, 0x0399]
+        0x1F8E -> [0x1F0E, 0x0399]
+        0x1F8F -> [0x1F0F, 0x0399]
+        0x1F90 -> [0x1F28, 0x0399]
+        0x1F91 -> [0x1F29, 0x0399]
+        0x1F92 -> [0x1F2A, 0x0399]
+        0x1F93 -> [0x1F2B, 0x0399]
+        0x1F94 -> [0x1F2C, 0x0399]
+        0x1F95 -> [0x1F2D, 0x0399]
+        0x1F96 -> [0x1F2E, 0x0399]
+        0x1F97 -> [0x1F2F, 0x0399]
+        0x1F98 -> [0x1F28, 0x0399]
+        0x1F99 -> [0x1F29, 0x0399]
+        0x1F9A -> [0x1F2A, 0x0399]
+        0x1F9B -> [0x1F2B, 0x0399]
+        0x1F9C -> [0x1F2C, 0x0399]
+        0x1F9D -> [0x1F2D, 0x0399]
+        0x1F9E -> [0x1F2E, 0x0399]
+        0x1F9F -> [0x1F2F, 0x0399]
+        0x1FA0 -> [0x1F68, 0x0399]
+        0x1FA1 -> [0x1F69, 0x0399]
+        0x1FA2 -> [0x1F6A, 0x0399]
+        0x1FA3 -> [0x1F6B, 0x0399]
+        0x1FA4 -> [0x1F6C, 0x0399]
+        0x1FA5 -> [0x1F6D, 0x0399]
+        0x1FA6 -> [0x1F6E, 0x0399]
+        0x1FA7 -> [0x1F6F, 0x0399]
+        0x1FA8 -> [0x1F68, 0x0399]
+        0x1FA9 -> [0x1F69, 0x0399]
+        0x1FAA -> [0x1F6A, 0x0399]
+        0x1FAB -> [0x1F6B, 0x0399]
+        0x1FAC -> [0x1F6C, 0x0399]
+        0x1FAD -> [0x1F6D, 0x0399]
+        0x1FAE -> [0x1F6E, 0x0399]
+        0x1FAF -> [0x1F6F, 0x0399]
+        0x1FB2 -> [0x1FBA, 0x0399]
+        0x1FB3 -> [0x0391, 0x0399]
+        0x1FB4 -> [0x0386, 0x0399]
+        0x1FB6 -> [0x0391, 0x0342]
+        0x1FB7 -> [0x0391, 0x0342, 0x0399]
+        0x1FBC -> [0x0391, 0x0399]
+        0x1FC2 -> [0x1FCA, 0x0399]
+        0x1FC3 -> [0x0397, 0x0399]
+        0x1FC4 -> [0x0389, 0x0399]
+        0x1FC6 -> [0x0397, 0x0342]
+        0x1FC7 -> [0x0397, 0x0342, 0x0399]
+        0x1FCC -> [0x0397, 0x0399]
+        0x1FD2 -> [0x0399, 0x0308, 0x0300]
+        0x1FD3 -> [0x0399, 0x0308, 0x0301]
+        0x1FD6 -> [0x0399, 0x0342]
+        0x1FD7 -> [0x0399, 0x0308, 0x0342]
+        0x1FE2 -> [0x03A5, 0x0308, 0x0300]
+        0x1FE3 -> [0x03A5, 0x0308, 0x0301]
+        0x1FE4 -> [0x03A1, 0x0313]
+        0x1FE6 -> [0x03A5, 0x0342]
+        0x1FE7 -> [0x03A5, 0x0308, 0x0342]
+        0x1FF2 -> [0x1FFA, 0x0399]
+        0x1FF3 -> [0x03A9, 0x0399]
+        0x1FF4 -> [0x038F, 0x0399]
+        0x1FF6 -> [0x03A9, 0x0342]
+        0x1FF7 -> [0x03A9, 0x0342, 0x0399]
+        0x1FFC -> [0x03A9, 0x0399]
+        0xFB00 -> [0x0046, 0x0046]
+        0xFB01 -> [0x0046, 0x0049]
+        0xFB02 -> [0x0046, 0x004C]
+        0xFB03 -> [0x0046, 0x0046, 0x0049]
+        0xFB04 -> [0x0046, 0x0046, 0x004C]
+        0xFB05 -> [0x0053, 0x0054]
+        0xFB06 -> [0x0053, 0x0054]
+        0xFB13 -> [0x0544, 0x0546]
+        0xFB14 -> [0x0544, 0x0535]
+        0xFB15 -> [0x0544, 0x053B]
+        0xFB16 -> [0x054E, 0x0546]
+        0xFB17 -> [0x0544, 0x053D]
+        _ -> []
