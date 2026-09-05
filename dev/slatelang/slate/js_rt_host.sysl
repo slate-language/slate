@@ -594,15 +594,30 @@ js_runtime_host() -> string = raw"""
         // then run against every back end there is. The interpreter's `run_one_test` in `run.sysl`
         // is the other half of this, and the two report in the same words on purpose.
         //
-        // **`$test` registers and `$runTests` runs**, which is `Program.tests` and `run_tests` said
-        // in JavaScript. Only the ENTRY file registers, exactly as `compile_module`'s `is_entry`
-        // decides for the interpreter -- a test file imports the module it tests, and registering
-        // every module's would run the imported file's tests once per importer.
+        // **`$test` and `$hook` register and `$suite` runs**, which is `Program.tests`, the four
+        // annotations beside it and `run_tests_named` said in JavaScript. Only the ENTRY file
+        // registers, exactly as `compile_module`'s `is_entry` decides for the interpreter -- a test
+        // file imports the module it tests, and registering every module's would run the imported
+        // file's tests once per importer, its `@setup` included.
         const REGISTERED = []
+
+        // What the file wrote AROUND its tests, held under the index `run.sysl` holds it under:
+        // `@setup`, `@teardown`, `@setupAll`, `@teardownAll`.
+        //
+        // **Four slots and not four names, because nothing about them differs but when they run.**
+        // That is `HookSetup`/`HookTeardown`/`HookSetupAll`/`HookTeardownAll` in `vm.sysl`, and the
+        // emitter writes the number.
+        const HOOKS = [null, null, null, null]
+        const HOOK_NAMES = ["", "", "", ""]
 
         // **On `$` and not on `B`, because the EMITTED PROGRAM calls these** -- `B`'s `$`-prefixed
         // names are the runtime's own and never become globals, and the emitter writes `$.$test`.
         $.$test = (name, fn) => { REGISTERED.push([name, fn]) }
+
+        $.$hook = (kind, name, fn) => {
+            HOOKS[kind] = fn
+            HOOK_NAMES[kind] = name
+        }
 
         // Every file of a suite, in ONE process, reported in the words `slate test` uses.
         //
@@ -615,10 +630,17 @@ js_runtime_host() -> string = raw"""
         // Each entry is a path and a function that EVALUATES that file's program, which is what
         // registers its tests. Running them is this function's job rather than the program's, so that
         // one report covers the suite and one status leaves it.
-        $.$suite = async (files) => {
+        //
+        // **`only` narrows what is RUN and never what is loaded**, a test's name being something the
+        // file has to run to declare. `run_tests_named` draws the same line.
+        $.$suite = async (files, only) => {
             let passed = 0
             let failed = 0
             let leftOut = 0
+
+            // Whether any test anywhere was picked, which is the question a filter that matches
+            // nothing has to be answered with.
+            let anyChosen = false
 
             // **A passing test's output is DISCARDED and a failing one's is shown**, which is what
             // the interpreter does by clearing `output` before each test and printing it only in the
@@ -629,11 +651,69 @@ js_runtime_host() -> string = raw"""
 
             const said = []
 
+            // One call of no arguments: make it, wait for it, and answer what it left behind. An
+            // empty answer is a call that did what it was asked to.
+            const phase = async (fn) => {
+                try {
+                    const answered = fn()
+
+                    if (answered instanceof Promise) await answered
+                } catch (e) {
+                    // **A skip is asked about BEFORE `caught`, which rethrows one.** It is a
+                    // verdict rather than a fault, on both hosts.
+                    //
+                    // **`caught` is otherwise what a `catch` in a slate program would have been
+                    // given**, so a `throw` of a value, a fault raised by the machine and a
+                    // JavaScript error from inside the runtime all reach here as one shape --
+                    // which is `settled_call` reading its `Err` on the other side.
+                    if (e instanceof $.Skipped) return { skip: e.reason }
+
+                    return { said: $.caught(e).getName("message") }
+                }
+
+                return {}
+            }
+
+            // One of the four, where the file wrote one at all.
+            const runHook = async (kind) => {
+                if (HOOKS[kind] === null) return {}
+
+                const ran = await phase(HOOKS[kind])
+
+                if (ran.skip === undefined) return ran
+
+                // **A `skip` in a teardown has no test left to leave out**, the verdict having been
+                // given, so it is a complaint about the teardown rather than a third state.
+                if (kind === 1 || kind === 3)
+                    return { said: "`" + HOOK_NAMES[kind] + "` called `skip`, and a teardown has no test to leave out" }
+
+                return ran
+            }
+
+            const guardedBy = (kind, complaint) =>
+                "`" + HOOK_NAMES[kind] + "` failed before this test ran\n" + complaint
+
+            // A teardown's own failure, kept as a verdict of its own -- never swallowed and never
+            // folded into the test's, which is what makes it count on the last line.
+            const hookVerdict = (path, kind, ran, from) => {
+                if (ran.said === undefined) return
+
+                failed += 1
+                said.push("  FAIL  " + path + " :: " + HOOK_NAMES[kind] + "   0ms")
+
+                for (const line of $.host.lines.slice(from)) said.push("        " + line)
+                for (const line of ran.said.split("\n")) said.push("        " + line)
+            }
+
             for (const [path, load] of files) {
                 // **The registry is emptied per FILE**, which is `compile_module`'s `is_entry` rule
                 // said at run time: a test file imports the module it tests, and a registry carried
                 // across files would run an imported file's tests once per importer.
                 REGISTERED.length = 0
+                HOOKS[0] = null
+                HOOKS[1] = null
+                HOOKS[2] = null
+                HOOKS[3] = null
 
                 try {
                     load()
@@ -650,35 +730,41 @@ js_runtime_host() -> string = raw"""
                     continue
                 }
 
-                for (const [name, fn] of REGISTERED) {
+                const chosen = REGISTERED.filter(([name]) => only === "" || name.includes(only))
+
+                // **`@setupAll` runs only where something was chosen**, a filter that picks nothing
+                // out of a file leaving it nothing to prepare.
+                if (chosen.length === 0) continue
+
+                anyChosen = true
+
+                const opened = await runHook(2)
+                const guarded = opened.skip === undefined && opened.said === undefined
+
+                for (const [name, fn] of chosen) {
                     const began = Date.now()
                     const from = $.host.lines.length
-                    let complaint = null
 
                     let skipReason = null
+                    let complaint = null
 
-                    try {
-                        const answered = fn()
+                    if (opened.skip !== undefined) skipReason = opened.skip
+                    else if (opened.said !== undefined) complaint = guardedBy(2, opened.said)
+                    else {
+                        const before = await runHook(0)
 
-                        if (answered instanceof Promise) await answered
-                    } catch (e) {
-                        // **A skip is asked about BEFORE `caught`, which rethrows one.** It is a
-                        // verdict rather than a fault, on both hosts.
-                        //
-                        // **`caught` is otherwise what a `catch` in a slate program would have been
-                        // given**, so a `throw` of a value, a fault raised by the machine and a
-                        // JavaScript error from inside the runtime all reach here as one shape --
-                        // which is `run_one_test` reading its `Err` on the other side.
-                        if (e instanceof $.Skipped) skipReason = e.reason
-                        else complaint = $.caught(e).getName("message")
+                        if (before.skip !== undefined) skipReason = before.skip
+                        else if (before.said !== undefined) complaint = guardedBy(0, before.said)
+                        else {
+                            const ran = await phase(fn)
+
+                            if (ran.skip !== undefined) skipReason = ran.skip
+                            else if (ran.said !== undefined) complaint = ran.said
+                        }
                     }
 
                     const ms = Date.now() - began
                     const printed = $.host.lines.slice(from)
-
-                    // **Cut back rather than left to grow**, or a long suite holds every line every
-                    // one of its tests ever printed.
-                    $.host.lines.length = from
 
                     if (skipReason !== null) {
                         leftOut += 1
@@ -691,10 +777,22 @@ js_runtime_host() -> string = raw"""
                         said.push("  FAIL  " + path + " :: " + name + "   " + ms + "ms")
 
                         for (const line of printed) said.push("        " + line)
-
                         for (const line of complaint.split("\n")) said.push("        " + line)
                     }
+
+                    // **The `@teardown` runs however the test went** -- passed, failed or left out --
+                    // and only where the test was actually attempted: a `@setupAll` that fell over
+                    // took the per-test pair with it.
+                    if (guarded) hookVerdict(path, 1, await runHook(1), from)
+
+                    // **Cut back rather than left to grow**, or a long suite holds every line every
+                    // one of its tests ever printed.
+                    $.host.lines.length = from
                 }
+
+                // **`@teardownAll` runs even where `@setupAll` faulted**, which is what a teardown is
+                // for: what it gives back is what a setup that stopped halfway had already taken.
+                hookVerdict(path, 3, await runHook(3), $.host.lines.length)
             }
 
             $.host.echo = echoed
@@ -713,6 +811,16 @@ js_runtime_host() -> string = raw"""
 
             $.host.write("")
             $.host.write(line)
+
+            // **A filter that picks nothing is a failure and not an empty success**, and the sentence
+            // is `no_match_line`'s word for word.
+            if (only !== "" && !anyChosen) {
+                $.host.write("slate: no test name contains \"" + only + "\"")
+
+                if ($.host.exit !== null) $.host.exit(1)
+
+                return
+            }
 
             if ($.host.exit !== null) $.host.exit(failed === 0 ? 0 : 1)
         }
