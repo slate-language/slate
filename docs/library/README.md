@@ -15,8 +15,7 @@ What a program has without writing it.
 | [`slate:time`](time.md) | eight temporal types, and the arithmetic over them |
 | [`slate:process`](process.md) | another program, this program's environment, signals |
 | [`slate:regex`](regex.md) | PCRE2 patterns |
-| [`slate:crypto`](crypto.md) | digests, HMAC, key derivation, randomness |
-| [`slate:password`](password.md) | Argon2id |
+| [`slate:crypto`](crypto.md) | digests, HMAC, Argon2id, key derivation, randomness |
 | [`slate:jwt`](jwt.md) | JSON Web Tokens |
 | [`slate:ws`](ws.md) | WebSockets |
 | [`slate:redis`](redis.md) | a Redis client |
@@ -33,8 +32,8 @@ What a program has without writing it.
 ## Why so many of these are modules rather than globals
 
 **Because the words are ones a program wants for its own.** `stat`, `send`, `close`, `connect`, `run`,
-`hash`, `check`, `query`, `on`, `setText` and `time` are all things an ordinary program declares. While
-they were global, writing `val stat = …` shadowed a builtin without meaning to.
+`query`, `on`, `setText` and `time` are all things an ordinary program declares. While they were global,
+writing `val stat = …` shadowed a builtin without meaning to.
 
 What is left global is roughly node's own list — `print`, `len`, the conversions, the array and string
 operations, JSON, the timers, the promise words, `next` and `fetch`.

@@ -38,7 +38,7 @@ way.
 
 ## What is not there yet
 
-**`slate:password`, `slate:process`'s `run`, `slate:redis`, `slate:nghttp2`, and TLS.** Each is a
+**`slate:process`'s `run`, `slate:redis`, `slate:nghttp2`, and TLS.** Each is a
 name that says *"not in the JavaScript back end yet"* when a program reaches it, rather than a name
 that is not there — so a program is told which half of the world it is in. **No global is on that
 list any more**; `fetch` was the last and has its own section below.
@@ -63,6 +63,22 @@ surface answers **promises** where `readImage` and its four siblings answer on t
 half would make the two back ends disagree about what an image is. That is `crypto.subtle`'s rule
 again — a host that has a thing only in a different shape does not have it — and it means
 [`slate:image`](../library/image.md) is a server's module.
+
+**`slate:crypto`'s ARGON2 IS node's OWN AND A BROWSER HAS NONE**, which is `slate:zstd`'s rule read once
+more. node carries Argon2id in its core `crypto` — `crypto.argon2` — so `argon2` and `argon2Verify` are the
+host's there, and **the records are compared between the back ends rather than merely round-tripped**: node
+and monocypher derive the same bytes for the same parameters, so `tests/js/p29.sl` verifies a record the
+interpreter made against a fixed salt and the interpreter verifies one node made. A digest that agreed with
+itself and with nothing else would still be caught.
+
+**The web platform has no Argon2 at all, and `crypto.subtle` is not a near miss.** Its `deriveBits` speaks
+PBKDF2 and HKDF, both fast by construction and neither memory-hard — so building the page half on one of
+those would be a password hash weaker than the same program gets on a server, under the same name, silently.
+Both refuse in a page, naming Argon2 and saying what a browser has instead.
+
+**`argon2NeedsRehash` works everywhere, including in a page.** It derives nothing — it reads the parameters
+out of the record and compares them — so it is a string parse, and a page that stores records it cannot make
+can still say which of them are due to be re-made.
 
 **`slate:sqlite` is WHOLE here on node and absent in a browser**, which is `slate:zstd`'s answer read
 again. node has carried `node:sqlite` since 22.5, so the module's floor is `DatabaseSync` there and the

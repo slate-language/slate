@@ -1,0 +1,447 @@
+module dev.slatelang.slate
+
+import sh.sysl.libuv
+import sh.sysl.monocypher
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf, buf_with_capacity}
+import sysl.posix.rand.entropy_from_os
+
+// Argon2id, which is `slate:crypto`'s password hash and the one thing in that module meant to be
+// slow.
+//
+// **A password is the one thing a server stores that must be expensive to check.** Everything else
+// in `slate:crypto` -- the digests, `hmac`, the HMAC under a JWT -- wants to be fast, and for a
+// password that is the whole vulnerability: a stolen table of fast hashes is tried at billions of
+// guesses a second on a graphics card. Argon2 is slow *and* memory-hungry, so the card's thousands
+// of cores cannot each hold a copy of the working state. The memory is the lever that matters, and
+// it is why a default `argon2` call reserves 19 MiB.
+//
+// **THE NAMES ARE THE ALGORITHM'S**, which is this module's rule rather than a preference: `sha256`
+// says which digest it is and `argon2` says which password hash it is. A `hash` that meant the slow
+// one while `sha256` beside it meant a fast one was exactly the confusion a reader of a login path
+// could not resolve by eye.
+//
+// **The parameters travel inside the string this answers**, which is the PHC format every other
+// Argon2 implementation reads:
+//
+//     $argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$hash...
+//
+// So `argon2Verify` uses the parameters the password was hashed *with*, and raising what a program
+// asks for invalidates nothing: existing records keep verifying, and `argon2NeedsRehash` says which
+// of them are below what is written today. Raise them on a successful login, when the plaintext is
+// in hand.
+//
+// ## Nothing here answers a result, and that is a decision rather than an oversight
+//
+// **A wrong password is `false`, and a record that will not parse is a fault.** The two are not the
+// same failure: a wrong password is the ordinary answer to the ordinary question, and a stored
+// record that is not an Argon2 record at all is a defect in whatever wrote it -- most likely a
+// column holding something else entirely. Collapsing them into `false` would make a corrupted row
+// read as an intruder, which is the one confusion a login path must not have.
+//
+// ## The salt comes from the kernel, per call
+//
+// **The kernel rather than anything in this program**, because a salt that is guessable is a salt
+// that is not there: one precomputed table would break every account at once. Sixteen bytes, which
+// is what RFC 9106 asks for, and a fresh sixteen for every call -- so hashing one password twice
+// gives two different records and neither is wrong.
+//
+// **`sysl.posix.rand.entropy_from_os` is what asks**, and it is the one function in sysl that answers
+// for key material: `seed_from_os` beside it feeds PCG32, whose whole output is computable by anyone
+// who sees a few of its values, and seeding a predictable generator unpredictably does not make it
+// unpredictable. This wants bytes nothing is computed from.
+//
+// **A `salt` may be GIVEN, and it is the one option here that is a footgun.** It is accepted because
+// a test vector and a record being reproduced from another implementation both need it, and refusing
+// would leave no way to say either; a program that passes a constant has undone the paragraph above.
+
+// The largest work area a stored record may ask this to allocate.
+//
+// **A record names its own memory cost, and this program allocates what it names**, so a record that
+// arrived from somewhere it should not have could ask for every byte the machine has. One gibibyte
+// is far above anything a real parameter set reaches -- OWASP's heaviest recommendation is 64 MiB --
+// and far below what would take the process down.
+private const work_area_ceiling: usize = 1024 * 1024 * 1024
+
+// The same ceiling said in the unit `memoryCost` is written in, which is kibibyte blocks.
+private const max_blocks: long = 1024 * 1024
+
+// A work area of `n` bytes, zeroed. **Per call rather than kept**, because Argon2 writes over every
+// byte of it before reading any, so a shared one would buy an allocation and cost a global.
+private work_area(n: usize) -> Buf[u8] = buf_with_capacity(n, u8(0))
+
+private the_text(v: Value, at: Span, name: string, what: string) -> Result[string, Signal]
+    v match
+        Str(p) -> Ok(p.s)
+        other -> Err(failure(at, s"`${name}` takes ${what} as text, and this is ${other.type_name()}"))
+
+// Whether this text is a record `argon2Verify` could read at all, which is what tells a swapped pair
+// of arguments from a corrupted row.
+private is_record(text: string) -> bool = monocypher.work_area_needed(text).is_ok()
+
+// The one sentence a record that will not parse gets.
+private unreadable(at: Span, name: string) -> Step =
+    fault(at, s"`${name}` was given text that is not an Argon2 record -- " +
+        "what `argon2` answers begins `$argon2id$` and carries its own parameters, and this does not")
+
+// -- WHAT A CALL MAY ASK FOR ----------------------------------------------------------------------
+
+// The parameters one call runs with: OWASP's login recommendation unless the options say otherwise.
+//
+// **`interactive()` is OWASP's first recommendation for a login** -- Argon2id, 19 MiB, two passes,
+// one lane -- and it is what a call with no second argument gets. The heavier profile beside it in
+// the cheat sheet, 64 MiB and three passes for something hashed rarely and worth more than a session,
+// is `{ memoryCost: 65536, timeCost: 3 }` here rather than a second name: once the numbers are
+// options at all, a name for one particular pair of them is a second way to say the same thing.
+private struct Wanted
+    params: monocypher.Params
+
+    // The tag length, which is what `hashLength` names. 32 bytes is what everything else in
+    // `slate:crypto` calls a key.
+    hash_len: usize
+
+    salt: [32]u8
+    salt_len: usize
+
+    // Whether the salt above was given rather than asked of the kernel.
+    salt_given: bool
+end Wanted
+
+private wanted() -> Wanted = Wanted(monocypher.interactive(), 32, [0; 32], 16, false)
+
+// The salt length this writes and RFC 9106 recommends, and the longest one a record may carry.
+private const default_salt: usize = 16
+private const max_salt: usize = 32
+
+// The longest tag `argon2` will derive. Argon2 itself will not produce fewer than four bytes.
+private const max_hash: usize = 64
+
+private option_names() -> string =
+    "`memoryCost`, `timeCost`, `parallelism`, `hashLength` and `salt`"
+
+private known_option(key: string) -> bool = (key == "memoryCost" || key == "timeCost"
+    || key == "parallelism" || key == "hashLength" || key == "salt")
+
+// One numeric option, bounded, with the default where it was left out.
+//
+// **A number out of range is refused rather than clamped**, a clamped one deriving a perfectly
+// good-looking record that agrees with nothing else that reads the same parameters.
+private option_number(o: *ObjectObj, key: string, at: Span, low: long, high: long,
+                      fallback: long) -> Result[long, Signal]
+    obj_get_name(o, key) match
+        None -> Ok(fallback)
+        Some(Int(n)) ->
+            if n < low || n > high
+                Err(failure(at, s"`${key}` runs from ${low} to ${high} and this is ${n}"))
+            else
+                Ok(n)
+        Some(other) -> Err(failure(at, s"`${key}` is a whole number, and this is ${other.type_name()}"))
+
+// The `salt` option, as bytes. **Text or an array**, since a vector is published either way.
+private option_salt(v: Value, at: Span) -> Result[Buf[u8], Signal]
+    v match
+        Str(p) ->
+            var out: Buf[u8] = buf()
+
+            for i in 0..<p.s.bytes.len
+                out.push(p.s.bytes[i])
+
+            Ok(out)
+        Array(a) -> bytes_of(a, at, "salt")
+        other -> Err(failure(at, s"`salt` is text or bytes, and this is ${other.type_name()}"))
+
+// The second argument of any of the three, read into what the call will run with.
+//
+// **An unknown key is refused rather than ignored**, which is `encodeWebP`'s rule and its reason:
+// `{ memoryCosts: 65536 }` is a parameter set silently unchanged, and a login that thought it had
+// been strengthened and had not is the worst shape that mistake can take.
+private read_options(v: Value, at: Span, name: string) -> Result[Wanted, Signal]
+    var want = wanted()
+
+    val o = v match
+        Object(o) -> o
+        other -> return Err(failure(at, s"`${name}` takes its parameters as a record, and this is ${other.type_name()}"))
+
+    for i in 0..<o.entries.len()
+        val entry = o.entries.at(i)
+
+        if !entry.dead
+            val key = entry.key match
+                Str(k) -> k.s
+                other -> return Err(failure(at, s"an option is named, and this is ${other.type_name()}"))
+
+            if !known_option(key)
+                return Err(failure(at, s"`${key}` is not one of `${name}`'s parameters -- there are ${option_names()}"))
+
+    val lanes = option_number(o, "parallelism", at, 1, 16777215, 1)?
+    val blocks = option_number(o, "memoryCost", at, 8 * lanes, max_blocks, 19456)?
+    val passes = option_number(o, "timeCost", at, 1, 4294967295, 2)?
+
+    want.hash_len = usize(option_number(o, "hashLength", at, 4, long(max_hash), 32)?)
+    want.params.blocks = u32(blocks)
+    want.params.passes = u32(passes)
+    want.params.lanes = u32(lanes)
+
+    obj_get_name(o, "salt") match
+        None -> ()
+        Some(sv) ->
+            val given = option_salt(sv, at)?
+
+            if given.len() < 8 || given.len() > max_salt
+                return Err(failure(at, s"an Argon2 salt is between 8 and ${max_salt} bytes, and this is ${given.len()}"))
+
+            for i in 0..<given.len()
+                want.salt[i] = given.at(i)
+
+            want.salt_len = given.len()
+            want.salt_given = true
+
+    Ok(want)
+end read_options
+
+// The parameters a call was given, or the defaults where it was given none.
+private asked_for(args: Buf[Value], at: Span, name: string, from: usize) -> Result[Wanted, Signal] =
+    if args.len() > from then read_options(args.at(from), at, name) else Ok(wanted())
+
+// -- ARGON2 RUNS ON THE THREAD POOL, AND WHAT CROSSES IS ARRAYS AND NOTHING ELSE ------------------
+
+// **Hashing a password is the one call in this language that is SUPPOSED to take a tenth of a
+// second**, and a loop is one thread: on the loop it is a tenth of a second in which the server
+// answers nobody. Ten simultaneous logins were ten seconds of a dead process. So the derivation goes
+// to libuv's thread pool, and `argon2` and `argon2Verify` answer promises.
+//
+// **What may cross into a pool thread is the rule this design is shaped by**, and it is `work.sysl`'s
+// rather than slate's: scalars and arrays, which are copied; a `&sync T`, whose count is atomic; and
+// a `*T`, which carries no count and asks the writer to have thought about it. A `string` is refused
+// outright, and rightly -- a sysl string is reference counted, and a count two threads touch is torn.
+//
+// **So the string handling stays on the loop's thread at BOTH ends, and only `argon2` crosses.**
+// `hash_password` and `check_password` in monocypher each do three things: read or write a PHC
+// string, derive, and compare. This takes the derivation alone -- `monocypher.argon2`, which
+// allocates nothing and touches no string -- and keeps `parse` and `encode` where the loop is. What
+// the pool thread sees is a struct of fixed arrays and integers.
+//
+// **The job reaches it through a `*Argon2Job`, and the box it points into is rooted HERE.** The
+// pointer is on the crossable list because a raw pointer has no count; what it does not do is keep
+// the object alive, so `jobs` below holds the `&Argon2Job` for exactly as long as the pool may still
+// be reading it. That table is the same arrangement `event.sysl` keeps for a pending callback, and
+// it is kept for the same reason.
+
+// One derivation, and everything both threads touch.
+//
+// **Every field is a fixed array or a number** -- no string, no `Buf` whose storage could move, and
+// nothing reference counted. The work area is the one allocation, taken on the loop's thread before
+// the job is queued and read by nothing else while it runs.
+private struct Argon2Job
+    password: [MaxPassword]u8
+    password_len: usize
+    salt: [32]u8
+    salt_len: usize
+    params: monocypher.Params
+    area: Buf[u8]
+    digest: [64]u8
+    digest_len: usize
+
+    // What `argon2Verify` is deriving towards, copied out of the parsed record. Unused by `argon2`,
+    // which has nothing to compare against -- the record it answers IS the digest.
+    expected: [64]u8
+
+    // Called on a POOL THREAD, and it is the only thing that is. It reads the inputs and writes the
+    // digest; nothing else in this file may be touched from here.
+    run(*self)
+        monocypher.argon2(self.digest[0..<self.digest_len], self.area.elems,
+            self.password[0..<self.password_len], self.salt[0..<self.salt_len], self.params, [], [])
+end Argon2Job
+
+// The longest password this will derive from.
+//
+// **A ceiling rather than a `Buf`, because the buffer crosses a domain boundary** and a fixed array
+// is copied into the struct where a growable one would be a pointer two threads share. Argon2 reads
+// the whole password whatever its length, so nothing is gained by a longer one -- and a login form
+// that accepts a kilobyte of password is a denial-of-service surface rather than a feature. It is
+// what a password manager's longest generated secret needs, several times over.
+private const MaxPassword: usize = 256
+
+// The jobs the pool may still be reading, indexed by the request id that will answer them.
+//
+// **This is `event.sysl`'s `pending` table for a different kind of pending thing**, and it exists for
+// that table's reason: the pool thread holds a `*Argon2Job` and a raw pointer keeps nothing alive, so
+// the box has to be held somewhere the loop's thread owns until the completion callback has run.
+private var jobs: Buf[Option[&Argon2Job]] = buf()
+
+private keep_job(id: usize, j: &Argon2Job)
+    while jobs.len() <= id
+        jobs.push(None)
+
+    jobs.set(id, Some(j))
+
+// The job for this request, taken out as it is read -- so the box is dropped once the answer is made.
+private take_job(id: usize) -> Option[&Argon2Job]
+    if id >= jobs.len() then return None
+
+    val j = jobs.at(id)
+
+    jobs.set(id, None)
+    j
+end take_job
+
+// Give the table back between runs, as `reset_events` does for the loop's own.
+//
+// Not `private`: `run.sysl` empties every table this program roots before the next program starts.
+forget_argon2_jobs()
+    jobs.clear()
+
+// Copy a password into the job's own storage, refusing one longer than the ceiling.
+private fill_password(j: *Argon2Job, password: string) -> bool
+    val b = password.bytes
+
+    if b.len > MaxPassword then return false
+
+    for i in 0..<b.len
+        j.password[i] = b[i]
+
+    j.password_len = b.len
+    true
+end fill_password
+
+// Hand the job to the pool and answer the promise it will settle.
+private on_the_pool(id: usize, at: Span, what: string, job: &Argon2Job,
+                    done: &Fn(usize, Span) -> unit) -> Step
+    keep_job(id, job)
+
+    val p: *Argon2Job = &*job
+
+    // **The job closure captures the pointer and the completion closure captures the id**, which is
+    // the same division `fs.sysl` keeps: what crosses into another thread is an address, and what
+    // comes back to the loop is an index into a table the loop owns.
+    val started = libuv.queue(() -> p.run(), (r) ->
+        r match
+            Ok(_) -> done(id, at)
+
+            // **A REJECTION RATHER THAN A RESULT, because this promise carries no result to fail
+            // in.** `argon2` answers the record and `argon2Verify` answers a boolean -- see the note
+            // at the head of this file about why neither is `{ ok, value }` -- so the one way a
+            // derivation can end badly has nowhere to be reported but the promise itself. In
+            // practice the pool only refuses a job that was cancelled, and nothing here cancels one.
+            Err(e) ->
+                take_job(id)
+                fail_request(id, s"`${what}` could not be run on the thread pool: ${e}", at))
+
+    request_started(id, at, what, started.map((_) -> ()))
+end on_the_pool
+
+// `argon2(password)` and `argon2(password, parameters)` -- a promise of the record to store.
+//
+// **A PROMISE, WHICH IS BREAKING AND IS THE WHOLE POINT.** The derivation is deliberately slow, so
+// the loop may not do it: `await argon2(p)` is what a login path writes.
+do_argon2(args: Buf[Value], at: Span) -> Step
+    if args.len() < 1 || args.len() > 2
+        return fault(at, s"`argon2` takes a password and, if it is not to use the defaults, its parameters -- and was given ${counted(args.len(), "argument")}")
+
+    val password = the_text(args.at(0), at, "argon2", "the password")?
+
+    var want = asked_for(args, at, "argon2", 1)?
+
+    if !want.salt_given
+        want.salt_len = default_salt
+
+        if !entropy_from_os(want.salt[0..<default_salt])
+            return fault(at, "`argon2` could not get randomness from the kernel, and a password hashed with a salt this program made up would not be worth storing")
+
+    var job: &Argon2Job = Argon2Job([0; MaxPassword], 0, [0; 32], want.salt_len, want.params,
+        work_area(monocypher.work_area_size(want.params)), [0; 64], want.hash_len, [0; 64])
+
+    for i in 0..<want.salt_len
+        job.salt[i] = want.salt[i]
+
+    if !fill_password(&*job, password)
+        return fault(at, s"`argon2` was given a password of ${password.bytes.len} bytes, and ${MaxPassword} is the longest it will derive from")
+
+    on_the_pool(begin_request(), at, "argon2", job, hash_answered)
+end do_argon2
+
+// Back on the loop's thread, with the digest the pool wrote. **The PHC string is built here**, where
+// a string may be made at all.
+private hash_answered(id: usize, at: Span)
+    take_job(id) match
+        Some(j) ->
+            answer_plain_request(id, str_value(monocypher.encode(j.params, j.salt[0..<j.salt_len],
+                j.digest[0..<j.digest_len])))
+        None -> ()
+end hash_answered
+
+// `argon2Verify(record, password)` -- a promise of whether that password is the one it was made from.
+//
+// **The record comes first, which is the order it is written in** (`argon2Verify(await argon2(p), p)`)
+// and the order monocypher's own call takes. Both arguments are text, so a swap would silently answer
+// `false` forever -- and that is why one is caught: a second argument that *is* a record while the
+// first is not can only be the pair the other way round.
+//
+// **The record is PARSED HERE and the comparison is made HERE**, with only the derivation between
+// them on a pool thread. So every complaint about a malformed record is still raised where the call
+// was written, before anything is queued -- which is what keeps a corrupted row a fault rather than
+// a rejected promise.
+do_argon2_verify(args: Buf[Value], at: Span) -> Step
+    if args.len() != 2
+        return fault(at, s"`argon2Verify` takes a stored record and a password, and was given ${counted(args.len(), "argument")}")
+
+    val stored = the_text(args.at(0), at, "argon2Verify", "the stored record")?
+    val password = the_text(args.at(1), at, "argon2Verify", "the password")?
+
+    var record = monocypher.parse(stored) match
+        Ok(r) -> r
+        Err(_) ->
+            if is_record(password)
+                return fault(at, "`argon2Verify` takes the stored record first and the password second, and these are the other way round")
+
+            return unreadable(at, "argon2Verify")
+
+    val needed = monocypher.work_area_size(record.params)
+
+    if needed > work_area_ceiling
+        return fault(at, s"this record asks for ${needed / (1024 * 1024)} MiB of working memory, which is more than any real Argon2 parameter reaches -- it is not a record this program wrote")
+
+    var job: &Argon2Job = Argon2Job([0; MaxPassword], 0, [0; 32], record.salt().len, record.params,
+        work_area(needed), [0; 64], record.hash().len, [0; 64])
+
+    for i in 0..<record.salt().len
+        job.salt[i] = record.salt()[i]
+
+    for i in 0..<record.hash().len
+        job.expected[i] = record.hash()[i]
+
+    if !fill_password(&*job, password)
+        return fault(at, s"`argon2Verify` was given a password of ${password.bytes.len} bytes, and ${MaxPassword} is the longest it will derive from")
+
+    on_the_pool(begin_request(), at, "argon2Verify", job, check_answered)
+end do_argon2_verify
+
+// Back on the loop's thread. **The comparison is constant time**, for the reason a MAC's is: how long
+// it took is a measurement, and one made a byte at a time over many attempts is a password.
+private check_answered(id: usize, at: Span)
+    take_job(id) match
+        Some(j) -> answer_plain_request(id, Bool(same_tag(j.digest[0..<j.digest_len],
+            j.expected[0..<j.digest_len])))
+        None -> ()
+end check_answered
+
+// `argon2NeedsRehash(record)` -- whether this record is weaker than what a call writes today.
+//
+// **Ask it after a successful `argon2Verify`, while the plaintext is still in hand**, and re-hash the
+// ones that answer `true`. That is the whole upgrade path, and it costs nothing extra: the password
+// is already there and the record it replaces is already known to be that password's.
+//
+// **The second argument is the parameters it is being measured against**, which is what a program
+// hashing with something other than the defaults has to be able to say -- otherwise a server on 64
+// MiB would be told every one of its own records was fine while it compared them against 19.
+do_argon2_needs_rehash(args: Buf[Value], at: Span) -> Step
+    if args.len() < 1 || args.len() > 2
+        return fault(at, s"`argon2NeedsRehash` takes a stored record and, if they are not the defaults, the parameters to measure it against -- and was given ${counted(args.len(), "argument")}")
+
+    val stored = the_text(args.at(0), at, "argon2NeedsRehash", "the stored record")?
+    val want = asked_for(args, at, "argon2NeedsRehash", 1)?
+
+    monocypher.needs_rehash(stored, want.params) match
+        Ok(weaker) -> Ok(Bool(weaker))
+        Err(_) -> unreadable(at, "argon2NeedsRehash")
+end do_argon2_needs_rehash

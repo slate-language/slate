@@ -1,0 +1,396 @@
+module dev.slatelang.slate
+
+// `slate:crypto`'s Argon2id in the JavaScript back end, which is node's own and nothing in a browser.
+//
+// **node HAS ARGON2 IN ITS CORE `crypto` NOW -- `crypto.argon2` and `crypto.argon2Sync` -- and that
+// is the whole reason this module crosses at all.** Everything else in `slate:crypto` is written out
+// next door because SHA-2 and HMAC are a few dozen lines; Argon2 is a memory-hard construction over
+// BLAKE2b that would be some three hundred, and one written here would have to be proved
+// byte-identical to monocypher's before a single record could be read by both back ends. The host's
+// is proved instead, which is what `tests/js/p29.sl` does: it verifies a record the interpreter made
+// and the interpreter verifies one made here, over a **fixed salt**, so the two derivations agree
+// bit for bit or the corpus reddens.
+//
+// **A BROWSER HAS NO ARGON2 AND `crypto.subtle` IS NOT A NEAR MISS.** Its `deriveBits` speaks PBKDF2
+// and HKDF, both of which are fast by construction and neither of which is memory-hard -- so a page
+// half built on it would be a password hash weaker than the one the same program got on a server,
+// under the same name, silently. That is the one substitution this file will not make: `argon2` and
+// `argon2Verify` refuse in a page, naming Argon2 and saying what a browser has instead.
+//
+// **`argon2NeedsRehash` WORKS EVERYWHERE, AND THE DIFFERENCE SAYS WHAT THE REFUSAL IS ABOUT.** It
+// derives nothing -- it reads the parameters out of a record and compares them -- so it is a string
+// parse, and a string parse is the same on every host. A page that stores records it cannot make can
+// still say which of them are due to be re-made.
+//
+// **The PHC reader and writer are HERE rather than the host's**, node's `crypto.argon2` taking and
+// answering raw bytes and knowing nothing about the `$argon2id$...` string. So this file carries
+// monocypher's `parse` and `encode` a second time, and the corpus is what says the two agree: every
+// refusal in it is a record this reader rejected and that one rejected too.
+js_runtime_argon2() -> string = raw"""
+        // -- Argon2id ----------------------------------------------------------------------------
+
+        // node's core `crypto`, or nothing where there is none.
+        const argon2Host = (() => {
+            if (typeof process === "undefined" || typeof require !== "function") return null
+
+            try {
+                const c = require("node:crypto")
+
+                return typeof c.argon2 === "function" ? c : null
+            } catch (e) {
+                return null
+            }
+        })()
+
+        const noArgon2 = (name) =>
+            fault("`" + name + "` is Argon2id, which this JavaScript host has not got -- node has it " +
+                "in `crypto` and the web platform has no Argon2 at all, `crypto.subtle` deriving keys " +
+                "with PBKDF2 and HKDF and nothing memory-hard")
+
+        // OWASP's first recommendation for a login, which is what a call with no parameters gets.
+        const ARGON2_BLOCKS = 19456
+        const ARGON2_PASSES = 2
+        const ARGON2_LANES = 1
+        const ARGON2_TAG = 32
+        const ARGON2_SALT = 16
+
+        // The ceiling, in the unit `memoryCost` is written in: a gibibyte of working memory.
+        const ARGON2_MAX_BLOCKS = 1048576
+        const ARGON2_MAX_SALT = 32
+        const ARGON2_MAX_TAG = 64
+        const ARGON2_MAX_PASSWORD = 256
+
+        const ARGON2_OPTIONS = "`memoryCost`, `timeCost`, `parallelism`, `hashLength` and `salt`"
+
+        const ARGON2_KNOWN = ["memoryCost", "timeCost", "parallelism", "hashLength", "salt"]
+
+        // -- the PHC string, which is monocypher's `encode` and `parse` --------------------------
+
+        // **The standard alphabet WITHOUT PADDING**, which is the format's one idiosyncrasy and the
+        // thing most likely to make two implementations disagree about a record they both wrote.
+        const ARGON2_B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+        const argon2B64 = (bytes) => {
+            let out = ""
+
+            for (let i = 0; i < bytes.length; i = i + 3) {
+                const left = bytes.length - i
+                const n = (bytes[i] << 16) | ((left > 1 ? bytes[i + 1] : 0) << 8) | (left > 2 ? bytes[i + 2] : 0)
+
+                out = out + ARGON2_B64[(n >> 18) & 63] + ARGON2_B64[(n >> 12) & 63]
+
+                if (left > 1) out = out + ARGON2_B64[(n >> 6) & 63]
+                if (left > 2) out = out + ARGON2_B64[n & 63]
+            }
+
+            return out
+        }
+
+        // The bytes of an unpadded base64 field, or `null` where it is not one.
+        //
+        // **A field of one character decodes to nothing and is refused**, four characters carrying
+        // three bytes and one left over carrying none -- which is what makes `AgIC` and `AgICA`
+        // different lengths and `AgICAgI` a record nobody wrote.
+        const argon2Unb64 = (text) => {
+            if (text.length === 0 || text.length % 4 === 1) return null
+
+            const out = new Uint8Array(Math.floor(text.length * 3 / 4))
+            let held = 0
+            let bits = 0
+            let at = 0
+
+            for (const ch of text) {
+                const v = ARGON2_B64.indexOf(ch)
+
+                if (v < 0) return null
+
+                held = (held << 6) | v
+                bits = bits + 6
+
+                if (bits >= 8) {
+                    bits = bits - 8
+                    out[at] = (held >> bits) & 255
+                    at = at + 1
+                }
+            }
+
+            return out.subarray(0, at)
+        }
+
+        // `m=19456,t=2,p=1` -- one of the three by its letter, read the way monocypher reads it.
+        const argon2Setting = (text, letter) => {
+            let at = 0
+
+            for (;;) {
+                if (at + 1 >= text.length) return null
+                if (text[at + 1] !== "=") return null
+
+                let end = at + 2
+
+                while (end < text.length && text[end] !== ",") end = end + 1
+
+                if (text[at] === letter) {
+                    const digits = text.slice(at + 2, end)
+
+                    if (digits.length === 0 || digits.length > 10 || !/^[0-9]+$/.test(digits)) return null
+
+                    return Number(digits)
+                }
+
+                if (end >= text.length) return null
+
+                at = end + 1
+            }
+        }
+
+        // A record, read. **Five separators and six fields, the first empty**, because the string
+        // begins with one.
+        const argon2Parse = (text) => {
+            const parts = text.split("$")
+
+            if (parts.length !== 6 || parts[0] !== "") return null
+
+            const algorithm = parts[1]
+
+            if (algorithm !== "argon2id" && algorithm !== "argon2i" && algorithm !== "argon2d") return null
+            if (parts[2] !== "v=19") return null
+
+            const blocks = argon2Setting(parts[3], "m")
+            const passes = argon2Setting(parts[3], "t")
+            const lanes = argon2Setting(parts[3], "p")
+
+            if (blocks === null || passes === null || lanes === null) return null
+
+            const salt = argon2Unb64(parts[4])
+            const hash = argon2Unb64(parts[5])
+
+            if (salt === null || hash === null) return null
+            if (salt.length < 8 || salt.length > ARGON2_MAX_SALT) return null
+            if (hash.length < 4 || hash.length > ARGON2_MAX_TAG) return null
+
+            return { algorithm: algorithm, blocks: blocks, passes: passes, lanes: lanes, salt: salt, hash: hash }
+        }
+
+        const argon2Encode = (algorithm, blocks, passes, lanes, salt, hash) =>
+            "$" + algorithm + "$v=19$m=" + blocks + ",t=" + passes + ",p=" + lanes + "$" +
+                argon2B64(salt) + "$" + argon2B64(hash)
+
+        const argon2Unreadable = (name) =>
+            fault("`" + name + "` was given text that is not an Argon2 record -- what `argon2` " +
+                "answers begins `$argon2id$` and carries its own parameters, and this does not")
+
+        // -- what a call may ask for -------------------------------------------------------------
+
+        const argon2Password = (v, name) => {
+            if (!$.isStr(v))
+                fault("`" + name + "` takes the password as text, and this is " + typeName(v))
+
+            return new TextEncoder().encode(v)
+        }
+
+        const argon2Record = (v, name, what) => {
+            if (!$.isStr(v))
+                fault("`" + name + "` takes " + what + " as text, and this is " + typeName(v))
+
+            return v
+        }
+
+        // One numeric parameter, bounded, with the default where it was left out.
+        const argon2Number = (opts, key, low, high, fallback) => {
+            if (opts === null) return fallback
+
+            const v = opts.lookup(key)[0]
+
+            if (v === undefined) return fallback
+
+            if (!$.isInt(v)) fault("`" + key + "` is a whole number, and this is " + typeName(v))
+
+            const n = Number(v)
+
+            if (n < low || n > high)
+                fault("`" + key + "` runs from " + low + " to " + high + " and this is " + v)
+
+            return n
+        }
+
+        // The `salt` parameter, as bytes. **Text or an array**, since a vector is published either way.
+        const argon2Salt = (opts) => {
+            if (opts === null) return null
+
+            const v = opts.lookup("salt")[0]
+
+            if (v === undefined) return null
+
+            let bytes = null
+
+            if ($.isStr(v)) bytes = new TextEncoder().encode(v)
+            else if (Array.isArray(v)) {
+                bytes = new Uint8Array(v.length)
+
+                for (let i = 0; i < v.length; i = i + 1) {
+                    const b = v[i]
+
+                    if (!$.isInt(b))
+                        fault("`salt` takes an array of numbers, and one of these is " + typeName(b))
+
+                    if (b < 0n || b > 255n) fault("a byte is between 0 and 255, and this is " + b)
+
+                    bytes[i] = Number(b)
+                }
+            } else fault("`salt` is text or bytes, and this is " + typeName(v))
+
+            if (bytes.length < 8 || bytes.length > ARGON2_MAX_SALT)
+                fault("an Argon2 salt is between 8 and " + ARGON2_MAX_SALT + " bytes, and this is " + bytes.length)
+
+            return bytes
+        }
+
+        // The second argument of any of the three, read into what the call will run with.
+        //
+        // **An unknown key is refused rather than ignored**, and the reason is the worst shape the
+        // mistake has: `{ memoryCosts: 65536 }` is a login that was thought to have been
+        // strengthened and was not.
+        const argon2Wanted = (args, at, name) => {
+            let opts = null
+
+            if (args.length > at) {
+                const v = args[at]
+
+                if (!(v instanceof $.SObj))
+                    fault("`" + name + "` takes its parameters as a record, and this is " + typeName(v))
+
+                for (const [k, held] of v.entries()) {
+                    if (typeof k !== "string")
+                        fault("an option is named, and this is " + typeName(k))
+
+                    if (ARGON2_KNOWN.indexOf(k) < 0)
+                        fault("`" + k + "` is not one of `" + name + "`'s parameters -- there are " +
+                            ARGON2_OPTIONS)
+                }
+
+                opts = v
+            }
+
+            const lanes = argon2Number(opts, "parallelism", 1, 16777215, ARGON2_LANES)
+            const blocks = argon2Number(opts, "memoryCost", 8 * lanes, ARGON2_MAX_BLOCKS, ARGON2_BLOCKS)
+            const passes = argon2Number(opts, "timeCost", 1, 4294967295, ARGON2_PASSES)
+            const tag = argon2Number(opts, "hashLength", 4, ARGON2_MAX_TAG, ARGON2_TAG)
+
+            return { blocks: blocks, passes: passes, lanes: lanes, tag: tag, salt: argon2Salt(opts) }
+        }
+
+        // The host's derivation, as a promise of the tag.
+        //
+        // **The async form rather than `argon2Sync`, and it is the same decision the interpreter
+        // made**: this is the one call in the language that is supposed to take a tenth of a second,
+        // and done on the loop that is a tenth of a second in which a server answers nobody.
+        const argon2Derive = (algorithm, message, nonce, want) =>
+            new Promise((resolve, reject) => {
+                argon2Host.argon2(algorithm, {
+                    message: message,
+                    nonce: nonce,
+                    parallelism: want.lanes,
+                    tagLength: want.tag,
+                    memory: want.blocks,
+                    passes: want.passes
+                }, (err, tag) => err ? reject(err) : resolve(new Uint8Array(tag)))
+            })
+
+        // `argon2(password)` and `argon2(password, parameters)` -- a promise of the record to store.
+        B.argon2 = (...args) => {
+            if (args.length < 1 || args.length > 2)
+                fault("`argon2` takes a password and, if it is not to use the defaults, its parameters -- and was given " +
+                    counted(args.length))
+
+            const message = argon2Password(args[0], "argon2")
+            const want = argon2Wanted(args, 1, "argon2")
+
+            if (message.length > ARGON2_MAX_PASSWORD)
+                fault("`argon2` was given a password of " + message.length + " bytes, and " +
+                    ARGON2_MAX_PASSWORD + " is the longest it will derive from")
+
+            if (argon2Host === null) noArgon2("argon2")
+
+            let nonce = want.salt
+
+            // **The kernel rather than anything in this program**, and the same call `randomBytes`
+            // makes: a salt a program worked out is a salt that is not there.
+            if (nonce === null) {
+                const source = typeof crypto !== "undefined" && crypto !== null ? crypto : null
+
+                if (source === null || typeof source.getRandomValues !== "function")
+                    fault("`argon2` could not get randomness from the kernel, and a password hashed with a salt this program made up would not be worth storing")
+
+                nonce = new Uint8Array(ARGON2_SALT)
+                source.getRandomValues(nonce)
+            }
+
+            return argon2Derive("argon2id", message, nonce, want).then((tag) =>
+                argon2Encode("argon2id", want.blocks, want.passes, want.lanes, nonce, tag))
+        }
+
+        // `argon2Verify(record, password)` -- a promise of whether that password made that record.
+        //
+        // **A wrong password is `false` and a record that will not parse is a FAULT**, which is the
+        // one confusion a login path must not have: a corrupted column is a defect in whatever wrote
+        // it, and reading it as an intruder answers 401 to somebody whose password was right.
+        B.argon2Verify = (...args) => {
+            if (args.length !== 2)
+                fault("`argon2Verify` takes a stored record and a password, and was given " + counted(args.length))
+
+            const stored = argon2Record(args[0], "argon2Verify", "the stored record")
+            const password = argon2Record(args[1], "argon2Verify", "the password")
+            const record = argon2Parse(stored)
+
+            // **Both arguments are text, so a swap would answer `false` forever and never say why.**
+            // A second argument that IS a record while the first is not can only be the pair the
+            // other way round.
+            if (record === null) {
+                if (argon2Parse(password) !== null)
+                    fault("`argon2Verify` takes the stored record first and the password second, and these are the other way round")
+
+                argon2Unreadable("argon2Verify")
+            }
+
+            if (record.blocks > ARGON2_MAX_BLOCKS)
+                fault("this record asks for " + Math.floor(record.blocks / 1024) +
+                    " MiB of working memory, which is more than any real Argon2 parameter reaches -- " +
+                    "it is not a record this program wrote")
+
+            const message = new TextEncoder().encode(password)
+
+            if (message.length > ARGON2_MAX_PASSWORD)
+                fault("`argon2Verify` was given a password of " + message.length + " bytes, and " +
+                    ARGON2_MAX_PASSWORD + " is the longest it will derive from")
+
+            if (argon2Host === null) noArgon2("argon2Verify")
+
+            const want = { blocks: record.blocks, passes: record.passes, lanes: record.lanes,
+                tag: record.hash.length }
+
+            // **The comparison is constant time**, for the reason a MAC's is: how long it took is a
+            // measurement, and one made a byte at a time over many attempts is a password.
+            return argon2Derive(record.algorithm, message, record.salt, want)
+                .then((tag) => sameTag(tag, record.hash))
+        }
+
+        // `argon2NeedsRehash(record)` and `argon2NeedsRehash(record, parameters)`.
+        //
+        // **This one derives nothing and so it works in a page too.** It reads the parameters out of
+        // the record and compares them, which is microseconds and a string parse; a promise here
+        // would be ceremony, and a refusal here would be a refusal to read.
+        B.argon2NeedsRehash = (...args) => {
+            if (args.length < 1 || args.length > 2)
+                fault("`argon2NeedsRehash` takes a stored record and, if they are not the defaults, the parameters to measure it against -- and was given " +
+                    counted(args.length))
+
+            const stored = argon2Record(args[0], "argon2NeedsRehash", "the stored record")
+            const want = argon2Wanted(args, 1, "argon2NeedsRehash")
+            const record = argon2Parse(stored)
+
+            if (record === null) argon2Unreadable("argon2NeedsRehash")
+
+            return record.algorithm !== "argon2id" || record.blocks < want.blocks ||
+                record.passes < want.passes || record.lanes !== want.lanes
+        }
+    """
