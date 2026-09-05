@@ -273,6 +273,9 @@ of PCRE2 constructs a browser has nothing to mean; so is `slate:gzip`, over the 
 redirect rule is the host's — all of them things a JavaScript host genuinely does or does not have, and
 `docs/reference/javascript.md` measures why. **`slate:brotli` is the clearest of the second kind**: no
 browser has a brotli encoder, so it refuses there naming brotli and pointing at `slate:gzip`.
+**`slate:image` is that case reached by two different roads**: node has no image support in its standard
+library at all, and a browser's is asynchronous where these five names answer on the spot — so images are
+a server's job and the refusal says so.
 
 **`defer` is deliberately not here.** It earns its place in Go and in sysl because neither collects: a
 function that acquires something has to release it on every exit path. slate has a tracing collector, so

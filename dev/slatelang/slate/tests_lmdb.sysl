@@ -1,0 +1,343 @@
+module dev.slatelang.slate
+@tests
+
+import sysl.text.Search
+
+// `slate:lmdb` -- the store, its two transactions, and every sentence it says when it will not do
+// something.
+//
+// **There is no corpus file and there cannot be one.** `tests/js/` is one program run on both back
+// ends and compared, and this module has no implementation on the second: a JavaScript host has no
+// memory-mapped file, so every name refuses there. That refusal is a test of its own at the bottom
+// of this file, run under node exactly as `slate:brotli`'s is.
+//
+// **Each of these gets a directory of its own**, which `in_store` makes and takes away. A shared one
+// would make two tests read each other's keys, and LMDB allows one writer at a time across a whole
+// environment -- so a shared store would also make them wait for each other.
+//
+// **Nothing here pins a size LMDB decides.** The maximum key length comes from the page size and
+// answers 8122 on a 1.0 build where every 0.9 document says 511, so a test that wrote either number
+// down would be a test of which library the machine has.
+
+@test
+A_STORE_KEEPS_WHAT_ONE_TRANSACTION_WROTE_AND_ANOTHER_READS_IT_BACK()
+    val prog = "val store = lmdbOpen(\"<dir>\")\n" +
+        "val w = lmdbWrite(store)\n" +
+        "val db = lmdbDb(w, \"users\")\n" +
+        "lmdbPut(w, db, \"u:1\", \"ed\")\n" +
+        "lmdbCommit(w)\n" +
+        "val r = lmdbRead(store)\n" +
+        "print(fromBytes(lmdbGet(r, lmdbDb(r, \"users\"), \"u:1\")).value)\n" +
+        "lmdbAbort(r)\n" +
+        "lmdbClose(store)\n"
+
+    assert_eq(in_store(prog), "ed")
+
+@test
+TEXT_AND_ITS_BYTES_ARE_THE_SAME_KEY_AND_THE_SAME_VALUE()
+    // **What goes into the store is what would have gone onto a wire**, which is `slate:zstd`'s
+    // rule: a program holding a string need not convert it first, and what comes back is bytes
+    // either way because LMDB records nothing about which it was given.
+    val prog = "val store = lmdbOpen(\"<dir>\")\n" +
+        "val w = lmdbWrite(store)\n" +
+        "val db = lmdbDb(w, null)\n" +
+        "lmdbPut(w, db, \"k\", \"hello\")\n" +
+        "print(lmdbGet(w, db, toBytes(\"k\")) == toBytes(\"hello\"))\n" +
+        "lmdbPut(w, db, toBytes(\"k\"), toBytes(\"again\"))\n" +
+        "print(fromBytes(lmdbGet(w, db, \"k\")).value)\n" +
+        "lmdbCommit(w)\n"
+
+    assert_eq(in_store(prog), "true\nagain")
+
+@test
+A_KEY_THAT_IS_NOT_THERE_IS_null_AND_NOT_A_FAILURE()
+    // **A store is asked about keys it does not have as a matter of course** -- that is what a
+    // session lookup on a first request is -- so the ordinary case must not be the exceptional one.
+    val prog = "val store = lmdbOpen(\"<dir>\")\n" +
+        "val w = lmdbWrite(store)\n" +
+        "val db = lmdbDb(w, null)\n" +
+        "print(lmdbGet(w, db, \"nope\"), lmdbHas(w, db, \"nope\"))\n" +
+        "print(lmdbDelete(w, db, \"nope\"))\n" +
+        "lmdbAbort(w)\n"
+
+    assert_eq(in_store(prog), "null false\nfalse")
+
+@test
+A_DELETE_SAYS_WHETHER_THE_KEY_WAS_THERE_SO_A_SWEEP_CAN_COUNT()
+    val prog = "val store = lmdbOpen(\"<dir>\")\n" +
+        "val w = lmdbWrite(store)\n" +
+        "val db = lmdbDb(w, null)\n" +
+        "lmdbPut(w, db, \"a\", \"1\")\n" +
+        "print(lmdbDelete(w, db, \"a\"), lmdbDelete(w, db, \"a\"))\n" +
+        "lmdbCommit(w)\n"
+
+    assert_eq(in_store(prog), "true false")
+
+@test
+AN_ABORTED_TRANSACTION_LEAVES_THE_STORE_AS_IT_WAS()
+    // **A transaction that is merely dropped aborts**, which is the safe way round -- so this is
+    // what a handler that threw halfway through a sequence of writes leaves behind.
+    val prog = "val store = lmdbOpen(\"<dir>\")\n" +
+        "val a = lmdbWrite(store)\n" +
+        "val db = lmdbDb(a, \"s\")\n" +
+        "lmdbPut(a, db, \"k\", \"kept\")\n" +
+        "lmdbCommit(a)\n" +
+        "val b = lmdbWrite(store)\n" +
+        "lmdbPut(b, lmdbDb(b, \"s\"), \"k\", \"thrown away\")\n" +
+        "lmdbAbort(b)\n" +
+        "val r = lmdbRead(store)\n" +
+        "print(fromBytes(lmdbGet(r, lmdbDb(r, \"s\"), \"k\")).value)\n"
+
+    assert_eq(in_store(prog), "kept")
+
+@test
+A_READER_SEES_THE_STORE_AS_IT_WAS_WHEN_IT_BEGAN()
+    // **This is LMDB's claim rather than slate's** and it is the whole reason a read takes no lock:
+    // the reader below is opened first, a write lands and commits, and the reader still answers what
+    // it began with -- while one opened afterwards sees the new value.
+    val prog = "val store = lmdbOpen(\"<dir>\")\n" +
+        "val first = lmdbWrite(store)\n" +
+        "val db = lmdbDb(first, \"s\")\n" +
+        "lmdbPut(first, db, \"k\", \"before\")\n" +
+        "lmdbCommit(first)\n" +
+        "val old = lmdbRead(store)\n" +
+        "val odb = lmdbDb(old, \"s\")\n" +
+        "val w = lmdbWrite(store)\n" +
+        "lmdbPut(w, lmdbDb(w, \"s\"), \"k\", \"after\")\n" +
+        "lmdbCommit(w)\n" +
+        "print(fromBytes(lmdbGet(old, odb, \"k\")).value)\n" +
+        "val fresh = lmdbRead(store)\n" +
+        "print(fromBytes(lmdbGet(fresh, lmdbDb(fresh, \"s\"), \"k\")).value)\n"
+
+    assert_eq(in_store(prog), "before\nafter")
+
+@test
+TWO_READ_TRANSACTIONS_AT_ONCE_ARE_ORDINARY_HERE_AND_THAT_IS_WHAT_noTls_BUYS()
+    // **Without `MDB_NOTLS` the second of these is refused with `BadRslot`**, whose own message --
+    // *"Invalid reuse of reader locktable slot"* -- reads as a damaged lock file rather than the
+    // design decision it is. slate is one thread with an event loop on it, so two handlers each
+    // holding a reader is the ordinary case; there is no option here and a program cannot turn the
+    // refusal back on.
+    val prog = "val store = lmdbOpen(\"<dir>\")\n" +
+        "val w = lmdbWrite(store)\n" +
+        "lmdbPut(w, lmdbDb(w, \"s\"), \"k\", \"v\")\n" +
+        "lmdbCommit(w)\n" +
+        "val a = lmdbRead(store)\n" +
+        "val b = lmdbRead(store)\n" +
+        "print(fromBytes(lmdbGet(a, lmdbDb(a, \"s\"), \"k\")).value)\n" +
+        "print(fromBytes(lmdbGet(b, lmdbDb(b, \"s\"), \"k\")).value)\n" +
+        "lmdbAbort(a)\n" +
+        "lmdbAbort(b)\n"
+
+    assert_eq(in_store(prog), "v\nv")
+
+@test
+A_CURSOR_WALKS_A_PREFIX_IN_KEY_ORDER_WHICH_IS_WHAT_A_RANGE_IS()
+    // **Keys come out in byte order**, so a prefix is a contiguous run and `lmdbSeek` at-or-after
+    // starts it whether or not the prefix is itself a key.
+    val prog = "val store = lmdbOpen(\"<dir>\")\n" +
+        "val w = lmdbWrite(store)\n" +
+        "val db = lmdbDb(w, \"s\")\n" +
+        "lmdbPut(w, db, \"u:2\", \"two\")\n" +
+        "lmdbPut(w, db, \"u:1\", \"one\")\n" +
+        "lmdbPut(w, db, \"z:9\", \"other\")\n" +
+        "lmdbPut(w, db, \"a:0\", \"before\")\n" +
+        "val c = lmdbCursor(w, db)\n" +
+        "var at = lmdbSeek(c, \"u:\")\n" +
+        "var seen = []\n" +
+        "while at != null && startsWith(fromBytes(at.key).value, \"u:\")\n" +
+        "    seen = concat(seen, [fromBytes(at.key).value + \"=\" + fromBytes(at.value).value])\n" +
+        "    at = lmdbNext(c)\n" +
+        "print(join(seen, \" \"))\n" +
+        "print(fromBytes(lmdbFirst(c).key).value)\n" +
+        "lmdbCursorClose(c)\n" +
+        "lmdbCommit(w)\n"
+
+    assert_eq(in_store(prog), "u:1=one u:2=two\na:0")
+
+@test
+A_WALK_OFF_THE_END_IS_null_AND_SO_IS_A_FIRST_ON_AN_EMPTY_DATABASE()
+    val prog = "val store = lmdbOpen(\"<dir>\")\n" +
+        "val w = lmdbWrite(store)\n" +
+        "val db = lmdbDb(w, \"s\")\n" +
+        "print(lmdbFirst(lmdbCursor(w, db)))\n" +
+        "lmdbPut(w, db, \"only\", \"1\")\n" +
+        "val c = lmdbCursor(w, db)\n" +
+        "print(fromBytes(lmdbFirst(c).key).value, lmdbNext(c))\n" +
+        "print(lmdbSeek(c, \"zzz\"))\n" +
+        "lmdbCommit(w)\n"
+
+    assert_eq(in_store(prog), "null\nonly null\nnull")
+
+@test
+A_NAMED_DATABASE_AND_THE_UNNAMED_ONE_ARE_DIFFERENT_STORES()
+    val prog = "val store = lmdbOpen(\"<dir>\", { maxDbs: 4 })\n" +
+        "val w = lmdbWrite(store)\n" +
+        "val main = lmdbDb(w, null)\n" +
+        "val users = lmdbDb(w, \"users\")\n" +
+        "lmdbPut(w, main, \"k\", \"unnamed\")\n" +
+        "lmdbPut(w, users, \"k\", \"named\")\n" +
+        "print(fromBytes(lmdbGet(w, main, \"k\")).value, fromBytes(lmdbGet(w, users, \"k\")).value)\n" +
+        "print(lmdbStat(w, users).entries)\n" +
+        "lmdbClear(w, users)\n" +
+        "print(lmdbStat(w, users).entries, lmdbStat(w, main).entries)\n" +
+        "lmdbCommit(w)\n"
+
+    // **The unnamed database has TWO entries and that is LMDB's design rather than a miscount**: a
+    // named database is itself a key in the unnamed one, which is where the name-to-`MDB_dbi`
+    // mapping lives. So a program that walks the unnamed database with a cursor sees its own keys
+    // and the names of every other database beside them, and one that keeps ordinary keys there
+    // wants a prefix.
+    assert_eq(in_store(prog), "unnamed named\n1\n0 2")
+
+@test
+lmdbInfo_REPORTS_THE_CEILING_THE_STORE_WAS_OPENED_WITH()
+    // **`mapSize` is the number a program watching for a full store needs**, since LMDB never moves
+    // it -- and `used` is pages written against it, which is the only meaningful fraction. The
+    // number of keys says nothing about how much room is left.
+    val prog = "val store = lmdbOpen(\"<dir>\", { mapSize: 1 << 20 })\n" +
+        "val info = lmdbInfo(store)\n" +
+        "print(info.mapSize, info.used < info.mapSize, info.maxReaders > 0)\n"
+
+    assert_eq(in_store(prog), "1048576 true true")
+
+@test
+A_STORE_TOO_SMALL_FOR_WHAT_IS_BEING_WRITTEN_SAYS_WHICH_KNOB_RAISES_IT()
+    // **`mapSize` is a hard ceiling and LMDB never grows it**, so the sentence has to name the place
+    // it is set -- *"the store is full"* on its own sends a reader to look at the disk.
+    val prog = "val store = lmdbOpen(\"<dir>\", { mapSize: 1 << 16 })\n" +
+        "val w = lmdbWrite(store)\n" +
+        "val db = lmdbDb(w, null)\n" +
+        "var i = 0\n" +
+        "while i < 200\n" +
+        "    lmdbPut(w, db, \"k\" + string(i), repeat(\"x\", 2000))\n" +
+        "    i = i + 1\n"
+
+    val said = fails_in_store(prog)
+
+    assert(said.contains("this store is full"))
+    assert(said.contains("`mapSize` at `lmdbOpen` is a ceiling LMDB reserves and never grows"))
+
+@test
+A_TRANSACTION_THAT_HAS_ENDED_AND_A_STORE_THAT_HAS_CLOSED_ARE_TWO_SENTENCES()
+    assert(fails_in_store("val s = lmdbOpen(\"<dir>\")\nval w = lmdbWrite(s)\nlmdbCommit(w)\nlmdbDb(w, null)\n")
+        .contains("this transaction has ended, and `lmdbDb` needs a live one"))
+    assert(fails_in_store("val s = lmdbOpen(\"<dir>\")\nlmdbCommit(lmdbWrite(s))\nlmdbClose(s)\nlmdbRead(s)\n")
+        .contains("this store has been closed, and `lmdbRead` needs an open one"))
+
+    // **Closing the store ends every transaction still open on it**, in the order LMDB wants -- a
+    // cursor before its transaction, a transaction before its environment. A server shutting down
+    // must not be stopped by a handler that was mid-write.
+    assert(fails_in_store("val s = lmdbOpen(\"<dir>\")\nval w = lmdbWrite(s)\nlmdbClose(s)\nlmdbDb(w, null)\n")
+        .contains("this transaction has ended, and `lmdbDb` needs a live one"))
+
+@test
+A_CURSOR_DIES_WITH_ITS_TRANSACTION_RATHER_THAN_READING_RECLAIMED_PAGES()
+    // **LMDB frees the transaction structure when a transaction ends and a cursor holds a pointer
+    // into it**, so a cursor used afterwards is a use-after-free. Nothing in LMDB can catch that;
+    // the table here can, because ending a transaction puts its cursors back first.
+    val prog = "val s = lmdbOpen(\"<dir>\")\n" +
+        "val w = lmdbWrite(s)\n" +
+        "val db = lmdbDb(w, null)\n" +
+        "lmdbPut(w, db, \"k\", \"v\")\n" +
+        "val c = lmdbCursor(w, db)\n" +
+        "lmdbCommit(w)\n" +
+        "lmdbFirst(c)\n"
+
+    assert(fails_in_store(prog).contains("this cursor's transaction has ended, and `lmdbFirst` needs a live one"))
+
+@test
+A_READER_ASKED_TO_WRITE_IS_TOLD_WHICH_CALL_BEGINS_A_WRITER()
+    // **A read transaction cannot write, and there is only one sensible answer to being asked** --
+    // so the sentence names `lmdbWrite` rather than saying no.
+    val prog = "val s = lmdbOpen(\"<dir>\")\n" +
+        "lmdbCommit(lmdbWrite(s))\n" +
+        "val r = lmdbRead(s)\n" +
+        "lmdbPut(r, lmdbDb(r, null), \"k\", \"v\")\n"
+
+    assert(fails_in_store(prog).contains("`lmdbPut` needs a write transaction, and this one is a reader -- `lmdbWrite` is what begins one"))
+
+@test
+A_READ_TRANSACTION_WILL_NOT_MAKE_A_DATABASE_AND_SAYS_WHERE_TO_MAKE_ONE()
+    // **Whether a database is created is decided by which transaction asked** rather than by an
+    // option: making one writes, so a reader asking for a database that is not there wanted a
+    // writer.
+    val prog = "val s = lmdbOpen(\"<dir>\")\n" +
+        "lmdbCommit(lmdbWrite(s))\n" +
+        "val r = lmdbRead(s)\n" +
+        "lmdbDb(r, \"never made\")\n"
+
+    val said = fails_in_store(prog)
+
+    assert(said.contains("this store has no database called `never made`"))
+    assert(said.contains("open it inside an `lmdbWrite` first"))
+
+@test
+A_STORE_WITH_NO_ROOM_FOR_ANOTHER_NAMED_DATABASE_NAMES_maxDbs()
+    val prog = "val s = lmdbOpen(\"<dir>\", { maxDbs: 1 })\n" +
+        "val w = lmdbWrite(s)\n" +
+        "lmdbDb(w, \"one\")\n" +
+        "lmdbDb(w, \"two\")\n"
+
+    assert(fails_in_store(prog).contains("`maxDbs` at `lmdbOpen` says how many it may hold"))
+
+@test
+A_DATABASE_FROM_ANOTHER_STORE_IS_REFUSED_RATHER_THAN_READ_AS_THE_WRONG_ONE()
+    // **An `MDB_dbi` is an index into ONE environment's table**, so handing one to a transaction of
+    // a different environment reads a database that is not the one named -- and LMDB cannot tell.
+    // The table here can, which is why a database handle carries the store it came from.
+    // **`noSubdir` is what makes two stores fit in one scratch directory**: the path is a single
+    // file rather than a directory LMDB writes two files into, which is what a small embedded store
+    // usually wants anyway.
+    val prog = "val a = lmdbOpen(\"<dir>/a\", { noSubdir: true })\n" +
+        "val b = lmdbOpen(\"<dir>/b\", { noSubdir: true })\n" +
+        "val wa = lmdbWrite(a)\n" +
+        "val wb = lmdbWrite(b)\n" +
+        "val da = lmdbDb(wa, null)\n" +
+        "lmdbGet(wb, da, \"k\")\n"
+
+    assert(fails_in_store(prog).contains("this database belongs to another store"))
+
+@test
+EVERY_lmdb_NAME_SAYS_WHAT_IT_TAKES()
+    assert(fails_in_store("lmdbOpen()").contains("`lmdbOpen` takes a path and an optional object of options, and was given 0 arguments"))
+    assert(fails_in_store("lmdbOpen(42)").contains("`lmdbOpen` takes the path as text, and this is an integer"))
+    assert(fails_in_store("lmdbOpen(\"<dir>\", { wat: 1 })").contains("`lmdbOpen` has no option called `wat`"))
+    assert(fails_in_store("lmdbOpen(\"<dir>\", { mapSize: \"big\" })").contains("`mapSize` is a whole number, and this is a string"))
+    assert(fails_in_store("lmdbOpen(\"<dir>\", { readOnly: 1 })").contains("`readOnly` is true or false, and this is an integer"))
+    assert(fails_in_store("lmdbRead(\"store\")").contains("`lmdbRead` takes an environment, and this is a string"))
+    assert(fails_in_store("lmdbCommit(0)").contains("`lmdbCommit` was given something that is not a transaction"))
+    assert(fails_in_store("lmdbFirst(0)").contains("`lmdbFirst` was given something that is not a cursor"))
+
+    val opened = "val s = lmdbOpen(\"<dir>\")\nval w = lmdbWrite(s)\nval db = lmdbDb(w, null)\n"
+
+    assert(fails_in_store(opened + "lmdbGet(w, db)").contains("`lmdbGet` takes a transaction, a database and a key, and was given 2 arguments"))
+    assert(fails_in_store(opened + "lmdbPut(w, db, \"k\")").contains("`lmdbPut` takes a transaction, a database, a key and a value, and was given 3 arguments"))
+    assert(fails_in_store(opened + "lmdbGet(w, db, 42)").contains("`lmdbGet` takes a key as text or bytes, and this is an integer"))
+    assert(fails_in_store(opened + "lmdbGet(w, db, \"\")").contains("`lmdbGet` was given an empty key, and LMDB has no such key"))
+    assert(fails_in_store(opened + "lmdbGet(w, 9, \"k\")").contains("`lmdbGet` was given something that is not a database"))
+    assert(fails_in_store(opened + "lmdbDb(w, 42)").contains("`lmdbDb` takes the name as text or `null`, and this is an integer"))
+
+@test
+A_KEY_LONGER_THAN_LMDB_WILL_TAKE_IS_REFUSED_WITH_THE_LIMIT_THIS_BUILD_HAS()
+    // **The number is asked for rather than written down**, the limit coming from the page size: a
+    // 1.0 build answers 8122 where every 0.9 document quotes 511, so a test carrying either would be
+    // a test of which library the machine has.
+    val prog = "val s = lmdbOpen(\"<dir>\")\n" +
+        "val w = lmdbWrite(s)\n" +
+        "lmdbPut(w, lmdbDb(w, null), repeat(\"k\", 20000), \"v\")\n"
+
+    val said = fails_in_store(prog)
+
+    assert(said.contains("this key is not a size LMDB will store"))
+    assert(said.contains("a key runs from 1 to"))
+
+@test
+slate_lmdb_REFUSES_ON_A_JAVASCRIPT_HOST_NAMING_LMDB_AND_WHY()
+    // **It is not on `OWED` and must not go back**, which is `slate:brotli`'s case: a browser has no
+    // memory-mapped file at all and node's LMDB is a native addon, so "not in the JavaScript back
+    // end yet" would be a promise nobody can keep.
+    val said = node_said("import { lmdbOpen } from slate:lmdb\nprint(lmdbOpen(\"/tmp\"))\n")
+
+    assert(said.contains("`lmdbOpen` is LMDB, and no JavaScript host has it"))
+    assert(said.contains("this module runs in the interpreter only"))

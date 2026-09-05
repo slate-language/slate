@@ -55,6 +55,15 @@ are not compared between the back ends and cannot be** — node links its own co
 interpreter links the machine's, so two encoders at one level may frame the same input differently and
 both be right. `tests/js/p27.sl` compares the round trip and every refusal instead.
 
+**`slate:image` is NOT on that list either, and its two hosts refuse for two different reasons.**
+node has no image support in its standard library at all — every reader anybody uses is an npm
+dependency — so *"not yet"* would be a promise nothing can keep without one. A browser **does**
+decode, through `createImageBitmap` and `OffscreenCanvas`, and is refused anyway: the whole of that
+surface answers **promises** where `readImage` and its four siblings answer on the spot, so a browser
+half would make the two back ends disagree about what an image is. That is `crypto.subtle`'s rule
+again — a host that has a thing only in a different shape does not have it — and it means
+[`slate:image`](../library/image.md) is a server's module.
+
 **`slate:sqlite` is WHOLE here on node and absent in a browser**, which is `slate:zstd`'s answer read
 again. node has carried `node:sqlite` since 22.5, so the module's floor is `DatabaseSync` there and the
 machine's libsqlite3 here, with one piece of slate source above both — the same object with the same five
@@ -73,6 +82,13 @@ encoder and none is coming, so *"not yet"* would be a promise nobody can keep. `
 `decompress` say that they are brotli, that a JavaScript host has none, and that
 [`slate:gzip`](../library/gzip.md) is the compression a browser does have. That is `abbrev`'s case
 below, drawn the same way.
+
+**[`slate:lmdb`](../library/lmdb.md) is not on that list either, and all nineteen of its names
+refuse.** A browser has no memory-mapped file at all — `IndexedDB` and the Origin Private File System
+are what a page stores things in, and neither is an ordered B+tree walked with a cursor — and node
+has no LMDB in its standard library: every binding on npm is a native addon, so a program compiled by
+`slate js` would depend on something the tool cannot see and did not install. Each refusal names the
+call, says it is LMDB, and says the module runs in the interpreter only.
 
 ### `slate:gzip` is whole here, and the container is read by slate rather than by the host
 
