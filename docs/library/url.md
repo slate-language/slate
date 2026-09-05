@@ -107,3 +107,58 @@ It is exported because the three callers inside `slate:http` do not exhaust it: 
 very thing moving the module was meant to stop.
 
 **A value wrapped in quotes is unwrapped**, a cookie's being so by the specification.
+
+## `base64urlEncode` and `base64urlDecode`
+
+Bytes as text that survives a URL: RFC 4648 §5's alphabet, which is base64 with `-` for `+` and `_`
+for `/`, **and no padding at all**.
+
+```slate
+import { base64urlEncode, base64urlDecode } from slate:url
+
+print(base64urlEncode("foobar"))
+print(base64urlEncode([251, 255]))
+
+val r = base64urlDecode("Zm9vYmFy")
+
+print(r.ok, fromBytes(r.value).value)
+
+val bad = base64urlDecode("ab*d")
+
+print(bad.ok, bad.error)
+```
+
+```output
+Zm9vYmFy
+-_8
+true foobar
+false `*` is not a base64url character
+```
+
+**Encode takes a string or an array of bytes, and a string is its UTF-8 bytes** — the same reading
+`encodeComponent` gives one, and the only reading there is: what an encoding of bytes does with text
+is encode the text's bytes.
+
+**Decode answers a result, and its value is BYTES.** Text encoded this way arrives from outside — a
+cookie, a token, a signature somebody sent — so being malformed is a condition the caller was always
+going to deal with rather than a fault, which is [the rule](../reference/faults.md) for anything read
+from outside. And what was encoded is as likely to be a digest as a sentence, so answering text would
+be guessing; `fromBytes` is the one call to text and answers a result of its own, so the two compose:
+
+```slate
+val r = base64urlDecode(piece)
+
+if r.ok then fromBytes(r.value) else r
+```
+
+Three things are refused, each with its own sentence:
+
+- **a character that is not in the alphabet**, `=` included — the padded spelling is base64 and this
+  is not it, and accepting both would make two encodings of one value valid, which is the shape of
+  hole a token format compared as text is walked through;
+- **a length one past a multiple of four**, which carries no whole byte in its last character, so
+  such a piece is truncated rather than merely odd;
+- **bits past the last whole byte that are not zero**, or two spellings decode to the same bytes.
+
+**`slate:jwt` is written on these**, a token being three base64url pieces; it carried a private copy
+until the pair moved here, which is why they are in this module and not in that one.

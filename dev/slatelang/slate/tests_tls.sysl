@@ -300,7 +300,7 @@ A_WHOLE_HTTP_2_REQUEST_TRAVELS_OVER_TLS_AND_ALPN_IS_WHAT_CHOSE_IT()
 // accepts, which is before the TLS handshake has said anything, so `alpnProtocol` there answers
 // `null` on a connection that is about to be `h2`.
 const H2Server: string = raw"""
-    import { serve, close, router } from slate:http
+    import { serve, close, router, sse } from slate:http
     import { h2Client, h2Receive, h2Send, h2Next, h2Request, h2Reset, h2Close } from slate:nghttp2
     import { readFileSync } from slate:fs
 
@@ -471,6 +471,108 @@ A_STREAMED_BODY_GOES_OUT_OVER_HTTP_2_AS_DATA_FRAMES_AS_THE_PIECES_ARRIVE()
     // **Two frames rather than one**, which is what says the pieces went out as they were produced
     // rather than being joined up and sent at the end -- the difference between a stream and a body.
     assert_eq(net_out(prog), "200 one two 2")
+
+@test
+A_STREAMED_SOURCE_OVER_HTTP_2_IS_TOLD_WITH_close_WHEN_THE_PEER_GIVES_UP()
+    // **`sendStreamed` has THREE ways out that leave the source unexhausted where the 1.1 writer has
+    // one**, and this is the one only HTTP/2 has: the peer resets the stream while the connection
+    // stays up. `h2Push` answers a refusal rather than faulting -- a cancelled fetch, a closed tab --
+    // so the response simply ends, and until this it ended without telling the source anything.
+    //
+    // **The connection is still there afterwards, which is what makes the assertion readable**: the
+    // second request on the same session asks the server what it did, so nothing has to be inferred
+    // from a socket that went away.
+    val prog = H2Server + raw"""
+
+    var told = 0
+
+    slow()
+        var n = 0
+
+        async pull()
+            if n >= 20 then return { done: true, value: null }
+
+            await sleep(200)
+
+            n = n + 1
+
+            { done: false, value: "piece " + string(n) }
+
+        shut()
+            told = told + 1
+
+        { next: pull, close: shut }
+
+    app.get("/slow", (req) -> sse(slow(), { heartbeat: 0 }))
+    app.get("/told", (req) -> "told " + string(told))
+
+    async main()
+        val c = (await connect("localhost", localPort(server))).value
+        val h = h2Client()
+
+        pump()
+            val out = h2Send(h)
+
+            if len(out) > 0 then send(c, out)
+
+        var cut = false
+        var asking = false
+        var body = ""
+
+        // The second request, once the server has had a turn to notice the reset.
+        ask()
+            asking = true
+
+            h2Request(h, { ":method": "GET", ":scheme": "https", ":authority": "localhost", ":path": "/told" })
+            pump()
+
+        arrived(chunk)
+            if chunk == null then return
+
+            h2Receive(h, chunk)
+
+            loop
+                val e = h2Next(h)
+
+                if e == null then break
+
+                if e.kind == "data"
+                    if asking
+                        body = body + fromBytes(e.bytes).value
+                    elif !cut
+                        // **CANCEL, on the stream and not on the connection**, which is what a
+                        // browser sends for a tab that closed while the rest of the session goes on.
+                        cut = true
+
+                        h2Reset(h, e.stream, 8)
+                        pump()
+                        setTimeout(ask, 700)
+
+                if e.kind == "streamClose" && asking
+                    print(body)
+
+                    h2Close(h)
+                    close(c)
+                    close(server)
+                    done()
+
+                    return
+
+            pump()
+
+        onBytes(c, arrived)
+
+        await startTls(c, { host: "localhost", trust: theCert, alpn: ["h2"] })
+
+        h2Request(h, { ":method": "GET", ":scheme": "https", ":authority": "localhost", ":path": "/slow" })
+        pump()
+
+    main()
+    """
+
+    // **Once**, which is half of the assertion: three ways out of one loop is three chances to tell
+    // a source twice, and a hub counting its subscribers would go negative for it.
+    assert_eq(out(NetImport + fused(8000, prog)), "told 1")
 
 @test
 REPEATED_cookie_FIELDS_OVER_HTTP_2_ARE_JOINED_THE_WAY_THE_SPECIFICATION_SAYS()

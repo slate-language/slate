@@ -11,7 +11,7 @@ What a program has without writing it.
 | [`slate:fs`](fs.md) | the file system, in a promise-shaped and a blocking form |
 | [`slate:net`](net.md) | TCP, and TLS at both ends |
 | [`slate:http`](http.md) | an HTTP server, a router, and static files |
-| [`slate:url`](url.md) | percent-encoding, and the `name=value` grammar |
+| [`slate:url`](url.md) | percent-encoding, base64url, and the `name=value` grammar |
 | [`slate:time`](time.md) | eight temporal types, and the arithmetic over them |
 | [`slate:process`](process.md) | another program, this program's environment, signals |
 | [`slate:regex`](regex.md) | PCRE2 patterns |

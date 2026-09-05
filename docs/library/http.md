@@ -135,6 +135,38 @@ app.get("/big", req -> { status: 202, headers: { "X-Kind": "report" }, body: row
 - **Both versions carry one.** Over HTTP/1.1 the pieces are chunks and over HTTP/2 they are DATA
   frames, and nothing a handler wrote says which.
 
+### A source is told when its reader has gone
+
+**A source may have a `close`, and the server calls it where the response ends with the source
+unexhausted** — the client hung up, the socket was closed under the response, the peer reset the
+stream, or the source itself faulted. A source that ran to `done` is told nothing, having finished.
+
+```slate
+subscribe(topic)
+    val q = queue()
+
+    async pull()
+        { done: false, value: await q.take() }
+
+    shut()
+        forget(topic, q)
+
+    { next: pull, close: shut }
+
+app.get("/events", req -> sse(subscribe("orders")))
+```
+
+**It is optional and is asked for exactly as `next` is**, so every source already written keeps
+working: a generator has no `close` and is left alone, and so is an object that does not name one.
+
+**Without it, a subscription outlives its reader for the life of the program.** That is the shape a
+source usually has — a topic, a query, a tail of a file — and a writer that simply stopped pulling
+left the thing behind it holding a reader that would never read again. `sse` forwards the message to
+the source it was given, so an event stream gets it through the wrapper.
+
+**It is called once.** There are several ways a streamed response can end early, and a source that
+counted its own readers would go wrong if any of them said so twice.
+
 ## `sse(source)`
 
 Server-sent events, which is a streamed response with one format on top of it:
