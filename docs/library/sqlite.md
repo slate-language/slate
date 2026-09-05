@@ -186,6 +186,11 @@ here — the same object with the same methods, over node's own copy of SQLite r
 machine's. `tests/js/p28.sl` is what says the two agree: the storage classes, the transaction, the
 full-text search and every sentence either back end says about SQL it will not take.
 
+**node writes one line to stderr the first time a program here opens a database** —
+`ExperimentalWarning: SQLite is an experimental feature` — which is node's and not slate's, and
+`node --no-warnings` silences it. It is written at the first call rather than when the program starts,
+so a program that never opens a database never draws it.
+
 **A browser has no SQLite and `node:sqlite` is not coming to one** — what a page has instead is
 IndexedDB and the long-deprecated Web SQL, neither of which is this — so the module refuses there
 naming node's module, exactly as [`slate:brotli`](brotli.md) does.
