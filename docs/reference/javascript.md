@@ -55,6 +55,15 @@ are not compared between the back ends and cannot be** — node links its own co
 interpreter links the machine's, so two encoders at one level may frame the same input differently and
 both be right. `tests/js/p27.sl` compares the round trip and every refusal instead.
 
+**`slate:image` is NOT on that list either, and its two hosts refuse for two different reasons.**
+node has no image support in its standard library at all — every reader anybody uses is an npm
+dependency — so *"not yet"* would be a promise nothing can keep without one. A browser **does**
+decode, through `createImageBitmap` and `OffscreenCanvas`, and is refused anyway: the whole of that
+surface answers **promises** where `readImage` and its four siblings answer on the spot, so a browser
+half would make the two back ends disagree about what an image is. That is `crypto.subtle`'s rule
+again — a host that has a thing only in a different shape does not have it — and it means
+[`slate:image`](../library/image.md) is a server's module.
+
 **`slate:brotli` is NOT on that list, and the difference matters.** No JavaScript host has a brotli
 encoder and none is coming, so *"not yet"* would be a promise nobody can keep. `compress` and
 `decompress` say that they are brotli, that a JavaScript host has none, and that
