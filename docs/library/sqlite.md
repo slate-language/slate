@@ -193,3 +193,10 @@ naming node's module, exactly as [`slate:brotli`](brotli.md) does.
 **Two builds of SQLite are two builds**, so a version number, a `bm25` score and anything else the
 library is free to change between releases are properties of the machine rather than claims about
 slate.
+
+**The one such difference worth knowing about is `"double quotes"`.** SQL says a double-quoted word is
+an *identifier*, and SQLite has a long-standing misfeature where one that matches no column is taken as
+a string literal instead — on by default in the build macOS ships and off in node's, which sets
+`SQLITE_DQS=0`. So `select "hello"` answers the text `hello` under the interpreter and
+`no such column: "hello"` under `slate js`. **Write a string literal in single quotes**, which is what
+SQL says and what both builds agree about.

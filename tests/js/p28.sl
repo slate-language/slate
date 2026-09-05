@@ -91,6 +91,25 @@ val hits = db.query("select body, bm25(search) as score from search where search
 // **The score itself is not printed** — it is a number two builds of SQLite may compute differently.
 print("hits", len(hits), hits[0].body, hits[0].score is real, hits[0].score < 0)
 
+// -- how many parameters a piece of SQL takes ----------------------------------------------------------
+
+// **This is the one thing the JavaScript floor works out rather than being told.** node exposes no
+// `sqlite3_bind_parameter_count`, so its runtime reads the count off the SQL — a `'...'` literal, a
+// `` `...` `` identifier, a `--` line comment and a `/* */` block comment are stepped over, a bare `?`
+// takes the next index, `?NNN` names one, and `:a`, `@a` and `$a` take one index per distinct name.
+// Each of these is called with ONE parameter, so the refusal carries the count each host arrived at
+// and the two are compared against SQLite's own answer.
+asked(sql) = print("wants", db.query(sql, 1) catch e -> e.message)
+
+asked("select ?, ?, ?")
+asked("select '?' as a, ? as b")
+asked("select ? as a -- ?\n, ? as b")
+asked("select ? /* ?, ? */, ? as b")
+asked("select ?3, ?1")
+asked("select :one, :two, :one")
+asked("select @a, $b, ?")
+asked("select 'it''s ?' as a, ? as b")
+
 // -- what it refuses -------------------------------------------------------------------------------------
 
 // **Every one of these is a fault and every one is a sentence**, which is slate's rule read for a
