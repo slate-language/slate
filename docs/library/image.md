@@ -3,7 +3,7 @@
 Photographs and avatars — decoding what somebody uploaded, scaling it down, and writing it back out.
 
 ```slate
-import { readImage, imageShape, resizeImage, encodePNG, encodeJPEG } from slate:image
+import { readImage, imageShape, resizeImage, encodePNG, encodeJPEG, encodeWebP } from slate:image
 
 // An image is a record. Four pixels, three channels, rows packed and the top row first.
 val square = { width: 2, height: 2, channels: 3,
@@ -53,23 +53,67 @@ runnable program above does.
 
 | | |
 |---|---|
-| **read** | PNG, JPEG, GIF (first frame), BMP, TGA, PSD, PIC, PNM, Radiance |
-| **write** | PNG, JPEG |
+| **read** | PNG, JPEG, GIF (first frame), WebP, BMP, TGA, PSD, PIC, PNM, Radiance |
+| **write** | PNG, JPEG, WebP |
 
 **The format is recognised from the bytes**, so there is nothing to tell `readImage` what to expect
 and a file with the wrong extension is read correctly anyway. A GIF decodes to its **first frame**;
 there is no animation.
 
-**There is no WebP.** The decoders here are Sean Barrett's `stb_image`, which has never read one —
-WebP is VP8 in a RIFF container, which is a video codec's worth of code — so a `.webp` upload is
-refused. That is worth knowing because it is what a modern browser writes: a page that re-encodes a
-photograph before uploading it often produces WebP, and a form taking images should say which it
-accepts.
+## WebP, which is what a browser writes
+
+Everything above but WebP is Sean Barrett's `stb_image`, which has never read one — WebP is VP8 in a
+RIFF container, a video codec's worth of code. WebP is libwebp, and it is here because it is what a
+modern browser produces: a page that re-encodes a photograph before uploading it usually writes one,
+so without it the commonest upload a form meets would be the one `readImage` refuses.
+
+Nothing about the call changes. The header says which decoder answers, and `channels` comes back as
+3 or 4 — a WebP carries RGB or RGBA and there is no greyscale form of the file, though
+`readImage(bytes, 1)` converts one for you exactly as it does a PNG.
 
 ```slate
-val webp = readImage(bytes)
+import { readImage, imageShape, encodeWebP } from slate:image
 
-if !webp.ok then print(webp.error)   // "this image could not be read: unknown image type"
+val src = { width: 2, height: 2, channels: 4,
+    pixels: [255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 128] }
+
+val file = encodeWebP(src, { lossless: true })
+
+print(file[0], file[1], file[2], file[3])       // "RIFF"
+print(file[8], file[9], file[10], file[11])     // "WEBP"
+
+val shape = imageShape(file).value
+
+print(shape.width, shape.height, shape.channels)
+print(readImage(file).value.pixels == src.pixels)
+
+// A quality instead of a record is the lossy coder, which keeps the alpha either way.
+print(len(encodeWebP(src, 40)) < len(encodeWebP(src, 100)))
+```
+
+```output
+82 73 70 70
+87 69 66 80
+2 2 4
+true
+true
+```
+
+**An animated WebP is refused**, and says which library reading one would take. Its frames live in
+`ANMF` chunks that only `libwebpdemux` walks, and that is a second library nothing here binds:
+
+```slate
+val anim = readImage(bytes)
+
+if !anim.ok then print(anim.error)
+// "this is an animated WebP; reading one needs libwebpdemux, which this package does not bind"
+```
+
+**A truncated WebP says it is truncated** rather than that it is damaged, which is the difference
+between an upload worth asking for again and one that is not:
+
+```slate
+print(readImage(partial).error)   // "the WebP data stops before the image does"
 ```
 
 ## `channels`, and asking for a different number
@@ -85,7 +129,7 @@ val avatar = readImage(upload, 4).value    // always RGBA, whatever arrived
 
 ## The two channels
 
-**`readImage` and `imageShape` answer a result; `resizeImage`, `encodePNG` and `encodeJPEG` fault.**
+**`readImage` and `imageShape` answer a result; `resizeImage` and the three encoders fault.**
 That is the rule the whole library follows: bytes from somewhere else are an answer the caller has to
 look at — a corrupt JPEG is a `400` to send, not a defect in the program reading it — and a value the
 program built itself is a fault. So a mismatched `pixels`, a width of zero, or a quality of 200 stops
@@ -134,15 +178,29 @@ a page, 60 a thumbnail, 95 something that will be edited again.
 really is a photograph. The encoder is stb's baseline JPEG writer: no progressive mode and no
 subsampling control, which is small, fast, and read by everything.
 
+`encodeWebP` takes **either**, and that is the one signature here with two forms:
+
+| | |
+|---|---|
+| `encodeWebP(image, quality)` | lossy, 1 to 100, roughly a quarter smaller than a JPEG at the same quality — **and it keeps an alpha channel**, which JPEG cannot |
+| `encodeWebP(image, { lossless: true })` | nothing thrown away, and about a fifth smaller than the PNG of the same image |
+
+Two forms rather than two names, because the second argument is what a caller has to think about
+either way and lossless is a value it can take. `{ lossless: false }` is refused rather than read as
+"lossy", since a lossy encode needs a number nobody wrote.
+
+A one- or two-channel image is widened to RGB or RGBA on the way out — there is no greyscale WebP —
+which is what a browser decoding the file would have shown anyway.
+
 ## Not in the JavaScript back end, on either host
 
-Both names refuse under `slate js`, and the two hosts refuse for different reasons. **node has no
+All six names refuse under `slate js`, and the two hosts refuse for different reasons. **node has no
 image support in its standard library at all** — there is no `zlib`-shaped module for pictures, and
 every reader anybody uses is an npm dependency. **A browser does decode**, through
-`createImageBitmap` and `OffscreenCanvas` — but the whole of that surface answers **promises**, where
-these five answer on the spot, so a browser half would make the two back ends disagree about what an
-image even is. That is the same rule `crypto.subtle` is held to: a host that has a thing only in a
-different shape does not have it.
+`createImageBitmap` and `OffscreenCanvas` — WebP as readily as PNG — but the whole of that surface
+answers **promises**, where these six answer on the spot, so a browser half would make the two back
+ends disagree about what an image even is. That is the same rule `crypto.subtle` is held to: a host
+that has a thing only in a different shape does not have it.
 
 So this is a server's module. Resize and re-encode where the interpreter runs, and send the browser
 the answer.
