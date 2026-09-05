@@ -1,0 +1,337 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sh.sysl.stb
+import sysl.buf.{Buf, buf}
+
+// Images -- what a site that takes photographs and avatars from the people using it needs, and no
+// more than that.
+//
+// **Five names: `readImage`, `imageShape`, `resizeImage`, `encodePNG` and `encodeJPEG`.** They are
+// bound over `sh.sysl.stb`, which carries Sean Barrett's `stb_image`, `stb_image_write` and
+// `stb_image_resize2` as vendored headers -- so nothing has to be installed to build slate and the
+// release's `otool -L` census does not grow a line.
+//
+// ## An image is a RECORD, and that is what makes the five compose
+//
+// `{ width, height, channels, pixels }`, where `pixels` is a byte array of `width * height *
+// channels` -- rows packed, top row first, and the channels interleaved. `readImage` answers one,
+// `resizeImage` takes one and answers one, and the two encoders take one. So a thumbnail is
+// `encodeJPEG(resizeImage(readImage(upload).value, 200, 200), 80)` and nothing in the middle is a
+// handle a program has to give back.
+//
+// **The alternative was an opaque handle**, which is what every handle in slate already is and is
+// what `sh.sysl.stb` hands its own callers -- and it is wrong here. The pixels are the *point*: a
+// program wants to look at them, store them, send them, or build one itself and encode it. An
+// image behind a handle would need a reader, a writer and a maker before it could do any of that,
+// and the record needs none.
+//
+// ## Which formats, and the one that is missing
+//
+// **PNG, JPEG and GIF in; PNG and JPEG out.** stb reads six more -- BMP, TGA, PSD, PIC, PNM and
+// Radiance -- and they arrive here for free, the format being recognised from the bytes rather than
+// from anything the caller says. A GIF decodes to its **first frame**; there is no animation, which
+// is stb's own line.
+//
+// **THERE IS NO WebP, AND IT IS NOT A GAP THIS MODULE CAN CLOSE.** stb has never read or written
+// one -- WebP is VP8 in a RIFF container and is a video codec's worth of code, which is exactly what
+// stb is not -- so a `.webp` upload is refused by `readImage` with stb's own *unknown image type*.
+// That matters because it is what a modern browser writes: a phone's photograph re-encoded by a
+// page before upload is often WebP. Closing it means a second binding over `libwebp`, which is a
+// package rather than a change here.
+//
+// ## The two channels, exactly as JSON and brotli draw them
+//
+// **`readImage` and `imageShape` answer a result and the other three fault.** Bytes that came from
+// somewhere else -- an upload, a file, a request body -- are not a defect in the program reading
+// them, so a corrupt JPEG is a `400` to answer rather than something to catch. The three that take
+// an image already hold a value the program built, so a mismatched shape or a width of zero is a
+// mistake in the program and faults where it is written.
+//
+// ## The size guard is `imageShape`, and it is why that name exists
+//
+// A decoded image is `width * height * channels` bytes however small the file was, and a PNG of a
+// few kilobytes can say it is 20,000 by 20,000 -- 1.2 GB of pixels from a request body nobody
+// looked at. `imageShape` reads that out of the header without decoding anything, which is the same
+// job `unzstd`'s limit does for a compression bomb and is the call to make before `readImage` on
+// anything that arrived over a socket.
+
+// -- reading what a program handed over ------------------------------------------------------------
+
+// The bytes of an image. **Text is refused rather than taken as UTF-8**, which is where this differs
+// from `zstd` and `compress`: those two encode text a program is holding, and no string anybody
+// writes is a PNG. A caller with a string of bytes has `toBytes`.
+private image_source(v: Value, at: Span, name: string) -> Result[Buf[u8], Signal]
+    v match
+        Array(a) -> bytes_of(a, at, name)
+        other -> Err(failure(at, s"`${name}` takes the bytes of an image, and this is ${other.type_name()}"))
+
+private image_whole(v: Value, at: Span, name: string, what: string) -> Result[long, Signal]
+    v match
+        Int(n) -> Ok(n)
+        other -> Err(failure(at, s"`${name}` takes ${what} as a whole number, and this is ${other.type_name()}"))
+
+// How many channels a decode should answer, as the count a caller writes.
+//
+// **`readImage(bytes)` converts nothing and `readImage(bytes, 4)` converts to RGBA**, which is the
+// call an avatar pipeline makes: a page's uploads are greyscale, RGB and RGBA in whatever mixture
+// the people using it happened to have, and code that composites or scales them wants one shape.
+private image_channels(n: long, at: Span) -> Result[stb.Channels, Signal] =
+    n match
+        1 -> Ok(stb.Channels.Grey)
+        2 -> Ok(stb.Channels.GreyAlpha)
+        3 -> Ok(stb.Channels.Rgb)
+        4 -> Ok(stb.Channels.Rgba)
+        other -> Err(failure(at, s"an image has 1 to 4 channels -- grey, grey and alpha, RGB, RGBA -- and this is ${other}"))
+
+// How `resize` is to read the channels it is handed. **A layout is not a count**, which is the trap
+// `sh.sysl.stb`'s own `Layout` exists to close, so the number is turned into one here rather than
+// passed through.
+private image_layout(channels: long, at: Span) -> Result[stb.Layout, Signal] =
+    channels match
+        1 -> Ok(stb.Layout.Grey)
+        2 -> Ok(stb.Layout.GreyAlpha)
+        3 -> Ok(stb.Layout.Rgb)
+        4 -> Ok(stb.Layout.Rgba)
+        other -> Err(failure(at, s"an image has 1 to 4 channels, and this says ${other}"))
+
+// What a decode, an encode or a resize objected to, as a sentence.
+//
+// **`Refused` carries stb's own words and they are passed through** -- *unknown image type*, *bad
+// png sig*, *outofdata* -- because each says more than any paraphrase of it would, and they say
+// different things to whoever sent the bytes.
+//
+// **An EMPTY reason is a real answer from stb and gets the sentence without the colon.** A PNG cut
+// short in its chunk header has its four type bytes read past the end, and stb builds the reason out
+// of the bytes it did get -- so a cut landing on a zero leaves the string empty, and a dangling
+// colon would send the reader looking for the missing half of a message that has none.
+private why_not_image(e: stb.Error) -> string = e match
+    stb.Error.Refused(why) ->
+        if why == "" then "this image could not be read" else s"this image could not be read: ${why}"
+    stb.Error.TooLarge -> "this is larger than the image decoder can be told about"
+    stb.Error.NoMemory -> "there was not enough memory to decode this image"
+    stb.Error.Shape(needed) -> s"the pixels do not match the dimensions -- ${needed} bytes were needed"
+    other -> "this image could not be read"
+
+// -- what a program is handed back -----------------------------------------------------------------
+
+private image_bytes(bytes: []const u8) -> Value
+    var items: Buf[Value] = buf()
+
+    for i in 0..<bytes.len
+        items.push(Int(long(bytes[i])))
+
+    Array(new_array(items))
+end image_bytes
+
+// `{ width, height, channels, pixels }`, which is what every one of the five reads or writes.
+//
+// **The array is made and HELD before the record is**, because `new_object` may collect and a
+// `Value` in a sysl local is not a root.
+private image_value(width: int, height: int, channels: int, pixels: []const u8) -> Value
+    val mark = root_mark()
+    val px = image_bytes(pixels)
+
+    hold(px)
+
+    val o = new_object()
+
+    hold(Object(o))
+    obj_put_name(o, "width", Int(long(width)))
+    obj_put_name(o, "height", Int(long(height)))
+    obj_put_name(o, "channels", Int(long(channels)))
+    obj_put_name(o, "pixels", px)
+    release(mark)
+    Object(o)
+end image_value
+
+// An image a program is handing back in, read out of the record and checked against itself.
+//
+// **The pixels are measured against the dimensions here rather than left to stb**, which is never
+// told how long the slice is and would read past its end. `sh.sysl.stb` makes the same check one
+// layer down for its own callers; this one is what turns it into a sentence naming both numbers.
+private struct Shot
+    width: int
+    height: int
+    channels: int
+    pixels: Buf[u8]
+end Shot
+
+private shot_of(v: Value, at: Span, name: string) -> Result[Shot, Signal]
+    val o = v match
+        Object(o) -> o
+        other -> return Err(failure(at, s"`${name}` takes an image -- a record with `width`, `height`, `channels` and `pixels` -- and this is ${other.type_name()}"))
+
+    val width = shot_number(o, "width", at, name)?
+    val height = shot_number(o, "height", at, name)?
+    val channels = shot_number(o, "channels", at, name)?
+
+    if width < 1 || height < 1
+        return Err(failure(at, s"an image is at least one pixel each way, and this one is ${width} by ${height}"))
+
+    if channels < 1 || channels > 4
+        return Err(failure(at, s"an image has 1 to 4 channels, and this says ${channels}"))
+
+    val pixels = obj_get_name(o, "pixels") match
+        Some(Array(a)) -> bytes_of(a, at, s"${name}'s pixels")?
+        Some(other) -> return Err(failure(at, s"an image's `pixels` is an array of bytes, and this is ${other.type_name()}"))
+        None -> return Err(failure(at, s"`${name}` was given a record with no `pixels` in it"))
+
+    val needed = usize(width) * usize(height) * usize(channels)
+
+    if pixels.len() < needed
+        return Err(failure(at, s"this image says it is ${width} by ${height} with ${channels} channels, which is ${needed} bytes, and it carries ${pixels.len()}"))
+
+    Ok(Shot(int(width), int(height), int(channels), pixels))
+end shot_of
+
+private shot_number(o: *ObjectObj, field: string, at: Span, name: string) -> Result[long, Signal] =
+    obj_get_name(o, field) match
+        Some(Int(n)) -> Ok(n)
+        Some(other) -> Err(failure(at, s"an image's `${field}` is a whole number, and this is ${other.type_name()}"))
+        None -> Err(failure(at, s"`${name}` was given a record with no `${field}` in it -- an image is `{ width, height, channels, pixels }`"))
+
+// -- reading -----------------------------------------------------------------------------------------
+
+// `readImage(bytes)` or `readImage(bytes, channels)` -- a result carrying the image, or the sentence
+// saying why not.
+do_read_image(args: Buf[Value], at: Span) -> Step
+    if args.len() < 1 || args.len() > 2
+        return fault(at, s"`readImage` takes the bytes of an image and optionally how many channels to answer, and was given ${counted(args.len(), "argument")}")
+
+    val source = image_source(args.at(0), at, "readImage")?
+    val want =
+        if args.len() == 2
+            image_channels(image_whole(args.at(1), at, "readImage", "the channel count")?, at)?
+        else
+            stb.Channels.Source
+
+    stb.decode(source.view(), want) match
+        Ok(img) ->
+            val mark = root_mark()
+            val made = ok_value(image_value(img.width, img.height, img.channels, img.pixels()))
+
+            hold(made)
+            release(mark)
+            Ok(made)
+        Err(e) -> Ok(err_value(why_not_image(e)))
+end do_read_image
+
+// `imageShape(bytes)` -- `{ width, height, channels }` from the header alone, without decoding.
+//
+// **This is the guard against a decompression bomb wearing a picture's clothes.** The pixels are
+// `width * height * channels` bytes whatever the file weighed, so a 4 KB PNG claiming 20,000 by
+// 20,000 is 1.2 GB the moment anything decodes it. Reading the shape first is what lets a handler
+// answer `413` instead.
+do_image_shape(args: Buf[Value], at: Span) -> Step
+    if args.len() != 1
+        return fault(at, s"`imageShape` takes the bytes of an image, and was given ${counted(args.len(), "argument")}")
+
+    val source = image_source(args.at(0), at, "imageShape")?
+
+    stb.probe(source.view()) match
+        Ok(shape) ->
+            val mark = root_mark()
+            val o = new_object()
+
+            hold(Object(o))
+            obj_put_name(o, "width", Int(long(shape.width)))
+            obj_put_name(o, "height", Int(long(shape.height)))
+            obj_put_name(o, "channels", Int(long(shape.channels)))
+
+            val made = ok_value(Object(o))
+
+            hold(made)
+            release(mark)
+            Ok(made)
+        Err(e) -> Ok(err_value(why_not_image(e)))
+end do_image_shape
+
+// -- scaling -------------------------------------------------------------------------------------------
+
+// `resizeImage(image, width, height)` -- the same image at another size, 8 bits a channel.
+//
+// **The filtering happens in sRGB space**, which is stb's own default and is the right answer for
+// every 8-bit image a page holds: averaging two sRGB bytes as though they were quantities of light
+// is what makes a naively downscaled photograph come out too dark.
+do_resize_image(args: Buf[Value], at: Span) -> Step
+    if args.len() != 3
+        return fault(at, s"`resizeImage` takes an image, a width and a height, and was given ${counted(args.len(), "argument")}")
+
+    val shot = shot_of(args.at(0), at, "resizeImage")?
+    val width = image_whole(args.at(1), at, "resizeImage", "the width")?
+    val height = image_whole(args.at(2), at, "resizeImage", "the height")?
+
+    if width < 1 || height < 1
+        return fault(at, s"a resized image is at least one pixel each way, and this asks for ${width} by ${height}")
+
+    // stb takes every length as an `int`, and a run away multiplication here would be the thing that
+    // allocated a terabyte -- so the answer's size is checked before anything is asked for it.
+    if width > 65535 || height > 65535
+        return fault(at, s"a resized image is at most 65535 pixels each way, and this asks for ${width} by ${height}")
+
+    val layout = image_layout(long(shot.channels), at)?
+    val needed = usize(width) * usize(height) * usize(shot.channels)
+    var dst: []u8 = [0; needed]
+
+    stb.resize(shot.pixels.view(), shot.width, shot.height, dst, int(width), int(height), layout) match
+        Ok(_) ->
+            val mark = root_mark()
+            val made = image_value(int(width), int(height), shot.channels, dst)
+
+            hold(made)
+            release(mark)
+            Ok(made)
+        Err(e) -> fault(at, why_not_image(e))
+end do_resize_image
+
+// -- writing --------------------------------------------------------------------------------------------
+
+// `encodePNG(image)` -- a whole PNG file, as bytes. Lossless, and what to reach for unless the
+// image is a photograph.
+do_encode_png(args: Buf[Value], at: Span) -> Step
+    if args.len() != 1
+        return fault(at, s"`encodePNG` takes an image, and was given ${counted(args.len(), "argument")}")
+
+    val shot = shot_of(args.at(0), at, "encodePNG")?
+
+    stb.encode_png(shot.pixels.view(), shot.width, shot.height, shot.channels) match
+        Ok(file) ->
+            val mark = root_mark()
+            val made = image_bytes(file.bytes())
+
+            hold(made)
+            release(mark)
+            Ok(made)
+        Err(e) -> fault(at, s"this image could not be encoded: ${e.message()}")
+end do_encode_png
+
+// `encodeJPEG(image, quality)` -- a whole JPEG file, as bytes.
+//
+// **The quality is written at every call**, which is `zstd`'s level and `compress`'s quality and the
+// same argument: it is the one number a caller has to think about, and no single value is right
+// often enough to be the quiet one. 80 is a photograph on a page, 60 a thumbnail, 95 something to
+// be edited again.
+//
+// stb's encoder is a baseline one -- no progressive mode, no subsampling control -- which is small,
+// fast, and read by everything.
+do_encode_jpeg(args: Buf[Value], at: Span) -> Step
+    if args.len() != 2
+        return fault(at, s"`encodeJPEG` takes an image and a quality from 1 to 100, and was given ${counted(args.len(), "argument")}")
+
+    val shot = shot_of(args.at(0), at, "encodeJPEG")?
+    val quality = image_whole(args.at(1), at, "encodeJPEG", "the quality")?
+
+    if quality < 1 || quality > 100
+        return fault(at, s"a JPEG quality runs from 1 to 100 and this is ${quality}")
+
+    stb.encode_jpg(shot.pixels.view(), shot.width, shot.height, shot.channels, int(quality)) match
+        Ok(file) ->
+            val mark = root_mark()
+            val made = image_bytes(file.bytes())
+
+            hold(made)
+            release(mark)
+            Ok(made)
+        Err(e) -> fault(at, s"this image could not be encoded: ${e.message()}")
+end do_encode_jpeg
