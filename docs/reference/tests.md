@@ -41,10 +41,42 @@ $ slate test .
 | `assert(condition)` | |
 | `assert(condition, message)` | |
 | `assertEq(got, wanted)` | renders both sides, quoting a string so `"6"` and `6` do not look alike |
+| `skip(reason)` | this test is not going to run here, and why |
 
 **A failed assertion raises**, and the runner catches it exactly as a [`catch`](faults.md) would. A test
 that faults without asserting anything fails the same way, and whatever it printed is shown above the
 failure.
+
+## Leaving a test out
+
+**`skip(reason)` says a test is not going to run here**, which is what a suite needs where one host has
+something another has not — a socket under [`slate js`](javascript.md), a database nobody started, a
+platform the code is not written for yet.
+
+```slate
+@test
+a_server_answers_what_it_is_asked() =
+    if !canListen() then skip("this host has no listener")
+
+    assertEq(ask("/"), "hello")
+```
+
+```
+  ok    tests/api.sl :: a_route_is_matched_before_it_is_called   0ms
+  skip  tests/api.sl :: a_server_answers_what_it_is_asked   this host has no listener
+
+7 passed, 1 skipped
+```
+
+**It raises**, so nothing after it runs — which is why there is no `return` on the line below it, and
+why forgetting one cannot leave the test running on the host it was written to be left out of.
+
+**A `catch` does not get it.** A skip is the test's whole verdict, exactly as `exit` is a script's, so
+a library the test called cannot swallow it.
+
+**A reason is required, and it is shown where the timing is on a pass.** A test left out with nothing
+said is one nobody ever puts back — and a run that skipped anything says so on its last line, so a
+suite that quietly stopped running half of itself cannot report a page of greens.
 
 ## Where tests live
 

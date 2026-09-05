@@ -24,11 +24,53 @@ import sysl.text.{from_utf8_unchecked, str_builder, StrBuilder}
 // it, which is what lets two programs run in one process.
 var output: Buf[string] = buf()
 
+// Whether the test now running asked to be left out, and the reason it gave.
+//
+// **Read by the runner rather than matched on the signal, and the asynchronous case is why.** A
+// `skip` inside an `async` test travels out of the coroutine and settles its promise as a rejection,
+// which keeps the sentence and loses which variant it was -- so the fact has to be written down where
+// `skip` was called. `run_one_test` clears both before every test.
+//
+// Not `private`: `run.sysl` reads the verdict off these.
+var skip_asked: bool = false
+var skip_reason: string = ""
+
+// **EVERY ARGUMENT IS ROOTED ACROSS THE CALL, AND THIS IS THE ONE PLACE THAT SAYS SO.** `args` is a
+// sysl `Buf`, which the collector does not walk -- and a call has already popped the callee and its
+// arguments off the operand stack by the time it gets here, so for the length of a native call the
+// only thing holding them is this buffer. That is invisible for every builtin that answers without
+// running slate code, and fatal for the ten or so that call back into it: `map` walks a receiver and
+// calls a function, and a callback that allocates hard enough to collect frees BOTH of them.
+//
+// **What it looks like is never a memory failure.** `["a", "b", "c"].map(r -> burn(500))` failed with
+// *"this array was changed while `map` was walking it"* about a literal nothing can reach; binding the
+// array to a `val` moved the failure onto the callback -- *"this function takes from 1 to 0
+// arguments"* -- because the freed slot had been taken by something else and read back as a function
+// of a different arity. Binding both made it pass, and the JavaScript back end passed throughout.
+//
+// **Rooting here rather than in each `do_*` is the point.** The hole was in `map`, and it was in
+// `filter`, `reduce`, `sort`, `find` and every other builtin that calls back -- one rule at the
+// dispatch cannot be half-applied, where a rule written out per builtin already had been.
 call_native(f: NativeFn, args: Buf[Value], at: Span) -> Step
+    val mark = root_mark()
+
+    for i in 0..<args.len()
+        hold(args.at(i))
+
+    val answer = dispatch_native(f, args, at)
+
+    // Nothing allocates between here and the caller pushing the answer, which is the same window
+    // every `do_*` already ends in.
+    release(mark)
+    answer
+end call_native
+
+private dispatch_native(f: NativeFn, args: Buf[Value], at: Span) -> Step
     f match
         NPrint -> do_print(args, at)
         NAssert -> do_assert(args, at)
         NAssertEq -> do_assert_eq(args, at)
+        NSkip -> do_skip(args, at)
 
         NChars -> do_chars(args, at)
         NSplit -> do_split(args, at)
@@ -102,6 +144,7 @@ call_native(f: NativeFn, args: Buf[Value], at: Span) -> Step
         NValues -> do_object_parts(args, at, false)
         NEntries -> do_object_parts(args, at, true)
         NHas -> do_has(args, at)
+        NWithout -> do_without(args, at)
         NSetTimeout -> do_timer(args, at, false)
         NSetInterval -> do_timer(args, at, true)
         NClearTimeout -> do_clear(args, at)
@@ -146,6 +189,7 @@ call_native(f: NativeFn, args: Buf[Value], at: Span) -> Step
         NSend -> do_send(args, at)
         NCloseSocket -> do_close(args, at)
         NLocalPort -> do_local_port(args, at)
+        NRemoteAddress -> do_remote_address(args, at)
         NStartTls -> do_start_tls(args, at)
         NAlpnProtocol -> do_alpn_protocol(args, at)
 
@@ -263,6 +307,8 @@ call_native(f: NativeFn, args: Buf[Value], at: Span) -> Step
         NDomOn -> no_document(at, "on")
         NDomOff -> no_document(at, "off")
         NDomSetChildren -> no_document(at, "setChildren")
+        NDomInsertBefore -> no_document(at, "insertBefore")
+        NDomRemoveChild -> no_document(at, "removeChild")
         NDomSetText -> no_document(at, "setText")
         NDomById -> no_document(at, "byId")
         NDomQuery -> no_document(at, "query")
@@ -324,7 +370,7 @@ call_native(f: NativeFn, args: Buf[Value], at: Span) -> Step
         NPbkdf2 -> do_pbkdf2(args, at)
         NRandomBytes -> do_random_bytes(args, at)
         NTimingSafeEqual -> do_timing_safe_equal(args, at)
-end call_native
+end dispatch_native
 
 // Whether these arguments begin with an array, which is what tells the array form of a shared name
 // from the text one. A wrong first argument falls through to the text form and is complained about
@@ -354,6 +400,25 @@ private do_assert(args: Buf[Value], at: Span) -> Step
 
     fault(at, "this assertion does not hold")
 end do_assert
+
+// `skip(reason)` -- this test is not going to run here, and why.
+//
+// **It raises, which is `assert`'s design and matters more here.** A `skip` that merely recorded
+// something would leave the rest of the test running, so every use of it would be `skip(...)` and a
+// `return` on the next line -- and the day somebody forgets the `return` the test runs on a host it
+// was written to be left out of and fails there for a reason nobody can read.
+//
+// **A reason is required.** A test left out with nothing said is one nobody ever puts back.
+private do_skip(args: Buf[Value], at: Span) -> Step
+    if args.len() != 1 then return fault(at, s"`skip` takes the reason this test is being left out, and was given ${counted(args.len(), "argument")}")
+
+    args.at(0) match
+        Str(p) ->
+            skip_asked = true
+            skip_reason = p.s
+            skipped(at, p.s)
+        other -> fault(at, s"`skip` takes a reason as text, and this is ${other.type_name()}")
+end do_skip
 
 // `assertEq(actual, expected)`.
 //
@@ -439,6 +504,12 @@ private do_local_port(args: Buf[Value], at: Span) -> Step
     if args.len() != 1 then return fault(at, s"`localPort` takes a socket and was given ${counted(args.len(), "argument")}")
 
     local_port(args.at(0), at)
+
+// `remoteAddress(conn)` -- the IP at the other end, or `null` where there is no other end.
+private do_remote_address(args: Buf[Value], at: Span) -> Step
+    if args.len() != 1 then return fault(at, s"`remoteAddress` takes a connection and was given ${counted(args.len(), "argument")}")
+
+    remote_address(args.at(0), at)
 
 private do_start_tls(args: Buf[Value], at: Span) -> Step
     if args.len() != 2 then return fault(at, s"`startTls` takes a socket and the host to connect as, and was given ${counted(args.len(), "argument")}")
@@ -742,9 +813,51 @@ private do_has(args: Buf[Value], at: Span) -> Step
     if args.len() != 2 then return fault(at, s"`has` takes an object and a key, and was given ${counted(args.len(), "argument")}")
 
     args.at(0) match
-        Object(o) -> Ok(Bool(obj_has(o, args.at(1), at)?))
+        // **A key the walks hide is a key the object does not have**, so `has(p, "proto")` on a class
+        // instance is false where `keys(p)` no longer lists it. Two answers to one question is what
+        // the four walks had between them before this.
+        Object(o) ->
+            if !walked_key(o, args.at(1)) then return Ok(Bool(false))
+
+            Ok(Bool(obj_has(o, args.at(1), at)?))
         other -> fault(at, s"`has` needs an object, and this is ${other.type_name()}")
 end do_has
+
+// `without(o, key)` -- the object again, with that key gone.
+//
+// **A NEW object, because a slate object's shape is not a thing a program changes in place.** `with`
+// is the other half of this and answers a copy for the same reason; a `delete` writing through the
+// value would make every name holding it see the field go, which is the surprise `with` was built to
+// avoid.
+//
+// **A key that is not there is not an error**, so `without` is idempotent and a program removing a
+// key it is unsure of writes one line. **A data value's copy is a data value**, exactly as `with`'s
+// is -- and a hidden key cannot be removed, there being nothing there to a program that asks.
+private do_without(args: Buf[Value], at: Span) -> Step
+    if args.len() != 2 then return fault(at, s"`without` takes an object and a key, and was given ${counted(args.len(), "argument")}")
+
+    args.at(0) match
+        Object(fields) ->
+            val key = args.at(1)
+            val mark = root_mark()
+            val o = new_object()
+
+            hold(Object(o))
+
+            for i in 0..<fields.entries.len()
+                val e = fields.entries.at(i)
+
+                if !e.dead && !(walked_key(fields, e.key) && same(e.key, key, at)?)
+                    obj_put(o, e.key, e.value, at)?
+
+            // Set last, the writes above being how the copy was filled -- `WithObject`'s own
+            // ordering and for its reason.
+            o.frozen = fields.frozen
+
+            release(mark)
+            Ok(Object(o))
+        other -> fault(at, s"`without` needs an object, and this is ${other.type_name()}")
+end do_without
 
 
 // The sentence a program gets for reaching a `slate:dom` name where there is no document.

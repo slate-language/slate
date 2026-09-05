@@ -119,8 +119,60 @@ a_tag_a_declaration_wrote_is_not_a_field() =
     val p = Point.new(1, 2)
 
     assertEq(keys(Point), ["new"])
-    assertEq(keys(p), ["x", "y", "proto"])
-    assertEq(keys(Circle(3)), ["r", "proto"])
+    assertEq(keys(p), ["x", "y"])
+    assertEq(keys(Circle(3)), ["r"])
+
+@test
+the_proto_a_nominal_value_is_reached_through_is_not_a_field_either() =
+    // **`entries(One(5))` used to answer `[["a", 5], ["proto", <data One>]]`**, so an object copied
+    // out of a data value was not the value it copied and `has(v, "proto")` was true of a name no
+    // program wrote. The printer had always hidden it; the six walks over an object had not.
+    val c = Circle(3)
+    val p = Point.new(1, 2)
+
+    assertEq(entries(c), [["r", 3]])
+    assertEq(values(p), [1, 2])
+    assertEq(len(p), 2)
+    assert(!has(c, "proto"), "a data value's `proto` is machinery and not a field")
+    assert(!has(p, "(class)"), "a tag is not a field a program can ask about either")
+
+    // **And a `proto` a PROGRAM wrote is an ordinary field**, which is what keeps this a rule about
+    // nominal values rather than a rule about the word.
+    val plain = { n: 1, proto: { m: 2 } }
+
+    assertEq(keys(plain), ["n", "proto"])
+    assert(has(plain, "proto"))
+
+@test
+without_answers_a_new_object_with_that_key_gone() =
+    val o = { a: 1, b: 2, c: 3 }
+
+    assertEq(keys(without(o, "b")), ["a", "c"])
+    assertEq(keys(o), ["a", "b", "c"])
+
+    // A key that is not there is not an error, so removing one twice does what removing it once did.
+    assertEq(keys(without(without(o, "b"), "b")), ["a", "c"])
+
+    // **A copy of a data value is a data value**, which is `with`'s rule read the other way.
+    val trimmed = without(Circle(3), "r")
+
+    assert(trimmed is object)
+    assertEq(keys(trimmed), [])
+
+@test
+with_on_a_data_value_refuses_a_field_its_type_does_not_have() =
+    // **`Circle(3) with { id: "x" }` answered a `Circle` carrying an `id`**, printed as though the
+    // declaration had a second positional field. Nothing else in the language can build one.
+    val said = try
+        Circle(3) with { id: "x" }
+        ""
+    catch e
+        e.message
+
+    assert(contains(said, "has no field `id`"), said)
+
+    // A field the type DOES have still updates, which is what `with` is for.
+    assertEq((Circle(3) with { r: 5 }).r, 5)
 
 @test
 a_class_with_its_own_hash_is_reachable_as_a_key() =

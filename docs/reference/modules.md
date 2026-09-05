@@ -50,6 +50,47 @@ leading `./` was optional.
 See [Packages](packages.md) for what a bare name resolves to, and [the library](../library/README.md)
 for the `slate:` modules.
 
+## Importing a file that is not slate
+
+**A quoted path naming anything but `.sl` or `.slx` is an asset, and one name takes the whole of it as
+a string:**
+
+```slate
+import styles from "./button.css"
+import template from "./welcome.html"
+
+print(len(styles))
+```
+
+**The file is read while the program is compiled and travels inside it**, so nothing has to sit beside
+the binary at run time and nothing is read twice — six files importing one stylesheet is one string.
+It is the same on both back ends: under `slate js` the text is written into the emitted program, byte
+for byte.
+
+**The extension decides, never what the writer meant.** `"./util.sl"` is a module and `"./button.css"`
+is an asset, and each is refused in the other's form:
+
+```slate
+import { helper } from "./styles.css"
+```
+
+```error
+is not slate source, so there are no names in it to take
+```
+
+and a bare name asked of slate source says the same thing the other way round — **slate has no
+default export**, and a file that does have names in it is imported by naming them.
+
+**A package's assets are the package's own.** A `.css` shipped beside a `.slx` is imported by that
+file, relatively, and handed on as an ordinary exported value — so nothing about the
+[package](packages.md) system had to learn what an asset is.
+
+**Two things are refused, both before the program runs.** A file that is not there is named beside the
+file that asked for it. And a file that is **not UTF-8 text** is refused rather than mangled: slate has
+one text type, so there is no value a PNG could arrive as, and a program that wants bytes wants
+[`readBytes`](../library/fs.md) — which reads them while the program runs, where their size is not the
+program's size.
+
 ## Imports are resolved before anything runs
 
 **The machine never sees an import.** That is not a preference: slate's file surface is promise-shaped,

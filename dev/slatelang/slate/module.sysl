@@ -4,7 +4,7 @@ import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.fs.read_bytes
 import sysl.path.normalize
-import sysl.text.{from_utf8_unchecked, split, str_builder}
+import sysl.text.{from_utf8, from_utf8_unchecked, split, str_builder}
 
 // Reading a program that is several files.
 //
@@ -85,7 +85,52 @@ private is_relative(raw: string) -> bool
     b.len > 2 && b[0] == u8('.') && b[1] == u8('.') && b[2] == u8('/')
 end is_relative
 
-// -- loading -----------------------------------------------------------------------------------
+// Whether a path names slate SOURCE.
+//
+// **`.slx` counts and it buys nothing but the name.** slx is read in every file -- there is no
+// ambiguity to gate on, `<` in prefix position beginning nothing else -- so the extension says to a
+// reader and to an editor what a file holds and says nothing to the compiler. That is the opposite
+// of `.tsx`, which had to be a separate parse mode because `<T>(x)` is a cast in TypeScript and a tag
+// in TSX.
+//
+// **It is a rule about IMPORTS as well as about walking a directory**, which is why it lives here
+// rather than beside the walk: a quoted specifier naming slate source is a module and one naming
+// anything else is an asset, and that is the whole of how the two forms are told apart.
+//
+// Not `private`: `main.sysl` walks a directory with it and `parse.sysl` reads an import with it.
+ends_with_sl(path: string) -> bool
+    val b = path.bytes
+
+    if b.len > 4 && b[b.len - 4] == u8('.') && b[b.len - 3] == u8('s') && b[b.len - 2] == u8('l') && b[b.len - 1] == u8('x')
+        return true
+
+    b.len > 3 && b[b.len - 3] == u8('.') && b[b.len - 2] == u8('s') && b[b.len - 1] == u8('l')
+end ends_with_sl
+
+// -- assets ----------------------------------------------------------------------------------------
+
+// What every asset a program imports holds, by its resolved path.
+//
+// **Module storage for `module_values`' reason and not for convenience.** The loader is the one pass
+// that reads files, and it reads an asset once, for both back ends and for both of the passes each of
+// them makes -- so the alternative is threading a table through `Loaded`, `Unit`, three callers of
+// `compile_module` and the JavaScript emitter, to hand around a thing only two arms ever read.
+//
+// **Filled by `load_program` and emptied by it**, so a program's assets never outlive the run that
+// asked for them.
+private var asset_paths: Buf[string] = buf()
+private var asset_texts: Buf[string] = buf()
+
+// What the file at this resolved path holds, or nothing where no import named it.
+//
+// **Both back ends ask this and neither reads a file**, which is the same arrangement `package_entry`
+// has: one rule about what an import means, asked again rather than handed down.
+asset_text(path: string) -> Option[string]
+    for i in 0..<asset_paths.len()
+        if asset_paths.at(i) == path then return Some(asset_texts.at(i))
+
+    None
+end asset_text
 
 // Every file a program is made of, and everything that was wrong with any of them.
 struct Loaded
@@ -120,6 +165,8 @@ end Loaded
 // a file, standard input, a test's string literal. Everything it imports is read here.
 load_program(entry: Source) -> Loaded
     clear_bodies()
+    asset_paths.clear()
+    asset_texts.clear()
 
     val name = normalize_path(entry.name)
     var l = Loaded(buf(), buf(), report(), buf(), buf(), packages_for(name))
@@ -208,6 +255,7 @@ private load_file(l: *Loaded, src: Source, stack: *Buf[string]) -> usize
         *st.kind match
             ImportNames(path, path_at, origin, _, _) -> take_import(l, me, path, path_at, origin, st.span, stack)
             ImportAll(path, path_at, origin, _) -> take_import(l, me, path, path_at, origin, st.span, stack)
+            ImportAsset(path, path_at, _) -> take_asset(l, me, path, path_at)
             _ -> ()
 
     stack.truncate(stack.len() - 1)
@@ -307,6 +355,42 @@ private take_file(l: *Loaded, me: usize, path: string, path_at: Span, whole: Spa
         Err(e) -> complain(l, me, path_at, s"cannot read `${path}`: ${e}")
         Ok(bytes) -> load_file(l, source(path, bytes), stack)
 end take_file
+
+// One asset: read it, check it is text, and remember what it holds.
+//
+// **There is no cycle check and there cannot be one**, an asset importing nothing. It is read once
+// however many files name it, which is `take_file`'s rule and matters more here: a stylesheet shared
+// by six components is one string in the program rather than six.
+//
+// **A file that is not UTF-8 is refused rather than mangled, and that is the design.** slate has one
+// text type and it is UTF-8, so there is no value a PNG could arrive as -- and answering replacement
+// characters, or the bytes reinterpreted as Latin-1, would put a corrupted value into the program
+// with nothing said. The refusal names `readBytes`, which is what a program wanting a binary file
+// actually needs and which reads it at run time where its size is not the program's size.
+//
+// **Both complaints are drawn against the IMPORT, so the report names both files** -- the one that
+// asked, by the line it asked on, and the one it asked for, by name in the sentence.
+private take_asset(l: *Loaded, me: usize, raw: string, path_at: Span)
+    if raw == "" then return
+
+    if !is_relative(raw)
+        complain(l, me, path_at, s"a file beside this one says where it starts, so an asset is written `\"./${raw}\"`")
+        return
+    end if
+
+    val path = resolve_import(l.sources.at(me).name, raw)
+
+    for i in 0..<asset_paths.len()
+        if asset_paths.at(i) == path then return
+
+    read_bytes(path) match
+        Err(e) -> complain(l, me, path_at, s"cannot read `${path}`, which `${l.sources.at(me).name}` imports: ${e}")
+        Ok(bytes) -> from_utf8(bytes) match
+            Err(_) -> complain(l, me, path_at, s"`${path}` is not UTF-8 text, and an import brings a file in as a string -- read a file of bytes with `readBytes` from `slate:fs` instead, which reads it while the program runs")
+            Ok(text) ->
+                asset_paths.push(path)
+                asset_texts.push(text)
+end take_asset
 
 // Where a package import points: the `main` of that package's own manifest, or -- where the
 // specifier carried a slash -- the file that package's `modules` gives that name.

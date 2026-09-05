@@ -47,8 +47,20 @@ would be held for the life of the server.
 
 ## The request
 
-`method`, `path`, `search` (the raw text after the `?`), `query`, `cookies`, `params`, `body` where the
-server read one, `keepAlive`, `upgrade`.
+`method`, `path`, `search` (the raw text after the `?`), `query`, `cookies`, `params`, `address`,
+`body` and `bytes` where the server read one, `keepAlive`, `upgrade`.
+
+- **`body` is the text and `bytes` is what arrived**, and both are there on every request `serve`
+  answers. A body that is not UTF-8 — a PNG, a zip, a binary part of a `multipart/form-data` upload —
+  decodes to nothing, so `body` is `""` and `bytes` is exact. Until 0.0.30 there was only `body`, and
+  such an upload was the same value as a request that carried no body at all: no header, no status,
+  no fault. **A large upload still wants `serveStream`**, which hands the bytes over as they arrive
+  rather than holding the whole of them twice.
+- **`address` is the IP that connected**, or `null` where the socket cannot say. It is
+  [`slate:net`'s `remoteAddress`](net.md) asked of this request's connection, so an IPv4 client of a
+  dual-stack server reads as `127.0.0.1` rather than as `::ffff:127.0.0.1`. **What a proxy wrote is
+  still a header**: `x-forwarded-for` is what a server behind one must read, and this is who actually
+  opened the socket.
 
 - **`search` and `query` are the URL API's two names.** A program wanting the raw text still has it —
   which matters because **a repeated name in `query` is the last one**. That is a decision: an array where

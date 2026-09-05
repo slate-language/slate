@@ -36,6 +36,7 @@ main()
 | `send(sock, v)` | a promise of a result; an **array is sent as bytes** |
 | `close(sock)` | |
 | `localPort(server)` | |
+| `remoteAddress(conn)` | the IP at the other end, or `null` where there is no other end |
 | `startTls(sock, options)` | a promise that settles when the handshake finishes |
 | `alpnProtocol(conn)` | which application protocol was agreed, or `null` |
 
@@ -62,6 +63,15 @@ a handler never hears about it. It is a registration of its own rather than a th
 ## Ports and names
 
 A port of `0` asks the kernel to pick one and `localPort` says which.
+
+**`remoteAddress` says who connected**, as the text a person would read it as — `"127.0.0.1"`,
+`"::1"`. A listener has no other end and answers `null`, which is an answer rather than a failure:
+asking a socket who is at the far end of it is asking about a thing that may not be there.
+
+**An IPv4 client of a dual-stack server is written the way it dialled.** `listen` binds `::` so that
+a client asking for `localhost` reaches the server, and the kernel then reports every IPv4 peer in
+the mapped form `::ffff:127.0.0.1`. The prefix is taken off here, or an allow-list written against
+`127.0.0.1` would match nothing on a machine with IPv6.
 
 **`connect` takes a name or an address**, resolving through libuv's resolver on its thread pool. A name that
 does not resolve settles the promise the way a refused connection does, rather than raising.

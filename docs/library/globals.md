@@ -96,12 +96,13 @@ Where slate parts from JavaScript it is **to remove a case rather than add one**
 
 ## Objects
 
-`keys  values  entries  has`
+`keys  values  entries  has  without`
 
 ```slate
 val o = { a: 1, b: 2 }
 
 print(keys(o), values(o), has(o, "a"))
+print(without(o, "a"), o)
 
 for [k, v] in entries(o)
     print(k, v)
@@ -109,9 +110,20 @@ for [k, v] in entries(o)
 
 ```output
 ["a", "b"] [1, 2] true
+{b: 2} {a: 1, b: 2}
 a 1
 b 2
 ```
+
+**`without` answers a NEW object**, which is `with`'s rule read the other way: a slate object's shape
+is not a thing one name changes under another's feet. A key that is not there is not an error, so a
+table forgetting something it is unsure of is one line — and a copy of a [data value](../reference/data-types.md)
+is a data value, as `with`'s is.
+
+**A `proto` a declaration wrote is not a field these report.** A class instance and a data variant
+reach what they are through it, so `keys`, `values`, `entries`, `has`, `len` and `without` all pass
+over it — which is what `print` has always done. A `proto` a *program* wrote on a plain object is an
+ordinary field and is reported like any other.
 
 An object answers **no** methods of its own — its names belong to the program, and a builtin `o.keys`
 would give every object a field nothing put there. The [four universal methods](README.md) are the

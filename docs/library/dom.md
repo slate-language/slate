@@ -13,6 +13,8 @@ import { byId, setText, on } from slate:dom
 | `setAttribute`, `removeAttribute`, `setProperty` | |
 | `on(node, event, fn)`, `off(node, id)` | |
 | `setChildren(node, kids)`, `setText(node, s)` | |
+| `insertBefore(parent, node, before)` | one child, in front of another; `null` appends |
+| `removeChild(parent, node)` | one child, out |
 | `byId(id)`, `query(selector)` | |
 | `children(node)` | the child nodes, as handles, in order |
 | `tagName(node)` | the tag in lower case, or `null` for a text node |
@@ -151,3 +153,22 @@ $ slate add github.com/slate-language/lath
 
 **It is a package rather than part of the language, and deliberately so**: a UI framework iterates far
 faster than a compiler, and baking one in would tie every framework fix to a language release.
+
+## Moving one child
+
+**`setChildren` writes the whole list and the two beside it move one node.** Both spellings are here
+because they cost different things: replacing a list is what makes a re-render idempotent, and it is
+what a browser records a mutation for per child — a keyed reconciler moving three rows of a thousand
+should not make the page do a thousand pieces of work.
+
+```slate
+insertBefore(list, row, list.children()[2])
+insertBefore(list, row, null)
+removeChild(list, row)
+```
+
+**`before` of `null` appends**, which is `Node.insertBefore`'s own rule and is what makes the last
+position no more work than any other. **A node already in the page MOVES rather than being copied**,
+so it keeps its focus, its scroll position and whatever it was playing. **The parent is named for the
+removal too**, where a browser needs only the child: a reconciler holds both, and naming the parent
+is what turns "that node is somewhere else entirely" from a silent success into a sentence.
