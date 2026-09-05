@@ -1,8 +1,17 @@
 module dev.slatelang.slate
 
 import sh.sysl.miniz
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
 
-// Unwrapping a `.gz`, which is what a package arrives inside.
+// gzip and zlib, which are two wrappers over one deflate stream -- and `slate:gzip`, which is what a
+// program compresses with.
+//
+// **Two readers share this file because they share the format.** The first is the package manager's:
+// a `.gz` arrives holding a package and has to be unwrapped before anything else can happen, and
+// `gunzip` below is that, with the vocabulary of somebody holding a download. The second is
+// `slate:gzip`, the module a program imports -- the same container written as well as read, plus the
+// zlib wrapper beside it, and every sentence written for somebody holding bytes rather than a file.
 //
 // **gzip is a small header, a raw deflate stream, and an eight-byte trailer.** `sh.sysl.miniz` does
 // the deflate; everything here is the wrapper around it, which zlib's own format does not have and
@@ -111,3 +120,320 @@ private past_nul(bytes: []const u8, from: usize) -> Result[usize, string]
 
         if c == 0 then return Ok(i)
 end past_nul
+
+// -- `slate:gzip`, which is the compression every host has ---------------------------------------
+
+// **The module exists because a browser has this and has nothing else.** `CompressionStream` speaks
+// gzip, zlib and raw deflate and speaks no brotli at all, so `slate:brotli` is a thing a JavaScript
+// host does not have and this is a thing every host does. That is the parity rule deciding a module
+// rather than an implementation detail: what a program reaches for when it wants its bytes smaller
+// anywhere slate runs is these four names.
+//
+// ## Every one of them answers a PROMISE, on both hosts
+//
+// **`CompressionStream` is a `TransformStream`, so there is no synchronous door to it**, and the
+// surface is shaped by that from the start rather than being made synchronous here and refused
+// there. The interpreter compresses with miniz and answers a promise it has already settled; moving
+// that onto libuv's thread pool later is an internal change nothing can see. `slate:password`
+// hashing on the pool is the same shape and was the precedent.
+//
+// **`slate:brotli` stays synchronous and is not touched.** Its signature already exists and a
+// consumer already holds it, which is the one thing that separates the two cases.
+//
+// ## No quality, and that is the parity rule again
+//
+// `slate:brotli` takes a quality because brotli's encoder has one; `CompressionStream` takes none
+// and there is no way to ask a browser for a slower, smaller answer. A number this could only obey
+// on one host is worse than not offering it, so there is none -- the level is the deflate default,
+// which is what a browser uses too.
+//
+// ## The two failure channels, exactly as `slate:brotli` draws them
+//
+// **Compressing faults and decompressing answers a result.** Compressing cannot fail on bytes the
+// program is already holding; decompressing is reading bytes from somewhere else, and a body that is
+// not a gzip stream is an ordinary thing to be sent and a `400` to answer.
+//
+// **A limit is not optional on the way back**, for the reason it is not optional in `slate:brotli`:
+// a few hundred bytes of crafted deflate expands without bound, and a caller says how large an
+// answer it is prepared to hold.
+
+// The compressor's working state, which is 167,800 bytes and does not belong on a stack.
+//
+// **A module `var` is what miniz's own documentation asks for**, and one is enough: nothing here
+// runs while anything else here is running, deflate being a synchronous call between two turns of
+// the loop.
+private var deflate_state: [miniz.DEFLATE_BYTES]u8 = [0; miniz.DEFLATE_BYTES]
+
+// The decompressor's, which is 8,376 -- small enough for a stack and kept beside the other so that
+// the two halves read alike.
+private var inflate_state: [miniz.INFLATE_BYTES]u8 = [0; miniz.INFLATE_BYTES]
+
+// Text or bytes, which is `slate:brotli`'s rule and for its reason: a program compressing a page
+// holds a string, and what goes on a wire is its UTF-8 either way.
+private gz_source(v: Value, at: Span, name: string) -> Result[Buf[u8], Signal]
+    v match
+        Str(p) ->
+            var out: Buf[u8] = buf()
+
+            for i in 0..<p.s.bytes.len
+                out.push(p.s.bytes[i])
+
+            Ok(out)
+        Array(a) -> bytes_of(a, at, name)
+        other -> Err(failure(at, s"`${name}` takes text or bytes, and this is ${other.type_name()}"))
+
+private gz_limit(v: Value, at: Span, name: string) -> Result[usize, Signal]
+    v match
+        Int(n) ->
+            if n < 0
+                Err(failure(at, s"a limit is a number of bytes and this is ${n}"))
+            else
+                Ok(usize(n))
+        other -> Err(failure(at, s"`${name}` takes the most it may become as a whole number, and this is ${other.type_name()}"))
+
+private gz_bytes(bytes: []const u8) -> Value
+    var items: Buf[Value] = buf()
+
+    for i in 0..<bytes.len
+        items.push(Int(long(bytes[i])))
+
+    Array(new_array(items))
+end gz_bytes
+
+// A promise that has already been answered.
+//
+// **This is `resolve`'s own machinery, reached from sysl rather than from a program**, and it is
+// what makes the interpreter's half of this module promise-shaped without pretending to be
+// asynchronous. There is nothing to wait for: the compression has already happened by the time the
+// caller is handed the promise, and `await` still goes round the ready queue exactly once, so a
+// program cannot tell which host it is on by watching what runs next.
+private gz_settled(v: Value) -> Step
+    val mark = root_mark()
+
+    hold(v)
+
+    val pr = new_promise()
+
+    hold(Promise(pr))
+    settle_ok(pr, v)
+    release(mark)
+    Ok(Promise(pr))
+end gz_settled
+
+// Deflate the whole of `src`, wrapped as the format asks.
+//
+// **`bound` is what makes this one call rather than a loop.** miniz says exactly how large a
+// compressed stream can be for an input of a given length -- incompressible bytes are *larger*
+// compressed, having a frame to carry -- so the destination is sized rather than guessed at.
+private deflated(src: []const u8, format: miniz.Format, at: Span, name: string) -> Result[Buf[u8], Signal]
+    var out: []u8 = [u8(0); miniz.bound(src.len)]
+
+    miniz.deflate(deflate_state, src, out, miniz.Level.Default, format) match
+        Err(_) -> Err(failure(at, s"`${name}` could not compress this, the encoder having refused to start"))
+        Ok(n) ->
+            var made: Buf[u8] = buf()
+
+            for i in 0..<n
+                made.push(out[i])
+
+            Ok(made)
+end deflated
+
+// Inflate a whole stream into a buffer sized by trying, since a deflate stream does not say how
+// large it will become.
+//
+// **The destination has to hold ALL of it, which is miniz's rule rather than a choice here**: an
+// inflater resolves a back reference by reading what it has already written, so there is no rolling
+// window to drain into and no way to grow the answer as it arrives. So a guess that turns out too
+// small is thrown away and the stream is inflated again into twice the room. That costs a second
+// pass and never more than the answer's own size in wasted work, where sizing at the limit up front
+// would allocate a gigabyte for a caller who named one only to guard against a bomb.
+private stretched(src: []const u8, format: miniz.Format, limit: usize) -> Result[Buf[u8], string]
+    var room: usize = if src.len * 4 > 1024 then src.len * 4 else 1024
+
+    if room > limit then room = limit
+
+    loop
+        var out: []u8 = [u8(0); room]
+
+        miniz.inflate(inflate_state, src, out, format) match
+            Ok(n) ->
+                var made: Buf[u8] = buf()
+
+                for i in 0..<n
+                    made.push(out[i])
+
+                return Ok(made)
+            // **`Full` is the only answer worth another pass**, the destination having filled;
+            // every other one is about the stream itself and says the same thing however much room
+            // it is given.
+            Err(Full) ->
+                if room >= limit then return Err(s"this expands past the ${limit} bytes it was allowed")
+
+                room = if room * 2 > limit then limit else room * 2
+            Err(e) -> return Err(why_gz(e))
+end stretched
+
+// What miniz objected to, said to somebody holding bytes rather than a download.
+//
+// **`gunzip`'s `why` above says the same things in the package manager's words**, and the two are
+// separate for that reason alone: a reader there is unpacking something that arrived over the
+// network, and a reader here is holding a request body somebody sent.
+private why_gz(e: miniz.Error) -> string
+    e match
+        Truncated -> "this compressed stream ends in the middle"
+        Corrupt -> "this is not a compressed stream at all"
+        Full -> "this expands past the room it was given"
+        Short(_) -> "this expands past the room it was given"
+        NoRoom(needed) -> s"decompressing needed ${needed} bytes of working space"
+end why_gz
+
+// The bytes a gzip member holds, as a result.
+//
+// **The trailer is what makes this exact where `stretched` has to guess.** gzip's `ISIZE` gives the
+// uncompressed length, so the destination is sized from the file and the limit is checked before a
+// byte is allocated -- which is the whole of the bomb defence for this format.
+private unwrapped(bytes: []const u8, limit: usize) -> Value
+    if bytes.len < 18 then return err_value("this is too short to be a gzip stream")
+
+    if bytes[0] != u8(0x1f) || bytes[1] != u8(0x8b)
+        return err_value("this does not begin with gzip's two magic bytes, so it is not a gzip stream")
+
+    if bytes[2] != 8
+        return err_value(s"this gzip stream says it uses compression method ${bytes[2]}, and the only one there is is deflate")
+
+    val flags = bytes[3]
+    var at: usize = 10
+
+    if flags & 0x04 != 0
+        if at + 2 > bytes.len then return err_value("this gzip stream ends inside its header")
+
+        at += 2 + usize(bytes[at]) + usize(bytes[at + 1]) * 256
+
+    if flags & 0x08 != 0
+        past_nul(bytes, at) match
+            // **`past_nul`'s own sentence is the package manager's and says "file"**, which is the
+            // right word for a download and the wrong one for bytes somebody sent.
+            Err(_) -> return err_value("this gzip stream ends inside its header")
+            Ok(next) -> at = next
+
+    if flags & 0x10 != 0
+        past_nul(bytes, at) match
+            Err(_) -> return err_value("this gzip stream ends inside its header")
+            Ok(next) -> at = next
+
+    if flags & 0x02 != 0 then at += 2
+    if at + 8 > bytes.len then return err_value("this gzip stream ends inside its header")
+
+    val size = le32(bytes, bytes.len - 4)
+
+    if size > limit then return err_value(s"this expands past the ${limit} bytes it was allowed")
+
+    var out: []u8 = [u8(0); size]
+
+    // **A trailer that lies is two different sentences and both are exact.** The destination is
+    // sized from `ISIZE`, so a stream holding MORE fills it and miniz answers `Full` -- there is no
+    // count to report, only that there was more -- while one holding less simply produces less and
+    // the count is worth saying. A JavaScript host reaches the same two sentences from the other
+    // side, having inflated the whole thing before comparing.
+    miniz.inflate(inflate_state, bytes[at..<(bytes.len - 8)], out, miniz.Format.Raw) match
+        Err(Full) -> return err_value(s"this gzip stream said it held ${size} bytes and holds more than that")
+        Err(e) -> return err_value(why_gz(e))
+        Ok(n) ->
+            if n != size
+                return err_value(s"this gzip stream said it held ${size} bytes and produced ${n}")
+
+    // **The checksum is the difference between damaged and merely wrong.** A stream that inflated to
+    // the right length and the wrong bytes is a download that arrived corrupt, and saying so sends
+    // the reader to the transport rather than to the compressor.
+    if usize(miniz.crc32(out)) != le32(bytes, bytes.len - 8)
+        return err_value("this gzip stream's checksum does not match its contents, so the bytes are damaged")
+
+    ok_value(gz_bytes(out))
+end unwrapped
+
+// `gzip(data)` -- a promise of the compressed bytes, wrapped as a gzip member.
+//
+// **The modification time is zero and the operating system byte is 255, which is "unknown"** -- so
+// compressing the same bytes twice gives the same stream, and a build step that packs something
+// ahead of time is reproducible. Nothing reads either field back; a decompressor skips both.
+do_gzip(args: Buf[Value], at: Span) -> Step
+    if args.len() != 1
+        return fault(at, s"`gzip` takes what to compress, and was given ${counted(args.len(), "argument")}")
+
+    val source = gz_source(args.at(0), at, "gzip")?
+    val body = deflated(source.view(), miniz.Format.Raw, at, "gzip")?
+    var out: Buf[u8] = buf()
+
+    out.push(0x1f)
+    out.push(0x8b)
+    out.push(8)
+    out.push(0)
+
+    // MTIME, four bytes of it, and zero for bytes that were never a file.
+    out.push(0)
+    out.push(0)
+    out.push(0)
+    out.push(0)
+
+    // XFL, which says nothing the decompressor uses, and OS.
+    out.push(0)
+    out.push(255)
+
+    for i in 0..<body.len()
+        out.push(body.at(i))
+
+    val sum = usize(miniz.crc32(source.view()))
+    val size = source.len() % 4294967296
+
+    out.push(u8(sum & 255))
+    out.push(u8((sum >> 8) & 255))
+    out.push(u8((sum >> 16) & 255))
+    out.push(u8((sum >> 24) & 255))
+    out.push(u8(size & 255))
+    out.push(u8((size >> 8) & 255))
+    out.push(u8((size >> 16) & 255))
+    out.push(u8((size >> 24) & 255))
+
+    gz_settled(gz_bytes(out.view()))
+end do_gzip
+
+// `gunzip(data, limit)` -- a promise of a result carrying the bytes, or the sentence saying why not.
+do_gunzip(args: Buf[Value], at: Span) -> Step
+    if args.len() != 2
+        return fault(at, s"`gunzip` takes what to decompress and the most it may become, and was given ${counted(args.len(), "argument")}")
+
+    val source = gz_source(args.at(0), at, "gunzip")?
+    val limit = gz_limit(args.at(1), at, "gunzip")?
+
+    gz_settled(unwrapped(source.view(), limit))
+end do_gunzip
+
+// `deflate(data)` -- a promise of the compressed bytes, wrapped as zlib.
+//
+// **This is what `Content-Encoding: deflate` means and what `CompressionStream("deflate")` writes**,
+// which is a zlib stream and not the bare deflate its name suggests. The two-byte header and the
+// adler-32 trailer are the difference, and every reader on either side of an HTTP connection expects
+// them.
+do_deflate(args: Buf[Value], at: Span) -> Step
+    if args.len() != 1
+        return fault(at, s"`deflate` takes what to compress, and was given ${counted(args.len(), "argument")}")
+
+    val source = gz_source(args.at(0), at, "deflate")?
+    val made = deflated(source.view(), miniz.Format.Zlib, at, "deflate")?
+
+    gz_settled(gz_bytes(made.view()))
+end do_deflate
+
+// `inflate(data, limit)` -- a promise of a result carrying the bytes, or the sentence saying why not.
+do_inflate(args: Buf[Value], at: Span) -> Step
+    if args.len() != 2
+        return fault(at, s"`inflate` takes what to decompress and the most it may become, and was given ${counted(args.len(), "argument")}")
+
+    val source = gz_source(args.at(0), at, "inflate")?
+    val limit = gz_limit(args.at(1), at, "inflate")?
+
+    stretched(source.view(), miniz.Format.Zlib, limit) match
+        Ok(made) -> gz_settled(ok_value(gz_bytes(made.view())))
+        Err(why) -> gz_settled(err_value(why))
+end do_inflate

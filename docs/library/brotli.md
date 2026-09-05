@@ -32,4 +32,10 @@ The three failures are three sentences, since they mean three different things t
 **A brotli stream carries no length and a crafted one of a few hundred bytes expands without bound.** There
 is no form of `decompress` that omits the limit.
 
+## Not in a browser
+
+**No JavaScript host has a brotli encoder**, so `compress` and `decompress` refuse under `slate js`,
+naming brotli rather than promising a release. [`slate:gzip`](gzip.md) is the compression a browser has,
+and it is promise-shaped for that reason; this module is synchronous and stays so.
+
 [`slate:http`](http.md) compresses a response without asking the handler; that page says what the rules are.

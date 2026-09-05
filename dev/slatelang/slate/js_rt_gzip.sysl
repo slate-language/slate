@@ -1,0 +1,338 @@
+module dev.slatelang.slate
+
+// `slate:gzip` over the host's own `CompressionStream`.
+//
+// **This is the one compression a JavaScript host has, which is why the module exists.**
+// `CompressionStream` speaks gzip, zlib and raw deflate and speaks no brotli at all -- so
+// `slate:brotli` is a thing a browser does not have and refuses in as many words, and these four
+// names are what a program reaches for when it wants its bytes smaller anywhere slate runs.
+//
+// **The surface is promise-shaped on BOTH hosts because it is a `TransformStream` here.** There is
+// no synchronous door to it, and inventing one -- collecting the chunks and hoping -- is not
+// something a host allows. `gzip.sysl` answers a promise it has already settled for that reason,
+// rather than the language having two shapes for one thing.
+//
+// ## The gzip container is read HERE and not handed over, and that is what buys the sentences
+//
+// A host's decompressor answers one opaque `TypeError` for everything: a stream that is not gzip at
+// all, one that stops in the middle, one whose checksum is wrong. `gzip.sysl` says which, because
+// miniz tells it. So the header and the trailer are parsed in this file exactly as `unwrapped`
+// parses them, and the body alone goes to `deflate-raw` -- which makes every refusal about the
+// CONTAINER read the same sentence on both back ends, including the limit, which is the one that
+// matters. **What is left is a body that would not inflate**, and there a JavaScript host can only
+// say that it did not; `docs/reference/javascript.md` names that difference.
+//
+// Inside the `$b` block, after the host's WebSocket and before the DOM's names.
+js_runtime_gzip() -> string = raw"""
+        // -- slate's bytes, and the runtime's ----------------------------------------------------
+
+        // **The sentences are `gz_source`'s in `gzip.sysl`, word for word**, which is what the
+        // differential corpus is checking. `bytes_of` is what the interpreter reads an array with
+        // and its two complaints are the two below.
+        const gzBytes = (v, name) => {
+            if ($.isStr(v)) return new TextEncoder().encode(v)
+
+            if (!Array.isArray(v))
+                fault("`" + name + "` takes text or bytes, and this is " + typeName(v))
+
+            const out = new Uint8Array(v.length)
+
+            for (let i = 0; i < v.length; i = i + 1) {
+                const b = v[i]
+
+                if (!$.isInt(b))
+                    fault("`" + name + "` takes an array of numbers, and one of these is " + typeName(b))
+
+                if (b < 0n || b > 255n) fault("a byte is between 0 and 255, and this is " + b)
+
+                out[i] = Number(b)
+            }
+
+            return out
+        }
+
+        const gzArray = (bytes) => Array.from(bytes, (b) => BigInt(b))
+
+        const gzLimit = (v, name) => {
+            if (!$.isInt(v))
+                fault("`" + name + "` takes the most it may become as a whole number, and this is " + typeName(v))
+
+            if (v < 0n) fault("a limit is a number of bytes and this is " + v)
+
+            return Number(v)
+        }
+
+        // **Both halves are asked for, because `hostHas("compression")` is one question.** A host
+        // with one and not the other is not a host that compresses.
+        const gzHave = (name) => {
+            if ($.host.compression === null || $.host.decompression === null)
+                fault("`" + name + "` needs the host's own compression, and this JavaScript host has no `CompressionStream`")
+        }
+
+        const gzOk = (v) => $.obj([["ok", true], ["value", v]])
+        const gzBad = (message) => $.obj([["ok", false], ["error", message]])
+
+        // Run bytes through one of the host's streams, gathering what comes out.
+        //
+        // **`cap` is what stops a bomb**, and it is counted as the chunks arrive rather than checked
+        // at the end: a few hundred bytes of crafted deflate expands without bound, so the point of
+        // a limit is never to hold the whole of what it refuses.
+        const gzThrough = async (kind, bytes, cap) => {
+            const stream = cap === null ? new $.host.compression(kind) : new $.host.decompression(kind)
+            const writer = stream.writable.getWriter()
+            const reader = stream.readable.getReader()
+
+            // **The write is not awaited and its rejection is swallowed here**, because a stream
+            // that fails fails at BOTH ends: the reader is where the failure is read, and an
+            // unhandled rejection on the writer's copy of it would stop the program instead.
+            writer.write(bytes).then(() => writer.close()).catch(() => {})
+
+            const pieces = []
+            let total = 0
+
+            for (;;) {
+                const step = await reader.read()
+
+                if (step.done) break
+
+                total = total + step.value.length
+
+                if (cap !== null && total > cap) {
+                    reader.cancel().catch(() => {})
+
+                    return null
+                }
+
+                pieces.push(step.value)
+            }
+
+            const out = new Uint8Array(total)
+            let at = 0
+
+            for (const piece of pieces) {
+                out.set(piece, at)
+                at = at + piece.length
+            }
+
+            return out
+        }
+
+        // -- the gzip container, read the way `gzip.sysl` reads it -------------------------------
+
+        const gzLe32 = (bytes, at) =>
+            bytes[at] + bytes[at + 1] * 256 + bytes[at + 2] * 65536 + bytes[at + 3] * 16777216
+
+        const gzPastNul = (bytes, from) => {
+            let i = from
+
+            for (;;) {
+                if (i >= bytes.length) return -1
+
+                const c = bytes[i]
+
+                i = i + 1
+
+                if (c === 0) return i
+            }
+        }
+
+        // Where the deflate body starts, or the sentence saying why there is not one.
+        const gzBodyAt = (bytes) => {
+            if (bytes.length < 18) return "this is too short to be a gzip stream"
+
+            if (bytes[0] !== 0x1f || bytes[1] !== 0x8b)
+                return "this does not begin with gzip's two magic bytes, so it is not a gzip stream"
+
+            if (bytes[2] !== 8)
+                return "this gzip stream says it uses compression method " + bytes[2] +
+                    ", and the only one there is is deflate"
+
+            const flags = bytes[3]
+            let at = 10
+
+            if ((flags & 0x04) !== 0) {
+                if (at + 2 > bytes.length) return "this gzip stream ends inside its header"
+
+                at = at + 2 + bytes[at] + bytes[at + 1] * 256
+            }
+
+            if ((flags & 0x08) !== 0) {
+                at = gzPastNul(bytes, at)
+
+                if (at < 0) return "this gzip stream ends inside its header"
+            }
+
+            if ((flags & 0x10) !== 0) {
+                at = gzPastNul(bytes, at)
+
+                if (at < 0) return "this gzip stream ends inside its header"
+            }
+
+            if ((flags & 0x02) !== 0) at = at + 2
+            if (at + 8 > bytes.length) return "this gzip stream ends inside its header"
+
+            return at
+        }
+
+        // The CRC-32 gzip's trailer carries, which is the one thing miniz has and a host does not.
+        //
+        // **A table built once**, since the alternative is a bit loop over every byte of every
+        // answer -- and the checksum is what tells a damaged download from a wrong one.
+        const GZ_CRC = (() => {
+            const table = new Uint32Array(256)
+
+            for (let i = 0; i < 256; i = i + 1) {
+                let c = i
+
+                for (let k = 0; k < 8; k = k + 1) c = (c & 1) !== 0 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1
+
+                table[i] = c >>> 0
+            }
+
+            return table
+        })()
+
+        const gzCrc32 = (bytes) => {
+            let c = 0xFFFFFFFF
+
+            for (let i = 0; i < bytes.length; i = i + 1) c = GZ_CRC[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8)
+
+            return (c ^ 0xFFFFFFFF) >>> 0
+        }
+
+        // What a host says when the body would not inflate.
+        //
+        // **One sentence where the interpreter has three**, and it is written as a plain statement
+        // rather than as one of miniz's: a host's decompressor throws the same `TypeError` for a
+        // truncated stream, a corrupt one and a wrong checksum, so choosing one of the interpreter's
+        // words would be a guess presented as a finding. Everything a CONTAINER can say is said
+        // above and below instead, which is most of what a caller ever meets.
+        const GZ_UNREADABLE = "this compressed stream could not be read"
+
+        // The two miniz raises about a stream rather than about its contents.
+        const GZ_NOT_ONE = "this is not a compressed stream at all"
+        const GZ_ENDS = "this compressed stream ends in the middle"
+
+        // -- the zlib header, which is two bytes and says four things ----------------------------
+
+        // **RFC 1950's own checks, and miniz makes all four**, so a stream that is not zlib at all is
+        // refused in the same words on both back ends -- which is the case a caller actually hits,
+        // somebody having handed a gzip stream or a JPEG to `inflate`. What is left to the host is a
+        // header that is right and a body that is not.
+        const gzZlibWrong = (bytes) => {
+            if (bytes.length < 2) return GZ_ENDS
+
+            const cmf = bytes[0]
+            const flg = bytes[1]
+
+            // The compression method, the window size, a preset dictionary this cannot supply, and
+            // the check bits that make the pair a multiple of 31.
+            if ((cmf & 0x0F) !== 8) return GZ_NOT_ONE
+            if ((cmf >> 4) > 7) return GZ_NOT_ONE
+            if ((flg & 0x20) !== 0) return GZ_NOT_ONE
+            if ((cmf * 256 + flg) % 31 !== 0) return GZ_NOT_ONE
+
+            return null
+        }
+
+        // -- the four names ----------------------------------------------------------------------
+
+        B.gzip = (...args) => {
+            wantArgs(args.length, 1, 1, "gzip", "what to compress")
+
+            const bytes = gzBytes(args[0], "gzip")
+
+            gzHave("gzip")
+
+            return gzThrough("gzip", bytes, null).then(gzArray)
+        }
+
+        B.deflate = (...args) => {
+            wantArgs(args.length, 1, 1, "deflate", "what to compress")
+
+            const bytes = gzBytes(args[0], "deflate")
+
+            gzHave("deflate")
+
+            return gzThrough("deflate", bytes, null).then(gzArray)
+        }
+
+        B.gunzip = (...args) => {
+            wantArgs(args.length, 2, 2, "gunzip",
+                "what to decompress and the most it may become")
+
+            const bytes = gzBytes(args[0], "gunzip")
+            const cap = gzLimit(args[1], "gunzip")
+
+            gzHave("gunzip")
+
+            const at = gzBodyAt(bytes)
+
+            if (typeof at === "string") return Promise.resolve(gzBad(at))
+
+            // **The trailer is checked against the limit before a byte is asked for**, which is
+            // `unwrapped`'s own order and is what makes the refusal the same sentence here.
+            const size = gzLe32(bytes, bytes.length - 4)
+
+            if (size > cap)
+                return Promise.resolve(gzBad("this expands past the " + cap + " bytes it was allowed"))
+
+            return gzThrough("deflate-raw", bytes.subarray(at, bytes.length - 8), cap).then((out) => {
+                // **A trailer may lie**, so the cap is also counted as the chunks arrive; that is
+                // what `null` means here.
+                if (out === null)
+                    return gzBad("this expands past the " + cap + " bytes it was allowed")
+
+                // **Two sentences for a trailer that lies, matching `unwrapped`'s two.** The
+                // interpreter sizes its destination from `ISIZE` and so has no count to report for a
+                // stream that held more; this one has inflated the whole thing and says the same
+                // words anyway, or the two back ends would disagree over a damaged file.
+                if (out.length > size)
+                    return gzBad("this gzip stream said it held " + size +
+                        " bytes and holds more than that")
+
+                if (out.length < size)
+                    return gzBad("this gzip stream said it held " + size + " bytes and produced " +
+                        out.length)
+
+                if (gzCrc32(out) !== gzLe32(bytes, bytes.length - 8))
+                    return gzBad("this gzip stream's checksum does not match its contents, so the bytes are damaged")
+
+                return gzOk(gzArray(out))
+            }, () => gzBad(GZ_UNREADABLE))
+        }
+
+        B.inflate = (...args) => {
+            wantArgs(args.length, 2, 2, "inflate",
+                "what to decompress and the most it may become")
+
+            const bytes = gzBytes(args[0], "inflate")
+            const cap = gzLimit(args[1], "inflate")
+
+            gzHave("inflate")
+
+            const wrong = gzZlibWrong(bytes)
+
+            if (wrong !== null) return Promise.resolve(gzBad(wrong))
+
+            return gzThrough("deflate", bytes, cap).then((out) => {
+                if (out === null)
+                    return gzBad("this expands past the " + cap + " bytes it was allowed")
+
+                return gzOk(gzArray(out))
+            }, () => gzBad(GZ_UNREADABLE))
+        }
+
+        // -- brotli, which is the other half of the same answer ----------------------------------
+
+        // **`slate:brotli` is a thing a JavaScript host does not have**, and it says so rather than
+        // sitting on `OWED`. `CompressionStream` has no brotli in any browser and there is no
+        // encoder in the platform to reach for, so "not in the JavaScript back end yet" would be a
+        // promise nobody can keep -- which is `abbrev`'s case and gets `abbrev`'s treatment.
+        const noBrotli = (name) => () =>
+            fault("`" + name + "` is brotli, and a JavaScript host has no brotli encoder -- " +
+                "`slate:gzip` is the compression a browser has")
+
+        B.compress = noBrotli("compress")
+        B.decompress = noBrotli("decompress")
+    """

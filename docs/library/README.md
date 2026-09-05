@@ -19,7 +19,8 @@ What a program has without writing it.
 | [`slate:jwt`](jwt.md) | JSON Web Tokens |
 | [`slate:ws`](ws.md) | WebSockets |
 | [`slate:redis`](redis.md) | a Redis client |
-| [`slate:brotli`](brotli.md) | compression |
+| [`slate:gzip`](gzip.md) | gzip and zlib — the compression every host has |
+| [`slate:brotli`](brotli.md) | brotli — smaller, and not in a browser |
 | [`slate:llhttp`](llhttp.md) | the HTTP parser itself |
 | [`slate:nghttp2`](nghttp2.md) | HTTP/2 framing, and HPACK |
 | [`slate:dom`](dom.md) | the document — in a browser only |

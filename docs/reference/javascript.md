@@ -31,10 +31,57 @@ The operators follow because the two languages disagree too often for the except
 
 ## What is not there yet
 
-**`slate:net`, `slate:password`, `slate:brotli`,
-`slate:llhttp`, `slate:process`'s `run`, `fetch`, and the modules written over them.** Each is a name that
-says *"not in the JavaScript back end yet"* when a program reaches it, rather than a name that is not
-there — so a program is told which half of the world it is in.
+**`slate:net`, `slate:password`, `slate:llhttp`, `slate:process`'s `run`, `fetch`, and the modules
+written over them.** Each is a name that says *"not in the JavaScript back end yet"* when a program
+reaches it, rather than a name that is not there — so a program is told which half of the world it is in.
+
+**`slate:brotli` is NOT on that list, and the difference matters.** No JavaScript host has a brotli
+encoder and none is coming, so *"not yet"* would be a promise nobody can keep. `compress` and
+`decompress` say that they are brotli, that a JavaScript host has none, and that
+[`slate:gzip`](../library/gzip.md) is the compression a browser does have. That is `abbrev`'s case
+below, drawn the same way.
+
+### `slate:gzip` is whole here, and the container is read by slate rather than by the host
+
+**This is the module the parity rule was written for.** A browser has `CompressionStream` and
+`DecompressionStream`, which speak gzip, zlib and raw deflate — so gzip and zlib are compression a
+slate program can count on anywhere, where brotli is not.
+
+```slate
+import { gzip, gunzip } from slate:gzip
+
+async main()
+    val small = await gzip(repeat("<p>hello</p>", 40))
+    val back = await gunzip(small, 1 << 20)
+
+    print(back.ok, fromBytes(back.value).value == repeat("<p>hello</p>", 40))
+
+main()
+```
+
+```output
+true true
+```
+
+**All four names answer promises on BOTH hosts, and that is the whole shape decision.** A
+`CompressionStream` is a `TransformStream`; there is no synchronous door to it, and slate's rule is
+that a host with a thing only in a different SHAPE does not have it. Nothing held the signature yet —
+the module is new — so it was written promise-shaped everywhere rather than synchronous in one place
+and refusing in the other. The interpreter compresses with miniz and answers a promise it has already
+settled.
+
+**The gzip header and trailer are parsed by slate on both back ends**, and only the deflate body goes
+to the host's stream. That is what makes the refusals the same sentence wherever a program runs: the
+magic bytes, the compression method, a header that ends early, the limit, the stated length and the
+CRC-32 are all slate's own checks, and the CRC is computed here rather than taken from anybody.
+
+**One sentence is not shared, and it is the body itself.** miniz says whether a stream that would not
+inflate was truncated or corrupt; a host's decompressor throws one `TypeError` for both, and for a
+wrong checksum too. So where the interpreter says *this compressed stream ends in the middle* or
+*this is not a compressed stream at all*, a JavaScript host says *this compressed stream could not be
+read* — a plain statement rather than a guess dressed as a finding. **zlib's own two-byte header is
+checked here as well**, so the common case — something that is not a zlib stream at all — does read
+the same on both.
 
 ### `slate:crypto` is whole here, and WebCrypto is not how
 
@@ -300,6 +347,9 @@ into the scope a built-in module's source compiles in — the same place `sha1` 
 answers whether the host provides a thing ITSELF, which is a different question from whether slate has
 one. The interpreter answers no to all of them: it speaks WebSocket over its own socket, compresses
 with miniz and fetches over OpenSSL, and in each case there is nobody else's implementation to use.
+
+**`compression` is two globals and one question.** A host with a `CompressionStream` and no
+`DecompressionStream` does not compress, so `hostHas("compression")` wants both.
 
 ## A builtin is a parameter, not a name taken from the host
 
