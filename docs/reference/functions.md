@@ -197,6 +197,54 @@ print(total(...xs))         // the spread it is the counterpart of
 so there is no absence to test for. It must be last and takes no default — one could never fire. A
 default *before* it is fine.
 
+## Callbacks take as many arguments as they declare
+
+**A call the program writes is strict**: `f(1, 2)` where `f` takes one argument is refused, and so is
+`f()` where it takes one. The count is a claim you made, and getting it wrong is a mistake.
+
+**A callback is different.** Where a builtin calls a function *you* supplied, it passes as many
+arguments as that function declares and no more:
+
+```slate
+print(map([1, 2, 3], () -> 9))          // the element is there and this one ignores it
+print(map([1, 2, 3], (v) -> v * 2))     // and this one reads it
+
+forEach([1, 2], () -> print("tick"))
+
+setTimeout(() -> print("later"), 0)
+```
+
+```output
+[9, 9, 9]
+[2, 4, 6]
+tick
+tick
+later
+```
+
+This is what a handler wants to look like — `on(node, "click", () -> setCount(n + 1))` for one that
+does not read the event, `onData(socket, () -> stop())` for a reader that does not care what arrived
+— and it is the rule everywhere a native calls back: array walks, `sorted`, timers, sockets,
+WebSocket handlers, [the document](../library/dom.md)'s events.
+
+**Declaring more than the caller has is still a fault, and it names the caller**, because your
+function is not the thing that is wrong:
+
+```slate
+map([1], (a, b) -> a)
+```
+
+```error
+`map` takes (integer) -> any here, and this is (integer, any) -> integer
+```
+
+That is the checker, which knows what `map` hands over. Reached through a value it cannot see, the
+machine says the same thing in its own words — *"`map` calls this with 1 argument and it takes 2
+arguments"*.
+
+TypeScript draws the line in the same place, and for the same reason: a function of fewer parameters
+is usable wherever more are supplied, while a direct call with the wrong count is an error.
+
 ## Destructuring parameters
 
 A parameter may take its argument apart, on a definition or a lambda:

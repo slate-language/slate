@@ -423,6 +423,26 @@ why that global is looked at at all — it is quickjs's writer and has no relati
 of the same name — and **a document is what tells the two apart**. `check/` in slate's own repo drives
 all of this against jsdom.
 
+### Arity is checked here too, and until 0.0.28 it was not
+
+A JavaScript function ignores an argument it was not expecting and binds `undefined` for one it was
+not given. slate refuses both, and the interpreter always has — so an emitted `f(1, 2)` for a
+one-parameter `f` quietly dropped the `2` and ran, where the same program under the interpreter
+faulted. **That is a disagreement about what a program means, not about how a complaint is worded.**
+A call with too *few* failed further in, with a sentence about `undefined` not being passable that
+named neither the function nor the count.
+
+Every slate call goes through one place in the runtime, and the signature the emitter already
+attaches for named arguments is what the check reads — a length comparison per call. A function
+taking **no** parameters carried no signature at all, which is why a component given props it does
+not declare was the silent case; it carries one now.
+
+**A callback is trimmed rather than refused**, on both back ends — see
+[Functions](functions.md#callbacks-take-as-many-arguments-as-they-declare). The document's `on`, the
+WebSocket handlers and the timers all go through that path here, so `on(node, "click", () -> …)` is
+what a page writes and what it has always written; what changed is that the two hosts now agree
+about it for the same reason rather than by accident.
+
 ### A diagnostic about a function names it, and the emitter says what to call it
 
 `` `Counter` takes 0 arguments and was given 1 `` rather than *"this function"*. The caret is on the

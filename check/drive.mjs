@@ -20,7 +20,7 @@ import { readFileSync } from "node:fs"
 // **A real origin and not `about:blank`.** `localStorage` is per origin, and an opaque one has no
 // store at all -- a page loaded from a file gets a `SecurityError` on the first access, which is
 // exactly the condition the module answers as a result rather than as a fault.
-const dom = new JSDOM("<!doctype html><html><body></body></html>", {
+const dom = new JSDOM("<!doctype html><html><body><div id=\"app\"></div></body></html>", {
     url: "https://example.test/start?q=1#frag",
     runScripts: "outside-only"
 })
@@ -32,6 +32,12 @@ const said = []
 w.console = { ...w.console, log: (...parts) => said.push(parts.join(" ")) }
 
 w.eval(readFileSync(process.argv[2], "utf8"))
+
+// **A handler that declares nothing and one that declares the event**, both clicked, which is the
+// callback rule where a person actually meets it: `onClick={() -> ...}` is what gets written for a
+// handler that does not read the event, and making it name one would be a tax on the common case.
+for (const id of ["quiet", "curious"])
+    w.document.getElementById(id).dispatchEvent(new w.MouseEvent("click", { bubbles: true }))
 
 // **Back is asynchronous in a browser and in jsdom**, the navigation being queued rather than done
 // on the spot, so the `popstate` line cannot be read until the queue has turned.
@@ -71,6 +77,10 @@ want("unstore takes one away", line(13),
 want("clear takes them all", line(14),
     'clear {"ok":true,"value":null} then {"ok":true,"value":[]}')
 want("the program reached the end", line(15), "ready")
+
+// The two clicks, in the order the driver made them.
+want("a handler that declares nothing is called", line(16), "clicked, reading nothing")
+want("and one that declares the event is given it", line(17), "clicked, and the event says click")
 
 // **The push above must NOT have raised `onNavigate`** -- so the only `navigated` line there can be
 // is the one the driver's `back()` caused.

@@ -416,14 +416,17 @@ g(ss: array of string) = map(ss, s -> s * 2)
 `*` does not apply to string and integer
 ```
 
-and so is its arity:
+and so is its arity — in one direction. **A callback may declare FEWER parameters than the builtin
+hands it**, because a native passes as many as the callback declares; see
+[Callbacks](functions.md#callbacks-take-as-many-arguments-as-they-declare). Declaring **more** is
+refused, there being nothing to fill them with:
 
 ```slate
-q(ns: array of integer) = sorted(ns, a -> a)
+q(ns: array of integer) = map(ns, (a, b) -> a)
 ```
 
 ```error
-`sorted` takes (integer, integer) -> any here, and this is (integer) -> integer
+`map` takes (integer) -> any here, and this is (integer, any) -> integer
 ```
 
 **None of that is a type variable.** A builtin's signature names an argument by *position*, and the
