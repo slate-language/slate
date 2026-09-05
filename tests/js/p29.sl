@@ -1,83 +1,113 @@
-// `slate:crypto`'s Argon2id, on both back ends.
+// `files(root)` — what a static server refuses, on both back ends.
 //
-// The interpreter derives with monocypher and a JavaScript host derives with node's own
-// `crypto.argon2`, so this is the one corpus file where two entirely separate implementations of a
-// memory-hard function have to answer the same bytes. A fixed salt is what makes that visible: with
-// the kernel's own salt every record differs from every other and the comparison could only be a
-// round trip, which each host would pass alone.
+// **A traversal is a question about the PATH a request wrote, so nothing here may go through
+// `fetch`.** A URL parser resolves `..` and reads `%2e%2e` as a dotted segment before a byte reaches
+// the network, so a client that builds a URL cannot ask the question at all — `curl` needs
+// `--path-as-is` for the same reason. The request line is written onto a socket here instead, which
+// is what an attacker does and what `slate:net` makes ordinary.
 //
-// The two directions are both here. `made` below is a record the INTERPRETER wrote, checked by
-// whichever host is running; the fixed-salt records are written afresh by each host and compared as
-// text, so a JavaScript host's own output is measured against the interpreter's.
+// **The root is made, served and taken away by the program**, so running it twice says the same
+// thing and running it leaves nothing behind. `pubsecret.txt` sits OUTSIDE the root and is what a
+// successful climb would hand back — every answer below says whether it leaked, so a refusal is
+// checked against the file it was refusing rather than only against its own status line.
+
+import { connect, onData, send, close, localPort } from slate:net
+import { serve, files, close as shutServer } from slate:http
+import { writeFileSync, mkdirSync, removeSync, rmdirSync, existsSync } from slate:fs
+
+val Root = "tests/js/pubroot"
+val Secret = "tests/js/pubsecret.txt"
+
+// Whatever a previous run left, so that this one starts from nothing.
+sweep()
+    if existsSync(s"${Root}/a.txt") then removeSync(s"${Root}/a.txt")
+    if existsSync(s"${Root}/sub") then rmdirSync(s"${Root}/sub")
+    if existsSync(Root) then rmdirSync(Root)
+    if existsSync(Secret) then removeSync(Secret)
+
+lay()
+    mkdirSync(Root)
+    mkdirSync(s"${Root}/sub")
+    writeFileSync(s"${Root}/a.txt", "under the root")
+    writeFileSync(Secret, "LEAKED")
+
+// One request, written as text onto a socket and read back whole.
 //
-// A browser has no Argon2 at all and refuses, which nothing here can see -- node is the host these
-// run on. `docs/reference/javascript.md` says which half is which.
+// **`Connection: close` is what ends it**, so the answer is complete when the socket says there is
+// no more rather than after a number of milliseconds.
+async ask(port, target)
+    val dialled = await connect("127.0.0.1", port)
+    val c = dialled.value
+    var got = ""
+    var ended = false
 
-import { argon2, argon2Verify, argon2NeedsRehash } from slate:crypto
+    onData(c, chunk ->
+        if chunk == null
+            close(c)
+            ended = true
+        else
+            got = got + chunk)
 
-// A record the interpreter made, salt and all.
-val made = "$argon2id$v=19$m=19456,t=2,p=1$r4sbZmsG138SCHlHRMqEZA$TKhpkYsEAjK8SUF4SfecoO2ZABzH6pCzLZ2lRRWwMx8"
+    await send(c, "GET " + target + " HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n")
 
-// Eight blocks and one pass -- below anything a real login writes, which is what `argon2NeedsRehash`
-// is asked about. Nothing derives from it, so its cost is nobody's.
-val weak = "$argon2id$v=19$m=8,t=1,p=1$AgICAgICAgICAgICAgICAg$AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM"
+    var turns = 0
 
-// The same shape asking for just under four gibibytes of working memory.
-val greedy = "$argon2id$v=19$m=4000000,t=2,p=1$AgICAgICAgICAgICAgICAg$AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM"
+    while !ended && turns < 400
+        await sleep(10)
+        turns = turns + 1
 
-// **What hands the machine a value the checker cannot see**, an unannotated function answering `any`
-// by design -- without it these are refused at the compile and the run-time check is never reached.
-anything(v) = v
+    got
+
+// The status line, and whether the file above the root came back with it. Nothing else is compared:
+// an `ETag` carries the moment the file was written, which the two back ends write at two different
+// moments.
+said(answer) =
+    val line = split(answer, "\r\n")[0]
+
+    if contains(answer, "LEAKED") then line + " LEAKED" else line
 
 async main()
-    // -- the derivation itself, which is what this file is for ---------------------------------
+    sweep()
+    lay()
 
-    val fixed = await argon2("correct horse", { salt: "slatefixedsalt16" })
+    val server = serve(0, files(Root))
+    val port = localPort(server)
 
-    print(fixed)
-    print(await argon2Verify(fixed, "correct horse"), await argon2Verify(fixed, "wrong"))
+    // What is under the root is served, and a percent-escape that decodes to an ordinary character
+    // is decoded and served — the refusals below are about what a part MEANS, not about the `%`.
+    print("plain           ", said(await ask(port, "/a.txt")))
+    print("escaped dot     ", said(await ask(port, "/a%2etxt")))
+    print("a dot part      ", said(await ask(port, "/%2e/a.txt")))
 
-    // The parameters that are not the defaults travel in the record and are read back out of it.
-    print(await argon2("root", { salt: "slatefixedsalt16", memoryCost: 32, timeCost: 1, parallelism: 2, hashLength: 16 }))
+    // The climb, written the four ways. The first is the one every server refuses; the other three
+    // are the same climb wearing a percent-escape, and each of them was answered `200` before the
+    // parts were decoded before they were judged.
+    print("plain climb     ", said(await ask(port, "/../pubsecret.txt")))
+    print("encoded climb   ", said(await ask(port, "/%2e%2e/pubsecret.txt")))
+    print("encoded slash   ", said(await ask(port, "/..%2fpubsecret.txt")))
+    print("both encoded    ", said(await ask(port, "/%2e%2e%2fpubsecret.txt")))
+    print("climb twice     ", said(await ask(port, "/%2e%2e%2f%2e%2e%2fetc%2fpasswd")))
 
-    // An empty password is a password, and it is not the same as any other.
-    val empty = await argon2("", { salt: "0123456789abcdef" })
+    // An encoded separator is refused even where it climbs nothing: it is one part naming two, and a
+    // server that took it would be deciding for itself what the client meant.
+    print("bare encoded /  ", said(await ask(port, "/%2f...")))
 
-    print(empty)
-    print(await argon2Verify(empty, ""), await argon2Verify(empty, " "))
+    // A NUL truncates a name at the system call rather than here, so it never gets that far.
+    print("a nul           ", said(await ask(port, "/a%00.txt")))
 
-    // -- a record one back end made, checked by the other --------------------------------------
+    // A `%` that is not two hex digits is a literal `%` to a browser and to `percentDecode`. A path
+    // is the one place where taking that guess makes the guess a file name.
+    print("bad escape      ", said(await ask(port, "/%zz")))
+    print("short escape    ", said(await ask(port, "/a%2")))
 
-    print(await argon2Verify(made, "correct horse"), await argon2Verify(made, "Correct horse"))
+    // **A file that is not there and a directory with no index answer the same 404**, which is the
+    // rule that was already here: telling a client which is which maps out the disk for it.
+    print("nothing there   ", said(await ask(port, "/nope.txt")))
+    print("a directory     ", said(await ask(port, "/sub")))
 
-    // -- what a record says it was made with ---------------------------------------------------
+    shutServer(server)
+    sweep()
 
-    print(argon2NeedsRehash(weak), argon2NeedsRehash(made))
-    print(argon2NeedsRehash(made, { memoryCost: 65536, timeCost: 3 }))
-    print(startsWith(fixed, "$argon2id$v=19$m=19456,t=2,p=1$"), len(split(fixed, "$")))
-
-    // -- and every way of getting it wrong -----------------------------------------------------
-
-    // **A wrong password is `false` and a record that will not parse is a FAULT**, which is the one
-    // confusion a login path must not have.
-    print(argon2Verify("hello", "x") catch e -> e.message)
-    print(argon2Verify("", "x") catch e -> e.message)
-    print(argon2NeedsRehash("hello") catch e -> e.message)
-    print(argon2Verify("x", made) catch e -> e.message)
-    print(argon2Verify(greedy, "x") catch e -> e.message)
-
-    print(argon2(anything(42)) catch e -> e.message)
-    print(argon2() catch e -> e.message)
-    print(argon2Verify("a") catch e -> e.message)
-    print(argon2NeedsRehash() catch e -> e.message)
-
-    print(argon2("x", anything(65536)) catch e -> e.message)
-    print(argon2("x", { memoryCosts: 1 }) catch e -> e.message)
-    print(argon2("x", { memoryCost: 4 }) catch e -> e.message)
-    print(argon2("x", { timeCost: 0 }) catch e -> e.message)
-    print(argon2("x", { hashLength: 3 }) catch e -> e.message)
-    print(argon2("x", { memoryCost: anything("lots") }) catch e -> e.message)
-    print(argon2("x", { salt: "short" }) catch e -> e.message)
-    print(argon2("x", { salt: anything(7) }) catch e -> e.message)
+    print("cleaned up      ", !existsSync(Root), !existsSync(Secret))
 
 main()

@@ -67,7 +67,7 @@ again — a host that has a thing only in a different shape does not have it —
 **`slate:crypto`'s ARGON2 IS node's OWN AND A BROWSER HAS NONE**, which is `slate:zstd`'s rule read once
 more. node carries Argon2id in its core `crypto` — `crypto.argon2` — so `argon2` and `argon2Verify` are the
 host's there, and **the records are compared between the back ends rather than merely round-tripped**: node
-and monocypher derive the same bytes for the same parameters, so `tests/js/p29.sl` verifies a record the
+and monocypher derive the same bytes for the same parameters, so `tests/js/p30.sl` verifies a record the
 interpreter made against a fixed salt and the interpreter verifies one node made. A digest that agreed with
 itself and with nothing else would still be caught.
 

@@ -271,8 +271,34 @@ Serves a directory.
   rendering in English of a moment in one zone.
 - **The tag is the size and the modification time, not a hash of the contents.** Hashing a file per request
   is what a static server exists not to do.
-- **A path that climbs out is refused and not sanitised.** A missing file and a directory with no index
-  answer the same `404`, telling a client which is which mapping out the disk for it.
+- **A missing file and a directory with no index answer the same `404`**, telling a client which is
+  which mapping out the disk for it.
+
+### What it refuses, and why refusing rather than repairing
+
+**A path that climbs out is refused and not sanitised.** Such a request is not a request with a mistake
+in it, and quietly rewriting the name would hide what was attempted.
+
+**Every part of the path is percent-decoded before it is judged**, which is the whole of the rule: `..`
+is a climb however it was spelled, and `/%2e%2e/x` and `/..%2fx` are the same request as `/../x`.
+A request is answered `403` when any part of it, *after decoding*:
+
+- is `..`;
+- carries a `/`, a `\` or a NUL byte. An encoded separator is one part naming two, and a NUL ends a
+  name at the system call rather than here — so `/logo.png%00.txt` is a request for one file wearing
+  another's extension;
+- came from a `%` that is not followed by two hexadecimal digits. A browser reads a stray `%` as a
+  literal `%` and so does [`percentDecode`](url.md), which is right for something a person typed into a
+  query string; a path is the one place where taking that guess makes the guess a file name.
+
+An empty part and a `.` part are dropped, so `//a`, `/./a` and `a` are one path. The path that comes
+out is then normalised and checked to be under the root a second time, so a mistake in the part rules
+is a `403` rather than a file.
+
+**A symlink is followed like any other file, and that is the operator's choice.** The check is on the
+name the request asked for and not on what the file system would make of it, so a link *inside* the
+root pointing outside it serves what it points at — nginx answers the same way. A root that must not
+be escaped that way is one with no such links in it.
 
 ## Compression
 
