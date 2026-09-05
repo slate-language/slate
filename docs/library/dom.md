@@ -16,6 +16,12 @@ import { byId, setText, on } from slate:dom
 | `byId(id)`, `query(selector)` | |
 | `markup(node)` | |
 | `release(node)` | give a handle back |
+| `location()` | where the page is, as a record |
+| `pushPath(url)`, `replacePath(url)` | move the address bar without a reload |
+| `back()`, `forward()` | move through what the page has visited |
+| `onNavigate(fn)` | the user moved — **not** a push the program made |
+| `stored(key)`, `store(key, v)` | `localStorage`, as results |
+| `unstore(key)`, `storedKeys()`, `clearStored()` | |
 
 **`on` and `off` rather than `addEventListener`**, and `byId` rather than `getElementById`. The DOM's names
 are long because JavaScript had no modules when they were chosen; these are reached through an import that
@@ -39,6 +45,47 @@ or stored.
 **`value` and `checked` are set as properties and not attributes**, and an input is where the difference
 shows: the attribute says what the field started as and the property says what it holds now, so a re-render
 that set the attribute would leave a typed-in field alone and the page would appear frozen.
+
+## Where the page is, where it has been, and what it remembers
+
+**A browser has `location`, `history` and `localStorage`, and nothing else does** — there is no address
+bar in an interpreter and no per-origin store on a server. So these refuse everywhere else, naming
+*which* of the three is missing rather than saying something about the document. That is the same rule
+`slate:time`'s `abbrev` follows, read from the other side.
+
+```slate
+import { location, pushPath, onNavigate, stored, store } from slate:dom
+
+val here = location()          // { href, protocol, host, hostname, port, path, query, hash }
+
+show(path) = render(path)
+
+onNavigate(show)               // the user pressed back, or forward
+
+pushPath("/notes/7")           // the address bar moves; onNavigate does NOT fire
+show("/notes/7")               // so a router renders after its own push
+
+store("theme", "dark")
+print(stored("theme").value)   // "dark", or null when nothing is stored
+```
+
+**`query` and `hash` carry their punctuation** — `"?a=1"` and `"#top"` — which is what a program pasting
+one back into a url needs. An empty one is `""` and never null.
+
+**A push does not raise `onNavigate`.** A browser raises it for a movement the *user* made and never for
+one the program made itself, so a router renders after its own push and waits to be told about everything
+else. Getting this wrong is how a router renders twice.
+
+**There is no state object, and that is a measurement.** `pushState` structured-clones what it is given
+and `structuredClone` strips the prototype, so a slate object put in comes back a plain object nothing in
+the language could read. The url is the whole of the state — which is also what keeps a router's two
+sources of truth from disagreeing after a `back`.
+
+**The store answers results**, which is [`readFileSync`](fs.md)'s channel and its reason: what comes back
+was written by somebody else — another tab, an earlier visit, a user who cleared it. A key that is not
+there is `{ ok: true, value: null }` and not a failure; a browser told to keep no data is
+`{ ok: false, error }`. A value that is not a string is stored as slate prints it, a store holding nothing
+else.
 
 ## Under the interpreter
 

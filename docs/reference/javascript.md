@@ -402,6 +402,27 @@ gives the program no way in.
 
 Which response headers are readable at all in a browser is CORS's decision and not slate's.
 
+### `slate:dom` has three more doors, and they are the rule read from the other side
+
+`location()`, the history calls and `localStorage` are things **a browser has and nothing else does**.
+So the interpreter and node both refuse them — naming *which* of the three, because they are three
+different mistakes — where everything else in this file is a name a browser has that slate had not
+yet reached.
+
+**No history state object**, and that is a measurement rather than a simplification: `pushState`
+structured-clones what it is given, and `structuredClone` strips the prototype, so a slate object put
+in comes back a plain object carrying a `fields` map that nothing in the language could read. The url
+is the whole of the state.
+
+**A push does not raise `onNavigate`** — a browser raises `popstate` for a movement the user made and
+never for one the program made itself.
+
+**A browser's `print` is the print dialog**, and the runtime used to reach for `globalThis.print` as
+its writer, so a page's every `print("hi")` asked which printer to use and wrote nothing. quickjs is
+why that global is looked at at all — it is quickjs's writer and has no relation to the window method
+of the same name — and **a document is what tells the two apart**. `check/` in slate's own repo drives
+all of this against jsdom.
+
 ## A builtin is a parameter, not a name taken from the host
 
 **The emitted program is a function whose parameters are the builtins**, applied to the runtime's own
