@@ -3,6 +3,12 @@ module dev.slatelang.slate
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.math.{Float, min, max}
+// **Exact integers, for `toFixed` and for nothing else here.** Rounding a `real` to a fixed number
+// of places the way JavaScript does is integer arithmetic at whatever width the value needs -- see
+// `do_to_fixed` -- and doing it in floating point is exactly the mistake that would make the two
+// back ends disagree about a tie.
+import sysl.math.bigint.{add as big_add, div as big_div, from_int as big_of, mul as big_mul,
+                         pow as big_pow, to_string as big_text}
 // **Case and whitespace are `case.sysl`'s and are no longer here.** Both had to know what a
 // character MEANS rather than where it is, which is a database and not a walk -- and everything left
 // in this file counts and cuts characters, which is Unicode-correct by construction.
@@ -355,6 +361,57 @@ do_replace(args: Buf[Value], at: Span) -> Step
     Ok(str_value(replace_all(s, old, new)))
 end do_replace
 
+// `padStart(s, n)` and `padEnd(s, n)`, with an optional filler -- the string brought up to a width.
+//
+// **The width is in CHARACTERS**, which is the rule every position in this file reads by and is the
+// whole point of the pair: a column of names lines up only if `é` counts as one.
+//
+// **A string already that wide is answered unchanged rather than cut**, which is JavaScript's rule
+// and the only defensible one -- padding is asking for a minimum, and a `padStart` that truncated
+// would lose data in the one call a program made to make it readable.
+//
+// **The filler REPEATS and is cut to fit**, so `padStart("7", 5, "ab")` is `"abab7"`, and an empty
+// filler is a fault: it can never reach the width, so a program asking for one has made a mistake
+// that would otherwise show up as a string that silently stayed short.
+do_pad(args: Buf[Value], at: Span, start: bool) -> Step
+    val name = if start then "padStart" else "padEnd"
+
+    if args.len() != 2 && args.len() != 3
+        return fault(at, s"`${name}` takes a string, a width and an optional filler, and was given ${counted(args.len(), "argument")}")
+
+    val s = text_of(args.at(0), at, name, "a string")?
+
+    val width = args.at(1) match
+        Int(n) ->
+            if n < 0 then return fault(at, s"`${name}` takes a width that is not negative, and this is ${n}")
+
+            usize(n)
+        other -> return fault(at, s"`${name}` takes a whole number of characters, and this is ${other.type_name()}")
+
+    val filler = if args.len() == 3 then text_of(args.at(2), at, name, "a filler")? else " "
+
+    if filler == "" then return fault(at, s"`${name}` cannot pad with the empty string -- no amount of it reaches a width")
+
+    val have = char_count(s)
+
+    if have >= width then return Ok(str_value(s))
+
+    val short = width - have
+    val each = char_count(filler)
+    var pad = str_builder()
+    var made: usize = 0
+
+    while made < short
+        val room = short - made
+
+        pad.push(if room >= each then filler else char_slice(filler, 0, room))
+        made += if room >= each then each else room
+
+    val fill = pad.finish()
+
+    Ok(str_value(if start then fill + s else s + fill))
+end do_pad
+
 do_repeat(args: Buf[Value], at: Span) -> Step
     wants(args, 2, at, "repeat", "a string and a count")?
 
@@ -520,6 +577,241 @@ private number_of(v: Value, at: Span, name: string) -> Result[real, Signal]
         Real(x) -> Ok(x)
         other -> Err(failure(at, s"`${name}` takes a number, and this is ${other.type_name()}"))
 
+
+// -- what a program calls: a number a PERSON reads -------------------------------------------------
+
+// **`string(x)` IS `%g` AND `%g` IS WRONG FOR MONEY**, which is the whole reason these two exist. Six
+// significant digits is the right default for a diagnostic and the wrong one for a price: `string`
+// turns `1234.5` into `1234.5` and a total of `1234.50` into `1234.5`, and a program that wants two
+// places has to build them out of `floor` and `%` by hand. Neither of these is a locale -- there is
+// no currency, no locale name and no digit shape here, and a program needing those is asking a
+// question a table of them answers rather than a builtin.
+
+// The largest magnitude `toFixed` will write. **JavaScript's own boundary**, above which its
+// `toFixed` gives up and answers what `String(x)` would -- an exponent, which is not what anybody
+// asking for a number of decimal places wanted. slate refuses instead of quietly changing shape.
+private const FixedLimit: real = 1e21
+
+// The most places `toFixed` will write, which is JavaScript's range and is a range for the same
+// reason: past this the digits are noise about a binary value rather than information.
+private const FixedPlaces: long = 100
+
+// `toFixed(x, digits)` -- the number written to exactly that many decimal places, as text.
+//
+// **BYTE-IDENTICAL WITH JAVASCRIPT'S `toFixed`, TIES INCLUDED, AND THE TIES ARE THE WHOLE
+// DIFFICULTY.** C's `printf("%.*f")` rounds a tie to the even digit -- so `2.5` at no places is `2`
+// -- and JavaScript rounds a tie away from zero, so it is `3`. The two disagree on every value that
+// lands exactly halfway, which is not an exotic set: `1.25` at one place, `0.125` at two, every
+// price that ends in half a cent. Handing this to `printf` would have made the two back ends
+// disagree about exactly the numbers a person notices.
+//
+// **So the arithmetic is exact and there is no floating point in it.** A `real` is `m * 2^e` for
+// whole `m` and `e`, which is found by doubling until it is a whole number -- every step exact,
+// because doubling a binary float is. The answer wanted is then `round(m * 2^e * 10^d)` with the tie
+// going up, and for a negative `e` that is `floor((2 * m * 10^d + 2^-e) / 2^(1-e))` -- integers all
+// the way down, and `sysl.math.bigint` does them at whatever width they need. That is the ECMAScript
+// definition read literally rather than approximated.
+//
+// **The SIGN is taken off first, which is also the specification's order** and is why
+// `toFixed(-0.4, 0)` is `"-0"` while `toFixed(-0.0, 2)` is `"0.00"`: the text gets a minus where the
+// number is less than zero, and negative zero is not.
+//
+// **An integer is written out rather than measured**, so `toFixed(9007199254740993, 0)` is that
+// number and not the nearest `real` to it.
+do_to_fixed(args: Buf[Value], at: Span) -> Step
+    wants(args, 2, at, "toFixed", "a number and how many places")?
+
+    val places = args.at(1) match
+        Int(n) ->
+            if n < 0 || n > FixedPlaces
+                return fault(at, s"`toFixed` writes from 0 to ${FixedPlaces} places, and was asked for ${n}")
+
+            usize(n)
+        other -> return fault(at, s"`toFixed` takes a whole number of places, and this is ${other.type_name()}")
+
+    args.at(0) match
+        Int(n) ->
+            var b = str_builder()
+
+            b.push_int(n)
+
+            if places > 0
+                b.push_char('.')
+                b.push(repeat("0", places))
+
+            Ok(str_value(b.finish()))
+        Real(x) ->
+            if x != x then return fault(at, "`toFixed` takes a number, and this is not one")
+
+            if x >= FixedLimit || x <= -FixedLimit
+                return fault(at, "`toFixed` writes a number in full, and this one is too large to be written that way -- it is 1e21 or beyond")
+
+            Ok(str_value(fixed_text(x, places)))
+        other -> fault(at, s"`toFixed` takes a number, and this is ${other.type_name()}")
+end do_to_fixed
+
+// The digits of `round(|x| * 10^places)`, a tie going away from zero, as text with no point in it.
+private fixed_digits(a: real, places: usize) -> string
+    var v = a
+    var e: long = 0
+
+    // Up into `[2^52, 2^53)`, where the value is a whole number and the doubling was exact. A
+    // subnormal takes the most turns of this and still cannot overflow, `2^52` being far below the
+    // largest `real`.
+    while v < 4503599627370496.0
+        v = v * 2.0
+        e -= 1
+
+    while v >= 9007199254740992.0
+        v = v / 2.0
+        e += 1
+
+    val m = big_of(long(v))
+    val scaled = big_mul(m, big_pow(big_of(10), places))
+
+    if e >= 0 then return big_text(big_mul(scaled, big_pow(big_of(2), usize(e))))
+
+    val half = big_pow(big_of(2), usize(-e))
+
+    big_text(big_div(big_add(big_mul(scaled, big_of(2)), half), big_mul(half, big_of(2))))
+end fixed_digits
+
+private fixed_text(x: real, places: usize) -> string
+    val negative = x < 0.0
+    val a = if negative then -x else x
+    var digits = if a == 0.0 then "0" else fixed_digits(a, places)
+
+    // Enough digits for a point to have something on both sides of it.
+    if char_count(digits) < places + 1 then digits = repeat("0", places + 1 - char_count(digits)) + digits
+
+    val cut = char_count(digits) - places
+    var b = str_builder()
+
+    if negative then b.push_char('-')
+
+    b.push(char_slice(digits, 0, cut))
+
+    if places > 0
+        b.push_char('.')
+        b.push(char_slice(digits, cut, char_count(digits)))
+
+    b.finish()
+end fixed_text
+
+// The two ways a program may say how a grouped number is written.
+private known_grouping(key: string) -> bool = key == "separator" || key == "decimal"
+
+private grouping_option(o: *ObjectObj, key: string, fallback: string, at: Span) -> Result[string, Signal] =
+    obj_get_name(o, key) match
+        None -> Ok(fallback)
+        Some(Str(p)) -> Ok(p.s)
+        Some(other) -> Err(failure(at, s"`${key}` is text, and this is ${other.type_name()}"))
+
+// `formatNumber(x)` and `formatNumber(x, { separator: ",", decimal: "." })` -- the digits of a
+// number grouped in threes.
+//
+// **The defaults are a comma and a full stop, which is a choice and not a neutral one.** A locale
+// database is the alternative and slate is not carrying one: what a locale buys is the right answer
+// for a reader in France, and what it costs is a megabyte of tables, a name to pass everywhere and a
+// program whose output depends on the machine it ran on. Two strings say the same thing for every
+// grouping convention there is -- `{ separator: " ", decimal: "," }` is the French one -- and they
+// say it where the program can see it.
+//
+// **IT TAKES A WHOLE NUMBER OR THE TEXT `toFixed` ANSWERED, AND A `real` IS REFUSED.** That looks
+// like a gap and is the opposite of one: a `real` has no single written form. `string` gives six
+// significant digits, so `1234567.25` renders as `1.23457e+06` and `1234.5` renders as `1234.5` --
+// the same call would group the small one and fail on the large one, which is the worst of both. So
+// the decision about how many places belongs to the program, it is spelled `toFixed(x, 2)`, and the
+// answer to that goes straight in here. `formatNumber(toFixed(total, 2))` is a price.
+//
+// **Which also makes the answer the same on both back ends by construction**, no part of it
+// depending on how a host chooses to render a binary fraction.
+do_format_number(args: Buf[Value], at: Span) -> Step
+    if args.len() != 1 && args.len() != 2
+        return fault(at, s"`formatNumber` takes a number and an optional record, and was given ${counted(args.len(), "argument")}")
+
+    val plain = args.at(0) match
+        Int(n) ->
+            var b = str_builder()
+
+            b.push_int(n)
+            b.finish()
+        Real(_) -> return fault(at, "`formatNumber` groups a whole number or the text `toFixed` answered -- a real has no one written form, `string` giving six significant digits, so say how many places you want with `toFixed(x, 2)`")
+        Str(p) -> p.s
+        other -> return fault(at, s"`formatNumber` takes a number, and this is ${other.type_name()}")
+
+    var separator = ","
+    var decimal = "."
+
+    if args.len() == 2
+        val o = args.at(1) match
+            Object(o) -> o
+            other -> return fault(at, s"`formatNumber` takes its options as a record, and this is ${other.type_name()}")
+
+        for i in 0..<o.entries.len()
+            val entry = o.entries.at(i)
+
+            if !entry.dead
+                val key = entry.key match
+                    Str(k) -> k.s
+                    other -> return fault(at, s"an option is named, and this is ${other.type_name()}")
+
+                if !known_grouping(key)
+                    return fault(at, s"`${key}` is not one of `formatNumber`'s options -- there are `separator` and `decimal`")
+
+        separator = grouping_option(o, "separator", ",", at)?
+        decimal = grouping_option(o, "decimal", ".", at)?
+
+    grouped_text(plain, separator, decimal, at)
+end do_format_number
+
+// The digits of a number written in full, grouped in threes from the right.
+private grouped_text(plain: string, separator: string, decimal: string, at: Span) -> Step
+    var whole = str_builder()
+    var frac = str_builder()
+    var negative = false
+    var after = false
+    var seen: usize = 0
+
+    for i in 0..<plain.bytes.len
+        val c = plain.bytes[i]
+
+        if i == 0 && c == u8('-')
+            negative = true
+        elif c == u8('.') && !after
+            after = true
+        elif c >= u8('0') && c <= u8('9')
+            if after then frac.push_char(char(u32(c))) else whole.push_char(char(u32(c)))
+
+            seen += 1
+        else
+            return fault(at, s"`formatNumber` groups the digits of a number written in full, and \"${plain}\" is not one")
+
+    if seen == 0
+        return fault(at, s"`formatNumber` groups the digits of a number written in full, and \"${plain}\" is not one")
+
+    val digits = whole.finish()
+    val n = char_count(digits)
+    var b = str_builder()
+
+    if negative then b.push_char('-')
+
+    if n == 0
+        b.push_char('0')
+    else
+        for i in 0..<n
+            if i > 0 && (n - i) % 3 == 0 then b.push(separator)
+
+            b.push(char_slice(digits, i, i + 1))
+
+    val rest = frac.finish()
+
+    if after
+        b.push(decimal)
+        b.push(rest)
+
+    Ok(str_value(b.finish()))
+end grouped_text
 
 // `boolean(v)` -- what an `if` would make of a value.
 //
