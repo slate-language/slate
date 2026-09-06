@@ -119,6 +119,34 @@ print(indexOf("héllo", "llo"))      // by character; it is 3 by byte
 There is no character type: a single character is a string of one. That is what lets indexing, `chars`
 and `split` all hand back the same kind of thing.
 
+**`.length` is that same count read as a property** — a name a `.` answers with a value and no brackets
+after it, exactly as a class's `get` is read. `s.length` is `len(s)` and counts the same characters, so
+a string of one emoji is 1 here where JavaScript, counting UTF-16 units, says 2. An array carries one
+too, and so therefore do the bytes under a string, an array of numbers being the only shape bytes have.
+
+```slate
+print("日本語".length, "a👋".length)
+print([1, 2, 3].length, toBytes("héllo").length)
+```
+
+```output
+3 2
+3 6
+```
+
+**It is read-only.** A length is what a value already is rather than a field it holds, so writing to one
+is refused instead of resizing anything:
+
+```slate
+var s = "abc"
+
+s.length = 5
+```
+
+```error
+`length` is a read-only property of a string
+```
+
 `toBytes(s)` answers an array of numbers and `fromBytes(bs)` answers a [result](faults.md); those two
 are the only place a slate program sees UTF-8, and `len(toBytes(s))` is the byte count.
 
