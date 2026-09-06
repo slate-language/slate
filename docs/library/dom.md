@@ -33,6 +33,8 @@ import { byId, setText, on } from slate:dom
 | `dispatch(node, event)` | send an event; answers whether nothing cancelled it |
 | `observe(node, options, fn)` | be told what changed; answers `{ disconnect }` |
 | `events(url, options)` | read a server's event stream; answers `{ close }` |
+| `focus(node)`, `blur(node)` | move the caret to a node, and take it away |
+| `activeElement()` | the node holding focus, or `null` for nothing (and for the body) |
 | `location()` | where the page is, as a record |
 | `pushPath(url)`, `replacePath(url)` | move the address bar without a reload |
 | `back()`, `forward()` | move through what the page has visited |
@@ -111,6 +113,25 @@ table slot the program has to give back, and a re-render makes hundreds of recor
 says is `type` (`"children"`, `"attributes"` or `"text"`), `attribute` (the name, or `null`), and
 `added` and `removed` as counts. A program that needs the nodes asks the page with `children` or
 `query`.
+
+## Moving focus
+
+**A modal is the case that asks for all three.** Opening one puts focus on its Cancel button,
+closing it gives focus back to whatever had it before, and trapping Tab inside it needs to know
+which of its own children currently holds focus.
+
+```slate
+focus(cancelButton)
+blur(cancelButton)
+val current = activeElement()
+```
+
+`focus(node)` and `blur(node)` call the element's own `focus()` and `blur()`; neither takes
+options. `activeElement()` answers the node holding focus, or `null` where nothing does.
+
+**A browser answers the `<body>` for "nothing focused", and `activeElement()` answers `null` for
+the body too** — one value to check rather than two. A program that wants to know what the body
+holds asks it directly, by `byId` or `query`.
 
 ## Reading a server's event stream
 
