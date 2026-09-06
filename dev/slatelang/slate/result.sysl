@@ -129,7 +129,12 @@ unpinned(t: Type) -> Type =
 // FUNCTION's answer would be wrong wherever a `return` is written above it, which is exactly what
 // `gather_returns` is for. Here the two halves are collected separately and joined, so the tail may
 // be read.
-private falls_out(x: Expr, env: *TypeEnv) -> Option[Type]
+//
+// **AND A BRANCH OF AN `if` IS ALWAYS A BLOCK**, one-line or not -- `if_expression` reads a one-line
+// branch as a STATEMENT -- so `if_result` has to come through here too, or every branch it asked
+// `type_of_expr` about would answer `Any` and the join would say nothing whatever.
+// Not `private`: `if_result` and `match_result` read a branch with it.
+falls_out(x: Expr, env: *TypeEnv) -> Option[Type]
     *x.kind match
         Block(stmts) ->
             if stmts.is_empty() then return Some(type_of(NullType))
@@ -156,20 +161,35 @@ private falls_out(x: Expr, env: *TypeEnv) -> Option[Type]
         IfExpr(_, then_branch, else_branch) -> else_branch match
             Some(other) -> both_ways(falls_out(then_branch, env), falls_out(other, env))
             None -> Some(type_of(Any))
-        MatchExpr(_, arms) ->
-            var out: Option[Type] = None
-
-            for i in 0..<arms.len()
-                enter_scope(env)
-                note_bindings(arms.at(i).pattern, env)
-
-                out = both_ways(out, falls_out(arms.at(i).body, env))
-
-                leave_scope(env)
-
-            out
+        MatchExpr(_, arms) -> arms_agree(arms, env)
         _ -> Some(type_of_expr(x, env))
 end falls_out
+
+// Every arm's answer as one, or nothing where no arm can fall out of its bottom at all.
+//
+// **Each arm is read in a scope of its own with its pattern's names in it**, which is `check_expr`'s
+// arrangement and is here for its reason: an arm body naming something the pattern bound must not
+// read an outer name of that spelling. A guard says nothing about what the arm answers and is not
+// read.
+private arms_agree(arms: Buf[Arm], env: *TypeEnv) -> Option[Type]
+    var out: Option[Type] = None
+
+    for i in 0..<arms.len()
+        enter_scope(env)
+        note_bindings(arms.at(i).pattern, env)
+
+        out = both_ways(out, falls_out(arms.at(i).body, env))
+
+        leave_scope(env)
+
+    out
+end arms_agree
+
+// An answer where there was one, and `Any` where there was not.
+private or_any(t: Option[Type]) -> Type =
+    t match
+        Some(one) -> one
+        None -> type_of(Any)
 
 // Two branches' answers as one. **A branch that cannot fall out contributes nothing**, which is what
 // makes an early `return` in one arm of an `if` cost the other arm nothing.
@@ -211,7 +231,16 @@ private gather_returns(x: Expr, into: *Buf[Type], env: *TypeEnv)
         Named(_, value) -> gather_returns(value, into, env)
         DataLit(inner) -> gather_returns(inner, into, env)
         Await(inner) -> gather_returns(inner, into, env)
-        Yield(inner) -> gather_returns(inner, into, env)
+        // **A `yield` ANYWHERE MAKES THE CALL ANSWER A GENERATOR RATHER THAN WHAT THE BODY GIVES
+        // BACK**, which is `async`'s rule for `async`'s reason -- and there is no flag to read it
+        // off, a function being a generator BECAUSE it holds a `yield` and the parser having
+        // answered that question long before this. So a `yield` is counted as an answer point of
+        // unknown type and the join gives the whole body up, which is the safe direction and needs
+        // no second walk. This arm is the only reason `gather_returns` may not be narrowed to the
+        // statements that can carry a `return`.
+        Yield(inner) ->
+            gather_returns(inner, into, env)
+            into.push(type_of(Any))
         Unary(_, rhs) -> gather_returns(rhs, into, env)
         Binary(_, lhs, rhs) ->
             gather_returns(lhs, into, env)
@@ -363,30 +392,12 @@ end shadow_declared
 // Not `private`: `type_of_expr`'s IfExpr arm.
 if_result(then_branch: Expr, else_branch: Option[Expr], env: *TypeEnv) -> Type
     else_branch match
-        Some(other) -> unpinned(joined(type_of_expr(then_branch, env), type_of_expr(other, env)))
+        Some(other) -> unpinned(or_any(both_ways(falls_out(then_branch, env), falls_out(other, env))))
         None -> type_of(Any)
 
 // The type of a `match` used for its value: every arm where they all agree, and `Any` otherwise.
 //
-// **Each arm is read in a scope of its own with its pattern's names in it**, which is
-// `check_expr`'s arrangement and is here for its reason: an arm body naming something the pattern
-// bound must not read an outer name of that spelling. A guard says nothing about what the arm
-// answers and is not read.
+// **An arm that cannot fall out of its bottom costs the others nothing**, an arm ending in a `throw`
+// or a `return` being the ordinary way a `match` used for its value still has one answer.
 // Not `private`: `type_of_expr`'s MatchExpr arm.
-match_result(arms: Buf[Arm], env: *TypeEnv) -> Type
-    if arms.is_empty() then return type_of(Any)
-
-    var out = type_of(Any)
-
-    for i in 0..<arms.len()
-        enter_scope(env)
-        note_bindings(arms.at(i).pattern, env)
-
-        val one = type_of_expr(arms.at(i).body, env)
-
-        leave_scope(env)
-
-        out = if i == 0 then one else joined(out, one)
-
-    unpinned(out)
-end match_result
+match_result(arms: Buf[Arm], env: *TypeEnv) -> Type = unpinned(or_any(arms_agree(arms, env)))
