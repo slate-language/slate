@@ -588,10 +588,49 @@ else
 text
 ```
 
+**A parameter is followed the same way**, carrying the same two types — the annotation is what may
+ever be assigned to it, and a test or an assignment says what it holds at the line being read. So a
+branch that narrows a parameter and then writes to it is describing the value it wrote, not the one
+the test proved:
+
+```slate
+report(s: string) = s
+
+f(x: string | number)
+    if x is number
+        x = "text"
+        return report(x)
+
+    "no"
+
+print(f(1))
+```
+
+```output
+text
+```
+
+The assignment is still measured against the annotation, which is what writing one asks for — a value
+outside it is refused on the line that wrote it:
+
+```slate
+f(x: string | number)
+    if x is number
+        x = true
+
+    x
+
+f(1)
+```
+
+```error
+`x` was declared string | number, and this is boolean
+```
+
 Below the branches the name holds the union of what each of them left it at, and a branch that always
 returns leaves nothing behind to join. Where that union cannot be worked out the declared type is what
 is left: a loop runs an unknown number of times, a `try` may stop anywhere in its body, and a closure
-that writes to the name runs at a time the block cannot place at all — so a `var` assigned inside any of
+that writes to the name runs at a time the block cannot place at all — so a name assigned inside any of
 the three reads as what it was declared, and a call wanting the narrower type is refused there. The
 assignment itself is always measured against the annotation, wherever it is written.
 
