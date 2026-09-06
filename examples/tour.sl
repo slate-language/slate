@@ -48,7 +48,7 @@ print(c(), c(), c())
 // can read the parameters to its left -- and an array written there is a fresh one every time.
 greet(who, greeting = "hello") = greeting + ", " + who
 
-between(xs, from, to = len(xs)) = xs[from..<to]
+between(xs, from, to = xs.length) = xs[from..<to]
 
 print(greet("ada"), greet("ada", "good day"))
 print(between([1, 2, 3, 4], 1), between([1, 2, 3, 4], 1, 3))
@@ -64,7 +64,7 @@ val ys = xs
 
 push(ys, 4)
 
-print(xs, len(xs), xs == [1, 2, 3, 4])
+print(xs, xs.length, xs == [1, 2, 3, 4])
 
 val person = { name: "ada", born: 1815 }
 
@@ -119,7 +119,7 @@ print(describe(true))
 // closes a block where the block is long enough to want it.
 // A loop is an expression: `break` gives it a value, and `else` runs when it finished on its own.
 find_first(xs, wanted)
-    for i in 0..<len(xs) do
+    for i in 0..<xs.length do
         if xs[i] == wanted then break i
     else
         -1

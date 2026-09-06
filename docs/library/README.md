@@ -40,7 +40,7 @@ What a program has without writing it.
 `query`, `on`, `setText` and `time` are all things an ordinary program declares. While they were global,
 writing `val stat = …` shadowed a builtin without meaning to.
 
-What is left global is roughly node's own list — `print`, `len`, the conversions, the array and string
+What is left global is roughly node's own list — `print`, the conversions, the array and string
 operations, JSON, the timers, the promise words, `next` and `fetch`.
 
 ## A method is the free function with the receiver in front

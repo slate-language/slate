@@ -60,7 +60,7 @@ print(fits(Point, Point(1, 2)), fits(Failure, Empty), fits(Failure, 1))
 print(has(Point(1, 2), "name"))
 
 // A tag is not a field, on either back end.
-print(keys(Point), keys(Failure), len(Point))
+print(keys(Point), keys(Failure), keys(Point).length)
 // A data type, a variant's maker, a value made by one, a class and a function -- each of which the
 // two back ends said differently at some point, which is the whole reason this file runs on both.
 print(Point, Failure, NotFound, Empty, NotFound("a"), Denied("a", "b"))

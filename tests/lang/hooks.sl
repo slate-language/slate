@@ -42,8 +42,8 @@ async A_HOOK_MAY_BE_async_AND_IS_WAITED_FOR() =
 // -- `assertFaults` --------------------------------------------------------------------------------
 
 // **A fault of the file's own, because the two back ends word their BUILTINS' complaints
-// differently** — `len(1)` is refused by both and not in the same sentence, so a test naming part of
-// the message has to name part of a message slate itself wrote.
+// differently** — `anything(1).length` is refused by both and not in the same sentence, so a test
+// naming part of the message has to name part of a message slate itself wrote.
 raises_plainly() =
     throw "the pump has no handle"
 
@@ -57,9 +57,13 @@ async answers_a_number() =
 
     42
 
+// A value whose type the checker cannot see, so `.length` below is a run-time fault and not a
+// compile-time refusal of the whole file.
+anything(v) = v
+
 @test
 A_CALL_THAT_RAISES_IS_WHAT_assertFaults_WANTED() =
-    assertFaults(() -> len(1))
+    assertFaults(() -> anything(1).length)
 
 @test
 THE_PART_OF_THE_MESSAGE_MAY_BE_NAMED() =

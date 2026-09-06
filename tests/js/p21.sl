@@ -27,8 +27,8 @@ val hello = toBytes("hello")
 val server = framed(1, hello)
 val client = maskedFrame(1, hello)
 
-print(server[0], server[1], len(server))
-print(client[0], client[1] >> 7, len(client))
+print(server[0], server[1], server.length)
+print(client[0], client[1] >> 7, client.length)
 
 val readServer = unframed(server, 0)
 val readClient = unframed(client, 0)
@@ -40,7 +40,7 @@ print(readClient.masked, readClient.fin, readClient.opcode, fromBytes(readClient
 // back as the same message, which is the whole of what masking has to be.
 val again = maskedFrame(1, hello)
 
-print(len(again) == len(client), fromBytes(unframed(again, 0).payload).value)
+print(again.length == client.length, fromBytes(unframed(again, 0).payload).value)
 
 // The three lengths a frame is written in, from either end.
 long(n)
@@ -51,7 +51,7 @@ long(n)
 
     val m = unframed(maskedFrame(2, bs), 0)
 
-    print(n, len(maskedFrame(2, bs)), m.size, len(m.payload))
+    print(n, maskedFrame(2, bs).length, m.size, m.payload.length)
 
 long(125)
 long(126)
@@ -59,7 +59,7 @@ long(65535)
 long(65536)
 
 // A frame that has not all arrived is not a frame yet, from either end.
-print(unframed(client[0..<(len(client) - 1)], 0))
+print(unframed(client[0..<(client.length - 1)], 0))
 print(unframed([], 0))
 
 // -- what a url may be ---------------------------------------------------------------------------

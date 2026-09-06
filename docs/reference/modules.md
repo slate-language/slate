@@ -64,7 +64,7 @@ a string:**
 import styles from "./button.css"
 import template from "./welcome.html"
 
-print(len(styles))
+print(styles.length)
 ```
 
 **The file is read while the program is compiled and travels inside it**, so nothing has to sit beside

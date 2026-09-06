@@ -25,7 +25,7 @@ print(regex("(?:ab)+").find("abab").text)
 
 val m = regex("(\\d+)-(\\w+)").find("xx 42-abc")
 
-print(m.text, m.start, m.end, len(m.groups), m.groups[1], m.groups[2])
+print(m.text, m.start, m.end, m.groups.length, m.groups[1], m.groups[2])
 
 val n = regex("(?<year>\\d{4})-(?<month>\\d{2})").find("on 2026-08")
 
@@ -63,13 +63,13 @@ print(regex("a.b").test("a\rb"), regex("a.b").test("a\u{2029}b"))
 // no-break space in a browser and not in the interpreter.
 print(regex("\\s").test("\u{a0}"), regex("\\s").test(" "))
 print(regex("\\S").test("\u{a0}"), regex("[\\S]").test("\u{a0}"))
-print(len(regex("\\s+").split("a b\tc")))
+print(regex("\\s+").split("a b\tc").length)
 
 // `\h`, `\v` and `\R`, which `RegExp` does not have at all.
 print(regex("\\h").test("\u{a0}"), regex("\\h").test("\n"))
 print(regex("\\v").test("\n"), regex("\\v").test(" "))
 print(regex("\\H").test("\u{a0}"), regex("\\V").test("\n"))
-print(len(regex("\\R").findAll("a\r\nb\nc")))
+print(regex("\\R").findAll("a\r\nb\nc").length)
 print(regex("[\\h\\v]").test("\t"), regex("[\\H]").test("q"))
 
 // The POSIX classes, and the negations that are NOT ASCII.
@@ -114,7 +114,7 @@ zero(pat, subject)
     for c in re.replace(subject, "#").chars()
         if c == "#" then subs += 1
 
-    print(pat, len(re.findAll(subject)), subs)
+    print(pat, re.findAll(subject).length, subs)
 
 zero("$", "abc")
 zero("^", "abc")
@@ -132,7 +132,7 @@ print(regex(",").split(",a,").join("|"))
 print(regex("z").split("abc").join("|"))
 print(regex("(,)").split("a,b").join("|"))
 print(regex("abc").split("abc").join("|"))
-print(len(regex("x").findAll("abc")))
+print(regex("x").findAll("abc").length)
 
 // -- replacing, whose syntax is PCRE2's and not JavaScript's --------------------------------------
 
@@ -151,7 +151,7 @@ print(regex("(a)").replace("a", "[\\1]"))
 val re = regex("a")
 
 print(re.test("banana"), re.test("banana"), re.test("banana"))
-print(len(re.findAll("banana")), len(re.findAll("banana")))
+print(re.findAll("banana").length, re.findAll("banana").length)
 print(regex("a") == regex("a"), regex("a") == regex("b"), regex("a") == regex("a", "i"))
 print(regex("a+", "i"))
 print(regex("a") is regex, "a" is regex, string(regex("a", "i")))
@@ -168,8 +168,8 @@ print(t[regex("a")], t[regex("a", "i")])
 // astral character before a match makes every offset after it one too many unless it is converted.
 val astral = regex("cd").find("\u{1f600}xcd")
 
-print(astral.start, astral.end, len("\u{1f600}xcd"))
-print(len(regex(".").findAll("\u{1f600}x")))
+print(astral.start, astral.end, "\u{1f600}xcd".length)
+print(regex(".").findAll("\u{1f600}x").length)
 print(regex("^.$").test("\u{1f600}"))
 print(regex("\\w").find("\u{1f600}ab").start)
 

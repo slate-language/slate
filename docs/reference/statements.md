@@ -226,7 +226,7 @@ its `else` clause left:
 
 ```slate
 find_first(xs, wanted)
-    for i in 0..<len(xs) do
+    for i in 0..<xs.length do
         if xs[i] == wanted then break i
     else
         -1

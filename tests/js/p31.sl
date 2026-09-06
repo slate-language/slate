@@ -92,7 +92,7 @@ val people = [{ name: "ann", age: 31 }, { name: "bo", age: 24 }, { name: "cy", a
 // **The ELEMENT and not the key**, and the FIRST of two equal keys wins.
 print(minBy(people, p -> p.age), maxBy(people, p -> p.age))
 print(minBy([], p -> p), maxBy([], p -> p))
-print(minBy(["bbb", "a", "cc"], s -> len(s)))
+print(minBy(["bbb", "a", "cc"], s -> s.length))
 
 // Every one of them is a method too, `xs.chunk(2)` being `chunk(xs, 2)`.
 print(nums.chunk(4), nums.unique(), nums.count(n -> n < 3))

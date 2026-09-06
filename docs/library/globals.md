@@ -20,18 +20,19 @@ going to handle. See [Tests](../reference/tests.md).
 
 ## Kinds and conversions
 
-`string  number  integer  real  boolean  len`
+`string  number  integer  real  boolean`
 
 **The type words are the conversions**, and the same word [tests in a pattern](../reference/patterns.md).
-`len` counts an array, an object, a string or a range; a string and an array also answer `.length`, which
-is this same count read as a [property](../reference/values.md).
+An array, a string and a range each answer `.length`; an object counts its own keys through
+`keys(o).length` instead, `.length` being a [property](../reference/values.md) of arrays, strings and
+ranges and not of objects.
 
 ```slate
 print(string(123) + "!")
 print(number("42"), number("nonsense"))
 print(integer(2.9))
 print(boolean(0))           // only false and null are false
-print(len("日本語"))        // in characters
+print("日本語".length)        // in characters
 ```
 
 ```output
@@ -86,7 +87,10 @@ true
 a-b-c true
 ```
 
-As methods, a string answers: `len chars split contains includes indexOf lastIndexOf startsWith
+**`length` is a property, not a method** — `s.length` counts characters, never UTF-16 units, so
+`"a👋".length` is 2. Writing to it is refused.
+
+As methods, a string answers: `chars split contains includes indexOf lastIndexOf startsWith
 endsWith trim trimStart trimEnd upper lower normalize casefold replace replaceAll repeat padStart
 padEnd number integer real boolean string`.
 
@@ -143,7 +147,7 @@ null 2
 ```
 
 **`length` is a property and not a method**, so it is read with no brackets after it — `xs.length` is
-`len(xs)`, and writing to it is refused rather than resizing the array:
+`xs.length`, and writing to it is refused rather than resizing the array:
 
 ```slate
 print([1, 2, 3].length, [].length)
@@ -193,9 +197,9 @@ table forgetting something it is unsure of is one line — and a copy of a [data
 is a data value, as `with`'s is.
 
 **A `proto` a declaration wrote is not a field these report.** A class instance and a data variant
-reach what they are through it, so `keys`, `values`, `entries`, `has`, `len` and `without` all pass
-over it — which is what `print` has always done. A `proto` a *program* wrote on a plain object is an
-ordinary field and is reported like any other.
+reach what they are through it, so `keys`, `values`, `entries`, `has` and `without` all pass over it —
+which is what `print` has always done. A `proto` a *program* wrote on a plain object is an ordinary
+field and is reported like any other.
 
 An object answers **no** methods of its own — its names belong to the program, and a builtin `o.keys`
 would give every object a field nothing put there. The [four universal methods](README.md) are the
@@ -229,7 +233,7 @@ two alike.
 | `toBytes(s)` | an array of numbers |
 | `fromBytes(bs)` | a **result** — arbitrary bytes are not text |
 
-`len(toBytes(s))` is the byte count, so there is no third name. These are the one place a slate program
+`toBytes(s).length` is the byte count, so there is no third name. These are the one place a slate program
 sees UTF-8, and two things need them: a `Content-Length`, and a read where a character may be split across
 two arrivals.
 
@@ -237,7 +241,7 @@ Bytes are an array of numbers, so they carry the same `length` any array does �
 here either:
 
 ```slate
-print(toBytes("héllo").length, len(toBytes("héllo")))
+print(toBytes("héllo").length, toBytes("héllo").length)
 ```
 
 ```output

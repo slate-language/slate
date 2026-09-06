@@ -89,7 +89,7 @@ db.run("insert into search (body) values (?)", "a lazy dog sleeping")
 val hits = db.query("select body, bm25(search) as score from search where search match ? order by score", "fox")
 
 // **The score itself is not printed** — it is a number two builds of SQLite may compute differently.
-print("hits", len(hits), hits[0].body, hits[0].score is real, hits[0].score < 0)
+print("hits", hits.length, hits[0].body, hits[0].score is real, hits[0].score < 0)
 
 // -- how many parameters a piece of SQL takes ----------------------------------------------------------
 

@@ -4,7 +4,7 @@
 a_placeholder_is_the_parameter_of_the_argument_it_stands_in() =
     assertEq(map([1, 2, 3], _ * 2), [2, 4, 6])
     assertEq(filter([1, 2, 5, 9], _ > 3), [5, 9])
-    assertEq(map(["ada", "al"], len(_)), [3, 2])
+    assertEq(map(["ada", "al"], _.length), [3, 2])
 
 @test
 a_placeholder_reads_the_same_as_the_lambda_it_stands_for() =
@@ -57,7 +57,7 @@ brackets_are_a_placeholder_scope_of_their_own() =
 
 @test
 a_bindings_value_is_a_placeholder_scope() =
-    val longer = len(_) > 3
+    val longer = _.length > 3
 
     assertEq(longer("abcd"), true)
     assertEq(longer("ab"), false)

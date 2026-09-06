@@ -40,12 +40,12 @@ a_type_is_written_inline_wherever_a_type_is_wanted() =
     // group, a union holding a function, and a type given to a generic type.
     apply(f: integer -> integer) -> integer = f(1)
     check(h: Handler) = h("ab", 2)
-    keep(xs: array of (string | null)) = len(xs)
+    keep(xs: array of (string | null)) = xs.length
     run(f: MaybeFn) = if f is null then 0 else f(2)
     show(p: Pair[string, integer]) = s"${p.first}=${p.second}"
 
     assertEq(apply(n -> n + 1), 2)
-    assert(check((s, n) -> len(s) == n))
+    assert(check((s, n) -> s.length == n))
     assertEq(keep(["a", null]), 2)
     assertEq(run(null), 0)
     assertEq(run(n -> n * 10), 20)
@@ -68,7 +68,7 @@ a_function_type_tests_callability_and_the_count() =
     assertEq(apply(anything(twoOrOne)), 1)
 
     // And one that gathers takes a call of any size at all.
-    gathers(...rest) = len(rest)
+    gathers(...rest) = rest.length
 
     assertEq(apply(anything(gathers)), 1)
 
@@ -84,7 +84,7 @@ a_lambdas_parameter_may_be_annotated_and_is_checked_when_it_is_called() =
 
 @test
 a_rest_parameter_is_annotated_as_the_array_it_gathers_into() =
-    count(...rest: array of integer) = len(rest)
+    count(...rest: array of integer) = rest.length
 
     assertEq(count(1, 2, 3), 3)
     assertEq(count(), 0)
@@ -131,7 +131,7 @@ a_type_is_a_value_and_a_generic_one_carries_the_shape_with_nothing_filled_in() =
     assert(Pair.test({ first: "a", second: 1 }))
     assert(Pair.test({ first: 1, second: "a" }))
     assert(!Pair.test({ first: 1 }))
-    assertEq(len(Pair.mismatch({ first: 1 })), 1)
+    assertEq(Pair.mismatch({ first: 1 }).length, 1)
 
 @test
 an_object_shape_is_still_at_least_its_fields_when_the_program_runs() =

@@ -13,7 +13,7 @@ import { sha256, hmac, randomBytes, timingSafeEqual } from slate:crypto
 val nonce = randomBytes(18)
 val tag = hmac("SHA-256", "a key", "the message")
 
-print(len(nonce), len(sha256("abc")), len(tag))
+print(nonce.length, sha256("abc").length, tag.length)
 print(timingSafeEqual(tag, hmac("SHA-256", "a key", "the message")))
 print(timingSafeEqual(tag, hmac("SHA-256", "a key", "another message")))
 ```

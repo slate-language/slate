@@ -75,7 +75,7 @@ the program:
 ```slate
 import { args, exit } from slate:process
 
-if args.len() == 0
+if args.length == 0
     print("usage: greet <name>...")
     exit(2)
 

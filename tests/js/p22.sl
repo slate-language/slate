@@ -17,7 +17,7 @@
 import { gzip, gunzip, deflate, inflate } from slate:gzip
 
 // One byte of an array replaced, which is how a stream is damaged below.
-patched(bs, at, byte) = concat(bs[0..<at], [byte], bs[(at + 1)..<len(bs)])
+patched(bs, at, byte) = concat(bs[0..<at], [byte], bs[(at + 1)..<bs.length])
 
 // -- what the format itself fixes ----------------------------------------------------------------
 
@@ -58,7 +58,7 @@ async main()
     // Nothing at all, which is the case a stream format has to have an answer for.
     val nothing = await gunzip(await gzip(""), 16)
 
-    print(nothing.ok, len(nothing.value))
+    print(nothing.ok, nothing.value.length)
 
     // Text that is not ASCII, so that the UTF-8 crossing is the same on both.
     val greek = "λ, καὶ ἡ σκοτία αὐτὸ οὐ κατέλαβεν"
@@ -70,7 +70,7 @@ async main()
     val long = repeat("slate compresses this line over and over. ", 500)
     val longBack = await gunzip(await gzip(long), 65536)
 
-    print(longBack.ok, len(longBack.value) == len(toBytes(long)))
+    print(longBack.ok, longBack.value.length == toBytes(long).length)
 
     // -- a member neither compressor here writes ---------------------------------------------------
 
@@ -102,12 +102,12 @@ async main()
     print((await gunzip([31, 139, 8, 8, 0, 0, 0, 0, 0, 255, 110, 111, 116, 101, 115, 116, 1, 2, 3, 4], 64)).error)
 
     // The trailer's checksum, which is computed on both back ends rather than taken from a host.
-    print((await gunzip(patched(packed, len(packed) - 8, 0), 4096)).error)
+    print((await gunzip(patched(packed, packed.length - 8, 0), 4096)).error)
 
     // The trailer's length, which is what sizes the answer -- too large is refused against the limit
     // and too small is caught against what actually came out.
-    print((await gunzip(patched(packed, len(packed) - 1, 255), 4096)).error)
-    print((await gunzip(patched(packed, len(packed) - 4, 3), 4096)).error)
+    print((await gunzip(patched(packed, packed.length - 1, 255), 4096)).error)
+    print((await gunzip(patched(packed, packed.length - 4, 3), 4096)).error)
 
     // zlib's own header, whose four rules are read here rather than left to the host.
     print((await inflate([1, 2, 3, 4], 64)).error)

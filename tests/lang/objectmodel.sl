@@ -132,7 +132,7 @@ the_proto_a_nominal_value_is_reached_through_is_not_a_field_either() =
 
     assertEq(entries(c), [["r", 3]])
     assertEq(values(p), [1, 2])
-    assertEq(len(p), 2)
+    assertEq(keys(p).length, 2)
     assert(!has(c, "proto"), "a data value's `proto` is machinery and not a field")
     assert(!has(p, "(class)"), "a tag is not a field a program can ask about either")
 
@@ -182,7 +182,7 @@ a_class_with_its_own_hash_is_reachable_as_a_key() =
     u[Keyed.new(2)] = "second"
 
     assertEq(u[Keyed.new(9)], "second")
-    assertEq(len(u), 1)
+    assertEq(keys(u).length, 1)
 
 @test
 a_data_value_is_a_key_too() =

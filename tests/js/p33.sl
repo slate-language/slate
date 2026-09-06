@@ -28,8 +28,8 @@ main()
     // Bytes are an array of numbers in slate, so they have one already.
     print(toBytes("héllo").length, toBytes("").length)
 
-    // **Characters, not UTF-16 units**, and `len` is the same answer because it is the same native.
-    print("a👋".length, len("a👋"))
+    // **Characters, not UTF-16 units.**
+    print("a👋".length)
     print("日本語".length, "👋👋👋".length)
 
     // A property is read through `?.` and by a placeholder exactly as any member is.

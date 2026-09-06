@@ -38,7 +38,7 @@ a_document_that_will_not_parse_is_a_RESULT() =
 
     assert(!r.ok)
     assert(r.error is string)
-    assert(len(r.error) > 0)
+    assert(r.error.length > 0)
 
 @test
 a_value_with_no_json_form_is_a_FAULT_and_is_named_rather_than_dropped() =
@@ -46,7 +46,7 @@ a_value_with_no_json_form_is_a_FAULT_and_is_named_rather_than_dropped() =
     // function in a value the program built itself is a defect in that program.
     val said = toJSON({ f: (x) -> x }) catch e -> e.message
 
-    assert(len(said) > 0)
+    assert(said.length > 0)
 
 @test
 the_seven_things_json_has_are_the_seven_slate_has() =

@@ -47,7 +47,7 @@ print(distance_from_origin({ x: 3, y: 4 }))
 var holds = 1
 
 holds = "text"
-print(area(len(holds), 2))
+print(area(holds.length, 2))
 
 print("done" match
     whatever -> whatever)

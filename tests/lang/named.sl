@@ -85,7 +85,7 @@ a_required_parameter_nobody_gave_is_named() =
 a_BUILTIN_has_no_parameter_names_to_pick_out() =
     // Its arguments are a list and the names it is documented under are prose, so there is nothing
     // to look up. Saying so is better than matching against something that was never a parameter.
-    assert((len(xs = [1]) catch e -> e.message).contains("builtin"))
+    assert((chars(s = "a") catch e -> e.message).contains("builtin"))
 
 @test
 a_function_that_GATHERS_cannot_have_an_argument_named() =

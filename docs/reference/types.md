@@ -380,7 +380,7 @@ type survives them and a mistake is caught where it is written — in either spe
 checked as the free function it is:
 
 ```slate
-f(xs: array of string) = len(xs)
+f(xs: array of string) = xs.length
 
 h(ns: array of integer) = f(ns.filter(n -> n > 1))
 ```
@@ -402,7 +402,7 @@ no `-> type` gets the answer its body gives back, and that answer reaches every 
 ```slate
 shout(s: string) = s
 
-tally(xs: array of integer) = len(xs)
+tally(xs: array of integer) = xs.length
 
 print(shout(tally([1, 2, 3])))
 ```
@@ -460,7 +460,7 @@ yet, so an unannotated recursive function answers `any` and an annotated one ans
 ```slate
 depth(n) = if n <= 0 then 0 else depth(n - 1) + 1
 
-count(xs: array of integer) -> integer = len(xs)
+count(xs: array of integer) -> integer = xs.length
 
 print(depth(3), count([1, 2]))
 ```
@@ -498,7 +498,7 @@ string is a number, which is what makes the else branch of a union test worth wr
 ```slate
 double(n: number) = n * 2
 
-widen(x: string | number) = if x is string then len(x) else double(x)
+widen(x: string | number) = if x is string then x.length else double(x)
 
 print(widen("abcd"), widen(3))
 ```
@@ -531,9 +531,9 @@ and the branch after it, `||` narrows the else — reaching it means neither ope
 swaps the two sides, so a test reaches everywhere it decides something:
 
 ```slate
-trimmed(x: string | null) = if x != null && len(x) > 0 then trim(x) else ""
+trimmed(x: string | null) = if x != null && x.length > 0 then trim(x) else ""
 
-named(x: string | null, fallback: string) = if x == null || len(x) == 0 then fallback else upper(x)
+named(x: string | null, fallback: string) = if x == null || x.length == 0 then fallback else upper(x)
 
 print(trimmed("  a  "), trimmed(null), named("bo", "?"), named(null, "?"))
 ```

@@ -176,7 +176,7 @@ print(hex(sha256("abc")))
 print(hex(md5("abc")), hex(sha1("abc")))
 print(hex(hmac("SHA-256", "key", "message")))
 print(hex(pbkdf2("SHA-1", "password", "salt", 4096, 20)))
-print(len(randomBytes(32)), timingSafeEqual("abc", "abc"), timingSafeEqual("abc", "abd"))
+print(randomBytes(32).length, timingSafeEqual("abc", "abc"), timingSafeEqual("abc", "abd"))
 ```
 
 ```output
@@ -343,7 +343,7 @@ print(regex("[[:alpha:]]+").find("42abc!").text)
 print(regex("\\p{Greek}+").find("ab\u{3b1}\u{3b2}!").text)
 print(regex("\\s").test("\u{a0}"), regex("a.b").test("a\rb"))
 print(regex("(\\w+)@(\\w+)").replace("a@b and c@d", "$2 at $1"))
-print(len(regex("$").findAll("abc")), regex("a*").split("bb").join("|"))
+print(regex("$").findAll("abc").length, regex("a*").split("bb").join("|"))
 ```
 
 ```output

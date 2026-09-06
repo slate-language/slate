@@ -104,7 +104,7 @@ serveStream(3000, async (req) ->
     var total = 0
 
     for await chunk in req
-        total = total + len(chunk)
+        total = total + chunk.length
 
     "that was " + string(total) + " bytes")
 ```

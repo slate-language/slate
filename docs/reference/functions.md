@@ -208,7 +208,7 @@ hi, ada
 from that:
 
 - `f(xs = [])` gives every call an array of its own.
-- A default may read the parameters to its left: `slice(xs, from, to = len(xs))`.
+- A default may read the parameters to its left: `slice(xs, from, to = xs.length)`.
 - A default that would fault costs nothing to a call that gave the argument.
 
 **A parameter that may be left out has to come last**, or leaving it out would slide every later

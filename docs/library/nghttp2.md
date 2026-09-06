@@ -37,7 +37,7 @@ val s = h2Server()
 pump(from, to)
     val bytes = h2Send(from)
 
-    if len(bytes) > 0 then h2Receive(to, bytes)
+    if bytes.length > 0 then h2Receive(to, bytes)
 
 // Everything the peer did since last time.
 seen(who)
@@ -231,7 +231,7 @@ needs a session made for it, since a session that extends its own windows has no
 val s = h2Server({ autoWindowUpdate: false })
 
 // … a body arrives, is written away, and only then:
-h2Consume(s, stream, len(bytes))
+h2Consume(s, stream, bytes.length)
 ```
 
 ## HPACK on its own
@@ -253,7 +253,7 @@ print(hpackInflate(dec, block))
 // The dynamic table is what makes the second block of the same headers a fraction of the first.
 val again = hpackDeflate(enc, { ":status": "200", "content-type": "text/plain" })
 
-print(len(again) < len(block))
+print(again.length < block.length)
 
 hpackClose(enc)
 hpackClose(dec)

@@ -54,7 +54,7 @@ async main()
 
     print(argon2NeedsRehash(weak), argon2NeedsRehash(made))
     print(argon2NeedsRehash(made, { memoryCost: 65536, timeCost: 3 }))
-    print(startsWith(fixed, "$argon2id$v=19$m=19456,t=2,p=1$"), len(split(fixed, "$")))
+    print(startsWith(fixed, "$argon2id$v=19$m=19456,t=2,p=1$"), split(fixed, "$").length)
 
     // -- and every way of getting it wrong -----------------------------------------------------
 

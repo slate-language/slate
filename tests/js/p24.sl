@@ -38,7 +38,7 @@ while i < 256
 
 val whole = base64urlDecode(base64urlEncode(bs))
 
-print(whole.ok, len(whole.value), toJSON(whole.value) == toJSON(bs))
+print(whole.ok, whole.value.length, toJSON(whole.value) == toJSON(bs))
 
 val all = [1, 2, 3, 4, 5]
 
@@ -46,7 +46,7 @@ for n in [1, 2, 3, 4, 5]
     val piece = all[0..<n]
     val here = base64urlEncode(piece)
 
-    print(len(here), toJSON(base64urlDecode(here).value) == toJSON(piece))
+    print(here.length, toJSON(base64urlDecode(here).value) == toJSON(piece))
 
 // -- what is refused, and in what words ------------------------------------------------------------
 
@@ -55,4 +55,4 @@ for n in [1, 2, 3, 4, 5]
 for s in ["ab*d", "Zm8=", "Zm9vYg==", "Zm9vA", "Zm9vZh", "Zm9vZg", ""]
     val r = base64urlDecode(s)
 
-    print(r.ok, if r.ok then string(len(r.value)) else r.error)
+    print(r.ok, if r.ok then string(r.value.length) else r.error)

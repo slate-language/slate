@@ -168,7 +168,7 @@ language — and everything after the program's name on the command line belongs
 
 import { args, exit } from slate:process
 
-if args.len() == 0
+if args.length == 0
     print("usage: greet <name>...")
     exit(2)
 

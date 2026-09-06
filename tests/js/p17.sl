@@ -59,7 +59,7 @@ tbl[t] = "moment"
 tbl[seconds(3)] = "length"
 tbl[micros(3000000)] = "again"
 tbl[epochMicros(3000000)] = "three seconds past the epoch"
-print(tbl[t], tbl[epochMillis(1756900000000)], tbl[seconds(3)], tbl[epochMicros(3000000)], len(tbl))
+print(tbl[t], tbl[epochMillis(1756900000000)], tbl[seconds(3)], tbl[epochMicros(3000000)], keys(tbl).length)
 
 // The words a program annotates with, and the six calendar kinds that answer false because nothing
 // can be one.

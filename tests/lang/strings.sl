@@ -2,9 +2,9 @@
 
 @test
 a_string_is_counted_in_characters_and_not_in_bytes() =
-    assertEq(len("日本語"), 3)
-    assertEq(len("héllo"), 5)
-    assertEq(len(toBytes("日本語")), 9)
+    assertEq("日本語".length, 3)
+    assertEq("héllo".length, 5)
+    assertEq(toBytes("日本語").length, 9)
 
 @test
 a_character_is_a_string_of_one() =
@@ -30,7 +30,7 @@ a_case_mapping_may_change_a_strings_length() =
     // language that has a case table.
     assertEq(upper("ß"), "SS")
     assertEq(upper("ﬁ"), "FI")
-    assertEq(len(lower("İ")), 2)
+    assertEq(lower("İ").length, 2)
 
 @test
 a_sigma_at_the_end_of_a_word_is_written_differently() =
@@ -157,7 +157,7 @@ bytes_go_out_and_come_back_as_a_result() =
     val bad = fromBytes([0x80])
 
     assert(!bad.ok)
-    assert(len(bad.error) > 0)
+    assert(bad.error.length > 0)
 
     // An overlong form, a surrogate and a sequence that stops early are each refused.
     assert(!fromBytes([0xc0, 0xaf]).ok)

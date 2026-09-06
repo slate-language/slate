@@ -14,7 +14,7 @@ val page = toBytes(repeat("<p>hello</p>", 40))
 val small = zstd(page, 3)                   // the level: 1 fast, 3 the default, 19 for storage
 val back = unzstd(small, 1 << 20)           // the limit is not optional
 
-print(len(small) < len(page))
+print(small.length < page.length)
 print(back.ok, fromBytes(back.value).value == fromBytes(page).value)
 print(unzstd(toBytes("not zstd"), 1 << 20).ok)
 ```

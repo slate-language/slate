@@ -34,12 +34,12 @@ val port = localPort(server)
 // hostile page cannot steer a proxy into reading payload bytes as a request of its own.
 masked(opcode, payload)
     val key = [7, 11, 13, 17]
-    var out = [0x80 | opcode, 0x80 | len(payload)]
+    var out = [0x80 | opcode, 0x80 | payload.length]
 
     for b in key
         push(out, b)
 
-    for i in 0..<len(payload)
+    for i in 0..<payload.length
         push(out, payload[i] ^ key[i % 4])
 
     out
@@ -48,7 +48,7 @@ masked(opcode, payload)
 cut(bs)
     var i = 0
 
-    while i + 3 < len(bs)
+    while i + 3 < bs.length
         if bs[i] == 13 && bs[i + 1] == 10 && bs[i + 2] == 13 && bs[i + 3] == 10 then return i
 
         i = i + 1

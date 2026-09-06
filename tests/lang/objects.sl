@@ -7,7 +7,7 @@ an_object_keeps_the_order_its_keys_were_written_in() =
     assertEq(keys(o), ["b", "a", "c"])
     assertEq(values(o), [1, 2, 3])
     assertEq(entries(o), [["b", 1], ["a", 2], ["c", 3]])
-    assertEq(len(o), 3)
+    assertEq(keys(o).length, 3)
 
 @test
 a_key_may_be_any_value_at_all() =
@@ -26,7 +26,7 @@ a_key_may_be_any_value_at_all() =
     assertEq(t["s"], "string")
     assertEq(t[true], "bool")
     assertEq(t[null], "null")
-    assertEq(len(t), 6)
+    assertEq(keys(t).length, 6)
 
 @test
 an_integral_real_and_the_integer_share_a_key_because_they_are_equal() =
@@ -35,7 +35,7 @@ an_integral_real_and_the_integer_share_a_key_because_they_are_equal() =
     t[1] = "one"
     t[1.0] = "one again"
 
-    assertEq(len(t), 1)
+    assertEq(keys(t).length, 1)
     assertEq(t[1], "one again")
 
 @test
@@ -64,7 +64,7 @@ a_quoted_key_is_the_only_spelling_for_one_that_is_not_a_name() =
     assertEq(string(o), "{\"a.b\": 1, \"if\": 2, end: 3}")
 
     // A quoted key that IS a name is the same key as the bare one.
-    assertEq(len({ a: 1, "a": 2 }), 1)
+    assertEq(keys({ a: 1, "a": 2 }).length, 1)
 
 @test
 with_answers_a_copy_and_leaves_the_original_alone() =
@@ -113,7 +113,7 @@ proto_is_an_ordinary_field_and_is_not_hidden() =
     val o = { n: 1, proto: { m: 2 } }
 
     assertEq(keys(o), ["n", "proto"])
-    assertEq(len(o), 2)
+    assertEq(keys(o).length, 2)
     assertEq(string(o), "{n: 1, proto: {m: 2}}")
 
 @test

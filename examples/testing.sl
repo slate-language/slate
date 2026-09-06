@@ -43,7 +43,7 @@ widen_clamps_every_element() =
 
 @test
 an_assertion_may_say_what_it_was_checking() =
-    assert(len(widen([])) == 0, "widening nothing gives nothing")
+    assert(widen([]).length == 0, "widening nothing gives nothing")
 
 // A test may be `async`, and the runner waits for it rather than calling it a pass.
 @test
@@ -51,7 +51,7 @@ async a_missing_file_answers_rather_than_raising() =
     val r = await readFile("no-such-file-here.txt")
 
     assert(!r.ok, "a file that is not there answers a result")
-    assert(len(r.error) > 0, "and the result carries a sentence saying why")
+    assert(r.error.length > 0, "and the result carries a sentence saying why")
 
 print("run me with `slate test` to see the tests; running me plainly does this instead")
 print(widen([1, 5, -2]))

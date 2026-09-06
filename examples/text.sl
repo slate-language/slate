@@ -1,7 +1,7 @@
 // Text and numbers.
 //
 // **A slate string is a sequence of characters, never of bytes.** Everything below counts and cuts
-// by character, so a program that has never thought about UTF-8 cannot get it wrong -- `len` of
+// by character, so a program that has never thought about UTF-8 cannot get it wrong -- `.length` of
 // three Japanese characters is three, and slicing one out gives you the character rather than a
 // third of it.
 //
@@ -10,7 +10,7 @@
 
 val greeting = "héllo, 世界"
 
-print(len(greeting))
+print(greeting.length)
 print(greeting[0], greeting[1], greeting[7])
 print(greeting[0..<5])
 print(chars("añb"))
