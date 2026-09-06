@@ -1,4 +1,15 @@
-# slate
+<p align="center">
+  <img src="https://slatelang.dev/slate-wordmark.svg" alt="slate" width="300">
+</p>
+
+<p align="center">
+  <a href="https://github.com/slate-language/slate/releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/slate-language/slate?label=release&color=4a5568"></a>
+  <a href="https://github.com/slate-language/homebrew-tap"><img alt="Homebrew" src="https://img.shields.io/badge/dynamic/regex?url=https%3A%2F%2Fraw.githubusercontent.com%2Fslate-language%2Fhomebrew-tap%2Fmain%2FFormula%2Fslate.rb&search=version%20%22(%5B%5E%22%5D%2B)%22&replace=%241&label=homebrew&color=fbb040"></a>
+  <a href="https://github.com/slate-language/slate/actions/workflows/docs.yml"><img alt="Docs" src="https://github.com/slate-language/slate/actions/workflows/docs.yml/badge.svg?branch=stable"></a>
+  <a href="https://github.com/slate-language/slate/commits/dev"><img alt="Last Commit" src="https://img.shields.io/github/last-commit/slate-language/slate/dev"></a>
+  <img alt="License" src="https://img.shields.io/github/license/slate-language/slate">
+  <a href="https://sysl.sh"><img alt="sysl Version" src="https://img.shields.io/badge/dynamic/regex?url=https%3A%2F%2Fraw.githubusercontent.com%2Fslate-language%2Fslate%2Fstable%2Fpackage.hocon&search=sysl%20%3D%20%22(%5B%5E%22%5D%2B)%22&replace=%241&label=sysl&color=blue"></a>
+</p>
 
 A small indentation-structured, garbage-collected language, written in [sysl](https://sysl.sh).
 
