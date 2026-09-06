@@ -162,6 +162,186 @@ a side cannot be negative
 A class with no declared fields keeps the plain form, where the body's value *is* the object:
 `new(v) = { v: v }`. It is given the class as its proto on the way out.
 
+## Properties
+
+**`get` in front of a definition makes a field that is worked out, and `set` makes one that is written
+through.** Both are the definition syntax the rest of the body uses, and `self` is the object exactly
+as it is for a method — what changes is how they are reached: `c.area`, with no brackets:
+
+```slate
+class Rect
+    var w
+    var h
+
+    get area(self) = self.w * self.h
+
+    get width(self) = self.w
+
+    set width(self, v)
+        self.w = v
+
+val r = Rect(3, 4)
+
+print(r.area, r.width)
+
+r.width = 10
+
+print(r.area, r.width)
+```
+
+```output
+12 3
+40 10
+```
+
+`get` and `set` are soft words, so a class that already has a method called `get` keeps it — what
+tells them apart is the name after the word.
+
+**A property lives on the class, as a method does**, so it costs an object nothing, a subclass
+overrides one by writing another, and a getter may read a getter:
+
+```slate
+class Circle
+    var r
+
+    get diameter(self) = self.r * 2
+
+    get area(self) = self.diameter * self.diameter
+
+print(Circle(2).diameter, Circle(2).area)
+```
+
+```output
+4 16
+```
+
+**A getter is not a method, and calling one is a fault** rather than a call of whatever it answered:
+
+```slate
+class Rect
+    var w
+    var h
+
+    get area(self) = self.w * self.h
+
+print(Rect(3, 4).area())
+```
+
+```error
+is a property, not a method
+```
+
+## What a property is not
+
+**A property is computed and not stored, so nothing that reports what an object HOLDS mentions one.**
+That is one rule and it settles four questions at once — `keys`, printing, [`toJSON`](../library/globals.md)
+and a [class pattern](patterns.md) all answer about fields, and `with` copies fields:
+
+```slate
+class Rect
+    var w
+    var h
+
+    get area(self) = self.w * self.h
+
+tell(v) = v match
+    Rect(w, h) -> s"${w} by ${h}"
+    _ -> "something else"
+
+val r = Rect(3, 4)
+
+print(keys(r), r, toJSON(r))
+print(tell(r), (r with { w: 10 }).area)
+```
+
+```output
+["w", "h"] Rect(w = 3, h = 4) {"w":3,"h":4}
+3 by 4 40
+```
+
+A class that wants `area` in its JSON writes a `toJSON` saying so, which is
+[what that hook is for](objects.md).
+
+**Only `.` reads a property.** `r["area"]` is the object's own table, which has never walked the
+`proto` chain either — so it answers nothing here, exactly as it does for a method.
+
+**A property and a field of one name are refused**, being one name to a reader and to the `.` that
+reaches both:
+
+```slate
+class Rect
+    var area
+
+    get area(self) = 1
+```
+
+```error
+given twice
+```
+
+`get area` beside `set area` is the pair the two words exist for and is not a clash.
+
+## A property with one half
+
+**A `get` with no `set` makes the property read-only, and the fault names it:**
+
+```slate
+class Rect
+    var w
+    var h
+
+    get area(self) = self.w * self.h
+
+val r = Rect(3, 4)
+
+r.area = 12
+```
+
+```error
+`area` is read-only on Rect
+```
+
+**A `set` with no `get` is the same thing facing the other way** — a write-only property, where the
+*read* is the mistake. Without that, storing through such a property and reading it back would answer
+`null` with nothing anywhere to say why:
+
+```slate
+class Box
+    var n
+
+    set doubled(self, v)
+        self.n = v * 2
+
+val b = Box(1)
+
+print(b.doubled)
+```
+
+```error
+`doubled` is write-only on Box
+```
+
+**A `set` may say what it takes, and then it is checked where the assignment is written**, which is
+what an annotated [`var`](types.md) already buys:
+
+```slate
+class Temperature
+    var celsius = 0
+
+    get f(self) = self.celsius * 9 / 5 + 32
+
+    set f(self, v: integer)
+        self.celsius = (v - 32) * 5 / 9
+
+val t = Temperature()
+
+t.f = "hot"
+```
+
+```error
+was declared integer
+```
+
 ## Class patterns
 
 A class name written with fields after it tests and takes apart at once, which is what a Scala case
