@@ -1,3 +1,8 @@
+---
+title: "slate:brotli"
+weight: 150
+---
+
 # `slate:brotli`
 
 ```slate

@@ -1,3 +1,8 @@
+---
+title: Objects
+weight: 80
+---
+
 # Objects
 
 An object is a collection of fields.

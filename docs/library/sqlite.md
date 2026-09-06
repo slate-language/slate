@@ -1,3 +1,8 @@
+---
+title: "slate:sqlite"
+weight: 130
+---
+
 # `slate:sqlite`
 
 SQLite — the database that needs no server, and the one a program can have without asking anybody to

@@ -1,3 +1,8 @@
+---
+title: "slate:time"
+weight: 60
+---
+
 # `slate:time`
 
 **Eight types, because one type is where a date library's bugs come from.** A `Date` that is an instant

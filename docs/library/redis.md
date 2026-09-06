@@ -1,3 +1,8 @@
+---
+title: "slate:redis"
+weight: 120
+---
+
 # `slate:redis`
 
 A Redis client on the event loop.

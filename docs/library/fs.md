@@ -1,3 +1,8 @@
+---
+title: "slate:fs"
+weight: 20
+---
+
 # `slate:fs`
 
 Ten operations, each in a promise-shaped and a blocking form.

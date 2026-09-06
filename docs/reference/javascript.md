@@ -1,3 +1,8 @@
+---
+title: JavaScript
+weight: 170
+---
+
 # JavaScript
 
 ```

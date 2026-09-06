@@ -1,3 +1,8 @@
+---
+title: Packages
+weight: 160
+---
+
 # Packages
 
 A package is named by an **unquoted** specifier:

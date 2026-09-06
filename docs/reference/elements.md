@@ -1,3 +1,8 @@
+---
+title: Elements
+weight: 140
+---
+
 # Elements
 
 `<div class="x">hi {name}</div>` parses. slate calls it **slx**, after tsx — the surface is JSX's, and

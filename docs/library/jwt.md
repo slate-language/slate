@@ -1,3 +1,8 @@
+---
+title: "slate:jwt"
+weight: 100
+---
+
 # `slate:jwt`
 
 JSON Web Tokens, written in slate.

@@ -1,3 +1,8 @@
+---
+title: "slate:http"
+weight: 40
+---
+
 # `slate:http`
 
 An HTTP server, written in slate over [`slate:net`](net.md).

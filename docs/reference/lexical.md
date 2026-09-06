@@ -1,3 +1,8 @@
+---
+title: Lexical structure
+weight: 10
+---
+
 # Lexical structure
 
 What the compiler reads before it reads anything else: files, whitespace, names and literals.

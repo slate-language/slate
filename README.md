@@ -12,8 +12,10 @@ and — with `slate:dom` and [lath](https://github.com/slate-language/lath), the
 written in slate — in a browser. `slate js app.slx -o app.js` writes one self-contained file: the runtime,
 the framework and the program, with no bundler and nothing to install.
 
-**The documentation is in [`docs/`](docs/)**: a [language reference](docs/reference/) and a
-[library reference](docs/library/).
+**The documentation is at [slatelang.dev](https://slatelang.dev)**, built from
+[`docs/`](docs/) in this repository: [getting started](docs/getting-started/), a
+[tour for JavaScript and TypeScript people](docs/tour-for-js/), a
+[language reference](docs/reference/) and a [library reference](docs/library/).
 
 ## Installing
 

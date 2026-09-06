@@ -1,3 +1,8 @@
+---
+title: "slate:url"
+weight: 50
+---
+
 # `slate:url`
 
 Percent-encoding and the `name=value` grammar — the piece under everything that reads a URL.

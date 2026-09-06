@@ -1,3 +1,8 @@
+---
+title: Values
+weight: 20
+---
+
 # Values
 
 slate is dynamically typed. Every value is one of a fixed set of kinds, and a program can ask which.

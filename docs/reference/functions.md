@@ -1,3 +1,8 @@
+---
+title: Functions
+weight: 60
+---
+
 # Functions
 
 **There is no keyword on a function.** The shape is what identifies it: a name, a parameter list in

@@ -1,3 +1,8 @@
+---
+title: "slate:zstd"
+weight: 160
+---
+
 # `slate:zstd`
 
 Zstandard — the encoding for a hot path, and for a protocol whose two ends are both yours.

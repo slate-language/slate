@@ -1,3 +1,8 @@
+---
+title: "slate:regex"
+weight: 80
+---
+
 # `slate:regex`
 
 PCRE2 patterns. **One export, because a pattern is one object and everything a program does with it is a

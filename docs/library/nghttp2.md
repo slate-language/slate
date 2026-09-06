@@ -1,3 +1,8 @@
+---
+title: "slate:nghttp2"
+weight: 200
+---
+
 # `slate:nghttp2`
 
 HTTP/2: the framing layer, and HPACK on its own.

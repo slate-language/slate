@@ -1,3 +1,8 @@
+---
+title: "slate:net"
+weight: 30
+---
+
 # `slate:net`
 
 TCP, and TLS at both ends.

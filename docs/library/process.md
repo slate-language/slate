@@ -1,3 +1,8 @@
+---
+title: "slate:process"
+weight: 70
+---
+
 # `slate:process`
 
 Another program, this program's own environment, and being asked to stop.

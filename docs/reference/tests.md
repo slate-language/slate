@@ -1,3 +1,8 @@
+---
+title: Tests
+weight: 150
+---
+
 # Tests
 
 `@test` marks a function of no arguments, and `slate test` is the only thing that calls one.

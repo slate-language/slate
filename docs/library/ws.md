@@ -1,3 +1,8 @@
+---
+title: "slate:ws"
+weight: 110
+---
+
 # `slate:ws`
 
 WebSockets, written in slate over the [`slate:http`](http.md) upgrade seam.

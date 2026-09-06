@@ -1,3 +1,8 @@
+---
+title: Language reference
+weight: 30
+---
+
 # Language reference
 
 Every construct in slate, written down once, in its own place.

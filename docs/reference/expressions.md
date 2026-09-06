@@ -1,3 +1,8 @@
+---
+title: Expressions
+weight: 30
+---
+
 # Expressions
 
 ## The precedence table

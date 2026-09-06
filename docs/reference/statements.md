@@ -1,3 +1,8 @@
+---
+title: Statements
+weight: 40
+---
+
 # Statements
 
 ## Declarations

@@ -1,3 +1,8 @@
+---
+title: "slate:dom"
+weight: 210
+---
+
 # `slate:dom`
 
 The document. **The one module that works in one host out of three** — it is real only in a browser,

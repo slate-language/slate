@@ -1,0 +1,147 @@
+# Build & deploy the slate documentation site.
+#
+#   Push to `stable`     → builds and deploys to https://slatelang.dev/.
+#   Push to `dev`        → builds only, so a page is never written blind.
+#   PR targeting either  → builds only, as a sanity check.
+#   workflow_dispatch    → manual trigger from the Actions tab.
+#
+# The site is built by juicer, which lives in its own repository and has no published launcher — so
+# this workflow checks juicer out beside the site and runs it from its own sbt project. When juicer
+# ships a runnable artifact, the two checkout steps collapse into one and the build step loses its
+# `working-directory`.
+#
+# **The site source is `site/`, and its content directory is a SYMLINK to the repository's own
+# `docs/`** — one copy of every page, the same file GitHub renders and `tests_docs.sysl` runs.
+# `actions/checkout` restores a symlink as a symlink, so nothing here has to know about it.
+
+name: Docs
+
+# **Both branches build; only `stable` deploys.** `dev` documents the language as it is on dev and is
+# checked here so a page is never written blind; `stable` documents the released language and is what
+# the world reads. A doc change therefore merges to dev without going live until a release.
+on:
+  push:
+    branches: ["dev", "stable"]
+  pull_request:
+    branches: ["dev", "stable"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# **`dev` is keyed by SHA and `stable` is deliberately not.**
+#
+# `cancel-in-progress: false` protects a run that has STARTED and does nothing for one that is merely
+# QUEUED — GitHub keeps one pending run per concurrency group, so while every dev push shared one
+# group a third push could evict the second commit's build before it ever began. Rendering is fast
+# enough that this has not happened, which makes the per-sha group prophylactic; it is here because
+# the failure is silent when it does arrive — a page that never rendered leaves no trace in the run
+# list, and the render check is not the same check the test suite makes. A page can compile every
+# fenced program and still fail to build.
+#
+# **`stable` keeps the ref, and that is not an oversight.** It is the branch this workflow *deploys*
+# from, and superseding is the behaviour a deploy wants: the newest commit is what the world should
+# read. Per-sha groups would let two stable runs proceed independently and publish out of order,
+# leaving the older content live — a skipped deploy can be re-run, a stale one looks finished.
+concurrency:
+  group: "docs-${{ github.ref == 'refs/heads/dev' && github.sha || github.ref }}"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the site
+        uses: actions/checkout@v6
+        with:
+          path: repo
+
+      - name: Check out juicer
+        uses: actions/checkout@v6
+        with:
+          repository: edadma/juicer
+          ref: stable
+          path: juicer
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # actions/setup-java does NOT ship sbt — the runner image only has the
+      # JDK after the previous step.
+      - name: Set up sbt
+        uses: sbt/setup-sbt@v1
+
+      - name: Cache sbt
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.sbt
+            ~/.cache/coursier
+          key: ${{ runner.os }}-sbt-${{ hashFiles('juicer/**/build.sbt', 'juicer/project/**') }}
+          restore-keys: ${{ runner.os }}-sbt-
+
+      # juicer's asset pipeline shells out to `sass` and `esbuild`. Without them
+      # on PATH it degrades to the committed `static/` copies and skips
+      # fingerprinting, which ships stale CSS and defeats cache busting.
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - name: Install asset toolchain (sass + esbuild)
+        run: npm install -g sass esbuild
+
+      - name: Build the site
+        working-directory: juicer
+        run: >
+          sbt 'juicerJVM/run build
+          -s ${{ github.workspace }}/repo/site
+          -d ${{ github.workspace }}/_site
+          -b https://slatelang.dev/'
+
+      - name: Upload site artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: docs-site
+          path: _site
+
+      # **This guard has to name the same branch `deploy` does**, and it is easy to miss when that
+      # branch changes: the deploy job's own `if:` is the obvious one, and a build that skips this
+      # step is perfectly green. What fails is `deploy`, on *"No artifacts named github-pages were
+      # found for this workflow run"* — which reads as a problem with the deploy action rather than as
+      # a step that never ran.
+      - name: Upload Pages artifact
+        if: github.ref == 'refs/heads/stable'
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: _site
+
+  # **`stable`, not `dev`** — the site the world reads documents the *released* language. slate's
+  # branches say the same thing: `stable` holds exactly the released tree and `dev` is where work
+  # lands, so the site follows the release rather than the integration branch.
+  deploy:
+    if: github.ref == 'refs/heads/stable'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      # **Ten minutes is this action's hard maximum and cannot be raised.** Asking for more is not an
+      # error and not a failure -- it is silently clamped, and the only trace is a line in the log:
+      #
+      #     Warning: timeout value is greater than the allowed maximum -
+      #     timeout set to the maximum of 600000 milliseconds.
+      #
+      # So the obvious repair for a slow Pages service is not available, and writing `timeout:` here
+      # buys nothing but a comment that lies. What is left when Pages is slow is to wait for it and
+      # re-run. Nothing in this repository fixes it.
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5

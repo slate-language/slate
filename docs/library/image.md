@@ -1,3 +1,8 @@
+---
+title: "slate:image"
+weight: 170
+---
+
 # `slate:image`
 
 Photographs and avatars — decoding what somebody uploaded, scaling it down, and writing it back out.

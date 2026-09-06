@@ -1,3 +1,8 @@
+---
+title: Types
+weight: 70
+---
+
 # Types
 
 slate is dynamically typed with a **gradual checker**: nothing has to be annotated, and what is

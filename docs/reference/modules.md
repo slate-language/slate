@@ -1,3 +1,8 @@
+---
+title: Modules
+weight: 110
+---
+
 # Modules
 
 **A file is a module.** What another file can see is what it writes `export` in front of:

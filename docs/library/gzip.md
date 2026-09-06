@@ -1,3 +1,8 @@
+---
+title: "slate:gzip"
+weight: 140
+---
+
 # `slate:gzip`
 
 gzip and zlib — the compression a program has wherever slate runs, including a browser.

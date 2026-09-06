@@ -1,3 +1,8 @@
+---
+title: Patterns
+weight: 50
+---
+
 # Patterns
 
 One grammar, used in four places: a `match` arm, an `is` test, a binding (`val { a } = o`), and a

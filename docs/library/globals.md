@@ -1,3 +1,8 @@
+---
+title: Globals
+weight: 10
+---
+
 # Globals
 
 The names a program has in scope with no import.

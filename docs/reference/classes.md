@@ -1,3 +1,8 @@
+---
+title: Classes
+weight: 90
+---
+
 # Classes
 
 A class is an [object with a proto](objects.md) and a word in front of it. `class` binds a name to an

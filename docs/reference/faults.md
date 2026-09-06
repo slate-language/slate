@@ -1,3 +1,8 @@
+---
+title: Faults
+weight: 130
+---
+
 # Faults
 
 slate has **two failure channels**, and which one a thing uses says what kind of failure it is.

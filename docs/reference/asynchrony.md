@@ -1,3 +1,8 @@
+---
+title: Asynchrony
+weight: 120
+---
+
 # Asynchrony
 
 ## `async` and `await`

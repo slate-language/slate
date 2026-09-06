@@ -1,3 +1,8 @@
+---
+title: "slate:lmdb"
+weight: 180
+---
+
 # `slate:lmdb`
 
 An ordered key-value store in a memory-mapped file — the one place a slate server can keep something

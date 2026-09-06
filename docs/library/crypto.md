@@ -1,3 +1,8 @@
+---
+title: "slate:crypto"
+weight: 90
+---
+
 # `slate:crypto`
 
 Digests, HMAC, key derivation and randomness.

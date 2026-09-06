@@ -1,3 +1,8 @@
+---
+title: Data types
+weight: 100
+---
+
 # Data types
 
 `data` declares a closed set of variants — an algebraic data type — and that closed set is what makes a
