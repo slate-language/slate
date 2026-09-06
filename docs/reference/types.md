@@ -394,6 +394,86 @@ is.
 
 `map(ns, n -> string(n))` is an `array of string`, the lambda's result being read off its body.
 
+### A function's answer is read off its body
+
+**Most functions never say what they answer, and the checker works it out anyway.** A definition with
+no `-> type` gets the answer its body gives back, and that answer reaches every call to it:
+
+```slate
+shout(s: string) = s
+
+tally(xs: array of integer) = len(xs)
+
+print(shout(tally([1, 2, 3])))
+```
+
+```error
+`shout` takes string here, and this is integer
+```
+
+An `if` or a `match` used for its value is worth what its branches agree on, so the same thing holds
+one level down:
+
+```slate
+tag(s: string) = s
+
+size(n) = if n > 10 then 2 else 1
+
+print(tag(size(20)))
+```
+
+```error
+`tag` takes string here, and this is integer
+```
+
+**Writing `-> type` still wins, and the body is checked against it** — an annotation is a promise, and
+this is where it is kept:
+
+```slate
+name() -> string = 1
+
+print(name())
+```
+
+```error
+this was declared to answer string, and answers integer
+```
+
+**Where the answer is not certain it is `any`, which fits everything.** Two answer points that
+disagree give the whole thing up rather than making a union, so a function that gives back a string on
+one branch and a number on another is said nothing about:
+
+```slate
+label(n) = if n > 10 then "big" else 1
+
+print(label(20), label(1))
+```
+
+```output
+big 1
+```
+
+The same holds for **recursion**, which is the one place writing the annotation buys something the
+checker cannot work out on its own: reading a recursive call means reading a result that is not known
+yet, so an unannotated recursive function answers `any` and an annotated one answers what it says.
+
+```slate
+depth(n) = if n <= 0 then 0 else depth(n - 1) + 1
+
+count(xs: array of integer) -> integer = len(xs)
+
+print(depth(3), count([1, 2]))
+```
+
+```output
+3 2
+```
+
+**An `async` function answers a promise and a generator answers a generator**, whatever their bodies
+give back — what awaiting or stepping produces is not what calling produces. And a function whose body
+calls something the checker knows nothing about answers `any` in its turn, which is what keeps this
+from spreading a guess.
+
 ### A callback knows what it is handed
 
 `map`, `filter`, `forEach` and the rest call their function with one element; `sorted` calls its

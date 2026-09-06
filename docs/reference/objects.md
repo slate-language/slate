@@ -128,21 +128,22 @@ That is not two rules but one: **captured methods take no receiver, shared ones 
 **Only `o.m(...)` passes a receiver.** `o.m` on its own hands back the bare function, so taking a method
 off an object and calling it later is allowed and gives you what you took.
 
-## Operator hooks
+## Operator methods
 
-An object may answer for an operator. The word is the method's name, and a [class](classes.md) body
-writes one with the definition syntax it already has:
+An object may answer for an operator, and **the operator is the method's name**. A
+[class](classes.md) body writes one with the definition syntax it already has, so the definition and
+every call that reaches it read alike:
 
 ```slate
 class Money
     var cents
 
-    plus(self, o)    = Money(self.cents + o.cents)
-    times(self, n)   = Money(self.cents * n)
-    negated(self)    = Money(-self.cents)
-    compare(self, o) = self.cents - o.cents      // `<`, `<=`, `>` and `>=` read its sign
+    +(self, o)   = Money(self.cents + o.cents)
+    *(self, n)   = Money(self.cents * n)
+    unary_-(self) = Money(-self.cents)
+    <=>(self, o) = self.cents - o.cents      // `<`, `<=`, `>` and `>=` read its sign
 
-    toString(self)   = "$" + string(self.cents / 100)
+    toString(self) = "$" + string(self.cents / 100)
 
 val a = Money(150)
 val b = Money(50)
@@ -156,27 +157,84 @@ $2 $3 $-1
 false true
 ```
 
-| hook | operator |
+| method | operator |
 |---|---|
-| `plus` | `+` |
-| `minus` | `-` |
-| `times` | `*` |
-| `dividedBy` | `/` |
-| `remainder` | `%` |
-| `negated` | prefix `-` |
-| `compare` | `<`, `<=`, `>`, `>=` |
-| `equals` | `==`, `!=` |
+| `+` | `+` |
+| `-` | `-` |
+| `*` | `*` |
+| `/` | `/` |
+| `%` | `%` |
+| `unary_-` | prefix `-` |
+| `<`, `<=`, `>`, `>=` | those four, each on its own |
+| `<=>` | all four of them, from one method |
+| `==` | `==`, and `!=` as its opposite |
 | `hash` | a table key |
 
-**Ordering is one hook and not four**, so a type cannot order inconsistently with itself. `==` keeps
-`equals`, because a type whose ordering is coarser than its equality is an ordinary thing to want.
+**`unary_-` is spelled apart from `-`** because it takes no other side: a class whose `-` has two
+operands has said nothing about what `-v` should be.
 
-**The left operand decides and the right is never asked** — `equals`'s rule already — so there is no
-reflected form and `2 * money` is a fault.
+**Nothing else may be named.** The bitwise operators, `&&` and `!` are all questions about bits or
+about truth, which is not a thing a value object has an opinion on, and a class body naming one is
+refused where it is written.
 
-**A hook is the last thing tried**, so none can shadow what an operator means.
+**A class orders itself in one of two ways and never both.** Either it writes the four comparisons,
+each saying exactly what that operator means for it, or it writes `<=>` and lets all four read the
+sign of one number:
 
-A type that writes `equals` should write `hash` beside it, or two equal values will not find each other
+```slate
+class Version
+    var n
+
+    <(self, o)  = self.n < o.n
+    <=(self, o) = self.n <= o.n
+    >(self, o)  = self.n > o.n
+    >=(self, o) = self.n >= o.n
+
+print(Version(1) < Version(2), Version(2) <= Version(2))
+```
+
+```output
+true true
+```
+
+Writing both is refused, the two being two chances for a type to order inconsistently with itself:
+
+```slate
+class Version
+    var n
+
+    <(self, o)   = self.n < o.n
+    <=>(self, o) = self.n - o.n
+```
+
+```error
+writes one or the other
+```
+
+**`==` is a method of its own and is not routed through `<=>`**, because a type whose ordering is
+coarser than its equality — a case-insensitive name, a version with build metadata — is an ordinary
+thing to want. **`!=` is always the opposite of `==` and a class may not write one:**
+
+```slate
+class Tag
+    var t
+
+    !=(self, o) = true
+```
+
+```error
+is always the opposite of
+```
+
+**The left operand decides and the right is never asked** — `a.equals(b)`'s rule already — so there
+is no reflected form and `2 * money` is a fault.
+
+**A method is the last thing tried**, so none can shadow what an operator already means.
+
+**An operator method is an ordinary member**, so `a.+(b)` calls what `a + b` calls and a word-named
+method has no operator meaning at all: a class writing `plus` has written a method called `plus`.
+
+A type that writes `==` should write `hash` beside it, or two equal values will not find each other
 in a table.
 
 ## `toString` and `toJSON`
