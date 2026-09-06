@@ -240,6 +240,9 @@ else.
 **A fourth door, and one a request carries without being asked** — `localStorage` never leaves the
 browser and a cookie always does, which is the whole reason a server-rendering framework reaches for
 one at all: a session id, a CSRF token, anything the *next* request needs to already be carrying.
+Every one of the four faults outside a browser, there being no document to read or write — so a file
+meant to run in more than one place guards the call itself, checking `host() == "browser"` first,
+[as `host()`](globals.md#host) documents.
 
 ```slate
 import { cookies, cookie, setCookie, deleteCookie } from slate:dom
