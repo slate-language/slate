@@ -13,6 +13,13 @@ $ slate js hello.sl -o hello.js
 the runtime, any framework, and the program. There is no bundler, no `node_modules`, and nothing to
 install beside it. The output runs under node, under quickjs, and in a browser.
 
+**Write the output as `.mjs` and node reads it as an ES module instead of a script**, which is the
+only thing the extension changes: the emitted program is the same text either way and everything it
+reaches for still works. A module has no `require` in it, so the runtime finds node's modules —
+`node:crypto` for `argon2`, `node:zlib` for zstd, `node:sqlite`, `node:net`, the file system —
+through `process.getBuiltinModule` rather than through a global that is only there in a script.
+Nothing else in this page reads differently under one shape or the other.
+
 `slate test --js .` compiles a whole directory into one program and runs it under node, reporting in the
 same words `slate test` does. **A test is written about the language rather than about an implementation
 of it**, so the same file is the check that the two back ends have not drifted apart — which is worth more
@@ -470,6 +477,14 @@ written is the shaping: the host answers a `Response` and slate answers `{ ok, v
 anything to do with, so both back ends answer *"`gopher://x/` is not an http or https URL"* rather
 than slate's sentence in one place and the browser's in the other. That is `slate:ws`'s rule for
 `open`, drawn the same way.
+
+**A RELATIVE URL IS RESOLVED IN A BROWSER AND REFUSED EVERYWHERE ELSE**, which is the one place that
+reading of a URL depends on the host — and it has to, because a page's own address is the base and
+nothing else has one. `fetch("/signup")` is the commonest call a page makes; it resolves against
+`location.href` through `new URL`, so `/signup`, `./next`, `../up` and a bare path all mean what the
+URL specification says they mean rather than what a second reading of it written here would. Under
+node and the interpreter the same call answers *"`/signup` is not an http or https URL, and there is
+no page to resolve it against"* — the same sentence with the missing half named.
 
 **`trust` refuses**, and it is the shape case rather than a missing feature. It names a certificate to
 trust as well as the machine's own, and no JavaScript host lets a program add a trust anchor for one

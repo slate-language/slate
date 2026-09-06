@@ -157,6 +157,17 @@ if shape.value.width * shape.value.height > 40_000_000 then return { status: 413
 val img = readImage(body).value
 ```
 
+**It answers for a header of ANY size, which is what makes that handler possible.** A guard that
+refused the very files it exists to catch would leave nothing to compare against a limit, so
+`imageShape` reads a PNG's `IHDR` itself where the decoder behind it will not — `stb_image` declines
+to parse a header whose pixels could not fit its own decoder, and 20,000 by 20,000 in RGB is exactly
+that. The limit is the caller's and is written in the program above; nothing here decides what is too
+big.
+
+A file that is cut short, or whose header says something no decoder would accept, is still a refusal
+with a sentence — reading a header for a picture nobody could decode is not the same as reading one
+that is not there.
+
 ## Scaling
 
 `resizeImage(image, width, height)` answers the same image at another size, eight bits a channel, and

@@ -234,3 +234,10 @@ forbidden response-header name, so a page never reads one. The browser still app
 
 **A body that is not UTF-8 is `""`** rather than a string of replacement characters, which is the same
 answer `run` gives and for the same reason: slate has no byte value for it to be.
+
+**In a browser a relative URL is resolved against the page's own address**, so `fetch("/signup")`,
+`fetch("./next")` and `fetch("../up")` all reach the origin the page was served from — the resolving is
+`new URL(url, location.href)`, which is what the platform's own `fetch` does with one. **Under node and
+the interpreter there is no page**, so the same call is refused and says so: *"`/signup` is not an http
+or https URL, and there is no page to resolve it against"*. A URL naming a scheme slate does not speak
+keeps the plain sentence, a base being no help to it.
