@@ -273,6 +273,25 @@ yes
 
 `next(g)`, which is `g.next()` — see [Asynchrony](../reference/asynchrony.md).
 
+## `host`
+
+```slate
+print(host())
+```
+
+```output
+interpreter
+```
+
+**Which of the three hosts this program is running on, constant for the life of a program.** These
+pages run on the interpreter, so that is what prints above; the same call answers `"node"` under
+`slate js` run with node, and `"browser"` in a browser. It takes no arguments and refuses one that
+takes any.
+
+**A shared file is the reason this exists.** A component with no control over where it runs cannot
+otherwise tell a browser-only call from one that will fault everywhere else — see
+[the DOM](dom.md) for the case that asked for it.
+
 ## `fetch`
 
 ```slate
