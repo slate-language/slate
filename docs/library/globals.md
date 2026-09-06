@@ -42,8 +42,9 @@ true
 
 ## Text
 
-`chars  split  join  contains  indexOf  lastIndexOf  startsWith  endsWith`
-`trim  trimStart  trimEnd  upper  lower  normalize  casefold  replace  repeat`
+`chars  split  join  contains  includes  indexOf  lastIndexOf  startsWith  endsWith`
+`trim  trimStart  trimEnd  upper  lower  normalize  casefold  replace  replaceAll  repeat`
+`padStart  padEnd`
 
 Every position is **in characters**, never in bytes.
 
@@ -60,33 +61,64 @@ Every position is **in characters**, never in bytes.
   else rather than falling to a default.
 - **`casefold` is not `lower`.** It is the key to store beside a name somebody will search for: `ß`
   folds to `ss`, folding is idempotent, and what it answers is composed.
+- **`includes` is `contains` and `replaceAll` is `replace`, under the names JavaScript gave them.**
+  `replace` has always changed every occurrence, so `replaceAll` is not a second behaviour — the
+  JavaScript habit of reaching for the "all" name is simply right here.
+- **`padStart` and `padEnd` bring a string up to a width, in characters.** The filler REPEATS and is
+  cut to fit, so `padStart("7", 5, "ab")` is `"abab7"`; a string already at or past the width is
+  answered unchanged.
 
 ```slate
 print(upper("Straße"), lower("ΟΔΟΣ"))
 print(casefold("STRASSE") == casefold("Straße"), lower("STRASSE") == lower("Straße"))
 print(normalize("e\u{301}", "NFC") == "é")
+print(padStart("7", 3), padEnd("7", 3, "0"))
+print(replaceAll("a,b,c", ",", "-"), includes("hello", "ell"))
 ```
 
 ```output
 STRASSE οδος
 true false
 true
+  7 700
+a-b-c true
 ```
 
-As methods, a string answers: `len chars split contains indexOf lastIndexOf startsWith endsWith trim
-trimStart trimEnd upper lower normalize casefold replace repeat number integer real boolean string`.
+As methods, a string answers: `len chars split contains includes indexOf lastIndexOf startsWith
+endsWith trim trimStart trimEnd upper lower normalize casefold replace replaceAll repeat padStart
+padEnd number integer real boolean string`.
 
 ## Numbers
 
-`abs  floor  ceil  round  trunc  sqrt  pow  min  max`
+`abs  floor  ceil  round  trunc  sqrt  pow  min  max  toFixed  formatNumber`
 
 - **The four roundings leave an integer alone**, an integer already being whole.
 - **`min` and `max` take as many arguments as they are given** and answer an integer when every one of
   them was — a `min` that answered a real for two integers would make every use of it in an index a
   conversion.
 - `pow` of two integers with a non-negative exponent answers an **integer**.
+- **`toFixed(x, places)` writes a number to exactly that many decimal places, as text.** It is
+  byte-identical with JavaScript's, ties included: a tie rounds AWAY from zero, which is not what
+  C's `printf` does.
+- **`formatNumber` groups the digits in threes**, taking a whole number or the text `toFixed`
+  answered — never a `real`, which has no one written form of its own. `formatNumber(toFixed(total,
+  2))` is a price. The defaults are a comma and a full stop; `{ separator: " ", decimal: "," }` is
+  the French convention, said with the same two strings rather than a locale name.
 
-As methods, a number answers: `abs floor ceil round trunc sqrt integer real boolean string`.
+```slate
+print(toFixed(1234.5, 2), toFixed(2.5, 0))
+print(formatNumber(1234567), formatNumber(toFixed(1234.5, 2)))
+print(formatNumber(toFixed(1234.5, 2), { separator: " ", decimal: "," }))
+```
+
+```output
+1234.50 3
+1,234,567 1,234.50
+1 234,50
+```
+
+As methods, a number answers: `abs floor ceil round trunc sqrt integer real boolean string toFixed
+formatNumber`.
 
 ## Arrays
 
@@ -196,8 +228,46 @@ The callback comes first, which is node's order. Both `ms` forms also take a
 ## Promises
 
 `sleep  resolve  reject  pending  settle  fail`
+`all  allSettled  race  any`
 
 See [Asynchrony](../reference/asynchrony.md).
+
+**The four that wait on many promises at once**, which `await` cannot be written to do by itself: it
+starts the second one only once the first has come back.
+
+- **`all` answers every value in the order given**, a plain value in the array being one that has
+  already arrived — a cache hit sits beside a `fetch` without being dressed up as a promise. It fails
+  with the first rejection in that same order, and `all([])` answers `[]`.
+- **`allSettled` answers the RESULT shape slate already has** — `{ ok: true, value }` or
+  `{ ok: false, error }`, the same shape `parseJSON`, every `Sync` call in `slate:fs` and `run`
+  already answer — and not JavaScript's `{ status, value | reason }`.
+- **`race` answers whichever one settles first**, success or failure.
+- **`any` answers the first to succeed**, past any number of failures, and fails only where every one
+  did — with every reason, since a slate rejection carries text and there is nothing for an
+  `AggregateError` to be.
+- **`race([])` and `any([])` are refused rather than answered** with a promise that never settles,
+  which is what JavaScript does and is a program that hangs.
+
+```slate
+async first(ms, label)
+    await sleep(ms)
+    label
+
+async main()
+    print(await all([1, resolve(2), 3]))
+    print(await allSettled([resolve(1), reject("bad")]))
+    print(await race([first(20, "slow"), first(5, "fast")]))
+    print(await any([reject("no"), resolve("yes")]))
+
+main()
+```
+
+```output
+[1, 2, 3]
+[{ok: true, value: 1}, {ok: false, error: "bad"}]
+fast
+yes
+```
 
 ## Generators
 
