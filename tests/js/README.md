@@ -75,6 +75,16 @@ ASCII string in every other program agrees either way, so `"a👋"` is the whole
 refusals travel with it: a read-only property, and a property called as though it were a method, each
 having to say so in the same words on both hosts.
 
+**`p36.sl` is about `Set` and `Map`, and the CONSEQUENCES of each being one design twice.** The
+interpreter keeps each in the very table an object is and the JavaScript runtime keeps each in `SObj`,
+which is that table again — so a number and a real that are equal share a key, two arrays written alike
+share one, a class with a `hash` decides its own members, and the walk gives back the order things went
+in. Reaching for the host's own `Map` and `Set` is the version that would have failed here: they key on
+SameValueZero, so `1` and `1.0` would be two entries and a class's hooks would never be asked. The
+renderings are the other half — `print` and `toJSON` write a set as an array and a map as an array of
+pairs on both hosts, where a JavaScript host says `Set(2) {1, 2}` and `{}`. And `size` is a property on
+both, with `.length` a missing name on both.
+
 **`dom/` is a run of its own and needs jsdom** — see `dom/README.md`.
 
 **`p8.sl` writes into `tests/js/scratch/` and takes it away again**, so that running it twice says
