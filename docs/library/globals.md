@@ -23,6 +23,8 @@ going to handle. See [Tests](../reference/tests.md).
 `string  number  integer  real  boolean  len`
 
 **The type words are the conversions**, and the same word [tests in a pattern](../reference/patterns.md).
+`len` counts an array, an object, a string or a range; a string and an array also answer `.length`, which
+is this same count read as a [property](../reference/values.md).
 
 ```slate
 print(string(123) + "!")
@@ -140,6 +142,19 @@ null 2
 3 [3, 2, 1]
 ```
 
+**`length` is a property and not a method**, so it is read with no brackets after it — `xs.length` is
+`len(xs)`, and writing to it is refused rather than resizing the array:
+
+```slate
+print([1, 2, 3].length, [].length)
+print(map(["a", "bb"], _.length))
+```
+
+```output
+3 0
+[1, 2]
+```
+
 Where slate parts from JavaScript it is **to remove a case rather than add one**:
 
 - **A mutator answers nothing**, so `sort` and `unshift` cannot be mistaken for the copying forms
@@ -217,6 +232,17 @@ two alike.
 `len(toBytes(s))` is the byte count, so there is no third name. These are the one place a slate program
 sees UTF-8, and two things need them: a `Content-Length`, and a read where a character may be split across
 two arrivals.
+
+Bytes are an array of numbers, so they carry the same `length` any array does — there is no third kind
+here either:
+
+```slate
+print(toBytes("héllo").length, len(toBytes("héllo")))
+```
+
+```output
+6 6
+```
 
 ## Timers
 

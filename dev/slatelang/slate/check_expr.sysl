@@ -101,7 +101,16 @@ type_of_expr(x: Expr, env: *TypeEnv) -> Type
         Field(target, field, optional) ->
             if optional then return type_of(Any)
 
-            *type_of_expr(target, env).kind match
+            val holder = type_of_expr(target, env)
+
+            // **A PROPERTY OF A BUILTIN KIND IS WORTH WHAT ITS NATIVE ANSWERS**, so `s.length` is an
+            // integer here and a call given it is checked. It is asked before the shape below
+            // because a builtin kind has no shape to ask about.
+            property_result(holder, field) match
+                Some(t) -> return t
+                None -> ()
+
+            *holder.kind match
                 ObjectWith(keys, values, maybe) ->
                     for i in 0..<keys.len()
                         if keys.at(i) == field && !maybe.at(i) then return values.at(i)
@@ -305,7 +314,13 @@ check_expr(x: Expr, env: *TypeEnv)
 
     *x.kind match
         Call(callee, args) ->
-            check_expr(callee, env)
+            // **A METHOD CALL'S CALLEE IS WALKED AS ITS RECEIVER**, not as a field read: `xs.nope()`
+            // is one mistake and `check_method` is where it is reported, so walking the whole callee
+            // would draw a second complaint about the same name from `check_field_read`.
+            *callee.kind match
+                Field(target, _, _) -> check_expr(target, env)
+                _ -> check_expr(callee, env)
+
             check_args(callee, args, env)
             check_method(callee, env)
             check_call(callee, args, env, at)
@@ -342,7 +357,9 @@ check_expr(x: Expr, env: *TypeEnv)
         ObjectLit(_, _, values) -> for i in 0..<values.len() do check_expr(values.at(i), env)
         Interp(pieces) -> for i in 0..<pieces.len() do check_expr(pieces.at(i), env)
         Compare(operands, _) -> for i in 0..<operands.len() do check_expr(operands.at(i), env)
-        Field(target, _, _) -> check_expr(target, env)
+        Field(target, name, optional) ->
+            check_expr(target, env)
+            check_field_read(target, name, optional, env, at)
         Index(target, key) ->
             check_expr(target, env)
             check_expr(key, env)
@@ -595,6 +612,74 @@ private check_binary(op: Tok, lhs: Expr, rhs: Expr, env: *TypeEnv, at: Span)
 
     complain_here(at, s"`${op_text(op)}` does not apply to ${show_type(a)} and ${show_type(b)}")
 end check_binary
+
+// What `x.p` answers, where `p` is a property of the kind `x` certainly is.
+//
+// **It asks the machine's own question**: `properties_of` in `method.sysl` is the table
+// `builtin_property` dispatches through, so a property added to a kind is added in one place and
+// this cannot come to claim a type for a name the machine has no property for.
+private property_result(t: Type, name: string) -> Option[Type]
+    if !certain(t) then return None
+
+    val kind = method_kind_word(t)
+
+    if kind == "" then return None
+
+    properties_of(kind, name) match
+        Some(f) -> Some(native_answer(f))
+        None -> None
+end property_result
+
+// What a property's native hands back.
+//
+// **`Any` for one nothing names here, which is the direction this pass is allowed to be wrong in**:
+// a property added to the table above and not to this list says nothing rather than something false.
+private native_answer(f: NativeFn) -> Type = f match
+    NLen -> type_of(IntegerType)
+    _ -> type_of(Any)
+
+// The walk over an ASSIGNMENT's target, which is a write and not a read.
+//
+// **`check_field_read` may not be asked here.** `[1].proto = o` is refused by the machine for what
+// it would do to the array, and a complaint that an array cannot read `proto` names the read half of
+// a statement that has none — so the receiver is walked and the name is left to the machine, which
+// has the better sentence for every case this could reach.
+// Not `private`: `check.sysl`'s `Assign` and `MultiAssign` arms are the callers.
+check_assign_target(target: Expr, env: *TypeEnv)
+    *target.kind match
+        Field(holder, _, _) -> check_expr(holder, env)
+        _ -> check_expr(target, env)
+end check_assign_target
+
+// `x.p` where the kind of `x` is known: a name that kind has neither a method nor a property for.
+//
+// **`check_method`'s question asked of a READ**, and sound for the same reason: a builtin's set of
+// names is closed, so `n.length` faults when it runs and this moves that fault to the compile. A
+// name read off an OBJECT is untouched -- an object grows fields over its life and a missing one
+// reads as `null` rather than faulting -- and so is a receiver whose type is not certain.
+//
+// **A call's callee never reaches here**, `check_expr`'s `Call` arm walking the receiver rather than
+// the whole callee: `xs.nope()` is `check_method`'s complaint and would otherwise draw two.
+private check_field_read(target: Expr, name: string, optional: bool, env: *TypeEnv, at: Span)
+    // **`?.` is left alone**, as it is everywhere else in this pass: it is written where a value may
+    // be missing, and what a narrowing did or did not prove about the holder is not this pass's to
+    // second-guess.
+    if optional then return
+
+    val t = type_of_expr(target, env)
+
+    if !certain(t) then return
+
+    val kind = method_kind_word(t)
+
+    if kind == "" then return
+    if methods_of(kind, name).is_some() then return
+    if properties_of(kind, name).is_some() then return
+
+    // **The same sentence the machine would have printed**, so a reader who meets this at compile
+    // time and then at run time does not have to work out that the two are one complaint.
+    complain_here(at, s"`${name}` is not something ${article(kind)} ${kind} can do")
+end check_field_read
 
 // Whether this is one of the kinds that is nothing but its word. Their operators are their own
 // subject, and a generator has none at all.
