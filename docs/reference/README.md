@@ -29,6 +29,7 @@ Every construct in slate, written down once, in its own place.
 | [Tests](tests.md) | `@test`, `slate test`, the assertions |
 | [Packages](packages.md) | the manifest, `slate add`, the cache, `slate.sum` |
 | [JavaScript](javascript.md) | `slate js`, and where the two back ends differ |
+| [External](external.md) | `external`, and what crosses the boundary to the host |
 
 ## How to read a rule here
 
