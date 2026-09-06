@@ -17,6 +17,15 @@ http_write_source() -> string = raw"""
     // short enough that a client that has gone away is not remembered for long.
     val IdleMillis = 5000
 
+    // How long a streamed response the server has closed under is given to finish what it already
+    // has. **A quarter of a second is a great deal for what it covers and a very little to wait**:
+    // what is being drained is a source whose answers are already settled and a socket whose writes
+    // are already queued, which is a turn of the loop -- and a source that has not run out by then
+    // is one that was never going to, which is the case the cut exists for. Twenty times shorter
+    // than `IdleMillis`, because a shutdown holding the loop for five seconds is the defect this
+    // whole path was written to end.
+    val DrainMillis = 250
+
     // How much of a request this server will hold before refusing it.
     //
     // **Node's llhttp defaults, and the reasoning is the same**: eight kilobytes of head is more than any
@@ -289,6 +298,44 @@ http_write_source() -> string = raw"""
         // nobody left to tell and nothing to put back.
         var stopped = false
 
+        // How to end the connection once this response has drained, or null while nobody has asked
+        // for it. **A CUT NO LONGER CLOSES THE SOCKET ITSELF**, which is what let a stream the
+        // program had just ended lose its last event: the writer is parked in `next` when the server
+        // is closed, so everything the source had already answered was still unwritten and the
+        // socket went out from under it. The cut hands the ending over instead, and it is taken when
+        // the source runs out or when `DrainMillis` says the source is not going to.
+        var closer = null
+
+        // Whether the socket has been taken away, which is the cut's deadline having fired. Nothing
+        // is written after that and the loop stops at the top.
+        var gone = false
+
+        // The deadline, or null while none is running.
+        var draining = null
+
+        stopDraining()
+            if draining != null
+                clearTimeout(draining)
+
+                draining = null
+
+        // End the connection now, whether the response drained or the deadline said it would not.
+        // **Once**, the drain and the deadline both being able to get here first.
+        endNow()
+            if closer == null then return
+
+            val end = closer
+
+            closer = null
+
+            stopDraining()
+            end()
+
+        hardStop()
+            gone = true
+
+            endNow()
+
         tellSource()
             if told then return
 
@@ -300,14 +347,23 @@ http_write_source() -> string = raw"""
         // AT ONCE rather than after a clock**, which is the whole of the fix: a shutdown used to
         // wait `IdleMillis` for a stream that was never going to end, and then reached the source
         // only as a by-product of the socket being torn out from under the writer.
-        cutHere()
+        //
+        // **AND THE SOCKET IS GIVEN `DrainMillis` TO CATCH UP, WHICH IS THE OTHER HALF.** A source
+        // that has already ended has its `done` waiting in a promise the writer has not been resumed
+        // for yet, so closing the socket here threw away every event the program had just written --
+        // the last one being the one an event stream's reader most needs. The loop goes on until the
+        // source runs out, and then the terminator and the ending go out in order.
+        cutHere(after)
             if stopped then return
 
             stopped = true
             beating = false
+            closer = after
 
             stopBeating(timer)
             tellSource()
+
+            draining = setTimeout(hardStop, DrainMillis)
 
         if watching != null then watching(cutHere)
 
@@ -367,9 +423,11 @@ http_write_source() -> string = raw"""
 
         try
             for await piece in r.source
-                // **A source that yields again after the cut is not written**, which is the same
-                // poll the h2 speaker has always had at the top of its loop.
-                if stopped then return
+                // **A source that yields again after the socket has GONE is not written**, which is
+                // the same poll the h2 speaker has always had at the top of its loop. A cut on its
+                // own no longer stops the loop: what the source has left is exactly what a shutdown
+                // is waiting to drain, and the deadline is what says it has waited long enough.
+                if gone then return
 
                 // **Framed before the send rather than inside it**, so a piece that cannot be
                 // rendered is the source's fault and not read as a client that has gone.
@@ -393,9 +451,13 @@ http_write_source() -> string = raw"""
 
             if watching != null then watching(null)
 
-            // The server closed under this response and the socket has already gone, so whatever
-            // came out of the source or out of the write is about a connection nobody is holding.
-            if stopped then return
+            // The server closed under this response, so whatever came out of the source or out of
+            // the write is about a connection nobody is holding -- and there is nothing left to
+            // drain, so the ending the cut handed over is taken now rather than at the deadline.
+            if stopped
+                endNow()
+
+                return
 
             // The client has gone: the caller's own `try` ends the connection, as it does for a
             // whole-body response whose write failed.
@@ -409,9 +471,24 @@ http_write_source() -> string = raw"""
 
         stopBeating(timer)
 
-        if stopped then return
+        if gone then return
 
         if watching != null then watching(null)
+
+        // **A DRAINED STREAM IS ENDED PROPERLY EVEN WHERE THE SERVER IS CLOSING**, which is the point
+        // of waiting for it: the terminator is what says the body is whole, and a client reading to
+        // the end of a chunked stream has no other way to be told. The write may still fail -- the
+        // reader is exactly the sort to have gone -- and there is nobody to tell about that, so it
+        // is caught rather than raised into a caller that would read it as a connection to end.
+        if stopped
+            try
+                await send(conn, "0\r\n\r\n")
+            catch away
+                val nobody = away
+
+            endNow()
+
+            return
 
         await send(conn, "0\r\n\r\n")
 

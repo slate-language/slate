@@ -785,3 +785,102 @@ A_CUT_STREAM_TELLS_ITS_SOURCE_ONCE_AND_NOT_ONCE_PER_WAY_OUT()
     """
 
     assert_eq(out(fused(20000, NetImport + text)), "the stream ended\ntold 1")
+
+@test
+A_STREAM_THE_PROGRAM_ENDED_IS_FLUSHED_BEFORE_THE_SERVER_CLOSES()
+    // **THE ORDERLY SHUTDOWN, WHICH IS THE OTHER HALF OF CUTTING A STREAM.** A program that ends its
+    // event streams and closes its server in the same breath -- an end-of-run drain, which is what
+    // every program holding a hub does -- leaves each writer parked in a `next` whose answer has
+    // already been settled. Closing the socket there threw all of it away: the client saw a head, no
+    // events at all and an end of stream, and the last thing the program wrote was the one thing it
+    // never got.
+    //
+    // **The client is a socket rather than `fetch`, because the terminator is the assertion.** A
+    // body that stops without one is a truncated chunked stream and reads as an ordinary end
+    // through a client that puts the pieces back together, so what has to be seen here is the wire:
+    // the event's own chunk, and then the zero-length chunk that says the body is whole.
+    val text = raw"""
+    import { serve, close, sse } from slate:http
+    import { connect, onData, send, close as shutSocket, localPort } from slate:net
+
+    var q = []
+    var over = false
+    var waiter = null
+
+    // A hub in miniature: values a program pushes, and a source that parks until there are some.
+    hub()
+        taken()
+            val v = q[0]
+
+            q = q.slice(1)
+
+            { done: false, value: v }
+
+        async pull()
+            if q.length > 0 then return taken()
+
+            if over then return { done: true, value: null }
+
+            waiter = pending()
+
+            await waiter
+
+            if q.length > 0 then return taken()
+
+            { done: true, value: null }
+
+        { next: pull }
+
+    wake()
+        if waiter != null
+            val w = waiter
+
+            waiter = null
+
+            settle(w, null)
+
+    val server = serve(0, (req) -> sse(hub(), { heartbeat: 0 }))
+
+    // **The push, the end and the close in one turn**, which is what makes this the shutdown rather
+    // than a race the test happened to win: the writer has not run between them.
+    async closer()
+        await sleep(150)
+
+        q.push("last")
+
+        over = true
+
+        wake()
+        close(server)
+
+    async main()
+        val c = (await connect("127.0.0.1", localPort(server))).value
+        var acc = ""
+
+        heard(chunk)
+            if chunk == null
+                print(join(split(acc, "\r\n"), "|"))
+                shutSocket(c)
+                done()
+            else
+                acc = acc + chunk
+
+        onData(c, heard)
+
+        await send(c, "GET /events HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n")
+
+    closer()
+    main()
+    """
+
+    val began = libuv.hrtime()
+    val said = out(fused(4000, text))
+    val took = (libuv.hrtime() - began) / 1000000
+
+    assert_eq(said,
+        "HTTP/1.1 200 OK|Content-Type: text/event-stream|Cache-Control: no-cache|" +
+            "Transfer-Encoding: chunked|Connection: close||c|data: last\n\n|0||")
+
+    // **The drain is not a clock**, and the number is what says so: a source that has run out is
+    // waited for over a turn of the loop and not over `DrainMillis`, let alone `IdleMillis`.
+    assert(took < 1000, s"the shutdown took ${took}ms, which is a clock rather than a drain")

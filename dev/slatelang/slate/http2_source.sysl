@@ -99,7 +99,14 @@ http2_source() -> string = raw"""
         // simply go away, and without a clock that socket is held forever -- and a socket is a handle
         // the loop waits on, so it is not only a server's memory that pays. HTTP/2 makes it likelier
         // rather than rarer: a connection carries many streams and is meant to be kept.
+        //
+        // **A SESSION THAT IS ALREADY FINISHED STARTS NO CLOCK**, for the reason the 1.1 connection
+        // states: a timer is a handle the loop waits on, so a clock started after the socket has gone
+        // holds a program with nothing left to do for the whole of `IdleMillis`. A streamed response
+        // that ends the session itself returns to a caller whose next step is to ask what is left.
         quiet()
+            if shut then return
+
             awake()
 
             idle = setTimeout(stop, IdleMillis)
@@ -126,15 +133,27 @@ http2_source() -> string = raw"""
             // stream is a response meant not to finish, so waiting for it held the connection for
             // the whole of `IdleMillis` and then closed the socket under a writer still parked in
             // its source. Every live stream is cut, and then the session goes.
+            //
+            // **AND IT GOES WHEN THE LAST OF THEM HAS DRAINED, WHICH IS `streamed`'s RULE HERE TOO.**
+            // A program that ends its streams and closes its server in the same breath leaves every
+            // writer parked in a `next` whose answer is already settled, so a session closed at the
+            // cut threw away the last event of all of them. Each cut is handed an ending and the
+            // session goes when the last one takes it -- or when each writer's own `DrainMillis`
+            // says its source was never going to end.
             if keys(cutters).length > 0
                 val live = cutters
 
                 cutters = {}
 
-                for [k, cut] in entries(live)
-                    cut()
+                var left = keys(live).length
 
-                stop()
+                ready()
+                    left = left - 1
+
+                    if left <= 0 then stop()
+
+                for [k, cut] in entries(live)
+                    cut(ready)
 
                 return
 
@@ -264,6 +283,35 @@ http2_source() -> string = raw"""
             var told = false
             var stopped = false
 
+            // The ending the cut handed over, the deadline that stops waiting for it, and whether
+            // the session has gone. **`streamed`'s rule, for `streamed`'s reason**: a cut that closed
+            // the session at once lost everything the source had already answered and the writer had
+            // not been resumed for.
+            var closer = null
+            var gone = false
+            var draining = null
+
+            stopDraining()
+                if draining != null
+                    clearTimeout(draining)
+
+                    draining = null
+
+            endNow()
+                if closer == null then return
+
+                val end = closer
+
+                closer = null
+
+                stopDraining()
+                end()
+
+            hardStop()
+                gone = true
+
+                endNow()
+
             tellSource()
                 if told then return
 
@@ -271,14 +319,17 @@ http2_source() -> string = raw"""
 
                 closeSource(r.source)
 
-            cutHere()
+            cutHere(after)
                 if stopped then return
 
                 stopped = true
                 beating = false
+                closer = after
 
                 stopBeating(timer)
                 tellSource()
+
+                draining = setTimeout(hardStop, DrainMillis)
 
             watched(stream, cutHere)
 
@@ -326,8 +377,9 @@ http2_source() -> string = raw"""
                     // a stream running over minutes is the ordinary end rather than a rare one: a
                     // refusal on the same connection, a GOAWAY, a client that hung up. The session
                     // is closed by then, so pushing into it would be a fault about a session where
-                    // what happened is that nobody is listening.
-                    if stopped then return
+                    // what happened is that nobody is listening. **The poll is the socket having
+                    // GONE and not the cut**: what the source has left is what a shutdown is draining.
+                    if gone then return
 
                     if shut
                         beating = false
@@ -339,6 +391,7 @@ http2_source() -> string = raw"""
                         // the source unexhausted -- there are three here where that one has one.
                         tellSource()
                         watched(stream, null)
+                        endNow()
 
                         return
 
@@ -365,6 +418,7 @@ http2_source() -> string = raw"""
                             // is of a reader having gone.
                             tellSource()
                             watched(stream, null)
+                            endNow()
 
                             return
 
@@ -379,8 +433,12 @@ http2_source() -> string = raw"""
                 tellSource()
                 watched(stream, null)
 
-                // The server closed under this response and the session has already gone.
-                if stopped then return
+                // The server closed under this response, so there is nothing left to drain and the
+                // ending the cut handed over is taken now rather than at the deadline.
+                if stopped
+                    endNow()
+
+                    return
 
                 if sending then throw e
 
@@ -392,13 +450,19 @@ http2_source() -> string = raw"""
 
             stopBeating(timer)
 
-            if stopped then return
+            if gone then return
 
             watched(stream, null)
 
+            // **A DRAINED STREAM IS ENDED PROPERLY EVEN WHERE THE SERVER IS CLOSING.** END_STREAM is
+            // what says the body is whole, and a client reading an event stream to its end has no
+            // other way to be told -- so the frame goes out, is flushed, and only then does the
+            // session get the ending the cut left here.
             h2Finish(session, stream)
 
             await flushed()
+
+            endNow()
 
         // A piece as `h2Push` takes it, or `null` where there is nothing in it.
         //

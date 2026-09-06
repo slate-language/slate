@@ -46,6 +46,13 @@ That is what makes `close` the thing that lets a program exit. A connection is a
 waits on, so closing only the listening socket would leave a program that had shut everything down
 still waiting — on connections whose clients may already be gone.
 
+**A STREAMED RESPONSE IS GIVEN A MOMENT TO FINISH WHAT IT ALREADY HAS.** A program that ends its event
+streams and closes its server in the same breath — which is what an orderly shutdown is — has written
+its last event into a source the server has not been resumed for yet, so `close` lets the stream drain:
+whatever the source still answers goes out, the body is ended properly, and then the socket goes. A
+source that does **not** run out is cut a quarter of a second later, its `close` having been called at
+once, because a stream that never ends is not something a shutdown can wait for.
+
 **A connection nobody is using is closed by the server anyway, after five seconds**, over either
 version. A client may keep a connection and then simply go away, and without that clock the socket
 would be held for the life of the server.
