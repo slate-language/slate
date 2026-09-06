@@ -13,14 +13,14 @@ class Empty
 class Money
     var cents
 
-    equals(self, o) = o is Money && self.cents == o.cents
+    ==(self, o) = o is Money && self.cents == o.cents
     toString(self) = "$" + string(self.cents)
 
 class Keyed
     var v
 
     hash(self) = 7
-    equals(self, o) = o is Keyed
+    ==(self, o) = o is Keyed
 
 data Shape
     Circle(r)
@@ -77,7 +77,7 @@ equals_is_the_same_function_as_the_operator() =
     assert((1).equals(1))
 
 @test
-a_class_that_writes_equals_decides_both_of_them() =
+a_class_that_writes_the_equality_operator_decides_both_of_them() =
     val m = Money.new(150)
 
     assert(m == Money.new(150))

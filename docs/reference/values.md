@@ -64,9 +64,10 @@ true true
 **A function is equal to itself.** `f == f` is true, and two separately written lambdas with the same
 body are not equal.
 
-A [class](classes.md) may take `==` over for its own instances by writing `equals`, and must write
-`hash` beside it if those instances are to be used as table keys. `<`, `<=`, `>` and `>=` are one hook,
-`compare` — see [Objects](objects.md).
+A [class](classes.md) may take `==` over for its own instances by writing a method called `==`, and
+must write `hash` beside it if those instances are to be used as table keys. `!=` is always the
+opposite of `==` and may not be written. `<`, `<=`, `>` and `>=` are each a method of their own, or
+all four at once as `<=>` — see [Objects](objects.md).
 
 ## Numbers
 
