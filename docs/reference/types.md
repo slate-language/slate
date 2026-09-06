@@ -474,6 +474,111 @@ give back — what awaiting or stepping produces is not what calling produces. A
 calls something the checker knows nothing about answers `any` in its turn, which is what keeps this
 from spreading a guess.
 
+### Narrowing
+
+**A test tells the checker something, and inside the branch where it held the name has the narrower
+type.** `x is string` makes `x` a string there, so a call the wider type would have been refused for
+is accepted:
+
+```slate
+shout(s: string) = upper(s) + "!"
+
+say(x: string | number) = if x is string then shout(x) else "#" + string(x)
+
+print(say("hi"), say(3))
+```
+
+```output
+HI! #3
+```
+
+**The side the test did NOT hold on takes that alternative away.** A `string | number` that is not a
+string is a number, which is what makes the else branch of a union test worth writing:
+
+```slate
+double(n: number) = n * 2
+
+widen(x: string | number) = if x is string then len(x) else double(x)
+
+print(widen("abcd"), widen(3))
+```
+
+```output
+4 6
+```
+
+A comparison with `null` narrows the same way, and it is how most of the standard library is guarded —
+`indexOf` answers `integer | null`, so the else branch of the test is where the integer is:
+
+```slate
+tail(xs: array of integer, mark: integer)
+    val at = indexOf(xs, mark)
+
+    if at == null then return xs
+
+    slice(xs, at + 1)
+
+print(tail([1, 2, 3], 1), tail([1, 2, 3], 9))
+```
+
+```output
+[2, 3] [1, 2, 3]
+```
+
+**A guard that leaves narrows the rest of the block**, as the example above does: where the branch
+always returns, reaching the line below it means the test was false. `&&` narrows its right operand
+and the branch after it, `||` narrows the else, and `!` swaps the two sides — so all four spellings of
+one test mean the same thing:
+
+```slate
+trimmed(x: string | null) = if x != null && len(x) > 0 then trim(x) else ""
+
+named(x: string | null, fallback: string) = if x == null || len(x) == 0 then fallback else upper(x)
+
+print(trimmed("  a  "), trimmed(null), named("bo", "?"), named(null, "?"))
+```
+
+```output
+a  BO ?
+```
+
+**Narrowing may only ever take a complaint away, never add one**, which is what decides the three
+places it says nothing at all:
+
+- **A `var` is never narrowed.** The branch that tested it may write to it, and a claim left standing
+  over the assignment would be a stale one — refusing a program that runs.
+- **A name of type `any` stays `any`.** There was nothing there to sharpen.
+- **A union that would empty is left alone.** `if x is string` on an `x: string` has an else branch
+  nothing reaches, and a complaint about code that never runs is a complaint no run could make.
+
+```slate
+report(s: string) = s
+
+var m = 1
+
+if m is number
+    m = "text"
+    print(report(m))
+```
+
+```output
+text
+```
+
+Only a bare name narrows: `o.field is string` says nothing about `o.field`, the next line being free
+to write to the field, and this pass says nothing about an object's fields in any case. And the
+narrowing is a claim that can still be wrong, which is what says it is being checked at all:
+
+```slate
+double(n: number) = n * 2
+
+say(x: string | number) = if x is string then double(x) else 0
+```
+
+```error
+`double` takes number here, and this is string
+```
+
 ### A callback knows what it is handed
 
 `map`, `filter`, `forEach` and the rest call their function with one element; `sorted` calls its

@@ -405,19 +405,31 @@ end may_narrow
 narrow_by(cond: Expr, want_true: bool, env: *TypeEnv)
     *cond.kind match
         IsPattern(subject, pat, negated) ->
-            // A negated test narrows the OTHER branch, which is the same rule read backwards.
-            if negated == want_true then return
-
             *subject.kind match
                 Name(name) ->
                     if !may_narrow(env, name) then return
 
+                    // A pattern that binds tells us nothing; one that tests tells us everything.
+                    val binds = first_binding(pat) match
+                        Some(_) -> true
+                        None -> false
+
+                    if binds then return
+
                     val narrowed = type_from_pattern(resolve_pattern(pat, 0))
 
-                    // A pattern that binds tells us nothing; one that tests tells us everything.
-                    first_binding(pat) match
-                        Some(_) -> ()
-                        None -> note_binding(env, name, narrowed, true)
+                    // A negated test says on this side what the plain one says on the other, which
+                    // is the same rule read backwards.
+                    if negated != want_true
+                        note_binding(env, name, narrowed, true)
+                    else
+                        // **THE SIDE THE TEST DID NOT HOLD ON TAKES THE ALTERNATIVE AWAY.** `x is
+                        // string` failing says the value is not a string, so a name declared
+                        // `string | number` holds a number in the else branch -- and until this was
+                        // here the pass refused that call, which is the one mistake it may not make.
+                        without_type(known_type(env, name), narrowed) match
+                            Some(rest) -> note_binding(env, name, rest, true)
+                            None -> ()
                 _ -> ()
 
         // **`a && b` narrows by both**, which is what makes `if x is string && len(x) > 0` work --
@@ -432,6 +444,13 @@ narrow_by(cond: Expr, want_true: bool, env: *TypeEnv)
             if op == AndAnd && want_true
                 narrow_by(lhs, true, env)
                 narrow_by(rhs, true, env)
+
+            // **`a || b` is that rule on the other side.** Reaching the else means neither operand
+            // held, so both of them narrow by their false side -- which is what makes
+            // `if x == null || done then ... else f(x)` the program it reads as.
+            if op == OrOr && !want_true
+                narrow_by(lhs, false, env)
+                narrow_by(rhs, false, env)
 
             if op == EqEq || op == BangEq
                 // The name may be written either side of the comparison; only one of the two is a
@@ -454,6 +473,12 @@ narrow_by(cond: Expr, want_true: bool, env: *TypeEnv)
                                     Some(rest) -> note_binding(env, name, rest, true)
                                     None -> ()
                         _ -> ()
+
+        // **`!c` is `c` with its two sides swapped**, so `if !(x is string) then a else b` narrows
+        // in `b` exactly as `if x is not string` does. Written without this the two spellings of one
+        // test did not mean the same thing.
+        Unary(op, rhs) ->
+            if op == Bang then narrow_by(rhs, !want_true, env)
         _ -> ()
 end narrow_by
 
@@ -461,6 +486,44 @@ private is_null_literal(x: Expr) -> bool
     *x.kind match
         NullLit -> true
         _ -> false
+
+// A union with one of its alternatives taken out, or nothing where there was nothing to take.
+//
+// **This is the else branch of a type test**, and the only narrowing that sharpens a type without a
+// test having held: `x is string` failing says as much about a `string | number` as its holding says
+// about the other side.
+//
+// **Nothing where there was nothing to take, and `Any` where taking it leaves nothing.** A name
+// whose type is `Any` stays `Any`, this pass having nothing to sharpen; and a type with every
+// alternative ruled out describes a branch nothing reaches, where a claim could only complain about
+// code that never runs.
+private without_type(t: Type, drop: Type) -> Option[Type]
+    *t.kind match
+        OneOf(alts) ->
+            var kept: Buf[Type] = buf()
+
+            // **`same_type` is already false for `Any` and for a union**, which is exactly the
+            // caution wanted here: taking an alternative away on either would be claiming something
+            // about a value this pass is not sure of, and a claim that is too narrow refuses a
+            // program that runs.
+            for i in 0..<alts.len()
+                if !same_type(alts.at(i), drop) then kept.push(alts.at(i))
+
+            if kept.len() == alts.len() then return None
+
+            // **A UNION WITH EVERYTHING TAKEN OUT OF IT DESCRIBES A BRANCH NOTHING REACHES**, so the
+            // name becomes `Any` there rather than keeping the type the test just ruled out. Keeping
+            // it would leave the pass complaining about code that never runs, which is a complaint
+            // no run could make.
+            if kept.len() == 0 then return Some(type_of(Any))
+            if kept.len() == 1 then return Some(kept.at(0))
+
+            Some(type_of(OneOf(kept)))
+
+        // The same answer where the type was never a union: `x is string` failing on an `x: string`
+        // is the unreachable branch written without one.
+        _ -> if same_type(t, drop) then Some(type_of(Any)) else None
+end without_type
 
 // A union with `null` taken out of it, or nothing where there was no `null` to take.
 //
