@@ -344,10 +344,13 @@ end guard_narrows
 
 // Whether control that reaches the end of this branch has left the block the branch is in.
 //
+// Not `private`: `check_expr.sysl`'s `if` and `match` arms ask it, a branch that always leaves being
+// one the join below the construct takes nothing from.
+//
 // **The LAST statement is the whole of the question.** A branch ending in a `return`, a `throw`, a
 // `break` or a `continue` cannot fall out of its bottom, and anything that jumped out earlier has
 // left as well. A branch that leaves only sometimes says nothing here, which is the safe answer.
-private always_leaves(x: Expr) -> bool
+always_leaves(x: Expr) -> bool
     *x.kind match
         Block(stmts) ->
             if stmts.len() == 0 then return false
@@ -398,7 +401,9 @@ private check_stmt(s: Stmt, block: Buf[Stmt], env: *TypeEnv)
                 // comparison the machine makes one instruction later, so the two cannot disagree.
                 if i > 0
                     *stmts.at(i).kind match
-                        CheckType(name, _, pat) -> check_declared_init(stmts.at(i - 1), name, pat, env)
+                        CheckType(name, _, pat) ->
+                            check_declared_init(stmts.at(i - 1), name, pat, env)
+                            follow_var(stmts.at(i - 1), name, pat, block, env)
                         _ -> ()
         Unpack(pat, init, _) ->
             check_expr(init, env)
@@ -423,11 +428,19 @@ private check_stmt(s: Stmt, block: Buf[Stmt], env: *TypeEnv)
             if op == Tok.Assign
                 *target.kind match
                     Name(name) ->
-                        val want = known_type(env, name)
+                        val want = declared_of(env, name)
                         val got = type_of_expr(value, env)
 
                         if !fits(got, want)
                             complain_here(value.span, s"`${name}` was declared ${show_type(want)}, and this is ${show_type(got)}")
+                        else
+                            // **WHAT THE NAME HOLDS FROM HERE ON IS WHAT WAS JUST PUT IN IT**, which
+                            // is the other half of an annotation: the declared type is what may ever
+                            // be assigned, and this is what a read below this line is checked
+                            // against. A value this pass is unsure of leaves the name at what it was
+                            // declared, which is what it says today and is the safe direction.
+                            if is_tracked(env, name)
+                                note_flow(env, name, if certain(got) then elementless(got, value) else want)
 
                     // **A PROPERTY IS THE ANNOTATED `var` RULE REACHING ONE MORE SPOT.** `set c(self,
                     // v: integer)` is a promise the machine keeps where the setter is called, so a
@@ -436,12 +449,28 @@ private check_stmt(s: Stmt, block: Buf[Stmt], env: *TypeEnv)
                     Field(obj, prop, optional) ->
                         if !optional then check_property_assign(obj, prop, value, env)
                     _ -> ()
+
+            // **A COMPOUND ASSIGNMENT LEAVES THE NAME AT WHAT IT WAS DECLARED.** What `+=` stores is
+            // what the operator answered rather than the operand written beside it, so following it
+            // exactly would be a second copy of `binary_type`'s table -- and the declared type is
+            // true of whatever it answered, every assignment being held to it.
+            if op != Tok.Assign
+                *target.kind match
+                    Name(name) -> widen_to_declared(name, env)
+                    _ -> ()
         MultiAssign(_, targets, values) ->
             for i in 0..<targets.len()
                 check_expr(targets.at(i), env)
 
             for i in 0..<values.len()
                 check_expr(values.at(i), env)
+
+            // **Which value lands on which target is a question about counts**, which this pass does
+            // not answer -- so every name written here is left at what it was declared.
+            for i in 0..<targets.len()
+                *targets.at(i).kind match
+                    Name(name) -> widen_to_declared(name, env)
+                    _ -> ()
         Def(_, params, defaults, body, _) -> check_body(params, defaults, body_at(body), env, buf())
 
         // **An imported name is `Any` and, more to the point, is no longer a builtin's signature.**
@@ -595,6 +624,41 @@ private check_declared_init(bound: Stmt, name: string, pat: Pattern, env: *TypeE
                 complain_here(x.span, s"`${name}` was declared ${show_type(want)}, and this is ${show_type(got)}")
         None -> ()
 end check_declared_init
+
+// **AN ANNOTATED `var` IS FOLLOWED THROUGH THE BLOCK, which is what stops the annotation refusing a
+// program it was written to describe.** `var m: string | number` assigned a string is a string from
+// that line on, and a call wanting one is a call the machine makes without faulting -- so the
+// declared type is what an assignment is measured against and the type the name HOLDS is what a read
+// is. Narrowing joins it rather than stepping around it: a `var` is narrowable now because a branch
+// that reassigns what it narrowed writes a note of its own over the narrowing.
+//
+// **A `var` a CLOSURE writes to is not followed at all.** A nested function runs at a time this block
+// cannot place -- possibly never, possibly between the test and the use -- so nothing said about the
+// name in this block is true of every run. It keeps the declared type it has always had, which is
+// exactly what this pass said about every `var` before flow reached them.
+private follow_var(bound: Stmt, name: string, pat: Pattern, block: Buf[Stmt], env: *TypeEnv)
+    val init = *bound.kind match
+        Var(who, x) -> if who == name then Some(x) else None
+        _ -> None
+
+    init match
+        Some(x) ->
+            if uses_in(name, block).written_in_closure then return
+
+            val declared = type_from_pattern(resolve_pattern(pat, 0))
+            val got = elementless(type_of_expr(x, env), x)
+
+            // **A value this pass is unsure of takes the DECLARED type rather than `Any`.** `Any`
+            // would be wider and would say nothing where the annotation says something the machine
+            // will hold the program to anyway.
+            note_var(env, name, if certain(got) && fits(got, declared) then got else declared, declared)
+        None -> ()
+end follow_var
+
+// A tracked name left at what it was declared, which is what every construct this pass cannot follow
+// exactly says about the names written inside it.
+private widen_to_declared(name: string, env: *TypeEnv)
+    if is_tracked(env, name) then note_flow(env, name, declared_of(env, name))
 
 // A definition's body, with its parameters in scope at the types its annotations gave them.
 //

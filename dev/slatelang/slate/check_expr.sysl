@@ -332,7 +332,11 @@ check_expr(x: Expr, env: *TypeEnv)
         Block(stmts) ->
             enter_scope(env)
             check_stmts(stmts, env)
-            leave_scope(env)
+
+            // **A BLOCK RUNS TO ITS END, so what it left a followed name holding is what the line
+            // below it holds.** The scope goes; the flow it wrote does not, or an assignment inside
+            // a branch would be forgotten before the join below the branch could read it.
+            leave_scope_flowing(env, false)
         ArrayLit(items) -> for i in 0..<items.len() do check_expr(items.at(i), env)
         DataLit(inner) -> check_expr(inner, env)
 
@@ -369,20 +373,58 @@ check_expr(x: Expr, env: *TypeEnv)
         IfExpr(cond, then_branch, else_branch) ->
             check_expr(cond, env)
 
+            // **WHAT A FOLLOWED NAME HOLDS BELOW AN `if` IS THE UNION OF WHAT THE BRANCHES LEFT IT
+            // AT**, and each branch's answer is read out of its own scope before that scope is left.
+            // A branch that always leaves contributes nothing, control below the `if` never having
+            // come from it; a missing `else` contributes the name as the false side of the test
+            // narrows it, that being what the path which skipped the branch left it at.
+            var j = join_start()
+            var then_names: Buf[string] = buf()
+            var then_types: Buf[Type] = buf()
+
             enter_scope(env)
             narrow_by(cond, true, env)
             check_expr(then_branch, env)
+            flow_here(env, &then_names, &then_types)
             leave_scope(env)
+
+            if !always_leaves(then_branch) then join_arm(&j, env, then_names, then_types)
 
             else_branch match
                 Some(other) ->
+                    var else_names: Buf[string] = buf()
+                    var else_types: Buf[Type] = buf()
+
                     enter_scope(env)
                     narrow_by(cond, false, env)
                     check_expr(other, env)
+                    flow_here(env, &else_names, &else_types)
                     leave_scope(env)
-                None -> ()
+
+                    if !always_leaves(other) then join_arm(&j, env, else_names, else_types)
+                // **A MISSING `else` IS STILL A PATH AND IT KNOWS THE TEST FAILED**, so what it
+                // contributes is the name as the false side narrows it -- which for a name the test
+                // ruled out entirely is a branch nothing reaches, and claiming what it held above
+                // would put a type back that no run can carry there.
+                None ->
+                    var skipped_names: Buf[string] = buf()
+                    var skipped_types: Buf[Type] = buf()
+
+                    enter_scope(env)
+                    narrow_by(cond, false, env)
+                    flow_here(env, &skipped_names, &skipped_types)
+                    leave_scope(env)
+
+                    join_arm(&j, env, skipped_names, skipped_types)
+
+            join_apply(&j, env)
         MatchExpr(subject, arms) ->
             check_expr(subject, env)
+
+            // **A subject matching NO arm is a run-time fault**, so reaching the line below a `match`
+            // means one of its arms ran -- and the join needs no contribution from a path that fell
+            // through, there being none.
+            var jm = join_start()
 
             for i in 0..<arms.len()
                 // **A pattern's bindings are not typed yet**, so the arm's body is walked in a scope
@@ -400,12 +442,20 @@ check_expr(x: Expr, env: *TypeEnv)
                     None -> ()
 
                 check_expr(arms.at(i).body, env)
+
+                var arm_names: Buf[string] = buf()
+                var arm_types: Buf[Type] = buf()
+
+                flow_here(env, &arm_names, &arm_types)
                 leave_scope(env)
 
+                if !always_leaves(arms.at(i).body) then join_arm(&jm, env, arm_names, arm_types)
+
+            join_apply(&jm, env)
             check_covers(subject, arms, env)
         While(_, cond, body, otherwise) ->
             check_expr(cond, env)
-            check_expr(body, env)
+            walk_loop_body(body, env)
             check_otherwise(otherwise, env)
         For(_, binding, iter, body, otherwise, _) ->
             check_expr(iter, env)
@@ -426,14 +476,21 @@ check_expr(x: Expr, env: *TypeEnv)
                 None -> note_bindings(binding, env)
 
             check_expr(body, env)
-            leave_scope(env)
+
+            // **A LOOP LEAVES WHAT IT WROTE TO AT THE DECLARED TYPE**, which is the only thing true
+            // of a body that ran once, ran a hundred times, or never ran at all.
+            leave_scope_flowing(env, true)
             check_otherwise(otherwise, env)
-        Loop(_, body) -> check_expr(body, env)
+        Loop(_, body) -> walk_loop_body(body, env)
         DoWhile(_, body, cond, otherwise) ->
-            check_expr(body, env)
+            walk_loop_body(body, env)
             check_expr(cond, env)
             check_otherwise(otherwise, env)
         TryCatch(body, caught, handler) ->
+            // **A `try` MAY STOP ANYWHERE IN ITS BODY**, so what the body left a followed name at is
+            // true only of the run that finished it -- and the handler runs on the one that did not.
+            // Both leave the names they wrote to at what they were declared.
+            enter_scope(env)
             check_expr(body, env)
             enter_scope(env)
 
@@ -443,7 +500,8 @@ check_expr(x: Expr, env: *TypeEnv)
             // `e.push(1)` is refused -- and it will buy more the day a field read is typed.
             note_type(env, caught, fault_shape())
             check_expr(handler, env)
-            leave_scope(env)
+            leave_scope_flowing(env, true)
+            leave_scope_flowing(env, true)
         Lambda(params, defaults, body, _) -> check_body(params, defaults, body_at(body), env, buf())
 
         // **A NAME NOTHING HAS BOUND IS REFUSED BEFORE IT RUNS**, which is the most common mistake
@@ -549,6 +607,17 @@ end names_field
 // **An arm narrows its subject the way an `is` narrows its operand**, and for the same reason: the
 // arm only runs where the pattern took. `note_bindings` has already put the arm's own names in, so
 // this is on top of them and a name the pattern bound wins by being nearer.
+// A loop's body, walked in a scope of its own so that every followed name written inside it is left
+// at what it was declared.
+//
+// **A loop is the one construct whose end is not the end of a straight line**: what the body left a
+// name at on the last turn is what the NEXT turn begins with, so a type read off the order the lines
+// are written in is a claim about one turn only.
+private walk_loop_body(body: Expr, env: *TypeEnv)
+    enter_scope(env)
+    check_expr(body, env)
+    leave_scope_flowing(env, true)
+
 private narrow_by_arm(subject: Expr, pat: Pattern, env: *TypeEnv)
     *subject.kind match
         Name(name) ->
