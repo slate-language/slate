@@ -1,0 +1,324 @@
+module dev.slatelang.slate
+
+import sh.sysl.gc
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.str_builder
+
+// Waiting on MANY promises at once, which is the one thing `await` cannot be written to do.
+//
+// **Awaiting in sequence is not the same program.** `val a = await one()` followed by `val b = await
+// two()` starts the second request only once the first has come back, so two calls of a hundred
+// milliseconds take two hundred; `all([one(), two()])` takes one. Nothing a program can write out of
+// `await` closes that gap, because the gap is exactly the suspension `await` is.
+//
+// **Four names and no namespace**, which is `resolve` and `reject`'s decision read again: slate has
+// no namespaces yet and inventing one for four functions would be inventing it for the wrong reason.
+// They are JavaScript's `Promise.all`, `.allSettled`, `.race` and `.any`.
+//
+// **A NATIVE CANNOT `await`, SO THE WAITING IS WRITTEN DOWN AND TAKEN WHEN A PROMISE SETTLES.** That
+// is the same arrangement `assertFaults` runs on -- a `FaultWatch` in `async.sysl` -- and this is the
+// second thing to need it, which is what made the mechanism worth generalizing rather than copying.
+
+// Which question a combination is asking.
+enum Combining
+    // Every one, or the first failure. **The array is in the order the promises were given**, not in
+    // the order they answered, which is the whole reason a program reaches for it.
+    WaitAll
+
+    // Every one, whether it worked or not, as an array of results.
+    WaitSettled
+
+    // The first to settle either way.
+    WaitRace
+
+    // The first to SUCCEED, and a fault naming every reason where none did.
+    WaitAny
+end Combining
+
+// The name a program wrote, for the sentences.
+private combine_name(kind: Combining) -> string = kind match
+    WaitAll -> "all"
+    WaitSettled -> "allSettled"
+    WaitRace -> "race"
+    WaitAny -> "any"
+
+// One `all`, `allSettled`, `race` or `any` still waiting for an answer.
+//
+// **The four parallel buffers are pre-sized and only ever `set`**, and that is load-bearing rather
+// than tidy: a sysl `Buf` is a slice and a count, so a COPY of this struct shares its storage and a
+// `set` through the copy is seen by the original. A `push` would not be. Everything here is
+// therefore filled in once, at the call, and written into afterwards.
+struct Combination
+    kind: Combining
+
+    // The promise the program is holding.
+    out: *PromiseObj
+
+    // What each of them answered, in the order they were given. Meaningless where the slot has not
+    // answered.
+    values: Buf[Value]
+
+    // Per slot: 0 while it is still waiting, 1 where it answered, 2 where it failed.
+    state: Buf[usize]
+
+    // Why a slot failed, empty otherwise.
+    messages: Buf[string]
+
+    // The promise a slot is still waiting on, and `null` once it has answered or where the slot was
+    // a plain value.
+    watching: Buf[*PromiseObj]
+
+    // Where the call was written, so a fault points at `all(...)` rather than at whatever line the
+    // last promise happened to settle on.
+    at: Span
+end Combination
+
+// The combinations still owed an answer.
+//
+// **A root the collector has to walk**, for `fault_watches`' reason: between the call answering and
+// the last promise settling, nothing else holds either the promise the program was given or the
+// values already collected for it.
+var combinations: Buf[Combination] = buf()
+
+// What a waiting combination can still reach. Called from `mark_scheduler`.
+mark_combinations(h: *gc.Heap)
+    for i in 0..<combinations.len()
+        val c = combinations.at(i)
+
+        gc.mark(h, ptr_cast(c.out))
+
+        for j in 0..<c.values.len()
+            mark_value(h, c.values.at(j))
+
+            val p = c.watching.at(j)
+
+            if p != null then gc.mark(h, ptr_cast(p))
+end mark_combinations
+
+// Give the list back between runs.
+reset_combinations() = combinations.clear()
+
+// Whether this combination now knows its answer.
+private decided(c: Combination) -> bool
+    var waiting = false
+    var failed = false
+    var answered = false
+
+    for i in 0..<c.state.len()
+        val s = c.state.at(i)
+
+        if s == 0 then waiting = true
+        elif s == 1 then answered = true
+        else failed = true
+
+    c.kind match
+        WaitAll -> failed || !waiting
+        WaitSettled -> !waiting
+        WaitRace -> answered || failed
+        WaitAny -> answered || !waiting
+end decided
+
+// Hand a decided combination its answer.
+//
+// **Everything it holds is rooted first.** Building the array or the records allocates, and a
+// combination taken off the list is no longer anything the collector walks -- so the values gathered
+// for it are held here for as long as it takes to put them somewhere traced.
+private answer_combination(c: Combination)
+    val mark = root_mark()
+
+    hold(Promise(c.out))
+
+    for i in 0..<c.values.len()
+        hold(c.values.at(i))
+
+    c.kind match
+        WaitAll -> answer_all(c)
+        WaitSettled -> answer_settled(c)
+        WaitRace -> answer_race(c)
+        WaitAny -> answer_any(c)
+
+    release(mark)
+end answer_combination
+
+// **The FIRST failure in the order the promises were given**, where more than one has failed by the
+// time the answer is taken. Only a call handed promises that had already settled can see more than
+// one at once -- the incremental path answers on the settling that decided it -- and picking by
+// position is what makes that case say the same thing twice.
+private answer_all(c: Combination)
+    for i in 0..<c.state.len()
+        if c.state.at(i) == 2
+            settle_err(c.out, c.messages.at(i), c.at)
+            return
+
+    val made = new_array(buf())
+
+    hold(Array(made))
+
+    for i in 0..<c.values.len()
+        made.items.push(c.values.at(i))
+
+    settle_ok(c.out, Array(made))
+end answer_all
+
+// **The RESULT shape slate already has, and not JavaScript's `{status, value | reason}`.** A slate
+// program reads `{ ok: true, value }` and `{ ok: false, error }` off `parseJSON`, off every `Sync`
+// call in `slate:fs` and off `run`, and a second spelling of the same idea would be a second thing to
+// remember for no gain -- `if r.ok` reads better than `if r.status == "fulfilled"`, and `match` takes
+// it apart with the pattern a program already writes. The `error` is the sentence the promise failed
+// with, a slate rejection carrying text rather than a value.
+private answer_settled(c: Combination)
+    val made = new_array(buf())
+
+    hold(Array(made))
+
+    for i in 0..<c.values.len()
+        made.items.push(if c.state.at(i) == 2 then err_value(c.messages.at(i)) else ok_value(c.values.at(i)))
+
+    settle_ok(c.out, Array(made))
+end answer_settled
+
+private answer_race(c: Combination)
+    for i in 0..<c.state.len()
+        if c.state.at(i) == 1
+            settle_ok(c.out, c.values.at(i))
+            return
+
+        if c.state.at(i) == 2
+            settle_err(c.out, c.messages.at(i), c.at)
+            return
+end answer_race
+
+// **What JavaScript raises an `AggregateError` for, said as one sentence.** slate's rejections carry
+// text and not a value, so there is nothing for an error object to be; what a reader of the failure
+// needs is every reason, and a sentence listing them is that with nothing else to learn.
+private answer_any(c: Combination)
+    for i in 0..<c.state.len()
+        if c.state.at(i) == 1
+            settle_ok(c.out, c.values.at(i))
+            return
+
+    var b = str_builder()
+
+    b.push("every promise `any` was given failed: ")
+
+    for i in 0..<c.messages.len()
+        if i > 0 then b.push("; ")
+
+        b.push(c.messages.at(i))
+
+    settle_err(c.out, b.finish(), c.at)
+end answer_any
+
+// Tell every combination that this promise has settled, and answer the ones that now know.
+//
+// **The decided ones come off the list BEFORE any of them is answered**, because settling a
+// combination's promise wakes whatever was awaiting it, which may make another combination -- and a
+// second walk of a list this one is halfway through has nothing to make it agree with the first.
+// That is `settle_watches`' rule and it is here for the same reason.
+//
+// Not `private`: `async.sysl`'s `wake` is the caller.
+settle_combinations(pr: *PromiseObj)
+    if combinations.is_empty() then return
+
+    var live: Buf[Combination] = buf()
+    var done: Buf[Combination] = buf()
+
+    for i in 0..<combinations.len()
+        // **`var` because `set` writes through**, which is the whole reason the buffers are
+        // pre-sized: this copy shares their storage with the one on the list.
+        var c = combinations.at(i)
+        var touched = false
+
+        for j in 0..<c.watching.len()
+            if c.watching.at(j) == pr
+                c.watching.set(j, null)
+
+                if pr.failed
+                    c.state.set(j, 2)
+                    c.messages.set(j, pr.message)
+                else
+                    c.state.set(j, 1)
+                    c.values.set(j, pr.value)
+
+                touched = true
+
+        if touched && decided(c) then done.push(c) else live.push(c)
+
+    combinations = live
+
+    for i in 0..<done.len()
+        answer_combination(done.at(i))
+end settle_combinations
+
+// `all(xs)`, `allSettled(xs)`, `race(xs)` and `any(xs)` -- one array in, one promise out.
+//
+// **A plain value in the array is a value that has already arrived**, which is `resolve`'s own
+// reading and is what makes `all([cached, fetch(url)])` a line a program can write: a cache hit does
+// not have to be dressed up as a promise to sit beside one.
+//
+// **Nothing to wait for is two different answers, and the split is what the question means.**
+// `all([])` and `allSettled([])` answer the empty array, every one of no promises having succeeded;
+// `race([])` and `any([])` are asking which of no promises came first, and there is no such one.
+// JavaScript answers that with a promise that never settles, which is a program that hangs and says
+// nothing -- so slate refuses at the call instead.
+do_combine(args: Buf[Value], at: Span, kind: Combining) -> Step
+    val name = combine_name(kind)
+
+    if args.len() != 1
+        return fault(at, s"`${name}` takes one array of promises, and was given ${counted(args.len(), "argument")}")
+
+    val xs = args.at(0) match
+        Array(a) -> a
+        other -> return fault(at, s"`${name}` takes an array of promises, and this is ${other.type_name()}")
+
+    val n = xs.items.len()
+
+    if n == 0
+        kind match
+            WaitRace -> return fault(at, "`race` was given nothing to race -- there is no first answer among no promises")
+            WaitAny -> return fault(at, "`any` was given nothing to wait for -- there is no first answer among no promises")
+            _ -> ()
+
+    val mark = root_mark()
+    val out = new_promise()
+
+    hold(Promise(out))
+
+    var c = Combination(kind, out, buf(), buf(), buf(), buf(), at)
+
+    for i in 0..<n
+        c.values.push(Null)
+        c.state.push(0)
+        c.messages.push("")
+        c.watching.push(null)
+
+    for i in 0..<n
+        xs.items.at(i) match
+            Promise(p) ->
+                // **A promise a combinator is waiting on is a promise something IS waiting on**, so
+                // a rejection it collects is not also reported at the end of the run as one nobody
+                // was waiting for. That is `watch_for_fault`'s rule and JavaScript's: `Promise.all`
+                // subscribes to every one of them whether or not it uses the answer.
+                p.handled = true
+
+                if p.settled
+                    if p.failed
+                        c.state.set(i, 2)
+                        c.messages.set(i, p.message)
+                    else
+                        c.state.set(i, 1)
+                        c.values.set(i, p.value)
+                else
+                    c.watching.set(i, p)
+            other ->
+                c.state.set(i, 1)
+                c.values.set(i, other)
+
+    // **A call handed nothing but settled promises answers before it comes back**, which is what an
+    // empty `all` and a `race` between two `resolve`s both are.
+    if decided(c) then answer_combination(c) else combinations.push(c)
+
+    release(mark)
+    Ok(Promise(out))
+end do_combine

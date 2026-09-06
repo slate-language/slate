@@ -27,7 +27,7 @@ print(upper("héllo"), upper("abc123"), upper(""), upper("日本語"))
 // -- lower has two cases of its own --------------------------------------------------------------
 
 // `İ` is the one lower case in the database longer than what it came from.
-print(lower("İ"), len(lower("İ")))
+print(lower("İ"), lower("İ").length)
 
 // A final sigma is context and not a table: last letter of a word, and not otherwise.
 print(lower("ΟΔΟΣ"), lower("ΣΟΦΟΣ"), lower("ΟΣΟ"))
@@ -55,7 +55,7 @@ val composed = "é"
 val decomposed = "e\u{301}"
 
 print(composed == decomposed, normalize(composed, "NFD") == decomposed, normalize(decomposed, "NFC") == composed)
-print(len(normalize(composed, "NFD")), len(normalize(decomposed, "NFC")))
+print(normalize(composed, "NFD").length, normalize(decomposed, "NFC").length)
 
 // The compatibility forms throw information away, which is what makes them for matching.
 print(normalize("ﬁ", "NFKC"), normalize("²", "NFKC"), normalize("①", "NFKC"))

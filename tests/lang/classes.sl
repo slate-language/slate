@@ -58,7 +58,7 @@ class Bag
     set(self, i, v)
         self.items[i] = v
 
-    get size(self) = len(self.items)
+    get size(self) = self.items.length
 
 writesTwice(o)
     o.twice = 9
@@ -104,7 +104,7 @@ A_PROPERTY_IS_NOT_A_FIELD_AND_NOTHING_THAT_WALKS_ONE_REPORTS_IT() =
     val r = Rect.new(3, 4)
 
     assertEq(keys(r), ["w", "h"])
-    assertEq(len(r), 2)
+    assertEq(keys(r).length, 2)
     assert(!has(r, "area"))
     assertEq(string(r), "Rect(w = 3, h = 4)")
     assertEq(toJSON(r), "{\"w\":3,\"h\":4}")

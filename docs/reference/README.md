@@ -12,13 +12,14 @@ Every construct in slate, written down once, in its own place.
 | | |
 |---|---|
 | [Lexical structure](lexical.md) | files, comments, indentation, names, literals, interpolation |
-| [Values](values.md) | the nine kinds, truth, equality, conversion |
+| [Values](values.md) | the eleven kinds, truth, equality, conversion |
 | [Expressions](expressions.md) | operators, the precedence table, ranges, `with`, `??`, `?.`, spread |
 | [Statements](statements.md) | `val` and `var`, assignment, `if`, every loop, blocks |
 | [Patterns](patterns.md) | `match`, `is`, what binds, what tests, exhaustiveness |
 | [Functions](functions.md) | definitions, lambdas, defaults, named arguments, `...rest` |
 | [Types](types.md) | `type`, annotations, what the checker will and will not say |
 | [Objects](objects.md) | fields, `proto`, the receiver rule, operator methods |
+| [Collections](collections.md) | `Set` and `Map`, any value as a key, `size`, iteration |
 | [Classes](classes.md) | `class`, `from`, `is`, `new`, class patterns |
 | [Data types](data-types.md) | `data`, variants, immutability, exhaustive `match` |
 | [Modules](modules.md) | `export`, `import`, the three kinds of specifier |

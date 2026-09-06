@@ -39,6 +39,8 @@ import { byId, setText, on } from slate:dom
 | `onNavigate(fn)` | the user moved — **not** a push the program made |
 | `stored(key)`, `store(key, v)` | `localStorage`, as results |
 | `unstore(key)`, `storedKeys()`, `clearStored()` | |
+| `cookies()`, `cookie(name)` | what the document is carrying, as an object or one value |
+| `setCookie(name, v, options = {})`, `deleteCookie(name, options = {})` | |
 
 **`on` and `off` rather than `addEventListener`**, and `byId` rather than `getElementById`. The DOM's names
 are long because JavaScript had no modules when they were chosen; these are reached through an import that
@@ -232,6 +234,40 @@ was written by somebody else — another tab, an earlier visit, a user who clear
 there is `{ ok: true, value: null }` and not a failure; a browser told to keep no data is
 `{ ok: false, error }`. A value that is not a string is stored as slate prints it, a store holding nothing
 else.
+
+## What rides along with every request
+
+**A fourth door, and one a request carries without being asked** — `localStorage` never leaves the
+browser and a cookie always does, which is the whole reason a server-rendering framework reaches for
+one at all: a session id, a CSRF token, anything the *next* request needs to already be carrying.
+Every one of the four faults outside a browser, there being no document to read or write — so a file
+meant to run in more than one place guards the call itself, checking `host() == "browser"` first,
+[as `host()`](globals.md#host) documents.
+
+```slate
+import { cookies, cookie, setCookie, deleteCookie } from slate:dom
+
+setCookie("theme", "dark", { path: "/", maxAge: 60 * 60 * 24 * 30, sameSite: "Lax" })
+
+print(cookie("theme"))         // "dark", or null when there is none
+print(cookies())               // every cookie the document is carrying, as an object
+
+deleteCookie("theme", { path: "/" })
+```
+
+**`cookie` and `cookies` answer plain values and never a result** — reading `document.cookie` cannot
+throw the way `localStorage` can, there being no quota to run out of and no separate permission a page
+can be denied. A name that is not set is `null`, not a fault.
+
+**The value is encoded and the options are not.** `setCookie` percent-encodes the value the same way
+`cookie` decodes it back — a `;` or `=` inside it would otherwise end the pair or split it in the wrong
+place — while `path`, `domain`, `expires` and `sameSite` are written into the cookie string exactly as
+given, because they are the browser's syntax and not a value a program round-trips.
+
+**A delete needs the SAME path and domain a set was given.** A cookie is identified by all three
+together, so `deleteCookie("theme")` after `setCookie("theme", "dark", { path: "/" })` writes a
+*second*, path-less cookie rather than removing the first — `document.cookie`'s own trap, carried
+through rather than papered over.
 
 ## Under the interpreter
 

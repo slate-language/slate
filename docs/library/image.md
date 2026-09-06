@@ -24,7 +24,7 @@ print(back.ok, back.value.width, back.value.height, back.value.channels)
 
 val bigger = resizeImage(back.value, 4, 4)
 
-print(bigger.width, bigger.height, len(bigger.pixels))
+print(bigger.width, bigger.height, bigger.pixels.length)
 
 // The shape without decoding anything, which is what to ask of an upload.
 print(imageShape(png).value.width, imageShape(png).value.height)
@@ -93,7 +93,7 @@ print(shape.width, shape.height, shape.channels)
 print(readImage(file).value.pixels == src.pixels)
 
 // A quality instead of a record is the lossy coder, which keeps the alpha either way.
-print(len(encodeWebP(src, 40)) < len(encodeWebP(src, 100)))
+print(encodeWebP(src, 40).length < encodeWebP(src, 100).length)
 ```
 
 ```output

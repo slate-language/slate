@@ -67,6 +67,14 @@ arrangement — a server and a client in one program — with the request writte
 says whether the file it planted *above* the root came back, so a refusal is checked against what it
 was refusing rather than only against its own status line.
 
+**`p33.sl` is about a PROPERTY, and the astral string is why it is a corpus file rather than only a
+unit test.** `.length` on a string, an array and the bytes under text is one table in each back end —
+`method.sysl`'s `properties_of` and `js_rt_method.sysl`'s `PROPERTIES` — and the emitted form could
+have been the host's own `.length`, which counts UTF-16 units where slate counts characters. Every
+ASCII string in every other program agrees either way, so `"a👋"` is the whole of the check. The
+refusals travel with it: a read-only property, and a property called as though it were a method, each
+having to say so in the same words on both hosts.
+
 **`dom/` is a run of its own and needs jsdom** — see `dom/README.md`.
 
 **`p8.sl` writes into `tests/js/scratch/` and takes it away again**, so that running it twice says

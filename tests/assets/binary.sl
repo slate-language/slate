@@ -1,3 +1,3 @@
 import logo from "./logo.qoi"
 
-print(len(logo))
+print(logo.length)

@@ -23,11 +23,11 @@ print(h(1, 2))
 print(h(1, 2, 3, 4))
 
 // A lambda, an async function and a generator each gather.
-val g = (a, ...rest) -> len(rest)
+val g = (a, ...rest) -> rest.length
 
 print(g(1), g(1, 2, 3))
 
-async wide(...xs) = len(xs)
+async wide(...xs) = xs.length
 
 gen(...xs)
     for x in xs

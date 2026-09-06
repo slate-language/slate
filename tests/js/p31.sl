@@ -1,152 +1,179 @@
-// `Set` and `Map` on both back ends.
+// The eighteen library additions a JavaScript person reaches for, on both back ends.
 //
-// The interpreter keeps each in the very table an object is -- insertion order, structural hashing,
-// and a class's own `==` and `hash` where it wrote them -- and the JavaScript runtime keeps each in
-// `SObj`, which is that table again. So what this file is for is the CONSEQUENCES of that being one
-// design twice: a number and a real that are equal share a key, two arrays written alike share one,
-// a class with a `hash` decides its own, and the order a walk gives back is the order things went in.
+// **Every one of them is written twice** — once for the interpreter in `text.sysl`, `value.sysl`,
+// `reshape.sysl` and `combine.sysl`, and once for the JavaScript back end in `js_rt_builtins.sysl`
+// and `js_rt_host.sysl` — so this file is what says the two readings are one language. Nothing
+// here is shared between the halves but the tree this program parses to.
 //
-// Reaching for the host's own `Map` and `Set` is the version of this that would have failed here:
-// they key on SameValueZero, so `1` and `1.0` would be two entries, two equal arrays would be two
-// keys, and a class's hooks would never be asked.
+// **The refusals are here for the same reason the answers are.** A sentence is what a program's
+// reader gets, so two back ends faulting in different words about one mistake is a disagreement
+// like any other; several of the lines below are the shortest input that produces one.
 //
-// **The renderings are the other half.** `print` and `toJSON` write a set as an array and a map as
-// an array of pairs on both hosts, which JavaScript itself does not -- `Set(2) {1, 2}` and `{}` are
-// what a JavaScript host would say, one of which nothing parses and the other of which is empty.
+// **`toFixed` and `formatNumber` are the pair worth reading twice.** JavaScript's `toFixed` rounds
+// a tie away from zero and C's `printf` rounds one to the even digit, so the interpreter does that
+// arithmetic exactly rather than handing it to the host — and `2.5` at nought places is where the
+// two rules disagree.
 
-// -- what is in one, and in what order --------------------------------------------------------
+// -- text ------------------------------------------------------------------------------------------
 
-val s = Set()
+print("[" + padStart("7", 3) + "]", "[" + padEnd("7", 3) + "]")
+print("[" + padStart("42", 6, "0") + "]", "[" + padEnd("ab", 7, "-") + "]")
 
-s.add("b").add("a").add("b")
-print(s, s.size(), len(s), s.values())
-print(s.has("a"), s.has("z"), s.delete("a"), s.has("a"), s.size())
+// A filler of more than one character repeats and is CUT where it does not fit.
+print("[" + padStart("x", 6, "ab") + "]", "[" + padEnd("x", 6, "ab") + "]")
 
-val t = Set([3, 1, 2, 3, 1])
+// **The width is in CHARACTERS**, which is why neither back end may hand this to JavaScript's own
+// `padStart`: that one counts UTF-16 units, so a name with an emoji in it comes out a column short.
+print("[" + padStart("🙂", 4, "-") + "]", "[" + padEnd("café", 6, ".") + "]")
 
-print(t, t.size())
+// A string already at the width, or past it, is itself.
+print("[" + padStart("hello", 5) + "]", "[" + padStart("hello", 2) + "]")
 
-for v in t
-    print("member", v)
+// **`replaceAll` IS `replace`**, slate's having always changed every occurrence.
+print(replaceAll("a,b,c", ",", ";"), replace("a,b,c", ",", ";"))
+print("1,234,567".replaceAll(",", ""))
 
-t.forEach(v -> print("each", v))
-print([...t], [...t, 99])
+// **`includes` IS `contains`**, and it answers about a string and about an array.
+print(includes("hello", "ell"), includes("hello", "xyz"))
+print(includes([1, 2, 3], 2), includes([1, 2, 3], 9))
+print("hello".includes("he"), [1, 2, 3].includes(3))
 
-// -- a map, whose entries are pairs -------------------------------------------------------------
+// -- numbers ---------------------------------------------------------------------------------------
 
-val m = Map()
+print(toFixed(3.14159, 2), toFixed(1.5, 0), toFixed(2.5, 0), toFixed(-2.5, 0))
+print(toFixed(0.1, 5), toFixed(1234.5678, 2), toFixed(1.005, 2))
+print(toFixed(7, 2), toFixed(7, 0), toFixed(-1.45, 1))
+print((3.14159).toFixed(3), (42).toFixed(1))
 
-m.set("first", 1).set("second", 2).set("first", 10)
-print(m, m.size(), m.get("first"), m.get("missing"), m.has("second"))
-print(m.keys(), m.values(), m.entries())
+print(formatNumber(1234567), formatNumber(-1234567), formatNumber(0), formatNumber(123))
+print(formatNumber(1000), formatNumber(999), formatNumber(1000000))
+print(formatNumber(toFixed(1234.5, 2)), formatNumber(toFixed(-1234.5, 2)))
+print(formatNumber(1234567, { separator: " " }), formatNumber(1234567, { separator: ".", decimal: "," }))
+print((1234567).formatNumber())
 
-for [k, v] in m
-    print("pair", k, v)
+// -- arrays ------------------------------------------------------------------------------------------
 
-m.forEach(p -> print("each", p))
-print([...m])
-print(m.delete("first"), m.delete("first"), m.size(), m)
+val nums = [1, 2, 3, 4, 5, 6, 7]
 
-// -- what counts as the same key ----------------------------------------------------------------
+// **The key is `string(f(x))`**, so the answer is an ordinary record: its keys are text, `keys`
+// walks it and `toJSON` writes it.
+val parity = groupBy(nums, n -> n % 2)
 
-// **An integer and a real that are numerically equal are ONE key**, because `==` says they are
-// equal. A JavaScript `Map` keyed the host's way would make these two entries.
-val numbers = Map()
+print(keys(parity))
+print(parity["0"], parity["1"])
+print(groupBy(["apple", "avocado", "beet"], s -> s[0]))
 
-numbers.set(1, "integer").set(1.0, "real")
-print(numbers.size(), numbers.get(1), numbers.get(1.0))
+// A group is an array even where it holds one element.
+print(groupBy([5], n -> n))
 
-// **Two arrays written alike are one key**, slate comparing them by what they hold.
-val structural = Set()
+print(zip([1, 2, 3], ["a", "b", "c"]))
 
-structural.add([1, 2]).add([1, 2]).add([1, 3])
-print(structural, structural.size(), structural.has([1, 2]))
+// **The SHORTEST array decides the length**, so nothing in the answer was in none of the inputs.
+print(zip([1, 2, 3], ["a"]), zip([1, 2], ["a", "b"], [true, false]))
+print(zip([1, 2, 3]), zip([], [1, 2]))
 
-// `null` is a value like any other and may be a key.
-val nulls = Map()
+print(unique([1, 2, 2, 3, 1, 3]), unique(["a", "a", "b"]), unique([]))
 
-nulls.set(null, "absent nothing")
-print(nulls.has(null), nulls.get(null), nulls.size())
+// Equality is `==`, which is the question `contains` asks, so two objects with the same fields are
+// one element.
+print(unique([{ a: 1 }, { a: 1 }, { a: 2 }]))
 
-// **A class that writes `==` should write `hash` beside it, and a set is where that matters**: the
-// table finds a member by its hash and only then compares, so two equal values that hashed apart
-// would never meet.
-class Point
-    var x
-    var y
+print(chunk(nums, 2), chunk(nums, 3), chunk(nums, 10), chunk([], 2))
 
-    ==(self, o) = o is Point && o.x == self.x && o.y == self.y
-    hash(self) = self.x * 31 + self.y
+print(count(nums, n -> n > 4), count(nums, n -> false), count([], n -> true))
 
-val points = Set()
+val [even, odd] = partition(nums, n -> n % 2 == 0)
 
-points.add(Point(1, 2)).add(Point(1, 2)).add(Point(3, 4))
-print(points.size(), points.has(Point(1, 2)), points.has(Point(9, 9)))
+print(even, odd)
+print(partition([], n -> true))
 
-val byPoint = Map()
+val people = [{ name: "ann", age: 31 }, { name: "bo", age: 24 }, { name: "cy", age: 31 }]
 
-byPoint.set(Point(1, 2), "origin-ish").set(Point(1, 2), "written over")
-print(byPoint.size(), byPoint.get(Point(1, 2)))
+// **The ELEMENT and not the key**, and the FIRST of two equal keys wins.
+print(minBy(people, p -> p.age), maxBy(people, p -> p.age))
+print(minBy([], p -> p), maxBy([], p -> p))
+print(minBy(["bbb", "a", "cc"], s -> s.length))
 
-// -- built from something else -------------------------------------------------------------------
+// Every one of them is a method too, `xs.chunk(2)` being `chunk(xs, 2)`.
+print(nums.chunk(4), nums.unique(), nums.count(n -> n < 3))
+print([1, 2].zip(["a", "b"]), people.maxBy(p -> p.age).name)
+print(nums.partition(n -> n > 5), [3, 1, 2].minBy(n -> n))
 
-print(Set(0..<4), Set(Set([5, 6])), Map(Map([["z", 9]])))
-print(Set([]), Map([]), Set().size(), Map().size())
-
-// -- what a set and a map ARE, as a test and as an annotation ------------------------------------
-
-print(t is Set, t is Map, m is Map, m is Set, [1] is Set)
-print(Set([1, 2]) is Set[integer], Set([1, 2]) is Set[string], Set() is Set[string])
-print(Map([[1, "a"]]) is Map[integer, string], Map([[1, "a"]]) is Map[string, string])
-
-val annotated: Map[string, integer] = Map([["n", 1]])
-
-print(annotated)
-
-// -- clearing, and the rendering both hosts owe --------------------------------------------------
-
-val emptied = Set([1, 2, 3])
-
-emptied.clear()
-print(emptied, emptied.size())
-print(toJSON(Set([1, 2])), toJSON(Map([["a", 1], ["b", 2]])))
-print(toJSON(Set()), toJSON(Map()))
-print(toJSON(Map([["a", 1]]), 2))
-print(string(Set([1, 2])), string(Map([["a", 1]])))
-
-// **Identity, not contents.** Two sets holding the same members are two sets, which is the rule a
-// mutable container has to take: an equality that walked them would stop being true without either
-// value being touched by the code that asked.
-val one = Set([1])
-val other = Set([1])
-
-print(one == one, one == other, one != other)
-
-// -- what each refuses ---------------------------------------------------------------------------
-
+// **The CHECKER refuses most of these where they are written**, which is the pass working -- so a
+// value whose type it cannot see is what makes the machine.s own sentence reachable at all. An
+// unannotated function answers `any` by design and permanently, which is the established way here.
 anything(v) = v
 
-try
-    print(Set(anything(1)))
-catch e
-    print(e.message)
+// -- what each of them refuses -----------------------------------------------------------------------
 
-try
-    print(Map(anything([1])))
-catch e
-    print(e.message)
+print(chunk(nums, 0) catch e -> e.message)
+print(chunk(nums, -1) catch e -> e.message)
+print(chunk(nums, anything("two")) catch e -> e.message)
+print(groupBy(anything(5), n -> n) catch e -> e.message)
+print(count(anything("abc"), n -> n) catch e -> e.message)
+print(zip() catch e -> e.message)
+print(zip([1], 2) catch e -> e.message)
+print(padStart("x", -1) catch e -> e.message)
+print(padStart("x", 3, "") catch e -> e.message)
+print(padEnd("x", 3, "") catch e -> e.message)
+print(replaceAll("abc", "", "!") catch e -> e.message)
+print(toFixed(1.5, -1) catch e -> e.message)
+print(toFixed(1.5, 200) catch e -> e.message)
+print(formatNumber(anything(1.5)) catch e -> e.message)
+print(formatNumber("twelve") catch e -> e.message)
+print(formatNumber(12, { seperator: "," }) catch e -> e.message)
+print(formatNumber(12, { separator: 5 }) catch e -> e.message)
 
-try
-    print(Map(anything([["a", 1, 2]])))
-catch e
-    print(e.message)
+// **A SPREAD IS NOT COUNTED BY THE CHECKER**, which is what makes a wrong-arity refusal reachable
+// from a program at all: written out, `unique(a, b)` is refused where it stands and this file would
+// not compile. So the count arrives at run time, which is the check both back ends are making.
+val two = [[1, 2], 3]
+val one = [[1, 2]]
+val none = []
 
-try
-    print(anything(Set()).get("a"))
-catch e
-    print(e.message)
+print(unique(...two) catch e -> e.message)
+print(chunk(...none) catch e -> e.message)
+print(minBy(...one) catch e -> e.message)
 
-try
-    print(len(anything(true)))
-catch e
-    print(e.message)
+// -- waiting on many promises at once ------------------------------------------------------------------
+
+// **A plain value in the array is a value that has already arrived**, which is `resolve`'s own
+// reading and is what makes `all([cached, fetched()])` a line a program can write.
+async slow(ms, v)
+    await sleep(ms)
+    v
+
+async bad(ms, why)
+    await sleep(ms)
+    await reject(why)
+
+async main()
+    print(await all([slow(10, 1), slow(1, 2), 3]))
+    print(await all([]))
+    print((await all([slow(1, 1), bad(1, "no good")])) catch e -> e.message)
+    print((await all([bad(1, "first"), bad(5, "second")])) catch e -> e.message)
+
+    val settled = await allSettled([slow(1, "yes"), bad(1, "nope")])
+
+    // **slate's RESULT shape and not JavaScript's `{ status, value | reason }`**, which is what
+    // `parseJSON`, every `Sync` call in `slate:fs` and `run` already answer.
+    print(settled)
+    print(settled[0].ok, settled[0].value, settled[1].ok, settled[1].error)
+    print(await allSettled([]))
+
+    print(await race([slow(1, "quick"), slow(50, "slow")]))
+    print((await race([bad(1, "lost"), slow(50, "won")])) catch e -> e.message)
+    print(await race([7, slow(1, "later")]))
+
+    print(await any([bad(1, "one"), slow(5, "two")]))
+    print((await any([bad(1, "one"), bad(5, "two")])) catch e -> e.message)
+
+    // **`race([])` and `any([])` FAULT rather than answering a promise that never settles**, which
+    // is what JavaScript does and is a program that hangs and says nothing.
+    print(race([]) catch e -> e.message)
+    print(any([]) catch e -> e.message)
+    print(all(anything(5)) catch e -> e.message)
+    print(allSettled(anything("no")) catch e -> e.message)
+    print(race(...two) catch e -> e.message)
+
+main()

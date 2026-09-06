@@ -13,7 +13,7 @@ run()
         out = out + "x" + string(i % 10)
         i = i + 1
 
-    len(out)
+    out.length
 
 val started = now()
 

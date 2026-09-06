@@ -20,6 +20,12 @@ slate is dynamically typed. Every value is one of a fixed set of kinds, and a pr
 | `object` | `{ a: 1 }` | reference type, compares by contents |
 | `function` | `x -> x`, a definition | |
 | promise | answered by an `async` call | see [Asynchrony](asynchrony.md) |
+| `set` | `Set([1, 2])` | reference type, holds each value once — [Collections](collections.md) |
+| `map` | `Map([["a", 1]])` | reference type, any value as a key — [Collections](collections.md) |
+
+A set and a map compare by **identity** rather than by contents, as a promise and a function do:
+what is in either can change, so an answer read off the contents would stop being true without
+either value being touched by the code that asked.
 
 Eight more scalar kinds come with [`slate:time`](../library/time.md) — `instant`, `duration`, `date`,
 `time`, `dateTime`, `zone`, `zoned`, `period` — and a compiled pattern comes with
@@ -103,7 +109,7 @@ kind test can tell the two apart, so a function that must answer an integer is w
 a person counts:
 
 ```slate
-print(len("日本語"))
+print("日本語".length)
 print("日本語"[0..<1])
 print("héllo"[1])
 print(indexOf("héllo", "llo"))      // by character; it is 3 by byte
@@ -119,8 +125,36 @@ print(indexOf("héllo", "llo"))      // by character; it is 3 by byte
 There is no character type: a single character is a string of one. That is what lets indexing, `chars`
 and `split` all hand back the same kind of thing.
 
+**`.length` is that count read as a property** — a name a `.` answers with a value and no brackets
+after it, exactly as a class's `get` is read. `s.length` counts characters and not UTF-16 units, so
+a string of one emoji is 1 here where JavaScript says 2. An array carries one too, and so therefore
+do the bytes under a string, an array of numbers being the only shape bytes have.
+
+```slate
+print("日本語".length, "a👋".length)
+print([1, 2, 3].length, toBytes("héllo").length)
+```
+
+```output
+3 2
+3 6
+```
+
+**It is read-only.** A length is what a value already is rather than a field it holds, so writing to one
+is refused instead of resizing anything:
+
+```slate
+var s = "abc"
+
+s.length = 5
+```
+
+```error
+`length` is a read-only property of a string
+```
+
 `toBytes(s)` answers an array of numbers and `fromBytes(bs)` answers a [result](faults.md); those two
-are the only place a slate program sees UTF-8, and `len(toBytes(s))` is the byte count.
+are the only place a slate program sees UTF-8, and `toBytes(s).length` is the byte count.
 
 **Case and whitespace are the whole database and not the ASCII range.** `upper` and `lower` answer
 what any other language with a case table answers, which is not always one character out for one
@@ -128,7 +162,7 @@ character in, and `trim` takes off Unicode's `White_Space` — so a no-break spa
 comes off and a zero-width no-break space, which is not a space at all, stays.
 
 ```slate
-print(upper("Straße"), len(lower("İ")))
+print(upper("Straße"), lower("İ").length)
 print(lower("ΟΔΟΣ"), lower("ΟΔΟΣΑ"))
 print("[" + trim(" \u{a0}x\u{a0} ") + "]")
 ```

@@ -101,7 +101,16 @@ type_of_expr(x: Expr, env: *TypeEnv) -> Type
         Field(target, field, optional) ->
             if optional then return type_of(Any)
 
-            *type_of_expr(target, env).kind match
+            val holder = type_of_expr(target, env)
+
+            // **A PROPERTY OF A BUILTIN KIND IS WORTH WHAT ITS NATIVE ANSWERS**, so `s.length` is an
+            // integer here and a call given it is checked. It is asked before the shape below
+            // because a builtin kind has no shape to ask about.
+            property_result(holder, field) match
+                Some(t) -> return t
+                None -> ()
+
+            *holder.kind match
                 ObjectWith(keys, values, maybe) ->
                     for i in 0..<keys.len()
                         if keys.at(i) == field && !maybe.at(i) then return values.at(i)
@@ -109,6 +118,13 @@ type_of_expr(x: Expr, env: *TypeEnv) -> Type
                     type_of(Any)
                 _ -> type_of(Any)
         Ensures(_, _, pat) -> type_from_pattern(resolve_pattern(pat, 0))
+
+        // **AN `if` AND A `match` USED FOR THEIR VALUE ARE WORTH WHAT THEIR BRANCHES AGREE ON**, and
+        // `Any` the moment they do not -- never a union, which `fits` refuses on the value side
+        // unless every alternative fits. `result.sysl` holds both joins, a function's inferred
+        // answer being the same question asked of a whole body.
+        IfExpr(_, then_branch, else_branch) -> if_result(then_branch, else_branch, env)
+        MatchExpr(_, arms) -> match_result(arms, env)
         _ -> type_of(Any)
 end type_of_expr
 
@@ -298,7 +314,13 @@ check_expr(x: Expr, env: *TypeEnv)
 
     *x.kind match
         Call(callee, args) ->
-            check_expr(callee, env)
+            // **A METHOD CALL'S CALLEE IS WALKED AS ITS RECEIVER**, not as a field read: `xs.nope()`
+            // is one mistake and `check_method` is where it is reported, so walking the whole callee
+            // would draw a second complaint about the same name from `check_field_read`.
+            *callee.kind match
+                Field(target, _, _) -> check_expr(target, env)
+                _ -> check_expr(callee, env)
+
             check_args(callee, args, env)
             check_method(callee, env)
             check_call(callee, args, env, at)
@@ -325,7 +347,11 @@ check_expr(x: Expr, env: *TypeEnv)
         Block(stmts) ->
             enter_scope(env)
             check_stmts(stmts, env)
-            leave_scope(env)
+
+            // **A BLOCK RUNS TO ITS END, so what it left a followed name holding is what the line
+            // below it holds.** The scope goes; the flow it wrote does not, or an assignment inside
+            // a branch would be forgotten before the join below the branch could read it.
+            leave_scope_flowing(env, false)
         ArrayLit(items) -> for i in 0..<items.len() do check_expr(items.at(i), env)
         DataLit(inner) -> check_expr(inner, env)
 
@@ -335,7 +361,9 @@ check_expr(x: Expr, env: *TypeEnv)
         ObjectLit(_, _, values) -> for i in 0..<values.len() do check_expr(values.at(i), env)
         Interp(pieces) -> for i in 0..<pieces.len() do check_expr(pieces.at(i), env)
         Compare(operands, _) -> for i in 0..<operands.len() do check_expr(operands.at(i), env)
-        Field(target, _, _) -> check_expr(target, env)
+        Field(target, name, optional) ->
+            check_expr(target, env)
+            check_field_read(target, name, optional, env, at)
         Index(target, key) ->
             check_expr(target, env)
             check_expr(key, env)
@@ -362,20 +390,58 @@ check_expr(x: Expr, env: *TypeEnv)
         IfExpr(cond, then_branch, else_branch) ->
             check_expr(cond, env)
 
+            // **WHAT A FOLLOWED NAME HOLDS BELOW AN `if` IS THE UNION OF WHAT THE BRANCHES LEFT IT
+            // AT**, and each branch's answer is read out of its own scope before that scope is left.
+            // A branch that always leaves contributes nothing, control below the `if` never having
+            // come from it; a missing `else` contributes the name as the false side of the test
+            // narrows it, that being what the path which skipped the branch left it at.
+            var j = join_start()
+            var then_names: Buf[string] = buf()
+            var then_types: Buf[Type] = buf()
+
             enter_scope(env)
             narrow_by(cond, true, env)
             check_expr(then_branch, env)
+            flow_here(env, &then_names, &then_types)
             leave_scope(env)
+
+            if !always_leaves(then_branch) then join_arm(&j, env, then_names, then_types)
 
             else_branch match
                 Some(other) ->
+                    var else_names: Buf[string] = buf()
+                    var else_types: Buf[Type] = buf()
+
                     enter_scope(env)
                     narrow_by(cond, false, env)
                     check_expr(other, env)
+                    flow_here(env, &else_names, &else_types)
                     leave_scope(env)
-                None -> ()
+
+                    if !always_leaves(other) then join_arm(&j, env, else_names, else_types)
+                // **A MISSING `else` IS STILL A PATH AND IT KNOWS THE TEST FAILED**, so what it
+                // contributes is the name as the false side narrows it -- which for a name the test
+                // ruled out entirely is a branch nothing reaches, and claiming what it held above
+                // would put a type back that no run can carry there.
+                None ->
+                    var skipped_names: Buf[string] = buf()
+                    var skipped_types: Buf[Type] = buf()
+
+                    enter_scope(env)
+                    narrow_by(cond, false, env)
+                    flow_here(env, &skipped_names, &skipped_types)
+                    leave_scope(env)
+
+                    join_arm(&j, env, skipped_names, skipped_types)
+
+            join_apply(&j, env)
         MatchExpr(subject, arms) ->
             check_expr(subject, env)
+
+            // **A subject matching NO arm is a run-time fault**, so reaching the line below a `match`
+            // means one of its arms ran -- and the join needs no contribution from a path that fell
+            // through, there being none.
+            var jm = join_start()
 
             for i in 0..<arms.len()
                 // **A pattern's bindings are not typed yet**, so the arm's body is walked in a scope
@@ -393,12 +459,20 @@ check_expr(x: Expr, env: *TypeEnv)
                     None -> ()
 
                 check_expr(arms.at(i).body, env)
+
+                var arm_names: Buf[string] = buf()
+                var arm_types: Buf[Type] = buf()
+
+                flow_here(env, &arm_names, &arm_types)
                 leave_scope(env)
 
+                if !always_leaves(arms.at(i).body) then join_arm(&jm, env, arm_names, arm_types)
+
+            join_apply(&jm, env)
             check_covers(subject, arms, env)
         While(_, cond, body, otherwise) ->
             check_expr(cond, env)
-            check_expr(body, env)
+            walk_loop_body(body, env)
             check_otherwise(otherwise, env)
         For(_, binding, iter, body, otherwise, _) ->
             check_expr(iter, env)
@@ -419,14 +493,21 @@ check_expr(x: Expr, env: *TypeEnv)
                 None -> note_bindings(binding, env)
 
             check_expr(body, env)
-            leave_scope(env)
+
+            // **A LOOP LEAVES WHAT IT WROTE TO AT THE DECLARED TYPE**, which is the only thing true
+            // of a body that ran once, ran a hundred times, or never ran at all.
+            leave_scope_flowing(env, true)
             check_otherwise(otherwise, env)
-        Loop(_, body) -> check_expr(body, env)
+        Loop(_, body) -> walk_loop_body(body, env)
         DoWhile(_, body, cond, otherwise) ->
-            check_expr(body, env)
+            walk_loop_body(body, env)
             check_expr(cond, env)
             check_otherwise(otherwise, env)
         TryCatch(body, caught, handler) ->
+            // **A `try` MAY STOP ANYWHERE IN ITS BODY**, so what the body left a followed name at is
+            // true only of the run that finished it -- and the handler runs on the one that did not.
+            // Both leave the names they wrote to at what they were declared.
+            enter_scope(env)
             check_expr(body, env)
             enter_scope(env)
 
@@ -436,7 +517,8 @@ check_expr(x: Expr, env: *TypeEnv)
             // `e.push(1)` is refused -- and it will buy more the day a field read is typed.
             note_type(env, caught, fault_shape())
             check_expr(handler, env)
-            leave_scope(env)
+            leave_scope_flowing(env, true)
+            leave_scope_flowing(env, true)
         Lambda(params, defaults, body, _) -> check_body(params, defaults, body_at(body), env, buf())
 
         // **A NAME NOTHING HAS BOUND IS REFUSED BEFORE IT RUNS**, which is the most common mistake
@@ -542,6 +624,17 @@ end names_field
 // **An arm narrows its subject the way an `is` narrows its operand**, and for the same reason: the
 // arm only runs where the pattern took. `note_bindings` has already put the arm's own names in, so
 // this is on top of them and a name the pattern bound wins by being nearer.
+// A loop's body, walked in a scope of its own so that every followed name written inside it is left
+// at what it was declared.
+//
+// **A loop is the one construct whose end is not the end of a straight line**: what the body left a
+// name at on the last turn is what the NEXT turn begins with, so a type read off the order the lines
+// are written in is a claim about one turn only.
+private walk_loop_body(body: Expr, env: *TypeEnv)
+    enter_scope(env)
+    check_expr(body, env)
+    leave_scope_flowing(env, true)
+
 private narrow_by_arm(subject: Expr, pat: Pattern, env: *TypeEnv)
     *subject.kind match
         Name(name) ->
@@ -588,6 +681,76 @@ private check_binary(op: Tok, lhs: Expr, rhs: Expr, env: *TypeEnv, at: Span)
 
     complain_here(at, s"`${op_text(op)}` does not apply to ${show_type(a)} and ${show_type(b)}")
 end check_binary
+
+// What `x.p` answers, where `p` is a property of the kind `x` certainly is.
+//
+// **It asks the machine's own question**: `properties_of` in `method.sysl` is the table
+// `builtin_property` dispatches through, so a property added to a kind is added in one place and
+// this cannot come to claim a type for a name the machine has no property for.
+private property_result(t: Type, name: string) -> Option[Type]
+    if !certain(t) then return None
+
+    val kind = method_kind_word(t)
+
+    if kind == "" then return None
+
+    properties_of(kind, name) match
+        Some(f) -> Some(native_answer(f))
+        None -> None
+end property_result
+
+// What a property's native hands back.
+//
+// **`Any` for one nothing names here, which is the direction this pass is allowed to be wrong in**:
+// a property added to the table above and not to this list says nothing rather than something false.
+private native_answer(f: NativeFn) -> Type = f match
+    NLen -> type_of(IntegerType)
+    NSetSize -> type_of(IntegerType)
+    NMapSize -> type_of(IntegerType)
+    _ -> type_of(Any)
+
+// The walk over an ASSIGNMENT's target, which is a write and not a read.
+//
+// **`check_field_read` may not be asked here.** `[1].proto = o` is refused by the machine for what
+// it would do to the array, and a complaint that an array cannot read `proto` names the read half of
+// a statement that has none — so the receiver is walked and the name is left to the machine, which
+// has the better sentence for every case this could reach.
+// Not `private`: `check.sysl`'s `Assign` and `MultiAssign` arms are the callers.
+check_assign_target(target: Expr, env: *TypeEnv)
+    *target.kind match
+        Field(holder, _, _) -> check_expr(holder, env)
+        _ -> check_expr(target, env)
+end check_assign_target
+
+// `x.p` where the kind of `x` is known: a name that kind has neither a method nor a property for.
+//
+// **`check_method`'s question asked of a READ**, and sound for the same reason: a builtin's set of
+// names is closed, so `n.length` faults when it runs and this moves that fault to the compile. A
+// name read off an OBJECT is untouched -- an object grows fields over its life and a missing one
+// reads as `null` rather than faulting -- and so is a receiver whose type is not certain.
+//
+// **A call's callee never reaches here**, `check_expr`'s `Call` arm walking the receiver rather than
+// the whole callee: `xs.nope()` is `check_method`'s complaint and would otherwise draw two.
+private check_field_read(target: Expr, name: string, optional: bool, env: *TypeEnv, at: Span)
+    // **`?.` is left alone**, as it is everywhere else in this pass: it is written where a value may
+    // be missing, and what a narrowing did or did not prove about the holder is not this pass's to
+    // second-guess.
+    if optional then return
+
+    val t = type_of_expr(target, env)
+
+    if !certain(t) then return
+
+    val kind = method_kind_word(t)
+
+    if kind == "" then return
+    if methods_of(kind, name).is_some() then return
+    if properties_of(kind, name).is_some() then return
+
+    // **The same sentence the machine would have printed**, so a reader who meets this at compile
+    // time and then at run time does not have to work out that the two are one complaint.
+    complain_here(at, s"`${name}` is not something ${article(kind)} ${kind} can do")
+end check_field_read
 
 // Whether this is one of the kinds that is nothing but its word. Their operators are their own
 // subject, and a generator has none at all.

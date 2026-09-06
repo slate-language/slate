@@ -176,7 +176,7 @@ print(hex(sha256("abc")))
 print(hex(md5("abc")), hex(sha1("abc")))
 print(hex(hmac("SHA-256", "key", "message")))
 print(hex(pbkdf2("SHA-1", "password", "salt", 4096, 20)))
-print(len(randomBytes(32)), timingSafeEqual("abc", "abc"), timingSafeEqual("abc", "abd"))
+print(randomBytes(32).length, timingSafeEqual("abc", "abc"), timingSafeEqual("abc", "abd"))
 ```
 
 ```output
@@ -343,7 +343,7 @@ print(regex("[[:alpha:]]+").find("42abc!").text)
 print(regex("\\p{Greek}+").find("ab\u{3b1}\u{3b2}!").text)
 print(regex("\\s").test("\u{a0}"), regex("a.b").test("a\rb"))
 print(regex("(\\w+)@(\\w+)").replace("a@b and c@d", "$2 at $1"))
-print(len(regex("$").findAll("abc")), regex("a*").split("bb").join("|"))
+print(regex("$").findAll("abc").length, regex("a*").split("bb").join("|"))
 ```
 
 ```output
@@ -517,12 +517,19 @@ gives the program no way in.
 
 Which response headers are readable at all in a browser is CORS's decision and not slate's.
 
-### `slate:dom` has three more doors, and they are the rule read from the other side
+### `slate:dom` has four more doors, and they are the rule read from the other side
 
-`location()`, the history calls and `localStorage` are things **a browser has and nothing else does**.
-So the interpreter and node both refuse them — naming *which* of the three, because they are three
-different mistakes — where everything else in this file is a name a browser has that slate had not
-yet reached.
+`location()`, the history calls, `localStorage` and cookies are things **a browser has and nothing
+else does**. So the interpreter and node both refuse them — naming *which* of the four, because they
+are four different mistakes — where everything else in this file is a name a browser has that slate
+had not yet reached.
+
+**Cookies are a different channel from `Set-Cookie` above**, and reaching for one does not reach the
+other. `fetch`'s response headers are what a *server* sent back on this one request; `document.cookie`
+is what rides along with *every* request this origin makes, written and read directly rather than
+through a response. A browser refuses a page `Set-Cookie` by CORS's rule; it does not refuse
+`document.cookie`, which is why `cookies`, `cookie`, `setCookie` and `deleteCookie` answer plain
+values and never a result the way `Set-Cookie`'s absence does.
 
 **No history state object**, and that is a measurement rather than a simplification: `pushState`
 structured-clones what it is given, and `structuredClone` strips the prototype, so a slate object put

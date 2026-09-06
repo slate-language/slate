@@ -101,7 +101,7 @@ a_parameter_may_take_its_argument_apart_and_may_carry_a_default() =
 
 @test
 a_rest_parameter_gathers_and_a_call_may_spread() =
-    count(first, ...rest) = [first, len(rest)]
+    count(first, ...rest) = [first, rest.length]
 
     assertEq(count(1), [1, 0])
     assertEq(count(1, 2, 3), [1, 2])
@@ -131,7 +131,7 @@ an_optional_field_may_be_missing_and_may_not_be_wrong() =
 mismatch_collects_where_test_stops() =
     val problems = Optional.mismatch({ size: "big" })
 
-    assertEq(len(problems), 2)
+    assertEq(problems.length, 2)
 
 @test
 a_test_narrows_the_name_it_tested() =

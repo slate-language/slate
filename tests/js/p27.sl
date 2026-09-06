@@ -19,7 +19,7 @@ val page = repeat("the quick brown fox jumps over the lazy dog, ", 40)
 val small = zstd(page, 3)
 
 print("round trip", fromBytes(unzstd(small, 65536).value).value == page)
-print("worth doing", len(small) < len(toBytes(page)) / 10)
+print("worth doing", small.length < toBytes(page).length / 10)
 
 // **Text crosses as its UTF-8**, so a program holding a string need not convert it first.
 print("text is its bytes", zstd("a page of text", 3) == zstd(toBytes("a page of text"), 3))
@@ -29,7 +29,7 @@ print("nothing", toJSON(unzstd(zstd("", 3), 16).value))
 
 // -- the level is a dial and not a format --------------------------------------------------------------
 
-print("harder is smaller", len(zstd(page, 19)) <= len(zstd(page, 1)))
+print("harder is smaller", zstd(page, 19).length <= zstd(page, 1).length)
 print("and reads back the same", fromBytes(unzstd(zstd(page, 19), 65536).value).value == page)
 print("and so does the fast end", fromBytes(unzstd(zstd(page, 1), 65536).value).value == page)
 
@@ -40,7 +40,7 @@ print("negative levels", fromBytes(unzstd(zstd(page, 0 - 5), 65536).value).value
 // -- what it refuses ------------------------------------------------------------------------------------
 
 print("not zstd", unzstd(toBytes("not zstd at all"), 1024).error)
-print("cut short", unzstd(small[0..<(len(small) / 2)], 65536).error)
+print("cut short", unzstd(small[0..<(small.length / 2)], 65536).error)
 print("too large", unzstd(small, 100).error)
 
 // **`unzstd` answers a result and `zstd` faults**, which is `parseJSON` against `toJSON` and for the

@@ -305,7 +305,7 @@ alternatives; a name binds; `@` does both; and a guard runs after the pattern ha
 classify(v) = v match
     { kind: "point", at: [0, 0] } -> "origin"
     { kind: "point", at: [x, y] } if x == y -> "diagonal"
-    [first, ...rest] -> s"a list of ${len(rest) + 1} starting ${first}"
+    [first, ...rest] -> s"a list of ${rest.length + 1} starting ${first}"
     "sat" | "sun" -> "a weekend"
     n @ number if n < 0 -> s"the negative number ${n}"
     _ -> "something else"
@@ -373,7 +373,7 @@ as a string:**
 ```slate
 import panel from "./panel.css"
 
-print(panel is string, len(panel) > 0)
+print(panel is string, panel.length > 0)
 ```
 
 ```output

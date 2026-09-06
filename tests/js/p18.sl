@@ -142,7 +142,7 @@ tbl[dt] = "both"
 tbl[toronto] = "a zone"
 tbl[z] = "a moment somewhere"
 tbl[p] = "a length by the calendar"
-print(tbl[date(2024, 7, 1)], tbl[time(9, 30, 5, 123456)], tbl[toronto], tbl[z], len(tbl))
+print(tbl[date(2024, 7, 1)], tbl[time(9, 30, 5, 123456)], tbl[toronto], tbl[z], keys(tbl).length)
 
 // The words a program annotates with.
 print(d is date, t is time, dt is dateTime, toronto is zone, z is zoned, p is period)

@@ -1,7 +1,7 @@
 val xs = [1, 2, 3]
 print(xs)
 print(7 / 2, 7 % 2, 2.5 + 1)
-print("hi" + " there", len("日本語"), "日本語"[1])
+print("hi" + " there", "日本語".length, "日本語"[1])
 val o = { a: 1, b: [1, { c: "x" }] }
 print(o, keys(o), o.b[1].c)
 print([1, 2] == [1, 2], 1 == 1.0, 0 == false)

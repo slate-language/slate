@@ -89,7 +89,7 @@ each_kind_keys_a_table_by_its_own_value() =
 
     assertEq(t[epochSeconds(3)], "moment")
     assertEq(t[seconds(3)], "length")
-    assertEq(len(t), 2)
+    assertEq(keys(t).length, 2)
 
 @test
 both_kinds_print_the_way_a_reader_wants_them() =

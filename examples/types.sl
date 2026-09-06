@@ -91,7 +91,7 @@ print(Note.mismatch({ pinned: 1 }))
 validated(shape, v) =
     val wrong = shape.mismatch(v)
 
-    if len(wrong) == 0 then s"a good ${shape.name()}" else s"bad ${shape.name()}: ${toJSON(wrong)}"
+    if wrong.length == 0 then s"a good ${shape.name()}" else s"bad ${shape.name()}: ${toJSON(wrong)}"
 
 print(validated(Note, { title: "a" }))
 print(validated(Point, { x: 1 }))

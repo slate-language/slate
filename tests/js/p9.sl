@@ -14,11 +14,11 @@
 
 import { args, exit } from slate:process
 
-print("how many: " + string(args.len()))
+print("how many: " + string(args.length))
 
 // The program's own name is NOT args[0], which is where this parts from C, node and Python.
 print("first: " + (args[0] ?? "<none>"))
-print("last: " + (args[args.len() - 1] ?? "<none>"))
+print("last: " + (args[args.length - 1] ?? "<none>"))
 
 // An argument is an ordinary string and goes wherever a string goes.
 for a in args

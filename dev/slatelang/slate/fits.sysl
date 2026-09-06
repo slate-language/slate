@@ -171,7 +171,7 @@ fits(got: Type, want: Type) -> bool
 
                 // **A GATHERING FUNCTION'S LAST PARAMETER IS AN ARRAY OF ARGUMENTS AND NOT ONE OF
                 // THEM**, so comparing it against what the caller will pass is comparing an array
-                // against an element -- which refused `map(ns, (...rest) -> len(rest))`, a program
+                // against an element -- which refused `map(ns, (...rest) -> rest.length)`, a program
                 // that runs. Everything before the gathering one is an ordinary parameter and is
                 // compared.
                 val fixed = if got_variadic then got_params.len() - 1 else got_params.len()
@@ -271,10 +271,30 @@ struct TypeEnv
     names: Buf[string]
     types: Buf[Type]
 
-    // **Whether a name may be written to, which only NARROWING needs.** A `var` reassigned inside
+    // **WHAT AN ASSIGNMENT IS CHECKED AGAINST, WHICH IS NOT WHAT A READ ANSWERS.** An annotated
+    // `var` carries two types: the one the program declared, which every assignment is held to for
+    // the name's whole life, and the one it holds at the line being walked, which is what a use of
+    // the name is checked against. `types` is the second and this is the first; for every other name
+    // the two are one type written twice.
+    declared: Buf[Type]
+
+    // **Whether a name may be written to, which only NARROWING needs.** A name reassigned inside
     // the branch that narrowed it makes the narrowed type stale, and a stale type here is too narrow
-    // -- which refuses a program that runs. So a mutable name is never narrowed.
+    // -- which refuses a program that runs. So a name is narrowed only where the writes to it are
+    // followed, which is what `tracked` below says.
     settled: Buf[bool]
+
+    // Whether this entry says what the name holds AT THIS POINT -- a narrowing, an assignment, or
+    // the join of an `if`'s two branches -- rather than what it was declared. **A branch's scope is
+    // read for these before it is left**, which is how the type each branch leaves a name at reaches
+    // the join below the branch.
+    flowed: Buf[bool]
+
+    // Whether assignments to the name are FOLLOWED, so that a read answers what the last one put
+    // there rather than what the name was declared. True for an annotated `var` all of whose writes
+    // are in the block that declared it, and for nothing else -- so a flow note about any other name
+    // dies with the scope that made it, exactly as a narrowing always has.
+    tracked: Buf[bool]
 
     // **It travels BESIDE `types` rather than in a table of its own**, so leaving a scope drops it
     // and an inner binding shadows an outer one — both of which a separate table would have had to be
@@ -284,19 +304,72 @@ struct TypeEnv
     marks: Buf[usize]
 end TypeEnv
 
-type_env() -> TypeEnv = TypeEnv(buf(), buf(), buf(), buf(), buf())
+type_env() -> TypeEnv = TypeEnv(buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf())
 
 enter_scope(e: *TypeEnv)
     e.marks.push(e.names.len())
 
 leave_scope(e: *TypeEnv)
+    drop_scope(e, false, false)
+
+// The same, keeping what the names in the scope were left HOLDING.
+//
+// **A block runs to its end, so what it left a name at is what the line below it holds** -- and the
+// scope a block opened is not a place that fact may die in. `widen` is for the scopes where it may:
+// a loop runs an unknown number of times and a `try` may stop anywhere in its body, so a name
+// assigned inside either is left at what it was DECLARED, which is the only thing true of every way
+// out. Only a tracked name travels; everything else is dropped exactly as it always was.
+leave_scope_flowing(e: *TypeEnv, widen: bool)
+    drop_scope(e, true, widen)
+
+private drop_scope(e: *TypeEnv, carry: bool, widen: bool)
     e.marks.pop() match
         Some(mark) ->
+            var out_names: Buf[string] = buf()
+            var out_types: Buf[Type] = buf()
+
+            if carry
+                gather_flow(e, mark, &out_names, &out_types)
+
             e.names.truncate(mark)
             e.types.truncate(mark)
+            e.declared.truncate(mark)
             e.settled.truncate(mark)
+            e.flowed.truncate(mark)
+            e.tracked.truncate(mark)
             e.bound.truncate(mark)
+
+            for i in 0..<out_names.len()
+                if is_tracked(e, out_names.at(i))
+                    note_flow(e, out_names.at(i), if widen then declared_of(e, out_names.at(i)) else out_types.at(i))
         None -> ()
+end drop_scope
+
+// What the scope standing open has left the names bound OUTSIDE it holding.
+//
+// **This is how a branch's exit type reaches the join below it**, so it is read before the scope is
+// left rather than after. A name the scope DECLARED is left out -- an inner binding of the same
+// spelling says nothing whatever about the outer one, and taking it for the outer one's type would
+// be a claim that refuses a program that runs.
+flow_here(e: *TypeEnv, names_out: *Buf[string], types_out: *Buf[Type])
+    if e.marks.len() == 0 then return
+
+    gather_flow(e, e.marks.at(e.marks.len() - 1), names_out, types_out)
+
+private gather_flow(e: *TypeEnv, mark: usize, names_out: *Buf[string], types_out: *Buf[Type])
+    for i in mark..<e.names.len()
+        if e.flowed.at(i) && e.tracked.at(i) && !redeclared_above(e, e.names.at(i), mark)
+            names_out.push(e.names.at(i))
+            types_out.push(e.types.at(i))
+
+// Whether the scope declared a name of this spelling itself, which makes every entry for it inside
+// the scope a statement about a DIFFERENT name.
+private redeclared_above(e: *TypeEnv, name: string, mark: usize) -> bool
+    for i in mark..<e.names.len()
+        if e.names.at(i) == name && !e.flowed.at(i) then return true
+
+    false
+end redeclared_above
 
 // **AN OBJECT'S SHAPE IS NOT CARRIED BY A NAME, AND THAT IS THE CONSERVATIVE BOUNDARY OF THIS
 // PASS.** An object is mutable and a field may be added to it anywhere -- by the next line, by a
@@ -320,10 +393,7 @@ note_type(e: *TypeEnv, name: string, t: Type)
 // have been handed anywhere, so nothing outside the block that declared it holds the object -- and
 // no field of it is ever written, so the shape it was built with is the shape it dies with.
 note_shaped(e: *TypeEnv, name: string, t: Type)
-    e.names.push(name)
-    e.types.push(t)
-    e.settled.push(true)
-    e.bound.push(BoundPlain)
+    push_entry(e, name, t, t, true, false, false)
 
 // The same, over a name the environment already has: what a DECLARATION says it is.
 //
@@ -335,9 +405,35 @@ renote_declared(e: *TypeEnv, name: string, t: Type)
 
 // The same, saying whether the name may later be written to.
 note_binding(e: *TypeEnv, name: string, t: Type, settled: bool)
+    push_entry(e, name, unshaped(t), unshaped(t), settled, false, false)
+
+// **AN ANNOTATED `var`, WHICH IS THE ONE NAME WHOSE TWO TYPES DIFFER.** `flow` is what it holds
+// where it was declared and `declared` is what it may ever hold; a read is checked against the
+// first and an assignment against the second. It is narrowable for the reason it is followed: an
+// assignment inside a branch is a flow note of its own, so nothing a branch does can leave a stale
+// claim behind it.
+note_var(e: *TypeEnv, name: string, flow: Type, declared: Type)
+    push_entry(e, name, unshaped(flow), unshaped(declared), true, false, true)
+
+// What a name holds AT THIS POINT: a narrowing, an assignment, or the join of the branches above.
+//
+// **What the name was DECLARED travels with it**, or an assignment inside a branch that narrowed the
+// name would be measured against the narrowing rather than against the annotation -- and
+// `var m: string | number` assigned a number inside `if m is string` would be refused, which is a
+// program that runs.
+note_flow(e: *TypeEnv, name: string, t: Type)
+    val b = bound_to(e, name)
+
+    push_entry(e, name, unshaped(t), declared_of(e, name), may_narrow(e, name), true, is_tracked(e, name))
+    note_bound(e, b)
+
+private push_entry(e: *TypeEnv, name: string, t: Type, declared: Type, settled: bool, flowed: bool, tracked: bool)
     e.names.push(name)
-    e.types.push(unshaped(t))
+    e.types.push(t)
+    e.declared.push(declared)
     e.settled.push(settled)
+    e.flowed.push(flowed)
+    e.tracked.push(tracked)
     e.bound.push(BoundPlain)
 
 // What the name just noted was BOUND to, where that is a class or one of its instances.
@@ -392,6 +488,32 @@ has_name(e: *TypeEnv, name: string) -> bool
 
         if e.names.at(i) == name then return true
 
+// **WHAT THE PROGRAM DECLARED THE NAME, which is what an assignment to it is checked against.** For
+// every name but an annotated `var` it is what `known_type` answers as well; for that one it is the
+// annotation, where `known_type` is what the name holds at the line being walked.
+declared_of(e: *TypeEnv, name: string) -> Type
+    var i = e.names.len()
+
+    loop
+        if i == 0 then return type_of(Any)
+
+        i -= 1
+
+        if e.names.at(i) == name then return e.declared.at(i)
+end declared_of
+
+// Whether assignments to the name move what a read of it answers.
+is_tracked(e: *TypeEnv, name: string) -> bool
+    var i = e.names.len()
+
+    loop
+        if i == 0 then return false
+
+        i -= 1
+
+        if e.names.at(i) == name then return e.tracked.at(i)
+end is_tracked
+
 // Whether a name is one narrowing may say anything about.
 may_narrow(e: *TypeEnv, name: string) -> bool
     var i = e.names.len()
@@ -415,22 +537,34 @@ end may_narrow
 narrow_by(cond: Expr, want_true: bool, env: *TypeEnv)
     *cond.kind match
         IsPattern(subject, pat, negated) ->
-            // A negated test narrows the OTHER branch, which is the same rule read backwards.
-            if negated == want_true then return
-
             *subject.kind match
                 Name(name) ->
                     if !may_narrow(env, name) then return
 
+                    // A pattern that binds tells us nothing; one that tests tells us everything.
+                    val binds = first_binding(pat) match
+                        Some(_) -> true
+                        None -> false
+
+                    if binds then return
+
                     val narrowed = type_from_pattern(resolve_pattern(pat, 0))
 
-                    // A pattern that binds tells us nothing; one that tests tells us everything.
-                    first_binding(pat) match
-                        Some(_) -> ()
-                        None -> note_binding(env, name, narrowed, true)
+                    // A negated test says on this side what the plain one says on the other, which
+                    // is the same rule read backwards.
+                    if negated != want_true
+                        note_flow(env, name, narrowed)
+                    else
+                        // **THE SIDE THE TEST DID NOT HOLD ON TAKES THE ALTERNATIVE AWAY.** `x is
+                        // string` failing says the value is not a string, so a name declared
+                        // `string | number` holds a number in the else branch -- and until this was
+                        // here the pass refused that call, which is the one mistake it may not make.
+                        without_type(known_type(env, name), narrowed) match
+                            Some(rest) -> note_flow(env, name, rest)
+                            None -> ()
                 _ -> ()
 
-        // **`a && b` narrows by both**, which is what makes `if x is string && len(x) > 0` work --
+        // **`a && b` narrows by both**, which is what makes `if x is string && x.length > 0` work --
         // the second operand is already inside the first's narrowing when the machine evaluates it.
         //
         // **`x != null` narrows too, and it has to**, because it is how slate asks the question:
@@ -442,6 +576,13 @@ narrow_by(cond: Expr, want_true: bool, env: *TypeEnv)
             if op == AndAnd && want_true
                 narrow_by(lhs, true, env)
                 narrow_by(rhs, true, env)
+
+            // **`a || b` is that rule on the other side.** Reaching the else means neither operand
+            // held, so both of them narrow by their false side -- which is what makes
+            // `if x == null || done then ... else f(x)` the program it reads as.
+            if op == OrOr && !want_true
+                narrow_by(lhs, false, env)
+                narrow_by(rhs, false, env)
 
             if op == EqEq || op == BangEq
                 // The name may be written either side of the comparison; only one of the two is a
@@ -458,12 +599,18 @@ narrow_by(cond: Expr, want_true: bool, env: *TypeEnv)
                             val says_null = (op == EqEq) == want_true
 
                             if says_null
-                                note_binding(env, name, type_of(NullType), true)
+                                note_flow(env, name, type_of(NullType))
                             else
                                 without_null(known_type(env, name)) match
-                                    Some(rest) -> note_binding(env, name, rest, true)
+                                    Some(rest) -> note_flow(env, name, rest)
                                     None -> ()
                         _ -> ()
+
+        // **`!c` is `c` with its two sides swapped**, so `if !(x is string) then a else b` narrows
+        // in `b` exactly as `if x is not string` does. Written without this the two spellings of one
+        // test did not mean the same thing.
+        Unary(op, rhs) ->
+            if op == Bang then narrow_by(rhs, !want_true, env)
         _ -> ()
 end narrow_by
 
@@ -471,6 +618,44 @@ private is_null_literal(x: Expr) -> bool
     *x.kind match
         NullLit -> true
         _ -> false
+
+// A union with one of its alternatives taken out, or nothing where there was nothing to take.
+//
+// **This is the else branch of a type test**, and the only narrowing that sharpens a type without a
+// test having held: `x is string` failing says as much about a `string | number` as its holding says
+// about the other side.
+//
+// **Nothing where there was nothing to take, and `Any` where taking it leaves nothing.** A name
+// whose type is `Any` stays `Any`, this pass having nothing to sharpen; and a type with every
+// alternative ruled out describes a branch nothing reaches, where a claim could only complain about
+// code that never runs.
+private without_type(t: Type, drop: Type) -> Option[Type]
+    *t.kind match
+        OneOf(alts) ->
+            var kept: Buf[Type] = buf()
+
+            // **`same_type` is already false for `Any` and for a union**, which is exactly the
+            // caution wanted here: taking an alternative away on either would be claiming something
+            // about a value this pass is not sure of, and a claim that is too narrow refuses a
+            // program that runs.
+            for i in 0..<alts.len()
+                if !same_type(alts.at(i), drop) then kept.push(alts.at(i))
+
+            if kept.len() == alts.len() then return None
+
+            // **A UNION WITH EVERYTHING TAKEN OUT OF IT DESCRIBES A BRANCH NOTHING REACHES**, so the
+            // name becomes `Any` there rather than keeping the type the test just ruled out. Keeping
+            // it would leave the pass complaining about code that never runs, which is a complaint
+            // no run could make.
+            if kept.len() == 0 then return Some(type_of(Any))
+            if kept.len() == 1 then return Some(kept.at(0))
+
+            Some(type_of(OneOf(kept)))
+
+        // The same answer where the type was never a union: `x is string` failing on an `x: string`
+        // is the unreachable branch written without one.
+        _ -> if same_type(t, drop) then Some(type_of(Any)) else None
+end without_type
 
 // A union with `null` taken out of it, or nothing where there was no `null` to take.
 //
@@ -494,3 +679,107 @@ private without_null(t: Type) -> Option[Type]
             Some(type_of(OneOf(kept)))
         _ -> None
 end without_null
+
+// -- where two branches meet -----------------------------------------------------------------------
+
+// The two types together: what a name holds below an `if` whose branches left it holding each.
+//
+// **`Any` swallows everything**, a branch this pass knows nothing about being one it may claim
+// nothing about below. Alternatives are flattened as they are collected, so a union never holds one,
+// and `same_type` is what keeps `string | string` from being written down as two.
+union_type(a: Type, b: Type) -> Type
+    var alts: Buf[Type] = buf()
+
+    if !add_alternatives(a, &alts) then return type_of(Any)
+    if !add_alternatives(b, &alts) then return type_of(Any)
+
+    if alts.len() == 0 then return type_of(Any)
+    if alts.len() == 1 then return alts.at(0)
+
+    type_of(OneOf(alts))
+end union_type
+
+private add_alternatives(t: Type, alts: *Buf[Type]) -> bool
+    *t.kind match
+        Any -> return false
+        OneOf(inner) ->
+            for i in 0..<inner.len()
+                if !add_alternatives(inner.at(i), alts) then return false
+        _ ->
+            var held = false
+
+            for i in 0..<alts.len()
+                if same_type(alts.at(i), t) then held = true
+
+            if !held then alts.push(t)
+
+    true
+end add_alternatives
+
+// What the branches walked so far have left each name holding.
+//
+// **A join is the union of the branches that can FALL OUT of the construct**, and a branch that
+// always leaves -- a `return`, a `throw`, a `break` -- contributes nothing, because control below
+// the construct never came from it. A branch that says nothing about a name contributes what the
+// name held ABOVE the construct, which is what that branch left it at.
+struct FlowJoin
+    names: Buf[string]
+    types: Buf[Type]
+    reached: bool
+end FlowJoin
+
+join_start() -> FlowJoin = FlowJoin(buf(), buf(), false)
+
+join_arm(j: *FlowJoin, e: *TypeEnv, names: Buf[string], types: Buf[Type])
+    if !j.reached
+        for i in 0..<names.len()
+            j.names.push(names.at(i))
+            j.types.push(types.at(i))
+
+        j.reached = true
+
+        return
+
+    var merged_names: Buf[string] = buf()
+    var merged_types: Buf[Type] = buf()
+
+    for i in 0..<j.names.len()
+        if !holds_name(merged_names, j.names.at(i)) then merged_names.push(j.names.at(i))
+
+    for i in 0..<names.len()
+        if !holds_name(merged_names, names.at(i)) then merged_names.push(names.at(i))
+
+    for i in 0..<merged_names.len()
+        val name = merged_names.at(i)
+        val above = known_type(e, name)
+
+        merged_types.push(union_type(last_flow(name, j.names, j.types, above), last_flow(name, names, types, above)))
+
+    j.names = merged_names
+    j.types = merged_types
+end join_arm
+
+// What the join says, written into the scope the construct stood in.
+join_apply(j: *FlowJoin, e: *TypeEnv)
+    if !j.reached then return
+
+    for i in 0..<j.names.len()
+        if is_tracked(e, j.names.at(i)) then note_flow(e, j.names.at(i), j.types.at(i))
+
+// **The LAST note wins**, a scope holding one per assignment and narrowing in the order they were
+// walked.
+private last_flow(name: string, names: Buf[string], types: Buf[Type], fallback: Type) -> Type
+    var out = fallback
+
+    for i in 0..<names.len()
+        if names.at(i) == name then out = types.at(i)
+
+    out
+end last_flow
+
+private holds_name(names: Buf[string], name: string) -> bool
+    for i in 0..<names.len()
+        if names.at(i) == name then return true
+
+    false
+end holds_name

@@ -95,10 +95,10 @@ print(verify(sign({ sub: "u1" }, "secret", "HS512"), "secret", "HS512").ok)
 
 // **Randomness is checked for its SHAPE and never for its value**, there being nothing two runs
 // agree about. What a program can rely on is the count and that two draws differ.
-print(len(randomBytes(1)), len(randomBytes(32)), len(randomBytes(1000)))
+print(randomBytes(1).length, randomBytes(32).length, randomBytes(1000).length)
 print(randomBytes(32) != randomBytes(32))
 
-allBytes(bs) = len(filter(bs, b -> b >= 0 && b <= 255)) == len(bs)
+allBytes(bs) = filter(bs, b -> b >= 0 && b <= 255).length == bs.length
 
 print(allBytes(randomBytes(64)))
 

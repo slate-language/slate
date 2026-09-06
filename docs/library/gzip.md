@@ -15,7 +15,7 @@ async main()
     val small = await gzip(page)
     val back = await gunzip(small, 1 << 20)        // the limit is not optional
 
-    print(len(small) < len(page))
+    print(small.length < page.length)
     print(back.ok, fromBytes(back.value).value == fromBytes(page).value)
 
     val zipped = await deflate("the same text, wrapped as zlib instead")

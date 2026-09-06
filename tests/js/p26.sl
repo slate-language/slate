@@ -230,7 +230,7 @@ upgradedByHand()
     print("upgrade", req.upgrade, req.path)
 
     // **It is an offset into that feed**, so what is past it is the other protocol's first bytes.
-    print("where the http stopped", httpUpgraded(p) == len(toBytes(handshake)))
+    print("where the http stopped", httpUpgraded(p) == toBytes(handshake).length)
 
     httpClose(p)
 

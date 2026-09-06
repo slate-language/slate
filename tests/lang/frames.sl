@@ -199,7 +199,7 @@ A_DESTRUCTURING_BINDING_IS_READ_AFTER_THE_STATEMENT_THAT_MADE_IT()
         val { name, count } = o
         val [head, ...rest] = [1, 2, 3]
 
-        name + string(count) + string(head) + string(len(rest))
+        name + string(count) + string(head) + string(rest.length)
 
     assertEq(taken({ name: "n", count: 7 }), "n712")
 

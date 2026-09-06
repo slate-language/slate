@@ -54,7 +54,7 @@ print(m, string(m), m.toString(), s"cost $m", [m])
 print((42).toString(), [1, 2].toString(), Circle(3).toString(), {a: 1}.toString())
 
 // A tag a declaration wrote is not a field.
-print(keys(Point), len(Point), keys(p), len(p))
+print(keys(Point), keys(Point).length, keys(p), keys(p).length)
 
 // A DIAGNOSTIC does not run `toString` -- a message about a fault that renders its values with the
 // program's own code can fault again, and the second fault is the one the reader would meet. Both

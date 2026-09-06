@@ -12,7 +12,7 @@ t[1.0] = "one again"
 t["s"] = "string"
 t[true] = "bool"
 t[null] = "null"
-print(t[[1, 2]], t[{a: 1}], t[1], t["s"], t[true], t[null], len(t))
+print(t[[1, 2]], t[{a: 1}], t[1], t["s"], t[true], t[null], keys(t).length)
 print(keys(t))
 
 class K
@@ -24,7 +24,7 @@ class K
 var u = {}
 u[K.new(1)] = "first"
 u[K.new(2)] = "second"
-print(u[K.new(9)], len(u))
+print(u[K.new(9)], keys(u).length)
 
 data Shape
     Circle(r)

@@ -1,0 +1,352 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// The eight questions about an array that a program otherwise writes a loop for.
+//
+// **Cut from `array.sysl` rather than added to it**, and the cut is a subject rather than a line
+// count: everything there is about ONE array -- walking it, changing it, finding a place in it --
+// and everything here answers with a DIFFERENT SHAPE. `groupBy` answers an object, `partition`
+// answers a pair, `chunk` and `zip` answer an array of arrays, and `minBy` answers one element out
+// of many.
+//
+// **Not one of them changes what it was given**, so there is no bare verb among them and no
+// participle either: `array.sysl`'s naming rule is about a pair where one form mutates, and these
+// have no such pair to be half of.
+//
+// **Every one is reachable as a method**, `method.sysl` being the whole of the difference:
+// `xs.chunk(2)` is `chunk(xs, 2)`, exactly as `xs.map(f)` is `map(xs, f)`.
+
+// -- the shapes these all take --------------------------------------------------------------------
+
+private array_at(args: Buf[Value], i: usize, at: Span, name: string) -> Result[*ArrayObj, Signal] =
+    args.at(i) match
+        Array(a) -> Ok(a)
+        other -> Err(failure(at, s"`${name}` takes an array, and this is ${other.type_name()}"))
+
+private wanted_count(args: Buf[Value], n: usize, at: Span, name: string, what: string) -> Result[unit, Signal]
+    if args.len() != n then return Err(failure(at, s"`${name}` takes ${what}, and was given ${counted(args.len(), "argument")}"))
+
+    Ok(())
+
+// **A callback may change the array it is walking, and without this that is a panic.** The loop
+// bound is read once, so an element removed part-way through leaves the next read past the end --
+// which sysl reports as an index past a `Buf`, with no line and nothing naming the program.
+// `array.sysl` carries the same guard and the same sentence for the same reason.
+private changed_under(at: Span, name: string) -> Signal =
+    failure(at, s"this array was changed while `${name}` was walking it -- walk a copy of it, or build a new array rather than changing this one")
+
+// One element handed to a one-argument function. **The element and nothing else**, which is the rule
+// every callback in `array.sysl` is called by: JavaScript's index and array are deliberately not
+// passed, so a function that happens to take a second argument cannot silently receive one.
+private on_one(f: Value, v: Value, at: Span, name: string) -> Step
+    var one: Buf[Value] = buf()
+
+    one.push(v)
+    apply_callback(f, one, at, name)
+
+// -- cutting an array up ---------------------------------------------------------------------------
+
+// `groupBy(xs, f)` -- an object whose keys are what `f` answered and whose values are the elements
+// that answered them, each group in the order the elements were in.
+//
+// **THE KEY IS `string(f(x))`, WHICH IS THE ONE RULE THIS BUILTIN HAS AND IS WHY IT IS WRITTEN
+// DOWN.** A slate object's keys are values rather than only text, so grouping could in principle
+// key on whatever `f` answered -- and then `groupBy(xs, x -> x.id)` would answer an object a `for
+// [k, v] in entries(o)` walked with integer keys, which is not what anybody writing `groupBy`
+// pictures. Rendering the key is what makes the answer an ordinary record: `keys(o)` is an array of
+// strings, `o["admin"]` reads a group, and `toJSON` writes it. The cost is stated rather than
+// hidden -- `1` and `"1"` land in one group, which is the same collision `toJSON` already refuses a
+// non-string key over.
+//
+// **A group is an array even where it has one element in it**, so nothing downstream has to ask
+// which case it is in.
+do_group_by(args: Buf[Value], at: Span) -> Step
+    wanted_count(args, 2, at, "groupBy", "an array and a function")?
+
+    val xs = array_at(args, 0, at, "groupBy")?
+    val mark = root_mark()
+    val out = new_object()
+
+    hold(Object(out))
+
+    val n = xs.items.len()
+
+    for i in 0..<n
+        val x = xs.items.at(i)
+
+        val key = on_one(args.at(1), x, at, "groupBy") match
+            Ok(v) -> printed(v, at) match
+                Ok(text) -> text
+                Err(e) ->
+                    release(mark)
+                    return Err(e)
+            Err(e) ->
+                release(mark)
+                return Err(e)
+
+        if xs.items.len() != n
+            release(mark)
+            return Err(changed_under(at, "groupBy"))
+
+        obj_get_name(out, key) match
+            Some(Array(group)) -> group.items.push(x)
+            _ ->
+                val group = new_array(buf())
+
+                group.items.push(x)
+                obj_put_name(out, key, Array(group))
+
+    release(mark)
+    Ok(Object(out))
+end do_group_by
+
+// `partition(xs, f)` -- `[yes, no]`, the elements the function said yes to and the ones it did not.
+//
+// **Two arrays and not an object with two named fields**, so that `val [pass, fail] = partition(...)`
+// takes it apart in one line -- which is what a caller does with it every time.
+do_partition(args: Buf[Value], at: Span) -> Step
+    wanted_count(args, 2, at, "partition", "an array and a function")?
+
+    val xs = array_at(args, 0, at, "partition")?
+    val mark = root_mark()
+    val out = new_array(buf())
+    val yes = new_array(buf())
+    val no = new_array(buf())
+
+    hold(Array(out))
+    out.items.push(Array(yes))
+    out.items.push(Array(no))
+
+    val n = xs.items.len()
+
+    for i in 0..<n
+        val x = xs.items.at(i)
+
+        val said = on_one(args.at(1), x, at, "partition") match
+            Ok(v) -> v.truthy()
+            Err(e) ->
+                release(mark)
+                return Err(e)
+
+        if xs.items.len() != n
+            release(mark)
+            return Err(changed_under(at, "partition"))
+
+        if said then yes.items.push(x) else no.items.push(x)
+
+    release(mark)
+    Ok(Array(out))
+end do_partition
+
+// `chunk(xs, n)` -- the array in runs of `n`, the last one short where it does not divide.
+//
+// **A chunk of nothing is refused rather than answered.** `chunk(xs, 0)` has no meaning that is not
+// an infinite loop or an empty answer that quietly loses everything, so it is a fault naming the
+// count -- which is `repeat`'s rule about a negative count and for the same reason.
+do_chunk(args: Buf[Value], at: Span) -> Step
+    wanted_count(args, 2, at, "chunk", "an array and a size")?
+
+    val xs = array_at(args, 0, at, "chunk")?
+
+    val size = args.at(1) match
+        Int(k) ->
+            if k <= 0 then return fault(at, s"`chunk` takes a size of at least one, and this is ${k}")
+
+            usize(k)
+        other -> return fault(at, s"`chunk` takes a whole number, and this is ${other.type_name()}")
+
+    val mark = root_mark()
+    val out = new_array(buf())
+
+    hold(Array(out))
+
+    var i: usize = 0
+
+    while i < xs.items.len()
+        val part = new_array(buf())
+
+        out.items.push(Array(part))
+
+        var k: usize = 0
+
+        while k < size && i + k < xs.items.len()
+            part.items.push(xs.items.at(i + k))
+            k += 1
+
+        i += size
+
+    release(mark)
+    Ok(Array(out))
+end do_chunk
+
+// -- folding several arrays together -----------------------------------------------------------------
+
+// `zip(a, b, ...)` -- one array of positions, each holding what every array had at that position.
+//
+// **The SHORTEST array decides the length**, which is Python's rule and the only one that needs no
+// filler value: padding would put something in the answer that was in none of the inputs, and slate
+// has no such value that may travel. A program that wants the longer form has the lengths and can
+// say what to pad with.
+do_zip(args: Buf[Value], at: Span) -> Step
+    if args.len() == 0 then return fault(at, "`zip` takes at least one array and was given none")
+
+    var shortest: usize = 0
+
+    for i in 0..<args.len()
+        val a = array_at(args, i, at, "zip")?
+
+        if i == 0 || a.items.len() < shortest then shortest = a.items.len()
+
+    val mark = root_mark()
+    val out = new_array(buf())
+
+    hold(Array(out))
+
+    for i in 0..<shortest
+        val row = new_array(buf())
+
+        out.items.push(Array(row))
+
+        for j in 0..<args.len()
+            args.at(j) match
+                Array(a) -> row.items.push(a.items.at(i))
+                _ -> ()
+
+    release(mark)
+    Ok(Array(out))
+end do_zip
+
+// `unique(xs)` -- the elements with every repeat after the first taken out, in the order they first
+// appeared.
+//
+// **Equality is `==`, which is the same question `contains` asks**, so a class that wrote `equals`
+// decides for its own values and two objects with the same fields are one element. That is a walk
+// over what has been kept so far rather than a table, which is quadratic and is the honest cost of
+// letting a program's own `equals` have the last word: a hash table would have to ask `hash`, and a
+// class may write one or not.
+do_unique(args: Buf[Value], at: Span) -> Step
+    wanted_count(args, 1, at, "unique", "an array")?
+
+    val xs = array_at(args, 0, at, "unique")?
+    val mark = root_mark()
+    val out = new_array(buf())
+
+    hold(Array(out))
+
+    val n = xs.items.len()
+
+    for i in 0..<n
+        val x = xs.items.at(i)
+        var seen = false
+
+        for j in 0..<out.items.len()
+            val yes = same(out.items.at(j), x, at) match
+                Ok(answer) -> answer
+                Err(e) ->
+                    release(mark)
+                    return Err(e)
+
+            if yes
+                seen = true
+                break
+
+        if xs.items.len() != n
+            release(mark)
+            return Err(changed_under(at, "unique"))
+
+        if !seen then out.items.push(x)
+
+    release(mark)
+    Ok(Array(out))
+end do_unique
+
+// -- one question about the whole array ---------------------------------------------------------
+
+// `count(xs, f)` -- how many elements the function said yes to.
+//
+// **`filter` then `.length` in one walk**, which is what it is for: the array `filter` builds is
+// thrown away by every caller that only wanted the number, and on a long array that is the whole cost.
+do_count(args: Buf[Value], at: Span) -> Step
+    wanted_count(args, 2, at, "count", "an array and a function")?
+
+    val xs = array_at(args, 0, at, "count")?
+    val n = xs.items.len()
+    var found: long = 0
+
+    for i in 0..<n
+        if on_one(args.at(1), xs.items.at(i), at, "count")?.truthy() then found += 1
+
+        if xs.items.len() != n then return Err(changed_under(at, "count"))
+
+    Ok(Int(found))
+end do_count
+
+// `minBy(xs, f)` and `maxBy(xs, f)` -- the ELEMENT whose key is smallest or largest.
+//
+// **The element and not the key**, which is the whole difference from `min(map(xs, f))`: a program
+// asking which order was largest wants the order, and having to look it up again by its total is the
+// step this removes.
+//
+// **`null` for an empty array**, where `pop` and `at` fault. The two are different questions: asking
+// for the smallest of nothing is a search that found nothing, which slate answers with `null` the
+// way `find` and `indexOf` do, while reaching past the end of an array is a mistake about a position.
+//
+// **The FIRST of two equal keys wins**, so `minBy` and `maxBy` over the same array are stable in the
+// same direction and a tie is broken by the order the program put the elements in.
+do_extreme_by(args: Buf[Value], at: Span, smallest: bool) -> Step
+    val name = if smallest then "minBy" else "maxBy"
+
+    wanted_count(args, 2, at, name, "an array and a function")?
+
+    val xs = array_at(args, 0, at, name)?
+    val n = xs.items.len()
+
+    if n == 0 then return Ok(Null)
+
+    val mark = root_mark()
+
+    hold(xs.items.at(0))
+
+    var best = xs.items.at(0)
+
+    var best_key = on_one(args.at(1), best, at, name) match
+        Ok(v) -> v
+        Err(e) ->
+            release(mark)
+            return Err(e)
+
+    hold(best_key)
+
+    for i in 1..<n
+        val x = xs.items.at(i)
+
+        val key = on_one(args.at(1), x, at, name) match
+            Ok(v) -> v
+            Err(e) ->
+                release(mark)
+                return Err(e)
+
+        if xs.items.len() != n
+            release(mark)
+            return Err(changed_under(at, name))
+
+        val ahead = on_values(Lt, if smallest then key else best_key, if smallest then best_key else key, at) match
+            Ok(Bool(yes)) -> yes
+            Ok(other) ->
+                release(mark)
+                return fault(at, s"`${name}` puts its keys in order with `<`, and these answered ${other.type_name()}")
+            Err(e) ->
+                release(mark)
+                return Err(e)
+
+        if ahead
+            best = x
+            best_key = key
+            hold(best)
+            hold(best_key)
+
+    release(mark)
+    Ok(best)
+end do_extreme_by

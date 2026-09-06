@@ -21,7 +21,7 @@ the program's name on the command line belongs to the program:
 
 import { args, exit } from slate:process
 
-if args.len() == 0
+if args.length == 0
     print("usage: greet <name>...")
 
 for name in args
@@ -70,7 +70,7 @@ statements, not a sum. Where an expression has to span lines, brackets are what 
 the off-side rule is suspended and the continuation is unambiguous:
 
 ```slate
-isShort(n) = len(n) < 4
+isShort(n) = n.length < 4
 isKnown(n) = n == "ada"
 
 val name = "ada"

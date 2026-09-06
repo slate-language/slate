@@ -92,7 +92,7 @@ the_operations_that_change_an_array_answer_nothing() =
     clear(xs)
 
     assertEq(xs, [])
-    assertEq(len(xs), 0)
+    assertEq(xs.length, 0)
 
 @test
 clear_takes_an_array_and_not_an_object() =

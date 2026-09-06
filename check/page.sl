@@ -106,7 +106,7 @@ setChildren(app, [quiet, curious, marked, shelf])
 
 val kids = children(shelf)
 
-print("kids " + string(len(kids)))
+print("kids " + string(kids.length))
 print("tags " + toJSON([tagName(kids[0]), tagName(kids[1]), tagName(kids[2])]))
 print("texts " + toJSON([nodeText(kids[0]), nodeText(kids[1]), nodeText(kids[2])]))
 print("class " + toJSON(attribute(kids[0], "class")))
@@ -216,7 +216,7 @@ print("kinds " + toJSON([nodeKind(holder), nodeKind(words), nodeKind(note)]))
 val tail = splitText(words, 6)
 
 print("split " + toJSON([nodeText(words), nodeText(tail)]))
-print("split kinds " + toJSON([nodeKind(tail), string(len(children(holder)))]))
+print("split kinds " + toJSON([nodeKind(tail), string(children(holder).length)]))
 
 val wide = createText("ab\u{1f600}cd")
 

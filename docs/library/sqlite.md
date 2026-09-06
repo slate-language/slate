@@ -156,7 +156,7 @@ db.run("insert into search (body) values (?)", "a lazy dog sleeping")
 
 val hits = db.query("select body, bm25(search) as score from search where search match ? order by score", "fox")
 
-print(len(hits), hits[0].body)
+print(hits.length, hits[0].body)
 print(hits[0].score is real, hits[0].score < 0)
 ```
 

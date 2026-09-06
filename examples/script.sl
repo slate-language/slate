@@ -13,7 +13,7 @@ import { args, exit } from slate:process
 // `args` is a VALUE, not a call, and it holds only what came after the program's own name. So
 // `args[0]` is the first thing a person typed, where C, node and Python all hand a program its whole
 // command line and begin by skipping past themselves.
-if args.len() == 0
+if args.length == 0
     print("usage: script.sl <word>...")
     print("       counts the letters in each word you give it")
 
@@ -26,8 +26,8 @@ if args.len() == 0
 var total = 0
 
 for word in args
-    print(word + ": " + string(len(word)))
-    total = total + len(word)
+    print(word + ": " + string(word.length))
+    total = total + word.length
 
 print("total: " + string(total))
 

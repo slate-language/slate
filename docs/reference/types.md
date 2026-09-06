@@ -380,7 +380,7 @@ type survives them and a mistake is caught where it is written — in either spe
 checked as the free function it is:
 
 ```slate
-f(xs: array of string) = len(xs)
+f(xs: array of string) = xs.length
 
 h(ns: array of integer) = f(ns.filter(n -> n > 1))
 ```
@@ -393,6 +393,221 @@ h(ns: array of integer) = f(ns.filter(n -> n > 1))
 is.
 
 `map(ns, n -> string(n))` is an `array of string`, the lambda's result being read off its body.
+
+### A function's answer is read off its body
+
+**Most functions never say what they answer, and the checker works it out anyway.** A definition with
+no `-> type` gets the answer its body gives back, and that answer reaches every call to it:
+
+```slate
+shout(s: string) = s
+
+tally(xs: array of integer) = xs.length
+
+print(shout(tally([1, 2, 3])))
+```
+
+```error
+`shout` takes string here, and this is integer
+```
+
+An `if` or a `match` used for its value is worth what its branches agree on, so the same thing holds
+one level down:
+
+```slate
+tag(s: string) = s
+
+size(n) = if n > 10 then 2 else 1
+
+print(tag(size(20)))
+```
+
+```error
+`tag` takes string here, and this is integer
+```
+
+**Writing `-> type` still wins, and the body is checked against it** — an annotation is a promise, and
+this is where it is kept:
+
+```slate
+name() -> string = 1
+
+print(name())
+```
+
+```error
+this was declared to answer string, and answers integer
+```
+
+**Where the answer is not certain it is `any`, which fits everything.** Two answer points that
+disagree give the whole thing up rather than making a union, so a function that gives back a string on
+one branch and a number on another is said nothing about:
+
+```slate
+label(n) = if n > 10 then "big" else 1
+
+print(label(20), label(1))
+```
+
+```output
+big 1
+```
+
+The same holds for **recursion**, which is the one place writing the annotation buys something the
+checker cannot work out on its own: reading a recursive call means reading a result that is not known
+yet, so an unannotated recursive function answers `any` and an annotated one answers what it says.
+
+```slate
+depth(n) = if n <= 0 then 0 else depth(n - 1) + 1
+
+count(xs: array of integer) -> integer = xs.length
+
+print(depth(3), count([1, 2]))
+```
+
+```output
+3 2
+```
+
+**An `async` function answers a promise and a generator answers a generator**, whatever their bodies
+give back — what awaiting or stepping produces is not what calling produces. And a function whose body
+calls something the checker knows nothing about answers `any` in its turn, which is what keeps this
+from spreading a guess.
+
+### Narrowing
+
+**A test tells the checker something, and inside the branch where it held the name has the narrower
+type.** `x is string` makes `x` a string there, so a call the wider type would have been refused for
+is accepted:
+
+```slate
+shout(s: string) = upper(s) + "!"
+
+say(x: string | number) = if x is string then shout(x) else "#" + string(x)
+
+print(say("hi"), say(3))
+```
+
+```output
+HI! #3
+```
+
+**The side the test did NOT hold on takes that alternative away.** A `string | number` that is not a
+string is a number, which is what makes the else branch of a union test worth writing:
+
+```slate
+double(n: number) = n * 2
+
+widen(x: string | number) = if x is string then x.length else double(x)
+
+print(widen("abcd"), widen(3))
+```
+
+```output
+4 6
+```
+
+A comparison with `null` narrows the same way, and it is how most of the standard library is guarded —
+`indexOf` answers `integer | null`, so the else branch of the test is where the integer is:
+
+```slate
+tail(xs: array of integer, mark: integer)
+    val at = indexOf(xs, mark)
+
+    if at == null then return xs
+
+    slice(xs, at + 1)
+
+print(tail([1, 2, 3], 1), tail([1, 2, 3], 9))
+```
+
+```output
+[2, 3] [1, 2, 3]
+```
+
+**A guard that leaves narrows the rest of the block**, as the example above does: where the branch
+always returns, reaching the line below it means the test was false. `&&` narrows its right operand
+and the branch after it, `||` narrows the else — reaching it means neither operand held — and `!`
+swaps the two sides, so a test reaches everywhere it decides something:
+
+```slate
+trimmed(x: string | null) = if x != null && x.length > 0 then trim(x) else ""
+
+named(x: string | null, fallback: string) = if x == null || x.length == 0 then fallback else upper(x)
+
+print(trimmed("  a  "), trimmed(null), named("bo", "?"), named(null, "?"))
+```
+
+```output
+a  BO ?
+```
+
+**Narrowing may only ever take a complaint away, never add one**, which is what decides the three
+places it says nothing at all:
+
+- **A `var` with no annotation is never narrowed.** Its type is already the union of everything ever
+  assigned to it, and the branch that tested it may write to it — so a claim left standing over the
+  assignment would be a stale one, refusing a program that runs.
+- **A name of type `any` stays `any`.** There was nothing there to sharpen.
+- **A union that would empty is left alone.** `if x is string` on an `x: string` has an else branch
+  nothing reaches, and a complaint about code that never runs is a complaint no run could make.
+
+```slate
+report(s: string) = s
+
+var m = 1
+
+if m is number
+    m = "text"
+    print(report(m))
+```
+
+```output
+text
+```
+
+**An annotated `var` is FOLLOWED rather than left alone**, which is the other half of writing the
+annotation. `var m: string | number` carries two types: the one it was declared, which every
+assignment to it is held to, and the one it holds at the line being read — the initialiser's type, then
+whatever the last assignment put there, narrowed by any test the line stands under. So a test narrows
+it like anything else, and a branch that writes to it says so itself:
+
+```slate
+report(s: string) = s
+
+var m: string | number = 1
+
+if m is string
+    print(report(m))
+else
+    m = "text"
+    print(report(m))
+```
+
+```output
+text
+```
+
+Below the branches the name holds the union of what each of them left it at, and a branch that always
+returns leaves nothing behind to join. Where that union cannot be worked out the declared type is what
+is left: a loop runs an unknown number of times, a `try` may stop anywhere in its body, and a closure
+that writes to the name runs at a time the block cannot place at all — so a `var` assigned inside any of
+the three reads as what it was declared, and a call wanting the narrower type is refused there. The
+assignment itself is always measured against the annotation, wherever it is written.
+
+Only a bare name narrows: `o.field is string` says nothing about `o.field`, the next line being free
+to write to the field, and this pass says nothing about an object's fields in any case. And the
+narrowing is a claim that can still be wrong, which is what says it is being checked at all:
+
+```slate
+double(n: number) = n * 2
+
+say(x: string | number) = if x is string then double(x) else 0
+```
+
+```error
+`double` takes number here, and this is string
+```
 
 ### A callback knows what it is handed
 
