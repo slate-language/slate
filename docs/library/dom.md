@@ -16,7 +16,7 @@ import { byId, setText, on } from slate:dom
 |---|---|
 | `createElement(tag)`, `createText(s)`, `createComment(s)` | |
 | `setAttribute`, `removeAttribute`, `setProperty` | |
-| `on(node, event, fn)`, `off(node, id)` | |
+| `on(node, event, fn)`, `off(node, event, fn)` | |
 | `setChildren(node, kids)`, `setText(node, s)` | |
 | `insertBefore(parent, node, before)` | one child, in front of another; `null` appends |
 | `removeChild(parent, node)` | one child, out |
