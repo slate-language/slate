@@ -226,6 +226,73 @@ private taken_name(b: *ClassBody, name: string) -> bool
     false
 end taken_name
 
+// The same question asked about a name a program WROTE, which a property answers to as well.
+//
+// **`get area` and `var area` are one name to a reader and to `.`**, so a class writing both is
+// refused exactly as any other duplicate is. **`get area` beside `set area` is not a clash** -- it is
+// the pair the two words exist for -- which is why the accessors are asked about here and check their
+// own key for themselves.
+private property_taken(b: *ClassBody, name: string) -> bool
+    if taken_name(b, name) then return true
+
+    taken_name(b, GetPrefix + name) || taken_name(b, SetPrefix + name)
+
+// The word a member begins with where it declares a property, or `""` where it does not. `start` is
+// where the word would be, which is one further along after an `async`.
+//
+// **`get` and `set` are SOFT words**, which they have to be: `get(self, k)` is an ordinary method
+// name and a class that had one must keep it. Two tokens settle it, as `class` and `data` are
+// settled -- the word, and then a definition rather than a `(`. So `get(self, k) = ...` is a method
+// and `get area(self) = ...` is a property, and nothing in between is ambiguous.
+private accessor_word(p: *Parser, start: usize) -> string
+    if p.peek_kind_at(start) != Ident then return ""
+
+    val word = p.text_at(start)
+
+    if word != "get" && word != "set" then return ""
+    if !at_definition_from(p, start + 1) then return ""
+
+    word
+end accessor_word
+
+// `get area(self)` and `set area(self, v)`, which become fields of the class under a key no program
+// can write.
+//
+// **A property is not stored and a getter is not a method**, so the two rules a reader needs are
+// the two this refuses on: a getter takes the receiver and nothing else, and a setter takes the
+// receiver and the value. Anything else would be read as a method with a strange name at the one
+// place the reader cannot see the mistake -- the call is `c.area`, which has no argument list to
+// count against.
+private declare_accessor(p: *Parser, what: string, cls: string, b: *ClassBody, word: string, said_async: bool, s: Stmt)
+    *s.kind match
+        Def(name, params, defaults, body, is_async) ->
+            val getter = word == "get"
+            val wanted: usize = if getter then 1 else 2
+            val shape = if getter then s"get ${name}(self)" else s"set ${name}(self, value)"
+
+            if params.len() != wanted || defaults.len() != 0
+                p.fault(s.span, s"a property is written `${shape}` -- a getter is handed the object and answers the value, and a setter is handed the object and the value being assigned")
+                return
+            end if
+
+            if is_async || said_async
+                p.fault(s.span, s"`${name}` cannot be `async` -- a property is read with `c.${name}`, which has nowhere to await, so an `async` one would hand back a promise wherever the value was wanted")
+                return
+            end if
+
+            val key = (if getter then GetPrefix else SetPrefix) + name
+
+            if taken_name(b, name) || taken_name(b, key)
+                p.fault(s.span, s"`${name}` is given twice in ${what} `${cls}`")
+                return
+            end if
+
+            b.keys.push(key)
+            b.key_spans.push(s.span)
+            b.values.push(expr(s.span, Lambda(params, defaults, body, false)))
+        _ -> ()
+end declare_accessor
+
 // One member: a `var` field, a `val` the class holds, or a definition.
 // **`what` is the word the reader wrote and `fields_ok` is whether a `var` means anything here**,
 // which is the whole of the difference between a class body and a data type's. A class's `var`
@@ -248,7 +315,7 @@ private one_member(p: *Parser, what: string, cls: string, b: *ClassBody, fields_
         val named = name_at.to(p.just_taken())
         val init = if p.accept(Assign) then Some(parse_body(p)) else None
 
-        if taken_name(b, fname)
+        if property_taken(b, fname)
             p.fault(named, s"`${fname}` is given twice in ${what} `${cls}`")
             return
         end if
@@ -279,7 +346,7 @@ private one_member(p: *Parser, what: string, cls: string, b: *ClassBody, fields_
             ObjectLit(_, _, _) -> shared_mutable(p, cls, vname, named)
             _ -> ()
 
-        if taken_name(b, vname)
+        if property_taken(b, vname)
             p.fault(named, if vname == "proto" then s"${what} `${cls}` says `from` and also gives a `proto`, and those are the same field -- keep whichever says it better" else s"`${vname}` is given twice in ${what} `${cls}`")
             return
         end if
@@ -287,6 +354,25 @@ private one_member(p: *Parser, what: string, cls: string, b: *ClassBody, fields_
         b.keys.push(vname)
         b.key_spans.push(named)
         b.values.push(value)
+        return
+    end if
+
+    // **A property is read before an ordinary definition is**, because `get area(self)` is a
+    // definition of `area` with a soft word in front of it and nothing later could tell the two
+    // apart. The word is stepped over and the rest is the member syntax the class body already has.
+    //
+    // **`async get area(self)` is read here too, so that it can be REFUSED with the sentence that
+    // says why.** It is the spelling every other language uses, so a reader who wants one writes it;
+    // left to the member check below it is a stray word in front of something that is not a
+    // definition, and the four complaints that come back name none of the mistake.
+    val said_async = p.at(Async) && accessor_word(p, 1) != ""
+    val accessor = accessor_word(p, if said_async then 1 else 0)
+
+    if accessor != ""
+        if said_async then p.bump()
+
+        p.bump()
+        declare_accessor(p, what, cls, b, accessor, said_async, parse_def(p))
         return
     end if
 
@@ -310,7 +396,7 @@ private one_member(p: *Parser, what: string, cls: string, b: *ClassBody, fields_
 
     *s.kind match
         Def(name, params, defaults, body, is_async) ->
-            if taken_name(b, name)
+            if property_taken(b, name)
                 p.fault(s.span, s"`${name}` is given twice in ${what} `${cls}`")
                 return
             end if
@@ -334,7 +420,7 @@ private one_member(p: *Parser, what: string, cls: string, b: *ClassBody, fields_
 
             for i in 0..<params.len()
                 if declares.at(i)
-                    if taken_name(b, params.at(i))
+                    if property_taken(b, params.at(i))
                         p.fault(s.span, s"`${params.at(i)}` is given twice in ${what} `${cls}`")
                     else
                         declare_field(b, params.at(i), s.span, None)
