@@ -323,12 +323,140 @@ do_read_image(args: Buf[Value], at: Span) -> Step
         Err(e) -> Ok(err_value(why_not_image(e)))
 end do_read_image
 
+// The three numbers `imageShape` answers, as the record a program reads.
+private image_shape_value(width: long, height: long, channels: long) -> Value
+    val mark = root_mark()
+    val o = new_object()
+
+    hold(Object(o))
+    obj_put_name(o, "width", Int(width))
+    obj_put_name(o, "height", Int(height))
+    obj_put_name(o, "channels", Int(channels))
+
+    val made = ok_value(Object(o))
+
+    hold(made)
+    release(mark)
+    made
+end image_shape_value
+
+// -- a PNG's own header, for the one file stb's header scan will not answer for ----------------------
+
+// **stb REFUSES A HEADER WHOSE PIXELS WOULD NOT FIT ITS DECODER, AND THAT IS THE VERY FILE
+// `imageShape` EXISTS FOR.** `stb_image` checks `(1 << 30) / width / channels < height` while it is
+// reading the IHDR and makes that check even when it was asked for the header alone -- so a PNG
+// claiming 20,000 by 20,000 in RGB, which is the decompression bomb this whole call is the guard
+// against, came back as *unknown image type* rather than as its shape. A handler cannot answer `413`
+// to a size it was never told.
+//
+// So a PNG's IHDR is read here, and **only where stb has already said no**: every file stb answers
+// for keeps stb's answer, channel count and error sentence alike, and nothing that works today
+// changes. The reader accepts what stb accepts and refuses what stb refuses -- the same signature,
+// the same thirteen-byte IHDR, the same depths and colour types, the same `tRNS` promotion, and the
+// same walk to the first `IDAT` -- so a file cut short runs out of chunks and keeps stb's
+// *outofdata*, and rubbish keeps *unknown image type*.
+//
+// **Only PNG needs this.** A GIF's dimensions are sixteen bits and a WebP's are fourteen, and stb's
+// JPEG frame check is against `INT_MAX` rather than `1 << 30` -- none of the three can reach a
+// ceiling with a header whose shape a decoder would otherwise report.
+//
+// `STBI_MAX_DIMENSIONS`, which is stb's own cap on a side and is checked here for the same reason
+// the rest is: a file this reader answered for and stb would have refused would make `imageShape`
+// disagree with `readImage` about what is even an image.
+private val PngMaxSide: usize = 1 << 24
+
+private png_be32(bytes: []const u8, at: usize) -> usize =
+    (usize(bytes[at]) << 24) | (usize(bytes[at + 1]) << 16) | (usize(bytes[at + 2]) << 8) |
+        usize(bytes[at + 3])
+
+private png_chunk_is(bytes: []const u8, at: usize, a: u8, b: u8, c: u8, d: u8) -> bool =
+    bytes[at] == a && bytes[at + 1] == b && bytes[at + 2] == c && bytes[at + 3] == d
+
+private png_header_shape(data: []const u8) -> Option[stb.Shape]
+    // The signature, the IHDR chunk header and its thirteen bytes: thirty-three in all, and a file
+    // shorter than that has no shape to read.
+    if data.len < 33 then return None
+
+    if !(data[0] == 137 && data[1] == 80 && data[2] == 78 && data[3] == 71 &&
+            data[4] == 13 && data[5] == 10 && data[6] == 26 && data[7] == 10)
+        return None
+
+    if png_be32(data, 8) != 13 || !png_chunk_is(data, 12, 73, 72, 68, 82) then return None
+
+    val width = png_be32(data, 16)
+    val height = png_be32(data, 20)
+    val depth = data[24]
+    val colour = data[25]
+
+    if width == 0 || height == 0 || width > PngMaxSide || height > PngMaxSide then return None
+    if depth != 1 && depth != 2 && depth != 4 && depth != 8 && depth != 16 then return None
+
+    // The compression method, the filter method and the interlace flag, which stb reads and which
+    // only ever hold one, one and two values.
+    if data[26] != 0 || data[27] != 0 || data[28] > 1 then return None
+
+    val paletted = colour == 3
+
+    if paletted && depth == 16 then return None
+
+    // What a decode of this file would answer, before any `tRNS` promotes it. A palette is three
+    // channels until a transparency chunk makes it four, which is stb's own arithmetic.
+    val base: usize = colour match
+        0 -> 1
+        2 -> 3
+        3 -> 3
+        4 -> 2
+        6 -> 4
+        _ -> return None
+
+    var at: usize = 33
+    var palette = false
+
+    // The chunks between the IHDR and the pixels, walked exactly as far as stb walks them: a header
+    // scan stops at the first `IDAT`, and at a `tRNS` before it, because those are the two places
+    // the channel count is finally known.
+    loop
+        if at + 8 > data.len then return None
+
+        val length = png_be32(data, at)
+        val next = at + 12 + length
+
+        if next < at || next > data.len then return None
+
+        if png_chunk_is(data, at + 4, 116, 82, 78, 83)
+            if paletted then return Some(stb.Shape(int(width), int(height), 4))
+
+            // A `tRNS` on a colour type that already carries alpha is damage rather than a channel.
+            if base % 2 == 0 then return None
+
+            return Some(stb.Shape(int(width), int(height), int(base) + 1))
+
+        if png_chunk_is(data, at + 4, 73, 68, 65, 84)
+            if paletted && !palette then return None
+
+            return Some(stb.Shape(int(width), int(height), int(base)))
+
+        if png_chunk_is(data, at + 4, 80, 76, 84, 69)
+            if length == 0 || length > 768 || length % 3 != 0 then return None
+
+            palette = true
+
+        // An `IEND` before any pixels is a file with no image in it.
+        if png_chunk_is(data, at + 4, 73, 69, 78, 68) then return None
+
+        at = next
+end png_header_shape
+
 // `imageShape(bytes)` -- `{ width, height, channels }` from the header alone, without decoding.
 //
 // **This is the guard against a decompression bomb wearing a picture's clothes.** The pixels are
 // `width * height * channels` bytes whatever the file weighed, so a 4 KB PNG claiming 20,000 by
 // 20,000 is 1.2 GB the moment anything decodes it. Reading the shape first is what lets a handler
 // answer `413` instead.
+//
+// **So it answers for a header of any size**, which is what makes that possible at all: a call that
+// refused the very files it exists to catch would leave a handler with nothing to measure. Where stb
+// will not read a header, `png_header_shape` above reads the IHDR itself.
 do_image_shape(args: Buf[Value], at: Span) -> Step
     if args.len() != 1
         return fault(at, s"`imageShape` takes the bytes of an image, and was given ${counted(args.len(), "argument")}")
@@ -344,37 +472,16 @@ do_image_shape(args: Buf[Value], at: Span) -> Step
             Ok(info) ->
                 if info.animated then return Ok(err_value(why_not_webp(libwebp.Error.Animated)))
 
-                val mark = root_mark()
-                val o = new_object()
-
-                hold(Object(o))
-                obj_put_name(o, "width", Int(long(info.width)))
-                obj_put_name(o, "height", Int(long(info.height)))
-                obj_put_name(o, "channels", Int(long(webp_source_channels(info))))
-
-                val made = ok_value(Object(o))
-
-                hold(made)
-                release(mark)
-                Ok(made)
+                Ok(image_shape_value(long(info.width), long(info.height), long(webp_source_channels(info))))
             Err(e) -> Ok(err_value(why_not_webp(e)))
 
     stb.probe(source.view()) match
-        Ok(shape) ->
-            val mark = root_mark()
-            val o = new_object()
-
-            hold(Object(o))
-            obj_put_name(o, "width", Int(long(shape.width)))
-            obj_put_name(o, "height", Int(long(shape.height)))
-            obj_put_name(o, "channels", Int(long(shape.channels)))
-
-            val made = ok_value(Object(o))
-
-            hold(made)
-            release(mark)
-            Ok(made)
-        Err(e) -> Ok(err_value(why_not_image(e)))
+        Ok(shape) -> Ok(image_shape_value(long(shape.width), long(shape.height), long(shape.channels)))
+        Err(e) ->
+            png_header_shape(source.view()) match
+                Some(shape) ->
+                    Ok(image_shape_value(long(shape.width), long(shape.height), long(shape.channels)))
+                None -> Ok(err_value(why_not_image(e)))
 end do_image_shape
 
 // -- scaling -------------------------------------------------------------------------------------------
