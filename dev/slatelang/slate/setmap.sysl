@@ -1,0 +1,323 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// What a program does to a set and to a map.
+//
+// **Both are an `ObjectObj` and nothing else**, which is the whole of why this file is short: an
+// object is already an insertion-ordered hash table keyed by any value at all, hashing structurally
+// and consulting a class's own `hash` and `==` where it wrote them. A set uses the key half and
+// ignores the value; a map uses both. `table.sysl` is the implementation of all three.
+//
+// **What separates a map from an object is what a KEY MEANS, not how it is stored.** An object's
+// keys are the program's field names -- `o.x` is a lookup a reader expects to find a field, a
+// `proto` on one is machinery, and a data value's are frozen. A map's keys are data: nothing is a
+// field, nothing is walked past, and a key that happens to spell `proto` is a key like any other.
+// That is exactly the distinction JavaScript drew when it added `Map` beside the object, and it is
+// why a program that keys by a number, an array or an instance wants this rather than an object.
+//
+// **A MUTATOR ANSWERS THE COLLECTION HERE, WHERE AN ARRAY'S ANSWERS NOTHING.** `array.sysl` refuses
+// to hand the array back from `sort` and `push` so that `ys = xs.sort()` cannot read as a fresh
+// array; the reason does not carry over, because `add` and `set` are the names JavaScript gave them
+// and chaining them is what those names are for -- `Set().add(1).add(2)` builds one set and says so.
+
+// The table behind a set, or a complaint naming what was given instead.
+private set_of(v: Value, at: Span, name: string) -> Result[*ObjectObj, Signal] = v match
+    SetVal(t) -> Ok(t)
+    other -> Err(failure(at, s"`${name}` takes a set, and this is ${other.type_name()}"))
+
+private map_of(v: Value, at: Span, name: string) -> Result[*ObjectObj, Signal] = v match
+    MapVal(t) -> Ok(t)
+    other -> Err(failure(at, s"`${name}` takes a map, and this is ${other.type_name()}"))
+
+private takes_n(args: Buf[Value], n: usize, at: Span, name: string, what: string) -> Result[unit, Signal]
+    if args.len() != n then return Err(failure(at, s"`${name}` takes ${what}, and was given ${counted(args.len(), "argument")}"))
+
+    Ok(())
+
+// How many live entries a table holds.
+//
+// **`o.live` rather than `obj_len`**, and the difference is the one thing a map may not inherit from
+// an object: `obj_len` walks the entries skipping what `walked_key` hides, which is right for a
+// record and wrong for a container. A map's `proto` is a key.
+private live_count(t: *ObjectObj) -> usize = t.live
+
+// Everything a value yields, in order -- what a constructor is given and what `...` spreads.
+//
+// **The list is materialised rather than walked lazily**, because what reads it puts each value
+// into a table that may grow, and a growth is where the collector runs. A `Buf[Value]` is not a
+// root, so the caller holds the collection it is filling and this holds nothing longer than it
+// takes to build.
+walked_values(v: Value, at: Span, what: string) -> Result[Buf[Value], Signal]
+    var out: Buf[Value] = buf()
+
+    v match
+        Array(a) ->
+            for i in 0..<a.items.len()
+                out.push(a.items.at(i))
+        SetVal(t) ->
+            for i in 0..<t.entries.len()
+                val e = t.entries.at(i)
+
+                if !e.dead then out.push(e.key)
+
+        // **A map yields its pairs**, which is what `for (k, v) in m` unpacks and what `Map(m)`
+        // reads back -- so a map spread into a `Map` is a copy of it, as an array spread into an
+        // array is.
+        MapVal(t) ->
+            for i in 0..<t.entries.len()
+                val e = t.entries.at(i)
+
+                if !e.dead
+                    var pair: Buf[Value] = buf()
+
+                    pair.push(e.key)
+                    pair.push(e.value)
+                    out.push(Array(new_array(pair)))
+        RangeVal(lo, hi, inclusive, has_lo, has_hi) ->
+            if !has_lo || !has_hi
+                return Err(failure(at, s"${what} needs a range with both ends, since one left out would never finish"))
+
+            for i in 0..<range_count(lo, hi, inclusive)
+                out.push(Int(lo + long(i)))
+        Gen(id, gen) ->
+            loop
+                gen_iter_next(id, gen, at)? match
+                    None -> break
+                    Some(one) -> out.push(one)
+        other -> return Err(failure(at, s"${what} takes an array, a range, a generator, a set or a map, and this is ${other.type_name()}"))
+
+    Ok(out)
+end walked_values
+
+// -- sets -----------------------------------------------------------------------------------------
+
+// `Set()` and `Set(xs)`.
+do_set_new(args: Buf[Value], at: Span) -> Step
+    if args.len() > 1
+        return fault(at, s"`Set` takes nothing or one thing to walk, and was given ${counted(args.len(), "argument")}")
+
+    val mark = root_mark()
+    val made = SetVal(new_object())
+
+    hold(made)
+
+    val out = fill_set(made, args, at)
+
+    release(mark)
+    out
+end do_set_new
+
+private fill_set(made: Value, args: Buf[Value], at: Span) -> Step
+    if args.len() == 1
+        val each = walked_values(args.at(0), at, "`Set`")?
+        val t = set_of(made, at, "Set")?
+
+        for i in 0..<each.len()
+            keepable(each.at(i), at, "put in a set")?
+            obj_put(t, each.at(i), Null, at)?
+
+    Ok(made)
+end fill_set
+
+// `add(s, v)` -- and the set back, so that adds chain.
+do_set_add(args: Buf[Value], at: Span) -> Step
+    takes_n(args, 2, at, "add", "a set and a value")?
+
+    val t = set_of(args.at(0), at, "add")?
+
+    keepable(args.at(1), at, "put in a set")?
+    obj_put(t, args.at(1), Null, at)?
+    Ok(args.at(0))
+end do_set_add
+
+do_set_has(args: Buf[Value], at: Span) -> Step
+    takes_n(args, 2, at, "has", "a set and a value")?
+
+    Ok(Bool(obj_has(set_of(args.at(0), at, "has")?, args.at(1), at)?))
+
+// `delete(s, v)` -- whether there was one, which is JavaScript's answer and the useful one.
+do_set_delete(args: Buf[Value], at: Span) -> Step
+    takes_n(args, 2, at, "delete", "a set and a value")?
+
+    Ok(Bool(obj_remove(set_of(args.at(0), at, "delete")?, args.at(1), at)?))
+
+do_set_clear(args: Buf[Value], at: Span) -> Step
+    takes_n(args, 1, at, "clear", "a set")?
+
+    empty_table(set_of(args.at(0), at, "clear")?)
+    Ok(Null)
+
+// Everything out of a table, keeping the object so that every name for it sees the change.
+private empty_table(t: *ObjectObj)
+    t.entries = buf()
+    t.index = fresh_index()
+    t.live = 0
+
+// `size(s)` -- how many are in it.
+//
+// **A method rather than the property JavaScript has**, because slate has no properties on a
+// builtin kind: `xs.len()` is a call and so is this. `len(s)` answers the same number.
+do_set_size(args: Buf[Value], at: Span) -> Step
+    takes_n(args, 1, at, "size", "a set")?
+
+    Ok(Int(long(live_count(set_of(args.at(0), at, "size")?))))
+
+// `values(s)` -- what is in it, as an array, in the order it was added.
+do_set_values(args: Buf[Value], at: Span) -> Step
+    takes_n(args, 1, at, "values", "a set")?
+
+    Ok(Array(new_array(walked_values(args.at(0), at, "`values`")?)))
+
+do_set_for_each(args: Buf[Value], at: Span) -> Step
+    takes_n(args, 2, at, "forEach", "a set and a function")?
+
+    val each = walked_values(args.at(0), at, "`forEach`")?
+
+    for i in 0..<each.len()
+        call_one(args.at(1), each.at(i), at, "forEach")?
+
+    Ok(Null)
+end do_set_for_each
+
+private call_one(f: Value, v: Value, at: Span, name: string) -> Step
+    var one: Buf[Value] = buf()
+
+    one.push(v)
+    apply_callback(f, one, at, name)
+
+// -- maps -----------------------------------------------------------------------------------------
+
+// `Map()` and `Map(pairs)`.
+do_map_new(args: Buf[Value], at: Span) -> Step
+    if args.len() > 1
+        return fault(at, s"`Map` takes nothing or a list of pairs, and was given ${counted(args.len(), "argument")}")
+
+    val mark = root_mark()
+    val made = MapVal(new_object())
+
+    hold(made)
+
+    val out = fill_map(made, args, at)
+
+    release(mark)
+    out
+end do_map_new
+
+private fill_map(made: Value, args: Buf[Value], at: Span) -> Step
+    if args.len() == 1
+        val each = walked_values(args.at(0), at, "`Map`")?
+        val t = map_of(made, at, "Map")?
+
+        for i in 0..<each.len()
+            // **A pair is an array of exactly two, and anything else is named rather than
+            // ignored.** JavaScript reads a one-element entry as a key with `undefined` beside it,
+            // which slate has nowhere to put -- and a reader who wrote `Map([1])` meant a pair.
+            val pair = each.at(i) match
+                Array(a) ->
+                    if a.items.len() != 2
+                        return fault(at, s"`Map` reads a list of pairs, and one of these has ${counted(a.items.len(), "value")} rather than a key and a value")
+
+                    a
+                other -> return fault(at, s"`Map` reads a list of pairs, and one of these is ${other.type_name()}")
+
+            keepable(pair.items.at(0), at, "a map key")?
+            keepable(pair.items.at(1), at, "put in a map")?
+            obj_put(t, pair.items.at(0), pair.items.at(1), at)?
+
+    Ok(made)
+end fill_map
+
+// `set(m, k, v)` -- and the map back, so that writes chain.
+do_map_set(args: Buf[Value], at: Span) -> Step
+    takes_n(args, 3, at, "set", "a map, a key and a value")?
+
+    val t = map_of(args.at(0), at, "set")?
+
+    keepable(args.at(1), at, "a map key")?
+    keepable(args.at(2), at, "put in a map")?
+    obj_put(t, args.at(1), args.at(2), at)?
+    Ok(args.at(0))
+end do_map_set
+
+// `get(m, k)` -- what the key holds, or `null` where there is none.
+//
+// **`null` and not `undefined`**, which is slate's rule rather than a choice made here: absence
+// stops at the boundary it arose at, so nothing hands one out. A program that has to tell a stored
+// `null` from a missing key asks `has` first, which is what `has` is for.
+do_map_get(args: Buf[Value], at: Span) -> Step
+    takes_n(args, 2, at, "get", "a map and a key")?
+
+    obj_get(map_of(args.at(0), at, "get")?, args.at(1), at)? match
+        None -> Ok(Null)
+        Some(v) -> Ok(v)
+
+do_map_has(args: Buf[Value], at: Span) -> Step
+    takes_n(args, 2, at, "has", "a map and a key")?
+
+    Ok(Bool(obj_has(map_of(args.at(0), at, "has")?, args.at(1), at)?))
+
+do_map_delete(args: Buf[Value], at: Span) -> Step
+    takes_n(args, 2, at, "delete", "a map and a key")?
+
+    Ok(Bool(obj_remove(map_of(args.at(0), at, "delete")?, args.at(1), at)?))
+
+do_map_clear(args: Buf[Value], at: Span) -> Step
+    takes_n(args, 1, at, "clear", "a map")?
+
+    empty_table(map_of(args.at(0), at, "clear")?)
+    Ok(Null)
+
+do_map_size(args: Buf[Value], at: Span) -> Step
+    takes_n(args, 1, at, "size", "a map")?
+
+    Ok(Int(long(live_count(map_of(args.at(0), at, "size")?))))
+
+do_map_keys(args: Buf[Value], at: Span) -> Step
+    takes_n(args, 1, at, "keys", "a map")?
+
+    val t = map_of(args.at(0), at, "keys")?
+
+    var out: Buf[Value] = buf()
+
+    for i in 0..<t.entries.len()
+        val e = t.entries.at(i)
+
+        if !e.dead then out.push(e.key)
+
+    Ok(Array(new_array(out)))
+end do_map_keys
+
+do_map_values(args: Buf[Value], at: Span) -> Step
+    takes_n(args, 1, at, "values", "a map")?
+
+    val t = map_of(args.at(0), at, "values")?
+
+    var out: Buf[Value] = buf()
+
+    for i in 0..<t.entries.len()
+        val e = t.entries.at(i)
+
+        if !e.dead then out.push(e.value)
+
+    Ok(Array(new_array(out)))
+end do_map_values
+
+// `entries(m)` -- the pairs, which is what walking a map gives and what `Map` reads back.
+do_map_entries(args: Buf[Value], at: Span) -> Step
+    takes_n(args, 1, at, "entries", "a map")?
+
+    Ok(Array(new_array(walked_values(args.at(0), at, "`entries`")?)))
+
+// `forEach(m, f)` -- the function on every pair, as `for (k, v) in m` unpacks one.
+do_map_for_each(args: Buf[Value], at: Span) -> Step
+    takes_n(args, 2, at, "forEach", "a map and a function")?
+
+    val each = walked_values(args.at(0), at, "`forEach`")?
+
+    for i in 0..<each.len()
+        call_one(args.at(1), each.at(i), at, "forEach")?
+
+    Ok(Null)
+end do_map_for_each
