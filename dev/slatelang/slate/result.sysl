@@ -1,0 +1,392 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// WHAT A FUNCTION ANSWERS WHERE NOBODY WROTE IT DOWN, and what a `match` or an `if` is worth.
+//
+// **`calls.sysl` reads a definition's `-> type` back off the `Ensures` the parser made of it, and
+// this is what happens when there is none.** A function with no result annotation used to be a
+// `FunctionType` answering `Any`, so nothing downstream of a call to one could be said at all --
+// which is most of the calls in most programs, slate being a language where an annotation is
+// optional everywhere.
+//
+// **THE RULE IS `check.sysl`'s AND IS WHAT DECIDES EVERY LINE HERE: the pass may only report what
+// the machine would also refuse.** An inferred type is a claim nobody wrote, so it is made only
+// where it is certain and is `Any` everywhere else:
+//
+// - **A local is `Any`.** The walk shadows every name a block declares before it reads anything, so
+//   a `val` inside the body cannot be mistaken for an outer name of the same spelling -- and it is
+//   not given the type of its initialiser either, which would want the whole of `check_stmt`'s
+//   reasoning about shapes and assignment run a second time.
+// - **The parameters keep their annotations**, which is where nearly all of the value is:
+//   `double(n: integer) = n * 2` answers an integer, and that is the shape an annotated program has.
+// - **A RECURSIVE call answers `Any`, and it falls out rather than being guarded against.** The walk
+//   reads the signature the block already noted, which for the function being read is the one with
+//   no result yet -- so `fact(n) = if n <= 1 then 1 else n * fact(n - 1)` joins an integer with an
+//   `Any` and gives up, which is what the user asked for. An annotation is what makes a recursive
+//   function's answer known.
+// - **EVERY ANSWER POINT MUST AGREE.** A body's answer is the join of every `return` in it and the
+//   value it falls out with; anything less than one type is `Any`, never a union. A union on the
+//   value side is refused by `fits` unless every alternative fits, and inventing one here would
+//   refuse programs that run.
+// - **AN INFERRED ARRAY FORGETS ITS ELEMENT**, which is `elementless`'s rule applied one level out.
+//   An array is mutable and the caller's name for it outlives the call, so `val xs = f()` followed
+//   by `xs.push("s")` holds an array of strings -- and a recorded `array of integer` would then
+//   refuse a program the machine runs. An object's shape needs no such rule: `note_type` drops one
+//   on the way into a scope, so the only place a shape survives is an argument written at the call,
+//   which nothing can have touched.
+//
+// **An ANNOTATION still wins and is still checked against the body**, which is `check_expr.sysl`'s
+// `Ensures` arm and is untouched: this is asked only where there is nothing to believe.
+
+// -- what a definition answers ---------------------------------------------------------------------
+
+// Re-note a definition with what its body was found to answer.
+//
+// **It is a second pass over the block rather than part of `signature_of`**, and the reason is
+// forward reference: every name the block binds is noted before any of this runs, so a body calling
+// something written below it reads a real signature rather than nothing. The first pass gives every
+// definition the result its annotation declared, and this one sharpens the ones that declared none.
+//
+// Not `private`: `check_stmts` asks it of every definition in a block.
+note_answer(name: string, params: Buf[string], defaults: usize, body: Expr, is_async: bool, env: *TypeEnv)
+    // **An `async` function answers a PROMISE and not what its body says**, which is
+    // `signature_of`'s rule for the same reason: what the body gives back is what awaiting the call
+    // produces, not what calling it does.
+    if is_async then return
+
+    // A body that says what it answers is believed, and the walk is not paid for.
+    if said_result(body) then return
+
+    val answered = answer_of(params, body, env)
+
+    *answered.kind match
+        Any -> return
+        _ -> ()
+
+    note_type(env, name, signature_answering(params, floor_of(params, defaults), body, answered))
+end note_answer
+
+// Whether the definition wrote its own `-> type`.
+private said_result(body: Expr) -> bool =
+    *body.kind match
+        Ensures(_, _, _) -> true
+        _ -> false
+
+// The join of every `return` in the body and the value the body falls out with.
+private answer_of(params: Buf[string], body: Expr, env: *TypeEnv) -> Type
+    var answers: Buf[Type] = buf()
+
+    enter_scope(env)
+    note_params(params, body, env)
+    gather_returns(body, &answers, env)
+
+    falls_out(body, env) match
+        Some(t) -> answers.push(t)
+
+        // **A body that cannot fall out of its bottom answers only through its returns**, a function
+        // ending in a `throw` or in a `return` on every branch being the ordinary case.
+        None -> ()
+
+    leave_scope(env)
+
+    if answers.is_empty() then return type_of(Any)
+
+    var out = answers.at(0)
+
+    for i in 1..<answers.len()
+        out = joined(out, answers.at(i))
+
+    unpinned(out)
+end answer_of
+
+// Two answers as one, which is the type they agree on and `Any` where they do not.
+//
+// **`same_type` is the agreement**, and it is already false for `Any` and for a union -- so either
+// of those anywhere in a body gives the whole answer up, which is the safe direction.
+// Not `private`: `type_of_expr` joins an `if`'s branches and a `match`'s arms with it.
+joined(a: Type, b: Type) -> Type = if same_type(a, b) then a else type_of(Any)
+
+// A type with an element an inference put on it taken off again.
+//
+// **The header says why: an array outlives the call that built it and the caller may write to it.**
+// Only the outermost one is worth undoing, an array of arrays being a shape no inference here
+// produces on its own.
+// Not `private`: `type_of_expr` unpins a join for the same reason.
+unpinned(t: Type) -> Type =
+    *t.kind match
+        ArrayOf(_) -> type_of(ArrayOf(type_of(Any)))
+        _ -> t
+
+// -- the value a body falls out with -----------------------------------------------------------------
+
+// What control reaching the bottom of this expression leaves behind, or nothing where it cannot
+// reach the bottom at all.
+//
+// **A BLOCK IS THE ONLY REASON THIS IS NOT `type_of_expr`.** A block's value is its trailing
+// statement's, and `type_of_expr` deliberately says nothing about one -- reading a block's tail as a
+// FUNCTION's answer would be wrong wherever a `return` is written above it, which is exactly what
+// `gather_returns` is for. Here the two halves are collected separately and joined, so the tail may
+// be read.
+private falls_out(x: Expr, env: *TypeEnv) -> Option[Type]
+    *x.kind match
+        Block(stmts) ->
+            if stmts.is_empty() then return Some(type_of(NullType))
+
+            enter_scope(env)
+            shadow_declared(stmts, env)
+
+            val answer = *stmts.at(stmts.len() - 1).kind match
+                Eval(e) -> falls_out(e, env)
+                Return(_) -> None
+                Throw(_) -> None
+                Break(_, _) -> None
+                Continue(_) -> None
+
+                // A block ending in anything else -- a binding, an import, a definition -- answers
+                // whatever the machine leaves there, which is not a question this pass asks.
+                _ -> Some(type_of(Any))
+
+            leave_scope(env)
+            answer
+
+        // **An `if` with no `else` is left exactly as it was**, which is `Any`: slate gives the
+        // missing branch a null and there is nothing to gain by saying so.
+        IfExpr(_, then_branch, else_branch) -> else_branch match
+            Some(other) -> both_ways(falls_out(then_branch, env), falls_out(other, env))
+            None -> Some(type_of(Any))
+        MatchExpr(_, arms) ->
+            var out: Option[Type] = None
+
+            for i in 0..<arms.len()
+                enter_scope(env)
+                note_bindings(arms.at(i).pattern, env)
+
+                out = both_ways(out, falls_out(arms.at(i).body, env))
+
+                leave_scope(env)
+
+            out
+        _ -> Some(type_of_expr(x, env))
+end falls_out
+
+// Two branches' answers as one. **A branch that cannot fall out contributes nothing**, which is what
+// makes an early `return` in one arm of an `if` cost the other arm nothing.
+private both_ways(a: Option[Type], b: Option[Type]) -> Option[Type]
+    a match
+        None -> return b
+        Some(_) -> ()
+
+    b match
+        None -> return a
+        Some(_) -> ()
+
+    Some(joined(a.unwrap(), b.unwrap()))
+end both_ways
+
+// -- every `return` in the body ----------------------------------------------------------------------
+
+// **The walk is exhaustive over `ExprKind` and over `StmtKind` on purpose and must stay so**, which
+// is `flow.sysl`'s rule for `flow.sysl`'s reason: a variant added later that carries an expression
+// and is not walked here would make the pass miss a `return`, and a missed answer point is an
+// inferred type that is too NARROW -- a program refused that runs.
+//
+// **A NESTED FUNCTION IS NOT ENTERED.** A `Def` and a `Lambda` carry their body by index rather than
+// in this tree, so a `return` inside one belongs to it and is out of reach here without anything
+// having to say so -- the `Def` arm below skips its defaults for the same reason.
+private gather_returns(x: Expr, into: *Buf[Type], env: *TypeEnv)
+    *x.kind match
+        IntLit(_) -> ()
+        RealLit(_) -> ()
+        StrLit(_) -> ()
+        BoolLit(_) -> ()
+        NullLit -> ()
+        UndefinedLit -> ()
+        Bad -> ()
+        Name(_) -> ()
+        ShapeLit(_, _) -> ()
+        Lambda(_, _, _, _) -> ()
+        Spread(inner) -> gather_returns(inner, into, env)
+        Named(_, value) -> gather_returns(value, into, env)
+        DataLit(inner) -> gather_returns(inner, into, env)
+        Await(inner) -> gather_returns(inner, into, env)
+        Yield(inner) -> gather_returns(inner, into, env)
+        Unary(_, rhs) -> gather_returns(rhs, into, env)
+        Binary(_, lhs, rhs) ->
+            gather_returns(lhs, into, env)
+            gather_returns(rhs, into, env)
+        Call(callee, args) ->
+            gather_returns(callee, into, env)
+            gather_all(args, into, env)
+        Index(target, key) ->
+            gather_returns(target, into, env)
+            gather_returns(key, into, env)
+        Field(target, _, _) -> gather_returns(target, into, env)
+        ArrayLit(items) -> gather_all(items, into, env)
+        ArrayRepeat(value, count) ->
+            gather_returns(value, into, env)
+            gather_returns(count, into, env)
+        Interp(pieces) -> gather_all(pieces, into, env)
+        WithFields(base, _, values) ->
+            gather_returns(base, into, env)
+            gather_all(values, into, env)
+        WithAll(base, other, _) ->
+            gather_returns(base, into, env)
+            gather_returns(other, into, env)
+        ObjectLit(_, _, values) -> gather_all(values, into, env)
+        Compare(operands, _) -> gather_all(operands, into, env)
+        Range(lo, hi, _) ->
+            gather_maybe(lo, into, env)
+            gather_maybe(hi, into, env)
+        IsPattern(subject, _, _) -> gather_returns(subject, into, env)
+        IncDec(target, _, _) -> gather_returns(target, into, env)
+        IfExpr(cond, then_branch, else_branch) ->
+            gather_returns(cond, into, env)
+            gather_returns(then_branch, into, env)
+            gather_maybe(else_branch, into, env)
+        MatchExpr(subject, arms) ->
+            gather_returns(subject, into, env)
+
+            for i in 0..<arms.len()
+                enter_scope(env)
+                note_bindings(arms.at(i).pattern, env)
+                gather_maybe(arms.at(i).guard, into, env)
+                gather_returns(arms.at(i).body, into, env)
+                leave_scope(env)
+        While(_, cond, body, otherwise) ->
+            gather_returns(cond, into, env)
+            gather_returns(body, into, env)
+            gather_maybe(otherwise, into, env)
+        For(_, binding, iter, body, otherwise, _) ->
+            gather_returns(iter, into, env)
+            enter_scope(env)
+            note_bindings(binding, env)
+            gather_returns(body, into, env)
+            leave_scope(env)
+            gather_maybe(otherwise, into, env)
+        Loop(_, body) -> gather_returns(body, into, env)
+        DoWhile(_, body, cond, otherwise) ->
+            gather_returns(body, into, env)
+            gather_returns(cond, into, env)
+            gather_maybe(otherwise, into, env)
+        Block(stmts) ->
+            enter_scope(env)
+            shadow_declared(stmts, env)
+
+            for i in 0..<stmts.len()
+                gather_in_stmt(stmts.at(i), into, env)
+
+            leave_scope(env)
+        Ensures(value, _, _) -> gather_returns(value, into, env)
+        TryCatch(body, caught, handler) ->
+            gather_returns(body, into, env)
+            enter_scope(env)
+            note_type(env, caught, type_of(Any))
+            gather_returns(handler, into, env)
+            leave_scope(env)
+end gather_returns
+
+private gather_all(xs: Buf[Expr], into: *Buf[Type], env: *TypeEnv)
+    for i in 0..<xs.len()
+        gather_returns(xs.at(i), into, env)
+
+private gather_maybe(x: Option[Expr], into: *Buf[Type], env: *TypeEnv)
+    x match
+        Some(inner) -> gather_returns(inner, into, env)
+        None -> ()
+
+private gather_in_stmt(s: Stmt, into: *Buf[Type], env: *TypeEnv)
+    *s.kind match
+        // **`return` with nothing is a null**, which is what the machine leaves.
+        Return(value) -> value match
+            Some(x) -> into.push(type_of_expr(x, env))
+            None -> into.push(type_of(NullType))
+        Val(_, init) -> gather_returns(init, into, env)
+        Var(_, init) -> gather_returns(init, into, env)
+        Unpack(_, init, _) -> gather_returns(init, into, env)
+        Group(inner) ->
+            for i in 0..<inner.len()
+                gather_in_stmt(inner.at(i), into, env)
+        Assign(_, target, value) ->
+            gather_returns(target, into, env)
+            gather_returns(value, into, env)
+        MultiAssign(_, targets, values) ->
+            gather_all(targets, into, env)
+            gather_all(values, into, env)
+
+        // A nested definition's body is its own, and is interned rather than standing here.
+        Def(_, _, _, _, _) -> ()
+        Eval(x) -> gather_returns(x, into, env)
+        Throw(x) -> gather_returns(x, into, env)
+
+        // **A `break` carries a LOOP's value and not the function's**, so it is gathered nowhere.
+        Break(_, value) -> gather_maybe(value, into, env)
+        Continue(_) -> ()
+        ImportNames(_, _, _, _, _) -> ()
+        ImportAll(_, _, _, _) -> ()
+        ImportAsset(_, _, _) -> ()
+        TypeDecl(_, _) -> ()
+        CheckType(_, _, _) -> ()
+end gather_in_stmt
+
+// Every name a block declares, as `Any`.
+//
+// **This is shadowing rather than typing**, which is `note_bindings`' job one level down and is here
+// for the same reason: a name a block took is no longer whatever an outer scope said it was, and a
+// local read at an answer point must not be mistaken for a parameter or a builtin of that spelling.
+// Giving it the type of its initialiser instead would want the whole of `check_stmt` run twice.
+private shadow_declared(stmts: Buf[Stmt], env: *TypeEnv)
+    for i in 0..<stmts.len()
+        *stmts.at(i).kind match
+            Val(name, _) -> note_type(env, name, type_of(Any))
+            Var(name, _) -> note_binding(env, name, type_of(Any), false)
+            Def(name, _, _, _, _) -> note_type(env, name, type_of(Any))
+            Unpack(pat, _, _) -> note_bindings(pat, env)
+            Group(inner) -> shadow_declared(inner, env)
+            ImportNames(_, _, _, _, locals) ->
+                for j in 0..<locals.len()
+                    note_type(env, locals.at(j), type_of(Any))
+            ImportAll(_, _, _, alias) -> note_type(env, alias, type_of(Any))
+            ImportAsset(_, _, name) -> note_type(env, name, type_of(StringType))
+            TypeDecl(name, _) -> note_type(env, name, shape_type())
+            _ -> ()
+end shadow_declared
+
+// -- what an `if` and a `match` are worth ------------------------------------------------------------
+
+// The type of an `if` used for its value: the two branches where they agree, and `Any` otherwise.
+//
+// **An `if` with no `else` is `Any` and stays so.** slate gives the missing branch a null, so the
+// honest answer would be a union with one -- and a union on the value side is refused by `fits`
+// unless every alternative fits, which would turn an inference into a refusal.
+// Not `private`: `type_of_expr`'s IfExpr arm.
+if_result(then_branch: Expr, else_branch: Option[Expr], env: *TypeEnv) -> Type
+    else_branch match
+        Some(other) -> unpinned(joined(type_of_expr(then_branch, env), type_of_expr(other, env)))
+        None -> type_of(Any)
+
+// The type of a `match` used for its value: every arm where they all agree, and `Any` otherwise.
+//
+// **Each arm is read in a scope of its own with its pattern's names in it**, which is
+// `check_expr`'s arrangement and is here for its reason: an arm body naming something the pattern
+// bound must not read an outer name of that spelling. A guard says nothing about what the arm
+// answers and is not read.
+// Not `private`: `type_of_expr`'s MatchExpr arm.
+match_result(arms: Buf[Arm], env: *TypeEnv) -> Type
+    if arms.is_empty() then return type_of(Any)
+
+    var out = type_of(Any)
+
+    for i in 0..<arms.len()
+        enter_scope(env)
+        note_bindings(arms.at(i).pattern, env)
+
+        val one = type_of_expr(arms.at(i).body, env)
+
+        leave_scope(env)
+
+        out = if i == 0 then one else joined(out, one)
+
+    unpinned(out)
+end match_result
