@@ -241,6 +241,11 @@ js_runtime_ops() -> string = raw"""
                 return a.lo === b.lo && ax === bx
             }
 
+            // **An external is compared by the value the HOST holds and never by the wrapper**, two
+            // declarations of one path being two wrappers around one thing. JavaScript's own `===`
+            // for an object is exactly this, and there is nothing structural to fall back on.
+            if (a instanceof SExt) return b instanceof SExt && a.held === b.held
+
             return a === b
         }
 
@@ -325,6 +330,10 @@ js_runtime_ops() -> string = raw"""
         }
 
         const index = (t, k) => {
+            // **A computed key on an external is a property by another spelling**, so it goes out as
+            // a name and what comes back comes in by the same table a `.` read uses.
+            if (t instanceof SExt) return inward(t.held[outward(k)])
+
             if (Array.isArray(t)) {
                 if (k instanceof SRange) {
                     const [lo, hi] = span(k, t.length)
@@ -363,6 +372,12 @@ js_runtime_ops() -> string = raw"""
         }
 
         const setIndex = (t, k, v) => {
+            if (t instanceof SExt) {
+                t.held[outward(k)] = outward(v)
+
+                return v
+            }
+
             if (Array.isArray(t)) {
                 if (!isInt(k)) fault("an array is indexed by an integer, and this is " + typeName(k))
 
@@ -448,9 +463,157 @@ js_runtime_ops() -> string = raw"""
         const hasProperty = (t, name) =>
             accessorOf(t, GETMARK, name) !== null || accessorOf(t, SETMARK, name) !== null
 
+        // -- the JavaScript host, which `external` names -------------------------------------------------
+
+        // **The invariant is one sentence: no foreign value ever becomes a slate value except as one
+        // of these.** Everything below is that sentence read in one direction or the other.
+        //
+        // `held` is what the host handed over and `receiver` is the object the path found it ON, so a
+        // bare call has the receiver the host itself would have given it. A browser's `fetch` called
+        // on anything but the window throws `Illegal invocation`, and every method of a host object
+        // has the same fault waiting in it.
+
+        // The name the host offers for what this holds, or `""` where it offers none.
+        const extName = (v) => {
+            const held = v.held
+
+            if (held === null || held === undefined) return ""
+
+            const ctor = held.constructor
+
+            return ctor === null || ctor === undefined || typeof ctor.name !== "string" ? "" : ctor.name
+        }
+
+        // A slate value on its way OUT to the host.
+        //
+        // **An array and an object are COPIED.** slate's array is the host's array and slate's object
+        // is a table this runtime owns, so handing either straight out would put slate's own
+        // representation where the host can write to it -- and a `fields` map is not something an API
+        // can read. The copy is one pass over what was being handed over anyway.
+        const outward = (v) => {
+            if (v === null || typeof v === "boolean" || typeof v === "string" || typeof v === "number")
+                return v
+
+            // **A count that cannot be a JavaScript number EXACTLY is a fault rather than a rounding**,
+            // which is the rule slate keeps everywhere else it converts.
+            if (typeof v === "bigint") {
+                const n = Number(v)
+
+                if (!Number.isSafeInteger(n))
+                    fault("`" + v + "` is too large to hand to JavaScript exactly -- a JavaScript number carries whole numbers up to 2^53")
+
+                return n
+            }
+
+            if (v instanceof SExt) return v.held
+            if (Array.isArray(v)) return v.map(outward)
+
+            if (v instanceof SObj) {
+                const made = {}
+
+                for (const [k, held] of v.entries()) {
+                    if (typeof k !== "string")
+                        fault("an object handed to JavaScript is read by its keys, and this one has " + typeName(k) + " for a key")
+
+                    made[k] = outward(held)
+                }
+
+                return made
+            }
+
+            if (v instanceof Promise) return v.then(outward)
+
+            // **A closure crosses as a function whose ARGUMENTS come inward**, so a callback is handed
+            // exactly what the language guarantees and its answer goes back out by this same table.
+            //
+            // **It is given as many arguments as it declares and no more**, which is the rule slate's
+            // own natives already follow: `map` hands a callback the element and the index, and a
+            // one-parameter lambda takes it. JavaScript does the same thing everywhere -- its own
+            // `map` calls back with three -- so a strict count here would refuse the ordinary case.
+            if (typeof v === "function" && !isGen(v))
+                return (...args) => outward(callback(v, args.map(inward), "the JavaScript host"))
+
+            fault(typeName(v) + " does not cross to JavaScript -- what crosses is null, a boolean, a number, a string, an array, an object, a function, a promise and another external")
+        }
+
+        // A host value on its way IN.
+        //
+        // **Everything that is not a primitive stays external**, which is the invariant read backwards:
+        // an array, an object and a function all come back as something read through the same
+        // operations, so nothing the host owns can be mistaken for something slate owns.
+        const inward = (v) => {
+            // **`undefined` becomes `null`, and that is slate's rule rather than a convenience.** A
+            // property that is absent and one holding `undefined` are the same read in JavaScript, so
+            // nothing here can honestly say which happened -- and slate's own `undefined` may not be
+            // stored anywhere, which is exactly what a value read off a host is for.
+            if (v === undefined || v === null) return null
+            if (typeof v === "boolean" || typeof v === "string" || typeof v === "bigint") return v
+
+            // **A whole number is an integer**, which is `slate:dom`'s rule for its own property reads
+            // rather than a new one: a length, a child count and a `clientWidth` are counts a loop is
+            // about to be written over.
+            if (typeof v === "number") return Number.isInteger(v) ? BigInt(v) : v
+
+            // **A thenable becomes a promise so that `await` works on it**, which is the shape rule
+            // `slate:gzip` and `fetch` already follow.
+            if (typeof v.then === "function") return Promise.resolve(v).then(inward)
+
+            return new SExt(v, undefined)
+        }
+
+        // What an `external` declaration binds. **The path is walked from the global object here**, so
+        // a name that is not there is a fault at the declaration and not at the first use of it.
+        const external = (path) => {
+            let receiver = globalThis
+            let held = globalThis
+
+            for (const step of path.split(".")) {
+                if (held === null || held === undefined)
+                    fault("this JavaScript host has no `" + path + "` -- there is nothing to read `" + step + "` from")
+
+                receiver = held
+                held = held[step]
+            }
+
+            if (held === undefined) fault("this JavaScript host has no `" + path + "`")
+
+            return new SExt(held, receiver)
+        }
+
+        const extShow = (t) => {
+            const named = extName(t)
+
+            return named === "" ? "an external" : "the external " + named
+        }
+
+        const extCall = (t, name, args) => {
+            // **`new` is how construction is spelled, which is the word slate uses for its own
+            // classes** -- and the cost is that it is the one method name an external cannot reach.
+            if (name === "new") {
+                if (typeof t.held !== "function")
+                    fault(extShow(t) + " is not something `new` can construct with")
+
+                return inward(new t.held(...args.map(outward)))
+            }
+
+            const f = t.held[name]
+
+            if (typeof f !== "function")
+                fault("`" + name + "` is not a method of " + extShow(t))
+
+            // **The receiver is the object the method was found on**, which is what a host method
+            // called on anything else throws about.
+            return inward(f.apply(t.held, args.map(outward)))
+        }
+
         // -- fields, methods and calls -------------------------------------------------------------------
 
         const field = (t, name) => {
+            // **A property read answers what the host holds, crossing inward** -- a function among
+            // them comes back external and UNBOUND, which is why a method is called as a method
+            // rather than read out and called later.
+            if (t instanceof SExt) return inward(t.held[name])
+
             if (t instanceof SObj) {
                 const held = t.lookup(name)[0]
 
@@ -506,6 +669,12 @@ js_runtime_ops() -> string = raw"""
         }
 
         const setField = (t, name, v) => {
+            if (t instanceof SExt) {
+                t.held[name] = outward(v)
+
+                return v
+            }
+
             if (!(t instanceof SObj)) {
                 // **A PROPERTY OF A BUILTIN KIND IS READ-ONLY AND THE COMPLAINT NAMES IT**, or the
                 // reader is told a string has no fields and is left thinking `length` was never
@@ -614,6 +783,13 @@ js_runtime_ops() -> string = raw"""
         }
 
         const method = (t, name, args, names) => {
+            if (t instanceof SExt) {
+                if (names !== undefined)
+                    fault("this is a method of the JavaScript host, and its parameters have no names an argument can pick out")
+
+                return extCall(t, name, args)
+            }
+
             if (t instanceof SObj) {
                 const [f, delegated] = t.lookup(name)
 
@@ -735,6 +911,19 @@ js_runtime_ops() -> string = raw"""
         }
 
         const call = (f, args, names) => {
+            // **A bare call keeps the receiver the PATH gave it**, which is what a browser's `fetch`
+            // called on anything but the window throws about. One read back out of another external
+            // has none, and is called on nothing, exactly as JavaScript would call it.
+            if (f instanceof SExt) {
+                if (typeof f.held !== "function")
+                    fault(extShow(f) + " is not something that can be called")
+
+                if (names !== undefined)
+                    fault("this is a function of the JavaScript host, and its parameters have no names an argument can pick out")
+
+                return inward(f.held.apply(f.receiver === undefined ? null : f.receiver, args.map(outward)))
+            }
+
             // **An object with a `new` is callable, and the call IS that `new`** -- `Circle(3)` and
             // `Circle.new(3)` are one thing said two ways. **No receiver is passed however the field
             // was found**, where an ordinary method reached through a proto is handed one: a `new`

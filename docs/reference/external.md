@@ -85,7 +85,7 @@ print(localStorage + 1)
 ```
 
 ```error
-does not apply to an external
+does not apply to external
 ```
 
 **And a structural pattern simply does not match**, because nothing a pattern does may fault. An
@@ -171,7 +171,7 @@ is what the program means: the pattern's text, the numbers a date holds, an arra
 | `undefined` | `null` |
 | `null` | `null` |
 | a boolean | a boolean |
-| a `number` | a real |
+| a `number` | an integer where it is whole, a real otherwise |
 | a `bigint` | an integer |
 | a string | a string |
 | a thenable | a promise, whose value crosses by this table |
@@ -182,10 +182,11 @@ array comes back external, an object comes back external, a function comes back 
 through the same property and call operations as anything else. There is no unwrapping and no
 conversion at the door, so nothing the host owns can be mistaken for something slate owns.
 
-**A `number` is a real and never an integer**, which is the decision the back end already took about
-its own values: an integer is a `BigInt` and a real is a `number`, so a `number` that happens to hold
-`3` cannot honestly answer `is integer` when the same expression on another value would answer
-otherwise. A count read off the host is converted where the program wants one.
+**A whole `number` is an integer and a fractional one is a real**, which is `slate:dom`'s rule for
+its own property reads rather than a new one. JavaScript has one number and slate has two, so
+something has to decide, and the value is the only evidence there is — a length, a child count, a
+`clientWidth` are what a program reads off a host most often, and every one of them is a count a
+loop is about to be written over. A real there would make `0..<n` a fault in the ordinary case.
 
 **`undefined` becomes `null`, and that is slate's rule rather than a convenience.** slate's own
 `undefined` exists only as the immediate answer to a read that found nothing and may not be stored
@@ -202,6 +203,12 @@ and a program written against it reads the same in both.
 **A slate closure crosses as a JavaScript function, and its arguments cross INWARD by the table
 above.** So a callback is handed exactly what the language guarantees: primitives as themselves, and
 everything else as an external it can read properties off. Its answer crosses outward.
+
+**It is given as many arguments as it declares and no more**, which is the rule slate's own natives
+already follow — `map` hands a callback the element and the index, and a one-parameter lambda takes
+it. JavaScript passes extra arguments everywhere, its own `map` calling back with three, so a strict
+count here would refuse the ordinary case. A callback declaring more than the host supplies is a
+fault, the function being right and what it was attached to being unable to feed it.
 
 **A method call keeps its receiver and a bare call keeps the one its path gave it.** `x.foo(a)` calls
 `foo` with `x` as `this`; `fetch(url)` on an `external fetch` is called on the global object, because
@@ -284,8 +291,9 @@ watch(id, onWidth)
 **Four things in that function are the whole feature.** `ResizeObserver.new(seen)` is JavaScript's
 `new` with a slate closure as its argument; `entries` arrives as an external because a JavaScript
 array is not a slate array; `entries[0]` and `first.contentRect` are property reads answering further
-externals; and `box.width` is a `number`, so what reaches `onWidth` is an ordinary slate real that
-can be compared, stored and printed.
+externals; and `box.width` is a `number`, so what reaches `onWidth` is an ordinary slate number that
+can be compared, stored and printed — an integer where the box is a whole number of pixels wide and a
+real where it is not, which is the rule for every number the host hands back.
 
 **`observer` is an external the caller keeps**, and `observer.disconnect()` later is the same method
 call as any other. Nothing about the value is different for having been constructed here rather than
