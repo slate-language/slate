@@ -117,7 +117,7 @@ Where slate parts from JavaScript it is **to remove a case rather than add one**
   the end is a mistake.
 - **`at` and `slice` count back from the end** where the position is negative, which is the whole reason
   JavaScript grew `at` beside `xs[i]`.
-- **A comparator answers a number** whose sign orders the pair, as `compare` does.
+- **A comparator answers a number** whose sign orders the pair, as a class's `<=>` does.
 
 ## Objects
 
