@@ -527,8 +527,8 @@ print(tail([1, 2, 3], 1), tail([1, 2, 3], 9))
 
 **A guard that leaves narrows the rest of the block**, as the example above does: where the branch
 always returns, reaching the line below it means the test was false. `&&` narrows its right operand
-and the branch after it, `||` narrows the else, and `!` swaps the two sides — so all four spellings of
-one test mean the same thing:
+and the branch after it, `||` narrows the else — reaching it means neither operand held — and `!`
+swaps the two sides, so a test reaches everywhere it decides something:
 
 ```slate
 trimmed(x: string | null) = if x != null && len(x) > 0 then trim(x) else ""
