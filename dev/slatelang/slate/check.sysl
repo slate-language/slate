@@ -175,7 +175,7 @@ check_stmts(stmts: Buf[Stmt], env: *TypeEnv)
             // **EVERY name this block binds is noted before any body is walked, not only the
             // definitions.** A closure may name something declared later in the block it sits in --
             //
-            //     val probe = { equals: o -> clear(xs) }
+            //     val probe = { "==": o -> clear(xs) }
             //     val xs = [probe]
             //
             // -- which runs, because the body runs after `xs` exists. Checking that body against the
@@ -211,6 +211,18 @@ check_stmts(stmts: Buf[Stmt], env: *TypeEnv)
             // declaration may name it -- which is the whole reason this is in the pre-pass rather
             // than only in the walk below.
             TypeDecl(name, _) -> note_type(env, name, shape_type())
+            _ -> ()
+
+    // **WHAT A DEFINITION ANSWERS IS READ OFF ITS BODY, and only once every name in the block is
+    // known.** It is a second pass for that reason: a body calling something written below it reads
+    // a real signature rather than nothing, which the first loop has just finished arranging. A
+    // definition that declared a result keeps it and is not walked at all; `result.sysl` carries the
+    // rule the walk obeys, which is this pass's own -- an answer nobody wrote is claimed only where
+    // every answer point in the body agrees, and is `Any` everywhere else.
+    for i in 0..<stmts.len()
+        *stmts.at(i).kind match
+            Def(name, params, defaults, body, is_async) ->
+                note_answer(name, params, defaults.len(), body_at(body), is_async, env)
             _ -> ()
 
     for i in 0..<stmts.len()
@@ -371,6 +383,8 @@ private check_stmt(s: Stmt, block: Buf[Stmt], env: *TypeEnv)
                 note_shaped(env, name, t)
             else
                 note_type(env, name, elementless(t, init))
+
+            note_bound(env, what_it_holds(init, env))
         Var(name, init) ->
             check_expr(init, env)
             note_binding(env, name, elementless(var_type(name, init, block, env), init), false)
@@ -414,6 +428,13 @@ private check_stmt(s: Stmt, block: Buf[Stmt], env: *TypeEnv)
 
                         if !fits(got, want)
                             complain_here(value.span, s"`${name}` was declared ${show_type(want)}, and this is ${show_type(got)}")
+
+                    // **A PROPERTY IS THE ANNOTATED `var` RULE REACHING ONE MORE SPOT.** `set c(self,
+                    // v: integer)` is a promise the machine keeps where the setter is called, so a
+                    // string written at `t.c = "hot"` is a fault this pass can move to the line that
+                    // has it. A field is untouched, this pass carrying no shape through a name.
+                    Field(obj, prop, optional) ->
+                        if !optional then check_property_assign(obj, prop, value, env)
                     _ -> ()
         MultiAssign(_, targets, values) ->
             for i in 0..<targets.len()
@@ -446,6 +467,109 @@ private check_stmt(s: Stmt, block: Buf[Stmt], env: *TypeEnv)
         CheckType(name, _, pat) -> renote_declared(env, name, type_from_pattern(resolve_pattern(pat, 0)))
         _ -> ()
 end check_stmt
+
+// -- properties --------------------------------------------------------------------------------
+
+// Whether a `val` was bound to a class or to something one of them made.
+//
+// **A class is a `val` bound to an object literal carrying `(class)`**, and the promised form —
+// `class Pen is Drawable` — wraps that in a block whose first statement is the same binding, both
+// being what `parse_class_decl` builds. Everything else is `BoundPlain`.
+private what_it_holds(init: Expr, env: *TypeEnv) -> Bound
+    class_literal(init) match
+        Some(lit) -> return BoundClass(lit)
+        None -> ()
+
+    made_by_class(init, env) match
+        Some(cls) -> BoundInstance(cls)
+        None -> BoundPlain
+end what_it_holds
+
+private class_literal(init: Expr) -> Option[Expr]
+    *init.kind match
+        ObjectLit(keys, _, _) ->
+            for i in 0..<keys.len()
+                if keys.at(i) == ClassTag then return Some(init)
+
+            None
+        Block(stmts) ->
+            if stmts.len() == 0 then return None
+
+            *stmts.at(0).kind match
+                Val(_, inner) -> class_literal(inner)
+                _ -> None
+        _ -> None
+end class_literal
+
+// The class `C(...)` or `C.new(...)` was written against, where `C` is one this file declared.
+//
+// **Only a call whose callee is a NAME**, so nothing is claimed about a constructor reached through
+// a variable, an array or a module object. What this answers is read by one function.
+private made_by_class(init: Expr, env: *TypeEnv) -> Option[string]
+    val callee = *init.kind match
+        Call(f, _) -> f
+        _ -> return None
+
+    *callee.kind match
+        Name(n) -> declared_class(env, n)
+        Field(inner, member, _) ->
+            if member != "new" then return None
+
+            *inner.kind match
+                Name(n) -> declared_class(env, n)
+                _ -> None
+        _ -> None
+end made_by_class
+
+private declared_class(env: *TypeEnv, name: string) -> Option[string] = bound_to(env, name) match
+    BoundClass(_) -> Some(name)
+    _ -> None
+
+// `t.c = v` against what `set c(self, v: T)` declared `T` to be.
+//
+// **It asks only where the receiver's class is beyond doubt** — a `val` bound to `C(...)` or
+// `C.new(...)`, which cannot be rebound and whose entry leaves the scope with the block that
+// declared it. A `var`, a parameter, a field and anything reached through a call say nothing here,
+// which is the same conservatism every other object question in this pass gets.
+private check_property_assign(target: Expr, prop: string, value: Expr, env: *TypeEnv)
+    val cls = *target.kind match
+        Name(n) -> bound_to(env, n) match
+            BoundInstance(c) -> c
+            _ -> return
+        _ -> return
+
+    val want = bound_to(env, cls) match
+        BoundClass(lit) -> setter_type(lit, prop)
+        _ -> return
+
+    val got = type_of_expr(value, env)
+
+    if !fits(got, want)
+        complain_here(value.span, s"`${prop}` on `${cls}` was declared ${show_type(want)}, and this is ${show_type(got)}")
+end check_property_assign
+
+// What a class's `set p(self, v: T)` says `T` is, or `Any` where there is no setter or it wrote no
+// annotation — `Any` fitting everything, which is the direction this pass may be wrong in.
+private setter_type(lit: Expr, prop: string) -> Type
+    val key = SetPrefix + prop
+
+    *lit.kind match
+        ObjectLit(keys, _, values) ->
+            for i in 0..<keys.len()
+                if keys.at(i) == key
+                    *values.at(i).kind match
+                        // **The annotation is read off the body**, where the parser desugared it to
+                        // a `CheckType` — which is `signature_of`'s rule and the reason a `Def`
+                        // carries no annotations of its own.
+                        Lambda(params, _, body, _) ->
+                            if params.len() != 2 then return type_of(Any)
+
+                            return param_type(params.at(1), body_at(body), buf(), 1)
+                        _ -> return type_of(Any)
+
+            type_of(Any)
+        _ -> type_of(Any)
+end setter_type
 
 // An annotated binding's initialiser, against the type the annotation declared.
 //

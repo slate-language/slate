@@ -19,7 +19,7 @@ class K
     var v
 
     hash(self) = 7
-    equals(self, o) = o is K
+    ==(self, o) = o is K
 
 var u = {}
 u[K.new(1)] = "first"

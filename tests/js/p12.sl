@@ -49,13 +49,13 @@ print(t.say(1, 2))
 class Money
     var cents
 
-    plus(self, o) = Money(self.cents + o.cents)
-    minus(self, o) = Money(self.cents - o.cents)
-    times(self, n) = Money(self.cents * n)
-    dividedBy(self, n) = Money(self.cents / n)
-    remainder(self, n) = Money(self.cents % n)
-    negated(self) = Money(-self.cents)
-    compare(self, o) = self.cents - o.cents
+    +(self, o) = Money(self.cents + o.cents)
+    -(self, o) = Money(self.cents - o.cents)
+    *(self, n) = Money(self.cents * n)
+    /(self, n) = Money(self.cents / n)
+    %(self, n) = Money(self.cents % n)
+    unary_-(self) = Money(-self.cents)
+    <=>(self, o) = self.cents - o.cents
 
 val a = Money(500)
 val b = Money(125)
@@ -63,11 +63,14 @@ val b = Money(125)
 print((a + b).cents, (a - b).cents, (a * 3).cents, (a / 2).cents, (a % 300).cents)
 print((-a).cents)
 print(a < b, a > b, a <= a, a >= a)
-// `==` is structural here, `equals` being handed no receiver and so not writable as a method.
+// `==` is structural here, the class having written none.
 print(a == Money(500), a == b)
 
-// A comparator answers a BOOLEAN, which is what `compare` above lets one be written from.
+// A comparator answers a BOOLEAN, which is what `<=>` above lets one be written from.
 print(map(sorted([a, b, Money(300)], (x, y) -> x < y), m -> m.cents))
+
+// `a.+(b)` calls what `a + b` calls: an operator method is an ordinary member.
+print(a.+(b).cents)
 
 // An inherited operator, one link up the chain.
 class Cents from Money
@@ -79,6 +82,43 @@ print((Cents(100) + Cents(50)).cents)
 // which the six bitwise operators did not until this release.
 print((a & b) catch e -> e.message)
 print((-{ x: 1 }) catch e -> e.message)
+
+// **The left operand decides and there is no reflected form**, so a number on the left stays one.
+print((2 * a) catch e -> e.message)
+
+// A class writing `==` decides both `==` and `!=`, the second being always the opposite.
+class Tag
+    var t
+
+    ==(self, o) = o is Tag && self.t == o.t
+
+print(Tag("a") == Tag("a"), Tag("a") != Tag("a"), Tag("a") != Tag("b"))
+
+// **The four comparisons may be written out one at a time**, and each is asked before `<=>` is.
+class Ver
+    var n
+
+    <(self, o) = self.n < o.n
+    <=(self, o) = self.n <= o.n
+    >(self, o) = self.n > o.n
+    >=(self, o) = self.n >= o.n
+
+print(Ver(1) < Ver(2), Ver(1) > Ver(2), Ver(1) <= Ver(1), Ver(1) >= Ver(1))
+
+// **A word-named method has no operator meaning at all** -- it is an ordinary method now.
+class Worded
+    var c
+
+    plus(self, o) = Worded(self.c + o.c)
+    compare(self, o) = self.c - o.c
+    negated(self) = Worded(-self.c)
+
+val w = Worded(1)
+
+print(w.plus(Worded(2)).c, w.compare(Worded(2)), w.negated().c)
+print((w + Worded(2)) catch e -> e.message)
+print((w < Worded(2)) catch e -> e.message)
+print((-w) catch e -> e.message)
 
 async main()
     print(await wide(1, 2, 3))

@@ -18,7 +18,7 @@ Every construct in slate, written down once, in its own place.
 | [Patterns](patterns.md) | `match`, `is`, what binds, what tests, exhaustiveness |
 | [Functions](functions.md) | definitions, lambdas, defaults, named arguments, `...rest` |
 | [Types](types.md) | `type`, annotations, what the checker will and will not say |
-| [Objects](objects.md) | fields, `proto`, the receiver rule, operator hooks |
+| [Objects](objects.md) | fields, `proto`, the receiver rule, operator methods |
 | [Classes](classes.md) | `class`, `from`, `is`, `new`, class patterns |
 | [Data types](data-types.md) | `data`, variants, immutability, exhaustive `match` |
 | [Modules](modules.md) | `export`, `import`, the three kinds of specifier |

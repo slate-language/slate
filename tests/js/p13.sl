@@ -13,7 +13,7 @@ class Empty
 class Money
     var cents
 
-    equals(self, o) = o is Money && self.cents == o.cents
+    ==(self, o) = o is Money && self.cents == o.cents
     toString(self) = "$" + string(self.cents)
 
 data Shape
@@ -40,10 +40,10 @@ print(Circle(3) == Circle(3), Nothing == Nothing)
 print(p.eq(q), p.eq(p), p.ne(q))
 print([1, 2].eq([1, 2]), 1.eq(1), "a".eq("a"), true.eq(true), null.eq(null))
 
-// `equals` is `==` under its own name, and the two may never disagree.
+// `equals` is the universal method behind `==`, and the two may never disagree.
 print(p.equals(q), p.equals(p), [1, 2].equals([1, 2]))
 
-// A class that writes `equals` gets it for `==` too, and one that writes `toString` gets it
+// A class that writes `==` gets it for `equals` too, and one that writes `toString` gets it
 // everywhere a value is rendered.
 val m = Money.new(150)
 
@@ -69,7 +69,7 @@ speak(v: string) = v
 
 print(speak(m) catch e -> e.message)
 
-// `equals` and `==` are one function, so a redefined `equals` decides both.
+// `equals` and `==` are one function, so the `==` a class writes decides both.
 print(m == Money.new(150), m.equals(Money.new(150)), m == 150)
 
 // `eq` and `ne` over every kind that has an identity and every kind that has not.

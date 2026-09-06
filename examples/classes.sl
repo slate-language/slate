@@ -201,20 +201,24 @@ val c = counter()
 c.bump()
 print(c.bump())
 
-// **AN OBJECT MAY ANSWER FOR AN OPERATOR.** `equals` and `hash` have always been proto hooks looked
-// up by name, and these are the same mechanism widened: the word is the method's name, so a class
-// body writes one with the definition syntax it already has.
+// **AN OBJECT MAY ANSWER FOR AN OPERATOR, AND THE OPERATOR IS THE METHOD'S NAME.** `hash` has always
+// been a proto hook looked up by name and this is the same mechanism widened -- so the definition and
+// every call that reaches it read alike, and `a.+(b)` calls what `a + b` calls.
 class Money
     var cents
 
-    plus(self, o) = Money(self.cents + o.cents)
-    minus(self, o) = Money(self.cents - o.cents)
-    times(self, n) = Money(self.cents * n)
-    negated(self) = Money(-self.cents)
+    +(self, o) = Money(self.cents + o.cents)
+    -(self, o) = Money(self.cents - o.cents)
+    *(self, n) = Money(self.cents * n)
 
-    // **Ordering is ONE hook, not four.** It answers a number below, at or above zero, and `<`,
-    // `<=`, `>` and `>=` all read its sign -- so a type cannot order inconsistently with itself.
-    compare(self, o) = self.cents - o.cents
+    // **`unary_-` is the prefix minus**, spelled apart from the `-` above because it takes no other
+    // side: a class with a two-operand `-` has said nothing about what `-v` should be.
+    unary_-(self) = Money(-self.cents)
+
+    // **`<=>` orders in ONE method.** It answers a number below, at or above zero, and `<`, `<=`, `>`
+    // and `>=` all read its sign -- so a type cannot order inconsistently with itself. A class writes
+    // this or the four comparisons, never both.
+    <=>(self, o) = self.cents - o.cents
 
     string(self) = "$" + string(self.cents / 100)
 
@@ -224,18 +228,17 @@ val bill = Money(4500)
 print((rent + bill).string(), (rent - bill).string(), (rent * 2).string(), (-bill).string())
 print(bill < rent, rent <= rent)
 
-// **`==` keeps its own hook and is NOT routed through `compare`**, a type whose ordering is coarser
-// than its equality being an ordinary thing to want. `equals` is handed no receiver, which is what
-// keeps every hook written before operators existed working -- so it is written as a captured
-// function rather than as a method, and a class wanting one says so on the object.
+// **`==` is a hook of its own and is NOT routed through `<=>`**, a type whose ordering is coarser
+// than its equality being an ordinary thing to want. This class writes none, so `==` is the deep
+// comparison every value gets. **`!=` is always its opposite and a class may not write one.**
 print(rent == Money(90000), rent == bill)
 
-// So a comparator is an ordinary `<`, and sorting falls out of the one hook.
-print(map(sorted([rent, bill, Money(12000)], (a, b) -> a < b), m -> m.string()))
-
-// **THE LEFT OPERAND DECIDES AND THE RIGHT IS NEVER ASKED**, which is `equals`'s rule already --
-// so there is no reflected form and `2 * rent` is not `rent.times(2)`.
+// **THE LEFT OPERAND DECIDES AND THE RIGHT IS NEVER ASKED**, so there is no reflected form: a number
+// on the left is a number on the left, and `2 * rent` is a fault rather than `rent * 2`.
 print((2 * rent) catch e -> e.message)
+
+// So a comparator is an ordinary `<`, and sorting falls out of the one method.
+print(map(sorted([rent, bill, Money(12000)], (a, b) -> a < b), m -> m.string()))
 
 // **AND A FUNCTION MAY GATHER WHAT IS LEFT OVER.** slate could spread at a call long before it
 // could gather at a definition; `...rest` is always bound, to an empty array where a call gave
