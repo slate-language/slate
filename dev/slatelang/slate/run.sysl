@@ -204,6 +204,11 @@ run_tests_named(src: Source, only: string) -> Tested
 
     output.clear()
 
+    // **The file's own event-loop scope opens here and closes after `@teardownAll`.** What a
+    // `@setupAll` opens is meant to stand for the whole file, so nothing between here and the last
+    // teardown may wait for it to close -- see `drain_events_to`.
+    val floor = outstanding
+
     val opened = run_hook(HookSetupAll)
 
     for i in 0..<chosen.len()
@@ -212,6 +217,18 @@ run_tests_named(src: Source, only: string) -> Tested
     // **`@teardownAll` runs even where `@setupAll` faulted**, which is what a teardown is for: the
     // state it gives back is exactly the state a setup that stopped halfway left behind.
     hook_verdict(HookTeardownAll, run_hook(HookTeardownAll), &results)
+
+    // **And the file's drain comes after it**, so the loop is given its last turns once the file has
+    // had its chance to hand back what it took. A fault raised there belongs to the pair that
+    // bracketed the file, there being no test left for it to be about.
+    val over = drain_verdict(floor)
+
+    if over != ""
+        val whose = if hook_names.at(HookTeardownAll) != "" then HookTeardownAll else HookSetupAll
+
+        results.push(TestRan(hook_names.at(whose), false, false, over, printed_so_far(), 0))
+    end if
+
     Tested("", results)
 end run_tests_named
 
@@ -347,6 +364,13 @@ end complaint
 
 // One test with whatever the file wrote around it, and the verdicts that came of it.
 //
+// **THE `@setup`, THE TEST AND THE `@teardown` ARE ONE EVENT-LOOP SCOPE, AND THE DRAIN COVERS THE
+// TRIPLE.** Each of the three is run only as far as its own answer settling, so a handle one of them
+// opens is still open for the next -- a listener a setup starts is a listener the test can connect
+// to -- and the loop is drained once, at the end, down to what was outstanding before the setup
+// began. **The teardown runs BEFORE that drain**, which is what makes a teardown able to give back
+// what the test took: a timer the test armed is cleared rather than waited out.
+//
 // **The `@teardown` runs however the test went -- passed, failed, or left out -- and however the
 // `@setup` went.** What a teardown gives back is exactly what a setup that stopped halfway had
 // already taken, so the one case where skipping it would be tempting is the one where it matters.
@@ -367,22 +391,57 @@ private run_guarded(t: TestCase, opened: HookRan, results: *Buf[TestRan])
         return
     end if
 
+    // What the drain at the end is owed: everything above this. Whatever the file's `@setupAll`
+    // opened is under it and is nothing this test may wait for.
+    val floor = outstanding
+
     val before = run_hook(HookSetup)
 
+    var left_out = false
+    var reason = ""
+    var said = ""
+
     if before.left_out
-        results.push(TestRan(t.name, false, true, before.reason, printed_so_far(), elapsed(began)))
+        left_out = true
+        reason = before.reason
     elif before.said != ""
-        results.push(TestRan(t.name, false, false, guarded_by(HookSetup, before.said), printed_so_far(), elapsed(began)))
+        said = guarded_by(HookSetup, before.said)
     else
         // The verdict a `skip` leaves behind, cleared before every test rather than after -- a test
         // that never called it must not inherit the last one's reason.
         skip_asked = false
         skip_reason = ""
 
-        results.push(finished(t, settled_call(t.fn, "a test"), began))
+        said = settled_call(t.fn, "a test")
+
+        // **A skip beats whatever the unwind came out as**, which is what makes the asynchronous
+        // case work: a `skip` inside an `async` test arrives here as a rejected promise, and the
+        // reason was written down where it was called. It is read before the teardown runs, the
+        // teardown clearing both.
+        if skip_asked
+            left_out = true
+            reason = skip_reason
+            said = ""
+        end if
     end if
 
-    hook_verdict(HookTeardown, run_hook(HookTeardown), results)
+    // What the test printed, taken before the teardown so a tidy-up's own output is the teardown's.
+    val printed = printed_so_far()
+
+    val after = run_hook(HookTeardown)
+
+    // The one drain, now that the teardown has given back whatever it was going to.
+    val drained = drain_verdict(floor)
+
+    // **A fault the drain turned up is the test's**, a timer that was left armed and threw being
+    // something the test did -- and it is folded in only where the test had nothing to say for
+    // itself, one mistake being worth one sentence.
+    if !left_out && said == "" then said = drained
+
+    val ok = !left_out && said == ""
+
+    results.push(TestRan(t.name, ok, left_out, if left_out then reason else said, printed, elapsed(began)))
+    hook_verdict(HookTeardown, after, results)
 end run_guarded
 
 // How a `@setup`, `@teardown`, `@setupAll` or `@teardownAll` went.
@@ -433,12 +492,28 @@ end hook_verdict
 private guarded_by(kind: usize, said: string) -> string =
     s"`${hook_names.at(kind)}` failed before this test ran\n${said}"
 
-// One call of no arguments: make it, let the loop settle, and read the verdict.
+// The complaint a drain down to `floor` left behind, and nothing where it left none.
+private drain_verdict(floor: usize) -> string
+    val said = drain_events_to(floor) match
+        Err(sig) -> complaint(sig)
+        Ok(_) -> unhandled_rejection() match
+            Some(sig) -> complaint(sig)
+            None -> ""
+
+    forget_rejections()
+    said
+end drain_verdict
+
+// One call of no arguments: make it, wait for it alone, and read the verdict.
 //
 // **An `async` one is waited for rather than refused.** Calling it starts a coroutine and hands back
 // a promise that has not settled, so a runner that read the answer straight away would call every
 // asynchronous test a pass. The promise is marked handled first, so that a failure is reported here
 // as this call's rather than at the end of the drain as the file's.
+//
+// **What is waited for is THIS call and not the loop**, which is `run_guarded`'s whole arrangement:
+// a setup, a test and a teardown share one scope, so the loop is turned here only until this one
+// answer settles and drained once at the end of the three.
 private settled_call(fn: Value, what: string) -> string
     var args: Buf[Value] = buf()
 
@@ -447,10 +522,11 @@ private settled_call(fn: Value, what: string) -> string
             // **THE PROMISE IS ROOTED ACROSS THE DRAIN, AND A sysl LOCAL IS NOT A ROOT.** The
             // collector walks the machine, the slots and this shadow stack; it cannot see a `Value`
             // sitting in a sysl variable, which is the rule `net.sysl` states about what a callback
-            // may capture and it binds here for the same reason. `drain_events` runs the whole rest
-            // of the program, so a collection inside it is not a possibility but a certainty for any
-            // test that allocates -- and an unrooted promise is freed there, its memory handed to the
-            // next `new_promise`, and read back below as a promise that has not settled.
+            // may capture and it binds here for the same reason. `settle_call` runs whatever the
+            // rest of this call needs, so a collection inside it is not a possibility but a
+            // certainty for any test that allocates -- and an unrooted promise is freed there, its
+            // memory handed to the next `new_promise`, and read back below as a promise that has
+            // not settled.
             //
             // What that looks like is a test whose body ran to its last line and is reported as
             // never having finished. It moves when anything nearby allocates differently, which is
@@ -463,7 +539,7 @@ private settled_call(fn: Value, what: string) -> string
                 Promise(pr) -> pr.handled = true
                 _ -> ()
 
-            val after = drain_events() match
+            val after = settle_call(v) match
                 Err(sig) -> complaint(sig)
                 Ok(_) -> unhandled_rejection() match
                     Some(sig) -> complaint(sig)
@@ -500,18 +576,6 @@ private said_at(message: string, at: Span) -> string
     srcs.push(current_source)
     Ran(Null, rep, srcs, current_unit.sources, output, 0).render()
 end said_at
-
-private finished(t: TestCase, said: string, began: u64) -> TestRan
-    val printed = printed_so_far()
-    val ms = elapsed(began)
-
-    // **A skip beats whatever the unwind came out as**, which is what makes the asynchronous case
-    // work: a `skip` inside an `async` test arrives here as a rejected promise, and the reason was
-    // written down where it was called.
-    if skip_asked then return TestRan(t.name, false, true, skip_reason, printed, ms)
-
-    TestRan(t.name, said == "", false, said, printed, ms)
-end finished
 
 // Everything printed since the output was last cleared, which is at the top of each test.
 private printed_so_far() -> string

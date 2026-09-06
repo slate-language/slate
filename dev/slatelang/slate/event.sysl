@@ -492,7 +492,19 @@ clear_timer(v: Value, at: Span) -> Step
 // libuv to completion in one go, as this used to, would have batched every callback ahead of every
 // resumption and interleaved them in an order nothing could predict. JavaScript's microtask rule is
 // exactly this, and it is why `RUN_ONCE` is asked for rather than the default.
-drain_events() -> Result[unit, Signal]
+drain_events() -> Result[unit, Signal] = drain_events_to(0)
+
+// The same drain, stopping once nothing beyond `floor` is outstanding.
+//
+// **A FLOOR IS WHAT LETS A DRAIN BELONG TO PART OF A PROGRAM RATHER THAN TO ALL OF IT.** `slate
+// test` runs a file's `@setupAll`, then each test, then its `@teardownAll`, and a store or a
+// listener the `@setupAll` opened is meant to stay open for the whole file -- so a test's drain
+// waiting for *nothing* outstanding waits for that listener to close and never returns. What a
+// test's drain is owed is what the test itself left behind, which is everything above the count
+// standing when it began.
+//
+// A floor of zero is the whole program, which is what `run` and `prepare` ask for.
+drain_events_to(floor: usize) -> Result[unit, Signal]
     // How many turns in a row have reported nothing active and settled nothing of ours. See the
     // guard below for what it is for.
     var idle = 0
@@ -506,7 +518,7 @@ drain_events() -> Result[unit, Signal]
             Some(s) -> return Err(s)
             None -> ()
 
-        if outstanding == 0 then break
+        if outstanding <= floor then break
 
         // **A turn reporting nothing active does NOT end the drain, and thinking it did cost a
         // working file system.** A timer is a handle and libuv counts it, so a loop with one
@@ -535,7 +547,14 @@ drain_events() -> Result[unit, Signal]
 
     // A handle that was closed needs one more turn for its close callback, and there is nothing left
     // to wait for -- so this returns as soon as those have run.
-    val closed: Result[unit, Signal] = libuv.default_loop().run() match
+    //
+    // **`RUN_NOWAIT` ABOVE A FLOOR, BECAUSE THE DEFAULT MODE RUNS UNTIL THE LOOP IS EMPTY.** A drain
+    // that stopped at a floor stopped with a handle still open by construction, and asking the
+    // default mode for one more turn there is asking it to wait for that handle to close -- which
+    // is the very wait the floor exists to avoid.
+    val mode = if floor == 0 then libuv.RUN_DEFAULT else libuv.RUN_NOWAIT
+
+    val closed: Result[unit, Signal] = libuv.default_loop().run(mode) match
         Err(e) -> Err(failure(point(0), s"the event loop stopped: ${e}"))
         Ok(_) -> Ok(())
 
@@ -548,4 +567,57 @@ drain_events() -> Result[unit, Signal]
     loop_fault match
         Some(s) -> Err(s)
         None -> Ok(())
-end drain_events
+end drain_events_to
+
+// Run the loop only until this one call has finished -- not until the loop has nothing left.
+//
+// **THIS IS WHAT LETS A `@setup`, ITS TEST AND ITS `@teardown` SHARE ONE EVENT-LOOP SCOPE.** Each of
+// the three has to finish before the next begins, and an `async` one finishes when its promise
+// settles; draining to idle in between would ALSO wait out everything the phase deliberately left
+// standing -- a listener the setup opened, a timer the test armed for its teardown to clear. So this
+// waits for the promise and for nothing else, and the drain that waits for the rest happens once,
+// after the teardown has had its chance to give back what the setup took.
+//
+// A value that is not a promise has nothing to wait for; the microtasks are still run, a call that
+// settled something on its way out owing the resumption.
+settle_call(v: Value) -> Result[unit, Signal]
+    v match
+        Promise(pr) -> settle_promise(pr)
+        _ ->
+            run_microtasks()
+
+            loop_fault match
+                Some(s) -> Err(s)
+                None -> Ok(())
+
+// Turn the loop until `pr` settles, or until nothing is left that could ever settle it.
+//
+// **Nothing outstanding is the answer "never", and it is the one this can give.** A promise waiting
+// on a handle that is never going to fire cannot be told from one waiting on a handle that is about
+// to, so a loop with work in it is turned; a loop with none is a promise the caller reports as a
+// call that never finished.
+private settle_promise(pr: *PromiseObj) -> Result[unit, Signal]
+    var idle = 0
+
+    loop
+        run_microtasks()
+
+        loop_fault match
+            Some(s) -> return Err(s)
+            None -> ()
+
+        if pr.settled then break
+        if outstanding == 0 then break
+        if idle >= 2 then break
+
+        val before = outstanding
+
+        val more = libuv.default_loop().run(libuv.RUN_ONCE) match
+            Err(e) -> return Err(failure(point(0), s"the event loop stopped: ${e}"))
+            Ok(alive) -> alive
+
+        idle = if !more && outstanding == before then idle + 1 else 0
+    end loop
+
+    Ok(())
+end settle_promise

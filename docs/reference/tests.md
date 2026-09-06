@@ -191,6 +191,13 @@ is exactly what a setup that stopped halfway had already taken. **Its own fault 
 own**, counted on the last line under the teardown's name rather than folded into the test or quietly
 dropped: a passing test with a broken teardown is not a passing file.
 
+**A `@setup`, the test it prepares and its `@teardown` run on one event loop**, and each of the three
+is waited for only as far as its own answer. So a socket the setup opened is still open while the test
+runs, and a timer the test armed is still armed while the teardown runs — which is what makes
+`clearTimeout` in a teardown mean anything. The loop is let settle **after** the teardown, and it waits
+only for what the three of them left behind: whatever the file's `@setupAll` opened is the file's, and
+settles after its `@teardownAll`.
+
 ## Running only some of them
 
 **`--only <substring>` runs the tests whose name contains it**, and nothing else:
