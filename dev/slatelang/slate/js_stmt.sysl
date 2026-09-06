@@ -407,12 +407,35 @@ end emit_assign_to
 // JavaScript function does not reliably say what its parameters are called -- so every function this
 // back end writes carries them, along with how many of them a call must give.
 emit_function(j: *Js, before: string, name: string, bound: string, shown: string, params: Buf[string], defaults: Buf[Expr], body: usize, is_async: bool, after: string, at: Span)
-    val star = if body_is_gen(body) then "*" else ""
+    val gen = body_is_gen(body)
+    val star = if gen then "*" else ""
     val prefix = if is_async then "async " else ""
     val called = if name == "" then "" else " " + name
 
-    line(j, s"${before}${prefix}function${star}${called}(${params_text(j, params, defaults)}) {")
+    // **Set before the parameter list is written, and not only around the body.** A default is
+    // emitted here too -- `params_text` calls `emit_inline` on each one -- and `x = await 5` or
+    // `x = yield 5` in a default is exactly as much this function's own `await` or `yield` as one
+    // written in the body is. Set only around the body, `in_async`/`in_gen` still named the
+    // ENCLOSING function while its defaults were being written, so `async f(x = await 5) = x`
+    // complained here that `await` was outside an `async` function -- wrongly, since it is this
+    // function's own default -- and a default containing `yield` would have been let through into
+    // a parameter list where node reads it as a *SyntaxError*, `yield` there belonging to no
+    // generator at all.
+    val outer_async = j.in_async
+    val outer_gen = j.in_gen
+
+    j.in_async = is_async
+    j.in_gen = gen
+
+    var prologue: Buf[string] = buf()
+
+    line(j, s"${before}${prefix}function${star}${called}(${params_text(j, params, defaults, &prologue)}) {")
     open(j)
+
+    // **Written before anything else in the body**, so a parameter a later default reads sees the
+    // guarded value and not the raw `undefined` a JavaScript default would have hidden.
+    for i in 0..<prologue.len()
+        line(j, prologue.at(i))
 
     val answer = fresh(j)
 
@@ -443,18 +466,12 @@ emit_function(j: *Js, before: string, name: string, bound: string, shown: string
     // written under a module-level `var n` wrote 7 into that `n`, where the interpreter binds the
     // name in the call and leaves the outer one alone. A function body is a scope in JavaScript as
     // much as in slate; this is the record of it catching up with the fact.
-    // **AND WHETHER AN `await` MAY BE WRITTEN IS THE BODY'S OWN QUESTION, saved and put back the
-    // same way.** `await` belongs to the function it is written in and not to the one that called
-    // it, so an ordinary function nested inside an `async` one is as much a refusal as one written
-    // at the top level -- and JavaScript answers that refusal with a *SyntaxError* that takes the
-    // whole emitted program with it. Restoring is what stops a plain function turning the enclosing
-    // `async` one's awaits into complaints on the way out.
+    // **`await`/`yield` are set above the parameter list already, and only `pending`/`bound`/
+    // `rebound` are the body's own to save here.**
     val outer_pending = j.pending
     val outer_bound = j.bound
     val outer_rebound = j.rebound
-    val outer_async = j.in_async
 
-    j.in_async = is_async
     j.pending = buf()
 
     for i in 0..<params.len()
@@ -467,11 +484,12 @@ emit_function(j: *Js, before: string, name: string, bound: string, shown: string
     j.pending = outer_pending
     j.bound = outer_bound
     j.rebound = outer_rebound
-    j.in_async = outer_async
     j.last_line = 0
     line(j, s"return ${answer};")
     close(j)
     line(j, "}" + after)
+    j.in_async = outer_async
+    j.in_gen = outer_gen
 
     // **A function with NO parameters carries a signature too, and leaving it out was the hole.**
     // The signature is what `call` checks arity against, so a `Counter()` given an argument had
@@ -511,14 +529,23 @@ private required_of(params: Buf[string], defaults: Buf[Expr]) -> usize
 //
 // **A default is emitted as an expression and never as hoisted statements**, which is what stops a
 // block from being written into a parameter list. A default that needs statements -- a `match`, a
-// loop -- is emitted as an immediately-called function instead, which is the one place this back end
-// uses one and is safe there: a default runs before the body, so there is no `return`, `break` or
-// `await` of the enclosing function to break.
+// loop -- is emitted as an immediately-called function instead, which is the one place `emit_inline`
+// uses one and is safe there: a default runs before the body, so there is no `return` or `break` of
+// the enclosing function to break.
+// **AN `await` OR A `yield` IS DIFFERENT, AND CANNOT BE EMITTED HERE AT ALL.** JavaScript refuses
+// either directly in a parameter list -- `Illegal await-expression in formal parameters`, and the
+// same for `yield` -- so wrapping one in `emit_inline`'s immediately-called function does not save
+// it: an ordinary arrow is not `async`, and even an `async` one would answer a promise rather than
+// the awaited value where a plain expression is wanted. `default_needs_prologue` finds these and
+// `prologue` is where they go instead -- a guarded assignment at the top of the body, exactly where
+// `await`/`yield` are legal, in the idiom `x = x === undefined ? <default> : x` already reads for
+// "the argument was not given": the parameter is left bare, so JavaScript's own rule for an omitted
+// argument -- `undefined` -- is what the guard tests.
 // **`defaults` covers the LAST of the parameters**, which the parser has already made sure of -- so
 // the first parameter with one is `params.len() - defaults.len()`, and reading the two lists in step
 // gives every default to the wrong parameter. That mistake is silent: the function still takes the
 // arguments it took, and only a call that leaves one out shows it.
-private params_text(j: *Js, params: Buf[string], defaults: Buf[Expr]) -> string
+private params_text(j: *Js, params: Buf[string], defaults: Buf[Expr], prologue: *Buf[string]) -> string
     var out = str_builder()
 
     // **A rest parameter is JavaScript's own `...`**, which is the one place the two languages agree
@@ -535,11 +562,18 @@ private params_text(j: *Js, params: Buf[string], defaults: Buf[Expr]) -> string
                 out.push("...")
                 out.push(js_name(name))
             None ->
-                out.push(js_name(params.at(i)))
+                val jn = js_name(params.at(i))
+
+                out.push(jn)
 
                 if i >= required
-                    out.push(" = ")
-                    out.push(emit_inline(j, defaults.at(i - required)))
+                    val d = defaults.at(i - required)
+
+                    if !hoists(d) && default_needs_prologue(d)
+                        prologue.push(s"${jn} = ${jn} === undefined ? ${emit_expr(j, d)} : ${jn};")
+                    else
+                        out.push(" = ")
+                        out.push(emit_inline(j, d))
 
     out.finish()
 end params_text
