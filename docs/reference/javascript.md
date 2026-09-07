@@ -118,6 +118,13 @@ has no LMDB in its standard library: every binding on npm is a native addon, so 
 `slate js` would depend on something the tool cannot see and did not install. Each refusal names the
 call, says it is LMDB, and says the module runs in the interpreter only.
 
+**[`slate:cluster`](../library/cluster.md) is WHOLE here on node and meaningless in a browser**, which
+is `slate:zstd`'s rule read once more and for once with nothing to build. The module is slate source
+over `spawn`, a channel, `adopt` and `listen`, and every one of those is already node's here — so the
+supervisor, the socket that crosses to a worker, the restart and the drain are the same program on both
+hosts. A page has no second process to start and no port to share, so the module is one of those a
+browser bundle never reaches for.
+
 ### `slate:gzip` is whole here, and the container is read by slate rather than by the host
 
 **This is the module the parity rule was written for.** A browser has `CompressionStream` and
