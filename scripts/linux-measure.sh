@@ -70,6 +70,20 @@ awk -v p="$peak" -v b="$baseline" 'BEGIN {
      }'
 free -g
 
+# What zswap actually achieved: the pages it held against the memory it held them in, and how many it
+# had to write through to the file underneath. A pool near its ceiling with a large `written_back`
+# count means the heap is bigger than compression can hide and the disk is doing the work.
+zs=/sys/kernel/debug/zswap
+if sudo test -r "$zs/stored_pages" 2>/dev/null; then
+  stored=$(sudo cat "$zs/stored_pages")
+  pool=$(sudo cat "$zs/pool_total_size")
+  back=$(sudo cat "$zs/written_back_pages" 2>/dev/null || echo 0)
+  awk -v s="$stored" -v p="$pool" -v b="$back" 'BEGIN {
+          printf "\tzswap: %.1f GB of pages held in %.1f GB of memory, %.1f GB written through\n", \
+                 s * 4096 / 1073741824, p / 1073741824, b * 4096 / 1073741824
+       }'
+fi
+
 if [ "$state" -eq 124 ]; then
   echo "'$label' was still running after $limit and was killed" >&2
 fi
