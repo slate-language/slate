@@ -204,11 +204,11 @@ and a program written against it reads the same in both.
 above.** So a callback is handed exactly what the language guarantees: primitives as themselves, and
 everything else as an external it can read properties off. Its answer crosses outward.
 
-**It is given as many arguments as it declares and no more**, which is the rule slate's own natives
-already follow — `map` hands a callback the element and the index, and a one-parameter lambda takes
-it. JavaScript passes extra arguments everywhere, its own `map` calling back with three, so a strict
-count here would refuse the ordinary case. A callback declaring more than the host supplies is a
-fault, the function being right and what it was attached to being unable to feed it.
+**It is given as many arguments as it declares and no more**, which is
+[the rule every slate call follows](functions.md#a-function-takes-as-many-arguments-as-it-declares-and-the-rest-are-dropped)
+— JavaScript passes extra arguments everywhere, its own `map` calling back with three, and a
+one-parameter lambda takes the first and drops the rest. A callback declaring more than the host
+supplies is a fault, the function being right and what it was attached to being unable to feed it.
 
 **A method call keeps its receiver and a bare call keeps the one its path gave it.** `x.foo(a)` calls
 `foo` with `x` as `this`; `fetch(url)` on an `external fetch` is called on the global object, because

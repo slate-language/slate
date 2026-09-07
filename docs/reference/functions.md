@@ -273,38 +273,75 @@ print(total(...xs))         // the spread it is the counterpart of
 so there is no absence to test for. It must be last and takes no default — one could never fire. A
 default *before* it is fine.
 
-## Callbacks take as many arguments as they declare
+## A function takes as many arguments as it declares, and the rest are dropped
 
-**A call the program writes is strict**: `f(1, 2)` where `f` takes one argument is refused, and so is
-`f()` where it takes one. The count is a claim you made, and getting it wrong is a mistake.
-
-**A callback is different.** Where a builtin calls a function *you* supplied, it passes as many
-arguments as that function declares and no more:
+**A call may give more than the function declares. The surplus is dropped**, wherever the call is
+written and whoever is making it:
 
 ```slate
-print(map([1, 2, 3], () -> 9))          // the element is there and this one ignores it
-print(map([1, 2, 3], (v) -> v * 2))     // and this one reads it
+f(a) = a
+val g = (a, b) -> a + b
 
-forEach([1, 2], () -> print("tick"))
-
-setTimeout(() -> print("later"), 0)
+print(f(1, 2, 3))
+print(g(1, 2, 3))
+print(map([1, 2, 3], v -> v * 2))
+print(map([1, 2, 3], () -> 9))
 ```
 
 ```output
-[9, 9, 9]
+1
+3
 [2, 4, 6]
-tick
-tick
+[9, 9, 9]
+```
+
+This is JavaScript's rule and TypeScript's, and it is what lets a function be used wherever a wider
+one is wanted. It is what a handler wants to look like — `on(node, "click", () -> setCount(n + 1))`
+for one that does not read the event, `onData(socket, () -> stop())` for a reader that does not care
+what arrived — and it holds everywhere something calls a function you wrote: array walks, `sorted`,
+timers, sockets, WebSocket handlers, [the document](../library/dom.md)'s events, a method reached
+off an object, a function [handed out to a JavaScript host](external.md).
+
+```slate
+setTimeout(() -> print("later"), 0)
+
+on2(f) = f(1, 2)
+
+print(on2(a -> a))
+```
+
+```output
+1
 later
 ```
 
-This is what a handler wants to look like — `on(node, "click", () -> setCount(n + 1))` for one that
-does not read the event, `onData(socket, () -> stop())` for a reader that does not care what arrived
-— and it is the rule everywhere a native calls back: array walks, `sorted`, timers, sockets,
-WebSocket handlers, [the document](../library/dom.md)'s events.
+**Too FEW is still a fault**, and that is not the same question: a parameter with no default has
+nothing to bind, and slate stores no absence, so there is no value to give it. Give it a
+[default](#defaults) where leaving it out is meant to be allowed.
 
-**Declaring more than the caller has is still a fault, and it names the caller**, because your
-function is not the thing that is wrong:
+```slate
+f(a, b) = a + b
+
+print(f(1))
+```
+
+```error
+`f` takes 2 arguments and this gives it 1
+```
+
+**A builtin is the exception**, because its parameters are not slate's: it cannot drop what it was
+given, and says so.
+
+```slate
+print(chars("a", "b"))
+```
+
+```error
+`chars` takes 1 argument and this gives it 2
+```
+
+**So a function declaring MORE than its caller will supply is still refused, and the complaint names
+the caller**, your function not being the thing that is wrong:
 
 ```slate
 map([1], (a, b) -> a)
@@ -318,20 +355,17 @@ That is the checker, which knows what `map` hands over. Reached through a value 
 machine says the same thing in its own words — *"`map` calls this with 1 argument and it takes 2
 arguments"*.
 
-TypeScript draws the line in nearly the same place, and the difference is worth knowing: there a
-function of fewer parameters is usable wherever more are supplied, *including* through a type you
-declared yourself, because the call that follows ignores the extra argument. **A slate call does
-not** — it passes what you wrote — so the relaxation holds only where the caller is a builtin that
-adapts to the callee. A parameter you annotated is compared strictly:
+The same rule read as a type: a function of fewer parameters fits wherever more are supplied, and
+one of more does not.
 
 ```slate
-apply(f: (integer, integer) -> integer) = f(1, 2)
+apply(f: (integer) -> integer) = f(1)
 
-print(apply(n -> n))
+print(apply((a, b) -> a))
 ```
 
 ```error
-`apply` takes (integer, integer) -> integer here, and this is (any) -> any
+`apply` takes (integer) -> integer here, and this is (any, any) -> any
 ```
 
 ## Destructuring parameters

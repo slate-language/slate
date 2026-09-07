@@ -675,10 +675,10 @@ g(ss: array of string) = map(ss, s -> s * 2)
 `*` does not apply to string and integer
 ```
 
-and so is its arity — in one direction. **A callback may declare FEWER parameters than the builtin
-hands it**, a native passing as many as the callback declares; see
-[Callbacks](functions.md#callbacks-take-as-many-arguments-as-they-declare). Declaring **more** is
-refused, there being nothing to fill them with:
+and so is its arity — in one direction. **A function may declare FEWER parameters than its caller
+supplies**, every call dropping what it cannot bind; see
+[Functions](functions.md#a-function-takes-as-many-arguments-as-it-declares-and-the-rest-are-dropped).
+Declaring **more** is refused, there being nothing to fill them with:
 
 ```slate
 q(ns: array of integer) = map(ns, (a, b) -> a)
@@ -688,9 +688,10 @@ q(ns: array of integer) = map(ns, (a, b) -> a)
 `map` takes (integer) -> any here, and this is (integer, any) -> integer
 ```
 
-**It is the CALLER that makes the relaxation sound, so it stops at a builtin.** A parameter the
-program annotated is compared strictly in both directions: a call the program wrote passes what the
-program wrote, and nothing adapts.
+**The relaxation does not stop at a builtin, because the CALL is what makes it sound rather than the
+caller.** A parameter the program annotated reads the same way: `apply(f: (integer, integer) ->
+integer) = f(1, 2)` takes `n -> n`, the call dropping the second argument exactly as `map` would.
+Only the floor is a limit, on either side.
 
 **None of that is a type variable.** A builtin's signature names an argument by *position*, and the
 type at that position is filled in at the call — no binding, no scope, nothing to write anywhere. What

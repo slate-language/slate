@@ -239,7 +239,7 @@ check_call(callee: Expr, args: Buf[Expr], env: *TypeEnv, at: Span)
 
     val shape = call_shape(callee, args, env, true)
 
-    check_arguments(shape.sig, callee, shape.args, env, at, shape.unwritten, shape.agreed)
+    check_arguments(shape.sig, callee, shape.args, env, at, shape.unwritten, shape.agreed, shape.native)
 end check_call
 
 // What a call is going to, and the arguments in ITS coordinates.
@@ -259,11 +259,12 @@ private call_shape(callee: Expr, args: Buf[Expr], env: *TypeEnv, reporting: bool
         Field(target, name, optional) ->
             if !optional
                 method_signature(type_of_expr(target, env), name) match
-                    Some(sig) -> return CallShape(sig, with_receiver(target, args), 1, true)
+                    Some(sig) -> return CallShape(sig, with_receiver(target, args), 1, true, true)
                     None -> ()
         _ -> ()
 
     val sig = type_of_expr(callee, env)
+    val native = native_callee(callee, env)
 
     // **A generic signature is solved HERE, before anything is checked or quoted**, which is the
     // arrangement a marker already has: everything downstream reads one signature and none of it
@@ -272,11 +273,22 @@ private call_shape(callee: Expr, args: Buf[Expr], env: *TypeEnv, reporting: bool
         var agreed = true
         val solved = solved_generics(sig, args, env, reporting, &agreed)
 
-        return CallShape(solved, args, 0, agreed)
+        return CallShape(solved, args, 0, agreed, native)
     end if
 
-    CallShape(sig, args, 0, true)
+    CallShape(sig, args, 0, true, native)
 end call_shape
+
+// Whether the call goes to a BUILTIN, whose count the machine still refuses.
+//
+// **Only a bare name can answer yes**, `BoundNative` being a note on a scope entry: a builtin
+// reached through a field, an element or a call is a value like any other by then, and the pass
+// says nothing about it rather than guessing.
+private native_callee(callee: Expr, env: *TypeEnv) -> bool = *callee.kind match
+    Name(n) -> bound_to(env, n) match
+        BoundNative -> true
+        _ -> false
+    _ -> false
 
 struct CallShape
     sig: Type
@@ -290,6 +302,12 @@ struct CallShape
     // be measured against that one and complained about a second time -- which is the shape a
     // wrong ARITY already steps aside from, and for its reason: one mistake, one sentence.
     agreed: bool
+
+    // **Whether the callee is a builtin, which is what decides the TOO-MANY half of the count.**
+    // A call to a function the program wrote drops what it cannot bind, so complaining there would
+    // be reporting what the machine does not; a builtin's parameters are sysl's and it refuses the
+    // count in its own words, so complaining there is this pass moving that refusal earlier.
+    native: bool
 end CallShape
 
 // The arguments walked, a callback knowing what it is going to be handed.
@@ -340,7 +358,7 @@ end check_args
 // method spelling means a call with the receiver in front, so the check counts it -- but the reader
 // did not write it, and *"`filter` takes 2 arguments and this gives it 1"* about `xs.filter()` sends
 // them looking for an argument they can see two of.
-private check_arguments(sig: Type, callee: Expr, args: Buf[Expr], env: *TypeEnv, at: Span, unwritten: usize, agreed: bool)
+private check_arguments(sig: Type, callee: Expr, args: Buf[Expr], env: *TypeEnv, at: Span, unwritten: usize, agreed: bool, native: bool)
     *sig.kind match
         FunctionType(params, required, variadic, result) ->
             // A lambda's type has `Any` parameters and says nothing; a definition with no annotated
@@ -350,7 +368,15 @@ private check_arguments(sig: Type, callee: Expr, args: Buf[Expr], env: *TypeEnv,
             // against it would refuse `f(1)` inside a function whose parameter was annotated
             // `function`, which runs. The cost is that a genuine `() -> x` has the same shape and
             // goes uncounted too, and the cost is worth paying to be sure.
-            if !says_nothing(params, result) && (args.len() < required || (!variadic && args.len() > params.len()))
+            // **TOO FEW ALWAYS, TOO MANY ONLY FOR A BUILTIN.** A call giving more than a function
+            // the PROGRAM wrote declares drops the surplus rather than faulting, on both hosts, so
+            // complaining about one would be reporting what the machine would not -- the one thing
+            // this pass may not do. A builtin's parameters are sysl's: it cannot drop what it was
+            // given and refuses the count in its own words, so that half is still worth saying
+            // where the call is written.
+            val too_many = native && !variadic && args.len() > params.len()
+
+            if !says_nothing(params, result) && (args.len() < required || too_many)
                 val floor = if required > unwritten then required - unwritten else 0
                 val ceiling = if params.len() > unwritten then params.len() - unwritten else 0
 
@@ -394,13 +420,6 @@ private check_arguments(sig: Type, callee: Expr, args: Buf[Expr], env: *TypeEnv,
                 val want = if given.is_empty() then raw else resolved(raw, given)
                 val got = if i < given.len() then given.at(i) else type_of_expr(args.at(i), env)
 
-                // **A MARKER IS WHAT SAYS A NATIVE WILL BE DOING THE CALLING**, and that is what
-                // makes the callback relaxation sound: a builtin's callback parameter names an
-                // argument by position -- `map`'s is `(<an element of argument 0>) -> any` -- where a
-                // parameter the PROGRAM annotated never carries one. So a function of fewer
-                // parameters fits here and nowhere else, which is exactly where the caller adapts.
-                val adapting = has_marker(raw)
-
                 // **A LITERAL WRITTEN AT AN ANNOTATED PARAMETER MAY CARRY NOTHING THE PARAMETER
                 // DOES NOT NAME**, which is the pass's third deliberate bend and is
                 // `check_expr.sysl`'s to explain. `want` is whatever the signature says by the time
@@ -408,8 +427,7 @@ private check_arguments(sig: Type, callee: Expr, args: Buf[Expr], env: *TypeEnv,
                 // its own. Asked BEFORE `fits`, and its refusal stands instead of that one: a
                 // misspelled field is missing and spare at once, and naming the spelling is the
                 // half of that worth saying.
-                if !refuse_excess_fields(args.at(i), want) &&
-                        !(if adapting then fits_callback(got, want) else fits(got, want))
+                if !refuse_excess_fields(args.at(i), want) && !fits(got, want)
                     complain_here(args.at(i).span, s"${named(callee)} takes ${show_type(want)} here, and this is ${show_type(got)}")
         _ -> ()
 end check_arguments

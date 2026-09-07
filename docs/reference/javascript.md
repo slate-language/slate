@@ -596,25 +596,24 @@ can be signalled, and says so in those words rather than installing a handler no
 node's `mtimeMs`. It was missing for one release, which nothing noticed until a program walking a
 directory tree asked a file for its modification time and reached a field that was not there.
 
-### Arity is checked here too, and until 0.0.28 it was not
+### A call with too few arguments is refused here too
 
-A JavaScript function ignores an argument it was not expecting and binds `undefined` for one it was
-not given. slate refuses both, and the interpreter always has — so an emitted `f(1, 2)` for a
-one-parameter `f` quietly dropped the `2` and ran, where the same program under the interpreter
-faulted. **That is a disagreement about what a program means, not about how a complaint is worded.**
-A call with too *few* failed further in, with a sentence about `undefined` not being passable that
-named neither the function nor the count.
+A JavaScript function binds `undefined` for an argument it was not given, and slate stores no
+absence — so a call with too *few* used to fail further in, with a sentence about `undefined` not
+being passable that named neither the function nor the count. Every slate call goes through one
+place in the runtime, and the signature the emitter already attaches for named arguments is what the
+check reads: a length comparison per call. A function taking **no** parameters carried no signature
+at all, which is why a component given props it does not declare was the silent case; it carries one
+now.
 
-Every slate call goes through one place in the runtime, and the signature the emitter already
-attaches for named arguments is what the check reads — a length comparison per call. A function
-taking **no** parameters carried no signature at all, which is why a component given props it does
-not declare was the silent case; it carries one now.
-
-**A callback is trimmed rather than refused**, on both back ends — see
-[Functions](functions.md#callbacks-take-as-many-arguments-as-they-declare). The document's `on`, the
-WebSocket handlers and the timers all go through that path here, so `on(node, "click", () -> …)` is
-what a page writes and what it has always written; what changed is that the two hosts now agree
-about it for the same reason rather than by accident.
+**Too MANY is not an error on either host — the surplus is dropped**, which is JavaScript's own rule
+and is what the interpreter does as well; see
+[Functions](functions.md#a-function-takes-as-many-arguments-as-it-declares-and-the-rest-are-dropped).
+The arguments are trimmed to the parameter list before the call, so what a slate function BINDS is
+the same on both hosts — a JavaScript function could otherwise read the extras back out of
+`arguments`, where a slate chunk never sees them. The document's `on`, the WebSocket handlers and
+the timers all go through that path, so `on(node, "click", () -> …)` is what a page writes and what
+it has always written.
 
 ### A diagnostic about a function names it, and the emitter says what to call it
 
