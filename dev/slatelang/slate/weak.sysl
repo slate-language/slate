@@ -1,0 +1,151 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// What a program does to a weak map and to a weak reference.
+//
+// **The storage is `setmap.sysl`'s and the difference is three collector hooks**, which `obj.sysl`
+// carries: a weak map is the very `ObjectObj` a map is, allocated under a kind whose `trace` marks
+// neither half, whose `ephemeron` marks a value because its key turned out live, and whose `weaken`
+// drops the entries whose keys did not. Nothing in this file knows about any of that -- which is the
+// point of putting it in the kind rather than in the operations.
+//
+// **A KEY HAS TO BE SOMETHING THE COLLECTOR CAN FREE, and that is the whole of the rule.** A number,
+// a boolean and a string are not: two occurrences of `"a"` are one value as far as a program can
+// tell, so an entry keyed by one could never be dropped and a weak map keyed by strings is a map
+// that leaks. JavaScript draws the line in the same place and for the same reason.
+//
+// **ALL FOUR NAMES REFUSE A KEY THE COLLECTOR CANNOT FREE, WHERE JAVASCRIPT REFUSES ONLY `set`.**
+// There `wm.get("a")` answers `undefined` and `wm.has("a")` answers `false`, which are the answers a
+// key nothing wrote would give -- so a program that stored under `"a"` somewhere else and reads here
+// is told nothing at all, and the mistake surfaces as a missing entry a long way from the line that
+// made it. slate names it at the line, which is the same argument that made `indexOf` answer `null`
+// rather than `-1` and made `Map([1])` a complaint rather than a pair with a hole in it.
+//
+// **An external is on the near side of that line even though the interpreter cannot free one.** It
+// is an interned path here and a real host object under `slate js`, where it is weak in the host's
+// own `WeakMap`; here its entries live as long as the map does, which is an ordinary identity-keyed
+// map and is the behaviour a placeholder should have.
+
+// Whether a value is one a weak map may be keyed by, or a weak reference may point at.
+//
+// **Every kind on this list is a thing a program keeps and hands around**, which is the reading of
+// "an object" that matters here: an object, an array, a class or data instance (an object), a
+// closure, a set, a map, a promise, a weak map, a weak reference, and an external. Everything else
+// is a value the program *has* rather than one it holds, and there is nothing to free.
+private weakly_holdable(v: Value) -> bool = v match
+    Object(_) -> true
+    Array(_) -> true
+    Fn(_) -> true
+    SetVal(_) -> true
+    MapVal(_) -> true
+    WeakMapVal(_) -> true
+    WeakRefVal(_) -> true
+    Promise(_) -> true
+    External(_) -> true
+
+    // **A builtin is on the list because a closure is**, and the two are one word to a program: a
+    // function is a function, and `slate js` could not tell them apart if it wanted to -- a builtin
+    // is an ordinary JavaScript function there. Neither this nor an external is anything the
+    // interpreter's collector can take away, so an entry keyed by one lives as long as the map does.
+    Native(_) -> true
+    _ -> false
+
+// The sentence both refusals are written from, so that the two cannot drift into two rules.
+private weakly_holdable_or(v: Value, at: Span, what: string) -> Result[unit, Signal]
+    if weakly_holdable(v) then return Ok(())
+
+    Err(failure(at, s"${what} must be something the collector can free -- an object, an array, a class instance, a closure or an external -- and this is ${v.type_name()}"))
+end weakly_holdable_or
+
+private weak_map_of(v: Value, at: Span, name: string) -> Result[*ObjectObj, Signal] = v match
+    WeakMapVal(t) -> Ok(t)
+    other -> Err(failure(at, s"`${name}` takes a weak map, and this is ${other.type_name()}"))
+
+private weak_ref_of(v: Value, at: Span, name: string) -> Result[*WeakRefObj, Signal] = v match
+    WeakRefVal(r) -> Ok(r)
+    other -> Err(failure(at, s"`${name}` takes a weak reference, and this is ${other.type_name()}"))
+
+private takes(args: Buf[Value], n: usize, at: Span, name: string, what: string) -> Result[unit, Signal]
+    if args.len() != n then return Err(failure(at, s"`${name}` takes ${what}, and was given ${counted(args.len(), "argument")}"))
+
+    Ok(())
+
+// `WeakMap()` -- and nothing else, there being nothing to fill it from.
+//
+// **No constructor argument, where `Map` takes a list of pairs.** A weak map cannot be walked, so
+// `WeakMap(other)` could not copy one; and a list of pairs is an array holding every key strongly,
+// which is the leak the kind exists to prevent, written into its own constructor.
+do_weak_map_new(args: Buf[Value], at: Span) -> Step
+    if args.len() != 0
+        return fault(at, s"`WeakMap` takes nothing, and was given ${counted(args.len(), "argument")}")
+
+    Ok(WeakMapVal(new_weak_map()))
+
+// `set(wm, k, v)` -- and the weak map back, so that writes chain as a map's do.
+do_weak_map_set(args: Buf[Value], at: Span) -> Step
+    takes(args, 3, at, "set", "a weak map, a key and a value")?
+
+    val t = weak_map_of(args.at(0), at, "set")?
+
+    weakly_holdable_or(args.at(1), at, "a weak map's key")?
+    keepable(args.at(2), at, "put in a weak map")?
+    obj_put(t, args.at(1), args.at(2), at)?
+    Ok(args.at(0))
+end do_weak_map_set
+
+// `get(wm, k)` -- what the key holds, or `null` where there is none.
+//
+// **A key the collector has taken away reads exactly like a key nothing ever wrote**, which is what
+// makes a weak map usable at all: a program that has to tell the two apart is holding the key, and a
+// program holding the key has an entry.
+do_weak_map_get(args: Buf[Value], at: Span) -> Step
+    takes(args, 2, at, "get", "a weak map and a key")?
+
+    val t = weak_map_of(args.at(0), at, "get")?
+
+    weakly_holdable_or(args.at(1), at, "a weak map's key")?
+
+    obj_get(t, args.at(1), at)? match
+        None -> Ok(Null)
+        Some(v) -> Ok(v)
+end do_weak_map_get
+
+do_weak_map_has(args: Buf[Value], at: Span) -> Step
+    takes(args, 2, at, "has", "a weak map and a key")?
+
+    val t = weak_map_of(args.at(0), at, "has")?
+
+    weakly_holdable_or(args.at(1), at, "a weak map's key")?
+    Ok(Bool(obj_has(t, args.at(1), at)?))
+end do_weak_map_has
+
+// `delete(wm, k)` -- whether there was one, which is a map's answer and the useful one.
+do_weak_map_delete(args: Buf[Value], at: Span) -> Step
+    takes(args, 2, at, "delete", "a weak map and a key")?
+
+    val t = weak_map_of(args.at(0), at, "delete")?
+
+    weakly_holdable_or(args.at(1), at, "a weak map's key")?
+    Ok(Bool(obj_remove(t, args.at(1), at)?))
+end do_weak_map_delete
+
+// `WeakRef(target)` -- a hold on a value that does not keep it alive.
+do_weak_ref_new(args: Buf[Value], at: Span) -> Step
+    takes(args, 1, at, "WeakRef", "one thing to point at")?
+
+    weakly_holdable_or(args.at(0), at, "a weak reference's target")?
+    Ok(WeakRefVal(new_weak_ref(args.at(0))))
+end do_weak_ref_new
+
+// `deref(r)` -- the target, or `null` once the collector has taken it.
+//
+// **`null` and not `undefined`**, which is slate's rule rather than a choice made here: absence
+// stops at the boundary it arose at, and slate has no `undefined` a program may store. Nothing that
+// may be a target is ever `null`, so the answer is unambiguous -- a `null` from here means gone.
+do_weak_ref_deref(args: Buf[Value], at: Span) -> Step
+    takes(args, 1, at, "deref", "a weak reference")?
+
+    Ok(weak_ref_of(args.at(0), at, "deref")?.target)
+end do_weak_ref_deref

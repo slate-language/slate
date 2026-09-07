@@ -112,6 +112,14 @@ struct ObjectObj
     // is settled the moment the object is built.
     frozen: bool
 
+    // Whether this table finds a key by IDENTITY rather than by what it holds.
+    //
+    // **A weak map and nothing else**, and it is a field for `frozen`'s reason: it is decided where
+    // the table is made and never changes, so a walk asking it per lookup would be paying for an
+    // answer that was settled at the allocation. `table.sysl`'s `key_hash` and `keys_match` are the
+    // two places it is read.
+    by_identity: bool
+
 // A function and the scope it was written in.
 //
 // **The scope is the whole of what makes it a closure**, and the reason this file exists: a function
@@ -170,6 +178,14 @@ struct PromiseObj
     // and what the program looks like from outside is a hang.
     orphaned: bool
 
+// A hold on a value that does not keep it alive.
+//
+// **One slot and nothing else**, so there is no finalizer: a `Value` carries no reference-counted
+// member, which is what lets a zeroed payload be a valid one of these from the moment `alloc`
+// answers -- a zeroed `Value` reads as `Null`, and `Null` is exactly what a cleared reference holds.
+struct WeakRefObj
+    target: Value
+
 // A scope: the names written in one block, and the scope it sits inside.
 struct EnvObj
     names: Map[string, Value]
@@ -195,8 +211,42 @@ mark_value(h: *gc.Heap, v: Value)
         MapVal(p) -> gc.mark(h, ptr_cast(p))
         Fn(p) -> gc.mark(h, ptr_cast(p))
         Promise(p) -> gc.mark(h, ptr_cast(p))
+
+        // **The weak pair is marked STRONGLY from outside and weakly from inside**, which is not a
+        // contradiction: a weak map is an ordinary object as far as everything holding *it* is
+        // concerned, and it is the entries inside it that do not keep their keys. A value naming one
+        // has to mark it, or a weak map held in a variable would be swept out from under the
+        // variable.
+        WeakMapVal(p) -> gc.mark(h, ptr_cast(p))
+        WeakRefVal(p) -> gc.mark(h, ptr_cast(p))
         _ -> ()
 end mark_value
+
+// The collected object a value points at, or null for one that points at nothing.
+//
+// **This is what a weak slot asks about**, `gc.is_live` taking the pointer marking decided about --
+// and a value with none is one the collector cannot free, so a weak slot holding it never clears.
+// An external is the case that matters: it is an interned path rather than an object, so a weak map
+// keyed by one is an ordinary identity-keyed map whose entries live as long as the map does.
+private object_of(v: Value) -> *u8 = v match
+    Str(p) -> ptr_cast(p)
+    Array(p) -> ptr_cast(p)
+    Object(p) -> ptr_cast(p)
+    SetVal(p) -> ptr_cast(p)
+    MapVal(p) -> ptr_cast(p)
+    WeakMapVal(p) -> ptr_cast(p)
+    WeakRefVal(p) -> ptr_cast(p)
+    Fn(p) -> ptr_cast(p)
+    Promise(p) -> ptr_cast(p)
+    _ -> null
+
+// Whether marking has decided this value survives. **A value with no object of its own always
+// does**, there being nothing for the collector to take away.
+private value_survives(h: *gc.Heap, v: Value) -> bool
+    val p = object_of(v)
+
+    p == null || gc.is_live(h, p)
+end value_survives
 
 // Grey every value in a map. Used by both the object kind and the scope kind.
 private mark_map(h: *gc.Heap, m: Map[string, Value])
@@ -283,6 +333,64 @@ finalize_env(p: *u8)
     o.names = map()
     o.mutable = map()
 
+// **A weak map's tracer marks NEITHER HALF, and that is the whole of what makes it weak.** A key
+// nothing else holds is free to go; a value is marked by the ephemeron below, and only because its
+// key turned out live. The table's `Buf`s are reference counted and belong to a finalizer, which is
+// `finalize_object` -- the storage is an `ObjectObj` and only the hooks differ.
+trace_weak_map(p: *u8, h: *gc.Heap)
+    ()
+
+// Mark the values whose keys turned out live, and answer whether that marked anything new.
+//
+// **The answer is what terminates the fixpoint**, so it must be false once there is nothing left to
+// do: a value already marked is not marked again, and a value with no object of its own -- a number,
+// a string of a kind the collector does not own -- counts as marked, having nothing to lose.
+//
+// **A value may be some other entry's key**, which is why `collect` runs this again after the
+// worklist drains rather than once: `wm.set(a, b)` and `wm.set(b, c)` with only `a` held from
+// outside keeps all three, and it takes two passes to find that out.
+ephemeron_weak_map(p: *u8, h: *gc.Heap) -> bool
+    val o: *ObjectObj = ptr_cast(p)
+    var changed = false
+
+    for i in 0..<o.entries.len()
+        val e = o.entries.at(i)
+
+        if !e.dead && value_survives(h, e.key) && !value_survives(h, e.value)
+            mark_value(h, e.value)
+            changed = true
+
+    changed
+end ephemeron_weak_map
+
+// Drop the entries whose keys did not survive, before anything is freed.
+//
+// **The entry is dropped by POSITION and its key is never hashed again**, which is not an
+// optimization: hashing a slate value may run a class's own `hash`, and running a program's code
+// from inside a collection is the one thing a hook may not do. The hash is on the entry, which is
+// what `obj_drop_at` needs to find its slot in the index.
+weaken_weak_map(p: *u8, h: *gc.Heap)
+    val o: *ObjectObj = ptr_cast(p)
+
+    for i in 0..<o.entries.len()
+        val e = o.entries.at(i)
+
+        if !e.dead && !value_survives(h, e.key) then obj_drop_at(o, i)
+end weaken_weak_map
+
+// A weak reference points at nothing as far as marking is concerned, which is the definition.
+trace_weak_ref(p: *u8, h: *gc.Heap)
+    ()
+
+// Null the slot once marking has decided the target is dead.
+//
+// **This runs before anything is freed**, so the slot is never read after its target's storage has
+// gone -- and `Null` is what `deref` then answers, slate having no `undefined` to store.
+weaken_weak_ref(p: *u8, h: *gc.Heap)
+    var o: *WeakRefObj = ptr_cast(p)
+
+    if !value_survives(h, o.target) then o.target = Null
+
 // A `Kind` must outlive every object naming it and its address must not move, so these are module
 // storage. Module storage states its type, which is why each is written out.
 var str_kind: gc.Kind = gc.Kind(&trace_str, &finalize_str, null, null)
@@ -291,6 +399,12 @@ var object_kind: gc.Kind = gc.Kind(&trace_object, &finalize_object, null, null)
 var closure_kind: gc.Kind = gc.Kind(&trace_closure, &finalize_closure, null, null)
 var env_kind: gc.Kind = gc.Kind(&trace_env, &finalize_env, null, null)
 var promise_kind: gc.Kind = gc.Kind(&trace_promise, &finalize_promise, null, null)
+
+// **The two kinds that use the hooks the other six leave null**, and they are the reason the
+// collector has four rather than two. A weak map shares the object's storage and its finalizer and
+// differs in nothing else; a weak reference is one slot, so it needs no finalizer at all.
+var weak_map_kind: gc.Kind = gc.Kind(&trace_weak_map, &finalize_object, &weaken_weak_map, &ephemeron_weak_map)
+var weak_ref_kind: gc.Kind = gc.Kind(&trace_weak_ref, null, &weaken_weak_ref, null)
 
 // -- the roots ----------------------------------------------------------------------------------
 
@@ -468,6 +582,8 @@ private var spare_object: *ObjectObj = null
 private var spare_closure: *ClosureObj = null
 private var spare_env: *EnvObj = null
 private var spare_promise: *PromiseObj = null
+private var spare_weak_map: *ObjectObj = null
+private var spare_weak_ref: *WeakRefObj = null
 
 // Take the reserves. Called with an empty heap, where the allocation cannot fail.
 private reserve_spares()
@@ -478,8 +594,14 @@ private reserve_spares()
     spare_env = ptr_cast(gc.alloc(&slate_heap, sizeof(EnvObj), &env_kind))
     spare_promise = ptr_cast(gc.alloc(&slate_heap, sizeof(PromiseObj), &promise_kind))
 
+    // **The weak pair gets a reserve of its own rather than borrowing the object's**, because the
+    // kind is written into the header at the allocation: a reserve taken under `object_kind` handed
+    // out as a weak map would be traced strongly and weakened by nothing.
+    spare_weak_map = ptr_cast(gc.alloc(&slate_heap, sizeof(ObjectObj), &weak_map_kind))
+    spare_weak_ref = ptr_cast(gc.alloc(&slate_heap, sizeof(WeakRefObj), &weak_ref_kind))
+
     // A zeroed payload is a valid object of each of these kinds except the ones holding a `Buf` or a
-    // `Map`, which a tracer walks -- and a zero `Buf` is an empty one, so all six are safe to trace
+    // `Map`, which a tracer walks -- and a zero `Buf` is an empty one, so all eight are safe to trace
     // from the moment they exist.
     heap_exhausted = false
 end reserve_spares
@@ -493,6 +615,8 @@ private mark_spares(h: *gc.Heap)
     gc.mark(h, ptr_cast(spare_closure))
     gc.mark(h, ptr_cast(spare_env))
     gc.mark(h, ptr_cast(spare_promise))
+    gc.mark(h, ptr_cast(spare_weak_map))
+    gc.mark(h, ptr_cast(spare_weak_ref))
 
 // Try once, collect, try again -- and answer the reserve rather than null when even that fails.
 //
@@ -531,6 +655,26 @@ new_object() -> *ObjectObj
     o.index = fresh_index()
     o.live = 0
     o.frozen = false
+    o.by_identity = false
+    o
+
+// **A weak map is `new_object`'s twin under another kind**, and the two must be built alike: the
+// index is a fresh one rather than an empty `Buf`, or the first insertion probes an array of no
+// slots.
+new_weak_map() -> *ObjectObj
+    var o: *ObjectObj = ptr_cast(alloc_or_collect(sizeof(ObjectObj), &weak_map_kind, ptr_cast(spare_weak_map)))
+
+    o.entries = buf()
+    o.index = fresh_index()
+    o.live = 0
+    o.frozen = false
+    o.by_identity = true
+    o
+
+new_weak_ref(target: Value) -> *WeakRefObj
+    var o: *WeakRefObj = ptr_cast(alloc_or_collect(sizeof(WeakRefObj), &weak_ref_kind, ptr_cast(spare_weak_ref)))
+
+    o.target = target
     o
 
 new_closure(params: Buf[string], body: usize, scope: *EnvObj) -> *ClosureObj

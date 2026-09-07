@@ -32,7 +32,10 @@ What a program has without writing it.
 | [`slate:lmdb`](lmdb.md) | LMDB — an ordered key-value store on disk |
 | [`slate:llhttp`](llhttp.md) | the HTTP parser itself |
 | [`slate:nghttp2`](nghttp2.md) | HTTP/2 framing, and HPACK |
-| [`slate:dom`](dom.md) | the document — in a browser only |
+
+**The document is not on that list any more.** `slate:dom` was built in until
+[`external`](../reference/external.md) made it writable in slate; it is a package now, and
+[its page](dom.md) says where it went.
 
 ## Why so many of these are modules rather than globals
 

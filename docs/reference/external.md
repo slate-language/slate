@@ -11,12 +11,13 @@ external localStorage
 
 **`external` names a value of the JavaScript host and binds it to a slate name.** It is the door
 through which a browser API or an npm package reaches a program, and it is a *language* feature
-rather than a library one: what used to need a hand-written builtin in the back end — thirteen of
-them are `slate:dom` — is a package's own line now.
+rather than a library one: what used to need a hand-written builtin in the back end is a package's own
+line now. **The document is the worked example** — `slate:dom` was forty-four such builtins and is
+[the `dom` package](../library/dom.md), written in slate over this declaration.
 
 **It is the JavaScript host's alone.** Under the interpreter the declaration is accepted and every
-operation that would touch the host faults, naming the command, exactly as `slate:dom` does — the
-program is correct and the way it was run is the mistake.
+operation that would touch the host faults, naming the command — the program is correct and the way it
+was run is the mistake.
 
 ## The declaration
 
@@ -132,8 +133,8 @@ program that wants a field's value asks for the field.
 ## What crosses the boundary
 
 **The invariant is one sentence: no foreign object ever becomes a slate value except as an
-external.** It is the rule `slate:dom` already keeps by handing out integers, and everything in the
-two tables below follows from it.
+external.** Nothing that came from the host is ever unwrapped into something slate owns, and
+everything in the two tables below follows from it.
 
 **Outward — a slate value handed to the host:**
 
@@ -182,8 +183,8 @@ array comes back external, an object comes back external, a function comes back 
 through the same property and call operations as anything else. There is no unwrapping and no
 conversion at the door, so nothing the host owns can be mistaken for something slate owns.
 
-**A whole `number` is an integer and a fractional one is a real**, which is `slate:dom`'s rule for
-its own property reads rather than a new one. JavaScript has one number and slate has two, so
+**A whole `number` is an integer and a fractional one is a real.** JavaScript has one number and
+slate has two, so
 something has to decide, and the value is the only evidence there is — a length, a child count, a
 `clientWidth` are what a program reads off a host most often, and every one of them is a count a
 loop is about to be written over. A real there would make `0..<n` a fault in the ordinary case.
@@ -237,15 +238,14 @@ is what makes the two blocks above this section run at all. The line is exactly 
 to be asked: identity, travel and the type test are the language's, and a property, a call and a
 construction are the host's.
 
-**The module still exists and the import still succeeds**, which is `slate:dom`'s rule for the same
-reason: a refusal at the import is a complaint about the module and sends a reader looking for a
-spelling mistake in a line that is right. The mistake is the command, so the command is what the
-sentence names.
+**The module still exists and the import still succeeds**, for the same reason: a refusal at the
+import is a complaint about the module and sends a reader looking for a spelling mistake in a line
+that is right. The mistake is the command, so the command is what the sentence names.
 
 ## Reading and writing `localStorage`
 
 **Two properties and a method, and nothing else is needed.** These blocks are for a page and are
-quoted rather than run, as `slate:dom`'s are:
+quoted rather than run:
 
 ```slate
 external localStorage
@@ -270,7 +270,7 @@ stringifies it, which is the host's rule and not slate's; a program that means a
 observer API has:
 
 ```slate
-import { byId } from slate:dom
+import { byId } from dom
 
 external ResizeObserver
 
