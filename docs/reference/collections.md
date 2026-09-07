@@ -333,3 +333,118 @@ val s: Set[string] = Set([1, 2, 3])
 ```error
 declared Set[string], and this is Set[integer]
 ```
+
+## A weak map does not keep its keys alive
+
+`WeakMap()` is a table from an object to anything, and **an entry goes away by itself once nothing
+else in the program holds its key**. That is the whole of what it is for: a table keyed by things
+somebody else owns — a listener list keyed by node, a cache keyed by request, a bit of state keyed by
+connection — would otherwise keep every one of those alive for as long as the table lived, which is
+the ordinary shape of a leak.
+
+Four names and no more: `set`, `get`, `has` and `delete`.
+
+```slate
+val node = { id: 1 }
+val listeners = WeakMap()
+
+listeners.set(node, ["click"])
+
+print(listeners.get(node), listeners.has(node))
+print(listeners.delete(node), listeners.has(node), listeners.get(node))
+```
+
+```output
+["click"] true
+true false null
+```
+
+**`set` answers the weak map, so writes chain**, and `get` answers `null` where there is no entry —
+which is also what it answers for a key the collector has taken away. A program that has to tell
+those apart is holding the key, and a program holding the key has an entry.
+
+**A key must be something the collector can free**: an object, an array, a class instance, a closure,
+a set, a map, a promise, or an [external](external.md). A number, a boolean and a string are not —
+two occurrences of `"a"` are one value as far as a program can tell, so an entry keyed by one could
+never be dropped, and a weak map keyed by strings is a map that leaks.
+
+```slate
+val wm = WeakMap()
+
+wm.set("a", 1)
+```
+
+```error
+a weak map's key must be something the collector can free
+```
+
+**All four names refuse such a key**, where JavaScript refuses only `set` and answers `undefined` or
+`false` for the rest. A read with a key that could never have been written with is a mistake, and it
+is named at the line rather than at the missing entry.
+
+**A weak map finds a key by IDENTITY, where a map finds one by what it holds.** This is the one place
+the two tables behave differently, and it is not a choice: a key found structurally could never be
+dropped, since another equal one can always arrive. A class's own `hash` and `==` are what a
+structural table asks, so a weak map does not consult them at all.
+
+```slate
+val a = { n: 1 }
+val b = { n: 1 }
+
+print(a == b)
+print(Map().set(a, "one").get(b))
+print(WeakMap().set(a, "one").get(b), WeakMap().set(a, "one").get(a))
+```
+
+```output
+true
+one
+null one
+```
+
+**There is no `size`, no `clear`, and no way to walk one**, and none of those is an omission: what is
+in a weak map is the collector's to decide, so a walk would answer differently on two runs of one
+program with nothing between them, and a count is a walk that says how long it was. It prints as
+`<WeakMap>` and has no JSON form.
+
+```slate
+print(WeakMap())
+print(WeakMap().size)
+```
+
+```error
+`size` is not something a weak map can do
+```
+
+## A weak reference holds a value without keeping it
+
+`WeakRef(target)` is one slot rather than a table, and `deref()` answers what is in it — the target
+while something else still holds it, and `null` once the collector has taken it away.
+
+```slate
+val page = { title: "Home" }
+val r = WeakRef(page)
+
+print(r, r.deref(), r.deref() == page)
+```
+
+```output
+<WeakRef> {title: "Home"} true
+```
+
+**`null` and not `undefined`**, which is slate's rule rather than a choice made here: nothing that may
+be a target is ever `null`, so a `null` from `deref` means gone. A target obeys the same rule a weak
+map's key does, and is refused in the same words.
+
+```slate
+print(WeakRef(3))
+```
+
+```error
+a weak reference's target must be something the collector can free
+```
+
+**Neither kind gives a program any way to make a collection happen**, and that is deliberate: when an
+entry goes is the collector's business, and a program that could ask would be written against one
+implementation of it. What either promises is only that a value held here does not, by itself, keep
+anything alive.
