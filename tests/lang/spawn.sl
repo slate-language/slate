@@ -285,3 +285,21 @@ async A_CHILD_STARTED_WITHOUT_A_CHANNEL_IS_REFUSED_A_SOCKET_BEFORE_ANYTHING_ELSE
 
     close(server)
     await started.value.exited
+
+@test
+async A_MESSAGE_SENT_JUST_BEFORE_EXIT_IS_DELIVERED_BEFORE_exited_SETTLES()
+    // node's `exit` fires the moment the process has terminated, which can land before the last
+    // read of the IPC channel -- so a worker that writes a message and stops in the same breath
+    // could once have had `exited` settle before the parent had seen what it said. `exited` now
+    // resolves on `close`, which waits for the channel to drain first. Racing this twenty times
+    // is what makes a windowed failure show up.
+    for i in 0..<20
+        val worker = spawn("/bin/sh", ["-c", "printf '\"ping\"\\n' >&3"], { ipc: true }).value
+        var got = null
+
+        worker.onMessage(m ->
+            got = m)
+
+        await worker.exited
+
+        assertEq(got, "ping")
