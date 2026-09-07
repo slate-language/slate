@@ -1,0 +1,357 @@
+# The Linux halves of a release.
+#
+# **This is the one artifact slate does not build on the development machine, and that is forced
+# rather than chosen.** sysl does not cross-compile, so a Linux binary has to be built on Linux and
+# there is no Linux machine here. Everything else a release ships -- the macOS tarball, the tag, the
+# tap commit -- is made locally and goes out with the runners down; these two do not.
+#
+# **The trigger is a tag push rather than `release: published`.** For a `release` event GitHub takes
+# the workflow file from the DEFAULT branch, which is `stable`, and `stable` is moved at the very end
+# of a release -- so such a job would run the previous release's copy of this file. A tag push takes
+# the workflow from the tag's own commit, which is exactly the tree being released.
+#
+# The consequence is an ordering one: the tag is pushed before `gh release create`, so this waits for
+# the release to appear before attaching to it.
+
+name: Linux release artifacts
+
+on:
+  push:
+    branches: [linux]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to attach to, e.g. v0.0.41. Leave empty to build and test only."
+        required: false
+        type: string
+
+# Attaching an asset to a release is a write to the repository's contents.
+permissions:
+  contents: write
+
+# **Never cancel in progress.** The usual reason to cancel a superseded run is that a newer commit
+# has made it irrelevant; a release build is not superseded by anything, and half an hour of runner
+# time is not reproducible here.
+concurrency:
+  group: "release-linux-${{ github.event.inputs.tag || github.ref }}"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      # Independent artifacts for independent architectures -- one failing says nothing about the
+      # other, and shipping one of the two is better than shipping neither.
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64
+          - runner: ubuntu-22.04-arm
+            arch: arm64
+
+    # **22.04 rather than 24.04, and the reason is the glibc floor.** Whatever the runner links
+    # against becomes the oldest distribution this binary runs on. 24.04 would set that at 2.39,
+    # which excludes Debian 12 -- the current Debian stable, on 2.36. 22.04 gives 2.35 and covers it.
+    # The build reports the floor it actually achieved rather than trusting this comment.
+    #
+    # **The image's own library versions do NOT come into it**, which is what `scripts/linux-deps.sh`
+    # buys: the five libraries newer than any distribution has are built there from source and linked
+    # statically, so choosing an older image costs nothing but the floor it was chosen for.
+    runs-on: ${{ matrix.runner }}
+
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      # Before the checkout, because it decides what to check out. A dispatch may name a tag; a tag
+      # push is its own; a dispatch naming nothing builds whatever ref it was dispatched from and
+      # attaches to nothing, which is how this workflow is tested without cutting a release.
+      - name: Work out what is being built
+        id: what
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag }}"
+          if [ -z "$tag" ] && [ "${{ github.ref_type }}" = "tag" ]; then
+            tag="${{ github.ref_name }}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "ref=${tag:-${{ github.ref }}}" >> "$GITHUB_OUTPUT"
+          echo "building ${tag:-${{ github.ref }}}, attaching to ${tag:-nothing}"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.what.outputs.ref }}
+
+      # **The tag and `package.hocon` must agree, and this is where that is caught.** A tag cut
+      # before the version bump would otherwise produce a tarball named for the new version holding
+      # an interpreter that answers with the old one -- which installs, runs, and lies.
+      - name: Work out the version
+        id: version
+        run: |
+          set -euo pipefail
+          declared=$(grep -oE '^[[:space:]]*version[[:space:]]*=[[:space:]]*"[^"]+"' package.hocon \
+                     | head -1 | sed 's/.*"\(.*\)"/\1/')
+          tag="${{ steps.what.outputs.tag }}"
+          if [ -n "$tag" ] && [ "${tag#v}" != "$declared" ]; then
+            echo "tag $tag names ${tag#v}, but package.hocon declares $declared" >&2
+            exit 1
+          fi
+          echo "version=$declared" >> "$GITHUB_OUTPUT"
+
+      # **The compiler wants more than a runner has, so the swap is not a precaution.** Compiling
+      # slate takes some 49 GB of heap in sysl 0.0.106 -- measured, not guessed -- and the suite a
+      # little more, against a hosted runner's 16 GB of RAM. Without a swap file large enough to hold
+      # the rest the build is OOM-killed with no diagnostic of its own: an exit status of 137 and
+      # nothing printed. `/mnt` is the runner's large disk.
+      - name: Give the runner room to compile
+        run: |
+          set -euo pipefail
+          df -h /mnt /
+          sudo swapoff -a || true
+          sudo fallocate -l 48G /mnt/slate-swap
+          sudo chmod 600 /mnt/slate-swap
+          sudo mkswap /mnt/slate-swap
+          sudo swapon /mnt/slate-swap
+          free -g
+
+      - name: Install the toolchain and the libraries
+        run: sudo -E ./scripts/linux-deps.sh
+
+      - name: Put clang on the PATH
+        run: echo "/usr/lib/llvm-20/bin" >> "$GITHUB_PATH"
+
+      - name: Install sysl
+        run: sudo ./scripts/linux-install-sysl.sh /usr/local
+
+      - name: Report the toolchain
+        run: |
+          which clang llvm-ar sysl
+          clang --version | head -2
+          ldd --version | head -1
+          sysl --version
+
+      - name: Build
+        run: sysl build .
+
+      # **`-C stage .` is load bearing.** The tarball IS a prefix, so `tar czf ... stage` would put
+      # everything under a `stage/` directory and the formula would install a binary one level too
+      # deep. slate needs nothing beside the executable, its standard modules being compiled in.
+      - name: Stage and archive
+        id: archive
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          arch="${{ matrix.arch }}"
+
+          test -x ./slate
+          ./slate --version | grep -qx "slate $version"
+
+          mkdir -p stage/bin
+          cp ./slate stage/bin/slate
+
+          tarball="slate-$version-linux-$arch.tar.gz"
+          tar -czf "$tarball" -C stage .
+
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(sha256sum "$tarball" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      # **The gate, and it is not ceremony: a Linux tarball nobody ran is a formula that installs and
+      # fails.** `sysl test .` is the whole of slate's suite and it is run from the project ROOT,
+      # which is load bearing -- one test reads `examples/*.sl` by relative path.
+      #
+      # **It runs AFTER the tarball is staged rather than before it**, so a run that gets this far
+      # and then goes red still leaves an artifact somebody can download and look at. Nothing is
+      # attached to a release until it has passed.
+      - name: Gate
+        run: sysl test .
+
+      # **The floor is measured, not assumed.** The comment on `runs-on` says which image was chosen
+      # and why; this says what the binary actually ended up requiring, which is the number a release
+      # note should carry and the only one anybody can act on.
+      - name: Report the glibc floor
+        id: glibc
+        run: |
+          set -euo pipefail
+          floor=$(objdump -T stage/bin/slate | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' | sort -uV | tail -1)
+          echo "floor=${floor#GLIBC_}" >> "$GITHUB_OUTPUT"
+          echo "highest glibc symbol version required: $floor"
+          echo "--- shared libraries this binary needs ---"
+          ldd stage/bin/slate
+
+      # **Unconditional, and it is the safety net rather than the delivery.** Attaching to a release
+      # can fail for reasons that have nothing to do with the build, and half an hour of runner time
+      # is not something this machine can reproduce. `overwrite` is not tidiness: the documented
+      # recovery for a failed attach is `gh run rerun`, which would otherwise die here on a name that
+      # already exists.
+      - name: Keep the tarball whatever happens next
+        uses: actions/upload-artifact@v4
+        with:
+          name: slate-linux-${{ matrix.arch }}
+          path: ${{ steps.archive.outputs.tarball }}
+          if-no-files-found: error
+          overwrite: true
+          compression-level: 0
+
+      # The tag is pushed before `gh release create` runs on the workstation, so the release may not
+      # exist yet when this gets here. Waiting is correct; giving up quietly is not.
+      - name: Wait for the release, then attach
+        if: steps.what.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.what.outputs.tag }}"
+
+          for _ in $(seq 1 60); do
+            if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+              found=yes
+              break
+            fi
+            sleep 30
+          done
+
+          if [ "${found:-no}" != "yes" ]; then
+            echo "release $tag still does not exist after 30 minutes" >&2
+            echo "the tarball is attached to this run as an artifact and can be uploaded by hand" >&2
+            exit 1
+          fi
+
+          gh release upload "$tag" "${{ steps.archive.outputs.tarball }}" \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Say what was built
+        run: |
+          {
+            echo "### ${{ matrix.arch }}"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| tarball | \`${{ steps.archive.outputs.tarball }}\` |"
+            echo "| sha256 | \`${{ steps.archive.outputs.sha256 }}\` |"
+            echo "| glibc floor | \`${{ steps.glibc.outputs.floor }}\` |"
+            echo "| attached to | \`${{ steps.what.outputs.tag || 'nothing -- build only' }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # **The tarball is built on the OLDEST distribution it is meant to run on, so the interesting
+  # question is whether it runs on the NEWER ones.** A binary that starts on the image it was built
+  # on and dies on the next release of the same distribution is the ordinary failure of a
+  # dynamically linked tarball, and nothing in the build job can see it: the sonames the linker wrote
+  # down are the ones that machine had. So each artifact is unpacked in a container of a
+  # distribution it was NOT built on, given the runtime libraries alone -- never the `-dev` packages,
+  # which a person installing slate will not have -- and made to run.
+  #
+  # `ldd` reporting `not found` for any library is the failure this exists to catch, and the fix for
+  # one is to build THAT library statically in `scripts/linux-deps.sh` beside the five already there,
+  # never to raise the image the release is built on.
+  compat:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64
+            image: ubuntu:24.04
+          - runner: ubuntu-22.04
+            arch: x86_64
+            image: ubuntu:latest
+          - runner: ubuntu-22.04
+            arch: x86_64
+            image: debian:12
+          - runner: ubuntu-22.04-arm
+            arch: arm64
+            image: ubuntu:24.04
+          - runner: ubuntu-22.04-arm
+            arch: arm64
+            image: ubuntu:latest
+          - runner: ubuntu-22.04-arm
+            arch: arm64
+            image: debian:12
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: ${{ matrix.image }}
+    steps:
+      - name: Install the runtime libraries
+        run: |
+          set -eu
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          # The runtime packages a README tells a person to install, and nothing else -- no compiler
+          # and no headers: this is the machine of somebody who downloaded a tarball. They are
+          # installed one at a time because a distribution renames them (`libssl3` became
+          # `libssl3t64` in Ubuntu 24.04), and a name that is not there must not stop the rest. The
+          # `ldd` check below is what actually says the set was right.
+          for p in ca-certificates libbrotli1 libpcre2-8-0 \
+                   libsqlite3-0 libwebp7 libssl3 libssl3t64; do
+            apt-get install -y --no-install-recommends "$p" || true
+          done
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: slate-linux-${{ matrix.arch }}
+
+      - name: Unpack and check what it needs
+        run: |
+          set -eu
+          mkdir -p prefix
+          tar -xzf slate-*-linux-*.tar.gz -C prefix
+          test -x prefix/bin/slate
+
+          echo "--- ldd on ${{ matrix.image }} ---"
+          ldd prefix/bin/slate || true
+          if ldd prefix/bin/slate | grep -q "not found"; then
+            echo "a library this binary needs is missing on ${{ matrix.image }}" >&2
+            echo "the fix is to build THAT library statically in scripts/linux-deps.sh," >&2
+            echo "beside the five already there -- not to raise the image the release is built on" >&2
+            exit 1
+          fi
+
+      # **The formula's own `test do`, run against the tarball before anybody installs it.** These
+      # are the same five assertions `slate-language/homebrew-tap`'s `Formula/slate.rb` makes -- the
+      # version, a shebang script, `slate test`, `slate js`, and one program calling into four bound
+      # libraries -- so what a working install means is written down twice and no more.
+      - name: The five smoke programs
+        run: |
+          set -eu
+          prefix="$PWD/prefix"
+          export PATH="$prefix/bin:$PATH"
+
+          slate --version | grep -qx "slate ${{ needs.build.outputs.version }}"
+
+          printf '#!%s/bin/slate\nimport { args } from slate:process\n\nfor name in args\n    print("Hello, " + name + "!")\n' "$prefix" > greet.sl
+          chmod 0755 greet.sl
+          test "$(./greet.sl world)" = "Hello, world!"
+
+          cat > one.sl <<'SL'
+          @test
+          adds() = assertEq(6 * 7, 42)
+          SL
+          slate test one.sl | grep -q "1 passed"
+
+          echo 'print(6 * 7)' > hello.sl
+          slate js hello.sl | grep -qF '$.arith("*", 6n, 7n)'
+
+          cat > libs.sl <<'SL'
+          import { sha256 } from slate:crypto
+          import { regex } from slate:regex
+          import { zstd, unzstd } from slate:zstd
+          import { compress, decompress } from slate:brotli
+
+          hex(bs) = bs.map(b -> "0123456789abcdef"[b >> 4] + "0123456789abcdef"[b & 15]).join("")
+
+          print(hex(sha256("abc")))
+          print(regex("(\\d+)-(\\d+)").find("10-20").groups[2])
+          print(fromBytes(unzstd(zstd(toBytes("zstd works"), 3), 4096).value).value)
+          print(fromBytes(decompress(compress(toBytes("brotli works"), 5), 4096).value).value)
+          SL
+
+          cat > want.txt <<'WANT'
+          ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+          20
+          zstd works
+          brotli works
+          WANT
+
+          slate libs.sl > got.txt
+          diff -u want.txt got.txt

@@ -31,14 +31,29 @@ the framework and the program, with no bundler and nothing to install.
 
 ## Installing
 
+On macOS, Apple silicon:
+
 ```
 brew tap slate-language/tap
 brew install slate
 ```
 
-macOS on Apple silicon is the only build there is so far: sysl does not cross-compile, so a Linux binary
-has to be built on Linux and nothing does that yet. Everywhere else, build it from source — which is a
-clone and one command, given [sysl](https://sysl.sh) installed.
+On Linux, x86_64 or arm64, from the tarball on the [latest release](https://github.com/slate-language/slate/releases/latest):
+
+```
+curl -LO https://github.com/slate-language/slate/releases/latest/download/slate-linux-x86_64.tar.gz
+sudo tar -xzf slate-linux-x86_64.tar.gz -C /usr/local
+sudo apt-get install libssl3 libpcre2-8-0 libsqlite3-0 libbrotli1 libwebp7
+slate --version
+```
+
+The asset is named for the release — `slate-<version>-linux-x86_64.tar.gz`, or `-linux-arm64` — and it
+unpacks into a prefix, so `bin/slate` lands wherever you point `-C`. The five packages are what the binary
+links at run time; Redis, libuv, LMDB, HTTP/2 and Zstandard are compiled in and need nothing installed. The
+build is made on Ubuntu 22.04, so it wants **glibc 2.35 or newer** — Ubuntu 22.04, Debian 12 and anything
+after them. Each release says the floor it actually achieved.
+
+Anywhere else, build it from source — a clone and one command, given [sysl](https://sysl.sh) installed.
 
 ## Running it
 
