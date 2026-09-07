@@ -159,6 +159,50 @@ print(map(["a", "bb"], _.length))
 [1, 2]
 ```
 
+**A CALLBACK IS HANDED THE ELEMENT, ITS POSITION AND THE ARRAY**, which is what JavaScript hands
+one. `reduce` puts the running answer in front of those three. A function declares as many of them as
+it wants and is given that many — every call drops what it cannot bind — so `x -> x * 2` is written
+exactly as it always was, and the index is there when you want it with no loop beside the call:
+
+```slate
+print(map(["a", "b", "c"], (letter, i) -> s"${i}:${letter}"))
+print(filter([10, 20, 30, 40], (n, i) -> i % 2 == 0))
+print(reduce([5, 6, 7], (total, n, i, all) -> total + n * i + all.length, 0))
+```
+
+```output
+["0:a", "1:b", "2:c"]
+[10, 30]
+29
+```
+
+The third argument is the array being walked, so a callback can look at what the walk has not reached
+yet. Changing that array while it is being walked is a fault rather than a short answer:
+
+```slate
+val xs = [1, 2, 3]
+
+print(map(xs, (n, i, all) -> if i + 1 < all.length then all[i + 1] else 0))
+```
+
+```output
+[2, 3, 0]
+```
+
+A callback declaring a **fourth** parameter is refused, there being nothing to fill it with —
+`reduce`'s limit is five for the same reason:
+
+```slate
+map([1, 2], (n, i, all, spare) -> n)
+```
+
+```error
+`map` takes (integer, integer, array of integer) -> any here
+```
+
+`sort` and `sorted` are the exception, and not really one: their function is asked about a **pair**,
+so there is no position to hand it.
+
 Where slate parts from JavaScript it is **to remove a case rather than add one**:
 
 - **A mutator answers nothing**, so `sort` and `unshift` cannot be mistaken for the copying forms

@@ -66,6 +66,8 @@ A_METHOD_AND_A_GENERATED_new_DROP_A_SURPLUS_TOO() =
 
 @test
 A_NATIVE_HANDS_A_CALLBACK_AS_MANY_ARGUMENTS_AS_IT_DECLARES() =
+    // `map` supplies three and the call binds what it declares; `callbacks.sl` is where what each
+    // of the three IS gets pinned.
     assertEq(map([1, 2, 3], v -> v * 2), [2, 4, 6])
     assertEq(map([1, 2, 3], () -> 9), [9, 9, 9])
 
@@ -103,9 +105,11 @@ TOO_FEW_ARGUMENTS_IS_STILL_A_FAULT_AND_THE_SENTENCE_NAMES_THE_FUNCTION() =
 
 @test
 A_CALLBACK_THAT_DECLARES_MORE_THAN_THE_NATIVE_SUPPLIES_NAMES_THE_NATIVE() =
-    // The reader's function is not wrong; the surface they attached it to cannot feed it.
-    assertFaults(() -> map([1], anything((a, b) -> a)),
-        "`map` calls this with 1 argument and it takes 2 arguments")
+    // The reader's function is not wrong; the surface they attached it to cannot feed it. `map`
+    // supplies three -- the element, its position and the array -- so a fourth has nothing to fill
+    // it.
+    assertFaults(() -> map([1], anything((a, b, c, d) -> a)),
+        "`map` calls this with 3 arguments and it takes 4 arguments")
 
 @test
 AN_ANNOTATED_FUNCTION_TYPE_ASKS_ONLY_WHETHER_A_CALL_OF_THAT_SIZE_IS_TAKEN() =

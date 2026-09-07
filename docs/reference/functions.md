@@ -344,16 +344,17 @@ print(chars("a", "b"))
 the caller**, your function not being the thing that is wrong:
 
 ```slate
-map([1], (a, b) -> a)
+map([1], (a, b, c, d) -> a)
 ```
 
 ```error
-`map` takes (integer) -> any here, and this is (integer, any) -> integer
+`map` takes (integer, integer, array of integer) -> any here, and this is (integer, integer, array of integer, any) -> integer
 ```
 
-That is the checker, which knows what `map` hands over. Reached through a value it cannot see, the
-machine says the same thing in its own words — *"`map` calls this with 1 argument and it takes 2
-arguments"*.
+That is the checker, which knows what `map` hands over — the element, its position and the array, so
+three is what there is and a fourth parameter has nothing to fill it. Reached through a value it
+cannot see, the machine says the same thing in its own words — *"`map` calls this with 3 arguments
+and it takes 4 arguments"*.
 
 The same rule read as a type: a function of fewer parameters fits wherever more are supplied, and
 one of more does not.

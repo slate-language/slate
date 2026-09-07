@@ -105,9 +105,18 @@ A_DESTRUCTURING_PARAMETER_IS_A_PARAMETER_PLUS_AN_UNPACK()
 A_FUNCTION_REACHED_FROM_A_BUILTIN_GETS_ITS_PARAMETERS_THE_SAME_WAY()
     // `map` calls this from inside the runtime rather than from a call instruction, which is a
     // second way into the chunk.
+    scaled(n, by, all) = n * by * all.length
+
+    assertEq(map([1, 2, 3], scaled), [0, 6, 18])
+
+    // **A DEFAULTED PARAMETER STANDING WHERE THE WALK SUPPLIES SOMETHING IS GIVEN THAT**, which is
+    // what JavaScript does and is worth writing down: `map` hands over the element, its position and
+    // the array, so `by` is the index here and not `2`. The default is still what a shorter call
+    // leaves it.
     twice(n, by = 2) = n * by
 
-    assertEq(map([1, 2, 3], twice), [2, 4, 6])
+    assertEq(map([1, 2, 3], twice), [0, 2, 6])
+    assertEq(twice(4), 8)
 
 @test
 async AN_async_FUNCTION_IS_STARTED_WITH_ITS_ARGUMENTS_AND_ITS_DEFAULTS()
