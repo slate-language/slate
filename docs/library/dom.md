@@ -10,7 +10,7 @@ weight: 210
 on is installed:
 
 ```
-$ slate add github.com/slate-language/dom
+$ slate install github.com/slate-language/dom
 ```
 
 ```slate
@@ -47,7 +47,7 @@ print(1)
 ```
 
 ```error
-`slate:dom` is no longer built in -- the document is the `dom` package: `slate add github.com/slate-language/dom`, then `import { byId } from dom`
+`slate:dom` is no longer built in -- the document is the `dom` package: `slate install github.com/slate-language/dom`, then `import { byId } from dom`
 ```
 
 ## The framework
@@ -59,5 +59,5 @@ to markup beside [`slate:http`](http.md), so server-side rendering is a by-produ
 project.
 
 ```
-$ slate add github.com/slate-language/lath
+$ slate install github.com/slate-language/lath
 ```

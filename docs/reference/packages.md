@@ -13,7 +13,7 @@ import { domHost } from lath/dom        // one of its other modules
 ```
 
 ```
-$ slate add github.com/slate-language/lath
+$ slate install github.com/slate-language/lath
 ```
 
 ## The manifest
@@ -54,7 +54,7 @@ hashed and pinned in `slate.sum` exactly as any other dependency when it is *you
 and a package you depend on has its own second section skipped, however deep it sits. So a package's suite
 may reach for whatever it likes without every consumer paying for it.
 
-**A package is in one section or the other**, and both `slate add` and the manifest reader refuse a name
+**A package is in one section or the other**, and both `slate install` and the manifest reader refuse a name
 in both: two packages cannot share an import name, and one package cannot be in two places. A file
 written by hand that names one twice is a file saying two contradictory things, and it is answered with a
 caret rather than resolved twice.
@@ -67,7 +67,7 @@ caret rather than resolved twice.
 ```
 
 ```
-slate add --dev github.com/slate-language/logger
+slate install --dev github.com/slate-language/logger
 ```
 
 **The format is slate's own syntax because slate's value model already is the config model** — null,
@@ -116,6 +116,6 @@ it is a statement about the code a build actually compiled rather than about one
 **It records the WHOLE graph and not the packages the project happens to name.** A package reached
 through another one is compiled exactly as one the manifest wrote, so it is pinned exactly as one.
 That takes saying because a package's own dependencies are written in its own manifest, which arrives
-*with* the package: `slate add` and `slate fetch` resolve, fetch, and then resolve again — until a
+*with* the package: `slate install` and `slate fetch` resolve, fetch, and then resolve again — until a
 round arrives with nothing new — because the first pass over an empty cache can only see what the
 project itself declared.

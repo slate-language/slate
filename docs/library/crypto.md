@@ -44,7 +44,7 @@ itself.
 ## Why the module exists
 
 **A package cannot have a native.** [`slate:jwt`](jwt.md) and [`slate:ws`](ws.md) are carried in the binary
-and are compiled against the scope the natives live in; a package installed with `slate add` is not — so
+and are compiled against the scope the natives live in; a package installed with `slate install` is not — so
 one speaking a protocol with a challenge in it (SCRAM, SASL, a signed webhook, a request signed for S3) had
 no digest at all and no source of unpredictability at all. **A nonce a program worked out from the clock is
 not a nonce**, and that half cannot be written in slate at any price.

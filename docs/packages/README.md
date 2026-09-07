@@ -7,10 +7,10 @@ summary: What is written in slate today — an API server, a PostgreSQL client, 
 # The packages
 
 Five packages, all in the [slate-language](https://github.com/slate-language) organisation, all
-written in slate. Each is added the same way:
+written in slate. Each is installed the same way:
 
 ```
-slate add github.com/slate-language/<name>
+slate install github.com/slate-language/<name>
 ```
 
 which writes the dependency into `package.sl`, fetches it into `$HOME/.slate/pkg`, and records the
@@ -27,7 +27,7 @@ to a language release.
 ### sluice — an API server
 
 ```
-slate add github.com/slate-language/sluice
+slate install github.com/slate-language/sluice
 ```
 
 **A request is a value, a handler is a function of it, and everything else is composition.** No
@@ -45,7 +45,7 @@ type NewNote = { title: string, text: string, pinned?: boolean }
 ### pg — PostgreSQL
 
 ```
-slate add github.com/slate-language/pg
+slate install github.com/slate-language/pg
 ```
 
 **A PostgreSQL client written in slate, speaking the wire protocol itself.** No libpq, no C binding,
@@ -60,7 +60,7 @@ import { connect } from pg
 ### logger — structured logging
 
 ```
-slate add github.com/slate-language/logger
+slate install github.com/slate-language/logger
 ```
 
 **A record is a value and a sink is a function of it.** What a record looks like is a rendering
@@ -78,7 +78,7 @@ import { info, warn, setLevel, setSink, json } from logger
 ### lath — a UI framework
 
 ```
-slate add github.com/slate-language/lath
+slate install github.com/slate-language/lath
 ```
 
 **A React-shaped UI framework.** A component is a function of its props, state lives in hooks kept on
@@ -98,7 +98,7 @@ The name is the strip a roof's slates are nailed to — the frame the pieces han
 ### mortar — components for lath
 
 ```
-slate add github.com/slate-language/mortar
+slate install github.com/slate-language/mortar
 ```
 
 **A component library for lath**, twenty-seven components with a stylesheet beside each one — modern
