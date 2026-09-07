@@ -91,3 +91,58 @@ async AN_async_CALL_THAT_ANSWERS_IS_A_FAILURE_TOO() =
         e.message
 
     assertEq(said, "expected a fault, got a value: 42")
+
+// -- a fault raised BELOW the callback's own frame --------------------------------------------------
+
+// **The call `assertFaults` entered is not the call that faulted**, which is the case a tail call and
+// a `catch` both miss. Unwinding leaves the machine standing where the fault was raised, so a native
+// that turns a fault into an answer -- which is the whole of what this assertion does -- returns into
+// a machine still carrying the frames of a call that is over. What it costs is not this assertion but
+// the NEXT return in the test, which reads a frame belonging to something long gone; so each of these
+// asserts again afterwards, that being the line the defect actually broke.
+
+thrower() =
+    throw "gone"
+
+one_frame_down() =
+    val n = thrower()
+
+    n + 1
+
+two_frames_down() =
+    val n = one_frame_down()
+
+    n + 1
+
+through_a_closure() =
+    val add = n -> thrower() + n
+
+    add(1)
+
+@test
+A_FAULT_ONE_FRAME_BELOW_THE_CALLBACK_IS_STILL_THE_FAULT() =
+    assertFaults(one_frame_down, "gone")
+    assertEq(freshEachTime > 0, true)
+
+@test
+A_FAULT_TWO_FRAMES_BELOW_THE_CALLBACK_IS_STILL_THE_FAULT() =
+    assertFaults(two_frames_down, "gone")
+    assertEq(freshEachTime > 0, true)
+
+@test
+A_FAULT_INSIDE_A_CLOSURE_THE_CALLBACK_CALLED_IS_STILL_THE_FAULT() =
+    assertFaults(through_a_closure, "gone")
+    assertEq(freshEachTime > 0, true)
+
+// **The machine is put back for a CAUGHT fault as well**, the callback having handled it and answered
+// -- so this is the same depth arriving through the other door.
+answers_after_catching() =
+    try
+        one_frame_down()
+    catch e
+        e.message
+
+@test
+A_CALLBACK_THAT_CATCHES_BELOW_ITSELF_ANSWERS_AND_THE_TEST_RETURNS() =
+    assertFaults(() -> assertFaults(answers_after_catching), "expected a fault, got a value: \"gone\"")
+    assertEq(freshEachTime > 0, true)
