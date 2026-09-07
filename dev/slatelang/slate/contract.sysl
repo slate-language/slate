@@ -55,10 +55,20 @@ parse_clause(p: *Parser) -> Stmt
     // -- does not read its own first statement as a clause of this function.
     p.clauses_ok = false
 
+    // **Which word is being read is what makes `old` a snapshot**, and it is put up across the
+    // condition alone so that the name is ordinary everywhere else in the file.
+    val outer_ensure = p.in_ensure
+    val outer_require = p.in_require
+
+    p.in_ensure = !is_require
+    p.in_require = is_require
+
     val cond = parse_expr(p)
     val said = cat.to(p.just_taken())
     val whole = at.to(p.just_taken())
 
+    p.in_ensure = outer_ensure
+    p.in_require = outer_require
     p.clauses_ok = here_ok
 
     if !here_ok
@@ -95,3 +105,121 @@ answering(body: Expr, clauses: Buf[Stmt], at: Span) -> Expr
     stmts.push(stmt(at, Eval(expr(at, Name(ResultName)))))
     expr(body.span, Block(stmts))
 end answering
+
+// The name of the slot the `n`th snapshot in a body is kept in.
+//
+// **Unspellable on purpose**, exactly as `(new)` and `(0)` are: a parenthesis is not part of any
+// identifier, so a program cannot name one of these and cannot be shadowed by one either. The index
+// is what keeps two snapshots apart, which is what makes each `old(e)` in a function its own value
+// rather than a lookup of the last one taken.
+old_slot(index: usize) -> string = s"(old ${index})"
+
+// Whether the call being read is the `old(e)` of a contract rather than a call of a program's own
+// `old`.
+//
+// **The word is soft and the clause is the whole of what makes it a snapshot.** `old` written
+// anywhere but a contract's condition -- a top-level function called `old`, a field named `old`, a
+// local bound to one -- is an ordinary name, so a program that already has one keeps working. A
+// `require` answers true here as well, so that the complaint below can name the rule.
+at_old_snapshot(p: *Parser, callee: Expr) -> bool
+    if !p.in_ensure && !p.in_require then return false
+
+    *callee.kind match
+        Name(name) -> name == "old"
+        _ -> false
+end at_old_snapshot
+
+// `old(e)` in an `ensure`: the value `e` had on ENTRY, read here as the slot that holds it.
+//
+// **A VALUE is kept, not a place.** The snapshot is whatever the expression answered when the
+// function was entered, so `old(items).length` on an array the body pushed to reads the array as it
+// stands *now* -- one array, changed under the snapshot -- and `old(items.length)` is what asks for
+// the length it had. Where an object is what changed, snapshot the field.
+//
+// **The clause's SOURCE TEXT is untouched**, so a failure still quotes `old(...)` as it was written:
+// `parse_clause` takes the text off the tokens and this rewrites only the tree.
+old_snapshot(p: *Parser, nested: bool, args: Buf[Expr], at: Span) -> Expr
+    val one = args.len() == 1 && plain_arg(args)
+
+    if p.in_require
+        p.fault(at, "`old(e)` is what `e` was on entry, and belongs in an `ensure`: a `require` is checked on entry, where `old(e)` and `e` are the same value")
+        return recovered(one, args, at)
+
+    if nested
+        p.fault(at, "`old` may not hold another `old`, a snapshot already being the value on entry")
+        return recovered(one, args, at)
+
+    if !one
+        p.fault(at, "`old` takes exactly one expression, which is what it snapshots on entry")
+        return recovered(one, args, at)
+
+    val name = old_slot(p.olds.len())
+
+    p.olds.push(stmt(at, Assign(Assign, expr(at, Name(name)), args.at(0))))
+    expr(at, Name(name))
+end old_snapshot
+
+// Whether the one argument is an expression a snapshot can be taken of, which `...xs` and `n = 1`
+// are not: both are shapes an argument list gives meaning to, and there is no argument list here.
+private plain_arg(args: Buf[Expr]) -> bool
+    *args.at(0).kind match
+        Spread(_) -> false
+        Named(_, _) -> false
+        _ -> true
+end plain_arg
+
+// What stands where a refused `old` was written, so that one mistake reads as one complaint.
+//
+// **The argument itself, wherever there is one**, since `old(e)` in a `require` really is `e` and
+// the inner `old` of a nested pair has already become its own slot. A slot is not made for a
+// refused snapshot, or the name would be one nothing declares.
+private recovered(one: bool, args: Buf[Expr], at: Span) -> Expr
+    if one then args.at(0) else expr(at, NullLit)
+
+// The snapshots a body asked for, taken where the body begins.
+//
+// **After the `require` clauses and before every other statement.** A precondition is often what
+// makes a snapshot safe to take at all -- `require i < xs.length` above `ensure result ==
+// old(xs[i])` -- so the checks that run on entry run first, and a snapshot expression that faults
+// faults on the way in rather than on the way out.
+//
+// **An assignment rather than a binding, because the slot is declared outside the body.** `result`
+// is declared the same way and for the same reason: the postconditions are written in the block
+// that WRAPS this one, and a name bound in here would not be in scope out there.
+snapshotting(body: Expr, olds: Buf[Stmt]) -> Expr
+    if olds.len() == 0 then return body
+
+    var stmts: Buf[Stmt] = buf()
+    var placed = false
+
+    *body.kind match
+        Block(inner) ->
+            for i in 0..<inner.len()
+                if !placed && !heads_a_contract(inner.at(i))
+                    for k in 0..<olds.len()
+                        stmts.push(olds.at(k))
+
+                    placed = true
+
+                stmts.push(inner.at(i))
+        _ -> ()
+
+    if !placed
+        for k in 0..<olds.len()
+            stmts.push(olds.at(k))
+
+        // A body that is nothing but its clauses, or one written on a line, still has its value
+        // last -- and the snapshots have to be in front of it.
+        val is_block = *body.kind match
+            Block(_) -> true
+            _ -> false
+
+        if !is_block then stmts.push(stmt(body.span, Eval(body)))
+
+    expr(body.span, Block(stmts))
+end snapshotting
+
+private heads_a_contract(s: Stmt) -> bool
+    *s.kind match
+        Clause(_, _, _, _, _) -> true
+        _ -> false

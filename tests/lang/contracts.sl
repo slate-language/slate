@@ -125,3 +125,121 @@ both_contract_words_are_still_ordinary_names() =
     val ensure = 3
 
     assertEq(ensure + 1, 4)
+
+// `old(e)` -- what `e` was on ENTRY, kept for the postcondition. What is worth running on both back
+// ends is that the snapshot is taken in the right place and that it is a VALUE: the interpreter
+// hoists it into a slot and node writes it into a `let`, and the two have to agree about both.
+
+class Tally
+    var count
+
+    bump(self)
+        ensure self.count == old(self.count) + 1
+        self.count += 1
+        self.count
+
+increment(n)
+    ensure result == old(n) + 1
+    n + 1
+
+spans(lo, hi)
+    ensure result == old(hi) - old(lo)
+    hi - lo
+
+grew(items)
+    ensure items.length == old(items.length) + 1
+    ensure old(items).length == items.length
+    push(items, 9)
+    items
+
+countDown(n, seen)
+    require n >= 0
+    ensure result == old(n)
+    push(seen, n)
+    if n == 0
+        return 0
+    countDown(n - 1, seen)
+    n
+
+old(v) = "kept " + v
+
+@test
+old_is_the_value_a_function_was_given_and_not_the_one_it_leaves() =
+    assertEq(increment(4), 5)
+    assertEq(increment(-1), 0)
+
+@test
+old_reads_the_object_a_mutating_method_was_called_on() =
+    val t = Tally.new(0)
+
+    assertEq(t.bump(), 1)
+    assertEq(t.bump(), 2)
+    assertEq(t.count, 2)
+
+@test
+old_keeps_a_value_and_not_a_place_so_the_expression_says_which() =
+    // `old(items.length)` is the length on entry; `old(items)` is the array itself, which the body
+    // is changing under the snapshot -- so a length read off it afterwards is the length it has now.
+    val xs = [1, 2]
+
+    assertEq(grew(xs), [1, 2, 9])
+    assertEq(xs.length, 3)
+
+@test
+two_olds_in_one_clause_are_two_independent_snapshots() =
+    assertEq(spans(2, 9), 7)
+
+@test
+a_postcondition_that_fails_quotes_the_clause_with_its_old_as_written() =
+    broken(n)
+        ensure result == old(n) + 1
+        n + 2
+
+    val said = (broken(1)) catch e -> e.message
+
+    assertEq(said, "`broken` ensures `result == old(n) + 1`, and gave back 3")
+
+@test
+every_call_takes_its_own_snapshots_so_recursion_means_what_it_looks_like() =
+    val seen = []
+
+    assertEq(countDown(3, seen), 3)
+    assertEq(seen, [3, 2, 1, 0])
+
+@test
+a_snapshot_that_faults_faults_on_the_way_in_and_not_on_the_way_out() =
+    // The snapshot is taken where the body begins, so a fault in one is reported before a single
+    // statement of the body has run -- which is what `told` proves.
+    val told = []
+
+    tracked(xs)
+        ensure result == old(xs.at(9))
+        push(told, "ran")
+        0
+
+    val said = (tracked([1, 2, 3])) catch e -> e.message
+
+    assert(said.contains("this array has 3 of them"))
+    assertEq(told, [])
+
+@test
+a_program_that_names_its_own_old_keeps_working() =
+    assertEq(old("it"), "kept it")
+
+    val shadow = (v) -> old(v) + "!"
+
+    assertEq(shadow("that"), "kept that!")
+
+@test
+a_postcondition_shows_the_answer_and_not_whatever_local_was_declared_last() =
+    // The sentence names what the function gave back, on both ways out. The fall-out path reads it
+    // by name: a run of statements has discarded the answer by the time the clause runs, so a
+    // reading off the top of the stack finds the last local the body declared instead.
+    keeps(n)
+        ensure result == 99
+        val other = 777
+        n + other
+
+    val said = (keeps(1)) catch e -> e.message
+
+    assertEq(said, "`keeps` ensures `result == 99`, and gave back 778")

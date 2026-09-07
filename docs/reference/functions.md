@@ -470,6 +470,75 @@ in one; nothing about a clause is worked out before the program runs. What the c
 one is what it says about the expression: a name that is not bound, a call of the wrong arity, a value
 that cannot be what a function takes. It never tries to decide whether a clause **holds**.
 
+### `old`
+
+A postcondition about a function that **changes** something needs the value as it was on the way in.
+`old(e)` is `e` evaluated **on entry**, kept for the clause to read on the way out:
+
+```slate
+bump(counter)
+    ensure counter.n == old(counter.n) + 1
+    counter.n += 1
+    counter.n
+
+val c = { n: 0 }
+
+print(bump(c))
+print(bump(c))
+```
+
+```output
+1
+2
+```
+
+It takes exactly one expression, and it is a snapshot only inside an `ensure` — a `require` is
+checked on entry, where `old(e)` and `e` are the same value, so writing one there is refused:
+
+```slate
+withdraw(balance, amount)
+    require amount <= old(balance)
+    balance - amount
+```
+
+```error
+`old(e)` is what `e` was on entry, and belongs in an `ensure`
+```
+
+Every `old` in a function is its own value, so two in one clause say two different things and each
+clause may have its own. Each call takes its own snapshots, which is what makes a contract on a
+recursive function mean what it looks like it means.
+
+**What is kept is a VALUE, not a place.** `old(items)` is the array the function was handed — the
+same array the body then changes — so a length read off it afterwards is the length it has *now*.
+`old(items.length)` is what asks for the length it had on entry:
+
+```slate
+grow(items)
+    ensure old(items).length == items.length
+    push(items, 9)
+    items
+
+print(grow([1, 2]))
+```
+
+```output
+[1, 2, 9]
+```
+
+`old` is a soft word like the two clauses themselves: outside an `ensure` it is an ordinary name, so
+a program that already has one keeps working.
+
+```slate
+old(v) = v + " (as it was)"
+
+print(old("the name"))
+```
+
+```output
+the name (as it was)
+```
+
 `require` and `ensure` are soft words. A program that already uses either as a name is untouched,
 because they are clauses only at the head of a body:
 
