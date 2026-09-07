@@ -58,9 +58,12 @@ apt-get update
 
 # `build-essential` is here for the system linker and the C headers clang compiles against, not for
 # gcc: sysl drives clang, and clang still needs `ld` and libc's headers to finish a link.
+#
+# `time` is GNU time, `/usr/bin/time`, which is not the shell's `time` keyword and is not installed
+# by default. `scripts/linux-measure.sh` reports the build's memory through it.
 apt-get install -y --no-install-recommends \
   build-essential ca-certificates cmake curl git gnupg lsb-release make pkg-config \
-  software-properties-common tar wget
+  software-properties-common tar time wget
 
 # **The libraries the bound packages link, in Debian's spelling of the Homebrew formula's list.**
 # brotli, openssl and webp are found through pkg-config and none is vendored; SQLite is the machine's
