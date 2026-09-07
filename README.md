@@ -64,14 +64,14 @@ Anywhere else, build it from source — a clone and one command, given [sysl](ht
 ## Running it
 
 ```
-slate hello.sl                  run a program
-slate hello.sl one two three    ... and give it arguments
-slate test .                    run every `@test` in a file or a directory
-slate test --js .               ... in the JavaScript engine instead
-slate js hello.sl -o hello.js   the same program, as JavaScript
-slate add github.com/owner/pkg  add a package
-slate --version                 which slate this is
-slate --help                    the whole list
+slate hello.sl                       run a program
+slate hello.sl one two three         ... and give it arguments
+slate test .                         run every `@test` in a file or a directory
+slate test --js .                    ... in the JavaScript engine instead
+slate js hello.sl -o hello.js        the same program, as JavaScript
+slate install github.com/owner/pkg   install a package (`add` is an alias)
+slate --version                      which slate this is
+slate --help                         the whole list
 ```
 
 From a clone, with no `slate` on the path yet:
@@ -213,7 +213,7 @@ and [lath](https://github.com/slate-language/lath) are for — React's model *an
 slate, over JSX-shaped elements the parser desugars into ordinary calls.
 
 ```
-$ slate add github.com/slate-language/lath
+$ slate install github.com/slate-language/lath
 ```
 
 ```

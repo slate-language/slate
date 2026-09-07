@@ -1,0 +1,696 @@
+module dev.slatelang.slate
+@tests
+
+// HTTP/2: `slate:http` answering over the version ALPN chose, on the TLS `tests_tls.sysl` sets up.
+//
+// **These are the HTTP/2 tests, cut out of `tests_tls.sysl` because that file passed a thousand
+// lines.** TLS is what carries HTTP/2 here -- there is no cleartext h2 listener -- so the two
+// subjects grew up in one file; what separates them is that nothing here is about the handshake.
+// A test in this file is about a REQUEST: how one arrives over an h2 connection, how a body goes
+// back out as DATA frames, and what the server does about headers, limits and a stream it is
+// still writing when the program ends. `H2Server` is the listener they all share.
+//
+// The bodies that arrive the other way -- `serveStream`, and the connection underneath a stream
+// still being read -- are in `tests_http2_streams.sysl`.
+
+@test
+A_WHOLE_HTTP_2_REQUEST_TRAVELS_OVER_TLS_AND_ALPN_IS_WHAT_CHOSE_IT()
+    // **The proof that the three pieces are one feature**: `slate:net` negotiates `h2`, `slate:nghttp2`
+    // frames what goes over it, and neither knows the other exists -- a session is bytes in and bytes
+    // out, so the socket is the program's own business.
+    //
+    // **Both ends are written in slate here**, which is what makes it a round trip rather than a
+    // parse: the server reads a request off frames it was handed and answers one on the same stream.
+    val prog = "import { h2Client, h2Server, h2Receive, h2Send, h2Next, h2Request, h2Respond, h2Close } from slate:nghttp2\nimport { readFileSync } from slate:fs\n\n" +
+        "val theCert = readFileSync(\"tests/tls/cert.pem\").value\nval theKey = readFileSync(\"tests/tls/key.pem\").value\n\n" +
+        "serve(conn)\n" +
+        "    val s = h2Server()\n\n" +
+        "    flush()\n" +
+        "        val out = h2Send(s)\n\n" +
+        "        if out.length > 0 then send(conn, out)\n\n" +
+        "    heard(chunk)\n" +
+        "        if chunk == null then return\n\n" +
+        "        h2Receive(s, chunk)\n\n" +
+        "        loop\n" +
+        "            val e = h2Next(s)\n\n" +
+        "            if e == null then break\n\n" +
+        "            if e.kind == \"headers\" && e.of == \"request\"\n" +
+        "                var path = \"?\"\n\n" +
+        "                for h in e.headers\n" +
+        "                    if h[0] == \":path\" then path = h[1]\n\n" +
+        "                h2Respond(s, e.stream, { \":status\": \"200\" }, \"answered \" + path + \" over \" + string(alpnProtocol(conn)))\n\n" +
+        "        flush()\n\n" +
+        "    onBytes(conn, heard)\n" +
+        "    flush()\n\n" +
+        "val server = listen({ port: 0, cert: theCert, key: theKey, alpn: [\"h2\", \"http/1.1\"] }, serve)\n\n" +
+        "async main()\n" +
+        "    val c = (await connect(\"localhost\", localPort(server))).value\n" +
+        "    val h = h2Client()\n\n" +
+        "    pump()\n" +
+        "        val out = h2Send(h)\n\n" +
+        "        if out.length > 0 then send(c, out)\n\n" +
+        "    var body = \"\"\n\n" +
+        "    arrived(chunk)\n" +
+        "        if chunk == null then return\n\n" +
+        "        h2Receive(h, chunk)\n\n" +
+        "        loop\n" +
+        "            val e = h2Next(h)\n\n" +
+        "            if e == null then break\n\n" +
+        "            if e.kind == \"data\" then body = body + fromBytes(e.bytes).value\n\n" +
+        "            if e.kind == \"streamClose\"\n" +
+        "                print(body)\n" +
+        "                h2Close(h)\n" +
+        "                close(c)\n" +
+        "                close(server)\n" +
+        "                done()\n" +
+        "                return\n\n" +
+        "        pump()\n\n" +
+        "    onBytes(c, arrived)\n\n" +
+        "    await startTls(c, { host: \"localhost\", trust: theCert, alpn: [\"h2\"] })\n\n" +
+        "    print(\"negotiated\", alpnProtocol(c))\n\n" +
+        "    h2Request(h, { \":method\": \"GET\", \":scheme\": \"https\", \":authority\": \"localhost\", \":path\": \"/things\" })\n" +
+        "    pump()\n\n" +
+        "main()"
+
+    assert_eq(net_out(prog), "negotiated h2\nanswered /things over h2")
+
+// `slate:http` ITSELF SPEAKING HTTP/2, which is the piece the three modules above were built for.
+//
+// **The handler is written once and answers over either version.** What decides is ALPN, and the
+// server asks it at the FIRST BYTE rather than at accept -- a connection callback fires when TCP
+// accepts, which is before the TLS handshake has said anything, so `alpnProtocol` there answers
+// `null` on a connection that is about to be `h2`.
+const H2Server: string = raw"""
+    import { serve, close, router, sse } from slate:http
+    import { h2Client, h2Receive, h2Send, h2Next, h2Request, h2Reset, h2Close } from slate:nghttp2
+    import { readFileSync } from slate:fs
+
+    val theCert = readFileSync("tests/tls/cert.pem").value
+    val theKey = readFileSync("tests/tls/key.pem").value
+
+    val app = router()
+
+    app.get("/notes/:id", (req) -> "note " + req.params.id + " for " + req.headers.host + " x=" + req.query.x)
+    app.post("/notes", (req) -> { status: 201, headers: { "Content-Type": "application/json" }, body: req.body })
+    app.notFound((req) -> { status: 404, body: "nothing at " + req.path })
+
+    val server = serve({ port: 0, cert: theCert, key: theKey, alpn: ["h2", "http/1.1"] }, app)
+    val site = "https://localhost:" + string(localPort(server))
+    """
+
+@test
+slate_http_ANSWERS_OVER_HTTP_2_WHEN_ALPN_SAYS_SO()
+    // **The same router, the same handler, the same reply forms** -- what differs is the framing and
+    // nothing a program wrote. The `:authority` arrives as `host`, so a handler reading it does not
+    // have to know which version it was spoken to over.
+    val prog = H2Server + raw"""
+
+    async main()
+        val c = (await connect("localhost", localPort(server))).value
+        val h = h2Client()
+
+        pump()
+            val out = h2Send(h)
+
+            if out.length > 0 then send(c, out)
+
+        var seen = 0
+        var body = ""
+        var status = ""
+
+        arrived(chunk)
+            if chunk == null then return
+
+            h2Receive(h, chunk)
+
+            loop
+                val e = h2Next(h)
+
+                if e == null then break
+
+                if e.kind == "headers" then status = e.headers[0][1]
+
+                if e.kind == "data" then body = body + fromBytes(e.bytes).value
+
+                if e.kind == "streamClose"
+                    print(status, body)
+
+                    body = ""
+                    seen = seen + 1
+
+                    if seen == 2
+                        h2Close(h)
+                        close(c)
+                        close(server)
+                        done()
+
+                        return
+
+            pump()
+
+        onBytes(c, arrived)
+
+        await startTls(c, { host: "localhost", trust: theCert, alpn: ["h2"] })
+
+        h2Request(h, { ":method": "GET", ":scheme": "https", ":authority": "localhost", ":path": "/notes/7?x=1" })
+        h2Request(h, { ":method": "POST", ":scheme": "https", ":authority": "localhost", ":path": "/notes" }, "{\"t\":1}")
+        pump()
+
+    main()
+    """
+
+    assert_eq(net_out(prog), "200 note 7 for localhost x=1\n201 {\"t\":1}")
+
+@test
+THE_SAME_LISTENER_ANSWERS_HTTP_1_1_AND_THE_ANSWER_IS_THE_SAME()
+    // **A client that offers no ALPN gets `http/1.1`**, which is `null` from `alpnProtocol` read the
+    // only way there is to read it -- and the llhttp path is untouched.
+    val prog = H2Server + raw"""
+
+    async main()
+        val r = await fetch(site + "/notes/7?x=1", { trust: theCert })
+        val gone = await fetch(site + "/nowhere", { trust: theCert })
+
+        print(r.value.status, r.value.body)
+        print(gone.value.status, gone.value.body)
+
+        close(server)
+        done()
+
+    main()
+    """
+
+    assert_eq(net_out(prog), "200 note 7 for localhost x=1\n404 nothing at /nowhere")
+
+@test
+A_STREAMED_BODY_GOES_OUT_OVER_HTTP_2_AS_DATA_FRAMES_AS_THE_PIECES_ARRIVE()
+    // **Refused outright until 0.0.25**, because `sh.sysl.nghttp2` had no data provider and there was
+    // nothing here to write a frame at a time with -- and draining instead would have turned an
+    // endpoint whose source never ends into a request that hangs forever. 0.3.0 bound the deferred
+    // and resume path, so the head goes out at once and a frame follows each piece.
+    val prog = H2Server + raw"""
+
+    counting()
+        yield "one "
+        yield "two"
+
+    app.get("/count", (req) -> counting())
+
+    async main()
+        val c = (await connect("localhost", localPort(server))).value
+        val h = h2Client()
+
+        pump()
+            val out = h2Send(h)
+
+            if out.length > 0 then send(c, out)
+
+        var body = ""
+        var status = ""
+        var frames = 0
+
+        arrived(chunk)
+            if chunk == null then return
+
+            h2Receive(h, chunk)
+
+            loop
+                val e = h2Next(h)
+
+                if e == null then break
+
+                if e.kind == "headers" then status = e.headers[0][1]
+
+                if e.kind == "data"
+                    body = body + fromBytes(e.bytes).value
+                    frames = frames + 1
+
+                if e.kind == "streamClose"
+                    print(status, body, frames)
+
+                    h2Close(h)
+                    close(c)
+                    close(server)
+                    done()
+
+                    return
+
+            pump()
+
+        onBytes(c, arrived)
+
+        await startTls(c, { host: "localhost", trust: theCert, alpn: ["h2"] })
+
+        h2Request(h, { ":method": "GET", ":scheme": "https", ":authority": "localhost", ":path": "/count" })
+        pump()
+
+    main()
+    """
+
+    // **Both pieces, in the order the generator yielded them**, and the stream closed after them --
+    // which is what says the body ended rather than the connection dropping.
+    // **Two frames rather than one**, which is what says the pieces went out as they were produced
+    // rather than being joined up and sent at the end -- the difference between a stream and a body.
+    assert_eq(net_out(prog), "200 one two 2")
+
+@test
+A_STREAMED_SOURCE_OVER_HTTP_2_IS_TOLD_WITH_close_WHEN_THE_PEER_GIVES_UP()
+    // **`sendStreamed` has THREE ways out that leave the source unexhausted where the 1.1 writer has
+    // one**, and this is the one only HTTP/2 has: the peer resets the stream while the connection
+    // stays up. `h2Push` answers a refusal rather than faulting -- a cancelled fetch, a closed tab --
+    // so the response simply ends, and until this it ended without telling the source anything.
+    //
+    // **The connection is still there afterwards, which is what makes the assertion readable**: the
+    // second request on the same session asks the server what it did, so nothing has to be inferred
+    // from a socket that went away.
+    val prog = H2Server + raw"""
+
+    var told = 0
+
+    slow()
+        var n = 0
+
+        async pull()
+            if n >= 20 then return { done: true, value: null }
+
+            await sleep(200)
+
+            n = n + 1
+
+            { done: false, value: "piece " + string(n) }
+
+        shut()
+            told = told + 1
+
+        { next: pull, close: shut }
+
+    app.get("/slow", (req) -> sse(slow(), { heartbeat: 0 }))
+    app.get("/told", (req) -> "told " + string(told))
+
+    async main()
+        val c = (await connect("localhost", localPort(server))).value
+        val h = h2Client()
+
+        pump()
+            val out = h2Send(h)
+
+            if out.length > 0 then send(c, out)
+
+        var cut = false
+        var asking = false
+        var body = ""
+
+        // The second request, once the server has had a turn to notice the reset.
+        ask()
+            asking = true
+
+            h2Request(h, { ":method": "GET", ":scheme": "https", ":authority": "localhost", ":path": "/told" })
+            pump()
+
+        arrived(chunk)
+            if chunk == null then return
+
+            h2Receive(h, chunk)
+
+            loop
+                val e = h2Next(h)
+
+                if e == null then break
+
+                if e.kind == "data"
+                    if asking
+                        body = body + fromBytes(e.bytes).value
+                    elif !cut
+                        // **CANCEL, on the stream and not on the connection**, which is what a
+                        // browser sends for a tab that closed while the rest of the session goes on.
+                        cut = true
+
+                        h2Reset(h, e.stream, 8)
+                        pump()
+                        setTimeout(ask, 700)
+
+                if e.kind == "streamClose" && asking
+                    print(body)
+
+                    h2Close(h)
+                    close(c)
+                    close(server)
+                    done()
+
+                    return
+
+            pump()
+
+        onBytes(c, arrived)
+
+        await startTls(c, { host: "localhost", trust: theCert, alpn: ["h2"] })
+
+        h2Request(h, { ":method": "GET", ":scheme": "https", ":authority": "localhost", ":path": "/slow" })
+        pump()
+
+    main()
+    """
+
+    // **Once**, which is half of the assertion: three ways out of one loop is three chances to tell
+    // a source twice, and a hub counting its subscribers would go negative for it.
+    assert_eq(out(NetImport + fused(8000, prog)), "told 1")
+
+@test
+REPEATED_cookie_FIELDS_OVER_HTTP_2_ARE_JOINED_THE_WAY_THE_SPECIFICATION_SAYS()
+    // **RFC 9113 SS8.2.3.** HTTP/2 lets a client split its cookies one field per cookie so that each
+    // compresses on its own, and browsers do -- and this path kept the LAST of a repeated name, which
+    // is right for every other header and silently drops all but one cookie here. What a handler saw
+    // was a request missing the session cookie it was sent.
+    val prog = H2Server + raw"""
+
+    app.get("/who", (req) -> req.headers.cookie + " | " + req.cookies.a + req.cookies.b)
+
+    async main()
+        val c = (await connect("localhost", localPort(server))).value
+        val h = h2Client()
+
+        pump()
+            val out = h2Send(h)
+
+            if out.length > 0 then send(c, out)
+
+        var body = ""
+        var status = ""
+
+        arrived(chunk)
+            if chunk == null then return
+
+            h2Receive(h, chunk)
+
+            loop
+                val e = h2Next(h)
+
+                if e == null then break
+
+                if e.kind == "headers" then status = e.headers[0][1]
+
+                if e.kind == "data" then body = body + fromBytes(e.bytes).value
+
+                if e.kind == "streamClose"
+                    print(status, body)
+
+                    h2Close(h)
+                    close(c)
+                    close(server)
+                    done()
+
+                    return
+
+            pump()
+
+        onBytes(c, arrived)
+
+        await startTls(c, { host: "localhost", trust: theCert, alpn: ["h2"] })
+
+        h2Request(h, [[":method", "GET"], [":scheme", "https"], [":authority", "localhost"],
+            [":path", "/who"], ["cookie", "a=1"], ["cookie", "b=2"]])
+        pump()
+
+    main()
+    """
+
+    assert_eq(net_out(prog), "200 a=1; b=2 | 12")
+
+@test
+A_BODY_OVER_HTTP_2_IS_BOUNDED_BY_THE_SAME_LIMIT_THE_1_1_SERVER_APPLIES()
+    // **`serve` has refused a body past `BodyBytes` with a `413` from the start**, and this path
+    // concatenated whatever arrived -- so the megabyte limit a program thinks it has held over
+    // HTTP/1.1 and not over HTTP/2, on the same listener, for the same handler.
+    val prog = H2Server + raw"""
+
+    app.post("/up", (req) -> "took " + string(req.body.length))
+
+    async main()
+        val c = (await connect("localhost", localPort(server))).value
+        val h = h2Client()
+
+        var body = ""
+        var status = ""
+
+        // The first write, before anything has come back to react to.
+        pump()
+            val out = h2Send(h)
+
+            if out.length > 0 then send(c, out)
+
+        arrived(chunk)
+            if chunk == null then return
+
+            h2Receive(h, chunk)
+
+            // **A SEND CAN END A STREAM, so this alternates reading the session and writing it
+            // until neither has anything left.** Every other client here drains once and writes
+            // once, and is right to: they have sent their whole request before the answer comes
+            // back, so the stream closes while the response is being READ. This one is still
+            // uploading when the answer arrives, so its stream closes on a WRITE -- and a client
+            // that stopped draining after writing would leave that `streamClose` sitting in the
+            // session, with nothing further to arrive to shake it out.
+            loop
+                loop
+                    val e = h2Next(h)
+
+                    if e == null then break
+
+                    if e.kind == "headers" then status = e.headers[0][1]
+
+                    if e.kind == "data" then body = body + fromBytes(e.bytes).value
+
+                    if e.kind == "streamClose"
+                        print(status, body)
+
+                        h2Close(h)
+                        close(c)
+                        close(server)
+                        done()
+
+                        return
+
+                val out = h2Send(h)
+
+                if out.length == 0 then break
+
+                send(c, out)
+
+        onBytes(c, arrived)
+
+        await startTls(c, { host: "localhost", trust: theCert, alpn: ["h2"] })
+
+        h2Request(h, { ":method": "POST", ":scheme": "https", ":authority": "localhost", ":path": "/up" },
+            repeat("z", 1200000))
+        pump()
+
+    main()
+    """
+
+    assert_eq(net_out(prog), "413 the body is larger than 1048576 bytes")
+
+@test
+AN_EVENT_STREAM_OVER_HTTP_2_CARRIES_ITS_HEARTBEAT_AS_A_DATA_FRAME()
+    // **SSE is what streaming over HTTP/2 is FOR**, a browser negotiating `h2` and then asking for an
+    // event stream being the ordinary case rather than an exotic one. The heartbeat is a member of
+    // the response and not a guess from its content type, so it is one more DATA frame here -- there
+    // is no chunk framing to get wrong, which was the 1.1 writer's first mistake.
+    val prog = H2Server + raw"""
+    import { sse } from slate:http
+
+    // **Slow on purpose, so a beat lands before the first value does.** A heartbeat that never fires
+    // is a timer this test would not have checked at all.
+    //
+    // **A source object rather than a generator**, because a generator that awaits is not a thing
+    // slate has yet -- an `async` function that yields is refused at the call. `sse` asks its source
+    // for `next()` and awaits the answer, so an object with an `async next` is a source like any
+    // other, which is the whole point of there being one protocol.
+    slowly()
+        var sent = 0
+
+        val source = {}
+
+        source.next = async () ->
+            if sent == 0
+                await sleep(400)
+
+                sent = 1
+
+                return { done: false, value: "first" }
+
+            if sent == 1
+                sent = 2
+
+                return { done: false, value: "second" }
+
+            { done: true, value: null }
+
+        source
+
+    app.get("/events", (req) -> sse(slowly(), { heartbeat: 0.3 }))
+
+    async main()
+        val c = (await connect("localhost", localPort(server))).value
+        val h = h2Client()
+
+        pump()
+            val out = h2Send(h)
+
+            if out.length > 0 then send(c, out)
+
+        var body = ""
+        var kind = ""
+
+        arrived(chunk)
+            if chunk == null then return
+
+            h2Receive(h, chunk)
+
+            loop
+                val e = h2Next(h)
+
+                if e == null then break
+
+                if e.kind == "headers"
+                    for [name, value] in e.headers
+                        if name == "content-type" then kind = value
+
+                if e.kind == "data" then body = body + fromBytes(e.bytes).value
+
+                if e.kind == "streamClose"
+                    print(kind)
+                    print(contains(body, ": keep-alive"), body[indexOf(body, "data:")..<body.length])
+
+                    h2Close(h)
+                    close(c)
+                    close(server)
+                    done()
+
+                    return
+
+            pump()
+
+        onBytes(c, arrived)
+
+        await startTls(c, { host: "localhost", trust: theCert, alpn: ["h2"] })
+
+        h2Request(h, { ":method": "GET", ":scheme": "https", ":authority": "localhost", ":path": "/events" })
+        pump()
+
+    main()
+    """
+
+    // **The keep-alive comment arrived as a DATA frame of its own**, which is the half a fast source
+    // would never have shown, and the events themselves are unchanged by it.
+    assert_eq(net_out(prog), "text/event-stream\ntrue data: first\n\ndata: second\n\n")
+
+@test
+A_STREAM_THE_PROGRAM_ENDED_IS_FLUSHED_BEFORE_THE_SERVER_CLOSES_OVER_HTTP_2()
+    // **THE 1.1 CONNECTION'S SHUTDOWN RULE, OVER HTTP/2.** A program that ends its event streams and
+    // closes its server in the same breath leaves every writer parked in a `next` whose answer has
+    // already been settled, and a session closed at the cut threw all of it away -- the client saw
+    // HEADERS, no DATA at all, and a connection that had gone. What says the answer is whole here is
+    // END_STREAM rather than a zero-length chunk, so `streamClose` is the assertion.
+    val prog = H2Server + raw"""
+    import { sse } from slate:http
+
+    var q = []
+    var over = false
+    var waiter = null
+
+    hub()
+        taken()
+            val v = q[0]
+
+            q = q.slice(1)
+
+            { done: false, value: v }
+
+        async pull()
+            if q.length > 0 then return taken()
+
+            if over then return { done: true, value: null }
+
+            waiter = pending()
+
+            await waiter
+
+            if q.length > 0 then return taken()
+
+            { done: true, value: null }
+
+        { next: pull }
+
+    wake()
+        if waiter != null
+            val w = waiter
+
+            waiter = null
+
+            settle(w, null)
+
+    app.get("/events", (req) -> sse(hub(), { heartbeat: 0 }))
+
+    // **The push, the end and the close in one turn**, which is what makes this the shutdown rather
+    // than a race the test happened to win: the writer has not run between them.
+    async closer()
+        await sleep(300)
+
+        q.push("last")
+
+        over = true
+
+        wake()
+        close(server)
+
+    async main()
+        val c = (await connect("localhost", localPort(server))).value
+        val h = h2Client()
+
+        pump()
+            val out = h2Send(h)
+
+            if out.length > 0 then send(c, out)
+
+        var body = ""
+
+        arrived(chunk)
+            if chunk == null
+                print("the session went with", body)
+                done()
+
+                return
+
+            h2Receive(h, chunk)
+
+            loop
+                val e = h2Next(h)
+
+                if e == null then break
+
+                if e.kind == "data" then body = body + fromBytes(e.bytes).value
+
+                if e.kind == "streamClose"
+                    print("ended with", body)
+
+                    h2Close(h)
+                    close(c)
+                    done()
+
+                    return
+
+            pump()
+
+        onBytes(c, arrived)
+
+        await startTls(c, { host: "localhost", trust: theCert, alpn: ["h2"] })
+
+        h2Request(h, { ":method": "GET", ":scheme": "https", ":authority": "localhost", ":path": "/events" })
+        pump()
+
+    closer()
+    main()
+    """
+
+    assert_eq(net_out(prog), "ended with data: last\n\n")
+

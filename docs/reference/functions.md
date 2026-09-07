@@ -403,8 +403,85 @@ print(double(3), f(1, { x: 2, y: 0 }, 3))
 6 6
 ```
 
-An annotation is checked **at the call** for a parameter, and where the function answers for a result.
-See [Types](types.md) for what the compiler will say about one before the program runs.
+An annotation is checked **at the call** for a parameter, and **at every way out** for a result — the
+value a `return` carries as much as the one the body falls out with. See [Types](types.md) for what the
+compiler will say about one before the program runs.
+
+## Contracts
+
+An annotation says what a value *is*. A contract says what has to be **true** of it. `require` is
+checked on the way in and `ensure` on the way out, where `result` names what the function answered:
+
+```slate
+withdraw(balance, amount)
+    require amount > 0
+    require amount <= balance
+    ensure result >= 0
+    balance - amount
+
+print(withdraw(100, 30))
+print(withdraw(100, 200) catch e -> e.message)
+```
+
+```output
+70
+`withdraw` requires `amount <= balance`, and this call does not meet it
+```
+
+Both are clauses at the **top of the body**, above every other statement, and both are checked when
+the program runs. A clause written further down is refused where it stands:
+
+```slate
+f(n)
+    val m = n * 2
+    require m > 0
+    m
+```
+
+```error
+a `require` clause is a function's contract, and belongs at the top of its body
+```
+
+A failed clause is an ordinary [fault](faults.md), naming the function and quoting the clause. A
+postcondition names the answer as well, which is the thing the clause is about and the thing that is
+not written above it:
+
+```slate
+clamp(n)
+    ensure result >= 0
+    if n < 0
+        return n
+    n
+
+print(clamp(5))
+print(clamp(-5) catch e -> e.message)
+```
+
+```output
+5
+`clamp` ensures `result >= 0`, and gave back -5
+```
+
+`ensure` covers **every** way out and not only the last line — `clamp` above answers through a
+`return`, and the clause is checked there too.
+
+A condition is an ordinary expression read for its truth, so anything a program can compute may stand
+in one; nothing about a clause is worked out before the program runs. What the compiler will say about
+one is what it says about the expression: a name that is not bound, a call of the wrong arity, a value
+that cannot be what a function takes. It never tries to decide whether a clause **holds**.
+
+`require` and `ensure` are soft words. A program that already uses either as a name is untouched,
+because they are clauses only at the head of a body:
+
+```slate
+val require = (path) -> "loaded " + path
+
+print(require("./config.sl"))
+```
+
+```output
+loaded ./config.sl
+```
 
 ## `async` and generators
 

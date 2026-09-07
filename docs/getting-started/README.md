@@ -266,7 +266,7 @@ what.
 ## Packages
 
 ```
-slate add github.com/slate-language/lath
+slate install github.com/slate-language/lath
 ```
 
 writes the dependency into `package.sl`, fetches it, and records the hash of the extracted tree in

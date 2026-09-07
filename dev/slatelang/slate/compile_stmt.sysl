@@ -52,6 +52,57 @@ private hoist_defs(u: *Unit, e: *Emit, stmts: Buf[Stmt])
             _ -> ()
 end hoist_defs
 
+// One contract clause: the condition, a jump past the refusal, and the refusal.
+//
+// **A jump over a fault rather than an instruction of its own**, where `CheckType` is an instruction:
+// a clause is an arbitrary expression and not a pattern, so there is nothing for a single instruction
+// to carry. What that costs is a message interned at compile time, which is why a postcondition ends
+// with `FailShowing` -- the value is on the stack and the reader wants to see it.
+private compile_clause(u: *Unit, e: *Emit, is_require: bool, owner: string, text: string, cond: Expr, at: Span)
+    compile_expr(u, e, cond)
+
+    val refuse = push_n(e, JumpIfFalse(0), at, 1, 0)
+    val over = push_n(e, Jump(0), at, 0, 0)
+
+    patch(e, refuse, here(e))
+
+    if is_require
+        push_n(e, FailWith(intern_str(u, s"`${owner}` requires `${text}`, and this call does not meet it")), at, 0, 0)
+    else
+        push_n(e, FailShowing(intern_str(u, s"`${owner}` ensures `${text}`, and gave back ")), at, 0, 0)
+
+    patch(e, over, here(e))
+end compile_clause
+
+// Every postcondition this chunk declared, run over the value about to be answered.
+//
+// **The answer is copied into `result` and left where it was**, which is what lets a clause be an
+// ordinary expression naming an ordinary local: the parser declared `result` at the top of the body,
+// so the slots pass has already given it a home.
+private compile_exits(u: *Unit, e: *Emit, at: Span)
+    if e.ensures.len() == 0 then return
+
+    push_n(e, Dup, at, 0, 1)
+    store_name(u, e, ResultName, at)
+
+    for i in 0..<e.ensures.len()
+        *e.ensures.at(i).kind match
+            Clause(_, _, owner, text, cond) ->
+                compile_clause(u, e, false, owner, text, cond, e.ensures.at(i).span)
+            _ -> ()
+end compile_exits
+
+// `-> type` asked of a `return`, which answers as surely as falling out of the body does.
+//
+// **The same `CheckResult` the wrapper emits**, so the two ways out of a function say one sentence.
+// The complaint about an annotation that names nothing is left to the wrapper, which is compiled once
+// per definition where this is compiled once per `return`.
+private check_answer(u: *Unit, e: *Emit, at: Span)
+    e.result_pat match
+        Some(pat) ->
+            push_n(e, CheckResult(intern_str(u, e.result_declared), intern_pattern(u, resolve_pattern(pat, 0))), at, 0, 0)
+        None -> ()
+
 private compile_stmt(u: *Unit, e: *Emit, s: Stmt, hoisted: bool)
     val at = s.span
 
@@ -102,6 +153,11 @@ private compile_stmt(u: *Unit, e: *Emit, s: Stmt, hoisted: bool)
                 Some(x) -> compile_expr(u, e, x)
                 None -> push_n(e, PushNull, at, 0, 1)
 
+            // **The postconditions are emitted in FRONT of the jump**, which is the half of a
+            // contract the parser could not write: falling out of a body is an expression it can
+            // wrap and a `return` is a jump nothing can be wrapped around.
+            compile_exits(u, e, at)
+            check_answer(u, e, at)
             put(e, Ret, at)
 
             // Nothing after a `return` runs, but the block it sits in still has to typecheck as
@@ -152,6 +208,17 @@ private compile_stmt(u: *Unit, e: *Emit, s: Stmt, hoisted: bool)
             slot_named(e, name) match
                 Some(i) -> push_n(e, CheckSlot(e.slot_of.at(i), intern_str(u, name), intern_str(u, declared), pk), at, 0, 0)
                 None -> push_n(e, Op.CheckType(intern_str(u, name), intern_str(u, declared), pk), at, 0, 0)
+
+            push_n(e, PushNull, at, 0, 1)
+
+        // **A precondition runs where it stands and a postcondition's declaration runs nowhere.**
+        // The head clause is what tells the ways out what to check; the parser has already put a copy
+        // carrying `at_exit` where the body falls out, and `compile_exits` writes the rest.
+        Clause(is_require, at_exit, owner, text, cond) ->
+            if is_require || at_exit
+                compile_clause(u, e, is_require, owner, text, cond, at)
+            else
+                e.ensures.push(s)
 
             push_n(e, PushNull, at, 0, 1)
         Break(label, value) -> jump_out(u, e, at, true, label, value)
