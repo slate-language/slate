@@ -4,8 +4,8 @@
 // cannot be printed here: it answers `"interpreter"` on one side and `"node"` on the other, by
 // design, and a differential test would fail on the one thing working as documented. What CAN be
 // pinned is a program that BRANCHES on it and prints the same thing regardless -- which is the
-// actual shape `docs/library/dom.md`'s cookie guard is: a shared file with no control over where it
-// runs, asking once and taking one of two paths that happen to answer alike here.
+// actual shape a page's cookie guard has: a shared file with no control over where it runs, asking
+// once and taking one of two paths that happen to answer alike here.
 
 if host() == "interpreter" || host() == "node" || host() == "browser"
     print("a known host")
