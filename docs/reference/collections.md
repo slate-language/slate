@@ -167,6 +167,11 @@ print(Set([1, 2]).size())
 `size` is a property, not a method
 ```
 
+**Nothing in one is at a position, which is also what `forEach` hands over.** An array's callbacks
+are given the element, its index and the array — [Globals](../library/globals.md) — while a set's
+`forEach` is given a member and a map's a `[key, value]` pair, and nothing else: there is no index to
+give.
+
 **`.length` is not a set's or a map's.** Neither is a sequence, nothing in one is at a position, and
 a program reaching for `.length` has confused it with an array.
 

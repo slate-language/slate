@@ -681,11 +681,11 @@ supplies**, every call dropping what it cannot bind; see
 Declaring **more** is refused, there being nothing to fill them with:
 
 ```slate
-q(ns: array of integer) = map(ns, (a, b) -> a)
+q(ns: array of integer) = map(ns, (a, b, c, d) -> a)
 ```
 
 ```error
-`map` takes (integer) -> any here, and this is (integer, any) -> integer
+`map` takes (integer, integer, array of integer) -> any here, and this is (integer, integer, array of integer, any) -> integer
 ```
 
 **The relaxation does not stop at a builtin, because the CALL is what makes it sound rather than the
