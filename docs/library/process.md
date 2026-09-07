@@ -68,6 +68,23 @@ for name in args
 
 `env(name)` answers `string | null`. `?? ""` is what a program writes.
 
+## `pid`
+
+`pid()` answers this process's own process id, the number the operating system knows it by —
+`child.pid`'s own question, asked of the program itself rather than of a child it started.
+
+```slate
+import { pid } from slate:process
+
+print(pid() > 0)
+```
+
+```output
+true
+```
+
+**A browser has no process id and `pid()` answers `null` there.**
+
 ## `run`
 
 ```slate

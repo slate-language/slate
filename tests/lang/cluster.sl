@@ -17,7 +17,7 @@
 // waits for the promise, and only then says what it expected.
 
 import { cluster, isPrimary, isWorker, workerId } from slate:cluster
-import { cpus } from slate:process
+import { cpus, pid, spawn } from slate:process
 
 // A value whose type the checker cannot see, so a refusal is the machine's rather than the pass's.
 anything(v) = v
@@ -70,6 +70,32 @@ THE_MACHINE_SAYS_HOW_MANY_THINGS_IT_CAN_DO_AT_ONCE()
     // dividing by nothing.
     assert(cpus() >= 1)
     assert(cpus() is integer)
+
+@test
+A_PROGRAM_KNOWS_ITS_OWN_pid()
+    assert(pid() > 0)
+    assert(pid() is integer)
+
+@test
+async pid_IS_THE_NUMBER_A_CHILD_SEES_AS_ITS_PARENT()
+    // A child's own `$PPID` is the operating system's answer to the same question `pid()` answers
+    // about this process, asked from the other side. `run` is not the way to ask it -- it is not
+    // built in the JavaScript back end -- so the child says it over the channel instead, the way
+    // every other process test here does.
+    val child = spawn("/bin/sh", ["-c", "printf '%s\\n' \"$PPID\" >&3"], { ipc: true }).value
+
+    val seen = []
+
+    child.onMessage(m ->
+        seen.push(m))
+
+    await child.exited
+
+    assertEq(seen[0], pid())
+
+@test
+pid_TAKES_NO_ARGUMENTS_AND_AN_EXTRA_ONE_IS_REFUSED()
+    assertFaults(() -> pid(1), "`pid` takes no arguments")
 
 @test
 A_CLUSTER_OF_NO_WORKERS_IS_REFUSED()

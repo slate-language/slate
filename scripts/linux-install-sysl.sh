@@ -28,7 +28,7 @@ case "$(uname -m)" in
   *) echo "sysl publishes no Linux tarball for $(uname -m)" >&2; exit 1 ;;
 esac
 
-url="https://github.com/sysl-lang/sysl/releases/download/v$version/sysl-$version-linux-$arch.tar.gz"
+url="https://github.com/sysl-lang/sysl-bootstrap/releases/download/v$version/sysl-$version-linux-$arch.tar.gz"
 echo "installing sysl $version ($arch) into $prefix"
 
 tmp=$(mktemp -d)
