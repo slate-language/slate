@@ -85,6 +85,39 @@ the mapped form `::ffff:127.0.0.1`. The prefix is taken off here, or an allow-li
 **`connect` takes a name or an address**, resolving through libuv's resolver on its thread pool. A name that
 does not resolve settles the promise the way a refused connection does, rather than raising.
 
+**`reusePort: true` asks several processes to share one port**, so the kernel spreads accepted
+connections across every one of them rather than giving the port to whichever process asked first —
+the foundation of a worker cluster, one process per core all `listen`ing on the port a load balancer
+sends traffic to:
+
+```slate
+val server = listen({ port: 3000, reusePort: true }, conn -> conn)
+```
+
+**A kernel that does not distribute this way REFUSES the flag rather than doing something else with
+it.** Two answers are correct depending on the machine, and both say so by name rather than leaving a
+program to guess: a kernel that distributes lets every listener bind, and one that does not answers
+`ENOTSUP` — never a bind that quietly succeeds without sharing anything, which would be a server that
+believes it has a share of the port and does not. macOS is one of the kernels that refuses:
+
+```slate
+import { listen } from slate:net
+
+try
+    listen({ port: 0, reusePort: true }, conn -> conn)
+    print("shared")
+catch e
+    print(e.message.contains("ENOTSUP"))
+```
+
+```output
+true
+```
+
+Left out, `reusePort` is `false`, which is a port belonging to one listener — the ordinary case and
+the one every program already written keeps. `reusePort` is `true` or `false` and nothing else;
+anything else is refused by name, the way every other option here is.
+
 ## Lifetime
 
 **A socket keeps the program alive, exactly as a timer does**, so `close` is not optional; a program that

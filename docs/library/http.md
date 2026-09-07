@@ -34,6 +34,9 @@ which is a file server and an HTTP/2 speaker downloaded to read a query string.
 The third argument to either server is for a protocol upgrade — see [`slate:ws`](ws.md).
 
 **HTTPS is `listen` told a certificate**, so `serve` did not have to change: TLS lives one layer down.
+**A worker cluster is the same argument again** — `serve({ port: 3000, reusePort: true }, app)` shares
+the port with every other process asking for it the same way, [`slate:net`](net.md#ports-and-names)
+saying what the kernel does with the flag and what it refuses to do.
 
 ## `close(server)`
 

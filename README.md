@@ -19,8 +19,9 @@ at what an API server needs — HTTP over node's own llhttp, HTTP/2 over nghttp2
 processes, regular expressions and JSON.
 
 **It also compiles to JavaScript**, so the same program runs under the interpreter, under node or quickjs,
-and — with `slate:dom` and [lath](https://github.com/slate-language/lath), the React-shaped framework
-written in slate — in a browser. `slate js app.slx -o app.js` writes one self-contained file: the runtime,
+and — with [dom](https://github.com/slate-language/dom) and
+[lath](https://github.com/slate-language/lath), the React-shaped framework written in slate — in a
+browser. `slate js app.slx -o app.js` writes one self-contained file: the runtime,
 the framework and the program, with no bundler and nothing to install.
 
 **The documentation is at [slatelang.dev](https://slatelang.dev)**, built from
@@ -186,8 +187,8 @@ Hello, slate!
 ## Writing a page
 
 `slate js` reads the same tree a second time and writes JavaScript, so a slate program runs under node,
-under quickjs, or in a browser. The last of those is what `slate:dom` and
-[lath](https://github.com/slate-language/lath) are for — React's model *and* React's mechanism, written in
+under quickjs, or in a browser. The last of those is what [dom](https://github.com/slate-language/dom)
+and [lath](https://github.com/slate-language/lath) are for — React's model *and* React's mechanism, written in
 slate, over JSX-shaped elements the parser desugars into ordinary calls.
 
 ```

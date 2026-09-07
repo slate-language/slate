@@ -322,9 +322,10 @@ pinning the skew rather than the calendar.
 nothing finer — the interpreter drops its microseconds to match. An instant a program *builds* keeps
 every digit: `epochMicros(1000000001)` is exact wherever it runs.
 
-**`slate:dom` is the other way round**: it works only here. Under the interpreter every one of its names
-faults with a sentence naming the *command* rather than the code, because the same program is correct in a
-browser and it is the command that is wrong.
+**The document is the other way round**: it works only here. It is [the `dom` package](../library/dom.md)
+rather than anything the compiler carries, written over [`external`](external.md) — so under the
+interpreter what refuses is the operation that would touch the host, naming the *command* rather than
+the code, because the same program is correct in a browser.
 
 ### `slate:regex` is whole here, and a pattern is TRANSLATED rather than handed over
 
@@ -517,46 +518,25 @@ gives the program no way in.
 
 Which response headers are readable at all in a browser is CORS's decision and not slate's.
 
-### `slate:dom` has four more doors, and they are the rule read from the other side
+### The document is a package, and this back end is what makes it possible
 
-`location()`, the history calls, `localStorage` and cookies are things **a browser has and nothing
-else does**. So the interpreter and node both refuse them — naming *which* of the four, because they
-are four different mistakes — where everything else in this file is a name a browser has that slate
-had not yet reached.
+**`slate:dom` was a built-in module and is [the `dom` package](../library/dom.md) now** — forty-four
+hand-written natives replaced by slate written over [`external`](external.md), which is the
+declaration that let a program name a JavaScript value for itself. Everything a page needs is the
+package's: elements, the read side hydration walks, `location`, the history calls, `localStorage` and
+cookies.
 
 **Cookies are a different channel from `Set-Cookie` above**, and reaching for one does not reach the
 other. `fetch`'s response headers are what a *server* sent back on this one request; `document.cookie`
 is what rides along with *every* request this origin makes, written and read directly rather than
 through a response. A browser refuses a page `Set-Cookie` by CORS's rule; it does not refuse
-`document.cookie`, which is why `cookies`, `cookie`, `setCookie` and `deleteCookie` answer plain
-values and never a result the way `Set-Cookie`'s absence does.
-
-**No history state object**, and that is a measurement rather than a simplification: `pushState`
-structured-clones what it is given, and `structuredClone` strips the prototype, so a slate object put
-in comes back a plain object carrying a `fields` map that nothing in the language could read. The url
-is the whole of the state.
-
-**A push does not raise `onNavigate`** — a browser raises `popstate` for a movement the user made and
-never for one the program made itself.
+`document.cookie`.
 
 **A browser's `print` is the print dialog**, and the runtime used to reach for `globalThis.print` as
 its writer, so a page's every `print("hi")` asked which printer to use and wrote nothing. quickjs is
 why that global is looked at at all — it is quickjs's writer and has no relation to the window method
-of the same name — and **a document is what tells the two apart**. `check/` in slate's own repo drives
-all of this against jsdom.
-
-### And four that READ the page, for a program adopting markup it did not write
-
-`children(node)`, `tagName(node)`, `nodeText(node)` and `attribute(node, name)` are the read side, and
-they refuse under the interpreter exactly as the write side does and for the same reason. They exist
-because **hydration cannot be written without them**: a framework adopting a server's markup has to
-walk what is there and ask what it found, and until 0.0.28 `slate:dom` could build a page and could
-not read one.
-
-**A handle for an element the program never created is not new** — `byId` and `query` have minted one
-since the module shipped — so what these add is the walk rather than a kind of value. `parent`, the
-siblings and an `innerHTML` reader are deliberately absent: a page is walked downwards from something
-the program already holds, and the rest is a general traversal API.
+of the same name — and **a document is what tells the two apart**. That is the last thing about a page
+this back end still decides on its own.
 
 ### Case, whitespace and the normal forms are one operation, and that took proving
 
