@@ -81,6 +81,13 @@ folding_is_for_comparing_and_lowering_is_for_showing() =
     // It composes what it answers, so a decomposed spelling folds to the composed one.
     assert(casefold("ÉCOLE") == casefold("e\u{301}cole"))
 
+    // Casefolding an iota-subscript omega decomposes it before folding, so the mark casefolding
+    // introduces lands behind the one the letter already carried rather than in front of it -- and
+    // `lower` leaves the same letter precomposed, having nothing to decompose it for.
+    val iotaSubscript = "\u{1FA4}\u{0350}"
+    assertEq(casefold(iotaSubscript), "\u{1F64}\u{0350}\u{03B9}")
+    assertEq(lower(iotaSubscript), iotaSubscript)
+
 @test
 searching_answers_null_for_a_miss_and_not_a_negative_number() =
     assertEq(indexOf("abcabc", "b"), 1)
