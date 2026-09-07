@@ -60,6 +60,36 @@ once, because a stream that never ends is not something a shutdown can wait for.
 version. A client may keep a connection and then simply go away, and without that clock the socket
 would be held for the life of the server.
 
+## `adopt(handler)`
+
+**The same server with no port, answering connections somebody else accepted.** A supervisor accepts on
+the one listening socket and hands each connection to a worker over its channel; the worker never listens
+at all, so it has a handler and no port to give `serve`.
+
+```slate
+import { channel } from slate:process
+import { adopt } from slate:http
+
+val app = adopt(req -> "answered by a worker")
+
+channel().onMessage((m, conn) ->
+    if conn != null then app.handle(conn))
+```
+
+- **`adopt(handler)` and `adopt(handler, onUpgrade)` answer `{ handle, close }`.** `handle(conn)` takes
+  one connection, which is node's `server.emit("connection", socket)`; `close()` ends the connections
+  this server accepted, which is what `close(server)` does to the half an adopting server has.
+- **Everything below the accept is the code that answers an ordinary request** — the parser,
+  keep-alive, the idle clock, the upgrade, `h2` over ALPN, the response writer. `serve` is this plus a
+  listening socket.
+- **A name of its own rather than an option on `serve`.** `serve`'s first argument is a port, and a call
+  whose first argument is sometimes a port and sometimes a function is the overload `serveStream` was
+  split out to avoid. A bare `handle(conn, handler)` was the other candidate and would build a fresh
+  server per connection — losing the table `close` needs and the keep-alive that makes a second request
+  on one connection cheap. node makes a server once and feeds it sockets, and so does this.
+- **[`slate:process`](process.md) is where the connection comes from**, and the same page says why a
+  socket may only be passed between two programs on the same host.
+
 ## The request
 
 `method`, `path`, `search` (the raw text after the `?`), `query`, `cookies`, `params`, `address`,

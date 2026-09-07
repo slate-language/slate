@@ -3,11 +3,24 @@ module dev.slatelang.slate
 // `spawn` and `channel` in the JavaScript back end -- a child process over node's own
 // `child_process`, talking the same newline-delimited JSON the interpreter talks.
 //
-// **THE WIRE FORMAT IS THE POINT OF THIS FILE.** node has an IPC channel of its own, and using it
-// would have been shorter and would have tied the format to node's internals -- a supervisor running
-// under the interpreter could then not drive a child running under node, which is exactly the
-// arrangement a mixed cluster is. So the channel here is what it is there: a fourth descriptor, one
-// JSON value per line, and `SLATE_CHANNEL_FD` naming the descriptor in the child's environment.
+// **THE WIRE FORMAT IS THE POINT OF THIS FILE**, and node's own channel turns out to BE that format:
+// `child_process` writes `JSON.stringify(message) + "\n"` down a descriptor, which is the
+// interpreter's wire byte for byte. So the fourth descriptor is node's `"ipc"` slot rather than a
+// plain pipe, and every pairing still works -- a child under the interpreter reads fd 3 and finds
+// exactly the lines node wrote, and a child under node started by the interpreter finds no
+// `NODE_CHANNEL_FD`, falls through to `SLATE_CHANNEL_FD`, and reads the descriptor itself.
+//
+// **What the ipc slot buys is a socket crossing the channel**, which a plain pipe cannot carry here:
+// node passes a handle only over its own channel, through an internal protocol both ends have to
+// speak. So `send(value, socket)` works between two programs on THIS host and is refused with a
+// sentence in either direction across the boundary -- never quietly dropped, which is what sending
+// node's internal frames to a program that does not speak them would be.
+//
+// **Each end learns what the other is, and neither can guess.** The parent's host goes into the
+// child's environment as `SLATE_CHANNEL_HOST`, where there is nothing to wait for; the child's comes
+// back as the line `channel()` writes as soon as it opens, which is swallowed rather than delivered.
+// A socket may therefore be passed to a child once that child has said something -- which is what a
+// worker signalling that it is ready already does.
 //
 // **A BROWSER HAS NO PROCESSES AND NEVER WILL**, so `spawn` refuses there naming the host, which is
 // `listen`'s refusal and not an `OWED` stub: this is not a thing a later release brings. `channel`
@@ -44,6 +57,48 @@ js_runtime_process() -> string = raw"""
         // interpreter's, and they are what makes a child of one back end readable by the other.
         const CHANNEL_VARIABLE = "SLATE_CHANNEL_FD"
         const CHANNEL_FD = 3
+
+        // The name the parent's host arrives under, and the three answers a peer can have. **A
+        // socket may only be passed between two programs on the same host**, so each end has to know
+        // what the other is before it writes one.
+        const HOST_VARIABLE = "SLATE_CHANNEL_HOST"
+        const HOST_NAME = "js"
+        const OTHER_HOST = "native"
+        const HOST_UNKNOWN = "?"
+
+        // The line a channel opens with, which is how a parent finds out what its child is. The
+        // interpreter writes the same bytes.
+        const helloText = (host) => "{\"$slate\":\"" + host + "\"}"
+
+        // The host a message names, where it is one of those lines and not an ordinary message.
+        const helloHost = (m) => {
+            if (m === null || typeof m !== "object" || Array.isArray(m)) return null
+
+            const keys = Object.keys(m)
+
+            if (keys.length !== 1 || keys[0] !== "$slate") return null
+
+            return m.$slate === HOST_NAME || m.$slate === OTHER_HOST ? m.$slate : null
+        }
+
+        // Why a socket may not be passed to a peer, and `null` where it may. **The refusals are the
+        // interpreter's own, word for word.**
+        const handlesRefused = (peer, isChild) => {
+            if (peer === HOST_NAME) return null
+
+            const who = isChild ? "this child" : "the program that started this one"
+
+            if (peer === OTHER_HOST)
+                return who + " is running on the interpreter and this program on the JavaScript host, so a socket cannot cross the channel"
+
+            if (peer === HOST_UNKNOWN)
+                return who + " is not a slate program, so a socket cannot cross the channel"
+
+            if (isChild)
+                return "this child has not said what it is yet -- a socket may be passed to a child once that child has sent its first message"
+
+            return who + " did not say which host it is running on, so a socket cannot cross the channel"
+        }
 
         // **The signals by name, and the list is the interpreter's own.** node takes a name and
         // answers one, where libuv counts -- so the number is looked up here, or the two back ends
@@ -103,6 +158,16 @@ js_runtime_process() -> string = raw"""
 
                 if (line.length === 0) continue
 
+                // **The line a channel opens with says which host the child is on, and is
+                // swallowed.** Only a child's first line is read this way, so a program whose own
+                // messages look like this is misread only in its very first one.
+                if (slot.child && slot.peer === "") {
+                    if (line === helloText(HOST_NAME)) { slot.peer = HOST_NAME; continue }
+                    if (line === helloText(OTHER_HOST)) { slot.peer = OTHER_HOST; continue }
+
+                    slot.peer = HOST_UNKNOWN
+                }
+
                 // **A line that is not JSON stops the program naming the channel**, rather than
                 // being dropped where nobody would see it: the sender is another program of the same
                 // system, so this is a defect somebody can fix.
@@ -113,8 +178,37 @@ js_runtime_process() -> string = raw"""
 
                 const f = slot.onMessage
 
-                if (f !== null) $.callback(f, [read.getKey("value")], "onMessage")
+                // **A socket is `null` on this wire and always will be.** A descriptor crosses
+                // node's own channel and nothing else, so a plain pipe carries messages alone.
+                if (f !== null) $.callback(f, [read.getKey("value"), null], "onMessage")
             }
+        }
+
+        // One message off node's own channel, which is the wire a socket can cross.
+        //
+        // **The value is put back through `parseJSON` rather than converted here**, so that one
+        // reading of a JSON document reaches a slate program however it arrived.
+        const nodeMessage = (slot, msg, socket) => {
+            if (slot.child && slot.peer === "") {
+                const said = helloHost(msg)
+
+                if (said !== null) { slot.peer = said; return }
+
+                slot.peer = HOST_UNKNOWN
+            }
+
+            const read = B.parseJSON(JSON.stringify(msg === undefined ? null : msg))
+
+            if (read.getKey("ok") !== true)
+                fault("a message on the channel is not JSON: " + read.getKey("error"))
+
+            const f = slot.onMessage
+
+            if (f === null) return
+
+            const held = socket === undefined || socket === null ? null : adoptSocket(socket)
+
+            $.callback(f, [read.getKey("value"), held], "onMessage")
         }
 
         // Read one end of a channel until it ends. **A failure is an end and not a fault**: a
@@ -136,17 +230,41 @@ js_runtime_process() -> string = raw"""
         // **A write that cannot be made is a RESULT and not a fault.** A worker dying while its
         // supervisor was writing to it is the ordinary shape of a process ending, and a supervisor
         // that had to wrap every `send` in a `try` to survive one is a supervisor nobody would write.
-        const writeMessage = (pipe, open, text, why) => {
-            if (!open || pipe === null) return $.obj([["ok", false], ["error", why]])
+        const writeMessage = (slot, text, socket, why) => {
+            if (!slot.open || slot.channel === null) return $.obj([["ok", false], ["error", why]])
 
             try {
-                pipe.write(text)
+                if (!slot.node) slot.channel.write(text)
+                else if (socket === undefined || socket === null) slot.channel.send(JSON.parse(text))
+                else slot.channel.send(JSON.parse(text), socket)
 
                 return $.obj([["ok", true], ["value", null]])
             } catch (e) {
                 return $.obj([["ok", false],
                     ["error", "this message could not be sent: " + (e && e.message ? e.message : String(e))]])
             }
+        }
+
+        // One message with a socket beside it, and this program's own copy given up.
+        //
+        // **The copy is given up because what crossed is a duplicate**, so leaving both open would
+        // have two programs reading one connection and each seeing half of it. node closes its own
+        // side of a sent handle by default and this closes the slate value that named it, so the two
+        // back ends agree about what a program is holding afterwards.
+        const sendWithSocket = (slot, text, sock, isChild, why) => {
+            if (!(sock instanceof $.SSocket))
+                fault("`send` passes on a socket, and this is " + typeName(sock))
+
+            const refusal = handlesRefused(slot.peer, isChild)
+
+            if (refusal !== null) fault(refusal)
+
+            const held = socketOf(sock, "send")
+            const answer = writeMessage(slot, text, held.handle, why)
+
+            if (answer.getKey("ok") === true) B.close(sock)
+
+            return answer
         }
 
         const childOptions = (v, name) => {
@@ -223,11 +341,17 @@ js_runtime_process() -> string = raw"""
             // and a worker's complaints belong wherever its supervisor's do.
             const stdio = ["ignore", "inherit", "inherit"]
 
-            if (options.ipc) stdio.push("pipe")
+            // **node's own channel in the fourth slot, not a plain pipe.** It writes the same
+            // newline-delimited JSON on the same descriptor, so a child under the interpreter cannot
+            // tell the difference -- and it is the only wire on this host a socket can cross.
+            if (options.ipc) stdio.push("ipc")
 
             const environment = options.env === null ? { ...process.env } : { ...options.env }
 
-            if (options.ipc) environment[CHANNEL_VARIABLE] = String(CHANNEL_FD)
+            if (options.ipc) {
+                environment[CHANNEL_VARIABLE] = String(CHANNEL_FD)
+                environment[HOST_VARIABLE] = HOST_NAME
+            }
 
             const settings = { stdio: stdio, env: environment }
 
@@ -256,7 +380,7 @@ js_runtime_process() -> string = raw"""
             }
 
             const slot = { handle: handle, gen: kidSlots.length + 1, pid: BigInt(handle.pid === undefined ? 0 : handle.pid),
-                channel: options.ipc ? handle.stdio[CHANNEL_FD] : null, ipc: options.ipc,
+                channel: options.ipc ? handle : null, node: true, child: true, peer: "", ipc: options.ipc,
                 open: options.ipc, inbox: "", onMessage: null, onExit: null, settled: false,
                 exited: null, resolve: null }
 
@@ -299,16 +423,18 @@ js_runtime_process() -> string = raw"""
                 if (told !== null) $.callback(told, [answer], "onExit")
             })
 
-            if (options.ipc && slot.channel !== null)
-                readChannel(slot.channel, slot, () => { slot.open = false })
+            if (options.ipc) {
+                handle.on("message", (msg, socket) => nodeMessage(slot, msg, socket))
+                handle.on("disconnect", () => { slot.open = false })
+            }
 
             return $.obj([["ok", true], ["value", new $.SChild(kidSlots.length - 1, slot.gen)]])
         }
 
         B.$childSend = (...args) => {
-            if (args.length !== 2)
-                fault("`send` takes one message, and was given " + (args.length - 1) +
-                    (args.length === 2 ? " argument" : " arguments"))
+            if (args.length < 2 || args.length > 3)
+                fault("`send` takes one message and optionally a socket to pass on, and was given " +
+                    (args.length - 1) + (args.length === 2 ? " argument" : " arguments"))
 
             const slot = childOf(args[0], "send")
 
@@ -319,8 +445,11 @@ js_runtime_process() -> string = raw"""
             if (!slot.ipc)
                 fault("this child was started without a channel -- `spawn` opens one where the options say `ipc: true`")
 
-            return writeMessage(slot.channel, slot.open, text,
-                slot.settled ? "this child has exited" : "this channel is closed")
+            const why = slot.settled ? "this child has exited" : "this channel is closed"
+
+            if (args.length === 3) return sendWithSocket(slot, text, args[2], true, why)
+
+            return writeMessage(slot, text, null, why)
         }
 
         B.$childKill = (...args) => {
@@ -357,7 +486,8 @@ js_runtime_process() -> string = raw"""
             const slot = childOf(args[0], "onMessage")
 
             slot.onMessage = wantChildHandler(args[1], "onMessage")
-            takeLines(slot)
+
+            if (!slot.node) takeLines(slot)
 
             return null
         }
@@ -394,6 +524,32 @@ js_runtime_process() -> string = raw"""
             if (ownChannel !== null) return new $.SChannel(0)
             if (procHost === null) return null
 
+            // **Which host the parent is on comes out of the environment**, where it was put at the
+            // spawn -- so a worker knows before it does anything whether a socket can go back up the
+            // channel, and there is nothing to wait for.
+            const parentHost = process.env[HOST_VARIABLE]
+            const peer = parentHost === undefined || parentHost === null ? "" : parentHost
+
+            // **node's own channel where a node parent opened one**, which is the wire a socket can
+            // cross. A parent under the interpreter sets no `NODE_CHANNEL_FD`, so `process.send` is
+            // not there and the descriptor is read directly instead -- messages either way, and a
+            // socket only on the first.
+            if (process.channel !== undefined && process.channel !== null &&
+                typeof process.send === "function") {
+                ownChannel = { channel: process, node: true, child: false, peer: peer, open: true,
+                    inbox: "", onMessage: null }
+
+                process.on("message", (msg, socket) => nodeMessage(ownChannel, msg, socket))
+                process.on("disconnect", () => {
+                    ownChannel.open = false
+                    ownChannel.channel = null
+                })
+
+                process.send({ "$slate": HOST_NAME })
+
+                return new $.SChannel(0)
+            }
+
             const named = process.env[CHANNEL_VARIABLE]
 
             if (named === undefined || named === null || named === "") return null
@@ -404,7 +560,8 @@ js_runtime_process() -> string = raw"""
 
             const pipe = new procHost.sockets.Socket({ fd: Number(named), readable: true, writable: true })
 
-            ownChannel = { channel: pipe, open: true, inbox: "", onMessage: null }
+            ownChannel = { channel: pipe, node: false, child: false, peer: peer, open: true,
+                inbox: "", onMessage: null }
 
             // **The channel keeps the program alive while it is open**, which is what a worker
             // waiting to be told something is -- and the channel ending, which is what the parent
@@ -418,6 +575,11 @@ js_runtime_process() -> string = raw"""
                 } catch (e) {
                 }
             })
+
+            // **And this program says what IT is, first thing**, the parent having no other way to
+            // find out: it started a command, and what that command turned out to be is only
+            // knowable from what it says.
+            pipe.write(helloText(HOST_NAME) + "\n")
 
             return new $.SChannel(0)
         }
@@ -433,13 +595,17 @@ js_runtime_process() -> string = raw"""
         }
 
         B.$channelSend = (...args) => {
-            if (args.length !== 2)
-                fault("`send` takes one message, and was given " + (args.length - 1) +
-                    (args.length === 2 ? " argument" : " arguments"))
+            if (args.length < 2 || args.length > 3)
+                fault("`send` takes one message and optionally a socket to pass on, and was given " +
+                    (args.length - 1) + (args.length === 2 ? " argument" : " arguments"))
 
             const slot = channelOf(args[0], "send")
+            const text = framed(args[1])
 
-            return writeMessage(slot.channel, slot.open, framed(args[1]), "this channel is closed")
+            if (args.length === 3)
+                return sendWithSocket(slot, text, args[2], false, "this channel is closed")
+
+            return writeMessage(slot, text, null, "this channel is closed")
         }
 
         B.$channelOnMessage = (...args) => {
@@ -450,7 +616,8 @@ js_runtime_process() -> string = raw"""
             const slot = channelOf(args[0], "onMessage")
 
             slot.onMessage = wantChildHandler(args[1], "onMessage")
-            takeLines(slot)
+
+            if (!slot.node) takeLines(slot)
 
             return null
         }

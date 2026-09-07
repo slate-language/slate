@@ -12,6 +12,7 @@
 // with nothing printed rather than a test that fails.
 
 import { spawn, channel } from slate:process
+import { listen, close } from slate:net
 
 // A value whose type the checker cannot see, so that a refusal is the MACHINE's rather than the
 // pass's. `tests/lang/callbacks.sl` has the same helper for the same reason.
@@ -212,3 +213,75 @@ async A_CHILD_STARTS_WHERE_IT_IS_TOLD_AND_WITH_THE_ENVIRONMENT_IT_IS_GIVEN()
     // variable kept passes it through — which is what `PATH` is doing here.
     await worker.exited
     assertEq(said, "hi")
+
+// -- passing a socket ------------------------------------------------------------------------------
+//
+// **What a supervisor is REFUSED is what can be driven from here**, `/bin/sh` being the one child both
+// hosts have. A socket that actually crosses needs a slate program at the other end and a host that
+// can pass a handle at all, which is `tests_process.sysl`'s arrangement on the interpreter and a pair
+// of compiled programs under node.
+
+@test
+async A_MESSAGE_THAT_CARRIES_NO_SOCKET_HANDS_ITS_HANDLER_null()
+    // **`null` and not a missing argument**, so a handler may read the second parameter without
+    // asking whether there was one -- and a handler that declares only the first is unchanged, a call
+    // dropping the arguments a function did not ask for.
+    val worker = spawn("/bin/sh", ["-c", echoing(1)], { ipc: true }).value
+    var carried = "not called"
+
+    worker.onMessage((m, sock) ->
+        carried = string(sock))
+
+    worker.send({ a: 1 })
+    await worker.exited
+    assertEq(carried, "null")
+
+@test
+async A_SOCKET_MAY_NOT_BE_PASSED_TO_A_CHILD_THAT_HAS_NOT_SAID_WHAT_IT_IS()
+    // A descriptor may only cross between two programs on the same host, and a supervisor cannot know
+    // what it started until that child has spoken. A worker signalling that it is ready is what says
+    // so, which is what a cluster already does.
+    val worker = spawn("/bin/sh", ["-c", echoing(1)], { ipc: true }).value
+    val server = listen(0, (conn) -> null)
+
+    assertFaults(() -> worker.send({ job: 1 }, server), "has not said what it is yet")
+
+    close(server)
+    worker.send("done")
+    await worker.exited
+
+@test
+async A_CHILD_THAT_IS_NOT_A_SLATE_PROGRAM_IS_REFUSED_A_SOCKET()
+    // The shell says something and what it says is not the line a slate channel opens with, so the
+    // question is settled and the refusal names it.
+    val worker = spawn("/bin/sh", ["-c", echoing(1)], { ipc: true }).value
+    val server = listen(0, (conn) -> null)
+
+    worker.onMessage((m) -> null)
+    worker.send({ a: 1 })
+    await worker.exited
+
+    assertFaults(() -> worker.send({ job: 1 }, server), "is not a slate program")
+    close(server)
+
+@test
+async WHAT_send_SAYS_ABOUT_A_SECOND_ARGUMENT_THAT_IS_NOT_A_SOCKET()
+    val worker = spawn("/bin/sh", ["-c", echoing(1)], { ipc: true }).value
+
+    assertFaults(() -> worker.send({ a: 1 }, 3), "passes on a socket")
+    assertFaults(() -> worker.send({ a: 1 }, 3, 4), "optionally a socket")
+
+    worker.send("done")
+    await worker.exited
+
+@test
+async A_CHILD_STARTED_WITHOUT_A_CHANNEL_IS_REFUSED_A_SOCKET_BEFORE_ANYTHING_ELSE()
+    // The `ipc` question is about the `spawn` and is asked first, so a supervisor that forgot the
+    // option hears about that rather than about the socket it was holding.
+    val started = spawn("/bin/sh", ["-c", "exit 0"])
+    val server = listen(0, (conn) -> null)
+
+    assertFaults(() -> started.value.send("hello", server), "started without a channel")
+
+    close(server)
+    await started.value.exited

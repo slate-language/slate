@@ -141,6 +141,7 @@ it left with 0
 | `child.exited` | a promise of `{ status, signal }`, settled once — `await` it to learn a worker died |
 | `child.onExit(fn)` | the callback form of the same answer |
 | `child.send(value)` | one message, as JSON and a newline — `{ ok, error }` |
+| `child.send(value, socket)` | the same message with a connection travelling beside it |
 | `child.onMessage(fn)` | what to call for every message the child sends |
 | `child.kill()`, `child.kill(signal)` | ask it to stop; `SIGTERM` where no signal is named |
 
@@ -156,6 +157,67 @@ it left with 0
   `toJSON`'s own words. That is slate's two-channel rule read twice in one call.
 - **A child started without `ipc` is refused a message** rather than answering a failure: the program
   asked for a child with no channel and then wrote to the channel.
+
+### Passing a connection to a worker
+
+**A supervisor can hand an accepted connection to a child, which is how one port is spread over several
+processes.** The supervisor is the only program listening; it accepts every connection itself and gives
+each one to a worker over the channel it spawned that worker with. This is what node's cluster module
+does by default, and on macOS it is the only way — the kernel refuses `reusePort` there.
+
+```slate
+import { spawn } from slate:process
+import { listen } from slate:net
+
+var workers = []
+var next = 0
+
+for i in 0..<4
+    workers.push(spawn("slate", ["worker.sl"], { ipc: true }).value)
+
+listen(8080, conn ->
+    workers[next].send({}, conn)
+    next = (next + 1) % workers.length)
+```
+
+and the worker, which never listens at all:
+
+```slate
+import { channel } from slate:process
+import { adopt } from slate:http
+
+val app = adopt(req -> "answered by a worker")
+
+channel().onMessage((m, conn) ->
+    if conn != null then app.handle(conn))
+```
+
+- **The second argument is a connection — what `accept` gives a listener and what `connect` answers.**
+  It travels as a duplicate of the descriptor, so **the sending side's copy is closed once the message
+  has gone**: two programs reading one connection would each see half of it. That is node's rule too.
+- **One message carries at most one connection**, and the message is what says what to do with it —
+  which worker, which tenant, which protocol. `{}` is an ordinary payload where there is nothing to say.
+- **A socket may only be passed between two programs on the same host**, a descriptor crossing a Unix
+  domain socket under the interpreter and node's own channel under `slate js`. Each end says which host
+  it is on — the parent in the child's environment, the child in the line its channel opens with — so a
+  pair that cannot pass one is refused with a sentence rather than dropping it.
+- **So a socket goes to a child that has already said something.** A worker signalling that it is ready
+  is what a supervisor waits for anyway; before that, the supervisor has started a command and does not
+  yet know what it turned out to be:
+
+```slate
+import { spawn } from slate:process
+import { listen } from slate:net
+
+val worker = spawn("/bin/sh", ["-c", "sleep 1"], { ipc: true }).value
+
+listen(0, conn -> null)
+worker.send({}, listen(0, conn -> null))
+```
+
+```error
+has not said what it is yet
+```
 
 ## `channel`
 
@@ -178,10 +240,16 @@ else
   now is the whole point of the call. Asking twice answers the same channel.
 - **An open channel keeps the program alive**, which is what a worker waiting to be told something is.
   It ends when the other end goes, so a worker whose supervisor has finished finishes too.
+- **`onMessage` is handed the message and the connection that came with it** — `fn(value, socket)`,
+  where `socket` is `null` for an ordinary message. A handler written with one parameter is unchanged, a
+  call dropping the arguments a function did not ask for. `channel().send(value, socket)` sends one back
+  up, under the same rule as `child.send`.
 - **The wire is one JSON value per line on descriptor 3**, and the child finds it through
   `SLATE_CHANNEL_FD` in its environment — which is what node's `NODE_CHANNEL_FD` is for. It is the same
   format on both back ends, so a supervisor running under the interpreter can drive a child running
-  under node and the other way round.
+  under node and the other way round. `SLATE_CHANNEL_HOST` beside it says which host the *parent* is
+  running on, and the first line a channel writes says which host the *child* is — the pair that decides
+  whether a connection can cross.
 - **A message arrives whole or not at all.** A read is a run of bytes and a message is a line, so half
   a message waits for the rest of itself — and a line that is not JSON stops the program naming the
   channel rather than being dropped where nobody would see it.

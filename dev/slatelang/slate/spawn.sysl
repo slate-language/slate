@@ -12,6 +12,10 @@ import sysl.text.from_utf8
 
 // A child that outlives the call that started it, and the message channel it was given.
 //
+// **`channel.sysl` is the other half**: the wire both ends of a channel speak, this program's own end
+// of the one it was started with, and the socket that may travel with a message. What is here is the
+// child -- starting one, watching it, and what a supervisor calls.
+//
 // **`run` is one question with one answer and this is a conversation**, which is the whole of the
 // difference between the two. `run` starts a program, waits for it, and hands back what it printed;
 // a program that wants a *worker* -- something started once, told things over its lifetime, and
@@ -64,11 +68,21 @@ struct Child
     // and stays answerable for ever -- where the handle goes when the channel ends.
     ipc: bool
 
+    // Which host the child turned out to be running on, and `""` until it has said. **A socket may
+    // only be passed between two programs on the same host**, so this is what a `send` carrying one
+    // is refused by; `HostUnknown` is a child that spoke and was not a slate program.
+    peer: string
+
     // Whether a message can still be written. False from the exit, and from the channel ending.
     channel_open: bool
 
     // The bytes of a message that has not reached its newline yet.
     inbox: Buf[u8]
+
+    // Sockets taken off the channel that have not been handed to a message yet. **A handle arrives
+    // attached to the bytes of the message it was sent with**, so this is nearly always empty and
+    // never holds more than the read that filled it.
+    socks: Buf[Value]
 
     // What the program registered, and `Null` for what it did not.
     on_message: Value
@@ -85,35 +99,6 @@ struct Child
     at: Span
 
 var children: Buf[Child] = buf()
-
-// This program's own end of the channel, where it was started with one.
-//
-// **One channel and one slot, because a program has one parent.** There is nothing to close it with
-// and nothing that hands the slot back, so unlike a child it needs no generation.
-struct Channel
-    live: bool
-    pipe: Option[&libuv.Pipe]
-    open: bool
-    inbox: Buf[u8]
-    on_message: Value
-
-    // The event slot that keeps the program alive while the channel is open. **A worker's whole job
-    // is to wait to be told something**, so a program with an open channel is a program with work
-    // outstanding -- and the channel ending, which is what the parent going away looks like, is what
-    // lets it exit. node's rule, arrived at from the same place.
-    keep: usize
-
-var channels: Buf[Channel] = buf()
-
-// The slot `channel()` has already opened, so that asking twice answers the same thing.
-var own_channel: Option[usize] = None
-
-// The name the descriptor arrives under. **`NODE_CHANNEL_FD` under another name**, and it has to be
-// a name: a descriptor number is not something a program can discover about itself.
-val ChannelVariable: string = "SLATE_CHANNEL_FD"
-
-// The descriptor the child is given, which is the slot after the three every program has.
-val ChannelFd: int = 3
 
 // Put both tables back to nothing, so that one program's children cannot be seen by the next.
 //
@@ -136,28 +121,14 @@ forget_children()
         c.live = false
         c.proc = None
         c.channel = None
+        c.socks = buf()
         c.on_message = Null
         c.on_exit = Null
         c.exited_promise = Null
         children.set(i, c)
 
     children = buf()
-
-    for i in 0..<channels.len()
-        var ch = channels.at(i)
-
-        if ch.live
-            ch.pipe match
-                Some(p) -> p.close(() -> ())
-                None -> ()
-
-        ch.live = false
-        ch.pipe = None
-        ch.on_message = Null
-        channels.set(i, ch)
-
-    channels = buf()
-    own_channel = None
+    forget_channels()
 end forget_children
 
 // Mark what a child and a channel can still reach.
@@ -169,8 +140,10 @@ mark_children(h: *gc.Heap)
         mark_value(h, children.at(i).on_exit)
         mark_value(h, children.at(i).exited_promise)
 
-    for i in 0..<channels.len()
-        mark_value(h, channels.at(i).on_message)
+        for j in 0..<children.at(i).socks.len()
+            mark_value(h, children.at(i).socks.at(j))
+
+    mark_channels(h)
 end mark_children
 
 // The process id of the child in this slot, for the way one is printed. `0` where the value names
@@ -189,8 +162,8 @@ end child_pid_of
 private claim_child(request: usize, promise: Value, at: Span) -> usize
     val gen = children.len() + 1
 
-    children.push(Child(true, gen, 0, None, None, false, false, buf(), Null, Null, promise, request,
-                        false, at))
+    children.push(Child(true, gen, 0, None, None, false, "", false, buf(), buf(), Null, Null,
+                        promise, request, false, at))
     children.len() - 1
 
 // The child a builtin was handed, as the slot that names it -- or the complaint about what it was
@@ -203,6 +176,16 @@ private child_of(v: Value, at: Span, name: string) -> Result[usize, Signal]
 
             Ok(id)
         other -> Err(failure(at, s"`${name}` is something a child process does, and this is ${other.type_name()}"))
+
+// Take the two channel variables off THIS process again, after a spawn that inherited them.
+private clear_channel_env()
+    libuv.unset_env(ChannelVariable) match
+        Err(_) -> ()
+        Ok(_) -> ()
+
+    libuv.unset_env(HostVariable) match
+        Err(_) -> ()
+        Ok(_) -> ()
 
 // -- starting one -----------------------------------------------------------------------------
 
@@ -231,7 +214,11 @@ start_child(command: string, args: Buf[Value], options: Value, at: Span) -> Step
     var channel_pipe: Option[&libuv.Pipe] = None
 
     if ipc
-        val p = libuv.pipe() match
+        // **An ipc pipe and not an ordinary one, so that a socket can cross it.** A handle travels
+        // as ancillary data on a Unix domain socket, which libuv only reads for a pipe that was made
+        // with this flag -- and on a pipe without it `write_handle` is refused outright. Nothing
+        // about an ordinary message changes.
+        val p = libuv.pipe(true) match
             Err(e) -> return Ok(err_value(s"a channel to `${command}` could not be made: ${e}"))
             Ok(p) -> p
 
@@ -246,12 +233,18 @@ start_child(command: string, args: Buf[Value], options: Value, at: Span) -> Step
         // the variable on THIS process across the spawn and taking it off again. `uv_spawn` has
         // done the fork and the exec by the time it returns, and nothing else in this program runs
         // in between, so the window is the call itself.
-        if environment.len() > 0 then environment.push(s"${ChannelVariable}=${ChannelFd}")
+        if environment.len() > 0
+            environment.push(s"${ChannelVariable}=${ChannelFd}")
+            environment.push(s"${HostVariable}=${HostName}")
 
     val added_to_own = ipc && environment.len() == 0
 
     if added_to_own
         libuv.set_env(ChannelVariable, s"${ChannelFd}") match
+            Err(e) -> return Ok(err_value(s"the channel could not be named to `${command}`: ${e}"))
+            Ok(_) -> ()
+
+        libuv.set_env(HostVariable, HostName) match
             Err(e) -> return Ok(err_value(s"the channel could not be named to `${command}`: ${e}"))
             Ok(_) -> ()
 
@@ -263,10 +256,7 @@ start_child(command: string, args: Buf[Value], options: Value, at: Span) -> Step
             record_child_exit(slot, status, signal),
         stdio.view(), cwd, environment.view(), 0, libuv.default_loop()) match
         Err(e) ->
-            if added_to_own
-                libuv.unset_env(ChannelVariable) match
-                    Err(_) -> ()
-                    Ok(_) -> ()
+            if added_to_own then clear_channel_env()
 
             channel_pipe match
                 Some(p) -> p.close(() -> ())
@@ -277,10 +267,7 @@ start_child(command: string, args: Buf[Value], options: Value, at: Span) -> Step
             return Ok(err_value(s"cannot run `${command}`: ${e}"))
         Ok(c) -> c
 
-    if added_to_own
-        libuv.unset_env(ChannelVariable) match
-            Err(_) -> ()
-            Ok(_) -> ()
+    if added_to_own then clear_channel_env()
 
     var held = children.at(slot)
 
@@ -299,31 +286,12 @@ start_child(command: string, args: Buf[Value], options: Value, at: Span) -> Step
         child.close(() -> ()))
 
     channel_pipe match
-        Some(p) -> read_channel(p, (bytes) -> child_bytes(slot, bytes), () -> child_channel_end(slot))
+        Some(p) -> read_channel(p, (bytes) -> child_bytes(slot, bytes), (v) -> child_socket(slot, v),
+                                () -> child_channel_end(slot))
         None -> ()
 
     Ok(ok_value(ChildVal(slot, children.at(slot).gen)))
 end start_child
-
-// Read a channel until it ends, handing the bytes on as they arrive.
-//
-// **A failed read is an end and not a fault**, which is `run`'s rule for a child's output and holds
-// here for a better reason: a channel fails when the peer goes, and the peer going is the ordinary
-// end of a conversation rather than a defect in either program.
-private read_channel(p: &libuv.Pipe, on_bytes: &Fn([]const u8) -> unit, on_end: &Fn() -> unit)
-    p.read_start((r) ->
-        r match
-            Data(bytes) -> on_bytes(bytes)
-            End ->
-                p.close(() -> ())
-                on_end()
-            Failed(_) ->
-                p.close(() -> ())
-                on_end()) match
-        Err(_) ->
-            p.close(() -> ())
-            on_end()
-        Ok(_) -> ()
 
 // One boolean option out of the options object, and `false` where it was not given.
 //
@@ -358,6 +326,18 @@ private child_bytes(slot: usize, bytes: []const u8)
 
     children.set(slot, c)
     deliver_lines(slot, true)
+    orphan_check(slot, true)
+
+// A socket off a child's channel, waiting for the message it was sent with.
+private child_socket(slot: usize, v: Value)
+    if slot >= children.len() then return
+
+    var c = children.at(slot)
+
+    if !c.live then return
+
+    c.socks.push(v)
+    children.set(slot, c)
 
 // A child's channel has ended, which is the child going away or closing its end.
 private child_channel_end(slot: usize)
@@ -370,6 +350,12 @@ private child_channel_end(slot: usize)
     c.channel_open = false
     c.channel = None
     c.inbox = buf()
+
+    // **A socket nobody was given is closed here**, its slot being one of the things keeping this
+    // program alive: a worker that went away half-way through a message would otherwise leave a
+    // supervisor waiting on a connection it never handed over.
+    drop_socks(c.socks)
+    c.socks = buf()
     children.set(slot, c)
 
 // The child has gone.
@@ -431,249 +417,6 @@ private drop_child(slot: usize)
     c.exited_promise = Null
     children.set(slot, c)
 
-// -- the child's own end --------------------------------------------------------------------------
-
-// `channel()` -- this program's end of the channel it was started with, or `null`.
-//
-// **`null` rather than a fault, because a program may be run both ways.** The same file is a worker
-// under a supervisor and a script somebody typed the name of, and asking which it is now is the
-// whole point of the call.
-do_channel(args: Buf[Value], at: Span) -> Step
-    if args.len() != 0
-        return fault(at, s"`channel` takes nothing at all, and was given ${counted(args.len(), "argument")}")
-
-    own_channel match
-        Some(id) -> return Ok(ChannelVal(id))
-        None -> ()
-
-    val named = env.get(ChannelVariable) match
-        Some(v) -> v
-        None -> return Ok(Null)
-
-    val fd = parse_fd(named) match
-        Some(n) -> n
-        None -> return fault(at, s"`${ChannelVariable}` names the channel's descriptor and holds `${named}`, which is not one")
-
-    val p = libuv.pipe() match
-        Err(e) -> return fault(at, s"the channel on descriptor ${fd} could not be opened: ${e}")
-        Ok(p) -> p
-
-    p.open(fd) match
-        Err(e) ->
-            p.close(() -> ())
-            return fault(at, s"the channel on descriptor ${fd} could not be opened: ${e}")
-        Ok(_) -> ()
-
-    // **The slot is claimed so that the loop has work**, which is what keeps a worker running
-    // between one message and the next. `repeating` is true for `hold_socket`'s reason: nothing
-    // ever fires it, and the flag is what stops a slot being spent by a callback that runs.
-    val keep = claim(Pending(Null, Null, null, None, None, true, true, 0))
-    val id = channels.len()
-
-    channels.push(Channel(true, Some(p), true, buf(), Null, keep))
-    own_channel = Some(id)
-
-    read_channel(p, (bytes) -> channel_bytes(id, bytes), () -> channel_end(id))
-    Ok(ChannelVal(id))
-end do_channel
-
-// The descriptor a variable names, where it names one.
-private parse_fd(text: string) -> Option[int]
-    if text.bytes.len == 0 then return None
-
-    var n: long = 0
-
-    for i in 0..<text.bytes.len
-        val b = text.bytes[i]
-
-        if b < 0x30u8 || b > 0x39u8 then return None
-
-        n = n * 10 + long(b - 0x30u8)
-
-        if n > 65535 then return None
-
-    Some(int(n))
-
-// Bytes off this program's own channel.
-private channel_bytes(id: usize, bytes: []const u8)
-    if id >= channels.len() then return
-
-    var ch = channels.at(id)
-
-    if !ch.live || !ch.open then return
-
-    for b in bytes do ch.inbox.push(b)
-
-    channels.set(id, ch)
-    deliver_lines(id, false)
-
-// The parent has gone, or closed its end.
-//
-// **The slot goes with it, and that is what lets a worker exit.** A program whose supervisor has
-// finished has nobody to be told anything by, so the thing keeping it alive is exactly what has
-// ended.
-private channel_end(id: usize)
-    if id >= channels.len() then return
-
-    var ch = channels.at(id)
-
-    if !ch.live then return
-
-    ch.open = false
-    ch.pipe = None
-    ch.inbox = buf()
-    channels.set(id, ch)
-    surrender(ch.keep)
-
-// -- messages, in and out --------------------------------------------------------------------------
-
-// Hand every whole message in the buffer to whoever is listening.
-//
-// **A message arrives whole or not at all.** A read is a run of bytes and not a message: two
-// messages arrive in one read as often as half of one does, so the newline is what decides where a
-// message ends and a partial line waits for the rest of itself.
-private deliver_lines(id: usize, is_child: bool)
-    var going = true
-
-    while going
-        val bytes = if is_child then children.at(id).inbox else channels.at(id).inbox
-        var cut: Option[usize] = None
-
-        for i in 0..<bytes.len()
-            if bytes.at(i) == 0x0au8 && cut.is_none()
-                cut = Some(i)
-
-        cut match
-            None -> going = false
-            Some(end) ->
-                var line: Buf[u8] = buf()
-                var rest: Buf[u8] = buf()
-
-                for i in 0..<end do line.push(bytes.at(i))
-                for i in (end + 1)..<bytes.len() do rest.push(bytes.at(i))
-
-                if is_child
-                    var c = children.at(id)
-
-                    c.inbox = rest
-                    children.set(id, c)
-                else
-                    var ch = channels.at(id)
-
-                    ch.inbox = rest
-                    channels.set(id, ch)
-
-                if !deliver_one(id, is_child, line) then going = false
-
-// One message, decoded and handed over. False where the program has been stopped by what was on the
-// channel, so that the rest of the buffer is not walked afterwards.
-//
-// **A line that is not JSON stops the program naming the channel.** The alternative is dropping it,
-// which is the one answer that leaves nothing to look at: the sender is another program of the same
-// system, so a message that will not decode is a defect somebody can fix rather than input from the
-// outside world.
-private deliver_one(id: usize, is_child: bool, line: Buf[u8]) -> bool
-    // A carriage return before the newline, so that a sender written for a line-based protocol on
-    // another platform is not a fault.
-    var trimmed = line
-
-    if trimmed.len() > 0 && trimmed.at(trimmed.len() - 1) == 0x0du8
-        var shorter: Buf[u8] = buf()
-
-        for i in 0..<(trimmed.len() - 1) do shorter.push(trimmed.at(i))
-
-        trimmed = shorter
-
-    if trimmed.len() == 0 then return true
-
-    val at = if is_child then children.at(id).at else point(0)
-
-    val text = from_utf8(trimmed.view()) match
-        Ok(t) -> t
-        Err(_) ->
-            loop_fault = Some(failure(at, "a message on the channel is not text"))
-            return false
-
-    val src = source_of("channel", text)
-
-    val decoded = json.parse(src) match
-        Err(d) ->
-            loop_fault = Some(failure(at, s"a message on the channel is not JSON: ${d.render(src)}"))
-            return false
-        Ok(j) -> j
-
-    val mark = root_mark()
-
-    val v = slate_of_json(decoded, at) match
-        Ok(x) -> x
-        Err(s) ->
-            release(mark)
-            loop_fault = Some(s)
-            return false
-
-    hold(v)
-
-    val fn = if is_child then children.at(id).on_message else channels.at(id).on_message
-
-    call_with(fn, v, "onMessage")
-    release(mark)
-    true
-end deliver_one
-
-// Call what a program registered, with one argument. `Null` is nobody to call and not an error.
-//
-// **A fault inside it stops the program**, as it does for a timer and a socket and for the same
-// reason: the loop is not running a statement, so there is nothing to attach the complaint to but
-// the whole run.
-private call_with(fn: Value, v: Value, name: string)
-    fn match
-        Null -> return
-        _ -> ()
-
-    var args: Buf[Value] = buf()
-    val mark = root_mark()
-
-    hold(fn)
-    hold(v)
-    args.push(v)
-
-    apply_callback(fn, args, point(0), name) match
-        Ok(_) -> ()
-        Err(s) -> loop_fault = Some(s)
-
-    release(mark)
-end call_with
-
-// The bytes of one message, framed: the JSON and the newline that ends it.
-private framed(v: Value, at: Span) -> Result[Buf[u8], Signal]
-    var path: Buf[*u8] = buf()
-    val j = json_of_slate(v, at, &path)?
-    val text = s"${j}"
-
-    var out: Buf[u8] = buf()
-
-    for i in 0..<text.bytes.len do out.push(text.bytes[i])
-
-    out.push(0x0au8)
-    Ok(out)
-
-// Write one message to a channel, and say what happened.
-//
-// **A write that cannot be made is a RESULT and not a fault**, which is the one decision here that
-// is not obvious. A worker dying while its supervisor was writing to it is the ordinary shape of a
-// process ending, and a supervisor that had to wrap every `send` in a `try` to survive one is a
-// supervisor nobody would write. What faults is a value that is not a message at all -- that is a
-// defect in the program rather than news about the world, and it is `toJSON`'s own split.
-private write_message(p: Option[&libuv.Pipe], open: bool, bytes: Buf[u8], why: string) -> Step
-    if !open then return Ok(err_value(why))
-
-    p match
-        None -> Ok(err_value(why))
-        Some(pipe) ->
-            pipe.write(bytes.view()) match
-                Err(e) -> Ok(err_value(s"this message could not be sent: ${e}"))
-                Ok(_) -> Ok(ok_value(Null))
-
 // -- what a program calls ---------------------------------------------------------------------
 
 // `spawn(command, args)` and `spawn(command, args, options)`.
@@ -696,10 +439,11 @@ do_spawn(args: Buf[Value], at: Span) -> Step
     start_child(command, argv, options, at)
 end do_spawn
 
-// `child.send(value)` -- one message to a child, as JSON and a newline.
+// `child.send(value)` and `child.send(value, socket)` -- one message to a child, as JSON and a
+// newline, with a connection travelling beside it where one was given.
 do_child_send(args: Buf[Value], at: Span) -> Step
-    if args.len() != 2
-        return fault(at, s"`send` takes one message, and was given ${counted(args.len() - 1, "argument")}")
+    if args.len() < 2 || args.len() > 3
+        return fault(at, s"`send` takes one message and optionally a socket to pass on, and was given ${counted(args.len() - 1, "argument")}")
 
     val slot = child_of(args.at(0), at, "send")?
     val c = children.at(slot)
@@ -716,7 +460,12 @@ do_child_send(args: Buf[Value], at: Span) -> Step
     if !c.ipc
         return fault(at, "this child was started without a channel -- `spawn` opens one where the options say `ipc: true`")
 
-    write_message(c.channel, c.channel_open, bytes, if c.settled then "this child has exited" else "this channel is closed")
+    val why = if c.settled then "this child has exited" else "this channel is closed"
+
+    if args.len() == 3
+        return write_with_socket(c.channel, c.channel_open, bytes, args.at(2), c.peer, true, at, why)
+
+    write_message(c.channel, c.channel_open, bytes, why)
 end do_child_send
 
 // `child.kill()` and `child.kill(signal)` -- ask a child to stop.
@@ -801,43 +550,3 @@ do_child_exited(args: Buf[Value], at: Span) -> Step
     val slot = child_of(args.at(0), at, "exited")?
 
     Ok(children.at(slot).exited_promise)
-
-// The channel a builtin was handed.
-private channel_of(v: Value, at: Span, name: string) -> Result[usize, Signal]
-    v match
-        ChannelVal(id) ->
-            if id >= channels.len() || !channels.at(id).live
-                return Err(failure(at, s"this channel was opened by another program, and `${name}` needs this one's"))
-
-            Ok(id)
-        other -> Err(failure(at, s"`${name}` is something a channel does, and this is ${other.type_name()}"))
-
-// `channel().send(value)` -- one message to whoever started this program.
-do_channel_send(args: Buf[Value], at: Span) -> Step
-    if args.len() != 2
-        return fault(at, s"`send` takes one message, and was given ${counted(args.len() - 1, "argument")}")
-
-    val id = channel_of(args.at(0), at, "send")?
-    val ch = channels.at(id)
-    val bytes = framed(args.at(1), at)?
-
-    write_message(ch.pipe, ch.open, bytes, "this channel is closed")
-end do_channel_send
-
-// `channel().onMessage(fn)` -- what to call for every message the parent sends.
-do_channel_on_message(args: Buf[Value], at: Span) -> Step
-    if args.len() != 2
-        return fault(at, s"`onMessage` takes a function to call, and was given ${counted(args.len() - 1, "argument")}")
-
-    val id = channel_of(args.at(0), at, "onMessage")?
-
-    args.at(1) match
-        Fn(_) -> ()
-        other -> return fault(at, s"`onMessage` needs a function to call, and this is ${other.type_name()}")
-
-    var ch = channels.at(id)
-
-    ch.on_message = args.at(1)
-    channels.set(id, ch)
-    Ok(Null)
-end do_channel_on_message

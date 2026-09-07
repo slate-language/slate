@@ -127,6 +127,12 @@ while a read callback closes its own.
 **A closed socket is not whatever opens next.** The value a program holds carries the generation that
 claimed its slot, so a socket held across a `close` never comes to mean its successor.
 
+**A connection may have been ACCEPTED BY ANOTHER PROGRAM.** `child.send(value, socket)` and
+`channel().send(value, socket)` in [`slate:process`](process.md) pass one over a worker's channel, and
+what arrives at the other end is an ordinary connection of this module's — `onData`, `send`, `close`,
+`remoteAddress` and `startTls` all read it as they read one this program accepted itself. The sending
+side's own copy is closed once the message has gone, so exactly one program is holding it.
+
 ## TLS
 
 A listener told a certificate hands out connections whose bytes are already decrypted, so
