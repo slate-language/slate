@@ -90,6 +90,104 @@ Options are `{ cwd, env, timeout }`.
   signal the child may ignore leaving the promise pending exactly as it was.
 - **Output that is not text fails the call** rather than being replaced or mangled.
 
+## `spawn`
+
+**`run` is one question with one answer and `spawn` is a conversation.** `run` starts a program, waits
+for it and hands back what it printed; a *worker* — something started once, told things over its
+lifetime, and watched for the moment it dies — has nothing to wait on and no single answer to be
+given. So `spawn` answers at once, with a child the program keeps.
+
+```slate
+import { spawn } from slate:process
+
+async main()
+    val started = spawn("/bin/sh", ["-c", "read line <&3; printf '%s\\n' \"$line\" >&3"],
+        { ipc: true })
+    val worker = started.value
+
+    worker.onMessage(m ->
+        print("the worker sent back job", m.job))
+
+    worker.send({ job: 7 })
+
+    val gone = await worker.exited
+
+    print("it left with", gone.value.status)
+
+main()
+```
+
+```output
+the worker sent back job 7
+it left with 0
+```
+
+- **`spawn(command, args)` and `spawn(command, args, options)` answer `{ ok: true, value: child }` or
+  `{ ok: false, error }`, and they answer it AT ONCE.** The child has already been started by the time
+  the call comes back, so "there is no such program" is known there rather than one turn later.
+- **The options are `cwd`, `env` and `ipc`.** `env` replaces the child's environment exactly as `run`'s
+  does; `ipc: true` opens the message channel.
+- **stdin is closed and stdout and stderr are INHERITED**, which is the pair a worker wants: a child
+  waiting on input nobody will type is a hang with nothing on screen, and a worker's own log lines
+  belong wherever its supervisor's do. A program that wants the output captured instead wants `run`.
+- **A live child keeps the program alive**, exactly as a socket does. A supervisor that has started a
+  worker and reached its last statement is not finished.
+
+### What a child answers to
+
+| | |
+|---|---|
+| `child.pid` | the number the operating system knows it by, readable after it has died |
+| `child.exited` | a promise of `{ status, signal }`, settled once — `await` it to learn a worker died |
+| `child.onExit(fn)` | the callback form of the same answer |
+| `child.send(value)` | one message, as JSON and a newline — `{ ok, error }` |
+| `child.onMessage(fn)` | what to call for every message the child sends |
+| `child.kill()`, `child.kill(signal)` | ask it to stop; `SIGTERM` where no signal is named |
+
+- **`exited` and `onExit` are both there because a supervisor wants each in a different place.**
+  `await child.exited` is what one worker's own line of execution waits on; `onExit` is what a
+  supervisor watching several of them registers, having no line of execution to give to any one.
+- **A signal is `null` and never `0`**, which is `run`'s rule and for its reason: zero is a status a
+  program can exit with, so "killed by signal 0" — which is not a thing — has to be distinguishable
+  from "not killed". A child stopped by `kill()` answers `15`.
+- **`send` answers a RESULT and refuses a value that is not a message.** A worker dying while its
+  supervisor was writing to it is the ordinary shape of a process ending, so that is
+  `{ ok: false, error }`; a value `toJSON` cannot render is a defect in the program and faults, in
+  `toJSON`'s own words. That is slate's two-channel rule read twice in one call.
+- **A child started without `ipc` is refused a message** rather than answering a failure: the program
+  asked for a child with no channel and then wrote to the channel.
+
+## `channel`
+
+The other end of the same thing, read from inside the child.
+
+```slate
+import { channel } from slate:process
+
+val ch = channel()
+
+if ch == null
+    print("nobody started me")
+else
+    ch.onMessage(job ->
+        ch.send({ done: job.id }))
+```
+
+- **`channel()` answers `{ send, onMessage }` or `null`.** `null` rather than a fault, because the same
+  file is a worker under a supervisor and a script somebody typed the name of — and asking which it is
+  now is the whole point of the call. Asking twice answers the same channel.
+- **An open channel keeps the program alive**, which is what a worker waiting to be told something is.
+  It ends when the other end goes, so a worker whose supervisor has finished finishes too.
+- **The wire is one JSON value per line on descriptor 3**, and the child finds it through
+  `SLATE_CHANNEL_FD` in its environment — which is what node's `NODE_CHANNEL_FD` is for. It is the same
+  format on both back ends, so a supervisor running under the interpreter can drive a child running
+  under node and the other way round.
+- **A message arrives whole or not at all.** A read is a run of bytes and a message is a line, so half
+  a message waits for the rest of itself — and a line that is not JSON stops the program naming the
+  channel rather than being dropped where nobody would see it.
+- **There is no `close`.** A worker ends by ending, and a supervisor closes a channel by letting the
+  child go — or by asking it to stop with `kill`.
+
 ## Signals
 
 A program that leaves a socket open never exits, so a server ends only from the inside — and every way a

@@ -1,0 +1,175 @@
+module dev.slatelang.slate
+@tests
+
+import sh.sysl.libuv
+import sh.sysl.libuv.Handle
+import sh.sysl.libuv.Stream
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, from_utf8}
+
+// The child's own end of the channel, which is `channel()` in `slate:process`.
+//
+// **THE CHANNEL IS REAL AND THE PROGRAM UNDER TEST IS THE CHILD.** `tests/lang/spawn.sl` drives the
+// other side of this — a supervisor starting `/bin/sh` and exchanging messages with it — and what is
+// left over is the half a program only reaches when somebody else started it. There is nothing to
+// stand in for that: what is being tested is that a descriptor named in the environment is opened,
+// read a line at a time, and written back to.
+//
+// So the suite plays the supervisor. `socket_pair` is what `uv_spawn` makes for a channel anyway, one
+// end is named in `SLATE_CHANNEL_FD` exactly as a spawn names it, and the program under test finds it
+// there and cannot tell the difference. **The suite's own end is `unref`ed**, or the drain at the end
+// of the program would have a live handle to wait on and the suite would hang rather than fail.
+//
+// **The suite SHUTS its end rather than closing it**, which is the whole reason the arrangement
+// terminates: a shutdown is end-of-file to the program's channel, so the program's slot is
+// surrendered and it ends — while this side stays readable, and the replies it has already written
+// are still there to be read.
+
+// What a program says over a channel it was started with, and what it printed.
+//
+// `text` is the program; `messages` are the lines to put on the channel before it starts, each one
+// already JSON.
+private over_a_channel(text: string, messages: Buf[string]) -> (string, string)
+    val (mine, theirs) = libuv.socket_pair().expect("a pair of connected sockets")
+    val ours = libuv.pipe().expect("a pipe for this side")
+
+    ours.open(mine).expect("this side is adopted")
+
+    var heard: Buf[u8] = buf()
+    val sink = &heard
+
+    ours.read_start((r) ->
+        r match
+            Data(bytes) ->
+                for b in bytes do sink.push(b)
+            End -> ()
+            Failed(_) -> ()).expect("this side is read")
+
+    // **Unref'ed, or the drain at the end of the program waits on it for ever.** The handle still
+    // delivers everything it is sent; what it stops being is a reason for the loop to go round.
+    ours.unref()
+
+    for i in 0..<messages.len()
+        ours.write(s"${messages.at(i)}\n".bytes).expect("the message is queued")
+
+    ours.shutdown().expect("this side says it has finished")
+    libuv.set_env(ChannelVariable, s"${theirs}").expect("the descriptor is named")
+
+    val said = out(s"${SpawnImport}${text}")
+
+    libuv.unset_env(ChannelVariable).expect("the name is taken back")
+
+    // **One more turn, for a reply written as the program ended.** A write is queued rather than
+    // done, so the last one may still be in the kernel when the program's own slot goes.
+    libuv.default_loop().run(libuv.RUN_NOWAIT).expect("the last reply lands")
+    ours.close(() -> ())
+    libuv.default_loop().run(libuv.RUN_NOWAIT).expect("the close finishes")
+
+    (said, from_utf8(heard.view()).unwrap_or(""))
+end over_a_channel
+
+private val SpawnImport: string = "import { spawn, channel } from slate:process\n"
+
+@test
+A_PROGRAM_STARTED_WITH_A_CHANNEL_READS_ITS_MESSAGES_AND_WRITES_BACK()
+    var messages: Buf[string] = buf()
+
+    messages.push("{\"n\": 1}")
+    messages.push("\"two\"")
+    messages.push("[3, 4]")
+
+    val (said, wire) = over_a_channel(
+        "val ch = channel()\n" +
+        "print(ch != null)\n" +
+        "ch.onMessage(m ->\n" +
+        "    print(m)\n" +
+        "    ch.send({ back: m }))\n",
+        messages)
+
+    assert_eq(said, "true\n{n: 1}\ntwo\n[3, 4]")
+
+    // **And the wire is what the other side would read**, which is the half a program cannot see:
+    // one JSON value per line, in the order they were sent.
+    assert_eq(wire, "{\"back\":{\"n\":1}}\n{\"back\":\"two\"}\n{\"back\":[3,4]}\n")
+
+@test
+A_PARTIAL_LINE_IS_HELD_UNTIL_ITS_NEWLINE_ARRIVES()
+    // The three messages are written as one run of bytes and the last of them is cut in half, which
+    // is what a read actually looks like: a message is a line and not a read.
+    val (mine, theirs) = libuv.socket_pair().expect("a pair of connected sockets")
+    val ours = libuv.pipe().expect("a pipe for this side")
+
+    ours.open(mine).expect("this side is adopted")
+    ours.unref()
+    ours.write("1\n2\n\"half".bytes).expect("the first run is queued")
+    ours.write(" a message\"\n".bytes).expect("the rest is queued")
+    ours.shutdown().expect("this side says it has finished")
+    libuv.set_env(ChannelVariable, s"${theirs}").expect("the descriptor is named")
+
+    val said = out(SpawnImport +
+        "val ch = channel()\n" +
+        "ch.onMessage(m ->\n" +
+        "    print(m))\n")
+
+    libuv.unset_env(ChannelVariable).expect("the name is taken back")
+    ours.close(() -> ())
+    libuv.default_loop().run(libuv.RUN_NOWAIT).expect("the close finishes")
+    assert_eq(said, "1\n2\nhalf a message")
+
+@test
+A_LINE_THAT_IS_NOT_JSON_STOPS_THE_PROGRAM_NAMING_THE_CHANNEL()
+    // **Not dropped, which is the one answer that leaves nothing to look at.** The sender is another
+    // program of the same system, so a message that will not decode is a defect somebody can fix.
+    val (mine, theirs) = libuv.socket_pair().expect("a pair of connected sockets")
+    val ours = libuv.pipe().expect("a pipe for this side")
+
+    ours.open(mine).expect("this side is adopted")
+    ours.unref()
+    ours.write("not json at all\n".bytes).expect("the message is queued")
+    ours.shutdown().expect("this side says it has finished")
+    libuv.set_env(ChannelVariable, s"${theirs}").expect("the descriptor is named")
+
+    val said = fails(SpawnImport +
+        "val ch = channel()\n" +
+        "ch.onMessage(m ->\n" +
+        "    print(m))\n")
+
+    libuv.unset_env(ChannelVariable).expect("the name is taken back")
+    ours.close(() -> ())
+    libuv.default_loop().run(libuv.RUN_NOWAIT).expect("the close finishes")
+    assert(said.contains("a message on the channel is not JSON"), s"the channel is named: ${said}")
+
+@test
+A_DESCRIPTOR_THAT_IS_NOT_A_NUMBER_IS_REFUSED_BY_NAME()
+    libuv.set_env(ChannelVariable, "not-a-descriptor").expect("the name is set")
+
+    val said = fails(SpawnImport + "print(channel())\n")
+
+    libuv.unset_env(ChannelVariable).expect("the name is taken back")
+    assert(said.contains("which is not one"), s"the variable is named: ${said}")
+
+@test
+WHAT_channel_SAYS_ABOUT_WHAT_IT_WAS_GIVEN_INSTEAD()
+    assert(fails(SpawnImport + "print(channel(1))").contains("`channel` takes nothing at all"))
+
+@test
+A_CHILD_AND_A_CHANNEL_PRINT_AS_WHAT_THEY_ARE()
+    // A child is shown by its process id, which is the one number about it that means anything
+    // outside this program — and the same number `pid` answers.
+    val shown = out(SpawnImport +
+        "val started = spawn(\"/bin/sh\", [\"-c\", \"exit 0\"])\n" +
+        "print(string(started.value) == \"<child \" + string(started.value.pid) + \">\")\n" +
+        "print(started.value == started.value, started.value is object)\n")
+
+    // **Two names for one child ARE the same child**, the value being its slot and its generation
+    // — and a child is not an object, so nothing reads a field off one that it did not put there.
+    assert_eq(shown, "true\ntrue false")
+
+@test
+A_CHILD_IS_REFUSED_A_NAME_THAT_IS_NOT_ONE_OF_ITS_OWN()
+    val said = fails(SpawnImport +
+        "val started = spawn(\"/bin/sh\", [\"-c\", \"exit 0\"])\n" +
+        "print(started.value.nope)\n")
+
+    assert(said.contains("`nope`"), s"the name is quoted: ${said}")

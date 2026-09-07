@@ -596,6 +596,25 @@ can be signalled, and says so in those words rather than installing a handler no
 node's `mtimeMs`. It was missing for one release, which nothing noticed until a program walking a
 directory tree asked a file for its modification time and reached a field that was not there.
 
+### `spawn` is node's `child_process`, and the channel is slate's own framing
+
+`slate:process`'s `spawn` and `channel` are whole here on node. The child is `child_process.spawn`
+with stdin ignored and stdout and stderr inherited, and the message channel is a fourth descriptor —
+**not node's own IPC**, which frames what it likes and would have made a node child unreadable to an
+interpreter supervisor. What goes over it is what goes over it there: one JSON value per line, with
+`SLATE_CHANNEL_FD` naming the descriptor in the child's environment. So a supervisor under either back
+end drives a child under either back end.
+
+**A browser has no processes**, so `spawn` refuses there naming the host, in `listen`'s words rather
+than as a name that is not built yet. `channel()` answers `null` in a page, which is the true answer:
+nothing started it.
+
+One sentence differs and cannot be made to agree. node reports a program that is not there through an
+event on the next tick, where libuv answers on the spot — so a spawn that fails is still
+`{ ok: false, error }` **at once** here, `pid` being `undefined` for a child that did not start, but
+the error reads *"the program could not be started"* where the interpreter carries the operating
+system's own `ENOENT: no such file or directory`.
+
 ### A call with too few arguments is refused here too
 
 A JavaScript function binds `undefined` for an argument it was not given, and slate stores no
