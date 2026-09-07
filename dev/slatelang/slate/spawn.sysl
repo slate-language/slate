@@ -1,0 +1,552 @@
+module dev.slatelang.slate
+
+import sh.sysl.gc
+import sh.sysl.json
+import sh.sysl.libuv
+import sh.sysl.libuv.Handle
+import sh.sysl.libuv.Stream
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.env
+import sysl.text.from_utf8
+
+// A child that outlives the call that started it, and the message channel it was given.
+//
+// **`channel.sysl` is the other half**: the wire both ends of a channel speak, this program's own end
+// of the one it was started with, and the socket that may travel with a message. What is here is the
+// child -- starting one, watching it, and what a supervisor calls.
+//
+// **`run` is one question with one answer and this is a conversation**, which is the whole of the
+// difference between the two. `run` starts a program, waits for it, and hands back what it printed;
+// a program that wants a *worker* -- something started once, told things over its lifetime, and
+// watched for the moment it dies -- has nothing to wait on and no single answer to be given. So
+// `spawn` answers at once, with a value the program keeps.
+//
+// **It is node's `fork` under slate's names**, and deliberately: a supervisor that starts N copies
+// of a program and exchanges messages with each is the shape everything from a web server's worker
+// pool to a build farm is written in, and there is nothing to gain by spelling it a second way.
+//
+// ## The channel is newline-delimited JSON, and that is the whole wire format
+//
+// `ipc: true` gives the child a fourth descriptor -- fd 3 -- with the parent holding the other end,
+// and every message is one JSON value followed by a newline. **A message arrives whole or not at
+// all**: a partial line is held until its newline arrives, and a line that is not JSON stops the
+// program naming the channel rather than being dropped where nobody would see it.
+//
+// **`SLATE_CHANNEL_FD` is how the child finds it**, which is `NODE_CHANNEL_FD`'s job in node and is
+// there for the same reason: a descriptor number is not something a program can discover about
+// itself. The child reads `channel()`, which answers that end or `null` where there is none.
+//
+// **The format is the same on both back ends**, which is what makes a mixed cluster possible: a
+// supervisor running under the interpreter can drive a child running under node, and a supervisor
+// under node can drive one under the interpreter. Nothing in the framing is either host's.
+
+// One child, for as long as the program that started it runs.
+//
+// **Module storage and a slot, for the reason `event.sysl` gives**: a libuv callback is a sysl
+// closure, which the collector cannot see through, so it captures an index into this table and
+// nothing else. Unlike a `run`, the slot is **never given back** -- `child.pid` and `child.exited`
+// answer for a child that has already died, and a slot reused underneath a value the program still
+// holds is a use-after-free wearing an integer's clothes. What is released at the exit is everything
+// heavy: the handles, the buffered half-line and the callbacks.
+struct Child
+    live: bool
+
+    // Which occupant of this slot this is. Stamped once, never reused -- a program holding a child
+    // from an earlier run cannot name one from this one.
+    gen: usize
+
+    // The child's process id, which is the one number about it that means anything outside this
+    // program: it is what `ps` and `kill` are written with.
+    pid: long
+
+    // The handles, kept alive here for as long as libuv may still call back.
+    proc: Option[&libuv.Process]
+    channel: Option[&libuv.Pipe]
+
+    // Whether this child was started with a channel at all, which is a question about the `spawn`
+    // and stays answerable for ever -- where the handle goes when the channel ends.
+    ipc: bool
+
+    // Which host the child turned out to be running on, and `""` until it has said. **A socket may
+    // only be passed between two programs on the same host**, so this is what a `send` carrying one
+    // is refused by; `HostUnknown` is a child that spoke and was not a slate program.
+    peer: string
+
+    // Whether a message can still be written. False from the exit, and from the channel ending.
+    channel_open: bool
+
+    // The bytes of a message that has not reached its newline yet.
+    inbox: Buf[u8]
+
+    // Sockets taken off the channel that have not been handed to a message yet. **A handle arrives
+    // attached to the bytes of the message it was sent with**, so this is nearly always empty and
+    // never holds more than the read that filled it.
+    socks: Buf[Value]
+
+    // What the program registered, and `Null` for what it did not.
+    on_message: Value
+    on_exit: Value
+
+    // The promise `child.exited` answers, and the request slot rooting it until it settles. **The
+    // slot is what keeps the program alive while a child runs**, exactly as a socket's does: a
+    // supervisor that has started a worker and reached its last statement is not finished.
+    exited_promise: Value
+    request: usize
+    settled: bool
+
+    // Where the `spawn` was written, for the sentence a failure carries.
+    at: Span
+
+var children: Buf[Child] = buf()
+
+// Put both tables back to nothing, so that one program's children cannot be seen by the next.
+//
+// **Every handle is closed and not merely dropped**, which is `reset_events`' rule: a child left
+// running past the program that started it is a process nobody is watching, and its handles are on
+// the loop the *next* program runs on.
+forget_children()
+    for i in 0..<children.len()
+        var c = children.at(i)
+
+        if c.live
+            c.proc match
+                Some(p) -> p.close(() -> ())
+                None -> ()
+
+            c.channel match
+                Some(p) -> p.close(() -> ())
+                None -> ()
+
+        c.live = false
+        c.proc = None
+        c.channel = None
+        c.socks = buf()
+        c.on_message = Null
+        c.on_exit = Null
+        c.exited_promise = Null
+        children.set(i, c)
+
+    children = buf()
+    forget_channels()
+end forget_children
+
+// Mark what a child and a channel can still reach.
+//
+// Not `private`: `obj.sysl` roots the collector's walk and this is one of the places it reaches.
+mark_children(h: *gc.Heap)
+    for i in 0..<children.len()
+        mark_value(h, children.at(i).on_message)
+        mark_value(h, children.at(i).on_exit)
+        mark_value(h, children.at(i).exited_promise)
+
+        for j in 0..<children.at(i).socks.len()
+            mark_value(h, children.at(i).socks.at(j))
+
+    mark_channels(h)
+end mark_children
+
+// The process id of the child in this slot, for the way one is printed. `0` where the value names
+// no child of this run, which no live value can.
+//
+// Not `private`: `render.sysl` prints a child by its pid.
+child_pid_of(id: usize, gen: usize) -> long
+    if id >= children.len() then return 0
+    if children.at(id).gen != gen then return 0
+
+    children.at(id).pid
+end child_pid_of
+
+// Take a slot. **Nothing is reused**, which is what the header says and is the difference from
+// `run`'s table: a value the program still holds names this slot for as long as the program runs.
+private claim_child(request: usize, promise: Value, at: Span) -> usize
+    val gen = children.len() + 1
+
+    children.push(Child(true, gen, 0, None, None, false, "", false, buf(), buf(), Null, Null,
+                        promise, request, false, at))
+    children.len() - 1
+
+// The child a builtin was handed, as the slot that names it -- or the complaint about what it was
+// handed instead.
+private child_of(v: Value, at: Span, name: string) -> Result[usize, Signal]
+    v match
+        ChildVal(id, gen) ->
+            if id >= children.len() || children.at(id).gen != gen
+                return Err(failure(at, s"this child was started by another program, and `${name}` needs one of this program's"))
+
+            Ok(id)
+        other -> Err(failure(at, s"`${name}` is something a child process does, and this is ${other.type_name()}"))
+
+// Take the two channel variables off THIS process again, after a spawn that inherited them.
+private clear_channel_env()
+    libuv.unset_env(ChannelVariable) match
+        Err(_) -> ()
+        Ok(_) -> ()
+
+    libuv.unset_env(HostVariable) match
+        Err(_) -> ()
+        Ok(_) -> ()
+
+// -- starting one -----------------------------------------------------------------------------
+
+// `spawn(command, args)` and `spawn(command, args, options)` -- a child, at once.
+//
+// **The answer is a result and not a promise**, which is the whole difference from `run`: there is
+// nothing to wait for. `{ ok: true, value: child }` where the child started, and
+// `{ ok: false, error }` where there is no such program -- the same split `run` makes one turn of
+// the loop later, made here because the exec has already been tried by the time `spawn` returns.
+start_child(command: string, args: Buf[Value], options: Value, at: Span) -> Step
+    val argv = string_list(args, at, "spawn")?
+    val cwd = option_text(options, "cwd", at, "spawn")?
+    var environment = option_env(options, at, "spawn")?
+    val ipc = option_flag(options, "ipc", at, "spawn")?
+
+    var stdio: Buf[libuv.Stdio] = buf()
+
+    // **stdin is closed and the other two are inherited**, which is the pair of decisions a worker
+    // wants. A child waiting on input nobody will type is a hang with nothing on screen, and a
+    // worker's own complaints belong wherever its supervisor's do -- a log a deployment already
+    // collects, rather than a pipe the supervisor has to remember to drain.
+    stdio.push(libuv.Ignore)
+    stdio.push(libuv.Inherit)
+    stdio.push(libuv.Inherit)
+
+    var channel_pipe: Option[&libuv.Pipe] = None
+
+    if ipc
+        // **An ipc pipe and not an ordinary one, so that a socket can cross it.** A handle travels
+        // as ancillary data on a Unix domain socket, which libuv only reads for a pipe that was made
+        // with this flag -- and on a pipe without it `write_handle` is refused outright. Nothing
+        // about an ordinary message changes.
+        val p = libuv.pipe(true) match
+            Err(e) -> return Ok(err_value(s"a channel to `${command}` could not be made: ${e}"))
+            Ok(p) -> p
+
+        // **Both flags, because the channel is a conversation.** One flag makes a pipe; the two
+        // together make a connected pair of sockets, which is what a descriptor that is written at
+        // both ends has to be. They are named from the CHILD's point of view, as `run`'s are.
+        stdio.push(libuv.ToPipe(p, libuv.READABLE_PIPE | libuv.WRITABLE_PIPE))
+        channel_pipe = Some(p)
+
+        // **The descriptor is passed in the environment, which is the only place it can go.** A
+        // replaced environment gets the entry added to it; an inherited one is reached by setting
+        // the variable on THIS process across the spawn and taking it off again. `uv_spawn` has
+        // done the fork and the exec by the time it returns, and nothing else in this program runs
+        // in between, so the window is the call itself.
+        if environment.len() > 0
+            environment.push(s"${ChannelVariable}=${ChannelFd}")
+            environment.push(s"${HostVariable}=${HostName}")
+
+    val added_to_own = ipc && environment.len() == 0
+
+    if added_to_own
+        libuv.set_env(ChannelVariable, s"${ChannelFd}") match
+            Err(e) -> return Ok(err_value(s"the channel could not be named to `${command}`: ${e}"))
+            Ok(_) -> ()
+
+        libuv.set_env(HostVariable, HostName) match
+            Err(e) -> return Ok(err_value(s"the channel could not be named to `${command}`: ${e}"))
+            Ok(_) -> ()
+
+    val waiting = begin_request()
+    val promised = awaited_request(waiting)
+    val slot = claim_child(waiting, promised, at)
+
+    val child = libuv.spawn(command, argv.view(), (status, signal) ->
+            record_child_exit(slot, status, signal),
+        stdio.view(), cwd, environment.view(), 0, libuv.default_loop()) match
+        Err(e) ->
+            if added_to_own then clear_channel_env()
+
+            channel_pipe match
+                Some(p) -> p.close(() -> ())
+                None -> ()
+
+            drop_child(slot)
+            surrender(waiting)
+            return Ok(err_value(s"cannot run `${command}`: ${e}"))
+        Ok(c) -> c
+
+    if added_to_own then clear_channel_env()
+
+    var held = children.at(slot)
+
+    held.proc = Some(child)
+    held.pid = long(child.pid())
+    held.channel = channel_pipe
+    held.ipc = ipc
+    held.channel_open = ipc
+    children.set(slot, held)
+
+    // **The exit callback is replaced now that there is a handle to capture**, exactly as `run`
+    // does it: `spawn` takes its callback before the child exists, and a callback that has to close
+    // the handle cannot be written until there is one. Nothing can have run in between.
+    child.on_exit((status, signal) ->
+        record_child_exit(slot, status, signal)
+        child.close(() -> ()))
+
+    channel_pipe match
+        Some(p) -> read_channel(p, (bytes) -> child_bytes(slot, bytes), (v) -> child_socket(slot, v),
+                                () -> child_channel_end(slot))
+        None -> ()
+
+    Ok(ok_value(ChildVal(slot, children.at(slot).gen)))
+end start_child
+
+// One boolean option out of the options object, and `false` where it was not given.
+//
+// **Absent and `false` are one answer here**, unlike `env` and `cwd`, because there is nothing a
+// program could mean by asking for no channel that leaving the option out does not already say.
+private option_flag(options: Value, key: string, at: Span, name: string) -> Result[bool, Signal]
+    options match
+        Value.Null -> Ok(false)
+        Object(o) ->
+            val (v, _) = field_from(o, key, at)?
+
+            v match
+                Undefined -> Ok(false)
+                Bool(b) -> Ok(b)
+                other -> Err(failure(at, s"`${key}` is true or false, and this is ${other.type_name()}"))
+        other -> Err(failure(at, s"`${name}` takes its options as an object, and this is ${other.type_name()}"))
+
+// -- what the parent's end does -----------------------------------------------------------------
+
+// Bytes off a child's channel.
+private child_bytes(slot: usize, bytes: []const u8)
+    if slot >= children.len() then return
+
+    var c = children.at(slot)
+
+    // **Not gated on the child still being alive.** A child that writes a message and exits in the
+    // same breath is ordinary, and the exit reaches this program first as often as not -- so a
+    // delivery that stopped at the exit would drop the last thing a worker said.
+    if !c.live then return
+
+    for b in bytes do c.inbox.push(b)
+
+    children.set(slot, c)
+    deliver_lines(slot, true)
+    orphan_check(slot, true)
+
+// A socket off a child's channel, waiting for the message it was sent with.
+private child_socket(slot: usize, v: Value)
+    if slot >= children.len() then return
+
+    var c = children.at(slot)
+
+    if !c.live then return
+
+    c.socks.push(v)
+    children.set(slot, c)
+
+// A child's channel has ended, which is the child going away or closing its end.
+private child_channel_end(slot: usize)
+    if slot >= children.len() then return
+
+    var c = children.at(slot)
+
+    if !c.live then return
+
+    c.channel_open = false
+    c.channel = None
+    c.inbox = buf()
+
+    // **A socket nobody was given is closed here**, its slot being one of the things keeping this
+    // program alive: a worker that went away half-way through a message would otherwise leave a
+    // supervisor waiting on a connection it never handed over.
+    drop_socks(c.socks)
+    c.socks = buf()
+    children.set(slot, c)
+
+// The child has gone.
+private record_child_exit(slot: usize, status: i64, signal: i32)
+    if slot >= children.len() then return
+
+    var c = children.at(slot)
+
+    if !c.live || c.settled then return
+
+    c.settled = true
+    children.set(slot, c)
+
+    val mark = root_mark()
+    val o = new_object()
+
+    hold(Object(o))
+    obj_put_name(o, "status", Int(long(status)))
+
+    // **A signal is `null` and not zero**, which is `run`'s decision and for its reason: zero is a
+    // status a program can exit with, so a caller has to be able to tell "killed by signal 0" --
+    // which is not a thing -- from "not killed".
+    obj_put_name(o, "signal", if signal == 0 then Null else Int(long(int(signal))))
+
+    val answer = Object(o)
+
+    answer_request(c.request, answer)
+
+    var after = children.at(slot)
+    val told = after.on_exit
+
+    // **The process handle goes and the channel does NOT**, which is the same rule `run` keeps by
+    // waiting for the pipes as well as for the exit: a message already on its way is a message the
+    // program was sent, and the read that carries it may land after the exit. What the exit settles
+    // is that nothing more can be *written* -- `channel_open` is false from here.
+    //
+    // **The pid and the promise stay.** A supervisor reads `child.pid` in the sentence it logs about
+    // a worker that died, and `await child.exited` may be written after the child has already gone.
+    after.proc = None
+    after.channel_open = false
+    after.on_exit = Null
+    children.set(slot, after)
+
+    call_with(told, answer, "onExit")
+    release(mark)
+end record_child_exit
+
+// Give up everything a slot holds, for a spawn that never started a child.
+private drop_child(slot: usize)
+    if slot >= children.len() then return
+
+    var c = children.at(slot)
+
+    c.live = false
+    c.proc = None
+    c.channel = None
+    c.on_message = Null
+    c.on_exit = Null
+    c.exited_promise = Null
+    children.set(slot, c)
+
+// -- what a program calls ---------------------------------------------------------------------
+
+// `spawn(command, args)` and `spawn(command, args, options)`.
+do_spawn(args: Buf[Value], at: Span) -> Step
+    if args.len() < 1 || args.len() > 3
+        return fault(at, s"`spawn` takes a command, its arguments and optionally some options, and was given ${counted(args.len(), "argument")}")
+
+    val command = text_argument(args.at(0), at, "spawn", "a command")?
+
+    var argv: Buf[Value] = buf()
+
+    if args.len() > 1
+        args.at(1) match
+            Array(a) ->
+                for i in 0..<a.items.len() do argv.push(a.items.at(i))
+            other -> return fault(at, s"`spawn` takes the arguments as an array, and this is ${other.type_name()}")
+
+    val options = if args.len() > 2 then args.at(2) else Value.Null
+
+    start_child(command, argv, options, at)
+end do_spawn
+
+// `child.send(value)` and `child.send(value, socket)` -- one message to a child, as JSON and a
+// newline, with a connection travelling beside it where one was given.
+do_child_send(args: Buf[Value], at: Span) -> Step
+    if args.len() < 2 || args.len() > 3
+        return fault(at, s"`send` takes one message and optionally a socket to pass on, and was given ${counted(args.len() - 1, "argument")}")
+
+    val slot = child_of(args.at(0), at, "send")?
+    val c = children.at(slot)
+
+    // **The message is framed BEFORE the channel is looked at**, so a value that is not a message is
+    // refused in `toJSON`'s words whether the child is alive or not -- a program that learns about
+    // its own defect only for a live child learns about it on the day it stops mattering.
+    val bytes = framed(args.at(1), at)?
+
+    // **A child started without `ipc` is refused rather than answering a failure**, because there is
+    // nothing about the world to report: the program asked for a child with no channel and then
+    // wrote to the channel, which is a mistake in the program -- and it is one whether the child is
+    // still running or not, which is why the question is about the `spawn` and not about the handle.
+    if !c.ipc
+        return fault(at, "this child was started without a channel -- `spawn` opens one where the options say `ipc: true`")
+
+    val why = if c.settled then "this child has exited" else "this channel is closed"
+
+    if args.len() == 3
+        return write_with_socket(c.channel, c.channel_open, bytes, args.at(2), c.peer, true, at, why)
+
+    write_message(c.channel, c.channel_open, bytes, why)
+end do_child_send
+
+// `child.kill()` and `child.kill(signal)` -- ask a child to stop.
+do_child_kill(args: Buf[Value], at: Span) -> Step
+    if args.len() < 1 || args.len() > 2
+        return fault(at, s"`kill` takes a signal or nothing at all, and was given ${counted(args.len() - 1, "argument")}")
+
+    val slot = child_of(args.at(0), at, "kill")?
+
+    // **`SIGTERM` by default, which is what a deployment sends and what `kill` with no argument
+    // means at a shell.** A default of `SIGKILL` would be a child given no chance to finish what it
+    // was doing, chosen for it by a program that said nothing about the matter.
+    val name = if args.len() == 2
+        args.at(1) match
+            Str(p) -> p.s
+            other -> return fault(at, s"`kill` takes a signal by name, and this is ${other.type_name()}")
+    else
+        "SIGTERM"
+
+    val signum = signal_number(name) match
+        Some(n) -> n
+        None -> return fault(at, s"`${name}` is not a signal -- ${signal_choices()}")
+
+    val c = children.at(slot)
+
+    c.proc match
+        None -> Ok(err_value("this child has exited"))
+        Some(p) ->
+            p.kill(signum) match
+                Err(e) -> Ok(err_value(s"this child could not be signalled: ${e}"))
+                Ok(_) -> Ok(ok_value(Null))
+end do_child_kill
+
+// `child.onMessage(fn)` -- what to call for every message the child sends.
+do_child_on_message(args: Buf[Value], at: Span) -> Step
+    if args.len() != 2
+        return fault(at, s"`onMessage` takes a function to call, and was given ${counted(args.len() - 1, "argument")}")
+
+    val slot = child_of(args.at(0), at, "onMessage")?
+
+    args.at(1) match
+        Fn(_) -> ()
+        other -> return fault(at, s"`onMessage` needs a function to call, and this is ${other.type_name()}")
+
+    var c = children.at(slot)
+
+    c.on_message = args.at(1)
+    children.set(slot, c)
+    Ok(Null)
+end do_child_on_message
+
+// `child.onExit(fn)` -- the callback form of `child.exited`.
+//
+// **Both, because a supervisor wants each in a different place.** `await child.exited` is what one
+// worker's own line of execution waits on; `onExit` is what a supervisor watching N of them
+// registers, having no line of execution to give to any one of them.
+do_child_on_exit(args: Buf[Value], at: Span) -> Step
+    if args.len() != 2
+        return fault(at, s"`onExit` takes a function to call, and was given ${counted(args.len() - 1, "argument")}")
+
+    val slot = child_of(args.at(0), at, "onExit")?
+
+    args.at(1) match
+        Fn(_) -> ()
+        other -> return fault(at, s"`onExit` needs a function to call, and this is ${other.type_name()}")
+
+    var c = children.at(slot)
+
+    c.on_exit = args.at(1)
+    children.set(slot, c)
+    Ok(Null)
+end do_child_on_exit
+
+// `child.pid` -- the number the operating system knows the child by.
+do_child_pid(args: Buf[Value], at: Span) -> Step
+    val slot = child_of(args.at(0), at, "pid")?
+
+    Ok(Int(children.at(slot).pid))
+
+// `child.exited` -- a promise of `{ status, signal }`, settled once and readable afterwards.
+do_child_exited(args: Buf[Value], at: Span) -> Step
+    val slot = child_of(args.at(0), at, "exited")?
+
+    Ok(children.at(slot).exited_promise)

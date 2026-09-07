@@ -576,6 +576,56 @@ can be signalled, and says so in those words rather than installing a handler no
 node's `mtimeMs`. It was missing for one release, which nothing noticed until a program walking a
 directory tree asked a file for its modification time and reached a field that was not there.
 
+### `spawn` is node's `child_process`, and the channel is slate's own framing
+
+`slate:process`'s `spawn` and `channel` are whole here on node. The child is `child_process.spawn`
+with stdin ignored and stdout and stderr inherited, and the message channel is a fourth descriptor
+carrying one JSON value per line, with `SLATE_CHANNEL_FD` naming it in the child's environment — the
+same wire as the interpreter's, so a supervisor under either back end drives a child under either back
+end.
+
+**That descriptor is node's own `"ipc"` slot, which turns out to write exactly that wire.**
+`child_process` frames a message as `JSON.stringify(message) + "\n"` down a descriptor, so a child
+running under the interpreter reads node's channel without knowing whose it is, and a child running
+under node that was started by the interpreter finds no `NODE_CHANNEL_FD`, falls through to
+`SLATE_CHANNEL_FD`, and reads the descriptor itself. What the ipc slot buys over a plain pipe is the
+one thing a plain pipe cannot carry here.
+
+#### A socket crosses between two programs on THIS host, and is refused across the boundary
+
+`child.send(value, socket)` and `channel().send(value, socket)` pass a connection to the other end.
+node passes a handle only over its own channel and through an internal protocol both ends have to
+speak, so the four pairings are not alike:
+
+| supervisor | worker | messages | a socket |
+|---|---|---|---|
+| `slate js` | `slate js` | yes | yes |
+| interpreter | interpreter | yes | yes |
+| `slate js` | interpreter | yes | refused with a sentence |
+| interpreter | `slate js` | yes | refused with a sentence |
+
+**Neither end can guess what the other is, so each says.** The parent's host goes into the child's
+environment as `SLATE_CHANNEL_HOST`; the child's comes back as the first line its channel writes,
+`{"$slate":"js"}` here and `{"$slate":"native"}` there, swallowed rather than delivered. A refusal is a
+fault naming both hosts — never a descriptor quietly dropped, which is what writing node's internal
+frames to a program that does not speak them would be.
+
+**So a socket goes to a child that has already said something.** The child says it as soon as it calls
+`channel()`, and a worker signalling that it is ready is what a supervisor waits for anyway.
+
+`slate:http`'s `adopt` is the same on both: a connection that arrived over a channel is fed to a server
+that never listened, which here is node's `server.emit("connection", socket)`.
+
+**A browser has no processes**, so `spawn` refuses there naming the host, in `listen`'s words rather
+than as a name that is not built yet. `channel()` answers `null` in a page, which is the true answer:
+nothing started it.
+
+One sentence differs and cannot be made to agree. node reports a program that is not there through an
+event on the next tick, where libuv answers on the spot — so a spawn that fails is still
+`{ ok: false, error }` **at once** here, `pid` being `undefined` for a child that did not start, but
+the error reads *"the program could not be started"* where the interpreter carries the operating
+system's own `ENOENT: no such file or directory`.
+
 ### A call with too few arguments is refused here too
 
 A JavaScript function binds `undefined` for an argument it was not given, and slate stores no

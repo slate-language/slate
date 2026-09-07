@@ -1,0 +1,552 @@
+module dev.slatelang.slate
+@tests
+
+import sh.sysl.libuv
+import sh.sysl.libuv.Handle
+import sh.sysl.libuv.Stream
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{remove_file, write_text}
+import sysl.process.{capture, Status}
+import sysl.text.{Search, from_utf8}
+
+// The child's own end of the channel, which is `channel()` in `slate:process`.
+//
+// **THE CHANNEL IS REAL AND THE PROGRAM UNDER TEST IS THE CHILD.** `tests/lang/spawn.sl` drives the
+// other side of this — a supervisor starting `/bin/sh` and exchanging messages with it — and what is
+// left over is the half a program only reaches when somebody else started it. There is nothing to
+// stand in for that: what is being tested is that a descriptor named in the environment is opened,
+// read a line at a time, and written back to.
+//
+// So the suite plays the supervisor. `socket_pair` is what `uv_spawn` makes for a channel anyway, one
+// end is named in `SLATE_CHANNEL_FD` exactly as a spawn names it, and the program under test finds it
+// there and cannot tell the difference. **The suite's own end is `unref`ed**, or the drain at the end
+// of the program would have a live handle to wait on and the suite would hang rather than fail.
+//
+// **The suite SHUTS its end rather than closing it**, which is the whole reason the arrangement
+// terminates: a shutdown is end-of-file to the program's channel, so the program's slot is
+// surrendered and it ends — while this side stays readable, and the replies it has already written
+// are still there to be read.
+
+// What a program says over a channel it was started with, and what it printed.
+//
+// `text` is the program; `messages` are the lines to put on the channel before it starts, each one
+// already JSON.
+private over_a_channel(text: string, messages: Buf[string]) -> (string, string)
+    val (mine, theirs) = libuv.socket_pair().expect("a pair of connected sockets")
+    val ours = libuv.pipe().expect("a pipe for this side")
+
+    ours.open(mine).expect("this side is adopted")
+
+    var heard: Buf[u8] = buf()
+    val sink = &heard
+
+    ours.read_start((r) ->
+        r match
+            Data(bytes) ->
+                for b in bytes do sink.push(b)
+            End -> ()
+            Failed(_) -> ()).expect("this side is read")
+
+    // **Unref'ed, or the drain at the end of the program waits on it for ever.** The handle still
+    // delivers everything it is sent; what it stops being is a reason for the loop to go round.
+    ours.unref()
+
+    for i in 0..<messages.len()
+        ours.write(s"${messages.at(i)}\n".bytes).expect("the message is queued")
+
+    ours.shutdown().expect("this side says it has finished")
+    libuv.set_env(ChannelVariable, s"${theirs}").expect("the descriptor is named")
+
+    val said = out(s"${SpawnImport}${text}")
+
+    libuv.unset_env(ChannelVariable).expect("the name is taken back")
+
+    // **One more turn, for a reply written as the program ended.** A write is queued rather than
+    // done, so the last one may still be in the kernel when the program's own slot goes.
+    libuv.default_loop().run(libuv.RUN_NOWAIT).expect("the last reply lands")
+    ours.close(() -> ())
+    libuv.default_loop().run(libuv.RUN_NOWAIT).expect("the close finishes")
+
+    (said, from_utf8(heard.view()).unwrap_or(""))
+end over_a_channel
+
+private val SpawnImport: string = "import { spawn, channel } from slate:process\n"
+
+@test
+A_PROGRAM_STARTED_WITH_A_CHANNEL_READS_ITS_MESSAGES_AND_WRITES_BACK()
+    var messages: Buf[string] = buf()
+
+    messages.push("{\"n\": 1}")
+    messages.push("\"two\"")
+    messages.push("[3, 4]")
+
+    val (said, wire) = over_a_channel(
+        "val ch = channel()\n" +
+        "print(ch != null)\n" +
+        "ch.onMessage(m ->\n" +
+        "    print(m)\n" +
+        "    ch.send({ back: m }))\n",
+        messages)
+
+    assert_eq(said, "true\n{n: 1}\ntwo\n[3, 4]")
+
+    // **And the wire is what the other side would read**, which is the half a program cannot see:
+    // one JSON value per line, in the order they were sent.
+    // **The line the channel opens with is the program saying which host it is on**, so that a
+    // supervisor knows whether a socket may be passed to it. It is swallowed at the other end rather
+    // than delivered, which is why nothing above sees it.
+    assert_eq(wire, "{\"$slate\":\"native\"}\n" +
+                    "{\"back\":{\"n\":1}}\n{\"back\":\"two\"}\n{\"back\":[3,4]}\n")
+
+@test
+A_PARTIAL_LINE_IS_HELD_UNTIL_ITS_NEWLINE_ARRIVES()
+    // The three messages are written as one run of bytes and the last of them is cut in half, which
+    // is what a read actually looks like: a message is a line and not a read.
+    val (mine, theirs) = libuv.socket_pair().expect("a pair of connected sockets")
+    val ours = libuv.pipe().expect("a pipe for this side")
+
+    ours.open(mine).expect("this side is adopted")
+    ours.unref()
+    ours.write("1\n2\n\"half".bytes).expect("the first run is queued")
+    ours.write(" a message\"\n".bytes).expect("the rest is queued")
+    ours.shutdown().expect("this side says it has finished")
+    libuv.set_env(ChannelVariable, s"${theirs}").expect("the descriptor is named")
+
+    val said = out(SpawnImport +
+        "val ch = channel()\n" +
+        "ch.onMessage(m ->\n" +
+        "    print(m))\n")
+
+    libuv.unset_env(ChannelVariable).expect("the name is taken back")
+    ours.close(() -> ())
+    libuv.default_loop().run(libuv.RUN_NOWAIT).expect("the close finishes")
+    assert_eq(said, "1\n2\nhalf a message")
+
+@test
+A_LINE_THAT_IS_NOT_JSON_STOPS_THE_PROGRAM_NAMING_THE_CHANNEL()
+    // **Not dropped, which is the one answer that leaves nothing to look at.** The sender is another
+    // program of the same system, so a message that will not decode is a defect somebody can fix.
+    val (mine, theirs) = libuv.socket_pair().expect("a pair of connected sockets")
+    val ours = libuv.pipe().expect("a pipe for this side")
+
+    ours.open(mine).expect("this side is adopted")
+    ours.unref()
+    ours.write("not json at all\n".bytes).expect("the message is queued")
+    ours.shutdown().expect("this side says it has finished")
+    libuv.set_env(ChannelVariable, s"${theirs}").expect("the descriptor is named")
+
+    val said = fails(SpawnImport +
+        "val ch = channel()\n" +
+        "ch.onMessage(m ->\n" +
+        "    print(m))\n")
+
+    libuv.unset_env(ChannelVariable).expect("the name is taken back")
+    ours.close(() -> ())
+    libuv.default_loop().run(libuv.RUN_NOWAIT).expect("the close finishes")
+    assert(said.contains("a message on the channel is not JSON"), s"the channel is named: ${said}")
+
+@test
+A_DESCRIPTOR_THAT_IS_NOT_A_NUMBER_IS_REFUSED_BY_NAME()
+    libuv.set_env(ChannelVariable, "not-a-descriptor").expect("the name is set")
+
+    val said = fails(SpawnImport + "print(channel())\n")
+
+    libuv.unset_env(ChannelVariable).expect("the name is taken back")
+    assert(said.contains("which is not one"), s"the variable is named: ${said}")
+
+@test
+WHAT_channel_SAYS_ABOUT_WHAT_IT_WAS_GIVEN_INSTEAD()
+    assert(fails(SpawnImport + "print(channel(1))").contains("`channel` takes nothing at all"))
+
+@test
+A_CHILD_AND_A_CHANNEL_PRINT_AS_WHAT_THEY_ARE()
+    // A child is shown by its process id, which is the one number about it that means anything
+    // outside this program — and the same number `pid` answers.
+    val shown = out(SpawnImport +
+        "val started = spawn(\"/bin/sh\", [\"-c\", \"exit 0\"])\n" +
+        "print(string(started.value) == \"<child \" + string(started.value.pid) + \">\")\n" +
+        "print(started.value == started.value, started.value is object)\n")
+
+    // **Two names for one child ARE the same child**, the value being its slot and its generation
+    // — and a child is not an object, so nothing reads a field off one that it did not put there.
+    assert_eq(shown, "true\ntrue false")
+
+@test
+A_CHILD_IS_REFUSED_A_NAME_THAT_IS_NOT_ONE_OF_ITS_OWN()
+    val said = fails(SpawnImport +
+        "val started = spawn(\"/bin/sh\", [\"-c\", \"exit 0\"])\n" +
+        "print(started.value.nope)\n")
+
+    assert(said.contains("`nope`"), s"the name is quoted: ${said}")
+
+// -- a socket crossing the channel ----------------------------------------------------------------
+
+// **THE SUITE PLAYS THE SUPERVISOR HERE TOO, AND THAT IS WHAT MAKES THESE REAL.** A handle crosses a
+// Unix domain socket as ancillary data, so the only way to test either direction is to have a second
+// program at the other end of a real ipc pipe -- and `over_a_channel` above already establishes that
+// the suite can be that program. What is added is the ipc flag, which is what libuv reads the
+// ancillary data for, and the two calls that put a handle on the wire and take one off it.
+//
+// `tests/lang/spawn.sl` drives what a supervisor is REFUSED, which needs no second host; the four
+// pairings of interpreter and node are what `docs/reference/javascript.md` sets out.
+
+// Turn the loop until something this side is waiting for has arrived.
+//
+// **A single `RUN_NOWAIT` is not enough and passed for a while anyway.** What a test of this kind
+// waits for is a write the OTHER program made and this side's own read of it, which is at least one
+// more turn than the program's own drain took -- so one non-blocking turn is a race that a quiet
+// machine wins and a busy one loses. The timer is what makes `RUN_ONCE` safe to use: without an
+// event of our own it would block for ever where nothing arrives, and the turn count is the ceiling.
+//
+// **`ready` has to read through a POINTER**, a sysl closure capturing by value: written against the
+// `Buf` itself it tests a copy that never grows, spins the whole ceiling and passes anyway because the
+// data has landed by the time the assertion reads the real one -- a test that is green for the wrong
+// reason and half a second slower for it.
+private pump_until(ready: &Fn() -> bool)
+    val tick = libuv.timer().expect("a timer")
+
+    tick.start(2u64, 2u64, () -> ()).expect("the timer is armed")
+
+    var turns = 0
+
+    while !ready() && turns < 250
+        libuv.default_loop().run(libuv.RUN_ONCE).expect("the loop turned")
+        turns = turns + 1
+
+    tick.close()
+    libuv.default_loop().run(libuv.RUN_NOWAIT).expect("the timer is given back")
+end pump_until
+
+// The suite's own end of a channel, as an ipc pipe rather than an ordinary one.
+private ipc_end() -> (&libuv.Pipe, i32)
+    val (mine, theirs) = libuv.socket_pair().expect("a pair of connected sockets")
+    val ours = libuv.pipe(true).expect("an ipc pipe for this side")
+
+    ours.open(mine).expect("this side is adopted")
+    ours.unref()
+    (ours, theirs)
+
+// A connected pair of sockets the suite owns, so that one of them can be handed to a program.
+private connected_tcp() -> (&libuv.Tcp, &libuv.Tcp, &libuv.Tcp)
+    val server = libuv.tcp().expect("a listening socket")
+    val client = libuv.tcp().expect("a client socket")
+
+    server.bind(libuv.ip4("127.0.0.1", 0).expect("an address"), 0).expect("bound")
+
+    var taken: Option[&libuv.Tcp] = None
+    val slot = &taken
+
+    server.listen(1, () ->
+        val conn = server.accept().expect("a connection")
+
+        *slot = Some(conn)).expect("listening")
+
+    client.connect(server.sockname().expect("the port"), (r) -> r.expect("connected")).expect("connecting")
+
+    while taken.is_none()
+        libuv.default_loop().run(libuv.RUN_ONCE).expect("the loop turned")
+
+    // **Unref'ed for `ipc_end`'s reason**: the drain at the end of the program under test would
+    // otherwise have this side's handles to wait on, and the suite would hang rather than fail.
+    server.unref()
+    client.unref()
+    (server, client, taken.expect("the connection"))
+
+@test
+A_SOCKET_ARRIVES_WITH_THE_MESSAGE_IT_WAS_SENT_WITH()
+    // The supervisor's shape exactly: a connection this side accepted, written to the worker with
+    // the message that says what to do with it, and answered by the worker on the socket itself.
+    val (ours, theirs) = ipc_end()
+    val (server, client, conn) = connected_tcp()
+
+    var reply: Buf[u8] = buf()
+    val heard = &reply
+
+    client.read_start((r) -> r match
+        Data(bytes) ->
+            for b in bytes do heard.push(b)
+        End -> ()
+        Failed(_) -> ()).expect("the client is read")
+
+    client.unref()
+    ours.write_handle("{\"job\": 1}\n".bytes, conn, (r) ->
+        r.expect("the handle was sent")
+        conn.close()).expect("the message is queued")
+
+    ours.shutdown().expect("this side says it has finished")
+    libuv.set_env(ChannelVariable, s"${theirs}").expect("the descriptor is named")
+
+    val said = out(SpawnImport +
+        "import { send, close } from slate:net\n" +
+        "val ch = channel()\n" +
+        "ch.onMessage((m, conn) ->\n" +
+        "    print(conn != null)\n" +
+        "    send(conn, \"worker took job \" + string(m.job))\n" +
+        "    close(conn))\n")
+
+    libuv.unset_env(ChannelVariable).expect("the name is taken back")
+    pump_until(() -> heard.len() > 0)
+    ours.close(() -> ())
+    server.close()
+    client.close()
+    libuv.default_loop().run(libuv.RUN_NOWAIT).expect("the closes finish")
+
+    assert_eq(said, "true")
+
+    // **And the connection the worker was given is the one this side accepted**, which is the whole
+    // claim: the answer arrives on the socket the supervisor made, written by the other program.
+    assert_eq(from_utf8(reply.view()).unwrap_or(""), "worker took job 1")
+
+@test
+A_SOCKET_WITH_NO_MESSAGE_TO_CARRY_IT_STOPS_THE_PROGRAM_NAMING_THE_CHANNEL()
+    // **One message carries at most one socket, and a socket carries no message of its own.** A
+    // handle that arrives with nothing to hand it to would otherwise be a connection nobody is ever
+    // told about -- a client waiting for an answer from a worker that was never given the socket.
+    val (ours, theirs) = ipc_end()
+    val (server, client, conn) = connected_tcp()
+
+    client.unref()
+    ours.write_handle("\n".bytes, conn, (r) ->
+        r.expect("the handle was sent")
+        conn.close()).expect("the message is queued")
+
+    ours.shutdown().expect("this side says it has finished")
+    libuv.set_env(ChannelVariable, s"${theirs}").expect("the descriptor is named")
+
+    val said = fails(SpawnImport +
+        "val ch = channel()\n" +
+        "ch.onMessage((m, conn) ->\n" +
+        "    print(m))\n")
+
+    libuv.unset_env(ChannelVariable).expect("the name is taken back")
+    ours.close(() -> ())
+    server.close()
+    client.close()
+    libuv.default_loop().run(libuv.RUN_NOWAIT).expect("the closes finish")
+    assert(said.contains("no message to carry it"), s"the channel is named: ${said}")
+
+@test
+A_SOCKET_GOES_UP_THE_CHANNEL_TO_A_PARENT_ON_THE_SAME_HOST()
+    // The other direction, which is what a worker handing a connection back would do -- and the
+    // pinned part is that the SENDER's copy is given up once the write has gone, since what crossed
+    // is a duplicate and two owners would each read half of one connection.
+    val (ours, theirs) = ipc_end()
+
+    var kinds: Buf[i32] = buf()
+    var wire: Buf[u8] = buf()
+    val seen = &kinds
+    val read = &wire
+
+    ours.read_start((r) -> r match
+        Data(bytes) ->
+            while ours.pending_count() > 0
+                seen.push(ours.pending_type())
+
+                val into = libuv.tcp().expect("a socket to put it in")
+
+                ours.accept_pending(into).expect("the handle was there")
+                into.close()
+
+            for b in bytes do read.push(b)
+        End -> ()
+        Failed(_) -> ()).expect("this side is read")
+
+    // **Shut before the program runs, as `over_a_channel` does**: that is end-of-file to its channel
+    // and is what lets it finish, while this side stays readable for what it writes.
+    ours.shutdown().expect("this side says it has finished")
+    libuv.set_env(ChannelVariable, s"${theirs}").expect("the descriptor is named")
+    libuv.set_env(HostVariable, HostName).expect("the host is named")
+
+    val said = out(SpawnImport +
+        "import { listen, localPort } from slate:net\n" +
+        "val ch = channel()\n" +
+        "val server = listen(0, (c) -> null)\n" +
+        "print(ch.send({ passing: true }, server).ok)\n" +
+        "check() =\n" +
+        "    try\n" +
+        "        localPort(server)\n" +
+        "        print(\"still open\")\n" +
+        "    catch e\n" +
+        "        print(e.message)\n" +
+        "setTimeout(check, 20)\n")
+
+    libuv.unset_env(ChannelVariable).expect("the name is taken back")
+    libuv.unset_env(HostVariable).expect("the host name is taken back")
+    pump_until(() -> seen.len() > 0)
+    ours.close(() -> ())
+    libuv.default_loop().run(libuv.RUN_NOWAIT).expect("the close finishes")
+
+    assert_eq(said, "true\nthis socket is closed, and `localPort` needs an open one")
+    assert_eq(kinds.len(), 1)
+    assert_eq(kinds.at(0), libuv.HANDLE_TCP)
+
+    // The wire opens with the line that says which host this program is on, and the message the
+    // socket travelled with follows it.
+    assert_eq(from_utf8(wire.view()).unwrap_or(""),
+              "{\"$slate\":\"native\"}\n{\"passing\":true}\n")
+
+@test
+A_SOCKET_MAY_NOT_BE_SENT_TO_A_PARENT_ON_THE_OTHER_HOST()
+    // **Refused with a sentence rather than dropped**, which is the whole of why each end says which
+    // host it is on: node passes a handle over its own channel and nothing else, so a descriptor
+    // written here would reach a node parent as ancillary data nobody reads.
+    val (ours, theirs) = ipc_end()
+
+    ours.shutdown().expect("this side says it has finished")
+    libuv.set_env(ChannelVariable, s"${theirs}").expect("the descriptor is named")
+    libuv.set_env(HostVariable, "js").expect("the host is named")
+
+    val said = fails(SpawnImport +
+        "import { listen } from slate:net\n" +
+        "val ch = channel()\n" +
+        "val server = listen(0, (c) -> null)\n" +
+        "ch.send({ passing: true }, server)\n")
+
+    libuv.unset_env(ChannelVariable).expect("the name is taken back")
+    libuv.unset_env(HostVariable).expect("the host name is taken back")
+    ours.close(() -> ())
+    libuv.default_loop().run(libuv.RUN_NOWAIT).expect("the close finishes")
+    assert(said.contains("cannot cross the channel"), s"the two hosts are named: ${said}")
+
+@test
+A_PARENT_THAT_SAID_NOTHING_ABOUT_ITS_HOST_IS_REFUSED_A_SOCKET_TOO()
+    // A program started by something that is not slate at all, which is what an empty variable
+    // means: the refusal names what is missing rather than guessing that the hosts match.
+    val (ours, theirs) = ipc_end()
+
+    ours.shutdown().expect("this side says it has finished")
+    libuv.set_env(ChannelVariable, s"${theirs}").expect("the descriptor is named")
+
+    val said = fails(SpawnImport +
+        "import { listen } from slate:net\n" +
+        "val ch = channel()\n" +
+        "ch.send({ passing: true }, listen(0, (c) -> null))\n")
+
+    libuv.unset_env(ChannelVariable).expect("the name is taken back")
+    ours.close(() -> ())
+    libuv.default_loop().run(libuv.RUN_NOWAIT).expect("the close finishes")
+    assert(said.contains("did not say which host"), s"what is missing is named: ${said}")
+
+@test
+AN_ADOPTED_CONNECTION_IS_SERVED_BY_slate_http_LIKE_ANY_OTHER()
+    // **What a cluster worker actually is.** The supervisor listens and accepts; the worker never
+    // listens at all and answers requests on connections it was handed. `adopt` is `serve` with the
+    // listening half taken out, so everything below the accept -- the parser, keep-alive, the
+    // response writer -- is the code that answers an ordinary request.
+    val (ours, theirs) = ipc_end()
+    val (server, client, conn) = connected_tcp()
+
+    var reply: Buf[u8] = buf()
+    val heard = &reply
+
+    client.read_start((r) -> r match
+        Data(bytes) ->
+            for b in bytes do heard.push(b)
+        End -> ()
+        Failed(_) -> ()).expect("the client is read")
+
+    client.write("GET /jobs HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".bytes)
+        .expect("the request is queued")
+
+    ours.write_handle("{}\n".bytes, conn, (r) ->
+        r.expect("the handle was sent")
+        conn.close()).expect("the message is queued")
+
+    ours.shutdown().expect("this side says it has finished")
+    libuv.set_env(ChannelVariable, s"${theirs}").expect("the descriptor is named")
+
+    val said = out(SpawnImport +
+        "import { adopt } from slate:http\n" +
+        "val app = adopt((req) -> \"answered \" + req.path)\n" +
+        "channel().onMessage((m, conn) ->\n" +
+        "    app.handle(conn))\n")
+
+    libuv.unset_env(ChannelVariable).expect("the name is taken back")
+    pump_until(() -> heard.len() > 0)
+    ours.close(() -> ())
+    server.close()
+    client.close()
+    libuv.default_loop().run(libuv.RUN_NOWAIT).expect("the closes finish")
+
+    assert_eq(said, "")
+
+    val answer = from_utf8(reply.view()).unwrap_or("")
+
+    assert(answer.starts_with("HTTP/1.1 200 OK"), s"a response came back: ${answer}")
+    assert(answer.ends_with("answered /jobs"), s"the handler wrote it: ${answer}")
+
+// -- the same thing between two programs under node ------------------------------------------------
+
+// The worker and the supervisor, compiled to JavaScript and run under node.
+//
+// **Both sides have to be node for a socket to cross**, which is the one thing about this that is not
+// symmetrical with the interpreter: node passes a handle over its own channel and through a protocol
+// only another node speaks. So this is the pairing that works, and the two mixed pairings are refused
+// with a sentence -- `docs/reference/javascript.md` sets out all four.
+private node_supervisor_said(worker: string, supervisor: string) -> string
+    val worker_src = "tests/handles-worker.tmp.sl"
+    val worker_js = worker_src + ".js"
+    val sup_src = "tests/handles-sup.tmp.sl"
+    val sup_js = sup_src + ".js"
+
+    write_text(worker_src, worker).unwrap()
+
+    if cli_status(["slate", "js", worker_src, "-o", worker_js]) != 0
+        return "the worker would not compile"
+
+    write_text(sup_src, s"val Worker = \"${worker_js}\"\n" + supervisor).unwrap()
+
+    if cli_status(["slate", "js", sup_src, "-o", sup_js]) != 0
+        return "the supervisor would not compile"
+
+    val ran = capture("node", [sup_js], "", [], true)
+
+    remove_file(worker_src)
+    remove_file(worker_js)
+    remove_file(sup_src)
+    remove_file(sup_js)
+
+    ran match
+        Err(e) -> s"node could not be started: ${e}"
+        Ok(o) -> if o.status.ok() then o.text.trim() else o.err.unwrap_or("").trim()
+end node_supervisor_said
+
+@test
+A_SOCKET_CROSSES_A_CHANNEL_BETWEEN_TWO_PROGRAMS_UNDER_NODE()
+    val said = node_supervisor_said(
+        "import { channel } from slate:process\n" +
+        "import { onData, send, close } from slate:net\n" +
+        "val ch = channel()\n" +
+        "ch.onMessage((m, conn) ->\n" +
+        "    if conn == null\n" +
+        "        ch.send({ ready: true })\n" +
+        "    else\n" +
+        "        onData(conn, (text) ->\n" +
+        "            send(conn, \"worker saw: \" + text)\n" +
+        "            close(conn)\n" +
+        "            ch.send({ done: true })))\n" +
+        "ch.send({ hello: true })\n",
+
+        "import { spawn } from slate:process\n" +
+        "import { listen, connect, onData, send, close, localPort } from slate:net\n" +
+        "val worker = spawn(\"node\", [Worker], { ipc: true }).value\n" +
+        "var server = null\n" +
+        "async dial()\n" +
+        "    val client = (await connect(\"127.0.0.1\", localPort(server))).value\n" +
+        "    onData(client, (text) ->\n" +
+        "        print(text)\n" +
+        "        close(client))\n" +
+        "    send(client, \"hello\")\n" +
+        "worker.onMessage((m) ->\n" +
+        "    if has(m, \"hello\")\n" +
+        "        server = listen(0, (conn) ->\n" +
+        "            print(\"passed: \" + string(worker.send({ job: 1 }, conn).ok)))\n" +
+        "        dial()\n" +
+        "    else if has(m, \"done\")\n" +
+        "        close(server)\n" +
+        "        worker.kill())\n")
+
+    // The connection the supervisor accepted is the one the worker answered on, so the client's own
+    // socket -- which never left the supervisor -- carries what the other process wrote.
+    assert_eq(said, "passed: true\nworker saw: hello")
