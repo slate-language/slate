@@ -74,6 +74,7 @@ the compiler resolves and the value the name binds.
 | `[T, U]` | an array whose first elements fit |
 | `array of T` | an array every element of which fits `T` |
 | `object of T` | an object every value of which fits `T` |
+| `1..100`, `0..<10`, `..0`, `1..` | a number between those ends |
 | `T \| U` | either |
 | `T & U` | both |
 | `(T)` | the same `T`, bracketed to group it |
@@ -109,6 +110,72 @@ element.
 
 **A `for` over one types its variable**, so `for u in users` where `users: array of User` makes `u` a
 `User`.
+
+### A range
+
+A port is not an integer and a percentage is not a number, and the difference is where the value stops
+being one. `1..65535` says so, and reads the way the range you would write in a `for` head does:
+
+```slate
+type Port    = 1..65535
+type Percent = 0..100
+
+listenOn(p: Port) = "port " + string(p)
+
+print(listenOn(8080))
+print(50 is Percent, 101 is Percent)
+```
+
+```output
+port 8080
+true false
+```
+
+**Both ends are included, and `..<` leaves the top one out** — the same pair of spellings a range
+expression uses. Either end may be left off, which is what "no floor" and "no ceiling" are said with:
+
+```slate
+print(9 is 0..<10, 10 is 0..<10, 10 is 0..10)
+print(-4 is ..0, 4 is 3.., 2 is 3..)
+```
+
+```output
+true false true
+true true false
+```
+
+**Whole ends mean whole numbers.** `0..100` is written by somebody describing a percentage, so `2.5`
+is not one of them; a bound written with a point widens the whole range to any number:
+
+```slate
+type Percent  = 0..100
+type Fraction = 0.0..1.0
+
+print(50 is Percent, 2.5 is Percent)
+print(0.25 is Fraction, 1 is Fraction)
+```
+
+```output
+true false
+true true
+```
+
+**The ends are the machine's and the checker says only that a range is a number.** A value it can see
+is a string is refused where it is written; a value it can only see is an integer is left to the check
+that runs where the value arrives.
+
+```slate
+pct(x: 0..100) = x
+
+print(pct("half"))
+```
+
+```error
+`pct` takes integer here, and this is string
+```
+
+A range is a [pattern](patterns.md) like the rest of this table, so the same spelling is an arm of a
+`match` and the right-hand side of `is`.
 
 ### `?` and `|`
 

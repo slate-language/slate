@@ -87,6 +87,31 @@ the negative number -4
 **A broad guard is why this matters.** `n if n < 0` binds *anything*, so the guard evaluates
 `[3, 4] < 0` and faults; `n @ number if n < 0` cannot reach the guard with the wrong kind.
 
+## Ranges
+
+`1..100` matches a number between its ends, both included; `..<` leaves the top one out, and either
+end may be left off:
+
+```slate
+grade(n) = n match
+    0..59   -> "F"
+    60..<70 -> "D"
+    70..<80 -> "C"
+    80..<90 -> "B"
+    _       -> "A"
+
+print(grade(12), grade(65), grade(95))
+print(-4 is ..0, 4 is 3..)
+```
+
+```output
+F D A
+true true
+```
+
+**Whole ends mean whole numbers**, so `2.5 is 0..100` is false and `2.5 is 0.0..100.0` is true. A range
+binds nothing, its ends being numbers, and it is a [type](types.md) in every position a pattern is one.
+
 ## `|` and `&`
 
 `|` is alternation. **No alternative may bind a name**, since it would be bound down one path and not
