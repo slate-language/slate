@@ -1,7 +1,10 @@
 module dev.slatelang.slate
 @tests
 
+import sh.sysl.libuv
 import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.write_text
 import sysl.text.Search
 
 // slate as a scripting language: a file the kernel can start, the arguments it was given, and the
@@ -329,3 +332,58 @@ AN_ASYNC_TESTS_OWN_PROMISE_SURVIVES_THE_COLLECTIONS_ITS_DRAIN_CAUSES()
     val said = test_verdict("churn()\n    var i = 0\n    var seen = 0\n\n    while i < 20000\n        val junk = { n: i, s: string(i) }\n        val soon = pending()\n\n        seen = seen + junk.n\n        i = i + 1\n\n@test\nasync THE_DRAIN_GOES_ON_AFTER_THIS_TEST_HAS_FINISHED()\n    setTimeout(churn, 1)\n    setTimeout(churn, 2)\n    setTimeout(churn, 3)\n\n    await sleep(0)\n\n    assert(true)\n", "THE_DRAIN_GOES_ON_AFTER_THIS_TEST_HAS_FINISHED")
 
     assert_eq(said, "")
+
+// -- what `print` does while a program is still running ----------------------------------------------
+
+// Timestamps around one `run_cli` call, in nanoseconds off `libuv.hrtime()`. Boxed rather than three
+// plain locals, because the sink below is a closure and a sysl closure captures BY VALUE -- writing
+// to a captured `var` would write to the closure's own copy and the test would read back nothing.
+private struct PrintTiming
+    began: u64
+    first: u64
+    got: bool
+
+@test
+PRINT_REACHES_ITS_READER_WHILE_THE_PROGRAM_IS_STILL_RUNNING()
+    // **The bug this pins.** `print` used to build up `output` and say nothing to its reader until
+    // the whole program had finished -- `do_print` only pushed onto a `Buf`, and `run_program` read
+    // that `Buf` back only after `run` had already returned. A program that never returns -- a
+    // server, a supervisor -- therefore said nothing at all, ever, to a reader that had it piped to
+    // a file or to systemd's journal. `do_print` now reaches `live_sink` -- which `run_program` wires
+    // to `run_cli`'s own `say` -- as each call happens, flushed behind it.
+    //
+    // **Measured rather than read off the shape of the code**, because a replay after `run` returns
+    // and a live call during it hand the sink the same text either way -- the only difference is
+    // WHEN. A program that prints and then sleeps for a while is what tells the two apart: the old
+    // code could not call the sink until the sleep was over, so its first call landed near the END
+    // of the run; live, it lands near the START.
+    val dir = libuv.mkdtemp_sync("/tmp/slate-live-print-XXXXXX").unwrap()
+    val where = s"${dir}/prog.sl"
+
+    write_text(where, "print(\"hello\")\n\nasync main()\n    await sleep(300)\n\nmain()\n").unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val timing: &PrintTiming = PrintTiming(libuv.hrtime(), 0, false)
+
+    val status = run_cli(["slate", where], (line: string) ->
+        if !timing.got
+            timing.first = libuv.hrtime()
+            timing.got = true
+
+        sink.push(line))
+
+    val took = (libuv.hrtime() - timing.began) / 1000000
+    val first_at = (timing.first - timing.began) / 1000000
+
+    // **Put back what the driver set, or the next test inherits it** -- `script_ran`'s own rule.
+    set_program_args(buf())
+    scrub(dir)
+
+    assert_eq(status, Fine)
+    assert_eq(lines.len(), 1)
+    assert_eq(lines.at(0), "hello")
+    assert(timing.got, "expected `print` to reach the sink at all")
+    assert(first_at < 150,
+        s"the print reached the sink ${first_at}ms in, against a 300ms sleep -- that is not live")
+    assert(took >= 250, s"the program only ran for ${took}ms in total, so the sleep did not happen")
