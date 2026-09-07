@@ -41,23 +41,31 @@ brew install slate
 On Linux, x86_64 or arm64, from the tarball on the [latest release](https://github.com/slate-language/slate/releases/latest):
 
 ```
-curl -LO https://github.com/slate-language/slate/releases/latest/download/slate-linux-x86_64.tar.gz
-sudo tar -xzf slate-linux-x86_64.tar.gz -C /usr/local
+tag=$(curl -fsSLo /dev/null -w '%{url_effective}' https://github.com/slate-language/slate/releases/latest | sed 's#.*/##')
+curl -LO "https://github.com/slate-language/slate/releases/download/$tag/slate-${tag#v}-linux-x86_64.tar.gz"
+sudo tar -xzf slate-*-linux-x86_64.tar.gz -C /usr/local
 sudo apt-get install libssl3t64 libsqlite3-0 libbrotli1 libwebp7
 slate --version
 ```
 
-The asset is named for the release — `slate-<version>-linux-x86_64.tar.gz`, or `-linux-arm64` — and it
-unpacks into a prefix, so `bin/slate` lands wherever you point `-C`.
+The asset is named for the release — `slate-<version>-linux-x86_64.tar.gz`, or `-linux-arm64` — which is
+what the first line is working out; take the version from the
+[releases page](https://github.com/slate-language/slate/releases) and write it out if you would rather.
+The tarball **is** a prefix, so `bin/slate` lands wherever you point `-C`.
 
-Those four packages are the whole of what the binary needs at run time. Redis, libuv, LMDB, HTTP/2,
-Zstandard and PCRE2 are **linked in**, so nothing has to be installed for them and no version of them has
-to match. On Ubuntu 22.04 the OpenSSL package is spelled `libssl3` rather than `libssl3t64`, that rename
-having come with 24.04's `time_t` transition; everything else is named the same everywhere.
+Those four packages are the whole of what the binary needs at run time — `ldd` on the shipped binary names
+OpenSSL, SQLite, brotli, libwebp and libc and nothing else. Redis, libuv, LMDB, HTTP/2, Zstandard, PCRE2
+and the collector are **linked in**, so nothing has to be installed for them and no version of them has to
+match. On Ubuntu 22.04 the OpenSSL package is spelled `libssl3` rather than `libssl3t64`, that rename
+having come with 24.04's `time_t` transition; everything else is named the same everywhere. A bare
+container image will also want `tzdata`, which any real installation already has and which
+`zone("America/Toronto")` reads.
 
 The build is made on Ubuntu 22.04, so it wants **glibc 2.35 or newer** — Ubuntu 22.04, Debian 12 and
-everything after them. Each release says the floor it actually achieved, and every release is unpacked and
-run on Ubuntu 24.04, 26.04 and Debian 12 before it is published.
+everything after them. Each release says the floor it actually achieved; every release is unpacked and run
+on Ubuntu 24.04, 26.04, the current Ubuntu and Debian 12, on both architectures, before it is published;
+and the binary that is shipped has run slate's own language suite on the machine that built it, under both
+the interpreter and node.
 
 Anywhere else, build it from source — a clone and one command, given [sysl](https://sysl.sh) installed.
 
