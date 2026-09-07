@@ -27,7 +27,7 @@ Every construct in slate, written down once, in its own place.
 | [Faults](faults.md) | `throw`, `try`/`catch`, and results as the other channel |
 | [Elements](elements.md) | slx — `<div>` in the source, and what it desugars to |
 | [Tests](tests.md) | `@test`, `slate test`, the assertions |
-| [Packages](packages.md) | the manifest, `slate add`, the cache, `slate.sum` |
+| [Packages](packages.md) | the manifest, `slate install`, the cache, `slate.sum` |
 | [JavaScript](javascript.md) | `slate js`, and where the two back ends differ |
 | [External](external.md) | `external`, and what crosses the boundary to the host |
 
