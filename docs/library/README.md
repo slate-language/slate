@@ -19,6 +19,7 @@ What a program has without writing it.
 | [`slate:url`](url.md) | percent-encoding, base64url, and the `name=value` grammar |
 | [`slate:time`](time.md) | eight temporal types, and the arithmetic over them |
 | [`slate:process`](process.md) | another program, this program's environment, signals |
+| [`slate:cluster`](cluster.md) | one worker per core, and the supervisor that keeps them alive |
 | [`slate:regex`](regex.md) | PCRE2 patterns |
 | [`slate:crypto`](crypto.md) | digests, HMAC, Argon2id, key derivation, randomness |
 | [`slate:jwt`](jwt.md) | JSON Web Tokens |

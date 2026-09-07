@@ -1,0 +1,295 @@
+module dev.slatelang.slate
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// `slate:cluster` -- the refusals, and the WORKER half, which no supervisor test can reach.
+//
+// **A worker is a program somebody else started with a channel**, so the suite plays the supervisor
+// exactly as `tests_process.sysl` does: `over_a_channel` makes a `socket_pair`, names one end in
+// `SLATE_CHANNEL_FD`, queues the lines a supervisor would send, and runs the program under test as
+// the child. What comes back is what the worker printed and what it wrote up the channel -- which is
+// the whole protocol, read from the side a program never sees.
+//
+// **The SUPERVISOR half is `tests/lang/cluster.sl`**, which runs on both back ends and starts real
+// `/bin/sh` children speaking the same wire. It is there rather than here for the reason every other
+// language test is: what a supervisor does is a thing a slate program does, so the test that says it
+// is written in slate and asked of every back end.
+//
+// **What no test in this repository can do is start a real slate WORKER**, a cluster spawning the
+// program it is running inside and the compiler's own suite not being a slate program on a command
+// line. `tests/lang/cluster.sl` covers the supervisor with children that speak the protocol and this
+// file covers the worker with a supervisor that does; the two halves meeting over a socket is what
+// the docs page's worked example is, run by hand.
+
+// A program importing the module, with a definition the tests below reach for.
+private val ClusterImport: string = "import { cluster, isPrimary, isWorker, workerId } from slate:cluster\n"
+
+// What one line of the supervisor's own traffic looks like.
+//
+// **Built with `+` on PLAIN strings**, because `$` opens an interpolation in a sysl `s"..."` and the
+// mark this module puts on every message is exactly that character.
+private said(what: string) -> string = "{\"$" + "cluster\": \"" + what + "\"}"
+
+// -- the refusals ------------------------------------------------------------------------------------
+
+@test
+A_CLUSTER_OF_NO_WORKERS_IS_REFUSED()
+    // **Refused rather than read as "do not start any".** A supervisor with nothing under it listens
+    // to nothing and never ends, which is not what a number can have meant.
+    val said = fails(ClusterImport + "cluster({ workers: 0 }, w -> null)\n")
+
+    assert(said.contains("a cluster runs at least one worker, and was asked for 0"), said)
+
+@test
+A_NEGATIVE_WORKER_COUNT_IS_THE_SAME_REFUSAL()
+    val said = fails(ClusterImport + "cluster({ workers: -3 }, w -> null)\n")
+
+    assert(said.contains("and was asked for -3"), said)
+
+@test
+A_WORKER_COUNT_THAT_IS_NOT_A_NUMBER_IS_REFUSED()
+    val said = fails(ClusterImport + "cluster({ workers: \"four\" }, w -> null)\n")
+
+    assert(said.contains("`workers` is how many processes to run"), said)
+
+@test
+A_SCHEDULING_NOBODY_HAS_IS_REFUSED_BY_NAME()
+    // **The two names are said back**, because the mistake this catches is a spelling and a reader
+    // holding the wrong one has nothing to compare against.
+    val said = fails(ClusterImport + "cluster({ workers: 1, scheduling: \"random\" }, w -> null)\n")
+
+    assert(said.contains("`scheduling` is \"roundRobin\" or \"reusePort\", and this is random"), said)
+
+@test
+OPTIONS_THAT_ARE_NOT_AN_OBJECT_ARE_REFUSED()
+    val said = fails(ClusterImport + "cluster(4, w -> null)\n")
+
+    assert(said.contains("`cluster` takes its options as an object"), said)
+
+@test
+A_SUPERVISOR_WITH_NO_COMMAND_LINE_SAYS_SO_RATHER_THAN_STARTING_SOMETHING_ELSE()
+    // **The case is real and is this suite's own.** A program whose statements were handed to slate
+    // rather than read from a file has no executable and no script to copy, so there is nothing to
+    // start -- and starting the nearest thing to hand would be a supervisor running some other
+    // program under the name of this one.
+    set_program_command("", "")
+
+    val said = fails(ClusterImport + "cluster({ workers: 1 }, w -> null)\n")
+
+    assert(said.contains("`slate:cluster` does not know what to start"), said)
+    assert(said.contains("name the worker command with `exec` and `args`"), said)
+
+@test
+A_PROGRAM_THAT_NOBODY_STARTED_IS_THE_SUPERVISOR()
+    // Asked before anything runs, and answered by whether this program was given a channel.
+    set_program_command("", "")
+
+    assert_eq(out(ClusterImport + "print(isPrimary, isWorker, workerId())\n"), "true false 0")
+
+// -- the worker half, over a real channel --------------------------------------------------------------
+
+// The worker under test: it says what it was told and writes back up the channel.
+private val Worker: string =
+    ClusterImport +
+    "cluster({}, w ->\n" +
+    "    print(\"worker\", w.workerId, workerId(), isWorker)\n" +
+    "    w.subscribe(\"news\", v -> print(\"heard\", v))\n" +
+    "    w.publish(\"news\", \"up\")\n" +
+    "    w.onShutdown(() -> print(\"draining\")))\n"
+
+// The supervisor's side of the handshake, as the lines it would write.
+private supervisor_says(extra: Buf[string]) -> Buf[string]
+    var messages: Buf[string] = buf()
+
+    messages.push("{\"$" + "cluster\": \"id\", \"id\": 7, \"scheduling\": \"roundRobin\"}")
+
+    for i in 0..<extra.len()
+        messages.push(extra.at(i))
+
+    messages
+end supervisor_says
+
+@test
+A_WORKER_SAYS_HELLO_AND_IS_ANSWERED_WITH_ITS_NUMBER()
+    // **The worker speaks first and the id is the answer to it.** A socket may only be sent to a
+    // child that has already said something, so a supervisor waits for a word from every worker in
+    // any case -- and answering that word is the cheapest place to number it.
+    set_program_command("", "")
+
+    var extra: Buf[string] = buf()
+
+    val (printed, wire) = over_a_channel(Worker, supervisor_says(extra))
+
+    assert_eq(printed, "worker 7 7 true")
+    assert(wire.contains("{\"$" + "cluster\":\"ready\"}"), wire)
+
+@test
+A_WORKER_PUBLISHES_UP_THE_CHANNEL_AND_HEARS_WHAT_IS_SENT_DOWN()
+    // The bus is the supervisor, so a worker's publish is a message up and a delivery is a message
+    // down. Neither is a broadcast the worker does itself.
+    set_program_command("", "")
+
+    var extra: Buf[string] = buf()
+
+    extra.push("{\"$" + "cluster\": \"publish\", \"topic\": \"news\", \"value\": \"from the other one\"}")
+
+    val (printed, wire) = over_a_channel(Worker, supervisor_says(extra))
+
+    assert_eq(printed, "worker 7 7 true\nheard from the other one")
+    assert(wire.contains("{\"$" + "cluster\":\"publish\",\"topic\":\"news\",\"value\":\"up\"}"), wire)
+
+@test
+A_TOPIC_NOBODY_SUBSCRIBED_TO_IS_DROPPED_RATHER_THAN_FAULTING()
+    set_program_command("", "")
+
+    var extra: Buf[string] = buf()
+
+    extra.push("{\"$" + "cluster\": \"publish\", \"topic\": \"weather\", \"value\": \"rain\"}")
+
+    val (printed, _) = over_a_channel(Worker, supervisor_says(extra))
+
+    assert_eq(printed, "worker 7 7 true")
+
+@test
+A_SHUTDOWN_RUNS_WHAT_THE_WORKER_REGISTERED_AND_IS_ANSWERED_WITH_drained()
+    set_program_command("", "")
+
+    var extra: Buf[string] = buf()
+
+    extra.push(said("shutdown"))
+
+    val (printed, wire) = over_a_channel(Worker, supervisor_says(extra))
+
+    assert_eq(printed, "worker 7 7 true\ndraining")
+    assert(wire.contains("{\"$" + "cluster\":\"drained\"}"), wire)
+
+@test
+A_MESSAGE_THAT_IS_NOT_THIS_MODULES_IS_LEFT_ALONE()
+    // **The channel belongs to the module and the mark is what says so.** A line that is not one of
+    // these is not a defect in anything -- it is somebody else's traffic -- so it is passed over
+    // rather than complained about.
+    set_program_command("", "")
+
+    var extra: Buf[string] = buf()
+
+    extra.push("{\"hello\": true}")
+    extra.push("[1, 2, 3]")
+    extra.push(said("shutdown"))
+
+    val (printed, _) = over_a_channel(Worker, supervisor_says(extra))
+
+    assert_eq(printed, "worker 7 7 true\ndraining")
+
+@test
+serve_ASKS_THE_SUPERVISOR_TO_LISTEN_AND_WAITS_TO_BE_TOLD_WHICH_PORT()
+    // **A worker under round-robin never listens**, so the port it gets is the supervisor's answer
+    // and not the kernel's -- which is what makes `serve(0, ...)` mean the same thing in a cluster
+    // as it does in a program with none.
+    set_program_command("", "")
+
+    var extra: Buf[string] = buf()
+
+    extra.push("{\"$" + "cluster\": \"listening\", \"req\": 1, \"port\": 45123}")
+
+    val program =
+        ClusterImport +
+        "cluster({}, async w ->\n" +
+        "    val s = await w.serve(0, req -> \"hello\")\n" +
+        "    print(\"serving on\", s.port))\n"
+
+    val (printed, wire) = over_a_channel(program, supervisor_says(extra))
+
+    assert_eq(printed, "serving on 45123")
+    assert(wire.contains("{\"$" + "cluster\":\"listen\",\"port\":0,\"req\":1}"), wire)
+
+@test
+A_PORT_THE_SUPERVISOR_COULD_NOT_OPEN_FAILS_THE_PROMISE_IN_ITS_OWN_WORDS()
+    // **A port already taken is an outside condition and reaches the worker as one**, which is why
+    // `serve` answers a promise: the refusal happens in another process and has to travel.
+    set_program_command("", "")
+
+    var extra: Buf[string] = buf()
+
+    extra.push("{\"$" + "cluster\": \"listening\", \"req\": 1, \"error\": \"cannot listen on port 80: EACCES\"}")
+
+    val program =
+        ClusterImport +
+        "cluster({}, async w ->\n" +
+        "    try\n" +
+        "        await w.serve(80, req -> \"hello\")\n" +
+        "    catch e\n" +
+        "        print(\"refused:\", e.message))\n"
+
+    val (printed, _) = over_a_channel(program, supervisor_says(extra))
+
+    assert_eq(printed, "refused: cannot listen on port 80: EACCES")
+
+@test
+A_SECOND_serve_IS_A_SECOND_REQUEST_AND_THE_ANSWERS_ARE_TOLD_APART()
+    // Two ports, two requests, and the reply carries which one it is about -- so an answer that
+    // arrives out of order still settles the promise it belongs to.
+    set_program_command("", "")
+
+    var extra: Buf[string] = buf()
+
+    extra.push("{\"$" + "cluster\": \"listening\", \"req\": 2, \"port\": 9002}")
+    extra.push("{\"$" + "cluster\": \"listening\", \"req\": 1, \"port\": 9001}")
+
+    val program =
+        ClusterImport +
+        "cluster({}, async w ->\n" +
+        "    val a = w.serve(9001, req -> \"a\")\n" +
+        "    val b = w.serve(9002, req -> \"b\")\n" +
+        "    print((await b).port, (await a).port))\n"
+
+    val (printed, _) = over_a_channel(program, supervisor_says(extra))
+
+    assert_eq(printed, "9002 9001")
+
+@test
+A_PORT_THAT_IS_NOT_A_NUMBER_IS_THE_PROGRAMS_OWN_MISTAKE()
+    set_program_command("", "")
+
+    var extra: Buf[string] = buf()
+
+    val program =
+        ClusterImport +
+        "cluster({}, w ->\n" +
+        "    w.serve(\"8080\", req -> \"hello\"))\n"
+
+    val (printed, _) = over_a_channel(program, supervisor_says(extra))
+
+    assert(printed.contains("`serve` takes a port number"), printed)
+
+@test
+A_SUBSCRIBER_THAT_IS_NOT_A_FUNCTION_IS_REFUSED()
+    set_program_command("", "")
+
+    var extra: Buf[string] = buf()
+
+    val program =
+        ClusterImport +
+        "cluster({}, w ->\n" +
+        "    w.subscribe(\"news\", 4))\n"
+
+    val (printed, _) = over_a_channel(program, supervisor_says(extra))
+
+    assert(printed.contains("a subscriber is a function"), printed)
+
+// -- what the machine says about itself ---------------------------------------------------------------
+
+@test
+cpus_IS_AT_LEAST_ONE_AND_IS_A_WHOLE_NUMBER()
+    // **Never zero, whatever the machine reports.** A program dividing its work by this would be
+    // dividing by nothing, and a machine that can do less than one thing at a time is not one slate
+    // is running on.
+    assert_eq(out("import { cpus } from slate:process\nprint(cpus() >= 1, cpus() is integer)\n"),
+              "true true")
+
+@test
+cpus_TAKES_NO_ARGUMENTS()
+    val said = fails("import { cpus } from slate:process\nprint(cpus(4))\n")
+
+    assert(said.contains("`cpus` takes no arguments"), said)

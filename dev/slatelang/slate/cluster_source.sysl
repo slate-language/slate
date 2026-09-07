@@ -1,0 +1,644 @@
+module dev.slatelang.slate
+
+// slate's cluster module, written in slate and carried in the binary.
+//
+// **THE SIXTH BUILT-IN MODULE WRITTEN IN SLATE**, after `slate:http`, `slate:jwt`, `slate:redis`,
+// `slate:sqlite`, `slate:url` and `slate:ws`; `stdlib.sysl` says how that kind differs from an export
+// list over natives, which is in `take_builtin` and nowhere else. What makes this one worth writing
+// in slate is that every piece it stands on is already a slate surface -- `spawn` and a channel from
+// `slate:process`, `adopt` from `slate:http`, `listen` from `slate:net`, `onSignal` for the two
+// signals a deployment sends -- so there is nothing here the machine has to be asked for.
+//
+// **A RAW TEXT BLOCK, SO WHAT IS WRITTEN HERE IS WHAT SLATE READS.** `raw"""` takes no escapes and
+// strips only the incidental indentation, so the module sits below at four spaces and reaches the
+// lexer at the margin -- and a `\r\n`, a quote or a `${...}` in it means itself. `http_source.sysl`
+// says the rest.
+//
+// **`execPath` and `scriptPath` are what let this module exist**, and they are declared into the
+// scope a built-in module compiles in rather than into a program's -- `hostHas`'s arrangement. A
+// supervisor starts another copy of the program it is running inside, and `args` deliberately does
+// not carry the program's own name, so nothing a program can read says what to run.
+
+// The module's source, as slate will read it.
+cluster_source() -> string = raw"""
+    // A worker cluster on one machine, so that a server uses every core the machine has.
+    //
+    // One process cannot use two cores, and a slate server is one event loop on one thread -- so a
+    // sixteen-core box running one slate program is using a sixteenth of what it has. A cluster is the
+    // answer every runtime with a single-threaded loop arrives at: run the program N times, spread the
+    // connections over the copies, and put one process in front to keep the others alive.
+    //
+    //     import { cluster } from slate:cluster
+    //
+    //     await cluster({ workers: 4 }, w ->
+    //         await w.serve(8080, req -> "answered by worker " + string(w.workerId)))
+    //
+    // **`cluster` is the one call a program makes, and it is called on BOTH sides of the fork.** The
+    // supervisor spawns the workers and answers a promise that settles when the cluster is down; a
+    // worker calls the function it was given. Which one a process is, is settled before a statement of
+    // the program runs -- a worker is a program that was started with a channel -- so `isPrimary` and
+    // `isWorker` are values rather than questions.
+    //
+    // ## The supervisor is the message bus, which is why one box needs nothing else
+    //
+    // Every worker is already talking to the supervisor over a channel, so a message from one worker to
+    // the others has a route through a process that is by definition alive and by definition on this
+    // machine. `w.publish(topic, value)` goes up and is fanned out to every OTHER worker's
+    // `w.subscribe(topic, fn)`; a publisher does not hear itself, which is the rule a bus with one
+    // process in the middle can actually keep.
+    //
+    // **So a single-box deployment needs no Redis, and that is the point of the module.** What a second
+    // machine needs is a bus that crosses machines, and this is deliberately not one.
+    //
+    // ## Two ways to spread a port, and the default works everywhere
+    //
+    // **Round-robin is the default on every platform**: the supervisor is the only process listening,
+    // and it hands each accepted connection to the next worker over the channel. That works on macOS,
+    // where the kernel refuses `reusePort` outright, and it is what node's cluster does by default.
+    //
+    // `{ scheduling: "reusePort" }` is the other one: every worker listens on the port itself with
+    // `reusePort: true` and the kernel spreads the connections. It is faster -- a connection never
+    // crosses a process boundary -- and it exists on Linux and the BSDs and not on macOS, where the
+    // attempt fails with `ENOTSUP` in the sentence `slate:net` gives it. node calls the pair `SCHED_RR`
+    // and `SCHED_NONE`.
+    //
+    // ## What happens when a worker dies, and when the machine asks the cluster to stop
+    //
+    // **A worker that exits is started again**, with a backoff after repeated quick deaths so that a
+    // program failing at start-up does not spin: the delay doubles from 100 ms and stops at
+    // `maxBackoffMillis`, which is thirty seconds. node restarts nothing; a supervisor that did not
+    // would be a supervisor in name.
+    //
+    // **`SIGTERM` drains.** The supervisor stops accepting, tells every worker to shut down, and each
+    // worker runs what it registered with `onShutdown` before ending. A worker still alive after
+    // `drainMillis` is killed. **`SIGHUP` rolls**: the workers are replaced one at a time, and the
+    // replacement is serving before the one it replaces is asked to leave, so the port is never
+    // unserved.
+
+    import { spawn, channel, cpus, exit, onSignal, offSignal } from slate:process
+    import { listen, close as closeSocket, localPort } from slate:net
+    import { adopt } from slate:http
+
+    // What a program hands `cluster`.
+    export type Options = { workers?: integer, scheduling?: string, drainMillis?: integer,
+        maxBackoffMillis?: integer, exec?: string, args?: array, primary?: function }
+
+    // What a worker's own function is given.
+    export type Worker = { workerId: integer, serve: function, publish: function, subscribe: function,
+        onShutdown: function }
+
+    // What `options.primary` is given, where a program asked for it.
+    export type Primary = { workers: integer, publish: function, subscribe: function,
+        onWorkerExit: function, shutdown: function }
+
+    // The channel this process was started with, or null where nobody started it.
+    //
+    // **THE CHANNEL IS WHAT SAYS WHICH HALF THIS IS**, and it is asked once, here, before anything else
+    // in the program runs. node marks a worker with an environment variable instead; slate cannot,
+    // `spawn`'s `env` replacing a child's environment rather than adding to it -- and a worker that had
+    // lost `PATH` and everything else the program needs would be a poor trade for one number.
+    val ownChannel = channel()
+
+    // Which half of the pair this process is.
+    export val isPrimary = ownChannel == null
+    export val isWorker = ownChannel != null
+
+    // Which worker this is, counting from 1, and 0 in the supervisor.
+    //
+    // **A call rather than a value, where the two above are values**, and the difference is real: which
+    // half a process is, is settled by how it was started, and which worker it is arrives from the
+    // supervisor over the channel a moment later. node's `cluster.worker.id` is the same number.
+    var myId = 0
+
+    export workerId() = myId
+
+    val RoundRobin = "roundRobin"
+    val ReusePort = "reusePort"
+
+    // `cluster(options, worker)` -- the whole of what a program writes.
+    //
+    // In the supervisor it starts the workers and answers a promise that settles once the cluster has
+    // shut down. In a worker it calls `worker(api)` and answers a promise that settles when that worker
+    // has drained.
+    export cluster(options = {}, worker = null)
+        if !(options is object)
+            throw "`cluster` takes its options as an object"
+
+        if isWorker then return workerSide(worker)
+
+        primarySide(options)
+
+    // -- the supervisor ----------------------------------------------------------------------------
+
+    primarySide(options)
+        val count = options.workers ?? cpus()
+
+        if !(count is integer)
+            throw "`workers` is how many processes to run, and is a whole number"
+
+        // **Refused rather than read as "no workers".** A cluster of none is a program that listens to
+        // nothing and never ends, which is never what anybody meant by the number.
+        if count < 1
+            throw "a cluster runs at least one worker, and was asked for " + string(count)
+
+        val scheduling = options.scheduling ?? RoundRobin
+
+        if scheduling != RoundRobin && scheduling != ReusePort
+            throw "`scheduling` is \"roundRobin\" or \"reusePort\", and this is " + string(scheduling)
+
+        val drainMillis = options.drainMillis ?? 10000
+        val maxBackoff = options.maxBackoffMillis ?? 30000
+        val command = options.exec ?? execPath()
+        val argv = options.args ?? [scriptPath()]
+
+        // **A supervisor that cannot say what to run says so here**, rather than starting something
+        // else: a program whose statements were handed to slate rather than read from a file has no
+        // command line of its own to copy.
+        if command == ""
+            throw "`slate:cluster` does not know what to start -- this program was not run from a command line, so name the worker command with `exec` and `args`"
+
+        val done = pending()
+
+        // Every worker there is, as `{ id, child, ready, leaving, ports, quickDeaths, born }`.
+        var crew = []
+
+        // The ports the workers asked to serve, as `{ port, server, rotation, next }`.
+        var ports = []
+
+        // What the supervisor itself asked to hear, as `topic -> [fn]`. `$exit` is `onWorkerExit`.
+        var subs = {}
+
+        var stopping = false
+        var rolling = false
+        var draining = null
+        var nextId = 0
+
+        memberOf(id)
+            for m in crew
+                if m.id == id then return m
+
+            null
+
+        // A worker that can be given work: it has said hello and is not on its way out.
+        working(m) = m.ready && !m.leaving && m.child != null
+
+        // The row for a port a worker ASKED for, which is not always the port that got opened.
+        //
+        // **A row is found by what was asked and answers with what was bound**, because `serve(0, ...)`
+        // is how a program that has to coexist with anything asks for a port -- and every worker asking
+        // for zero must join the one listener rather than opening a socket each. node's cluster keys
+        // its shared handles on the requested address the same way.
+        portRow(asked)
+            for row in ports
+                if row.asked == asked then return row
+
+            null
+
+        // Hand one connection to the next worker in that port's rotation.
+        //
+        // **A connection nobody can serve is CLOSED rather than queued.** Every worker for this port is
+        // dead or draining, so holding the connection would be holding it until one comes back -- which
+        // is a client waiting on a request nothing is going to read.
+        handOut(row, conn)
+            val n = row.rotation.length
+            var tried = 0
+
+            while tried < n
+                val id = row.rotation[row.next % n]
+
+                row.next = (row.next + 1) % n
+                tried = tried + 1
+
+                val m = memberOf(id)
+
+                if m != null && working(m)
+                    val sent = m.child.send({ "$cluster": "connection", port: row.port }, conn)
+
+                    if sent.ok then return
+
+            closeSocket(conn)
+
+        arrived(port, conn)
+            val row = portRow(port)
+
+            if row == null then closeSocket(conn) else handOut(row, conn)
+
+        // Start listening for a port a worker asked for, and put that worker in its rotation.
+        //
+        // **The FIRST worker to ask opens the port and every later one joins**, which is what makes the
+        // program read the same in a worker as it would with no cluster at all: every worker calls
+        // `serve` on the same port and only one socket is ever bound.
+        listenFor(m, port, req)
+            var row = portRow(port)
+
+            if row == null
+                var made = null
+
+                try
+                    made = listen(port, conn -> arrived(port, conn))
+                catch e
+                    m.child.send({ "$cluster": "listening", req: req, error: e.message })
+
+                    return
+
+                row = { asked: port, port: localPort(made), server: made, rotation: [], next: 0 }
+
+                ports.push(row)
+
+            if !contains(row.rotation, m.id) then row.rotation.push(m.id)
+
+            if !contains(m.ports, row.port) then m.ports.push(row.port)
+
+            m.child.send({ "$cluster": "listening", req: req, port: row.port })
+
+        forgetPortsOf(m)
+            for row in ports
+                var i = 0
+
+                while i < row.rotation.length
+                    if row.rotation[i] == m.id then removeAt(row.rotation, i) else i = i + 1
+
+            m.ports = []
+
+        // Send a published value on to every worker but the one it came from.
+        fanOut(topic, value, from)
+            for m in crew
+                if working(m) && m.id != from
+                    m.child.send({ "$cluster": "publish", topic: topic, value: value })
+
+            if from != 0 && has(subs, topic)
+                for f in subs[topic]
+                    f(value)
+
+        heard(m, message)
+            if !(message is object) || !has(message, "$cluster") then return
+            if m.child == null then return
+
+            val what = message["$cluster"]
+
+            if what == "ready"
+                m.ready = true
+
+                // **The id goes down as the answer to hello and not before it.** A worker has to have
+                // spoken before a socket can be sent to it, so the supervisor waits for a word from
+                // every child anyway -- and answering that word is the cheapest place to number it.
+                m.child.send({ "$cluster": "id", id: m.id, scheduling: scheduling })
+            elif what == "listen"
+                if scheduling == RoundRobin then listenFor(m, message.port, message.req)
+            elif what == "publish"
+                fanOut(message.topic, message.value, m.id)
+
+        start(deaths)
+            nextId = nextId + 1
+
+            val started = spawn(command, argv, { ipc: true })
+
+            if !started.ok
+                throw "`slate:cluster` could not start a worker: " + started.error
+
+            val m = { id: nextId, child: started.value, ready: false, leaving: false, ports: [],
+                quickDeaths: deaths, born: monotonic() }
+
+            crew.push(m)
+
+            m.child.onMessage((value, conn) -> heard(m, value))
+            m.child.onExit(gone -> left(m, gone))
+
+            m
+
+        drop(m)
+            var i = 0
+
+            while i < crew.length
+                if crew[i].id == m.id then removeAt(crew, i) else i = i + 1
+
+        anyoneLeft()
+            for m in crew
+                if m.child != null then return true
+
+            false
+
+        // **The signal handlers are taken back when the cluster ends**, and not left standing: a
+        // supervisor is a thing a program can run more than once in its life -- a test does -- and a
+        // handler for a cluster that has gone would restart nothing and drain nothing.
+        var watching = []
+
+        endIfAllGone()
+            if !stopping || anyoneLeft() then return
+
+            if draining != null
+                clearTimeout(draining)
+
+                draining = null
+
+            for id in watching
+                offSignal(id)
+
+            watching = []
+
+            settle(done, null)
+
+        // A worker has gone. Report it, take it out of every rotation, and start another unless the
+        // whole cluster is on its way down.
+        left(m, gone)
+            val id = m.id
+            val pid = m.child.pid
+
+            m.child = null
+            m.ready = false
+
+            forgetPortsOf(m)
+
+            if has(subs, "$exit")
+                for f in subs["$exit"]
+                    f({ id: id, pid: pid, status: gone.status, signal: gone.signal })
+
+            if stopping
+                endIfAllGone()
+
+                return
+
+            if m.leaving then return
+
+            // **A worker that lived a while starts again at once and one that died fast waits.** The
+            // failure this is for is a program that cannot start at all -- a port taken, a missing file
+            // -- where restarting immediately is a loop that burns a core and fills a log.
+            val quick = millis(monotonic() - m.born) < 1000
+            val deaths = if quick then m.quickDeaths + 1 else 0
+
+            drop(m)
+
+            val wait = backoff(deaths, maxBackoff)
+
+            if wait == 0 then startAgain(deaths) else setTimeout(() -> startAgain(deaths), wait)
+
+        startAgain(deaths)
+            if stopping then return
+
+            start(deaths)
+
+        // Stop accepting, ask every worker to drain, and kill whoever is still there afterwards.
+        shutdown()
+            if stopping then return
+
+            stopping = true
+
+            for row in ports
+                closeSocket(row.server)
+
+            ports = []
+
+            for m in crew
+                if m.child != null then m.child.send({ "$cluster": "shutdown" })
+
+            draining = setTimeout(() -> killTheRest(), drainMillis)
+
+            endIfAllGone()
+
+        killTheRest()
+            for m in crew
+                if m.child != null then m.child.kill("SIGKILL")
+
+        // Replace the workers one at a time, the replacement serving before the one it replaces leaves.
+        async roll()
+            if rolling || stopping then return
+
+            rolling = true
+
+            var going = []
+
+            for m in crew
+                going.push(m.id)
+
+            for id in going
+                if stopping then break
+
+                val old = memberOf(id)
+
+                if old != null
+                    val wanted = old.ports
+                    val fresh = start(0)
+
+                    await standingBy(fresh, wanted)
+
+                    old.leaving = true
+
+                    forgetPortsOf(old)
+
+                    if old.child != null
+                        old.child.send({ "$cluster": "shutdown" })
+
+                        await goneOrKilled(old)
+
+            rolling = false
+
+        // Wait until a worker has said hello and taken over every port the one it replaces was serving.
+        async standingBy(m, wanted)
+            val until = monotonic() + millis(drainMillis)
+
+            while monotonic() < until
+                if m.child == null then return
+
+                if m.ready && covers(m.ports, wanted) then return
+
+                await sleep(10)
+
+        async goneOrKilled(m)
+            val until = monotonic() + millis(drainMillis)
+
+            while monotonic() < until
+                if m.child == null then return
+
+                await sleep(10)
+
+            if m.child != null then m.child.kill("SIGKILL")
+
+        val handle = { workers: count,
+            publish: (topic, value) -> fanOut(topic, value, 0),
+            subscribe: (topic, f) -> remember(subs, topic, f),
+            onWorkerExit: f -> remember(subs, "$exit", f),
+            shutdown: () -> shutdown() }
+
+        for i in 0..<count
+            start(0)
+
+        watching.push(onSignal("SIGTERM", () -> shutdown()))
+        watching.push(onSignal("SIGINT", () -> shutdown()))
+        watching.push(onSignal("SIGHUP", () -> roll()))
+
+        // **`has` and not `!= null`, because a field that is not there reads as `undefined`** -- which
+        // is not null, so the plain comparison is true of an options object that never mentioned it.
+        if has(options, "primary") then options.primary(handle)
+
+        done
+
+    // -- a worker ------------------------------------------------------------------------------------
+
+    workerSide(worker)
+        val ch = ownChannel
+        val done = pending()
+
+        // The servers this worker adopted, by the port the supervisor is listening on.
+        var apps = {}
+
+        // The `serve` calls waiting for the supervisor to say it is listening.
+        var asking = {}
+        var nextAsk = 0
+
+        var subs = {}
+        var shutdownFns = []
+        var scheduling = RoundRobin
+        var closing = false
+
+        // `serve(port, handler)` -- what `serve` in `slate:http` is to a program with no cluster.
+        //
+        // It answers a promise of `{ port, close }` rather than a server, because under round-robin the
+        // socket belongs to the supervisor: a worker asking for port 0 learns which port the kernel
+        // chose only when the supervisor says so.
+        serve(port, handler, onUpgrade = null)
+            if !(port is integer)
+                throw "`serve` takes a port number"
+
+            val app = adopt(handler, onUpgrade)
+
+            // **Under `reusePort` a worker listens for itself**, so nothing crosses the channel at all
+            // and a refusal from the kernel is the one `slate:net` gives -- which on macOS is `ENOTSUP`
+            // and is what this option's whole cost is.
+            if scheduling == ReusePort then return listenHere(port, app)
+
+            nextAsk = nextAsk + 1
+
+            val req = nextAsk
+            val p = pending()
+
+            asking[string(req)] = { promise: p, app: app }
+
+            ch.send({ "$cluster": "listen", port: port, req: req })
+
+            p
+
+        listenHere(port, app)
+            val p = pending()
+
+            try
+                val server = listen({ port: port, reusePort: true }, conn -> app.handle(conn))
+
+                settle(p, { port: localPort(server), close: () -> stopListening(server, app) })
+            catch e
+                fail(p, e.message)
+
+            p
+
+        stopListening(server, app)
+            closeSocket(server)
+            app.close()
+
+        val api = { workerId: 0,
+            serve: serve,
+            publish: (topic, value) -> ch.send({ "$cluster": "publish", topic: topic, value: value }),
+            subscribe: (topic, f) -> remember(subs, topic, f),
+            onShutdown: f -> shutdownFns.push(f) }
+
+        // Run what the program asked to run on the way out, close what it was serving, and stop.
+        //
+        // **A worker ends by ending, and an open channel keeps it alive** -- so once it has drained
+        // there is nothing left to wait for and nothing that would let it finish, which is what `exit`
+        // is for. The program's own tail runs first: settling the promise `cluster` answered hands the
+        // line of execution back before a timer of no delay at all can fire.
+        async drain()
+            if closing then return
+
+            closing = true
+
+            for f in shutdownFns
+                await f()
+
+            for key in keys(apps)
+                apps[key].close()
+
+            apps = {}
+
+            ch.send({ "$cluster": "drained" })
+            settle(done, null)
+            setTimeout(() -> exit(0), 0)
+
+        told(message, conn)
+            if !(message is object) || !has(message, "$cluster") then return
+
+            val what = message["$cluster"]
+
+            if what == "id"
+                myId = message.id
+                api.workerId = message.id
+                scheduling = message.scheduling
+
+                if worker != null then worker(api)
+            elif what == "listening"
+                listening(message)
+            elif what == "connection"
+                val key = string(message.port)
+
+                if conn != null
+                    if has(apps, key) then apps[key].handle(conn) else closeSocket(conn)
+            elif what == "publish"
+                if has(subs, message.topic)
+                    for f in subs[message.topic]
+                        f(message.value)
+            elif what == "shutdown"
+                drain()
+
+        listening(message)
+            val key = string(message.req)
+
+            if !has(asking, key) then return
+
+            val ask = asking[key]
+
+            asking = without(asking, key)
+
+            if has(message, "error")
+                fail(ask.promise, message.error)
+            else
+                apps[string(message.port)] = ask.app
+
+                settle(ask.promise, { port: message.port, close: () -> ask.app.close() })
+
+        ch.onMessage((message, conn) -> told(message, conn))
+        ch.send({ "$cluster": "ready" })
+
+        done
+
+    // -- what both sides use --------------------------------------------------------------------------
+
+    // Add a listener under a topic, making the list where this is the first.
+    remember(table, topic, f)
+        if !(f is function)
+            throw "a subscriber is a function"
+
+        if !has(table, topic) then table[topic] = []
+
+        table[topic].push(f)
+
+    // Whether every port in `wanted` is one `held` has.
+    covers(held, wanted)
+        for p in wanted
+            if !contains(held, p) then return false
+
+        true
+
+    // How long to wait before starting a worker that has died quickly `deaths` times running.
+    //
+    // **Doubling from 100 ms, and it stops.** A cap is what keeps a cluster whose workers cannot start
+    // from becoming a cluster that never tries again.
+    backoff(deaths, ceiling)
+        if deaths < 1 then return 0
+
+        var wait = 100
+        var i = 1
+
+        while i < deaths && wait < ceiling
+            wait = wait * 2
+            i = i + 1
+
+        if wait > ceiling then ceiling else wait
+    """
