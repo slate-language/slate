@@ -180,6 +180,45 @@ async awaiting_something_that_is_not_a_promise_answers_it() =
     assertEq(await 7, 7)
 
 @test
+async AN_ASYNC_LAMBDA_TAKES_ITS_PARAMETERS_IN_BRACKETS_AS_WELL_AS_BARE() =
+    val none = async () -> 7
+    val one = async (x) -> x + 1
+    val two = async (a, b) -> a + b
+    val bare = async x -> x + 1
+
+    assertEq(await none(), 7)
+    assertEq(await one(1), 2)
+    assertEq(await two(1, 2), 3)
+    assertEq(await bare(1), 2)
+
+@test
+async AN_ASYNC_LAMBDAS_BRACKETS_TAKE_EVERY_PARAMETER_FORM_A_WRITTEN_LAMBDA_TAKES() =
+    val defaulted = async (a, b = 5) -> a + b
+    val rested = async (a, ...rest) -> a + rest.length
+    val fromObject = async ({ a, b }) -> a + b
+    val fromArray = async ([a, b]) -> a + b
+
+    assertEq(await defaulted(1), 6)
+    assertEq(await defaulted(1, 2), 3)
+    assertEq(await rested(1, 2, 3), 3)
+    assertEq(await fromObject({ a: 1, b: 2 }), 3)
+    assertEq(await fromArray([1, 2]), 3)
+
+@test
+async AN_ASYNC_LAMBDA_IN_BRACKETS_READS_THE_SAME_WHEREVER_IT_STANDS() =
+    doubled(x) =
+        async (y) -> y * x
+
+    // As an argument, immediately invoked, nested one inside another, and awaiting in its own body.
+    val promises = [1, 2, 3].map(async (x) -> await resolve(x * 2))
+    val twice = doubled(2)
+
+    assertEq(await promises[0], 2)
+    assertEq(await promises[2], 6)
+    assertEq(await (async (x) -> x + 1)(41), 42)
+    assertEq(await twice(21), 42)
+
+@test
 async a_timer_resumes_the_program_later() =
     var seen = []
 
