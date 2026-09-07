@@ -287,6 +287,8 @@ is the reference: the manifest, the cache, and what `slate.sum` guarantees.
 - **[A tour for JavaScript and TypeScript people](../tour-for-js/)** — what is different here, and why.
 - **[The language reference](../reference/)** — every construct, written down once, in its own place.
 - **[The library](../library/)** — what a program has without writing it.
+- **[Deploy to Linux](deploy.md)** — the binary on a server, a program under `slate:cluster`, and
+  systemd keeping it up.
 
 **Every program on these pages is run by slate's own test suite**, and every refusal is quoted from
 the diagnostic the compiler really prints. A page that drifts from the compiler fails the build.

@@ -67,6 +67,9 @@ on Ubuntu 24.04, 26.04, the current Ubuntu and Debian 12, on both architectures,
 and the binary that is shipped has run slate's own language suite on the machine that built it, under both
 the interpreter and node.
 
+Running a server on that box, under [`slate:cluster`](docs/library/cluster.md) and kept up by systemd, is
+[Deploy to Linux](docs/getting-started/deploy.md).
+
 Anywhere else, build it from source — a clone and one command, given [sysl](https://sysl.sh) installed.
 
 ## Running it
