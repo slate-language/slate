@@ -2,9 +2,10 @@ module dev.slatelang.slate
 @tests
 
 import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
 import sysl.fs.{read_bytes, remove_file, write_text}
 import sysl.process.capture
-import sysl.text.{Search, from_utf8_unchecked}
+import sysl.text.{Search, from_utf8_unchecked, str_builder}
 
 // The emitted PROGRAM, rather than the statement a form compiles to.
 //
@@ -341,6 +342,32 @@ private probed(program: string, probe: string) -> string
         Ok(o) -> if o.status.ok() then o.text.trim() else o.err.unwrap_or("").trim()
 end probed
 
+// The emitted program run under a real node, read for its exit status as well as what it printed.
+//
+// **`probed` throws the status away, and `exit` is exactly the case that needs it kept.** A program
+// that calls `process.exit` never gets to `o.status.ok()` deciding anything -- the status IS the
+// answer -- so this is `probed`'s file-write-compile-run arrangement with the one thing added.
+private node_status_and_said(program: string) -> (string, string)
+    val src = "tests/js-exit.tmp.sl"
+    val out_js = src + ".js"
+
+    write_text(src, program).unwrap()
+
+    val wrote = cli_status(["slate", "js", src, "-o", out_js])
+
+    remove_file(src)
+
+    if wrote != 0 then return (s"`slate js` exited ${wrote}", "")
+
+    val ran = capture("node", [out_js], "", [], true)
+
+    remove_file(out_js)
+
+    ran match
+        Err(e) -> (s"node could not be started: ${e}", "")
+        Ok(o) -> (s"${o.status}", o.text.trim())
+end node_status_and_said
+
 @test
 THE_EMITTED_PROGRAM_LEAVES_THE_HOSTS_OWN_GLOBALS_ALONE()
     // **`print` is the one to ask about, because it is the plainest.** A host that has a `print` of
@@ -376,6 +403,69 @@ host_ANSWERS_NODE_UNDER_THE_EMITTED_PROGRAM()
     // `js_rt_ws.sysl`'s `B.host` telling the two apart.
     assert_eq(probed("print(host())\n", ""), "node")
 end host_ANSWERS_NODE_UNDER_THE_EMITTED_PROGRAM
+
+@test
+EXIT_INSIDE_AN_UNAWAITED_ASYNC_FUNCTION_STOPS_THE_PROCESS_WITH_ITS_STATUS()
+    // **`B.exit` has always called `process.exit` directly**, so this side of the fix is about the
+    // interpreter and `slate test --js` catching up to what compiling to JavaScript already did --
+    // this test is here to say so is still true rather than because it was ever broken.
+    val (status, said) = node_status_and_said(
+        "import { exit } from slate:process\n\nasync main()\n    print(\"before\")\n    exit(3)\n\nmain()\n")
+
+    assert_eq(said, "before")
+    assert_eq(status, "exited 3")
+end EXIT_INSIDE_AN_UNAWAITED_ASYNC_FUNCTION_STOPS_THE_PROCESS_WITH_ITS_STATUS
+
+@test
+EXIT_INSIDE_AN_AWAITED_ASYNC_FUNCTION_IS_NOT_CAUGHT_BY_A_TRY_AROUND_THE_AWAIT()
+    val (status, said) = node_status_and_said(
+        "import { exit } from slate:process\n" +
+        "async handler(req)\n" +
+        "    print(\"handling\")\n" +
+        "    exit(7)\n\n" +
+        "async dispatch()\n" +
+        "    try\n" +
+        "        await handler(1)\n" +
+        "    catch e\n" +
+        "        print(\"caught:\", e.message)\n\n" +
+        "dispatch()\n")
+
+    assert_eq(said, "handling")
+    assert_eq(status, "exited 7")
+end EXIT_INSIDE_AN_AWAITED_ASYNC_FUNCTION_IS_NOT_CAUGHT_BY_A_TRY_AROUND_THE_AWAIT
+
+@test
+A_TEST_MAY_NOT_STOP_THE_RUN_UNDER_NODE_EITHER()
+    // **`process.exit` from inside `slate test --js` used to take the whole suite with it**: `B.exit`
+    // called it unconditionally, `$suite` runs every file in one node process, and nothing in that
+    // process could have told a test's `exit` apart from a real request to stop. A test calling
+    // `exit` killed node outright -- no FAIL line, no "N passed", just node gone and whatever exit
+    // code `exit` itself had been given standing in for the suite's own. `$testMode` is what tells
+    // them apart now: `$suite` turns it on, `B.exit` raises `Exited` instead of calling `process.exit`
+    // while it is, and `caught` passes `Exited` through every `catch` a tested program wrote --
+    // uncatchable there exactly as `Quit` is in the interpreter.
+    val src = "tests/js-exit-test.tmp.sl"
+
+    write_text(src, "import { exit } from slate:process\n@test\nasync t()\n    exit(9)\n").unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val status = run_cli(["slate", "test", "--js", src], (line: string) -> sink.push(line))
+
+    remove_file(src)
+
+    var said = str_builder()
+
+    for i in 0..<lines.len()
+        if i > 0 then said.push("\n")
+
+        said.push(lines.at(i))
+
+    val out = said.finish()
+
+    assert(out.contains("`exit(9)` was called, and a test may not stop the run it is part of"), out)
+    assert_eq(status, 1)
+end A_TEST_MAY_NOT_STOP_THE_RUN_UNDER_NODE_EITHER
 
 @test
 A_PROGRAM_MAY_STILL_DECLARE_A_NAME_A_BUILTIN_HAS()

@@ -47,6 +47,11 @@ struct Resumption
     failed: bool
     message: string
     at: Span
+    src: usize
+
+    // Whether the failure was `exit`, and its status -- see `PromiseObj`, which this is a snapshot of.
+    quit: bool
+    quit_status: long
 
 // The answers waiting to be handed back. **Not `private`: `vm.sysl`'s `Await` queues onto it.**
 var ready: Buf[Resumption] = buf()
@@ -143,12 +148,12 @@ end settle_watches
 
 private answer_watch(w: FaultWatch, pr: *PromiseObj)
     if !pr.failed
-        settle_err(w.out, s"expected a fault, got a value: ${show_value(pr.value)}", w.at)
+        settle_err(w.out, s"expected a fault, got a value: ${show_value(pr.value)}", w.at, current_source)
         return
     end if
 
     if w.wanted != "" && !pr.message.contains(w.wanted)
-        settle_err(w.out, s"the fault said \"${pr.message}\", wanted it to contain \"${w.wanted}\"", w.at)
+        settle_err(w.out, s"the fault said \"${pr.message}\", wanted it to contain \"${w.wanted}\"", w.at, current_source)
         return
     end if
 
@@ -187,7 +192,7 @@ settle_ok(pr: *PromiseObj, v: Value)
     pr.value = v
     wake(pr)
 
-settle_err(pr: *PromiseObj, message: string, at: Span)
+settle_err(pr: *PromiseObj, message: string, at: Span, src: usize)
     if pr.settled then return
 
     pr.settled = true
@@ -195,6 +200,7 @@ settle_err(pr: *PromiseObj, message: string, at: Span)
     pr.value = Null
     pr.message = message
     pr.at = at
+    pr.src = src
 
     // Recorded whether or not anything is waiting -- see `rejections`.
     rejections.push(pr)
@@ -207,24 +213,64 @@ settle_err(pr: *PromiseObj, message: string, at: Span)
     orphan_failed(pr)
 end settle_err
 
+// **`exit` settling the promise of the `async` function it was called inside.**
+//
+// **A variant of its own and not a call to `settle_err`, for the same reason `Quit` is a variant of
+// its own and not a `Fail` with a special message.** `pr.message` is still given the rendered
+// sentence -- `slate test` reads it straight off a test's own promise without asking what kind of
+// failure it was -- but `pr.quit` is what tells `resume_one`, `orphan_failed` and
+// `unhandled_rejection` to hand `exit` back out as `Quit` rather than as an ordinary fault, which is
+// what keeps it uncatchable and keeps its status reaching the driver from an `await` away exactly as
+// it does from a call that never suspended.
+settle_quit(pr: *PromiseObj, at: Span, src: usize, status: long)
+    if pr.settled then return
+
+    pr.settled = true
+    pr.failed = true
+    pr.quit = true
+    pr.quit_status = status
+    pr.value = Null
+    pr.message = signal_message(Quit(at, src, status))
+    pr.at = at
+    pr.src = src
+
+    rejections.push(pr)
+    wake(pr)
+    orphan_failed(pr)
+end settle_quit
+
 // A failure nothing can ever be waiting for, made the program's fault where it stands.
 //
 // **`loop_fault` and not a return value, because neither caller can report anything.** One is
 // `settle_err`, reached from a timer callback or a socket read; the other is the `Discard` that threw
 // the promise away. The loop reads it at the top of its next turn and stops the program there, which
 // is the path a callback that faults outright already takes.
+//
+// **`exit` is handed back as `Quit`, carrying the file the promise remembered rather than whatever
+// `current_source` happens to be here** -- the loop is somewhere else entirely by the time an orphan
+// is found, and `failure` would otherwise stamp the wrong file on the right offset.
 orphan_failed(pr: *PromiseObj)
     if !pr.orphaned || !pr.failed || pr.handled then return
 
     loop_fault match
         Some(_) -> ()
-        None -> loop_fault = Some(failure(pr.at, s"this failed inside an `async` function whose promise nothing awaited: ${pr.message}"))
+        None -> loop_fault = Some(promise_signal(pr))
 end orphan_failed
+
+// What a failed promise is, told back as the `Signal` it settled with -- `Quit` where `exit` is why
+// it failed, an ordinary `Fail` otherwise. Carries the file the promise remembered rather than
+// whatever `current_source` happens to be at the point this is asked, which may be neither the file
+// the fault was raised in nor the one the promise was made in.
+private promise_signal(pr: *PromiseObj) -> Signal =
+    if pr.quit
+        Quit(pr.at, pr.src, pr.quit_status)
+    else
+        Fail(pr.at, pr.src, s"this failed inside an `async` function whose promise nothing awaited: ${pr.message}")
 
 // Queue everything that was waiting on this.
 private wake(pr: *PromiseObj)
     for i in 0..<pr.waiters.len()
-        ready.push(Resumption(pr.waiters.at(i), pr.value, pr.failed, pr.message, pr.at))
+        ready.push(Resumption(pr.waiters.at(i), pr.value, pr.failed, pr.message, pr.at, pr.src, pr.quit, pr.quit_status))
 
     pr.waiters.clear()
 
@@ -254,7 +300,7 @@ unhandled_rejection() -> Option[Signal]
         val pr = rejections.at(i)
 
         if !pr.handled
-            return Some(failure(pr.at, s"this failed inside an `async` function whose promise nothing awaited: ${pr.message}"))
+            return Some(promise_signal(pr))
 
     None
 end unhandled_rejection
@@ -319,9 +365,10 @@ finish(outcome: Step)
 
     outcome match
         Ok(v) -> settle_ok(pr, v)
-        Err(Fail(at, _, m)) -> settle_err(pr, m, at)
+        Err(Fail(at, src, m)) -> settle_err(pr, m, at, src)
+        Err(Quit(at, src, n)) -> settle_quit(pr, at, src, n)
         Err(Wait) -> ()
-        Err(s) -> settle_err(pr, signal_message(s), signal_span(s))
+        Err(s) -> settle_err(pr, signal_message(s), signal_span(s), signal_source(s))
 end finish
 
 // -- draining -----------------------------------------------------------------------------------------
@@ -369,7 +416,11 @@ private resume_one(r: Resumption)
         //
         // With nothing to catch it the answer is the same one this used to build by hand: the
         // coroutine ends and its own promise fails in turn.
-        resume_failed(&current_unit, r.at, r.message)
+        //
+        // **`exit` is handed back as `Quit`, and `guarded` matches `Fail` and only `Fail`** -- so a
+        // `try` around the `await` is offered nothing and this passes straight through it, exactly as
+        // it would have if `exit` had never crossed a promise at all.
+        resume_failed(&current_unit, if r.quit then Quit(r.at, r.src, r.quit_status) else Fail(r.at, r.src, r.message))
     else
         resume_chunk(&current_unit)
 
