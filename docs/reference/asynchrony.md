@@ -54,6 +54,26 @@ val x = await sleep(1)
 `async` goes in front of a definition, a lambda, or a method. Making the whole program a coroutine is a
 real design and one to make on purpose.
 
+**In front of a lambda it takes either spelling of the parameters**, the bare name and the bracketed
+list, and a bracketed list may hold everything a written lambda's may — none, several, a default, a
+rest parameter, a destructuring pattern:
+
+```slate
+async main()
+    val twice = async (x) -> x * 2
+    val hello = async () -> "hello"
+    val add = async (a, b = 2) -> a + b
+    val one = async x -> x + 1
+
+    print(await twice(21), await hello(), await add(1), await one(1))
+
+main()
+```
+
+```output
+42 hello 3 2
+```
+
 ## The order things run in
 
 **A settled promise still resumes through the queue rather than continuing in place**, so what was
