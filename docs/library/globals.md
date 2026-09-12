@@ -96,13 +96,17 @@ padEnd number integer real boolean string`.
 
 ## Numbers
 
-`abs  floor  ceil  round  trunc  sqrt  pow  min  max  toFixed  formatNumber`
+`abs  floor  ceil  round  trunc  sqrt  pow  min  max  random  toFixed  formatNumber`
 
 - **The four roundings leave an integer alone**, an integer already being whole.
 - **`min` and `max` take as many arguments as they are given** and answer an integer when every one of
   them was — a `min` that answered a real for two integers would make every use of it in an index a
   conversion.
 - `pow` of two integers with a non-negative exponent answers an **integer**.
+- **`random()` answers a real in `[0, 1)`** and takes no arguments, which is JavaScript's
+  `Math.random()` under its own name — 53 bits, and never `1.0`. It is **not a source of secrets**:
+  a handful of draws gives away every draw that follows, so a key, a token, a nonce or a password
+  reset wants `randomBytes` in [`slate:crypto`](crypto.md) instead.
 - **`toFixed(x, places)` writes a number to exactly that many decimal places, as text.** It is
   byte-identical with JavaScript's, ties included: a tie rounds AWAY from zero, which is not what
   C's `printf` does.
@@ -121,6 +125,18 @@ print(formatNumber(toFixed(1234.5, 2), { separator: " ", decimal: "," }))
 1234.50 3
 1,234,567 1,234.50
 1 234,50
+```
+
+A draw cannot be printed and checked — what it *is* can:
+
+```slate
+val r = random()
+
+print(r >= 0 && r < 1, r is real)
+```
+
+```output
+true true
 ```
 
 As methods, a number answers: `abs floor ceil round trunc sqrt integer real boolean string toFixed

@@ -71,6 +71,38 @@ a_number_says_what_it_is_when_printed() =
     assertEq(string(0.1 + 0.2), "0.3")
 
 @test
+a_draw_is_a_real_between_zero_and_one() =
+    val r = random()
+
+    assert(r is real)
+    assert(r >= 0)
+    assert(r < 1)
+
+    // A hundred draws, every one of them in range: a generator whose top bit leaked, or one dividing
+    // by 2^53 - 1, would be found here rather than by the single draw above.
+    var i = 0
+
+    while i < 100
+        val x = random()
+
+        assert(x >= 0 && x < 1)
+        i += 1
+
+@test
+two_draws_are_not_the_same_number() =
+    // **A handful rather than a pair**, and the pin is that all eight differ: a generator that never
+    // advanced would answer one number eight times, and 53-bit draws collide about once in 2^48
+    // runs of this, which is far enough from flaky.
+    var seen = []
+    var i = 0
+
+    while i < 8
+        seen.push(random())
+        i += 1
+
+    assert(unique(seen).length == 8)
+
+@test
 dividing_an_integer_by_zero_is_a_fault_rather_than_an_answer() =
     assert((1 / 0) catch e -> true)
     assert((1 % 0) catch e -> true)

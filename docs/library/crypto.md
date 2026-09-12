@@ -35,6 +35,10 @@ false
 | `argon2Verify(record, attempt)` | a promise of `true` or `false` |
 | `argon2NeedsRehash(record)` | `true` or `false`, at once |
 
+**`randomBytes` is where a secret comes from, and the global `random()` is not.** `random()` is a fast
+generator seeded once and answers a real in `[0, 1)`, which is what a shuffle or a jitter wants; a key, a
+token, a nonce or a password reset asks the operating system every time, which is this.
+
 **`hmac` takes the digest by name** — `"MD5"`, `"SHA-1"`, `"SHA-256"`, `"SHA-384"`, `"SHA-512"` — because
 what a program is speaking to decides it, and a default here would be a decision taken by whoever wrote the
 module rather than by the protocol. **`pbkdf2` takes the same names without `"MD5"`**: every other name
