@@ -107,6 +107,42 @@ one array every instance pushes into. **A mutable literal under `val` is therefo
 message names `var` as the fix. Only a *literal* is refused: an object bound outside the class and named
 here is sharing somebody asked for, and still compiles.
 
+## No member may be called `proto`
+
+**`proto` is the link itself, not a name a class can spend.** A class is an object with a `proto`, and
+every object it makes is given one pointing back at the class — that is the whole of how a method is
+found. A member declared under that name would be sitting behind the link: `t.proto` walks to the link
+first and answers the class, and the declared value only appears once something has assigned to it. So
+it is refused where it is written, in every form that declares one — `var`, `val`, a `new` parameter, a
+method, a getter, a setter, and a `data` variant's field:
+
+```slate
+class Thing
+    var proto = 2
+```
+
+```error
+`proto` is how an object reaches what it was made from, so class `Thing` cannot call a member that
+```
+
+**This is a rule about class bodies and changes nothing about `proto` on an ordinary object.** A literal
+is where a program writes the link by hand, which is how protos worked before `class` existed, so
+`{ proto: 2 }` is an ordinary field holding an ordinary integer and `{ proto: Thing }` is still the link
+a lookup walks:
+
+```slate
+class Greeter
+    hi(self) = "hi"
+
+print({ proto: 2 }.proto)
+print({ proto: Greeter }.hi())
+```
+
+```output
+2
+hi
+```
+
 ## The generated `new`
 
 **A class that declares fields and writes no constructor is given one**, taking all of them — the fields
