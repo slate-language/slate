@@ -61,6 +61,17 @@ declared in the file adds its own name to it.
 are read this way in pattern position and nowhere else. What it costs is real: a `match` arm may no
 longer bind a name spelled `date` or `time`.
 
+**Reaching for one of them afterwards names what happened instead of just saying "not defined".**
+
+```slate
+val [a, time] = [1, 2]
+print(time)
+```
+
+```error
+`time` here tests for a `time` value rather than binding one
+```
+
 `number` is the one word that is not a kind, being the union of `integer` and `real`.
 
 **`_` matches anything and binds nothing.**
