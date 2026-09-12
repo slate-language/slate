@@ -109,7 +109,9 @@ padEnd number integer real boolean string`.
   reset wants `randomBytes` in [`slate:crypto`](crypto.md) instead.
 - **`toFixed(x, places)` writes a number to exactly that many decimal places, as text.** It is
   byte-identical with JavaScript's, ties included: a tie rounds AWAY from zero, which is not what
-  C's `printf` does.
+  C's `printf` does. **It never faults on the number itself** — past `1e21` it gives up on decimal
+  places and answers what `string` would in exponential form, `NaN` answers `"NaN"`, and an
+  infinity answers `"Infinity"`/`"-Infinity"`. Only the place count, outside `0..100`, is refused.
 - **`formatNumber` groups the digits in threes**, taking a whole number or the text `toFixed`
   answered — never a `real`, which has no one written form of its own. `formatNumber(toFixed(total,
   2))` is a price. The defaults are a comma and a full stop; `{ separator: " ", decimal: "," }` is
@@ -119,12 +121,14 @@ padEnd number integer real boolean string`.
 print(toFixed(1234.5, 2), toFixed(2.5, 0))
 print(formatNumber(1234567), formatNumber(toFixed(1234.5, 2)))
 print(formatNumber(toFixed(1234.5, 2), { separator: " ", decimal: "," }))
+print(toFixed(1e21, 2), toFixed(1.0 / 0.0, 2), toFixed(0.0 / 0.0, 2))
 ```
 
 ```output
 1234.50 3
 1,234,567 1,234.50
 1 234,50
+1e+21 Infinity NaN
 ```
 
 A draw cannot be printed and checked — what it *is* can:
