@@ -85,6 +85,30 @@ print(ok)
 true
 ```
 
+**A block that closes ends the expression it is part of**, as it ends the statement. So the line under
+a block is a statement of its own whatever it begins with — a `-`, a `[`, a `(` or a `{` there is never
+read as an operator on the block's value:
+
+```slate
+sign(x)
+    if x > 0
+        return 1
+
+    -1
+
+count()
+    var i = 0
+    while i < 2
+        i = i + 1
+    [i, 1]
+
+print(sign(0), count())
+```
+
+```output
+-1 [2, 1]
+```
+
 ## `end`, and the closing words
 
 A block that has grown long enough to want a closing marker takes one: `end if`, `end while`,

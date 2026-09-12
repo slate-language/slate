@@ -35,6 +35,126 @@ a_for_walks_an_array_a_range_and_an_objects_entries() =
 
     assertEq(seen, [1, 2, 0, 1, "a", 1])
 
+// A block that closes ends the expression holding it, so the line under it is a statement of its own
+// whatever it begins with. Each of these was read as an operator on the block's value: `-1` as a
+// subtraction from the `if`, `[i, 1]` as an index on the loop's last line, `(` as a call.
+
+@test
+A_LINE_UNDER_AN_if_THAT_BEGINS_WITH_A_MINUS_IS_A_STATEMENT_AND_NOT_A_SUBTRACTION() =
+    sign(x)
+        if x > 0
+            return 1
+
+        -1
+
+    assertEq(sign(0), -1)
+    assertEq(sign(5), 1)
+
+@test
+A_LINE_UNDER_A_while_THAT_BEGINS_WITH_A_BRACKET_IS_AN_ARRAY_AND_NOT_AN_INDEX() =
+    counted()
+        var i = 0
+        while i < 2
+            i = i + 1
+        [i, 1]
+
+    assertEq(counted(), [2, 1])
+
+@test
+A_LINE_UNDER_A_for_THAT_BEGINS_WITH_A_BRACE_IS_AN_OBJECT() =
+    total()
+        var n = 0
+        for x in [1, 2, 3]
+            n = n + x
+        { n: n }
+
+    assertEq(total(), { n: 6 })
+
+@test
+A_LINE_UNDER_A_match_THAT_BEGINS_WITH_A_PARENTHESIS_IS_A_GROUP_AND_NOT_A_CALL() =
+    named(x)
+        val word = x match
+            1 -> "one"
+            _ -> "many"
+        (word + "!")
+
+    assertEq(named(1), "one!")
+    assertEq(named(2), "many!")
+
+@test
+A_LINE_UNDER_A_BLOCK_LAMBDA_IS_A_STATEMENT_OF_ITS_OWN() =
+    tripled()
+        val triple = x ->
+            val y = x * 3
+            y
+        -triple(2)
+
+    assertEq(tripled(), -6)
+
+@test
+A_LINE_UNDER_A_try_AND_ITS_catch_IS_A_STATEMENT_OF_ITS_OWN() =
+    recovered()
+        val v = try
+            1 / 0
+        catch e
+            10
+        -v
+
+    assertEq(recovered(), -10)
+
+@test
+A_LINE_THAT_CLOSES_TWO_BLOCKS_AT_ONCE_BEGINS_A_STATEMENT_TOO() =
+    summed(xs)
+        var n = 0
+        for x in xs
+            if x > 1
+                n = n + x
+        [n, -n]
+
+    assertEq(summed([1, 2, 3]), [5, -5])
+
+@test
+A_STRING_UNDER_AN_if_AND_ITS_else_IS_THE_ANSWER() =
+    said(x)
+        var s = ""
+        if x
+            s = "yes"
+        else
+            s = "no"
+        "said"
+
+    assertEq(said(true), "said")
+
+@test
+A_LINE_UNDER_A_WRAPPED_CONDITIONAL_IS_A_STATEMENT_OF_ITS_OWN() =
+    shape(xs)
+        val kind = if xs.length == 0
+            then "empty"
+            else "carrying"
+        [kind, -xs.length]
+
+    assertEq(shape([]), ["empty", 0])
+    assertEq(shape([7]), ["carrying", -1])
+
+// What a closing block must NOT end: a line continued inside brackets, and a chain written after the
+// bracket that closes a block lambda, are each still one expression.
+
+@test
+A_LINE_WRAPPED_INSIDE_BRACKETS_IS_STILL_ONE_EXPRESSION() =
+    val sum = (1 +
+        2 -
+        [10][0])
+
+    assertEq(sum, -7)
+
+@test
+A_BRACKET_THAT_CLOSES_A_BLOCK_LAMBDA_CAN_STILL_BE_CHAINED() =
+    val out = [1, 2].map(x ->
+        val y = x * 2
+        y).map(x -> x + 1)
+
+    assertEq(out, [3, 5])
+
 @test
 a_while_runs_while_its_condition_holds() =
     var n = 0
