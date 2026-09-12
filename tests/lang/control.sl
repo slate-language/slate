@@ -381,3 +381,86 @@ async a_for_await_evaluates_its_subject_once() =
 
     assertEq(seen, [1, 2])
     assertEq(made, 1)
+
+@test
+a_range_steps_by_what_by_says() =
+    var up = []
+
+    for x in 0..<10 by 2
+        push(up, x)
+
+    var down = []
+
+    for x in 10..0 by -1
+        push(down, x)
+
+    assertEq(up, [0, 2, 4, 6, 8])
+    assertEq(down, [10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0])
+    assertEq(string(Set(1..9 by 3)), "[1, 4, 7]")
+
+@test
+a_step_that_runs_away_from_its_end_covers_nothing() =
+    // The answer `10..0` already gave before there were steps: a range that cannot reach its ceiling
+    // is empty rather than a mistake.
+    assertEq((0..10 by -1).length, 0)
+    assertEq((10..0 by 2).length, 0)
+
+    var seen = []
+
+    for x in 0..10 by -1
+        push(seen, x)
+
+    assertEq(seen, [])
+
+@test
+a_stepped_range_counts_prints_and_compares_by_the_numbers_it_covers() =
+    assertEq((0..<10 by 2).length, 5)
+    assertEq((10..0 by -1).length, 11)
+    assertEq((1..9 by 3).length, 3)
+    assertEq(string(0..<10 by 2), "0..<10 by 2")
+    assertEq(string(0..3), "0..3")
+
+    // `0..<10 by 2` and `0..8 by 2` are the same five numbers, exactly as `1..3` and `1..<4` are the
+    // same three -- so they are equal and therefore find each other in a table.
+    assert(0..<10 by 2 == 0..8 by 2)
+    assert(!(0..<10 by 2 == 0..<10))
+
+    val o = {}
+
+    o[0..<10 by 2] = "evens"
+
+    assertEq(o[0..8 by 2], "evens")
+
+@test
+a_stepped_range_slices_by_the_positions_it_covers() =
+    assertEq([10, 20, 30, 40, 50, 60][0..<6 by 2], [10, 30, 50])
+    assertEq("abcdef"[0..<6 by 2], "ace")
+    assertEq([1, 2, 3][2..0 by -1], [3, 2, 1])
+
+@test
+a_stepped_range_is_a_pattern_as_an_ordinary_one_is() =
+    assert(6 is 0..<10 by 2)
+    assert(!(7 is 0..<10 by 2))
+
+    grade(n) = n match
+        0..<10 by 3 -> "on"
+        _           -> "off"
+
+    assertEq(grade(9), "on")
+    assertEq(grade(8), "off")
+
+@test
+by_IS_A_SOFT_WORD_AND_STAYS_AN_ORDINARY_NAME() =
+    // Taking `by` as a keyword would take the name away from every program that wanted it. It means a
+    // step only where a range has just been read, which is the one place it can mean anything.
+    var by = 3
+
+    by = by + 1
+
+    assertEq(by, 4)
+    assertEq({ by: 7 }.by, 7)
+    assertEq((0..<12 by by).length, 3)
+
+    double(by) = by * 2
+
+    assertEq(double(5), 10)

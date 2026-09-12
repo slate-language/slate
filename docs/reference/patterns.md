@@ -109,6 +109,24 @@ F D A
 true true
 ```
 
+**A step narrows a range pattern to every *k*th number**, which is the `by` an expression writes and
+means the same thing — so a declared type can say what an even digit is:
+
+```slate
+type Even = 0..<10 by 2
+
+print(4 is Even, 5 is Even)
+print(6 is 0..<10 by 2, 7 is 0..<10 by 2)
+```
+
+```output
+true false
+true false
+```
+
+A step here is a whole number beside whole ends, and it counts from the end it walks away from — so
+`..100 by 2` is refused, having no end to count from.
+
 **Whole ends mean whole numbers**, so `2.5 is 0..100` is false and `2.5 is 0.0..100.0` is true. A range
 binds nothing, its ends being numbers, and it is a [type](types.md) in every position a pattern is one.
 

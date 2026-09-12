@@ -204,6 +204,10 @@ print(c, n)
 
 `do` introduces a one-line body — `while c do …`, `for x in xs do …`, `loop do …`.
 
+A `for` over a range walks every number it covers, and [`by`](expressions.md#by-gives-a-range-a-step)
+is how that range takes a step: `for i in 0..<10 by 2` counts the evens, and `for i in 10..0 by -1`
+counts down.
+
 **`for await x in source`** is the fourth, and it walks something that answers `next()` a value at a
 time — see [Asynchrony](asynchrony.md).
 

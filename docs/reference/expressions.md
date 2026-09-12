@@ -19,6 +19,7 @@ Loosest at the top. Everything is left-associative except the lambda arrow.
 | 25 | `is` | |
 | 30 | `==` `!=` `<` `<=` `>` `>=` | one level, because a chain of them is one comparison |
 | 35 | `..` `..<` | non-associative |
+| 35 | `by` | the step of the range on its left |
 | 40 | `\|` | |
 | 42 | `^` | |
 | 44 | `&` | |
@@ -128,6 +129,77 @@ hel
 
 An end left out is taken from whatever the range is used on. Ranges do not associate, so `a..b..c` is
 refused. **`a..=b` is refused by name**, since a reader arriving from Rust writes it once.
+
+### `by` gives a range a step
+
+`by` takes the numbers the range covers down to every *k*th of them. It binds to the range on its
+left — looser than `..` and `..<`, tighter than a comparison — so `0..<10 by 1 + 1` steps by two and
+`0..<10 by 2 == r` compares the stepped range:
+
+```slate
+for x in 0..<10 by 2
+    print(x)
+
+print(1..9 by 3, (1..9 by 3).length)
+print([10, 20, 30, 40, 50, 60][0..<6 by 2])
+```
+
+```output
+0
+2
+4
+6
+8
+1..9 by 3 3
+[10, 30, 50]
+```
+
+**A negative step runs the range downwards**, and `10..0 by -1` is the countdown a `for` head wants:
+
+```slate
+var seen = []
+
+for x in 10..7 by -1
+    push(seen, x)
+
+print(seen)
+print((0..10 by -1).length, (10..0 by 2).length)
+```
+
+```output
+[10, 9, 8, 7]
+0 0
+```
+
+**A step whose sign disagrees with the ends covers nothing** — which is the answer `10..0` gave
+before there were steps at all — so those two lengths are zero rather than a complaint.
+
+**A step of `0` is refused**, where it is written if it is a number and where it is worked out if it
+is not, since a range that never moves would never reach its end:
+
+```slate
+print(0..<10 by 0)
+```
+
+```error
+a range steps by 0
+```
+
+**`by` is a soft word**: it means a step only straight after a range, and is an ordinary name
+everywhere else.
+
+```slate
+val by = 3
+
+print(by * 2, (0..<12 by by).length)
+```
+
+```output
+6 4
+```
+
+A range whose top is left out takes no step — a word standing where the top belongs is read as that
+top, so `0..by` is a range up to what `by` holds.
 
 ## Field and index
 

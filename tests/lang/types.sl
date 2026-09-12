@@ -11,6 +11,9 @@ type MaybeFn = (integer -> integer) | null
 type Spot = { x: number, y: number }
 type Wrapper = { inner: object }
 
+// A range with a step is a type the same way a range without one is: the numbers it covers.
+type Even = 0..<10 by 2
+
 anything(v) = v
 
 @test
@@ -157,3 +160,12 @@ an_object_shape_is_still_at_least_its_fields_when_the_program_runs() =
 area(p: Spot) = p.x * p.y
 
 inner(o: Wrapper) = o.inner.a
+
+@test
+A_RANGE_TYPE_HONOURS_ITS_STEP() =
+    // `1..65535` says what a port is; `0..<10 by 2` says what an even digit is, and it is the same
+    // range the expression grammar writes.
+    assert(4 is Even)
+    assert(!(5 is Even))
+    assert(0 is Even)
+    assert(!(10 is Even))
