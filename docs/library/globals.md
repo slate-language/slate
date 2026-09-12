@@ -212,7 +212,9 @@ Where slate parts from JavaScript it is **to remove a case rather than add one**
   the end is a mistake.
 - **`at` and `slice` count back from the end** where the position is negative, which is the whole reason
   JavaScript grew `at` beside `xs[i]`.
-- **A comparator answers a number** whose sign orders the pair, as a class's `<=>` does.
+- **A comparator answers a boolean: whether the first value comes before the second.** `sorted(xs,
+  _.age < _.age)` is the whole of one. A comparator answering `-1`, `0` or `1` is refused by name:
+  `0` is true in slate, so a three-way answer would read as "yes, yes, yes".
 
 ## Objects
 
