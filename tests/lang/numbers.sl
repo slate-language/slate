@@ -48,6 +48,27 @@ conversions_between_the_kinds() =
     assertEq(number("nonsense"), null)
 
 @test
+number_OF_A_TEXT_DENOTING_NEGATIVE_ZERO_KEEPS_THE_SIGN_THE_WAY_JAVASCRIPT_DOES() =
+    // A plain integer literal cannot carry the sign of zero -- `-0` and `0` are one `long` -- so
+    // `number("-0")` answers the real `-0` rather than the integer `0`, exactly as JavaScript's
+    // `Number("-0")` is `-0` rather than `0`. `0 == -0.0`, so the sign has to be read off which way
+    // `1.0` divides rather than off `==`.
+    assert(number("-0") is real)
+    assert(number("0") is integer)
+    assertEq(string(1.0 / number("-0")), "-inf")
+    assertEq(string(1.0 / number("0")), "inf")
+
+    // The neighbours: any run of zero digits after the sign, and a `+` that leaves zero positive
+    // exactly as a bare `0` does.
+    assertEq(string(1.0 / number("-00")), "-inf")
+    assertEq(string(1.0 / number("-0.0")), "-inf")
+    assertEq(string(1.0 / number("+0")), "inf")
+
+    // Leading whitespace already went through `strtod`, which reads the sign correctly by itself --
+    // this is not new here, only checked, since it shares `number`'s path with the fix above.
+    assertEq(string(1.0 / number(" -0")), "-inf")
+
+@test
 rounding_and_magnitude() =
     assertEq(floor(3.7), 3.0)
     assertEq(ceil(3.2), 4.0)
@@ -106,3 +127,39 @@ two_draws_are_not_the_same_number() =
 dividing_an_integer_by_zero_is_a_fault_rather_than_an_answer() =
     assert((1 / 0) catch e -> true)
     assert((1 % 0) catch e -> true)
+
+@test
+toFixed_WRITES_THE_GIVEN_NUMBER_OF_DECIMAL_PLACES() =
+    assertEq(toFixed(9, 2), "9.00")
+    assertEq(toFixed(1.005, 2), "1.00")
+
+    // A tie rounds AWAY from zero, which is JavaScript's rule and not C's `printf`'s.
+    assertEq(toFixed(2.5, 0), "3")
+    assertEq(toFixed(0.125, 2), "0.13")
+
+    // The sign is taken off first, so a negative rounding to nothing still reads negative.
+    assertEq(toFixed(-0.4, 0), "-0")
+
+@test
+toFixed_PAST_1e21_ANSWERS_WHAT_STRING_WOULD_RATHER_THAN_REFUSING() =
+    // JavaScript's own `toFixed` never refuses on the number's magnitude: past `1e21` it gives up
+    // on decimal places and answers what `String(x)` would -- an exponent -- rather than throwing.
+    assertEq(toFixed(1e21, 2), "1e+21")
+    assertEq(toFixed(-1e21, 2), "-1e+21")
+    assertEq(toFixed(1.5e21, 5), "1.5e+21")
+    assertEq(toFixed(2e25, 0), "2e+25")
+
+@test
+toFixed_OF_NAN_AND_INFINITY_ANSWERS_THEIR_NAMES() =
+    // Also never a fault in JavaScript: `NaN.toFixed(2)` is `"NaN"` and `Infinity.toFixed(2)` is
+    // `"Infinity"`, spelled out in full rather than in `string`'s own `nan`/`inf`.
+    assertEq(toFixed(0.0 / 0.0, 2), "NaN")
+    assertEq(toFixed(1.0 / 0.0, 2), "Infinity")
+    assertEq(toFixed(-1.0 / 0.0, 2), "-Infinity")
+
+@test
+toFixed_REFUSES_A_PLACE_COUNT_OUTSIDE_ZERO_TO_A_HUNDRED() =
+    // JavaScript throws a `RangeError` for a digit count outside `0..100`, and this is the one
+    // refusal `toFixed` keeps -- the number itself is never the reason to refuse.
+    assert((toFixed(1, -1) catch e -> e.message).contains("0 to 100 places"))
+    assert((toFixed(1, 101) catch e -> e.message).contains("0 to 100 places"))
