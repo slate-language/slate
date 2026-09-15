@@ -1,0 +1,554 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf, byte_sink}
+import sysl.math.{min, max}
+// `display_real_shortest` and `FormatSpec` are the root module's -- `js_number_text`'s reason for
+// wanting them is beside it, on `do_to_fixed`'s far side.
+import sysl.{FormatSpec, display_real_shortest}
+// **`random()`'s generator and its one seed.** `sysl.rand` is PCG32 and says of itself that it is
+// not a source of unpredictability, which is exactly what `random()` promises a program; the seed
+// comes from the kernel through `sysl.posix.rand`, the same `getentropy(2)` that `slate:crypto`'s
+// `randomBytes` reaches -- so two runs of one program draw different numbers and neither is a
+// secret.
+import sysl.posix.rand.seed_from_os
+import sysl.rand.{Rng, rng}
+// **Exact integers, for `toFixed` and for nothing else here.** Rounding a `real` to a fixed number
+// of places the way JavaScript does is integer arithmetic at whatever width the value needs -- see
+// `do_to_fixed` -- and doing it in floating point is exactly the mistake that would make the two
+// back ends disagree about a tie.
+import sysl.math.bigint.{add as big_add, div as big_div, from_int as big_of, mul as big_mul,
+                         pow as big_pow, to_string as big_text}
+import sysl.text.{from_utf8, parse_long, parse_real, repeat, str_builder}
+
+// Numbers, as a slate program reaches them: the conversions, the arithmetic that is a name rather
+// than an operator, and the two that write a number out for a PERSON to read.
+//
+// **Cut out of `text.sysl` when the registry landed and that file could no longer hold its own
+// installer under a thousand lines.** The seam is the one `text.sysl` had already drawn in a section
+// heading -- everything here is about a number and nothing here counts or cuts a character -- so
+// what crosses is one name: `text_of`, which `number` needs because `number("3")` reads a string.
+// `char_count` and `char_slice` were public already, `fixed_text` laying a point into digits.
+
+// -- what a program calls: numbers -------------------------------------------------------------------
+
+// `number(s)` -- a string read as a number, or null where it is not one.
+//
+// **A whole number where it was written as one**, so `num("3")` is an integer and `num("3.0")` is a
+// real -- which is the distinction slate keeps everywhere else and would be odd to drop here.
+do_number(args: Buf[Value], at: Span) -> Step
+    wants(args, 1, at, "number", "one string")?
+
+    args.at(0) match
+        Int(n) -> return Ok(Int(n))
+        Real(x) -> return Ok(Real(x))
+        _ -> ()
+
+    val s = text_of(args.at(0), at, "number", "a string or a number")?
+
+    parse_long(s) match
+        Ok(n) ->
+            // A plain integer literal cannot carry the sign of zero -- `-0` and `0` are one `long`.
+            // JavaScript's `Number("-0")` keeps it, so the text that denotes it -- a `-` in front of
+            // nothing but zero digits -- answers the real `-0` instead of the integer `0`.
+            return Ok(if n == 0 && s.starts_with("-") then Real(-0.0) else Int(n))
+        Err(_) -> ()
+
+    parse_real(s) match
+        Ok(x) -> Ok(Real(x))
+        Err(_) -> Ok(Null)
+end do_number
+
+// `integer(x)` -- a number without its fraction, towards zero.
+do_integer(args: Buf[Value], at: Span) -> Step
+    wants(args, 1, at, "integer", "one number")?
+
+    args.at(0) match
+        Int(n) -> Ok(Int(n))
+        Real(x) -> Ok(Int(long(x.trunc())))
+        other -> fault(at, s"`integer` takes a number, and this is ${other.type_name()} -- `number` is what reads one out of a string")
+
+// `real(x)` -- a number as a real, whatever it was written as.
+do_real(args: Buf[Value], at: Span) -> Step
+    wants(args, 1, at, "real", "one number")?
+
+    args.at(0) match
+        Int(n) -> Ok(Real(real(n)))
+        Real(x) -> Ok(Real(x))
+        other -> fault(at, s"`real` takes a number, and this is ${other.type_name()}")
+
+// The four that round, which keep the kind they were given: an integer is already whole.
+do_round(args: Buf[Value], at: Span, which: usize) -> Step
+    val name = if which == 0 then "floor" elif which == 1 then "ceil" elif which == 2 then "round" else "trunc"
+
+    wants(args, 1, at, name, "one number")?
+
+    args.at(0) match
+        Int(n) -> Ok(Int(n))
+        Real(x) ->
+            val r = if which == 0 then x.floor() elif which == 1 then x.ceil() elif which == 2 then x.round() else x.trunc()
+
+            Ok(Real(r))
+        other -> fault(at, s"`${name}` takes a number, and this is ${other.type_name()}")
+end do_round
+
+do_abs(args: Buf[Value], at: Span) -> Step
+    wants(args, 1, at, "abs", "one number")?
+
+    args.at(0) match
+        Int(n) -> Ok(Int(if n < 0 then -n else n))
+        Real(x) -> Ok(Real(x.abs()))
+        other -> fault(at, s"`abs` takes a number, and this is ${other.type_name()}")
+
+do_sqrt(args: Buf[Value], at: Span) -> Step
+    wants(args, 1, at, "sqrt", "one number")?
+
+    val x = number_of(args.at(0), at, "sqrt")?
+
+    if x < 0.0 then return fault(at, s"`sqrt` takes a number that is not negative, and this is ${x}")
+
+    Ok(Real(x.sqrt()))
+end do_sqrt
+
+// The generator behind `random()`, and whether it has been seeded yet.
+//
+// **Seeded ONCE, on the first draw rather than at startup.** A program that never calls `random()`
+// then never asks the kernel for anything, and the first call pays for the whole run.
+var draws: Rng = rng(0u64, 0u64)
+var draws_seeded: bool = false
+
+// `random()` -- a real in `[0, 1)`, which is JavaScript's `Math.random()` under its own name.
+//
+// **THIS IS NOT A SOURCE OF SECRETS AND MUST NOT BE USED AS ONE.** The generator is fast and small
+// and its whole state is two words, so anybody who sees a handful of draws can compute every draw
+// that follows -- which is what a shuffle, a jitter, a sample or a piece of test data wants, and
+// what a key, a token, a nonce or a password reset must not have. `randomBytes` in `slate:crypto`
+// is the other thing, and it asks the kernel every time.
+//
+// **The top 53 bits of a 64-bit draw, which is `unit`'s own arithmetic.** Fifty-three is the width
+// of a `real`'s mantissa: fewer would leave representable values that never come back, and dividing
+// by `2^53 - 1` rather than `2^53` would let `1.0` appear. The JavaScript back end answers
+// `Math.random()`, whose specification says the same two things.
+do_random(args: Buf[Value], at: Span) -> Step
+    wants(args, 0, at, "random", "no arguments")?
+
+    if !draws_seeded
+        // **A kernel that will not answer is not a fault here**, unlike `randomBytes`, where bytes
+        // the program made up would not be worth having. A draw nobody may key on still has to
+        // answer, so the fallback is a fixed seed and the sequence is merely reproducible.
+        val seed = seed_from_os() match
+            Some(s) -> s
+            None -> 0x9e3779b97f4a7c15u64
+
+        draws = rng(seed, 0x5851f42d4c957f2du64)
+        draws_seeded = true
+
+    Ok(Real(draws.unit()))
+end do_random
+
+// **`pow` keeps the kind it was given, which is the rule everything above it already follows.** An
+// integer raised to a whole power is an integer -- `pow(2, 10)` is those ten multiplications and
+// nothing else -- and answering a real for them made every use of the answer in an index or a `%` a
+// conversion the caller had to write, `x / pow(2, n) % 256` being refused outright. A NEGATIVE
+// exponent is the one case that cannot stay whole: `pow(2, -1)` is a half, and it says so with a
+// real rather than with a fault.
+//
+// **The multiplying is not an optimisation.** `a.pow(b)` goes through a real, whose 53 bits of
+// mantissa round an answer like `pow(3, 40)` silently; squaring is exact for every answer that fits
+// a `long`, and wraps like `*` for every answer that does not.
+do_pow(args: Buf[Value], at: Span) -> Step
+    wants(args, 2, at, "pow", "a number and an exponent")?
+
+    val a = number_of(args.at(0), at, "pow")?
+    val b = number_of(args.at(1), at, "pow")?
+
+    args.at(0) match
+        Int(base) ->
+            args.at(1) match
+                Int(e) ->
+                    if e >= 0 then return Ok(Int(whole_pow(base, e)))
+                other -> ()
+        other -> ()
+
+    Ok(Real(a.pow(b)))
+end do_pow
+
+// `base` multiplied by itself `e` times, by squaring, for an exponent that is not negative.
+private whole_pow(base: long, e: long) -> long
+    var result: long = 1
+    var factor = base
+    var n = e
+
+    while n > 0
+        if n % 2 == 1 then result = result * factor
+
+        factor = factor * factor
+        n = n / 2
+
+    result
+end whole_pow
+
+// `min(a, b, ...)` and `max(a, b, ...)`, over as many as are given.
+//
+// **Integers in, integer out.** A `min` that answered a real for two integers would make every use
+// of it in an index a conversion.
+do_extreme(args: Buf[Value], at: Span, smallest: bool) -> Step
+    val name = if smallest then "min" else "max"
+
+    if args.len() == 0 then return fault(at, s"`${name}` takes at least one number and was given none")
+
+    var whole = true
+
+    for i in 0..<args.len()
+        args.at(i) match
+            Int(_) -> ()
+            Real(_) -> whole = false
+            other -> return fault(at, s"`${name}` takes numbers, and one of these is ${other.type_name()}")
+
+    var best = number_of(args.at(0), at, name)?
+
+    for i in 1..<args.len()
+        val x = number_of(args.at(i), at, name)?
+
+        best = if smallest then min(best, x) else max(best, x)
+
+    if whole then Ok(Int(long(best))) else Ok(Real(best))
+end do_extreme
+
+// Any number as a real, for the arithmetic that has only one form.
+private number_of(v: Value, at: Span, name: string) -> Result[real, Signal]
+    v match
+        Int(n) -> Ok(real(n))
+        Real(x) -> Ok(x)
+        other -> Err(failure(at, s"`${name}` takes a number, and this is ${other.type_name()}"))
+
+
+// -- what a program calls: a number a PERSON reads -------------------------------------------------
+
+// **`string(x)` IS `%g` AND `%g` IS WRONG FOR MONEY**, which is the whole reason these two exist. Six
+// significant digits is the right default for a diagnostic and the wrong one for a price: `string`
+// turns `1234.5` into `1234.5` and a total of `1234.50` into `1234.5`, and a program that wants two
+// places has to build them out of `floor` and `%` by hand. Neither of these is a locale -- there is
+// no currency, no locale name and no digit shape here, and a program needing those is asking a
+// question a table of them answers rather than a builtin.
+
+// The largest magnitude `toFixed` will write in full. **JavaScript's own boundary**, above which
+// its `toFixed` gives up on decimal places and answers what `String(x)` would -- an exponent,
+// which is not what anybody asking for a number of decimal places wanted, but is what JavaScript
+// answers, and `toFixed` here answers it too rather than quietly changing shape by refusing.
+private const FixedLimit: real = 1e21
+
+// The most places `toFixed` will write, which is JavaScript's range and is a range for the same
+// reason: past this the digits are noise about a binary value rather than information.
+private const FixedPlaces: long = 100
+
+// `toFixed(x, digits)` -- the number written to exactly that many decimal places, as text.
+//
+// **BYTE-IDENTICAL WITH JAVASCRIPT'S `toFixed`, TIES INCLUDED, AND THE TIES ARE THE WHOLE
+// DIFFICULTY.** C's `printf("%.*f")` rounds a tie to the even digit -- so `2.5` at no places is `2`
+// -- and JavaScript rounds a tie away from zero, so it is `3`. The two disagree on every value that
+// lands exactly halfway, which is not an exotic set: `1.25` at one place, `0.125` at two, every
+// price that ends in half a cent. Handing this to `printf` would have made the two back ends
+// disagree about exactly the numbers a person notices.
+//
+// **So the arithmetic is exact and there is no floating point in it.** A `real` is `m * 2^e` for
+// whole `m` and `e`, which is found by doubling until it is a whole number -- every step exact,
+// because doubling a binary float is. The answer wanted is then `round(m * 2^e * 10^d)` with the tie
+// going up, and for a negative `e` that is `floor((2 * m * 10^d + 2^-e) / 2^(1-e))` -- integers all
+// the way down, and `sysl.math.bigint` does them at whatever width they need. That is the ECMAScript
+// definition read literally rather than approximated.
+//
+// **The SIGN is taken off first, which is also the specification's order** and is why
+// `toFixed(-0.4, 0)` is `"-0"` while `toFixed(-0.0, 2)` is `"0.00"`: the text gets a minus where the
+// number is less than zero, and negative zero is not.
+//
+// **An integer is written out rather than measured**, so `toFixed(9007199254740993, 0)` is that
+// number and not the nearest `real` to it.
+do_to_fixed(args: Buf[Value], at: Span) -> Step
+    wants(args, 2, at, "toFixed", "a number and how many places")?
+
+    val places = args.at(1) match
+        Int(n) ->
+            if n < 0 || n > FixedPlaces
+                return fault(at, s"`toFixed` writes from 0 to ${FixedPlaces} places, and was asked for ${n}")
+
+            usize(n)
+        other -> return fault(at, s"`toFixed` takes a whole number of places, and this is ${other.type_name()}")
+
+    args.at(0) match
+        Int(n) ->
+            var b = str_builder()
+
+            b.push_int(n)
+
+            if places > 0
+                b.push_char('.')
+                b.push(repeat("0", places))
+
+            Ok(str_value(b.finish()))
+        Real(x) ->
+            // JavaScript's `toFixed` never faults on the number itself -- a `NaN` answers `"NaN"`
+            // and an infinity answers `"Infinity"`/`"-Infinity"`, both spelled out here because
+            // `js_number_text` below only carries the exponential form.
+            if x != x then return Ok(str_value("NaN"))
+            if x.is_infinite() then return Ok(str_value(if x > 0.0 then "Infinity" else "-Infinity"))
+
+            if x >= FixedLimit || x <= -FixedLimit
+                return Ok(str_value(js_number_text(x)))
+
+            Ok(str_value(fixed_text(x, places)))
+        other -> fault(at, s"`toFixed` takes a number, and this is ${other.type_name()}")
+end do_to_fixed
+
+// `x` written the way JavaScript's `Number.prototype.toString` writes a number past `toFixed`'s
+// range: the shortest decimal that reads back to `x`, in exponential form. `sysl.render`'s
+// `display_real_shortest` is that shortest text already -- Steele and White's answer, tried at
+// fifteen, sixteen and seventeen significant digits and stopped at the first that round-trips --
+// and it agrees with JavaScript's own spelling in exactly this domain: the exponent is always at
+// least two digits here (`|x| >= 1e21`), which is the one place C's `%g` and JavaScript could have
+// disagreed, `%g` padding a one-digit exponent with a leading zero that JavaScript never writes.
+private js_number_text(x: real) -> string
+    var sink = byte_sink()
+
+    display_real_shortest(x, &sink, FormatSpec(0, -1, false))
+    from_utf8(sink.text()).unwrap()
+end js_number_text
+
+// The digits of `round(|x| * 10^places)`, a tie going away from zero, as text with no point in it.
+private fixed_digits(a: real, places: usize) -> string
+    var v = a
+    var e: long = 0
+
+    // Up into `[2^52, 2^53)`, where the value is a whole number and the doubling was exact. A
+    // subnormal takes the most turns of this and still cannot overflow, `2^52` being far below the
+    // largest `real`.
+    while v < 4503599627370496.0
+        v = v * 2.0
+        e -= 1
+
+    while v >= 9007199254740992.0
+        v = v / 2.0
+        e += 1
+
+    val m = big_of(long(v))
+    val scaled = big_mul(m, big_pow(big_of(10), places))
+
+    if e >= 0 then return big_text(big_mul(scaled, big_pow(big_of(2), usize(e))))
+
+    val half = big_pow(big_of(2), usize(-e))
+
+    big_text(big_div(big_add(big_mul(scaled, big_of(2)), half), big_mul(half, big_of(2))))
+end fixed_digits
+
+private fixed_text(x: real, places: usize) -> string
+    val negative = x < 0.0
+    val a = if negative then -x else x
+    var digits = if a == 0.0 then "0" else fixed_digits(a, places)
+
+    // Enough digits for a point to have something on both sides of it.
+    if char_count(digits) < places + 1 then digits = repeat("0", places + 1 - char_count(digits)) + digits
+
+    val cut = char_count(digits) - places
+    var b = str_builder()
+
+    if negative then b.push_char('-')
+
+    b.push(char_slice(digits, 0, cut))
+
+    if places > 0
+        b.push_char('.')
+        b.push(char_slice(digits, cut, char_count(digits)))
+
+    b.finish()
+end fixed_text
+
+// The two ways a program may say how a grouped number is written.
+private known_grouping(key: string) -> bool = key == "separator" || key == "decimal"
+
+private grouping_option(o: *ObjectObj, key: string, fallback: string, at: Span) -> Result[string, Signal] =
+    obj_get_name(o, key) match
+        None -> Ok(fallback)
+        Some(Str(p)) -> Ok(p.s)
+        Some(other) -> Err(failure(at, s"`${key}` is text, and this is ${other.type_name()}"))
+
+// `formatNumber(x)` and `formatNumber(x, { separator: ",", decimal: "." })` -- the digits of a
+// number grouped in threes.
+//
+// **The defaults are a comma and a full stop, which is a choice and not a neutral one.** A locale
+// database is the alternative and slate is not carrying one: what a locale buys is the right answer
+// for a reader in France, and what it costs is a megabyte of tables, a name to pass everywhere and a
+// program whose output depends on the machine it ran on. Two strings say the same thing for every
+// grouping convention there is -- `{ separator: " ", decimal: "," }` is the French one -- and they
+// say it where the program can see it.
+//
+// **IT TAKES A WHOLE NUMBER OR THE TEXT `toFixed` ANSWERED, AND A `real` IS REFUSED.** That looks
+// like a gap and is the opposite of one: a `real` has no single written form. `string` gives six
+// significant digits, so `1234567.25` renders as `1.23457e+06` and `1234.5` renders as `1234.5` --
+// the same call would group the small one and fail on the large one, which is the worst of both. So
+// the decision about how many places belongs to the program, it is spelled `toFixed(x, 2)`, and the
+// answer to that goes straight in here. `formatNumber(toFixed(total, 2))` is a price.
+//
+// **Which also makes the answer the same on both back ends by construction**, no part of it
+// depending on how a host chooses to render a binary fraction.
+do_format_number(args: Buf[Value], at: Span) -> Step
+    if args.len() != 1 && args.len() != 2
+        return fault(at, s"`formatNumber` takes a number and an optional record, and was given ${counted(args.len(), "argument")}")
+
+    val plain = args.at(0) match
+        Int(n) ->
+            var b = str_builder()
+
+            b.push_int(n)
+            b.finish()
+        Real(_) -> return fault(at, "`formatNumber` groups a whole number or the text `toFixed` answered -- a real has no one written form, `string` giving six significant digits, so say how many places you want with `toFixed(x, 2)`")
+        Str(p) -> p.s
+        other -> return fault(at, s"`formatNumber` takes a number, and this is ${other.type_name()}")
+
+    var separator = ","
+    var decimal = "."
+
+    if args.len() == 2
+        val o = args.at(1) match
+            Object(o) -> o
+            other -> return fault(at, s"`formatNumber` takes its options as a record, and this is ${other.type_name()}")
+
+        for i in 0..<o.entries.len()
+            val entry = o.entries.at(i)
+
+            if !entry.dead
+                val key = entry.key match
+                    Str(k) -> k.s
+                    other -> return fault(at, s"an option is named, and this is ${other.type_name()}")
+
+                if !known_grouping(key)
+                    return fault(at, s"`${key}` is not one of `formatNumber`'s options -- there are `separator` and `decimal`")
+
+        separator = grouping_option(o, "separator", ",", at)?
+        decimal = grouping_option(o, "decimal", ".", at)?
+
+    grouped_text(plain, separator, decimal, at)
+end do_format_number
+
+// The digits of a number written in full, grouped in threes from the right.
+private grouped_text(plain: string, separator: string, decimal: string, at: Span) -> Step
+    var whole = str_builder()
+    var frac = str_builder()
+    var negative = false
+    var after = false
+    var seen: usize = 0
+
+    for i in 0..<plain.bytes.len
+        val c = plain.bytes[i]
+
+        if i == 0 && c == u8('-')
+            negative = true
+        elif c == u8('.') && !after
+            after = true
+        elif c >= u8('0') && c <= u8('9')
+            if after then frac.push_char(char(u32(c))) else whole.push_char(char(u32(c)))
+
+            seen += 1
+        else
+            return fault(at, s"`formatNumber` groups the digits of a number written in full, and \"${plain}\" is not one")
+
+    if seen == 0
+        return fault(at, s"`formatNumber` groups the digits of a number written in full, and \"${plain}\" is not one")
+
+    val digits = whole.finish()
+    val n = char_count(digits)
+    var b = str_builder()
+
+    if negative then b.push_char('-')
+
+    if n == 0
+        b.push_char('0')
+    else
+        for i in 0..<n
+            if i > 0 && (n - i) % 3 == 0 then b.push(separator)
+
+            b.push(char_slice(digits, i, i + 1))
+
+    val rest = frac.finish()
+
+    if after
+        b.push(decimal)
+        b.push(rest)
+
+    Ok(str_value(b.finish()))
+end grouped_text
+
+// `boolean(v)` -- what an `if` would make of a value.
+//
+// **The last of the conversions, and it exists so the set is complete**: every type word that can
+// convert does, and a reader who has learned `string` and `number` does not have to find out that
+// this one is spelled some other way.
+do_boolean(args: Buf[Value], at: Span) -> Step
+    wants(args, 1, at, "boolean", "one value")?
+
+    Ok(Bool(args.at(0).truthy()))
+
+// -- what this file registers ---------------------------------------------------------------------
+
+// Numbers. `number` reads one out of a string; `integer` and `real` move between the two kinds slate
+// keeps apart everywhere else.
+var n_number: NativeFn = 0
+var n_integer: NativeFn = 0
+var n_real: NativeFn = 0
+var n_boolean: NativeFn = 0
+var n_abs: NativeFn = 0
+var n_floor: NativeFn = 0
+var n_ceil: NativeFn = 0
+var n_round: NativeFn = 0
+var n_trunc: NativeFn = 0
+var n_sqrt: NativeFn = 0
+var n_pow: NativeFn = 0
+var n_min: NativeFn = 0
+var n_max: NativeFn = 0
+
+// **A draw, and not a source of unpredictability.** `random()` is a fast generator seeded once from
+// the kernel, which is what a shuffle, a jitter and a sample want; a key, a token or a nonce wants
+// `randomBytes` in `slate:crypto` instead.
+var n_random: NativeFn = 0
+
+// **The two that render a number for a PERSON to read.** `string` answers six significant digits
+// because that is what `%g` does, which is right for a diagnostic and wrong for a price; `toFixed`
+// says how many places, and `formatNumber` groups the thousands. They compose in one direction:
+// `formatNumber(toFixed(total, 2))` is a price.
+var n_to_fixed: NativeFn = 0
+var n_format_number: NativeFn = 0
+
+install_numbers(env: *EnvObj)
+    n_number = register("number", do_number)
+    n_integer = register("integer", do_integer)
+    n_real = register("real", do_real)
+    n_boolean = register("boolean", do_boolean)
+    n_abs = register("abs", do_abs)
+    n_floor = register("floor", (args, at) -> do_round(args, at, 0))
+    n_ceil = register("ceil", (args, at) -> do_round(args, at, 1))
+    n_round = register("round", (args, at) -> do_round(args, at, 2))
+    n_trunc = register("trunc", (args, at) -> do_round(args, at, 3))
+    n_sqrt = register("sqrt", do_sqrt)
+    n_pow = register("pow", do_pow)
+    n_min = register("min", (args, at) -> do_extreme(args, at, true))
+    n_max = register("max", (args, at) -> do_extreme(args, at, false))
+    n_random = register("random", do_random)
+    n_to_fixed = register("toFixed", do_to_fixed)
+    n_format_number = register("formatNumber", do_format_number)
+
+    declare(env, "number", Native(n_number), false)
+    declare(env, "integer", Native(n_integer), false)
+    declare(env, "real", Native(n_real), false)
+    declare(env, "boolean", Native(n_boolean), false)
+    declare(env, "abs", Native(n_abs), false)
+    declare(env, "floor", Native(n_floor), false)
+    declare(env, "ceil", Native(n_ceil), false)
+    declare(env, "round", Native(n_round), false)
+    declare(env, "trunc", Native(n_trunc), false)
+    declare(env, "sqrt", Native(n_sqrt), false)
+    declare(env, "pow", Native(n_pow), false)
+    declare(env, "min", Native(n_min), false)
+    declare(env, "max", Native(n_max), false)
+    declare(env, "random", Native(n_random), false)
+    declare(env, "toFixed", Native(n_to_fixed), false)
+    declare(env, "formatNumber", Native(n_format_number), false)
+end install_numbers
