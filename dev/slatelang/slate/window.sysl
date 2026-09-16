@@ -1,0 +1,713 @@
+module dev.slatelang.slate
+
+// **THE WHOLE FILE IS BEHIND THE `webview` FEATURE.** Gated out, `slate:window` is not a module this
+// build has, the ten natives are not registered, `forget_windows` is not called from `reset_events`,
+// `mark_windows` is not called from `roots`, and libwebview is never asked for.
+#if feature_webview
+import sh.sysl.gc
+import sh.sysl.json
+import sh.sysl.libuv
+import sh.sysl.libuv.Handle
+import sh.sysl.parsing.*
+import sh.sysl.webview
+import sysl.buf.{Buf, buf}
+
+// A desktop window with a web page in it, and a bridge between that page and the program.
+//
+// **IT IS HERE BECAUSE A PROGRAM THAT ALREADY RUNS ON libuv CAN GAIN A WINDOW WITHOUT CHANGING HOW
+// IT RUNS.** slate is one thread with an event loop on it; a platform's window system is also a
+// loop, and the ordinary way to have both is a second thread with a lock between them. This module
+// has neither. The platform's loop is turned over from a libuv timer -- eight milliseconds at a
+// time, which is about 120 Hz -- so every callback a page makes lands on slate's own thread, by
+// construction, and nothing here needs a `&sync` closure, a lock, or a second collector root set.
+//
+// **What it buys is that a window is a handle like a socket.** A program serving HTTP can open one;
+// a `for await` over a stream keeps running while it is up; a timer keeps ticking and can write into
+// the page. None of that is arranged -- it is what falls out of the window being a guest on the loop
+// the program already had.
+//
+// ## The names keep their `window` prefix, which is `slate:lmdb`'s rule
+//
+// **This is a door onto somebody else's window system and it is named as one.** `slate:lmdb` exports
+// `lmdbOpen` and `slate:llhttp` exports `httpParser`; the tier is the same here -- a conversion at
+// the boundary and no policy of its own -- so the naming is too. What sits on top is a package's
+// job: a component model, a router, a way of describing a page in slate rather than in HTML. Every
+// one of those is a design decision with several answers, and none of them belongs in the compiler.
+//
+// **`window` itself is the one name with no prefix**, because it is the constructor and the module is
+// named after it -- which is `slate:cluster`'s arrangement exactly.
+//
+// ## A handle is an integer, which is what every handle in slate is
+//
+// A window is a number into a table on this side, so no foreign object ever becomes a slate value:
+// `==` compares what slate says it compares, `print` has something to say, and the collector has
+// nothing new to walk. A number that names no window is refused by the table it is looked up in.
+//
+// ## One timer serves every window, and it is what keeps the program alive
+//
+// Opening the first window claims an ordinary slot in `event.sysl`'s table and starts a repeating
+// libuv timer in it. So a window counts towards `outstanding` exactly as a listening socket does:
+// while one is up the drain does not end, and `drain_events_to`'s floor sees it like anything else,
+// which is what lets `slate test` run a test that opens a window without waiting out the program
+// that opened it.
+//
+// **The last window to close stops the timer and gives the slot back**, so a program whose window
+// the user closed exits on its own with nothing written to make it.
+//
+// ## A bound function may answer later, and that is why `bind_async` is the one used
+//
+// webview's own `bind` wants the whole answer before the closure returns, which would make an
+// `async` handler impossible: the page would be answered with a pending promise rendered as JSON.
+// `bind_async` hands over the call's id instead and is answered whenever the program is ready -- so
+// a handler that awaits a file read, a query or a request is the ordinary case rather than the one
+// that cannot be written. `page_calls` below is the queue of what a page has asked and not yet been
+// told.
+
+// -- the tables --------------------------------------------------------------------------------------
+
+// One window, and the promise `windowDone` answers about it.
+private struct OpenWindow
+    // The window, and `None` once it has gone. Dropping it here is what frees it.
+    w: Option[&webview.Webview]
+
+    // The promise `windowDone` hands back, made the first time it is asked for and `null` until then.
+    // **A collector root**: between `windowDone` answering and the window closing, this table is the
+    // only thing holding it.
+    done: *PromiseObj
+end OpenWindow
+
+// One `windowBind` registration: which window, and the slate function to call.
+//
+// **The slate function is held HERE and the sysl closure captures a `usize` into this table**, which
+// is `event.sysl`'s arrangement and is not a style choice: a counted box may not live in GC memory,
+// and the collector cannot see through one into a slate value a sysl closure captured. So what the
+// closure carries is a number, and this table is what the mark phase walks.
+private struct PageBinding
+    win: usize
+    f: Value
+    live: bool
+end PageBinding
+
+// One call a page made that has not been answered, because the handler gave back a promise.
+private struct PageCall
+    // The promise the handler answered with. **A collector root**, for `PageBinding.f`'s reason.
+    answer: *PromiseObj
+
+    win: usize
+
+    // webview's own id for the page's call, which is what `answer` is given.
+    call: string
+end PageCall
+
+private var windows: Buf[OpenWindow] = buf()
+private var bounds: Buf[PageBinding] = buf()
+private var page_calls: Buf[PageCall] = buf()
+
+// The slot in `event.sysl`'s table that the pump timer lives in, and `None` while no window is open.
+private var pump_slot: Option[usize] = None
+
+// How often the platform's loop is turned over, in milliseconds. **About 120 Hz**, so the worst a
+// click waits to be seen is eight milliseconds and an idle window costs 125 wake-ups a second.
+private val PumpEvery: u64 = 8
+
+// Mark what a window and a bound function can still reach.
+//
+// **Called from `roots` and not from `mark_pending`**, for `mark_watches`' reason: a bound function
+// is neither waiting for an answer nor outstanding on the loop -- it lasts as long as its window.
+mark_windows(h: *gc.Heap)
+    for i in 0..<windows.len()
+        if windows.at(i).done != null
+            gc.mark(h, ptr_cast(windows.at(i).done))
+
+    for i in 0..<bounds.len()
+        if bounds.at(i).live then mark_value(h, bounds.at(i).f)
+
+    for i in 0..<page_calls.len()
+        gc.mark(h, ptr_cast(page_calls.at(i).answer))
+end mark_windows
+
+// Give every window back between runs, which is what the socket table does and for the same reason:
+// the next program starts with nothing of this one's still reachable.
+//
+// **A window left open is worse than a socket left open**, because it is on the screen: the suite is
+// one process, so a window a faulted program never closed would still be there while the next test
+// ran, and the pump timer would still be turning its loop over.
+forget_windows()
+    for i in 0..<windows.len()
+        var open = windows.at(i)
+
+        open.w match
+            Some(w) -> w.terminate().unwrap_or(())
+            None -> ()
+
+        open.w = None
+        open.done = null
+        windows.set(i, open)
+
+    windows.clear()
+    bounds.clear()
+    page_calls.clear()
+
+    // **The slot itself is `reset_events`' to give back**, it being one of the slots that function
+    // surrenders; what is put back here is only this file's name for it.
+    pump_slot = None
+end forget_windows
+
+// -- what a program calls ------------------------------------------------------------------------------
+
+// `window({ title, width, height, html, url, debug })` -- a window, and the one place one is made.
+//
+// **The options are read in full before any C is touched**, which is not a tidiness rule: making a
+// window is the one call here that cannot be undone cheaply, so a program that named an option wrong
+// is told so without a window appearing and going away again.
+do_window(args: Buf[Value], at: Span) -> Step
+    if args.len() > 1
+        return fault(at, s"`window` takes an optional object of options, and was given ${counted(args.len(), "argument")}")
+
+    val how = if args.len() == 1 then window_options(args.at(0), at)? else default_window()
+
+    val w = webview.webview(debug = how.debug) match
+        Ok(w) -> w
+        Err(why) -> return fault(at, s"a window could not be made: ${why.message()}")
+
+    w.title(how.title).unwrap_or(())
+    w.size(how.width, how.height, webview.Hint.Start).unwrap_or(())
+
+    if how.url != ""
+        w.navigate(how.url).unwrap_or(())
+    else
+        w.html(how.html).unwrap_or(())
+
+    windows.push(OpenWindow(Some(w), null))
+    start_pump(at)?
+    Ok(Int(long(windows.len() - 1)))
+end do_window
+
+// `windowBind(w, name, fn)` -- make `name` an asynchronous function on the page's `window` object.
+//
+// **The page's arguments arrive as slate values and the answer goes back as JSON**, which is the
+// whole of the bridge. A handler that answers a promise is answered from `settle_page_calls` below,
+// so `await` inside one is ordinary.
+do_window_bind(args: Buf[Value], at: Span) -> Step
+    if args.len() != 3
+        return fault(at, s"`windowBind` takes a window, a name and a function, and was given ${counted(args.len(), "argument")}")
+
+    val id = handle_of_window(args.at(0), at, "windowBind")?
+    val w = live_window(id, at, "windowBind")?
+
+    val name = args.at(1) match
+        Str(n) -> n.s
+        other -> return fault(at, s"`windowBind` takes the name as text, and this is ${other.type_name()}")
+
+    args.at(2) match
+        Fn(_) -> ()
+        Native(_) -> ()
+        other -> return fault(at, s"`windowBind` needs a function to call, and this is ${other.type_name()}")
+
+    bounds.push(PageBinding(id, args.at(2), true))
+
+    val bid = bounds.len() - 1
+
+    // **The closure captures the index and not the value**, which is the whole arrangement: the
+    // collector cannot see through this box, so what it holds must be something it does not have to.
+    w.bind_async(name, (call, page_args) -> page_called(bid, call, page_args)) match
+        Ok(_) -> Ok(Null)
+        Err(why) ->
+            var b = bounds.at(bid)
+
+            b.live = false
+            b.f = Null
+            bounds.set(bid, b)
+            fault(at, s"`${name}` could not be given to the page: ${why.message()}")
+end do_window_bind
+
+// `windowEval(w, js)` -- run JavaScript in the page. It answers nothing: the page's own thread runs
+// it, and what it produced is sent back through a bound function if the program wants it.
+do_window_eval(args: Buf[Value], at: Span) -> Step
+    val w = one_and_text(args, at, "windowEval", "the script")?
+
+    w.w.eval(w.text) match
+        Ok(_) -> Ok(Null)
+        Err(why) -> fault(at, s"this script could not be run in the page: ${why.message()}")
+
+// `windowTitle(w, text)` -- what the title bar says.
+do_window_title(args: Buf[Value], at: Span) -> Step
+    val w = one_and_text(args, at, "windowTitle", "the title")?
+
+    w.w.title(w.text) match
+        Ok(_) -> Ok(Null)
+        Err(why) -> fault(at, s"this window's title could not be set: ${why.message()}")
+
+// `windowNavigate(w, url)` -- load a url.
+do_window_navigate(args: Buf[Value], at: Span) -> Step
+    val w = one_and_text(args, at, "windowNavigate", "the url")?
+
+    w.w.navigate(w.text) match
+        Ok(_) -> Ok(Null)
+        Err(why) -> fault(at, s"this window could not be sent to that url: ${why.message()}")
+
+// `windowHtml(w, markup)` -- replace the page with markup the program holds.
+do_window_html(args: Buf[Value], at: Span) -> Step
+    val w = one_and_text(args, at, "windowHtml", "the markup")?
+
+    w.w.html(w.text) match
+        Ok(_) -> Ok(Null)
+        Err(why) -> fault(at, s"this window could not be given that page: ${why.message()}")
+
+// `windowSize(w, width, height)` -- how big the window is, in points.
+do_window_size(args: Buf[Value], at: Span) -> Step
+    if args.len() != 3
+        return fault(at, s"`windowSize` takes a window, a width and a height, and was given ${counted(args.len(), "argument")}")
+
+    val id = handle_of_window(args.at(0), at, "windowSize")?
+    val w = live_window(id, at, "windowSize")?
+    val width = measure(args.at(1), at, "a width")?
+    val height = measure(args.at(2), at, "a height")?
+
+    w.size(width, height, webview.Hint.Start) match
+        Ok(_) -> Ok(Null)
+        Err(why) -> fault(at, s"this window could not be resized: ${why.message()}")
+end do_window_size
+
+// `windowClose(w)` -- close the window, as the user closing it would.
+//
+// **Closing a window that has already gone is not a failure**, which is `close` on a socket: a
+// program that closes its window in a handler and again on the way out has done nothing wrong.
+do_window_close(args: Buf[Value], at: Span) -> Step
+    if args.len() != 1
+        return fault(at, s"`windowClose` takes a window, and was given ${counted(args.len(), "argument")}")
+
+    val id = handle_of_window(args.at(0), at, "windowClose")?
+
+    if id >= windows.len()
+        return fault(at, "`windowClose` was given something that is not a window")
+
+    windows.at(id).w match
+        Some(w) ->
+            w.terminate().unwrap_or(())
+            window_gone(id)
+        None -> ()
+
+    if no_window_is_open() then stop_pump()
+
+    Ok(Null)
+end do_window_close
+
+// `windowClosed(w)` -- whether the window has gone, because the user closed it or `windowClose` did.
+do_window_closed(args: Buf[Value], at: Span) -> Step
+    if args.len() != 1
+        return fault(at, s"`windowClosed` takes a window, and was given ${counted(args.len(), "argument")}")
+
+    val id = handle_of_window(args.at(0), at, "windowClosed")?
+
+    if id >= windows.len()
+        return fault(at, "`windowClosed` was given something that is not a window")
+
+    Ok(Bool(windows.at(id).w.is_none()))
+end do_window_closed
+
+// `windowDone(w)` -- a promise that settles when the window has gone.
+//
+// **It is the idiom `child.exited` already uses**, and it is what a program written around a window
+// awaits instead of polling `windowClosed`. A window that has gone already answers a promise that has
+// already settled, which is what stops `await windowDone(w)` waiting for something that has happened.
+do_window_done(args: Buf[Value], at: Span) -> Step
+    if args.len() != 1
+        return fault(at, s"`windowDone` takes a window, and was given ${counted(args.len(), "argument")}")
+
+    val id = handle_of_window(args.at(0), at, "windowDone")?
+
+    if id >= windows.len()
+        return fault(at, "`windowDone` was given something that is not a window")
+
+    var open = windows.at(id)
+
+    if open.done == null
+        val pr = new_promise()
+        val mark = root_mark()
+
+        hold(Promise(pr))
+        open.done = pr
+        windows.set(id, open)
+        release(mark)
+
+        if open.w.is_none() then settle_ok(pr, Null)
+
+    Ok(Promise(windows.at(id).done))
+end do_window_done
+
+// -- the loop ------------------------------------------------------------------------------------------
+
+// Turn every open window's platform loop over once, and notice the ones that have gone.
+//
+// **This is the whole of the run-loop decision.** libuv owns the thread, so every one of these turns
+// happens between two slate statements and nothing crosses a thread: a page's click reaches a slate
+// closure on the thread that built it.
+private pump_windows()
+    for i in 0..<windows.len()
+        windows.at(i).w match
+            Some(w) ->
+                w.pump() match
+                    Ok(_) -> ()
+                    Err(why) ->
+                        loop_fault = Some(failure(point(0), s"a window's events could not be delivered: ${why.message()}"))
+                        return
+
+                if w.closed() then window_gone(i)
+            None -> ()
+
+    if no_window_is_open() then stop_pump()
+end pump_windows
+
+// A window has gone: free it, settle what was waiting on it, and forget what it was bound to.
+private window_gone(id: usize)
+    var open = windows.at(id)
+
+    open.w = None
+    windows.set(id, open)
+
+    for i in 0..<bounds.len()
+        if bounds.at(i).live && bounds.at(i).win == id
+            var b = bounds.at(i)
+
+            b.live = false
+            b.f = Null
+            bounds.set(i, b)
+
+    // **A call the page will never hear the answer to is dropped rather than answered**, the window
+    // it would have been answered through being gone.
+    var left: Buf[PageCall] = buf()
+
+    for i in 0..<page_calls.len()
+        if page_calls.at(i).win != id then left.push(page_calls.at(i))
+
+    page_calls = left
+
+    if open.done != null then settle_ok(open.done, Null)
+end window_gone
+
+private no_window_is_open() -> bool
+    for i in 0..<windows.len()
+        if windows.at(i).w.is_some() then return false
+
+    true
+end no_window_is_open
+
+// Start the one timer every window shares, where it is not already running.
+//
+// **It claims an ordinary slot**, so `outstanding` counts it and a program with a window up does not
+// exit -- which is what a listening socket does and is the behaviour a program expects.
+private start_pump(at: Span) -> Result[unit, Signal]
+    if pump_slot.is_some() then return Ok(())
+
+    libuv.timer() match
+        Err(e) -> Err(failure(at, s"a window's timer could not be made: ${e}"))
+        Ok(t) ->
+            val id = claim(Pending(Null, Null, null, Some(t), None, true, true, 0))
+
+            pump_slot = Some(id)
+
+            t.start(0, PumpEvery, () -> pump_windows()) match
+                Err(e) ->
+                    pump_slot = None
+                    surrender(id)
+                    Err(failure(at, s"a window's timer could not be started: ${e}"))
+                Ok(_) -> Ok(())
+end start_pump
+
+// Stop it, which closes the handle and gives the slot back -- so the drain ends and the program can.
+private stop_pump()
+    pump_slot match
+        Some(id) ->
+            pump_slot = None
+            surrender(id)
+        None -> ()
+
+// -- the bridge ------------------------------------------------------------------------------------
+
+// A page called a bound function. **This runs on slate's thread**, being reached from the pump timer.
+private page_called(bid: usize, call: string, page_args: string)
+    if bid >= bounds.len() then return
+
+    val b = bounds.at(bid)
+
+    if !b.live then return
+
+    val mark = root_mark()
+
+    hold(b.f)
+
+    val arr = page_arguments(page_args, point(0)) match
+        Ok(v) -> v
+        Err(s) ->
+            release(mark)
+            reject_page(b.win, call, signal_message(s))
+            return
+
+    hold(arr)
+
+    var vals: Buf[Value] = buf()
+
+    arr match
+        Array(a) ->
+            for i in 0..<a.items.len()
+                vals.push(a.items.at(i))
+        _ -> ()
+
+    val answered = apply_callback(b.f, vals, point(0), "windowBind") match
+        Ok(v) -> v
+        Err(s) ->
+            release(mark)
+
+            s match
+                // **A fault in the handler rejects the page's promise and does not stop the
+                // program**, which is what a page asking for something impossible has to do: the
+                // program is a server to that page and a bad request is not its own defect.
+                Fail(_, _, _) -> reject_page(b.win, call, signal_message(s))
+                other -> loop_fault = Some(other)
+
+            return
+
+    hold(answered)
+
+    // **A promise is answered LATER and everything else at once**, which is the point of `bind_async`
+    // and the reason an `async` handler works here at all.
+    answered match
+        Promise(pr) ->
+            pr.handled = true
+            page_calls.push(PageCall(pr, b.win, call))
+
+            if pr.settled then settle_page_calls(pr)
+        v -> answer_page(b.win, call, v)
+
+    release(mark)
+end page_called
+
+// Hand a settled promise's verdict to the page that is waiting for it.
+//
+// **Reached from `wake` in `async.sysl`**, which is where a promise tells everything watching it. The
+// entries are taken off the list before any of them is answered, for `settle_watches`' reason.
+settle_page_calls(pr: *PromiseObj)
+    var taken: Buf[PageCall] = buf()
+    var left: Buf[PageCall] = buf()
+
+    for i in 0..<page_calls.len()
+        if page_calls.at(i).answer == pr then taken.push(page_calls.at(i)) else left.push(page_calls.at(i))
+
+    if taken.is_empty() then return
+
+    page_calls = left
+
+    for i in 0..<taken.len()
+        val c = taken.at(i)
+
+        if pr.failed
+            reject_page(c.win, c.call, pr.message)
+        else
+            answer_page(c.win, c.call, pr.value)
+end settle_page_calls
+
+// Resolve the page's promise with a value, or reject it where the value is not one JSON can carry.
+private answer_page(id: usize, call: string, v: Value)
+    var path: Buf[*u8] = buf()
+
+    json_of_slate(v, point(0), &path) match
+        Ok(j) -> tell_page(id, call, Ok(s"${j}"))
+        Err(s) -> reject_page(id, call, signal_message(s))
+
+private reject_page(id: usize, call: string, why: string)
+    tell_page(id, call, Err(json_text(why)))
+
+private tell_page(id: usize, call: string, result: webview.Answer)
+    if id >= windows.len() then return
+
+    windows.at(id).w match
+        Some(w) -> w.answer(call, result).unwrap_or(())
+        None -> ()
+
+// A sentence as a JSON string, which is what a rejected page promise carries.
+private json_text(s: string) -> string = s"${json.Json.Str(s)}"
+
+// -- a page's arguments, and a handler's answer ------------------------------------------------------
+
+// The JSON array a page's call arrives as, read into slate values.
+//
+// **Not `private`**: `tests_window.sysl` asks this and `answered_json` directly, a page's call being
+// the one thing about this module a test can exercise on a machine with no window server.
+page_arguments(text: string, at: Span) -> Step
+    val src = source_of("window", text)
+
+    val j = json.parse(src) match
+        Ok(j) -> j
+        Err(d) -> return fault(at, s"a page called a bound function with arguments that are not JSON: ${d.render(src)}")
+
+    j match
+        json.Json.Arr(_) -> slate_of_json(j, at)
+        _ -> fault(at, "a page's call arrives as a JSON array of its arguments, and this is not an array")
+end page_arguments
+
+// What a handler answered, as the JSON text the page's promise resolves with.
+//
+// **Not `private`**, for `page_arguments`' reason.
+answered_json(v: Value, at: Span) -> Result[string, Signal]
+    var path: Buf[*u8] = buf()
+    val j = json_of_slate(v, at, &path)?
+
+    Ok(s"${j}")
+end answered_json
+
+// -- what a value is, on the way in ------------------------------------------------------------------
+
+// What `window` was told, with the defaults where it was told nothing.
+private struct WindowOptions
+    title: string
+    width: int
+    height: int
+    html: string
+    url: string
+    debug: bool
+end WindowOptions
+
+// **800 by 600 and a page saying nothing.** The size is the one figure that is a decision rather than
+// an absence: a window with no size at all is the platform's guess, which on macOS is small enough to
+// read as a defect.
+private default_window() -> WindowOptions = WindowOptions("", 800, 600, "", "", false)
+
+private window_options(v: Value, at: Span) -> Result[WindowOptions, Signal]
+    val o = v match
+        Object(o) -> o
+        Null -> return Ok(default_window())
+        other -> return Err(failure(at, s"`window` takes an object of options, and this is ${other.type_name()}"))
+
+    var how = default_window()
+    var said_html = false
+    var said_url = false
+
+    for i in 0..<o.entries.len()
+        val entry = o.entries.at(i)
+
+        if !entry.dead
+            val key = entry.key match
+                Str(k) -> k.s
+                other -> return Err(failure(at, s"an option is named, and this is ${other.type_name()}"))
+
+            if key == "title"
+                how.title = words(entry.value, at, "title")?
+            elif key == "width"
+                how.width = measure(entry.value, at, "a width")?
+            elif key == "height"
+                how.height = measure(entry.value, at, "a height")?
+            elif key == "html"
+                how.html = words(entry.value, at, "html")?
+                said_html = true
+            elif key == "url"
+                how.url = words(entry.value, at, "url")?
+                said_url = true
+            elif key == "debug"
+                how.debug = entry.value match
+                    Bool(b) -> b
+                    other -> return Err(failure(at, s"`debug` is true or false, and this is ${other.type_name()}"))
+            else
+                return Err(failure(at, s"`window` has no option called `${key}` -- it takes `title`, `width`, `height`, `html`, `url` and `debug`"))
+
+    // **Naming both is refused rather than resolved**, first-wins and last-wins each silently
+    // throwing away something somebody wrote -- which is the manifest reader's rule about a repeated
+    // key, drawn here for its reason.
+    if said_html && said_url
+        return Err(failure(at, "`window` takes `html` or `url` and not both -- a window shows one page"))
+
+    Ok(how)
+end window_options
+
+private words(v: Value, at: Span, name: string) -> Result[string, Signal]
+    v match
+        Str(s) -> Ok(s.s)
+        other -> Err(failure(at, s"`${name}` is text, and this is ${other.type_name()}"))
+
+private measure(v: Value, at: Span, what: string) -> Result[int, Signal]
+    v match
+        Int(n) ->
+            if n <= 0 then return Err(failure(at, s"${what} is a positive whole number, and this is ${n}"))
+
+            Ok(int(n))
+        other -> Err(failure(at, s"${what} is a whole number, and this is ${other.type_name()}"))
+
+// A handle, which is always a number into the one table.
+private handle_of_window(v: Value, at: Span, name: string) -> Result[usize, Signal]
+    v match
+        Int(n) ->
+            if n < 0 then return Err(failure(at, s"`${name}` was given something that is not a window"))
+
+            Ok(usize(n))
+        other -> Err(failure(at, s"`${name}` takes a window, and this is ${other.type_name()}"))
+
+private live_window(id: usize, at: Span, name: string) -> Result[&webview.Webview, Signal]
+    if id >= windows.len() then return Err(failure(at, s"`${name}` was given something that is not a window"))
+
+    windows.at(id).w match
+        Some(w) -> Ok(w)
+        None -> Err(failure(at, s"this window has closed, and `${name}` needs an open one"))
+end live_window
+
+// What the four one-string calls share: a window and the text to give it.
+private struct WindowAndText
+    w: &webview.Webview
+    text: string
+end WindowAndText
+
+private one_and_text(args: Buf[Value], at: Span, name: string, what: string) -> Result[WindowAndText, Signal]
+    if args.len() != 2
+        return Err(failure(at, s"`${name}` takes a window and ${what}, and was given ${counted(args.len(), "argument")}"))
+
+    val id = handle_of_window(args.at(0), at, name)?
+    val w = live_window(id, at, name)?
+
+    val text = args.at(1) match
+        Str(s) -> s.s
+        other -> return Err(failure(at, s"`${name}` takes ${what} as text, and this is ${other.type_name()}"))
+
+    Ok(WindowAndText(w, text))
+end one_and_text
+
+// -- what this file registers ---------------------------------------------------------------------
+
+// **A desktop window, which is `slate:window` and the one thing here that is not on a socket.** The
+// names keep a `window` prefix, which is `slate:lmdb`'s rule: this is a door onto somebody else's
+// window system with no policy of slate's in it, so a component model or a router over these is a
+// package rather than another module here.
+var n_window: NativeFn = 0
+var n_window_bind: NativeFn = 0
+var n_window_eval: NativeFn = 0
+var n_window_title: NativeFn = 0
+var n_window_size: NativeFn = 0
+var n_window_navigate: NativeFn = 0
+var n_window_html: NativeFn = 0
+var n_window_close: NativeFn = 0
+var n_window_closed: NativeFn = 0
+var n_window_done: NativeFn = 0
+
+install_window(env: *EnvObj, everything: bool)
+    n_window = register("window", do_window)
+    n_window_bind = register("windowBind", do_window_bind)
+    n_window_eval = register("windowEval", do_window_eval)
+    n_window_title = register("windowTitle", do_window_title)
+    n_window_size = register("windowSize", do_window_size)
+    n_window_navigate = register("windowNavigate", do_window_navigate)
+    n_window_html = register("windowHtml", do_window_html)
+    n_window_close = register("windowClose", do_window_close)
+    n_window_closed = register("windowClosed", do_window_closed)
+    n_window_done = register("windowDone", do_window_done)
+
+    if everything
+        declare(env, "window", Native(n_window), false)
+        declare(env, "windowBind", Native(n_window_bind), false)
+        declare(env, "windowEval", Native(n_window_eval), false)
+        declare(env, "windowTitle", Native(n_window_title), false)
+        declare(env, "windowSize", Native(n_window_size), false)
+        declare(env, "windowNavigate", Native(n_window_navigate), false)
+        declare(env, "windowHtml", Native(n_window_html), false)
+        declare(env, "windowClose", Native(n_window_close), false)
+        declare(env, "windowClosed", Native(n_window_closed), false)
+        declare(env, "windowDone", Native(n_window_done), false)
+end install_window
+#endif

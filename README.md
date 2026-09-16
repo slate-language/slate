@@ -104,6 +104,27 @@ sysl build . --no-default-features --features server
 The remaining three are not features and cannot be left out: `openssl@3`, `libuv` and `pcre2` are what
 TLS, the event loop and `slate:regex` are made of. SQLite is the machine's own and costs nothing.
 
+### The desktop build
+
+**There is a seventh feature, `webview`, and it is the one that is _not_ on by default.** It carries
+[`slate:window`](docs/library/window.md) — a desktop window with a web page in it, over the platform's
+own web view — and it is out of `default` deliberately: a server does not want a window, and putting
+it in would add a library to what everybody installing slate has to have and a line to the Homebrew
+formula. So the released binary is unchanged, and a desktop build is one flag:
+
+```
+brew install sysl-lang/tap/webview
+sysl build . --features webview
+```
+
+The library is from that tap rather than plain `brew install` because webview's upstream cuts no
+releases and ships no pkg-config file. The example is `examples/desktop/notes.sl`, which is a notes
+app in about seventy lines:
+
+```
+sysl run . --features webview -- examples/desktop/notes.sl
+```
+
 A program that imports a module the build left out is told which feature it is behind rather than that
 slate has no such module:
 
