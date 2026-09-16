@@ -62,9 +62,10 @@ forEach([1, 2, 3], x ->
 
 An arrow written mid-line would hand the block to whatever line came next, so it does not open one.
 
-**A `,` written at the block's own bracket depth ends the block**, so a block lambda need not be the
-last argument: the comma closes the block and whatever follows it is the next argument, on that line
-or the next. A comma written deeper in brackets — inside a call or an array literal in the body —
+**A `,` that ends its line, at the block's own bracket depth, ends the block** — so a block lambda
+need not be the last argument: the comma closes the block and the arguments after it are read as
+arguments. A comma written mid-line belongs to the statement it is in, which is what keeps `a, b = b, a`
+whole inside such a body; and one written deeper in brackets, inside a call or an array literal,
 belongs to those brackets and closes nothing.
 
 **A trailing operator does not continue a line.** `a +` followed by `b` on the next line is two

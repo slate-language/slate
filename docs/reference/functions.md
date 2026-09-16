@@ -87,10 +87,10 @@ forEach([1, 2, 3], x ->
 ```
 
 `->` and `match` are the two tokens that suspend the bracket rule, and only where they end a line.
-**A `,` written at the block's own bracket depth ends the block**, so a block lambda need not be the
-last argument: `setTimeout(() ->` … `, 1000)` keeps node's order and still takes a block body, with
-the milliseconds on the same line as the body's last statement or on a line of their own. A comma
-deeper in brackets — inside a call or an array literal written in the body — closes nothing.
+**A `,` that ends its line, at the block's own bracket depth, ends the block** — so a block lambda need
+not be the last argument: `setTimeout(() ->` … `,` and then `1000)` on the next line keeps node's
+order and still takes a block body. A comma written mid-line is the statement's own, which is what
+keeps `a, b = b, a` whole inside such a body, and one deeper in brackets closes nothing.
 
 A lambda's parameters may be annotated; its result may not, the arrow already standing between the
 parameters and the body. What it answers is read off that body — see [Types](types.md).
