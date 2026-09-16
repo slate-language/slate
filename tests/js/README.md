@@ -85,6 +85,15 @@ renderings are the other half — `print` and `toJSON` write a set as an array a
 pairs on both hosts, where a JavaScript host says `Set(2) {1, 2}` and `{}`. And `size` is a property on
 both, with `.length` a missing name on both.
 
+**`p37.sl` is about a file's body being an async context, and the two back ends reach that by
+different routes.** The interpreter compiles the file's chunk with the flag an `async` definition's
+body carries and starts it as a coroutine, turning the loop until its promise settles; `slate js`
+emits the file into an `async` function and writes `await` where the program did. So what the file
+asserts is the ORDERING, which is the half that could disagree: a statement between two `await`s
+happening between them, a timer armed below an `await` being armed in the resumption rather than
+before it, and a `for await` walking its source once over both an asynchronous source and a
+generator.
+
 **`dom/` is a run of its own and needs jsdom** — see `dom/README.md`.
 
 **`p8.sl` writes into `tests/js/scratch/` and takes it away again**, so that running it twice says

@@ -181,10 +181,13 @@ emit_module(prog: Program, src: Source) -> Emitted = emit_one(prog, src, 0, fals
 
 // One module of a program, told which file it is and whether the markers name it.
 private emit_one(prog: Program, src: Source, file: usize, stamp: bool, testing: bool) -> Emitted
-    // **The top level is not `async`, and not a generator either**, which is `compile_module`'s
-    // `fresh_emit(false, false, ...)` said once more here: a top-level `await` or `yield` is refused
-    // by both hosts and by node itself.
-    var j = Js(str_builder(), src, file, stamp, 0, 0, 0, report(), buf(), false, false, buf(), buf(), buf(), buf(), buf(), buf(), "", None)
+    // **The top level is `async` where the file waits and not otherwise, which is `compile_module`'s
+    // `fresh_emit(prog.awaits, false, ...)` said once more here.** The function this file's code is
+    // written into is made `async` by the same flag, so an `await` that is legal to the interpreter
+    // is legal to JavaScript -- and a file that waits for nothing is emitted into a plain function,
+    // which is what keeps every other program's output byte for byte what it was. **A top-level
+    // `yield` is still refused by both hosts**, there being nothing to yield to.
+    var j = Js(str_builder(), src, file, stamp, 0, 0, 0, report(), buf(), prog.awaits, false, buf(), buf(), buf(), buf(), buf(), buf(), "", None)
 
     for i in 0..<prog.type_names.len()
         j.type_names.push(prog.type_names.at(i))
@@ -279,17 +282,25 @@ emit_program(l: Loaded, testing: bool) -> Emitted
 
     out.push(scope_opens(names))
 
+    val waits = program_awaits(l)
+
     if testing
         // **A file run for its tests is a SUITE OF ONE**, so that there is one runner and not two.
         // `slate js --test p.sl | node -` and `slate test --js .` then report in the same words
         // because they are the same code, rather than because two places were kept in step.
-        out.push(suite_text(one_entry(l.sources.at(l.order.at(l.order.len() - 1)).name, body.code), ""))
+        out.push(suite_text(one_entry(l.sources.at(l.order.at(l.order.len() - 1)).name, body.code, waits), ""))
     else
         // **The semicolon in front of the program is load-bearing.** JavaScript inserts one only
         // where the next line cannot continue the last, and `(` can: without this the prelude's
         // final statement reads the program's own function as an argument and calls it, which is a
         // `TypeError` a long way from its cause.
-        out.push("\n;(() => {\n")
+        //
+        // **The wrapper is `async` where the program waits and a plain function where it does not**,
+        // which is `compile_module`'s gate in the other back end: a top-level `await` has to sit
+        // inside an `async` function or it is a *SyntaxError* that takes the whole file with it, and
+        // making every program's wrapper `async` would change the emitted text of every program that
+        // never waits -- and would hand the host a promise for a program that finished synchronously.
+        out.push(if waits then "\n;(async () => {\n" else "\n;(() => {\n")
         out.push(body.code)
         out.push("})();\n")
 
@@ -298,13 +309,31 @@ emit_program(l: Loaded, testing: bool) -> Emitted
     Emitted(out.finish(), body.report, body.srcs)
 end emit_program
 
+// Whether any file of this program waits at its own top level.
+//
+// **Asked of the whole program rather than per file**, because the function every file is written
+// into is one function: a single file's body is inlined into the wrapper and an imported file's is a
+// nested call the importer `await`s, and either one needs the wrapper around it to be `async`.
+//
+// Not `private`: `main.sysl` assembles a suite and needs the same answer per file.
+program_awaits(l: Loaded) -> bool
+    for i in 0..<l.order.len()
+        if l.programs.at(l.order.at(i)).awaits then return true
+
+    false
+end program_awaits
+
 // One entry of a suite: the path, and a function that evaluates that file's program.
 //
+// **The evaluator is `async` where the file waits**, and `$suite` waits for what it answers -- so a
+// test file that reads a config or opens a store at its top level has finished doing it before its
+// first test runs.
+//
 // Not `private`: `main.sysl` builds a suite out of one of these per file.
-one_entry(path: string, body: string) -> string
+one_entry(path: string, body: string, waits: bool) -> string
     var out = str_builder()
 
-    out.push(s"    [${quoted_js(path)}, () => {\n")
+    out.push(s"    [${quoted_js(path)}, ${if waits then "async () => {" else "() => {"}\n")
     out.push(indented(body))
     out.push("    }]")
 
@@ -404,7 +433,13 @@ program_body(l: Loaded, testing: bool) -> Emitted
             srcs.push(body.srcs.at(k))
 
         if many
-            out.push(s"\n    const $$m${which} = (() => {\n")
+            // **A file that waits becomes an `async` function the importer AWAITS**, which is what
+            // makes an export the importer reads one the imported file has finished writing -- the
+            // interpreter's `run_top_level` settling a module before the next one runs, said in
+            // JavaScript. A file that waits for nothing is the plain function it always was.
+            val waits = l.programs.at(which).awaits
+
+            out.push(s"\n    const $$m${which} = ${if waits then "await (async () => {" else "(() => {"}\n")
             out.push(s"        $$.at(0, ${which});\n")
             out.push("        const $exports = $.obj([]);\n\n")
             out.push(indented(indented(body.code)))

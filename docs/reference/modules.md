@@ -100,8 +100,8 @@ program's size.
 
 **The machine never sees an import.** That is not a preference: slate's file surface is promise-shaped,
 so an import resolved at run time would need either a blocking read carved out as a special case or an
-`import` that answers a promise — and the second forces top-level `await`, which slate refuses, on every
-program that imports anything at all.
+`import` that answers a promise — and the second would make every program that imports anything at all
+wait for it, which is a cost paid by every file rather than by the ones that wanted to wait.
 
 What it costs is that **a path cannot be computed**, which is the same bargain sysl takes and is what
 makes the set of files a program is made of knowable by reading it.

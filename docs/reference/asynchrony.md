@@ -41,18 +41,44 @@ below it runs after the caller has moved on** — which is node's rule, and why 
 before either worker's first step. The two workers then interleave by their own clocks: with those
 numbers `a` takes its first two steps, `b` takes one, `a` finishes, and `b` finishes last.
 
-**Top-level `await` is refused**, so a program that wants to wait writes an `async main` and calls it:
+**A program's own body is an async context**, as an ES module's is, so `await` is legal at the top
+level. Everything under one runs once it has settled, and the program ends when the top level has
+settled and nothing else is pending:
 
 ```slate
-val x = await sleep(1)
+async later(ms, v)
+    await sleep(ms)
+    v
+
+print("first")
+print(await later(5, "waited"))
+print("last")
+```
+
+```output
+first
+waited
+last
+```
+
+A file that imports another waits for it: an imported file's top level finishes before a line of the
+file that imported it runs, so an export is never read before it has been written.
+
+**`await` still belongs to the function it is written in**, so an ordinary function or lambda inside a
+file that waits does not get to:
+
+```slate
+plain()
+    await sleep(1)
+
+plain()
 ```
 
 ```error
 `await` belongs in an `async` function
 ```
 
-`async` goes in front of a definition, a lambda, or a method. Making the whole program a coroutine is a
-real design and one to make on purpose.
+`async` goes in front of a definition, a lambda, or a method.
 
 **In front of a lambda it takes either spelling of the parameters**, the bare name and the bracketed
 list, and a bracketed list may hold everything a written lambda's may — none, several, a default, a
@@ -247,14 +273,18 @@ main()
 a `for await` asks its subject for `next()`, and an array has none -- write `for` without `await` to walk an array
 ```
 
-Outside an `async` function it is refused where the awaiting would happen:
+A file's top level takes one like any other async context. Inside an ordinary function it is refused
+where the awaiting would happen:
 
 ```slate
 twoOf()
     yield 1
 
-for await x in twoOf()
-    print(x)
+walk()
+    for await x in twoOf()
+        print(x)
+
+walk()
 ```
 
 ```error
