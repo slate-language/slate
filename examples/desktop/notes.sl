@@ -81,8 +81,8 @@ windowBind(w, "quit", () -> windowClose(w))
 // **An ordinary slate timer writing into the page**, and it is the proof rather than the decoration:
 // a counter that goes up on its own while a window is up is libuv still turning, which is the thing
 // the whole design was chosen for.
-val clock = setInterval(() ->
-    windowEval(w, "document.getElementById('clock').textContent = new Date().toLocaleTimeString()"),
+val clock = setInterval(
+    () -> windowEval(w, "document.getElementById('clock').textContent = new Date().toLocaleTimeString()"),
     1000)
 
 await windowDone(w)
