@@ -74,7 +74,7 @@ windowBind(w, "load", () -> readFileSync(Notes).value ?? "")
 
 windowBind(w, "save", (text) ->
     writeFileSync(Notes, text)
-    "saved ${len(text)} characters")
+    s"saved ${text.length} characters")
 
 windowBind(w, "quit", () -> windowClose(w))
 
@@ -89,6 +89,6 @@ val clock = setInterval(() ->
 async main()
     await windowDone(w)
     clearInterval(clock)
-    print("window closed; notes are in ${Notes}")
+    print(s"window closed; notes are in ${Notes}")
 
 main()
