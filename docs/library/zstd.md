@@ -7,6 +7,12 @@ weight: 160
 
 Zstandard — the encoding for a hot path, and for a protocol whose two ends are both yours.
 
+**This module is behind the `zstd` build feature**, which is on by default and is in every released
+binary. It is a feature because libzstd has to be installed before slate will build at all — see
+[Building without a library](https://github.com/slate-language/slate#building-without-a-library). A
+build without it also stops offering `Content-Encoding: zstd`, `slate:http` reaching for the same
+two names from inside the built-in scope.
+
 ```slate
 import { zstd, unzstd } from slate:zstd
 

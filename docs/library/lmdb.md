@@ -8,6 +8,12 @@ weight: 180
 An ordered key-value store in a memory-mapped file — the one place a slate server can keep something
 across a restart without a second process being up.
 
+**This module is behind the `lmdb` build feature**, which is on by default and is in every released
+binary. It is a feature because LMDB has to be installed before slate will build at all, so a build
+that will never use a store can leave it out — see [Building without a library](https://github.com/slate-language/slate#building-without-a-library).
+A build without it says so when a program imports this module, naming the feature rather than
+claiming slate has no such module.
+
 ```slate
 import { lmdbOpen, lmdbWrite, lmdbRead, lmdbDb, lmdbPut, lmdbGet, lmdbCommit, lmdbAbort } from slate:lmdb
 

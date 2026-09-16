@@ -7,6 +7,12 @@ weight: 200
 
 HTTP/2: the framing layer, and HPACK on its own.
 
+**This module is behind the `http2` build feature**, which is on by default and is in every released
+binary. It is a feature because nghttp2 has to be installed before slate will build at all — see
+[Building without a library](https://github.com/slate-language/slate#building-without-a-library). It
+is the one feature that reaches into another module: a build without it leaves `slate:http` speaking
+HTTP/1.1 alone, with the same three exports, the same request and the same reply forms.
+
 ```slate
 import { h2Client, h2Server, h2Receive, h2Send, h2Next, h2Request, h2Respond, h2Close } from slate:nghttp2
 ```

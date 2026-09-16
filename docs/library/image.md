@@ -7,6 +7,13 @@ weight: 170
 
 Photographs and avatars — decoding what somebody uploaded, scaling it down, and writing it back out.
 
+**The WebP half of this module is behind the `webp` build feature**, which is on by default and is in
+every released binary — and it is the one feature that takes half a module rather than all of it. PNG,
+JPEG and GIF are Sean Barrett's stb, which is vendored and costs nobody anything; WebP is libwebp,
+which has to be installed before slate will build at all. A build without the feature keeps the other
+five names and has no `encodeWebP`, and a WebP handed to `readImage` is refused as an unknown image
+type. See [Building without a library](https://github.com/slate-language/slate#building-without-a-library).
+
 ```slate
 import { readImage, imageShape, resizeImage, encodePNG, encodeJPEG, encodeWebP } from slate:image
 

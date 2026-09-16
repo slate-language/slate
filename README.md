@@ -72,6 +72,48 @@ Running a server on that box, under [`slate:cluster`](docs/library/cluster.md) a
 
 Anywhere else, build it from source — a clone and one command, given [sysl](https://sysl.sh) installed.
 
+### Building without a library
+
+Building from source wants nine libraries installed — `openssl@3`, `libuv`, `pcre2`, `brotli`, `hiredis`,
+`nghttp2`, `zstd`, `lmdb` and `webp` — and sysl refuses before it compiles anything if one of them is
+missing. Six of the nine are **features**, so a build can leave them out:
+
+| feature | what goes with it |
+|---|---|
+| `http2` | `slate:nghttp2`, and `slate:http` stops speaking HTTP/2 — it still serves HTTP/1.1 unchanged |
+| `redis` | `slate:redis` |
+| `lmdb` | `slate:lmdb` |
+| `zstd` | `slate:zstd`, and `Content-Encoding: zstd` |
+| `brotli` | `slate:brotli`, and `Content-Encoding: br` |
+| `webp` | `slate:image`'s WebP half — the other five names are vendored stb and stay |
+
+All six are on by default, so the released binary and an ordinary `sysl build .` are exactly what they
+have always been. To leave some out, name the ones you want:
+
+```
+sysl build . --no-default-features --features http2,brotli
+```
+
+`server` is the five an API server usually wants — `http2`, `redis`, `lmdb`, `brotli` and `zstd` — so a
+build with no image codec is:
+
+```
+sysl build . --no-default-features --features server
+```
+
+The remaining three are not features and cannot be left out: `openssl@3`, `libuv` and `pcre2` are what
+TLS, the event loop and `slate:regex` are made of. SQLite is the machine's own and costs nothing.
+
+A program that imports a module the build left out is told which feature it is behind rather than that
+slate has no such module:
+
+```
+error: `slate:lmdb` is not in this build -- it is behind the `lmdb` feature, so build with `--features lmdb`
+```
+
+`sysl deps .` prints the dependency graph a set of features resolved to, and a library nothing turned on
+is never cloned and never asked of pkg-config.
+
 ## Running it
 
 ```

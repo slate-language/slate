@@ -7,6 +7,10 @@ weight: 120
 
 A Redis client on the event loop.
 
+**This module is behind the `redis` build feature**, which is on by default and is in every released
+binary. It is a feature because hiredis has to be installed before slate will build at all — see
+[Building without a library](https://github.com/slate-language/slate#building-without-a-library).
+
 ```slate
 import { redis } from slate:redis
 

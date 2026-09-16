@@ -5,6 +5,12 @@ weight: 150
 
 # `slate:brotli`
 
+**This module is behind the `brotli` build feature**, which is on by default and is in every released
+binary. It is a feature because libbrotli has to be installed before slate will build at all — see
+[Building without a library](https://github.com/slate-language/slate#building-without-a-library). A
+build without it also stops offering `Content-Encoding: br`, `slate:http` reaching for the same two
+names from inside the built-in scope.
+
 ```slate
 import { compress, decompress } from slate:brotli
 
