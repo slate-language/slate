@@ -85,7 +85,10 @@ val clock = setInterval(
     () -> windowEval(w, "document.getElementById('clock').textContent = new Date().toLocaleTimeString()"),
     1000)
 
-await windowDone(w)
+// Top-level `await` is refused (see docs/reference/asynchrony.md), so the wait is an `async main`.
+async main()
+    await windowDone(w)
+    clearInterval(clock)
+    print("window closed; notes are in ${Notes}")
 
-clearInterval(clock)
-print("window closed; notes are in ${Notes}")
+main()
