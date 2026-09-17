@@ -434,14 +434,23 @@ own list.
 **`==` compares by value, all the way down, and there is no `===`:**
 
 ```slate
+val o = { a: 1 }
+
 print([1, 2] == [1, 2], { a: 1 } == { a: 1 })
 print("1" == 1)
+print(o.nope == null, o.nope == undefined, null == 0)
 ```
 
 ```output
 true true
 false
+true true false
 ```
+
+**One thing of loose equality is kept and one only: `null == undefined` is true**, so the `== null`
+idiom you already write means "absent, either way" here too. Everything else stays strict — `"1" == 1`
+and `null == 0` are both false — which is why nothing needs a `===`, and `has(o, k)` is the presence
+test where the difference between a `null` field and a missing one matters.
 
 **An integer is a 64-bit integer**, not a double pretending. It wraps, it does not promote, and `/`
 between two integers divides towards zero:

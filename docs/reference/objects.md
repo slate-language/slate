@@ -61,6 +61,10 @@ a 1
 b 2
 ```
 
+**`has` is the presence test, and it is the only one.** A field holding `null` and a field that is not
+there both answer true to `== null` — [the one special case in `==`](values.md) — so where the
+difference matters, `has` is what draws it.
+
 `o with { f: v }` answers a **copy** with `f` changed. There is no spread in a literal — `with` is it.
 
 ## `proto`

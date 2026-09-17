@@ -52,6 +52,74 @@ a_missing_field_is_undefined_and_undefined_may_not_be_stored() =
 keeps(v) = v
 
 @test
+the_two_absences_compare_equal_and_has_is_what_tells_them_apart() =
+    val o = { x: null }
+
+    // `x == null` and `x == undefined` are one question: is this absent, either way.
+    assert(o.nope == null)
+    assert(o.nope == undefined)
+    assert(o.x == null)
+    assert(o.x == undefined)
+    assert(null == undefined)
+
+    // `!=` is the negation of that one question and nothing else.
+    assert(!(o.nope != null))
+    assert(!(null != undefined))
+
+    // They are still two values, and `has` is what asks which one is there.
+    assert(has(o, "x"))
+    assert(!has(o, "nope"))
+
+@test
+THE_ABSENCE_RULE_IS_THE_ONLY_LOOSENESS_IN_EQUALITY() =
+    // Nothing else of JavaScript's loose equality is taken, which is why there is no `===` here:
+    // there is nothing to escape back to.
+    assert(!(null == 0))
+    assert(!(null == ""))
+    assert(!(null == false))
+    assert(!(null == []))
+    assert(null != 0)
+
+    val o = {}
+
+    assert(!(o.nope == 0))
+    assert(!(o.nope == ""))
+    assert(!(o.nope == false))
+
+@test
+a_pattern_still_tells_a_null_from_an_absent_read() =
+    // `==` treats the two alike and a pattern does not -- a literal pattern is a shape test.
+    val o = { x: null }
+
+    val here = o.x match
+        null -> "null"
+        _ -> "neither"
+
+    val gone = o.nope match
+        null -> "null"
+        _ -> "neither"
+
+    assertEq(here, "null")
+    assertEq(gone, "neither")
+
+@test
+NO_CONTAINER_CAN_HOLD_AN_ABSENCE_SO_EQUALITY_MEETS_ONE_ONLY_AT_THE_TOP() =
+    // The comparison is one function all the way down, so the rule would hold inside an array or an
+    // object as well -- and no program can build the case, an absence being keepable nowhere.
+    val o = {}
+
+    assert(contains(inArray(o) catch e -> e.message, "cannot be put in an array"))
+    assert(contains(inObject(o) catch e -> e.message, "cannot be put in an object"))
+
+    // What a container CAN hold is `null`, and that compares as it always did.
+    assert([null] == [null])
+    assert({ a: null } == { a: null })
+    assert(!([null] == [0]))
+
+inArray(o) = [o.nope]
+inObject(o) = { a: o.nope }
+
+@test
 a_quoted_key_is_the_only_spelling_for_one_that_is_not_a_name() =
     val o = { "a.b": 1, "if": 2, end: 3 }
 

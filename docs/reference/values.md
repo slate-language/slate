@@ -70,6 +70,31 @@ true true
 **A function is equal to itself.** `f == f` is true, and two separately written lambdas with the same
 body are not equal.
 
+**There is one special case, and it is the two absences: `null == undefined` is true.** So `x == null`
+and `x == undefined` are the same question — *is this absent, either way* — and `!=` is its negation.
+A field holding `null` and a field that is not there are still two different things, and
+[`has`](objects.md) is what asks which one you have.
+
+```slate
+val o = { a: 1, b: null }
+
+print(o.b == null, o.nope == null, o.b == undefined)
+print(null == 0, null == false, undefined == "")
+print(has(o, "b"), has(o, "nope"))
+```
+
+```output
+true true true
+false false false
+true false
+```
+
+**Nothing else of JavaScript's loose equality comes with it**, which is why there is no `===` to
+escape back to. `null == 0`, `null == false` and `undefined == ""` are all false, and `==` is strict
+about every other pair of kinds. The `== null` idiom is taken deliberately because a read that found
+nothing is almost always to be handled the same way whichever kind of nothing it was; where it is
+not, `has` draws the line.
+
 A [class](classes.md) may take `==` over for its own instances by writing a method called `==`, and
 must write `hash` beside it if those instances are to be used as table keys. `!=` is always the
 opposite of `==` and may not be written. `<`, `<=`, `>` and `>=` are each a method of their own, or
@@ -216,9 +241,10 @@ mutating it. `concat(xs, ys)` is the array counterpart.
 
 ## Absence
 
-**There is no `undefined`.** `null` is the only absence, it is an ordinary value, and slate refuses to
-store anything else in its place. That single rule explains a run of behaviour that otherwise looks
-unrelated:
+**`null` is the only absence a program can keep**, it is an ordinary value, and slate refuses to store
+anything else in its place — `undefined` exists only as the immediate answer to a read that found
+nothing, and [compares equal to `null`](#equality). That single rule explains a run of behaviour that
+otherwise looks unrelated:
 
 - `pop`, `shift` and `at` **fault** where there is nothing there, rather than answering nothing.
 - `find` and `indexOf` answer **`null`** — a search that found nothing is an answer, where reaching
