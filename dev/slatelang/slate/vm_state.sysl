@@ -1,6 +1,7 @@
 module dev.slatelang.slate
 
 import sh.sysl.gc
+import sh.sysl.libuv
 import sh.sysl.miniz
 import sh.sysl.parsing.*
 import sh.sysl.sqlite
@@ -66,6 +67,15 @@ struct Vm
     hook_names: Buf[string]
 
     // -- the event loop (`event.sysl`) ---------------------------------------------------------------
+
+    // The libuv loop this VM's timers, sockets and requests are on.
+    //
+    // **A field rather than `default_loop()`, because libuv's default loop is the PROCESS's.** A loop
+    // may only be turned by one thread, so a VM running on a thread of its own has to be on a loop of
+    // its own -- `new_vm(ceiling, libuv.new_loop().unwrap())` is what an actor writes, and the
+    // program's own VM keeps the default loop, which is what every handle in the process was already
+    // on.
+    uv_loop: &libuv.Loop
 
     // Everything the loop may still call, and the only thing standing between a pending callback and
     // the sweep.
@@ -441,7 +451,10 @@ extern free(block: *u8)
 // **Positional and in field order, because that is the shape sysl gives**, so a field added above is
 // added here in the same place or the compiler says which type stopped matching. The groups are the
 // struct's groups.
-new_vm(ceiling: usize) -> Vm
+// **`lp` is the loop this VM's handles go on**, and it defaults to the process's own so that every
+// call written before there was a second thread means what it always did. A VM that is going to run
+// on a thread of its own is given `libuv.new_loop()`, a loop being turnable by one thread at a time.
+new_vm(ceiling: usize, lp: &libuv.Loop = libuv.default_loop()) -> Vm
     val block = malloc(ceiling)
 
     // **Loud rather than degraded.** A null block would be a heap whose first allocation answers null,
@@ -453,7 +466,7 @@ new_vm(ceiling: usize) -> Vm
         fresh_machine(), buf(),
         new_unit(), buf(),
         buf(), no_hooks(), no_hook_names(),
-        buf(), 0, 0, None,
+        lp, buf(), 0, 0, None,
         buf(), 0, buf(), buf(),
         buf(),
         buf(), 0,
@@ -502,13 +515,22 @@ new_vm(ceiling: usize) -> Vm
 // `enter` below.
 private var main_vm: Vm = new_vm(HeapBytes)
 
-// The one module-level `var` the runtime keeps, and it is a POINTER to the VM in charge.
+// The one module-level `var` the runtime keeps, and it is a POINTER to the VM in charge OF THIS
+// THREAD.
 //
-// **Here by design, and it is what `current()` is for.** It would be a thread-local the day sysl has
-// one, and `new_vm()` the thing an actor calls on its own thread; sysl has no thread-local storage
-// today, so `enter`/`leave` below buy the sequential half of the same thing and the per-thread
-// version is this one declaration.
-private var the_vm: *Vm = &main_vm
+// **`@thread_local` is what makes two VMs run at once**, and it is the whole of the mechanism:
+// every thread reads its own copy of this pointer, so `current()` answers the VM the line of
+// execution belongs to rather than the one the process last entered. `enter`/`leave` below swap
+// *this thread's* copy, which is what keeps nesting on one thread working exactly as it did.
+//
+// **Every copy starts at `null` and `current()` reads that as the program's own VM.** A
+// thread-local's copies are stamped from a single image in the object file rather than by code that
+// runs per thread, so the initializer has to be a value the compiler can write down and `&main_vm`
+// -- the address of a module `var` -- is not one it will take. `null` is, and it says the right
+// thing anyway: a thread that has entered nothing belongs to the VM the process runs its program on,
+// which is exactly what every thread read before this was per-thread.
+@thread_local
+private var the_vm: *Vm = null
 
 // The VM this line of execution belongs to.
 //
@@ -516,7 +538,11 @@ private var the_vm: *Vm = &main_vm
 // a function that reaches the same subsystem a dozen times takes a pointer to that subsystem once --
 // `val vm: *Machine = &current().machine` at the top of `run_frames` is the worked example, and it is
 // why converting the instruction loop changed one line rather than a hundred and sixteen.
-current() -> *Vm = the_vm
+//
+// **The null test is what gives a thread that entered nothing the program's own VM**, and it is here
+// rather than in the declaration because a thread-local may not be initialized with an address. It is
+// one comparison on a pointer this thread has just loaded.
+current() -> *Vm = if the_vm == null then &main_vm else the_vm
 
 // Run what follows on `vm`, and answer the VM that was in charge.
 //
@@ -526,8 +552,9 @@ current() -> *Vm = the_vm
 // that every `enter` is matched by a `leave` on every way out -- including a fault, which is why the
 // runtime itself never calls these and a test or an embedder does.
 //
-// **This is the sequential stand-in for a thread-local**, so a second VM runs on the main thread
-// today and an actor's would need nothing here but a `@thread_local` on `the_vm`.
+// **It swaps THIS THREAD'S pointer**, `the_vm` being a thread-local, so two threads each entering a
+// VM of their own run both at once and neither can see the other's. Nesting on one thread is
+// unchanged: each level holds the value it was answered.
 enter(vm: *Vm) -> *Vm
     val was = the_vm
 

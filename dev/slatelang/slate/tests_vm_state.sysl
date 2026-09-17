@@ -2,8 +2,13 @@ module dev.slatelang.slate
 @tests
 
 import sh.sysl.gc
+import sh.sysl.libuv
 import sysl.buf.{Buf, buf}
 import sysl.fs.{entries, read_bytes}
+
+// **`spawn` alone, never `current`**: `sysl.posix.threads` has a `current()` of its own -- the calling
+// thread's handle -- and slate's `current()` is the VM this line of execution belongs to.
+import sysl.posix.threads.spawn
 import sysl.slices.sort_by
 import sysl.text.{Search, from_utf8_unchecked, split, str_builder}
 
@@ -110,6 +115,11 @@ private counted_in(name: string) -> Counted
 
             continue
 
+        // **An ATTRIBUTE stands on its own line between the comment and the declaration**, which is
+        // where `@thread_local` sits above `the_vm`, so it is stepped over exactly as a comment is.
+        // Resetting the marker here would lose the reason a process-wide global gave for being one.
+        if line.starts_with("@") then continue
+
         if !line.starts_with("var ") && !line.starts_with("private var ")
             marked = false
             continue
@@ -158,7 +168,7 @@ THE_RUNTIMES_STATE_LIVES_IN_VM_AND_A_NEW_GLOBAL_HAS_TO_BE_ARGUED_FOR()
 
     // **The VM is ONE global and the test says so**, that being the whole claim: a second `var` in
     // `vm_state.sysl` would be state outside the struct, which is the thing this file exists to stop.
-    assert_eq(the_vm, 1, "`the_vm`, the POINTER `current()` answers, which becomes a thread-local the day sysl has one")
+    assert_eq(the_vm, 1, "`the_vm`, the POINTER `current()` answers, and it is a `@thread_local` -- one copy per thread")
 
 @test
 A_VM_STARTS_EMPTY_AND_CURRENT_ANSWERS_THE_SAME_ONE_EVERY_TIME()
@@ -267,3 +277,90 @@ A_VM_WITH_A_SMALL_CEILING_FAULTS_ON_ITS_OWN_LIMIT_NOT_THE_PROCESS()
 
     current().output.clear()
 end A_VM_WITH_A_SMALL_CEILING_FAULTS_ON_ITS_OWN_LIMIT_NOT_THE_PROCESS
+
+// -- and two of them at once, on two threads ---------------------------------------------------------
+
+// How many bytes of a program's output the thread below carries back. Two short lines, and the
+// assertion compares the whole of it, so a longer answer fails rather than being quietly cut.
+private const SaidBytes: usize = 96
+
+// What the second thread writes back through the address it was handed.
+//
+// **A fixed array of bytes and not a `string`, and that is the crossing rule rather than a
+// preference.** A sysl string is reference counted and a count two threads touch is torn, so
+// `spawn`'s `@crossing(arg)` looks through the pointer and refuses a state holding one. Plain bytes
+// carry no count, and the reading back into a `string` happens on the thread that asserts.
+private struct WhatTheOtherThreadSaw
+    // Whether the body ran to its end. False where it never started, so a failure says which.
+    ran: bool
+
+    // How many of `said` are the program's output.
+    said_len: usize
+
+    // What the program on that thread printed.
+    said: [SaidBytes]u8
+end WhatTheOtherThreadSaw
+
+// A second VM's whole life, on a thread of its own: its own loop, its own heap, its own program.
+//
+// **A `*extern` taking one address is the whole of what may cross** (`sysl.posix.threads.spawn`), so
+// the program text is a literal written here rather than anything handed over.
+private on_a_thread_of_its_own(state: *WhatTheOtherThreadSaw)
+    // **A loop of its own, because libuv's default loop is the PROCESS's** and may be turned by one
+    // thread at a time. This is the one thing a thread has to arrange before it enters a VM.
+    val lp = libuv.new_loop().expect("a loop of this thread's own")
+
+    var mine = new_vm(SmallCeiling, lp)
+    val was = enter(&mine)
+
+    // A timer, so that the drain this thread runs is its own loop's and not the main thread's.
+    val said = out("setTimeout(() -> print(\"from the other thread\"), 1)\nprint(6 * 7)")
+
+    leave(was)
+    dispose_vm(&mine)
+    lp.close().expect("the thread's loop closes with nothing left on it")
+
+    val bytes = said.bytes
+    var n: usize = 0
+
+    while n < bytes.len && n < SaidBytes
+        state.said[n] = bytes[n]
+        n += 1
+
+    state.said_len = n
+    state.ran = true
+end on_a_thread_of_its_own
+
+@test
+TWO_VMS_RUN_ON_TWO_THREADS_AT_ONCE_EACH_ON_ITS_OWN_HEAP_AND_LOOP()
+    reset_vm()
+    current().output.clear()
+
+    // **The process-wide tables are built here on purpose, before the second thread exists.**
+    // `register` is append-only and hands out a name's id on the first program that installs the
+    // builtins, so two threads installing them at once would be two threads writing one `Map`. A
+    // program run first makes every later `register` a read of a table nothing writes again.
+    assert_eq(out("print(\"warm\")"), "warm")
+
+    val ceiling_before = current().heap_ceiling
+    val modules_before = current().module_values.len()
+
+    var seen = WhatTheOtherThreadSaw(false, 0, [0u8; SaidBytes])
+    var thread = spawn(&on_a_thread_of_its_own, &seen).unwrap()
+
+    // Meanwhile, on this thread: this VM, this heap, the process's own loop, and a timer on it.
+    val here = out("setTimeout(() -> print(\"from the main thread\"), 1)\nprint(1 + 1)")
+
+    assert(thread.join(), "the second thread was waited for")
+
+    assert_eq(here, "2\nfrom the main thread", "this thread's VM ran its own program")
+    assert(seen.ran, "the second VM ran to the end on a thread of its own")
+    assert_eq(from_utf8_unchecked(seen.said[0..<seen.said_len]), "42\nfrom the other thread",
+        "and printed what ITS program printed, on its own heap and its own loop")
+
+    // And this VM is exactly where it was left.
+    assert_eq(current().heap_ceiling, ceiling_before, "the main VM's block is the size it always was")
+    assert_eq(current().module_values.len(), modules_before, "and so is its module table")
+
+    current().output.clear()
+end TWO_VMS_RUN_ON_TWO_THREADS_AT_ONCE_EACH_ON_ITS_OWN_HEAP_AND_LOOP

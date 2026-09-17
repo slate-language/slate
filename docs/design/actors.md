@@ -245,12 +245,13 @@ libuv loop and a collector; an actor is one of each. `sh.sysl.gc`'s `heap(base, 
 block it works over, so a per-actor heap ceiling is the `cap` that actor was spawned with, and a
 finalizer is a `Kind`'s `finalize` on that heap, running on that thread.
 
-**The prerequisite is the VM-struct refactor, and it is the next piece of work rather than this one.**
-The runtime's state is module storage today — 457 top-level `var`s across `dev/slatelang/slate/*.sysl`
-— which is one interpreter per process by construction. Gathering it into a struct a thread owns is
-what makes a second one possible. It buys a second thing on its own: a slate VM that a sysl program
-can hold becomes an **embeddable** library, which is a use nobody has today because there is nothing
-to hold.
+**The prerequisite is met.** The runtime's state is a `Vm` struct a thread owns, the pointer
+`current()` answers is `@thread_local`, and a VM is built over a libuv loop of its own — so two VMs
+already run at once on two threads, each on its own heap and its own loop, which
+`TWO_VMS_RUN_ON_TWO_THREADS_AT_ONCE_EACH_ON_ITS_OWN_HEAP_AND_LOOP` in `tests_vm_state.sysl` pins.
+`docs/design/vm-state.md` is that design and says what a thread sets up. It buys a second thing on
+its own: a slate VM that a sysl program can hold is an **embeddable** library, which is a use nobody
+had while there was nothing to hold.
 
 **The transport exists already.** `sh.sysl.libuv` 0.1.6 has `thread`, `join`, a `Mutex`, and an
 `Async` whose `Waker` is the one libuv call safe from any thread — with a test carrying a hundred

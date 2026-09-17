@@ -81,17 +81,44 @@ dispose_vm(&second)
   VM's own ceiling, so a VM spawned with a megabyte runs out of *its* megabyte with the ordinary
   *"this program has run out of memory"* and the process's own VM never hears about it.
 
-**`enter`/`leave` are the sequential stand-in for a thread-local, because sysl has none.** There is no
-thread-local storage in the language — `sysl.posix.threads` crosses a domain with `&sync` and a
-`@crossing` parameter, and nothing declares per-thread storage — so `the_vm` stays one pointer and
-`enter` swaps it. **The previous VM travels back through the caller** rather than through a stack
-here, which is what keeps this two assignments and no state of its own; a caller with a `leave` to
-write is holding the value to write it with, so nesting works. Every `enter` owes a `leave` on every
-way out, which is why the runtime itself never calls these and a test or an embedder does.
+**`the_vm` IS `@thread_local`, so the pointer is per thread and two VMs run at once.** Every thread
+reads its own copy, which is what makes `current()` answer the VM the *line of execution* belongs to
+rather than the one the process last entered. `enter`/`leave` swap this thread's copy and are
+otherwise untouched: the previous VM travels back through the caller rather than through a stack
+here, so nesting on one thread works exactly as it did, and every `enter` still owes a `leave` on
+every way out — which is why the runtime itself never calls these and a test or an embedder does.
 
-**The per-thread version is one declaration**: `the_vm` gains a thread-local attribute and `enter`
-becomes what an actor does once on its own thread. Nothing else in the tree learns a word, because
-everything already goes through `current()`.
+**The initializer is `null` and `current()` reads that as the program's own VM.** A thread-local's
+copies are stamped from one image in the object file rather than by code that runs per thread, so
+the value has to be one the compiler can write down and the address of a module `var` is not one it
+takes. `null` says the right thing anyway: a thread that has entered nothing belongs to the VM the
+process runs its program on.
+
+**A THREAD SETS UP ONE THING BESIDE ITS VM, AND IT IS A LOOP.** libuv's default loop belongs to the
+process and may be turned by one thread at a time, so a VM that is going to run on a thread of its
+own is built over a loop of its own:
+
+```
+val lp = libuv.new_loop().expect("a loop of this thread's own")
+var mine = new_vm(4194304, lp)
+val was = enter(&mine)
+
+val said = out("setTimeout(() -> print(\"hello\"), 1)")
+
+leave(was)
+dispose_vm(&mine)
+lp.close().expect("the thread's loop closes")
+```
+
+`Vm.uv_loop` is the field, `new_vm`'s second parameter defaults to `libuv.default_loop()` so the
+program's own VM keeps the loop every handle in the process was already on, and `event_loop()` in
+`event.sysl` is the accessor every site that starts a handle or turns the loop reads — timers, the
+drain, TCP, pipes, signals and a spawned process. What still reaches `default_loop()` directly is
+`sh.sysl.libuv`'s own synchronous file-system calls and the two calls whose loop parameter sits
+behind other defaults, `resolve` and `queue`; a thread doing file, DNS or thread-pool work owes that
+routing before it can be trusted.
+
+Everything else in the tree learns nothing, because it already goes through `current()`.
 
 ## What a module-level `var` is now
 
