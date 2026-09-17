@@ -198,6 +198,12 @@ runs, and a timer the test armed is still armed while the teardown runs — whic
 only for what the three of them left behind: whatever the file's `@setupAll` opened is the file's, and
 settles after its `@teardownAll`.
 
+**A handle a test opened and never closed is a failure of that test, named, rather than a hang.** A
+socket a test opens and forgets stays open whether the test passed or not, so once the test and its
+`@teardown` have settled, anything the two of them opened and left open is closed and reported —
+`left 1 handle open: a TCP server on :51234`, naming what it was. A test that would otherwise have
+passed fails on this alone: a test must close what it opens.
+
 ## Running only some of them
 
 **`--only <substring>` runs the tests whose name contains it**, and nothing else:

@@ -68,18 +68,24 @@ arguments. A comma written mid-line belongs to the statement it is in, which is 
 whole inside such a body; and one written deeper in brackets, inside a call or an array literal,
 belongs to those brackets and closes nothing.
 
-**A trailing operator does not continue a line.** `a +` followed by `b` on the next line is two
-statements, not a sum. Where an expression has to span lines, brackets are what say so — inside them
-the off-side rule is suspended and the continuation is unambiguous:
+**A binary operator that ends its line continues the statement onto the next one, at any
+indentation.** Every arithmetic, comparison and bitwise operator does this, and so do the two
+operators that read a field, `.` and `?.`, and the *compound* assignment operators — nothing but
+blanks or a trailing comment may stand between the operator and the newline. `->` is left out, having
+already opened a block under the rule above. **Two more are left out for the same reason as `->`,
+without a mechanism of their own to say so**: a bare `=`, since `name() =` followed by a deeper line
+is how a definition's body opens by the ordinary rule below; and `..`/`..<`, since `for i in 1..`
+followed by a deeper line is how a `for` loop's own body opens, and a range left open-ended on
+purpose is exactly the shape a `for` refuses by name. A line that instead *starts* with an operator
+is not this rule and is a statement of its own, exactly as it always was:
 
 ```slate
 isShort(n) = n.length < 4
 isKnown(n) = n == "ada"
 
 val name = "ada"
-val ok = (
-    isShort(name) ||
-    isKnown(name))
+val ok = isShort(name) ||
+    isKnown(name)
 
 print(ok)
 ```
@@ -87,6 +93,9 @@ print(ok)
 ```output
 true
 ```
+
+Brackets still suspend the off-side rule on their own terms too, which is what lets a longer
+expression be broken wherever it reads best rather than only right after an operator.
 
 **A block that closes ends the expression it is part of**, as it ends the statement. So the line under
 a block is a statement of its own whatever it begins with — a `-`, a `[`, a `(` or a `{` there is never
