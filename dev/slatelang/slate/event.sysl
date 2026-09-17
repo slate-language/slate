@@ -67,25 +67,21 @@ struct Pending
     // and every lookup misses. It is never reused and never reset.
     gen: usize
 
-// Everything the loop may still call.
+// Everything the loop may still call is `current().pending`, how many callbacks are still owed is
+// `current().outstanding`, and the number the next claim will stamp its slot with is
+// `current().generation`. See `Pending.gen`, and `vm_state.sysl` for why the three are fields of the
+// VM rather than module storage.
 //
-// **Module storage and a collector root.** See the header: this table is the only thing standing
-// between a pending callback and the sweep.
-var pending: Buf[Pending] = buf()
-
-// How many callbacks are still outstanding, which is what decides whether the loop has work.
-var outstanding: usize = 0
-
-// The number the next claim will stamp its slot with. See `Pending.gen`.
-var generation: usize = 0
+// **A collector root**: that table is the only thing standing between a pending callback and the
+// sweep.
 
 // Mark what the loop can still reach.
 mark_pending(h: *gc.Heap)
-    for i in 0..<pending.len()
-        if pending.at(i).live
-            mark_value(h, pending.at(i).callback)
-            mark_value(h, pending.at(i).on_error)
-            gc.mark(h, ptr_cast(pending.at(i).promise))
+    for i in 0..<current().pending.len()
+        if current().pending.at(i).live
+            mark_value(h, current().pending.at(i).callback)
+            mark_value(h, current().pending.at(i).on_error)
+            gc.mark(h, ptr_cast(current().pending.at(i).promise))
 
 // Give the table back between runs.
 reset_events()
@@ -98,10 +94,10 @@ reset_events()
     // drain waits on, and nothing is ever going to connect to it: the wait has no end and nothing to
     // print. That is a hang in whichever program happened to run next, which is not the one with the
     // defect in it.
-    for i in 0..<pending.len()
+    for i in 0..<current().pending.len()
         surrender(i)
 
-    pending.clear()
+    current().pending.clear()
     forget_parsers()
     forget_tls()
 
@@ -141,34 +137,36 @@ reset_events()
     // are on the loop the next program runs on and nobody is watching it -- which in the suite means
     // the suite itself is the supervisor of a worker it never started.
     forget_children()
-    outstanding = 0
+    current().outstanding = 0
 
     // **Back to zero, so that what a program is shown does not depend on what ran before it.** The
     // generation only has to be unique within one run -- nothing survives a `reset` to collide with
     // -- and letting it carry over would make a socket's printed name a function of the suite's
     // order.
-    generation = 0
-    loop_fault = None
+    current().generation = 0
+    current().loop_fault = None
 
 // Take a slot, reusing a spent one where there is one.
 //
 // Not `private`: `private` in sysl is private to the *file*, and `fs.sysl` claims a slot for every
 // request it has outstanding.
 claim(p: Pending) -> usize
+    val v = current()
+
     var slot = p
 
-    generation += 1
-    slot.gen = generation
+    v.generation += 1
+    slot.gen = v.generation
 
-    for i in 0..<pending.len()
-        if !pending.at(i).live
-            pending.set(i, slot)
-            outstanding += 1
+    for i in 0..<v.pending.len()
+        if !v.pending.at(i).live
+            v.pending.set(i, slot)
+            v.outstanding += 1
             return i
 
-    pending.push(slot)
-    outstanding += 1
-    pending.len() - 1
+    v.pending.push(slot)
+    v.outstanding += 1
+    v.pending.len() - 1
 end claim
 
 // Which occupant of a slot is in it now. `0` for a slot that has never been claimed, which no live
@@ -176,9 +174,9 @@ end claim
 //
 // Not `private`: every id a program is given carries one of these, so `net.sysl` checks them too.
 gen_at(id: usize) -> usize
-    if id >= pending.len() then return 0
+    if id >= current().pending.len() then return 0
 
-    pending.at(id).gen
+    current().pending.at(id).gen
 end gen_at
 
 // The slot a generation is in, if it is still in one.
@@ -187,8 +185,8 @@ end gen_at
 // is bounded by how much a program has in flight at once rather than by how much it has ever done --
 // and the one caller is `clearTimeout`, which no program is in a hurry about.
 slot_of_gen(gen: usize) -> Option[usize]
-    for i in 0..<pending.len()
-        val slot = pending.at(i)
+    for i in 0..<current().pending.len()
+        val slot = current().pending.at(i)
 
         if slot.live && slot.gen == gen then return Some(i)
 
@@ -197,9 +195,9 @@ end slot_of_gen
 
 // Whether an id and the generation it was handed out with still name what they named.
 holds(id: usize, gen: usize) -> bool
-    if id >= pending.len() then return false
+    if id >= current().pending.len() then return false
 
-    val slot = pending.at(id)
+    val slot = current().pending.at(id)
 
     slot.live && slot.gen == gen
 end holds
@@ -209,9 +207,9 @@ end holds
 //
 // Not `private`: `fs.sysl` gives its slot back when an answer arrives.
 surrender(id: usize)
-    if id >= pending.len() then return
+    if id >= current().pending.len() then return
 
-    var slot = pending.at(id)
+    var slot = current().pending.at(id)
 
     if !slot.live then return
 
@@ -235,8 +233,8 @@ surrender(id: usize)
 
     slot.timer = None
     slot.socket = None
-    pending.set(id, slot)
-    outstanding -= 1
+    current().pending.set(id, slot)
+    current().outstanding -= 1
 end surrender
 
 // Run the slate callback in a slot.
@@ -245,9 +243,9 @@ end surrender
 // statement to attach it to -- the loop is not running any -- so it is reported against the whole
 // run.
 private fire(id: usize)
-    if id >= pending.len() then return
+    if id >= current().pending.len() then return
 
-    val slot = pending.at(id)
+    val slot = current().pending.at(id)
 
     if !slot.live then return
 
@@ -269,13 +267,12 @@ private fire(id: usize)
     else
         apply_callback(cb, none, point(0), "setTimeout") match
             Ok(_) -> ()
-            Err(s) -> loop_fault = Some(s)
+            Err(s) -> current().loop_fault = Some(s)
 
     release(mark)
 end fire
 
-// The first fault a callback raised, if any. Read once the loop stops.
-var loop_fault: Option[Signal] = None
+// The first fault a callback raised, if any, is `current().loop_fault`. Read once the loop stops.
 
 // -- a request, which is a slot holding nothing but a promise ---------------------------------------
 
@@ -304,7 +301,7 @@ begin_request() -> usize
 end begin_request
 
 // The promise a slot is holding, as the value a program gets back.
-awaited_request(id: usize) -> Value = Promise(pending.at(id).promise)
+awaited_request(id: usize) -> Value = Promise(current().pending.at(id).promise)
 
 // Hand an answer back and give the slot up.
 //
@@ -331,9 +328,9 @@ end answer_request
 // **The promise is read out before the slot is surrendered**, because surrendering is also what
 // clears the slot's copy of it -- the same ordering `fire` needs and for the same reason.
 answer_plain_request(id: usize, v: Value)
-    if id >= pending.len() then return
+    if id >= current().pending.len() then return
 
-    val slot = pending.at(id)
+    val slot = current().pending.at(id)
 
     if !slot.live then return
 
@@ -350,9 +347,9 @@ end answer_plain_request
 // still taken because it says where the call was written, which is what a diagnostic would want if
 // this ever went back to raising.
 refuse_request(id: usize, at: Span, what: string, e: libuv.Error)
-    if id >= pending.len() then return
+    if id >= current().pending.len() then return
 
-    val slot = pending.at(id)
+    val slot = current().pending.at(id)
 
     if !slot.live then return
 
@@ -365,9 +362,9 @@ end refuse_request
 
 // Fail a request with a sentence of slate's own, where there is no libuv error to quote.
 deny_request(id: usize, at: Span, message: string)
-    if id >= pending.len() then return
+    if id >= current().pending.len() then return
 
-    val slot = pending.at(id)
+    val slot = current().pending.at(id)
 
     if !slot.live then return
 
@@ -391,9 +388,9 @@ end deny_request
 //
 // Not `private`: `argon2.sysl`'s completion callback is the caller.
 fail_request(id: usize, message: string, at: Span)
-    if id >= pending.len() then return
+    if id >= current().pending.len() then return
 
-    val slot = pending.at(id)
+    val slot = current().pending.at(id)
 
     if !slot.live then return
 
@@ -539,11 +536,11 @@ drain_events_to(floor: usize) -> Result[unit, Signal]
 
         // A resumption may have faulted its way out to a promise nobody holds, and a callback may
         // have faulted outright. Either ends the program.
-        loop_fault match
+        current().loop_fault match
             Some(s) -> return Err(s)
             None -> ()
 
-        if outstanding <= floor then break
+        if current().outstanding <= floor then break
 
         // **A turn reporting nothing active does NOT end the drain, and thinking it did cost a
         // working file system.** A timer is a handle and libuv counts it, so a loop with one
@@ -561,13 +558,13 @@ drain_events_to(floor: usize) -> Result[unit, Signal]
         // **Read a turn beginning HERE and not after the last one ended.** `run_microtasks` above
         // resumes coroutines, and a resumed coroutine starts the next request -- so a count taken
         // at the bottom of the loop is a count of work this turn had nothing to do with.
-        val before = outstanding
+        val before = current().outstanding
 
         val more = libuv.default_loop().run(libuv.RUN_ONCE) match
             Err(e) -> return Err(failure(point(0), s"the event loop stopped: ${e}"))
             Ok(alive) -> alive
 
-        idle = if !more && outstanding == before then idle + 1 else 0
+        idle = if !more && current().outstanding == before then idle + 1 else 0
     end loop
 
     // A handle that was closed needs one more turn for its close callback, and there is nothing left
@@ -589,7 +586,7 @@ drain_events_to(floor: usize) -> Result[unit, Signal]
     // the answer is a coroutine abandoned mid-statement.
     run_microtasks()
 
-    loop_fault match
+    current().loop_fault match
         Some(s) -> Err(s)
         None -> Ok(())
 end drain_events_to
@@ -611,7 +608,7 @@ settle_call(v: Value) -> Result[unit, Signal]
         _ ->
             run_microtasks()
 
-            loop_fault match
+            current().loop_fault match
                 Some(s) -> Err(s)
                 None -> Ok(())
 
@@ -627,21 +624,21 @@ private settle_promise(pr: *PromiseObj) -> Result[unit, Signal]
     loop
         run_microtasks()
 
-        loop_fault match
+        current().loop_fault match
             Some(s) -> return Err(s)
             None -> ()
 
         if pr.settled then break
-        if outstanding == 0 then break
+        if current().outstanding == 0 then break
         if idle >= 2 then break
 
-        val before = outstanding
+        val before = current().outstanding
 
         val more = libuv.default_loop().run(libuv.RUN_ONCE) match
             Err(e) -> return Err(failure(point(0), s"the event loop stopped: ${e}"))
             Ok(alive) -> alive
 
-        idle = if !more && outstanding == before then idle + 1 else 0
+        idle = if !more && current().outstanding == before then idle + 1 else 0
     end loop
 
     Ok(())
