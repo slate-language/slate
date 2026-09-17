@@ -252,3 +252,18 @@ the_new_math_functions_take_exactly_the_numbers_they_say() =
     assert((atan2(1) catch e -> e.message).contains("`atan2` takes two numbers, and was given 1 argument"))
     assert((hypot(1, 2, 3) catch e -> e.message)
         .contains("`hypot` takes two numbers, and was given 3 arguments"))
+
+@test
+a_binary_operator_left_dangling_at_the_end_of_a_line_continues_the_statement() =
+    // Nothing but blanks or a comment stands between the operator and the newline, so the statement
+    // is not finished -- at whatever column the next line happens to sit at, brackets or none.
+    val sum = 1 +
+        2 +
+        3
+
+    assertEq(sum, 6)
+
+    val cmp = 1 < 2 ||
+        3 < 4
+
+    assert(cmp)
