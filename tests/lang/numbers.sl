@@ -163,3 +163,80 @@ toFixed_REFUSES_A_PLACE_COUNT_OUTSIDE_ZERO_TO_A_HUNDRED() =
     // refusal `toFixed` keeps -- the number itself is never the reason to refuse.
     assert((toFixed(1, -1) catch e -> e.message).contains("0 to 100 places"))
     assert((toFixed(1, 101) catch e -> e.message).contains("0 to 100 places"))
+
+// The trigonometric, hyperbolic and logarithmic functions, and the two constants. Every assertion
+// here is a boolean or an exact integer rather than a printed real, so a last-bit difference between
+// the interpreter's `libm` and node's `Math` -- which neither back end promises never to have --
+// cannot turn a passing run red on one of them and not the other.
+@test
+PI_AND_E_ARE_THE_TWO_CONSTANTS() =
+    assert(PI > 3.14159 && PI < 3.14160)
+    assert(E > 2.71828 && E < 2.71829)
+
+@test
+the_trigonometric_functions_agree_with_their_inverses_at_the_easy_points() =
+    assertEq(sin(0), 0.0)
+    assertEq(cos(0), 1.0)
+    assertEq(tan(0), 0.0)
+    assertEq(asin(0), 0.0)
+    assertEq(acos(1), 0.0)
+    assertEq(atan(0), 0.0)
+
+    assert((sin(PI / 2) - 1).abs() < 1e-12)
+    assert((asin(1) - PI / 2).abs() < 1e-12)
+    assert((acos(0) - PI / 2).abs() < 1e-12)
+    assert((atan(1) - PI / 4).abs() < 1e-12)
+
+@test
+atan2_KEEPS_JAVASCRIPTS_OWN_ARGUMENT_ORDER_Y_THEN_X() =
+    assert((atan2(1, 1) - PI / 4).abs() < 1e-12)
+    assert((atan2(1, 0) - PI / 2).abs() < 1e-12)
+    assert((atan2(0, -1) - PI).abs() < 1e-12)
+
+@test
+the_hyperbolic_functions_at_zero() =
+    assertEq(sinh(0), 0.0)
+    assertEq(cosh(0), 1.0)
+    assertEq(tanh(0), 0.0)
+
+@test
+log_log2_log10_and_exp_are_the_inverses_of_each_other() =
+    assertEq(log(1), 0.0)
+    assertEq(log2(8), 3.0)
+    assertEq(log10(1000), 3.0)
+    assertEq(exp(0), 1.0)
+    assert((log(E) - 1).abs() < 1e-12)
+
+@test
+log_OF_A_NON_POSITIVE_NUMBER_ANSWERS_NAN_OR_MINUS_INFINITY_RATHER_THAN_FAULTING() =
+    // Exactly what JavaScript's `Math.log` answers, on both back ends: a domain error here is not a
+    // fault, unlike `sqrt`'s.
+    assertEq(string(log(0)), "-inf")
+    assert(log(-1) != log(-1))
+
+@test
+cbrt_ANSWERS_THE_REAL_CUBE_ROOT_INCLUDING_OF_A_NEGATIVE_NUMBER() =
+    assertEq(cbrt(27), 3.0)
+    assertEq(cbrt(-27), -3.0)
+
+@test
+hypot_IS_THE_LENGTH_OF_THE_HYPOTENUSE() =
+    assertEq(hypot(3, 4), 5.0)
+    assertEq(hypot(0, 0), 0.0)
+
+@test
+a_number_answers_the_single_argument_ones_as_methods_too() =
+    // `sqrt`'s own precedent: a free function of one number is that number's method as well.
+    assert(((PI / 2).sin() - 1).abs() < 1e-12)
+    assertEq((0).cos(), 1.0)
+    assertEq((27).cbrt(), 3.0)
+    assert(((1.0).log() - 0).abs() < 1e-12)
+
+@test
+the_new_math_functions_take_exactly_the_numbers_they_say() =
+    assert((sin(1, 2) catch e -> e.message).contains("`sin` takes one number, and was given 2 arguments"))
+    assert((sin() catch e -> e.message).contains("`sin` takes one number, and was given 0 arguments"))
+    assert((sin("x") catch e -> e.message).contains("`sin` takes a number, and this is a string"))
+    assert((atan2(1) catch e -> e.message).contains("`atan2` takes two numbers, and was given 1 argument"))
+    assert((hypot(1, 2, 3) catch e -> e.message)
+        .contains("`hypot` takes two numbers, and was given 3 arguments"))

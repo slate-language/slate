@@ -97,6 +97,8 @@ padEnd number integer real boolean string`.
 ## Numbers
 
 `abs  floor  ceil  round  trunc  sqrt  pow  min  max  random  toFixed  formatNumber`
+`sin  cos  tan  asin  acos  atan  atan2  sinh  cosh  tanh  log  log2  log10  exp  cbrt  hypot`
+`PI  E`
 
 - **The four roundings leave an integer alone**, an integer already being whole.
 - **`min` and `max` take as many arguments as they are given** and answer an integer when every one of
@@ -116,6 +118,26 @@ padEnd number integer real boolean string`.
   answered — never a `real`, which has no one written form of its own. `formatNumber(toFixed(total,
   2))` is a price. The defaults are a comma and a full stop; `{ separator: " ", decimal: "," }` is
   the French convention, said with the same two strings rather than a locale name.
+- **The trigonometric, hyperbolic and logarithmic functions are bare names, the way `sqrt` is** —
+  there is no `Math` object to reach through. `sin cos tan` take radians and `asin acos atan` answer
+  them; `atan2(y, x)` keeps `Math.atan2`'s own argument order, `y` before `x`. `log` is the natural
+  logarithm, `log2` and `log10` the other two bases, and `exp` is `log`'s inverse. `cbrt` is the real
+  cube root, defined for a negative number where `sqrt` refuses one. `hypot(a, b)` is the length of
+  a right triangle's hypotenuse. **A domain error answers `nan` or `-inf`, not a fault** — `log(0)`
+  and `log(-1)` are exactly what JavaScript's `Math.log` answers, on both back ends.
+- **`PI` and `E`** are the two constants, not calls — `PI` rather than `PI()`.
+
+```slate
+print(sin(PI / 2), cos(0), atan2(1, 1) == PI / 4)
+print(log(E), exp(0), hypot(3, 4), cbrt(27))
+print(log(0), log(-1))
+```
+
+```output
+1 1 true
+1 1 5 3
+-inf nan
+```
 
 ```slate
 print(toFixed(1234.5, 2), toFixed(2.5, 0))
@@ -143,8 +165,9 @@ print(r >= 0 && r < 1, r is real)
 true true
 ```
 
-As methods, a number answers: `abs floor ceil round trunc sqrt integer real boolean string toFixed
-formatNumber`.
+As methods, a number answers: `abs floor ceil round trunc sqrt sin cos tan asin acos atan sinh cosh
+tanh log log2 log10 exp cbrt integer real boolean string toFixed formatNumber`. `atan2`, `hypot`,
+`pow`, `min` and `max` take a second number and stay bare calls, the way `pow` already does.
 
 ## Arrays
 
