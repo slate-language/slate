@@ -55,26 +55,31 @@ import sysl.container.{Map, map}
 //
 // **Zero-filled, so it is BSS**: the pages cost address space and are committed by the operating
 // system only as they are touched. A program that uses a megabyte pays for a megabyte.
-private const HeapBytes: usize = 268435456
+// Not `private`: `new_vm` in `vm_state.sysl` starts a VM's `heap_limit` at the ceiling.
+const HeapBytes: usize = 268435456
 
+// process-wide: THE ARENA, and the one piece of the runtime a VM does not yet own. A root function
+// needs an address, so this is module storage; giving each VM a block of its own is `heap(base, cap)`
+// taking a different `base`, which is what `docs/design/actors.md` asks for next.
 private var storage: [HeapBytes]u8 = [0u8; HeapBytes]
 
-// The one heap. **Module storage, and the collector's design is what forces it**: a root function
-// must be a top-level function to have an address, and it has to reach the interpreter's state, so
-// that state cannot be a local of anything. One interpreter to a process is the consequence.
+// The one heap. Its ROOTS are per-VM (`current().root_values` and the rest); the heap itself is not,
+// because it is the heap over `storage` and there is one of those.
+//
+// process-wide: a heap over the process's one arena. It becomes a `Vm` field on the day a VM is
+// spawned with a block of its own, and the roots are already waiting for it there.
 var slate_heap: gc.Heap = gc.heap(&storage[0], HeapBytes)
 
 // How much of that block a program may actually have.
 //
-// **The array is the ceiling and this is the setting**, which is what lets a test about running out
-// of memory run out of a small one. Filling 256 MiB to find out what happens at the end of it takes
-// nearly five seconds; filling one takes no time at all, and the behaviour under test is the same
-// either way. Nothing but the suite changes it, and `run` puts it back.
-var heap_limit: usize = HeapBytes
+// **The array is the ceiling and `current().heap_limit` is the setting**, which is what lets a test
+// about running out of memory run out of a small one. Filling 256 MiB to find out what happens at the
+// end of it takes nearly five seconds; filling one takes no time at all, and the behaviour under test
+// is the same either way. Nothing but the suite changes it, and `run` puts it back.
 
 // Give the next program a heap of this size. `reset_heap` is what acts on it.
 set_heap_limit(bytes: usize)
-    heap_limit = if bytes > HeapBytes then HeapBytes else bytes
+    current().heap_limit = if bytes > HeapBytes then HeapBytes else bytes
 
 // -- the objects --------------------------------------------------------------------------------
 
@@ -407,17 +412,27 @@ weaken_weak_ref(p: *u8, h: *gc.Heap)
 
 // A `Kind` must outlive every object naming it and its address must not move, so these are module
 // storage. Module storage states its type, which is why each is written out.
+//
+// process-wide: eight tables of function addresses, built at startup and never written again. A VM
+// of its own would hold the same eight, so each is one table and not one per VM.
 var str_kind: gc.Kind = gc.Kind(&trace_str, &finalize_str, null, null)
+// process-wide: see `str_kind`.
 var array_kind: gc.Kind = gc.Kind(&trace_array, &finalize_array, null, null)
+// process-wide: see `str_kind`.
 var object_kind: gc.Kind = gc.Kind(&trace_object, &finalize_object, null, null)
+// process-wide: see `str_kind`.
 var closure_kind: gc.Kind = gc.Kind(&trace_closure, &finalize_closure, null, null)
+// process-wide: see `str_kind`.
 var env_kind: gc.Kind = gc.Kind(&trace_env, &finalize_env, null, null)
+// process-wide: see `str_kind`.
 var promise_kind: gc.Kind = gc.Kind(&trace_promise, &finalize_promise, null, null)
 
 // **The two kinds that use the hooks the other six leave null**, and they are the reason the
 // collector has four rather than two. A weak map shares the object's storage and its finalizer and
 // differs in nothing else; a weak reference is one slot, so it needs no finalizer at all.
+// process-wide: see `str_kind`.
 var weak_map_kind: gc.Kind = gc.Kind(&trace_weak_map, &finalize_object, &weaken_weak_map, &ephemeron_weak_map)
+// process-wide: see `str_kind`.
 var weak_ref_kind: gc.Kind = gc.Kind(&trace_weak_ref, null, &weaken_weak_ref, null)
 
 // -- the roots ----------------------------------------------------------------------------------
@@ -430,28 +445,28 @@ var weak_ref_kind: gc.Kind = gc.Kind(&trace_weak_ref, null, &weaken_weak_ref, nu
 // This is the shadow stack every precise collector's client has to keep, and it is the real cost of
 // tracing over refcounting. The alternative -- scanning the machine stack -- is what makes a
 // conservative collector a porting project rather than a dependency.
-private var root_values: Buf[Value] = buf()
-private var root_envs: Buf[*EnvObj] = buf()
+// The two are `current().root_values` and `current().root_envs` -- fields of the VM, see
+// `vm_state.sysl`.
 
 // Where the stacks stand now, to be given back to `release` on the way out.
-root_mark() -> usize = root_values.len()
+root_mark() -> usize = current().root_values.len()
 
-env_mark() -> usize = root_envs.len()
+env_mark() -> usize = current().root_envs.len()
 
 // Hold a value across a point that may collect.
 hold(v: Value)
-    root_values.push(v)
+    current().root_values.push(v)
 
 // Let go of everything pushed since a mark.
 release(mark: usize)
-    root_values.truncate(mark)
+    current().root_values.truncate(mark)
 
 // Hold a scope across a point that may collect.
 hold_env(e: *EnvObj)
-    root_envs.push(e)
+    current().root_envs.push(e)
 
 release_env(mark: usize)
-    root_envs.truncate(mark)
+    current().root_envs.truncate(mark)
 
 // Everything the program can still reach.
 //
@@ -492,11 +507,11 @@ roots(h: *gc.Heap)
     // nobody watching. Both are held in module storage and nowhere else.
     mark_scheduler(h)
 
-    for i in 0..<root_values.len()
-        mark_value(h, root_values.at(i))
+    for i in 0..<current().root_values.len()
+        mark_value(h, current().root_values.at(i))
 
-    for i in 0..<root_envs.len()
-        gc.mark(h, ptr_cast(root_envs.at(i)))
+    for i in 0..<current().root_envs.len()
+        gc.mark(h, ptr_cast(current().root_envs.at(i)))
 
     // The emergency objects a full heap is answered with. Nothing else refers to them until the
     // moment they are handed out, so nothing else would keep them.
@@ -506,22 +521,21 @@ end roots
 // How much of the heap is spoken for.
 heap_used() -> usize = gc.used(&slate_heap)
 
-// How many collections this program has run, which is what makes a claim about *when* slate collects
-// something a test can check rather than something a comment asserts.
-var collections: usize = 0
+// How many collections this program has run is `current().collections`, which is what makes a claim
+// about *when* slate collects something a test can check rather than something a comment asserts.
 
 // Collect, at a point the interpreter has chosen because it knows what is live.
 collect_now()
-    collections += 1
+    current().collections += 1
     gc.collect(&slate_heap, &roots)
 
 // The smallest live set worth collecting over. Below this a program is cheap enough that tracing it
 // costs more than the storage it would give back.
-private const CollectFloor: usize = 262144
+// Not `private`: `new_vm` in `vm_state.sysl` starts a VM's `collect_above` here.
+const CollectFloor: usize = 262144
 
-// How much the live set may grow to before the next collection. Raised after every collection to a
-// multiple of what survived it.
-var collect_above: usize = CollectFloor
+// How much the live set may grow to before the next collection is `current().collect_above`. Raised
+// after every collection to a multiple of what survived it.
 
 // How much bigger than the surviving set the heap may get before collecting again.
 //
@@ -549,12 +563,12 @@ private const Headroom: usize = 2
 // raised to a multiple of what survived, which is what makes the cost of collecting proportional to
 // the garbage produced rather than to the statements executed.
 maybe_collect()
-    if gc.live_size(&slate_heap) > collect_above
+    if gc.live_size(&slate_heap) > current().collect_above
         collect_now()
 
         val survived = gc.live_size(&slate_heap) * Headroom
 
-        collect_above = if survived > CollectFloor then survived else CollectFloor
+        current().collect_above = if survived > CollectFloor then survived else CollectFloor
 
 // Give the heap back, and run every finalizer still outstanding.
 //
@@ -567,12 +581,14 @@ reset_heap()
     // **Rebuilt rather than reused, because the limit may have moved.** `dispose` hands every block
     // back to the free list, which is the right thing for a heap of the same size and the wrong one
     // for a heap that has just changed size -- the free list would still describe the old extent.
-    slate_heap = gc.heap(&storage[0], heap_limit)
-    root_values.clear()
-    root_envs.clear()
-    collections = 0
-    collect_above = CollectFloor
-    heap_exhausted = false
+    val v = current()
+
+    slate_heap = gc.heap(&storage[0], v.heap_limit)
+    v.root_values.clear()
+    v.root_envs.clear()
+    v.collections = 0
+    v.collect_above = CollectFloor
+    v.heap_exhausted = false
     reserve_spares()
 
 // -- allocation ---------------------------------------------------------------------------------
@@ -585,9 +601,9 @@ reset_heap()
 // while the interpreter is between sub-expressions, with everything live either in a scope or on the
 // shadow stack.
 
-// Whether the last allocation failed. Read at the statement boundary, where there is a span to point
-// at -- an allocator has no idea which line of the program it is serving.
-var heap_exhausted: bool = false
+// Whether the last allocation failed is `current().heap_exhausted`. Read at the statement boundary,
+// where there is a span to point at -- an allocator has no idea which line of the program it is
+// serving.
 
 // One object of every kind, taken while the heap is empty and never given back.
 //
@@ -601,47 +617,44 @@ var heap_exhausted: bool = false
 // A reserve is a real object in the heap with a real header, so it can be written to, traced and
 // marked like any other. Handing the same one out twice makes two slate values share it, which is
 // wrong and does not matter: the program stops at the end of the statement that got it.
-private var spare_str: *StrObj = null
-private var spare_array: *ArrayObj = null
-private var spare_object: *ObjectObj = null
-private var spare_closure: *ClosureObj = null
-private var spare_env: *EnvObj = null
-private var spare_promise: *PromiseObj = null
-private var spare_weak_map: *ObjectObj = null
-private var spare_weak_ref: *WeakRefObj = null
+// They are the eight `current().spare_*` fields -- see `vm_state.sysl`.
 
 // Take the reserves. Called with an empty heap, where the allocation cannot fail.
 private reserve_spares()
-    spare_str = ptr_cast(gc.alloc(&slate_heap, sizeof(StrObj), &str_kind))
-    spare_array = ptr_cast(gc.alloc(&slate_heap, sizeof(ArrayObj), &array_kind))
-    spare_object = ptr_cast(gc.alloc(&slate_heap, sizeof(ObjectObj), &object_kind))
-    spare_closure = ptr_cast(gc.alloc(&slate_heap, sizeof(ClosureObj), &closure_kind))
-    spare_env = ptr_cast(gc.alloc(&slate_heap, sizeof(EnvObj), &env_kind))
-    spare_promise = ptr_cast(gc.alloc(&slate_heap, sizeof(PromiseObj), &promise_kind))
+    val v = current()
+
+    v.spare_str = ptr_cast(gc.alloc(&slate_heap, sizeof(StrObj), &str_kind))
+    v.spare_array = ptr_cast(gc.alloc(&slate_heap, sizeof(ArrayObj), &array_kind))
+    v.spare_object = ptr_cast(gc.alloc(&slate_heap, sizeof(ObjectObj), &object_kind))
+    v.spare_closure = ptr_cast(gc.alloc(&slate_heap, sizeof(ClosureObj), &closure_kind))
+    v.spare_env = ptr_cast(gc.alloc(&slate_heap, sizeof(EnvObj), &env_kind))
+    v.spare_promise = ptr_cast(gc.alloc(&slate_heap, sizeof(PromiseObj), &promise_kind))
 
     // **The weak pair gets a reserve of its own rather than borrowing the object's**, because the
     // kind is written into the header at the allocation: a reserve taken under `object_kind` handed
     // out as a weak map would be traced strongly and weakened by nothing.
-    spare_weak_map = ptr_cast(gc.alloc(&slate_heap, sizeof(ObjectObj), &weak_map_kind))
-    spare_weak_ref = ptr_cast(gc.alloc(&slate_heap, sizeof(WeakRefObj), &weak_ref_kind))
+    v.spare_weak_map = ptr_cast(gc.alloc(&slate_heap, sizeof(ObjectObj), &weak_map_kind))
+    v.spare_weak_ref = ptr_cast(gc.alloc(&slate_heap, sizeof(WeakRefObj), &weak_ref_kind))
 
     // A zeroed payload is a valid object of each of these kinds except the ones holding a `Buf` or a
     // `Map`, which a tracer walks -- and a zero `Buf` is an empty one, so all eight are safe to trace
     // from the moment they exist.
-    heap_exhausted = false
+    v.heap_exhausted = false
 end reserve_spares
 
 // Keep the reserves alive. They are rooted rather than special-cased in the sweep, because a rooted
 // object is one the collector already knows how to keep.
 private mark_spares(h: *gc.Heap)
-    gc.mark(h, ptr_cast(spare_str))
-    gc.mark(h, ptr_cast(spare_array))
-    gc.mark(h, ptr_cast(spare_object))
-    gc.mark(h, ptr_cast(spare_closure))
-    gc.mark(h, ptr_cast(spare_env))
-    gc.mark(h, ptr_cast(spare_promise))
-    gc.mark(h, ptr_cast(spare_weak_map))
-    gc.mark(h, ptr_cast(spare_weak_ref))
+    val v = current()
+
+    gc.mark(h, ptr_cast(v.spare_str))
+    gc.mark(h, ptr_cast(v.spare_array))
+    gc.mark(h, ptr_cast(v.spare_object))
+    gc.mark(h, ptr_cast(v.spare_closure))
+    gc.mark(h, ptr_cast(v.spare_env))
+    gc.mark(h, ptr_cast(v.spare_promise))
+    gc.mark(h, ptr_cast(v.spare_weak_map))
+    gc.mark(h, ptr_cast(v.spare_weak_ref))
 
 // Try once, collect, try again -- and answer the reserve rather than null when even that fails.
 //
@@ -658,23 +671,23 @@ private alloc_or_collect(size: usize, kind: *gc.Kind, spare: *u8) -> *u8
 
     if p != null then return p
 
-    heap_exhausted = true
+    current().heap_exhausted = true
     spare
 end alloc_or_collect
 new_str(s: string) -> *StrObj
-    var o: *StrObj = ptr_cast(alloc_or_collect(sizeof(StrObj), &str_kind, ptr_cast(spare_str)))
+    var o: *StrObj = ptr_cast(alloc_or_collect(sizeof(StrObj), &str_kind, ptr_cast(current().spare_str)))
 
     o.s = s
     o
 
 new_array(items: Buf[Value]) -> *ArrayObj
-    var o: *ArrayObj = ptr_cast(alloc_or_collect(sizeof(ArrayObj), &array_kind, ptr_cast(spare_array)))
+    var o: *ArrayObj = ptr_cast(alloc_or_collect(sizeof(ArrayObj), &array_kind, ptr_cast(current().spare_array)))
 
     o.items = items
     o
 
 new_object() -> *ObjectObj
-    var o: *ObjectObj = ptr_cast(alloc_or_collect(sizeof(ObjectObj), &object_kind, ptr_cast(spare_object)))
+    var o: *ObjectObj = ptr_cast(alloc_or_collect(sizeof(ObjectObj), &object_kind, ptr_cast(current().spare_object)))
 
     o.entries = buf()
     o.index = fresh_index()
@@ -687,7 +700,7 @@ new_object() -> *ObjectObj
 // index is a fresh one rather than an empty `Buf`, or the first insertion probes an array of no
 // slots.
 new_weak_map() -> *ObjectObj
-    var o: *ObjectObj = ptr_cast(alloc_or_collect(sizeof(ObjectObj), &weak_map_kind, ptr_cast(spare_weak_map)))
+    var o: *ObjectObj = ptr_cast(alloc_or_collect(sizeof(ObjectObj), &weak_map_kind, ptr_cast(current().spare_weak_map)))
 
     o.entries = buf()
     o.index = fresh_index()
@@ -697,13 +710,13 @@ new_weak_map() -> *ObjectObj
     o
 
 new_weak_ref(target: Value) -> *WeakRefObj
-    var o: *WeakRefObj = ptr_cast(alloc_or_collect(sizeof(WeakRefObj), &weak_ref_kind, ptr_cast(spare_weak_ref)))
+    var o: *WeakRefObj = ptr_cast(alloc_or_collect(sizeof(WeakRefObj), &weak_ref_kind, ptr_cast(current().spare_weak_ref)))
 
     o.target = target
     o
 
 new_closure(params: Buf[string], body: usize, scope: *EnvObj) -> *ClosureObj
-    var o: *ClosureObj = ptr_cast(alloc_or_collect(sizeof(ClosureObj), &closure_kind, ptr_cast(spare_closure)))
+    var o: *ClosureObj = ptr_cast(alloc_or_collect(sizeof(ClosureObj), &closure_kind, ptr_cast(current().spare_closure)))
 
     o.params = params
     o.body = body
@@ -711,7 +724,7 @@ new_closure(params: Buf[string], body: usize, scope: *EnvObj) -> *ClosureObj
     o
 
 new_promise() -> *PromiseObj
-    var o: *PromiseObj = ptr_cast(alloc_or_collect(sizeof(PromiseObj), &promise_kind, ptr_cast(spare_promise)))
+    var o: *PromiseObj = ptr_cast(alloc_or_collect(sizeof(PromiseObj), &promise_kind, ptr_cast(current().spare_promise)))
 
     o.value = Null
     o.settled = false
@@ -727,7 +740,7 @@ new_promise() -> *PromiseObj
     o
 
 new_env(parent: *EnvObj) -> *EnvObj
-    var o: *EnvObj = ptr_cast(alloc_or_collect(sizeof(EnvObj), &env_kind, ptr_cast(spare_env)))
+    var o: *EnvObj = ptr_cast(alloc_or_collect(sizeof(EnvObj), &env_kind, ptr_cast(current().spare_env)))
 
     o.names = map()
     o.mutable = map()

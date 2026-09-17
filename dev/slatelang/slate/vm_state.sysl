@@ -1,0 +1,200 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.rand.{Rng, rng}
+
+// The runtime's own state, gathered into one thing a VM owns.
+//
+// **This file exists so that a second slate VM can exist in the same process.** The state below was
+// fifty files' worth of module-level `var`s, which is one interpreter to a process by construction:
+// two of them would have written over each other's machine, heap roots, event loop and output. An
+// actor on its own thread, and a slate VM a sysl program can hold and embed, are both the same
+// missing thing -- a runtime whose state is a *value* somebody owns rather than storage the process
+// has. `docs/design/actors.md` is where that is argued; this is the piece of it that had to exist
+// first.
+//
+// **Every field here was a module-level `var` and nothing about its behaviour changed.** The move is
+// mechanical and `docs/design/vm-state.md` says how to make the next one: take the `var`, put it in
+// the group below that names its subsystem, and write `current().x` where it said `x`.
+//
+// **A module-level `var` is now refused by `tests_vm_state.sysl` unless it is marked process-wide**,
+// which is what stops the fifty files growing back. See that file for the two classes and the count.
+struct Vm
+    // -- the machine (`vm.sysl`) ---------------------------------------------------------------------
+
+    // The line of execution currently running. **A field and not a local**: `alloc` can collect at any
+    // allocation, so what the machine holds has to be reachable from a root function at every instant.
+    machine: Machine
+
+    // The lines of execution set aside by `park`. `mark_vm` walks every live one of them, because a
+    // suspended call is not running and is not therefore any less alive.
+    parked: Buf[Machine]
+
+    // -- the unit being run, and what its modules left behind (`vm.sysl`) ----------------------------
+
+    // The unit being run. **Reached rather than threaded**: a user-supplied `equals` is called from
+    // inside a table lookup, which is called from `same`, which knows nothing about units.
+    current_unit: Unit
+
+    // What each module exported, in the order the modules ran. A collector root: the closures in it
+    // hold their module's scope, and the scope holds whatever it captured.
+    module_values: Buf[Value]
+
+    // -- what the file being run declared around its tests (`vm.sysl`) -------------------------------
+
+    // The tests the entry file declared, in the order they were written. A collector root: a test
+    // function is reached from nothing else once its module's scope has been left.
+    registered_tests: Buf[TestCase]
+
+    // What the file wrote around its tests, `Null` where it wrote nothing, indexed by `HookSetup` and
+    // its three neighbours. A collector root for `registered_tests`' reason.
+    hook_fns: Buf[Value]
+
+    // What each of them is called, so a failure in one names the function rather than the test that
+    // happened to be standing next to it.
+    hook_names: Buf[string]
+
+    // -- the event loop (`event.sysl`) ---------------------------------------------------------------
+
+    // Everything the loop may still call, and the only thing standing between a pending callback and
+    // the sweep.
+    pending: Buf[Pending]
+
+    // How many callbacks are still outstanding, which is what decides whether the loop has work.
+    // **slate's own count is the authority**; libuv's answer is a spin-check on it.
+    outstanding: usize
+
+    // The number the next claim will stamp its slot with. See `Pending.gen`. Never reused, never reset.
+    generation: usize
+
+    // The first fault a callback raised, if any. Read once the loop stops.
+    loop_fault: Option[Signal]
+
+    // -- what the program printed, and what the running test asked (`builtin.sysl`) ------------------
+
+    // Everything the program printed, in order. `run` clears it, which is what lets two programs run
+    // one after the other.
+    output: Buf[string]
+
+    // Whether `print` also reaches the real descriptor as each call happens. Off by default, because
+    // most callers of `run` are asking a question rather than running a program.
+    live_output: bool
+
+    // Where a live `print` goes: whatever sink this run was given, so that a captured run's sink sees
+    // what its own program printed.
+    live_sink: &Fn(string) -> unit
+
+    // Whether the test now running asked to be left out, and the reason it gave. **Written down here
+    // rather than matched on the signal**, because a `skip` inside an `async` test travels out of the
+    // coroutine as a rejection, which keeps the sentence and loses which variant it was.
+    skip_asked: bool
+    skip_reason: string
+
+    // -- randomness (`number.sysl`) ------------------------------------------------------------------
+
+    // The generator behind `random()`, and whether it has been seeded yet. Seeded ONCE, on the first
+    // draw rather than at startup, so a program that never calls `random()` never asks the kernel.
+    draws: Rng
+    draws_seeded: bool
+
+    // -- the heap's roots and the collector's counters (`obj.sysl`) ----------------------------------
+    //
+    // **The heap itself is NOT here, and that is the one thing this refactor did not buy.** `storage`
+    // is a 256 MiB module array because a root function needs an address, and `slate_heap` is the heap
+    // over that one block -- so both stay process-wide until a VM is handed a block of its own, which
+    // is what `heap(base, cap)` already takes and what the actors chapter asks for next.
+
+    // How much of that block this program may actually have. The array is the ceiling and this is the
+    // setting, which is what lets a test about running out of memory run out of a small one.
+    heap_limit: usize
+
+    // The shadow stack: what the interpreter is holding at a point that may collect, and which no
+    // scope refers to. `hold`/`release` and `hold_env`/`release_env` are its whole interface.
+    root_values: Buf[Value]
+    root_envs: Buf[*EnvObj]
+
+    // How many collections this program has run, which is what makes a claim about *when* slate
+    // collects something a test can check rather than something a comment asserts.
+    collections: usize
+
+    // How much the live set may grow to before the next collection. Raised after every collection to
+    // a multiple of what survived it.
+    collect_above: usize
+
+    // Whether the heap has been handed out to the last byte, which is what turns the next allocation
+    // into a diagnostic rather than a crash.
+    heap_exhausted: bool
+
+    // The emergency objects a full heap is answered with, one per kind. Nothing else refers to them
+    // until the moment they are handed out, so nothing else would keep them.
+    spare_str: *StrObj
+    spare_array: *ArrayObj
+    spare_object: *ObjectObj
+    spare_closure: *ClosureObj
+    spare_env: *EnvObj
+    spare_promise: *PromiseObj
+    spare_weak_map: *ObjectObj
+    spare_weak_ref: *WeakRefObj
+
+    // -- the assets the program imported (`module.sysl`) ---------------------------------------------
+
+    // What every asset a program imports holds, by its resolved path. Filled by `load_program` and
+    // emptied by it, so a program's assets never outlive the run that asked for them.
+    asset_paths: Buf[string]
+    asset_texts: Buf[string]
+
+    // -- compiling (`compile.sysl`) ------------------------------------------------------------------
+
+    // Which file is being compiled, as an index into the unit's sources. `machine`'s own `Frame` holds
+    // the run-time twin of this.
+    compiling_source: usize
+
+    // Every type any module has declared so far, and where. Filled as each module compiles, which is
+    // why no pre-pass is needed.
+    known_source: Buf[usize]
+    known_name: Buf[string]
+    known_pat: Buf[Pattern]
+    known_public: Buf[bool]
+
+    // The types the file being compiled may name: its own, and the exported ones it imported.
+    visible_names: Buf[string]
+    visible_pats: Buf[Pattern]
+
+    // What was wrong with the program, found while compiling rather than while parsing. `run` folds
+    // these in with the parser's.
+    compile_faults: Report
+    compile_fault_srcs: Buf[usize]
+
+// A runtime with nothing in it yet.
+//
+// **Positional and in field order, because that is the shape sysl gives**, so a field added above is
+// added here in the same place or the compiler says which type stopped matching. The groups are the
+// struct's groups.
+new_vm() -> Vm
+    Vm(
+        fresh_machine(), buf(),
+        new_unit(), buf(),
+        buf(), no_hooks(), no_hook_names(),
+        buf(), 0, 0, None,
+        buf(), false, no_live_sink, false, "",
+        rng(0u64, 0u64), false,
+        HeapBytes, buf(), buf(), 0, CollectFloor, false,
+        null, null, null, null, null, null, null, null,
+        buf(), buf(),
+        0, buf(), buf(), buf(), buf(), buf(), buf(), report(), buf())
+
+// The one module-level `var` the runtime keeps, and it is the VM itself.
+//
+// **Here by design, and it is what `current()` is for.** Stage two of this work makes it a
+// thread-local and `new_vm()` the thing an actor calls on its own thread; every other file in the
+// tree already goes through the accessor, so that change lands in this file and nowhere else.
+private var the_vm: Vm = new_vm()
+
+// The VM this line of execution belongs to.
+//
+// **A pointer, so that a caller writes through it.** `current().output.push(line)` is the shape, and
+// a function that reaches the same subsystem a dozen times takes a pointer to that subsystem once --
+// `val vm: *Machine = &current().machine` at the top of `run_frames` is the worked example, and it is
+// why converting the instruction loop changed one line rather than a hundred and sixteen.
+current() -> *Vm = &the_vm
