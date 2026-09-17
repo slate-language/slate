@@ -27,10 +27,11 @@ import sysl.container.{Map, map}
 // else. That is what lets one be stored into GC memory, copied into a `Buf`, and passed around with
 // no ARC traffic on the interpreter's hot path.
 
-// How many bytes the collected heap gets.
+// How many bytes the collected heap gets by default.
 //
-// One block, fixed at startup -- there is no growing, and `alloc` answers null when it is full. It is
-// a static rather than a `malloc` so that nothing here needs an allocator to start.
+// One block, fixed when the VM is made -- there is no growing, and `alloc` answers null when it is
+// full. **A VM asks for its own ceiling** (`new_vm(ceiling)` in `vm_state.sysl`, which `malloc`s the
+// block), and this is what the program's own VM asks for, so the default behaviour is what it was.
 //
 // **Four megabytes was the first number and it was too small to build anything with**: about twelve
 // thousand objects with a proto, fewer than a program reading a modest CSV would make. This holds
@@ -49,37 +50,41 @@ import sysl.container.{Map, map}
 //
 // **It reproduced only on MODULE storage.** The same declaration inside a function is a body local and
 // lowers to an `alloca` and a fill loop, flat at every size -- sysl's first reduction was a single
-// entry file and showed nothing, which nearly sent the diagnosis the other way. `storage` below is
-// module storage precisely because the collector's root function needs an address, so slate could not
-// have avoided it.
+// entry file and showed nothing, which nearly sent the diagnosis the other way. The arena was a
+// module-level `[HeapBytes]u8` for exactly that reason and is a `malloc` now, so none of this binds
+// any more; it is kept because the sysl defect is worth knowing about before somebody writes the
+// next big array.
 //
-// **Zero-filled, so it is BSS**: the pages cost address space and are committed by the operating
-// system only as they are touched. A program that uses a megabyte pays for a megabyte.
-// Not `private`: `new_vm` in `vm_state.sysl` starts a VM's `heap_limit` at the ceiling.
+// **A `malloc`ed block is NOT zero-filled and nothing here needs it to be**: `gc.alloc` zeroes every
+// payload before the caller sees it, which its own doc says is what makes storing a reference-counted
+// member safe. **`malloc` rather than `calloc` is the whole of what keeps the old BSS bargain** --
+// the pages cost address space and are committed by the operating system only as they are touched,
+// so a program that uses a megabyte still pays for a megabyte rather than for 256 of them.
+// Not `private`: `new_vm` in `vm_state.sysl` gives the program's own VM this ceiling.
 const HeapBytes: usize = 268435456
 
-// process-wide: THE ARENA, and the one piece of the runtime a VM does not yet own. A root function
-// needs an address, so this is module storage; giving each VM a block of its own is `heap(base, cap)`
-// taking a different `base`, which is what `docs/design/actors.md` asks for next.
-private var storage: [HeapBytes]u8 = [0u8; HeapBytes]
-
-// The one heap. Its ROOTS are per-VM (`current().root_values` and the rest); the heap itself is not,
-// because it is the heap over `storage` and there is one of those.
+// The heap this line of execution allocates in.
 //
-// process-wide: a heap over the process's one arena. It becomes a `Vm` field on the day a VM is
-// spawned with a block of its own, and the roots are already waiting for it there.
-var slate_heap: gc.Heap = gc.heap(&storage[0], HeapBytes)
+// **A `*gc.Heap` accessor rather than a global, which is the `machine()`/`running_unit()` shape**, so
+// every site below reads `slate_heap()` where it read the global, and nothing else moved. The block
+// under it is `current().region`, `malloc`ed by `new_vm` and given back by `dispose_vm`.
+slate_heap() -> *gc.Heap = &current().heap
 
 // How much of that block a program may actually have.
 //
-// **The array is the ceiling and `current().heap_limit` is the setting**, which is what lets a test
+// **`current().heap_ceiling` is the block and `current().heap_limit` is the setting**, which lets a test
 // about running out of memory run out of a small one. Filling 256 MiB to find out what happens at the
 // end of it takes nearly five seconds; filling one takes no time at all, and the behaviour under test
 // is the same either way. Nothing but the suite changes it, and `run` puts it back.
 
 // Give the next program a heap of this size. `reset_heap` is what acts on it.
+// **The ceiling is this VM's own block and not `HeapBytes`**, which is the whole of what a per-VM
+// region changed here: a VM spawned with a megabyte cannot be asked for more than a megabyte, where
+// the shared arena would have handed it 256.
 set_heap_limit(bytes: usize)
-    current().heap_limit = if bytes > HeapBytes then HeapBytes else bytes
+    val v = current()
+
+    v.heap_limit = if bytes > v.heap_ceiling then v.heap_ceiling else bytes
 
 // -- the objects --------------------------------------------------------------------------------
 
@@ -471,7 +476,9 @@ release_env(mark: usize)
 // Everything the program can still reach.
 //
 // **A top-level function, because a hook is reached by address** and a nested one has no address to
-// take. That is also why the state above is module storage.
+// take. **It reaches the VM through `current()`**, which is what lets it be one function over any
+// number of heaps: `gc.collect` hands it the heap it is collecting, and that is `current().heap`
+// because the caller asked for it through `slate_heap()`.
 roots(h: *gc.Heap)
     // The machine's operand and frame stacks. **These are what the shadow stack below exists to
     // stand in for**, and once the walker is gone most of it goes with it.
@@ -519,7 +526,7 @@ roots(h: *gc.Heap)
 end roots
 
 // How much of the heap is spoken for.
-heap_used() -> usize = gc.used(&slate_heap)
+heap_used() -> usize = gc.used(slate_heap())
 
 // How many collections this program has run is `current().collections`, which is what makes a claim
 // about *when* slate collects something a test can check rather than something a comment asserts.
@@ -527,7 +534,7 @@ heap_used() -> usize = gc.used(&slate_heap)
 // Collect, at a point the interpreter has chosen because it knows what is live.
 collect_now()
     current().collections += 1
-    gc.collect(&slate_heap, &roots)
+    gc.collect(slate_heap(), &roots)
 
 // The smallest live set worth collecting over. Below this a program is cheap enough that tracing it
 // costs more than the storage it would give back.
@@ -563,10 +570,10 @@ private const Headroom: usize = 2
 // raised to a multiple of what survived, which is what makes the cost of collecting proportional to
 // the garbage produced rather than to the statements executed.
 maybe_collect()
-    if gc.live_size(&slate_heap) > current().collect_above
+    if gc.live_size(slate_heap()) > current().collect_above
         collect_now()
 
-        val survived = gc.live_size(&slate_heap) * Headroom
+        val survived = gc.live_size(slate_heap()) * Headroom
 
         current().collect_above = if survived > CollectFloor then survived else CollectFloor
 
@@ -576,14 +583,14 @@ maybe_collect()
 // every sysl string and `Buf` a live object holds would leak. It is also what lets two programs run
 // in one process, which every test in this repo does.
 reset_heap()
-    gc.dispose(&slate_heap)
+    gc.dispose(slate_heap())
 
     // **Rebuilt rather than reused, because the limit may have moved.** `dispose` hands every block
     // back to the free list, which is the right thing for a heap of the same size and the wrong one
     // for a heap that has just changed size -- the free list would still describe the old extent.
     val v = current()
 
-    slate_heap = gc.heap(&storage[0], v.heap_limit)
+    v.heap = gc.heap(v.region, v.heap_limit)
     v.root_values.clear()
     v.root_envs.clear()
     v.collections = 0
@@ -623,18 +630,18 @@ reset_heap()
 private reserve_spares()
     val v = current()
 
-    v.spare_str = ptr_cast(gc.alloc(&slate_heap, sizeof(StrObj), &str_kind))
-    v.spare_array = ptr_cast(gc.alloc(&slate_heap, sizeof(ArrayObj), &array_kind))
-    v.spare_object = ptr_cast(gc.alloc(&slate_heap, sizeof(ObjectObj), &object_kind))
-    v.spare_closure = ptr_cast(gc.alloc(&slate_heap, sizeof(ClosureObj), &closure_kind))
-    v.spare_env = ptr_cast(gc.alloc(&slate_heap, sizeof(EnvObj), &env_kind))
-    v.spare_promise = ptr_cast(gc.alloc(&slate_heap, sizeof(PromiseObj), &promise_kind))
+    v.spare_str = ptr_cast(gc.alloc(slate_heap(), sizeof(StrObj), &str_kind))
+    v.spare_array = ptr_cast(gc.alloc(slate_heap(), sizeof(ArrayObj), &array_kind))
+    v.spare_object = ptr_cast(gc.alloc(slate_heap(), sizeof(ObjectObj), &object_kind))
+    v.spare_closure = ptr_cast(gc.alloc(slate_heap(), sizeof(ClosureObj), &closure_kind))
+    v.spare_env = ptr_cast(gc.alloc(slate_heap(), sizeof(EnvObj), &env_kind))
+    v.spare_promise = ptr_cast(gc.alloc(slate_heap(), sizeof(PromiseObj), &promise_kind))
 
     // **The weak pair gets a reserve of its own rather than borrowing the object's**, because the
     // kind is written into the header at the allocation: a reserve taken under `object_kind` handed
     // out as a weak map would be traced strongly and weakened by nothing.
-    v.spare_weak_map = ptr_cast(gc.alloc(&slate_heap, sizeof(ObjectObj), &weak_map_kind))
-    v.spare_weak_ref = ptr_cast(gc.alloc(&slate_heap, sizeof(WeakRefObj), &weak_ref_kind))
+    v.spare_weak_map = ptr_cast(gc.alloc(slate_heap(), sizeof(ObjectObj), &weak_map_kind))
+    v.spare_weak_ref = ptr_cast(gc.alloc(slate_heap(), sizeof(WeakRefObj), &weak_ref_kind))
 
     // A zeroed payload is a valid object of each of these kinds except the ones holding a `Buf` or a
     // `Map`, which a tracer walks -- and a zero `Buf` is an empty one, so all eight are safe to trace
@@ -661,13 +668,13 @@ private mark_spares(h: *gc.Heap)
 // **The caller is going to write through whatever comes back**, so this may not answer null. What it
 // does instead is say so in `heap_exhausted`, which the statement boundary reports against a line.
 private alloc_or_collect(size: usize, kind: *gc.Kind, spare: *u8) -> *u8
-    var p = gc.alloc(&slate_heap, size, kind)
+    var p = gc.alloc(slate_heap(), size, kind)
 
     if p != null then return p
 
     collect_now()
 
-    p = gc.alloc(&slate_heap, size, kind)
+    p = gc.alloc(slate_heap(), size, kind)
 
     if p != null then return p
 

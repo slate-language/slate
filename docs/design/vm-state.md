@@ -9,11 +9,11 @@ slate's interpreter keeps its state in a `Vm` struct, and `current()` answers th
 of execution belongs to. This page says why, what is in it, what is deliberately not, and how to move
 the next file.
 
-**The struct is now whole.** Every module-level `var` that was per-VM state has moved into `Vm`; what
-is still process-wide is marked as such and stays where it is, and what is still missing is the
-per-actor heap. It is here rather than under `reference/` because what it is *for* is the actors
-design, and a VM with a heap of its own is the next piece of that work rather than a description of
-the language.
+**The struct is now whole and it owns its heap.** Every module-level `var` that was per-VM state has
+moved into `Vm`, the arena moved in with it, and what is still process-wide is marked as such and
+stays where it is. A second VM runs a program of its own in the same process today, which is what
+`A_SECOND_VM_RUNS_A_PROGRAM_OF_ITS_OWN_IN_THE_SAME_PROCESS` in `tests_vm_state.sysl` says. It is here
+rather than under `reference/` because what it is *for* is the actors design.
 
 ## Why
 
@@ -51,9 +51,47 @@ run_frames(u: *Unit, ...) -> Step
 Every `vm.stack`, `vm.frames`, `vm.scope` below it is unchanged. `machine()` in `execute.sysl` and
 `running_unit()` in `vm.sysl` are the two accessors of that shape; add one where a subsystem earns it.
 
-**`the_vm` in `vm_state.sysl` is the one module-level `var` that remains by design.** Stage two makes
-it a thread-local and `new_vm()` the thing an actor calls on its own thread; because every other file
-goes through `current()`, that change lands in one file.
+**`the_vm` in `vm_state.sysl` is the one module-level `var` that remains by design**, and it is a
+`*Vm` rather than a `Vm`: the thing `current()` answers is a pointer somebody can move. It becomes a
+thread-local the day sysl has one, and because every other file goes through `current()`, that change
+is a single declaration.
+
+## Running a second VM
+
+**`new_vm(ceiling)`, `enter`, `leave`, `dispose_vm` — and that is the whole of the surface.**
+
+```
+var second = new_vm(4194304)
+val was = enter(&second)
+val said = out("print(6 * 7)")
+
+leave(was)
+dispose_vm(&second)
+```
+
+- **`new_vm(ceiling)` `malloc`s a block of `ceiling` bytes and lays the VM's `gc.Heap` over it.**
+  `gc.heap(base, cap)` has always taken the block it works over, so a second VM is a second `base`
+  and nothing else. `malloc` rather than `calloc`, because `gc.alloc` zeroes each payload itself and
+  untouched pages should stay uncommitted — which is the bargain the 256 MiB BSS array it replaced
+  was making. The program's own VM asks for `HeapBytes`, so nothing about the default changed.
+- **`dispose_vm` runs every outstanding finalizer and frees the block.** The finalizers touch no VM
+  state — each gives back a sysl `string`, a `Buf` or a `Map` its object held — so a VM that is not
+  the current one can be disposed safely.
+- **`heap_ceiling` is the block and `heap_limit` is the setting.** `set_heap_limit` clamps to the
+  VM's own ceiling, so a VM spawned with a megabyte runs out of *its* megabyte with the ordinary
+  *"this program has run out of memory"* and the process's own VM never hears about it.
+
+**`enter`/`leave` are the sequential stand-in for a thread-local, because sysl has none.** There is no
+thread-local storage in the language — `sysl.posix.threads` crosses a domain with `&sync` and a
+`@crossing` parameter, and nothing declares per-thread storage — so `the_vm` stays one pointer and
+`enter` swaps it. **The previous VM travels back through the caller** rather than through a stack
+here, which is what keeps this two assignments and no state of its own; a caller with a `leave` to
+write is holding the value to write it with, so nesting works. Every `enter` owes a `leave` on every
+way out, which is why the runtime itself never calls these and a test or an embedder does.
+
+**The per-thread version is one declaration**: `the_vm` gains a thread-local attribute and `enter`
+becomes what an actor does once on its own thread. Nothing else in the tree learns a word, because
+everything already goes through `current()`.
 
 ## What a module-level `var` is now
 
@@ -61,9 +99,9 @@ Four things, and `tests_vm_state.sysl` counts each of them:
 
 | class | what it is | how it is recognised | count |
 |---|---|---|---|
-| the VM | `the_vm` in `vm_state.sysl` | by name | 1 |
+| the VM | `the_vm` in `vm_state.sysl`, a `*Vm` | by name | 1 |
 | **B**, a native's id | `var n_<name>: NativeFn = 0` | by shape | 367 |
-| **B/C**, process-wide | marked `process-wide:` in the comment above it | by the marker | 14 |
+| **B/C**, process-wide | marked `process-wide:` in the comment above it | by the marker | 13 |
 | **A**, still owed | anything else | by elimination | 0 |
 
 **A new global is none of the first three**, so it lands in the fourth and fails the census until its
@@ -81,14 +119,22 @@ zero now, and stays zero unless a file grows one back.
   and never written again; a `Kind`'s address must not move, and a per-VM copy would hold the same
   eight function pointers.
 
-### Class C — genuinely shared, and it is the arena
+### Class C — empty, and the arena is why
 
-- **`storage` and `slate_heap` in `obj.sysl`.** `storage` is a 256 MiB BSS array and `slate_heap` is
-  the heap over it. The collector's root function needs an address, so the arena is module storage;
-  a per-VM heap is `heap(base, cap)` taking a *different* block, which is exactly what the actors
-  chapter asks for and is not this stage's work. **The heap's roots are already per-VM** —
-  `root_values`, `root_envs`, the spares, the counters and `heap_limit` are all `Vm` fields — so the
-  day a VM is spawned with a block of its own, the only thing left to move is the heap handle itself.
+**There is no class C any more.** It held exactly two things — `storage`, a 256 MiB BSS array in
+`obj.sysl`, and `slate_heap`, the one `gc.Heap` over it — and both are gone: `region`, `heap_ceiling`
+and `heap` are `Vm` fields, and `slate_heap()` is a `*gc.Heap` accessor of the `machine()` shape, so
+every allocation site reads `slate_heap()` where it read `&slate_heap` and nothing else moved.
+
+**What the arena was doing in module storage was giving the collector's root function an address**,
+and that is still the requirement: `roots` is a top-level function because a hook is reached by
+address. It simply reaches the heap through `current()` now, so one function serves any number of
+heaps — `gc.collect` hands it the heap it is collecting, which is `current().heap` because that is
+what the caller asked for.
+
+**The one thing that replaced them is `main_vm`**, the storage for the *program's own* VM, marked
+process-wide for the plain reason that a process has one and it has to outlive everything, including
+a `main` that has returned into a libuv callback. A second VM is an ordinary local somebody owns.
 
 ### Class A — none owed, and the two shapes the 49 turned out to be
 

@@ -1,6 +1,7 @@
 module dev.slatelang.slate
 @tests
 
+import sh.sysl.gc
 import sysl.buf.{Buf, buf}
 import sysl.fs.{entries, read_bytes}
 import sysl.slices.sort_by
@@ -22,7 +23,8 @@ import sysl.text.{Search, from_utf8_unchecked, split, str_builder}
 //   append-only and answers the first id for a name it already has, so an id never moves and two VMs
 //   in one process would agree on every one of them;
 // - **something marked `process-wide:`** in a comment above it, which says in the same breath why it
-//   is not per-VM -- the collector's `Kind` tables, the native index, and the heap arena;
+//   is not per-VM -- the collector's `Kind` tables, the native index, and the storage for the
+//   program's own VM;
 // - **a `var` still owed the move**, which is stage two's work and is written down per file below.
 //
 // A new global is none of the first three, so it lands in the fourth and fails this test until its
@@ -46,7 +48,14 @@ private val StateOwed: string = ""
 // How many of each kind there are. **The totals are pinned separately from the per-file list** so
 // that a `var` moving between the classes is caught even where the file's own count did not change.
 private const NativeHandles: usize = 367
-private const ProcessWideGlobals: usize = 14
+
+// **THE ARENA IS GONE FROM THIS COUNT AND THAT IS WHAT STAGE THREE BOUGHT.** It was 14 while
+// `obj.sysl` held a 256 MiB module array and the one `gc.Heap` over it; a VM `malloc`s its own block
+// now, so both came out and `main_vm` -- the STORAGE for the program's own VM, which has to outlive
+// everything -- went in. What is left is the eight `gc.Kind` tables, the native index's four, one
+// for the storage, and none for a heap.
+private const ProcessWideGlobals: usize = 13
+
 private const StateOwedTotal: usize = 0
 
 // What one file's module-level `var`s came to.
@@ -149,7 +158,7 @@ THE_RUNTIMES_STATE_LIVES_IN_VM_AND_A_NEW_GLOBAL_HAS_TO_BE_ARGUED_FOR()
 
     // **The VM is ONE global and the test says so**, that being the whole claim: a second `var` in
     // `vm_state.sysl` would be state outside the struct, which is the thing this file exists to stop.
-    assert_eq(the_vm, 1, "`the_vm`, which `current()` answers and stage two makes a thread-local")
+    assert_eq(the_vm, 1, "`the_vm`, the POINTER `current()` answers, which becomes a thread-local the day sysl has one")
 
 @test
 A_VM_STARTS_EMPTY_AND_CURRENT_ANSWERS_THE_SAME_ONE_EVERY_TIME()
@@ -162,7 +171,7 @@ A_VM_STARTS_EMPTY_AND_CURRENT_ANSWERS_THE_SAME_ONE_EVERY_TIME()
     assert_eq(current().output.len(), 1, "and read back through another")
 
     // A fresh VM is a VM with nothing in it, which is what an actor would be spawned with.
-    val fresh = new_vm()
+    var fresh = new_vm(SmallCeiling)
 
     assert_eq(fresh.output.len(), 0)
     assert_eq(fresh.parked.len(), 0)
@@ -172,4 +181,89 @@ A_VM_STARTS_EMPTY_AND_CURRENT_ANSWERS_THE_SAME_ONE_EVERY_TIME()
     assert_eq(fresh.hook_fns.len(), HookCount, "the four hook slots exist before anything is written")
     assert(!fresh.draws_seeded, "and the generator has not asked the kernel for anything")
 
+    // **A block of its own, which is the thing a second VM could not have before.**
+    assert(fresh.region != null, "and a heap block it owns")
+    assert_eq(fresh.heap_ceiling, SmallCeiling)
+
+    dispose_vm(&fresh)
+
+    assert(fresh.region == null, "given back, so a VM that is done costs the process nothing")
+
     current().output.clear()
+
+// -- a second VM -------------------------------------------------------------------------------------
+
+// What a second VM in these tests is given. Four megabytes is enough to compile and run a small
+// program and small enough that taking one costs nothing.
+private const SmallCeiling: usize = 4194304
+
+// A heap a program can fill, which is what `in_small_heap` has always used.
+private const TinyCeiling: usize = 1048576
+
+// A program that outgrows any heap it is given.
+private const Greedy: string = "var kept = []\nfor i in 0..<40000\n    push(kept, { a: i, b: [i, i, i], c: \"x\" + string(i) })"
+
+@test
+A_SECOND_VM_RUNS_A_PROGRAM_OF_ITS_OWN_IN_THE_SAME_PROCESS()
+    reset_vm()
+    current().output.clear()
+    current().output.push("what the first VM was holding")
+
+    val modules_before = current().module_values.len()
+
+    // **`live_size` is the witness and it is the sharp one.** A second VM sharing the one arena would
+    // have `reset_heap`'d this heap out from under the first VM on its way in -- everything below
+    // still passes, and this does not.
+    val live_before = gc.live_size(slate_heap())
+
+    var second = new_vm(SmallCeiling)
+    val was = enter(&second)
+
+    // The ordinary compile-and-drain path: `out` is `run`, which is what a program gets.
+    val said = out("print(6 * 7)\nprint(\"from a VM of my own\")")
+
+    leave(was)
+
+    assert_eq(said, "42\nfrom a VM of my own")
+
+    // And the first VM is exactly where it was left.
+    assert_eq(current().output.len(), 1, "the first VM's output buffer is its own")
+    assert_eq(current().output.at(0), "what the first VM was holding")
+    assert_eq(current().module_values.len(), modules_before, "and so is its module table")
+    assert_eq(gc.live_size(slate_heap()), live_before, "and nothing of its heap was collected or freed")
+
+    dispose_vm(&second)
+    current().output.clear()
+end A_SECOND_VM_RUNS_A_PROGRAM_OF_ITS_OWN_IN_THE_SAME_PROCESS
+
+@test
+A_VM_WITH_A_SMALL_CEILING_FAULTS_ON_ITS_OWN_LIMIT_NOT_THE_PROCESS()
+    reset_vm()
+    current().output.clear()
+
+    val ceiling_before = current().heap_ceiling
+    val live_before = gc.live_size(slate_heap())
+
+    var small = new_vm(TinyCeiling)
+    val was = enter(&small)
+    val said = fails(Greedy)
+
+    leave(was)
+
+    assert(said.contains("this program has run out of memory"),
+        "a VM runs out of ITS OWN heap, with the ordinary sentence and not a crash")
+
+    // **The ceiling is the block, so asking for more than the VM was spawned with is refused.**
+    assert_eq(small.heap_ceiling, TinyCeiling)
+
+    // And the process's own VM never heard about any of it.
+    assert_eq(current().heap_ceiling, ceiling_before, "the first VM's block is the size it always was")
+    assert_eq(gc.live_size(slate_heap()), live_before, "and nothing on it moved")
+
+    dispose_vm(&small)
+
+    // Which is proved by running a program on it afterwards.
+    assert_eq(out("print(\"the first VM is still running\")"), "the first VM is still running")
+
+    current().output.clear()
+end A_VM_WITH_A_SMALL_CEILING_FAULTS_ON_ITS_OWN_LIMIT_NOT_THE_PROCESS
