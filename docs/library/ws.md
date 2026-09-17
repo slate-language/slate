@@ -22,9 +22,14 @@ serve(port, handler, (req, socket, head) ->
 | `open(url)` | a **promise** of a result holding the connection — the client |
 | `accept(req, socket, head)` | a **result** holding the connection — the server |
 | `accepting(req)` | whether this request is a WebSocket handshake |
-| `framed(payload, opcode)` | a frame a server writes, for a program doing its own writing |
+| `framed(payload, opcode)` | a frame a server writes, as [`bytes`](bytes.md), for a program doing its own writing |
 | `maskedFrame(payload, opcode)` | the same frame a client writes, which is masked |
-| `unframed(bytes)` | the other direction |
+| `unframed(bytes)` | the other direction; its `payload` is a buffer too |
+
+**A binary message arrives as [`bytes`](bytes.md) and may be sent as either.** `onBinary(f)` hands `f`
+a buffer, `sendBytes` takes a buffer or an array of numbers, and the connection accumulates what
+arrives in one buffer rather than a value per byte — which is what a frame's header is read out of
+and what `send` is handed at the end of it.
 
 ## `open(url)` — the client
 

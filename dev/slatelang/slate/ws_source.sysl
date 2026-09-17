@@ -56,7 +56,7 @@ ws_source() -> string = raw"""
     // One frame, read off the wire. **`tooBig` is the only field that is always there**: a frame
     // whose stated length is over the limit is refused before its bytes are looked at, so there is
     // nothing else to say about it. Everything else is optional for that reason and for no other.
-    export type Frame = { tooBig: boolean, fin?: boolean, opcode?: integer, masked?: boolean, payload?: array, size?: integer }
+    export type Frame = { tooBig: boolean, fin?: boolean, opcode?: integer, masked?: boolean, payload?: bytes, size?: integer }
 
     // What `accept` answers: the connection under `value`, or why the handshake was not one.
     export type Accepted = { ok: boolean, value?: object, error?: string }
@@ -64,7 +64,7 @@ ws_source() -> string = raw"""
     // A live connection, and everything a program does with one.
     export type Connection = { onMessage: function, onBinary: function, onClose: function, send: function, sendBytes: function, ping: function, close: function }
 
-    base64(bs: array) -> string
+    base64(bs: bytes | array) -> string
         var out = ""
         var i = 0
 
@@ -98,8 +98,13 @@ ws_source() -> string = raw"""
     // One frame, encoded. **A server never masks**, which is the protocol's rule and not an omission:
     // masking exists to stop a hostile page steering an intermediary into treating payload bytes as a
     // request, and only the browser's direction has that problem.
-    export framed(opcode: integer, payload: bytes | array) -> array
-        var out = [0x80 | opcode]
+    //
+    // **The frame is [`bytes`](bytes.md), and the payload is joined rather than walked.** A header is
+    // at most fourteen bytes and is pushed one at a time because that is what it is; the body is one
+    // `concat`, which is a copy of a run of memory -- where the loop this replaced cost a value per
+    // byte of every message the connection ever sent.
+    export framed(opcode: integer, payload: bytes | array) -> bytes
+        var out = bytes([0x80 | opcode])
         val n = payload.length
 
         if n < 126
@@ -114,10 +119,7 @@ ws_source() -> string = raw"""
             for i in 0..<8
                 push(out, (n >> ((7 - i) * 8)) & 0xFF)
 
-        for b in payload
-            push(out, b)
-
-        out
+        concat(out, payload)
 
     // One frame written by a CLIENT, which is the same frame masked.
     //
@@ -126,10 +128,14 @@ ws_source() -> string = raw"""
     // front of a server sees traffic it cannot predict, and a browser is the only direction that can
     // be told what to send by a hostile document. So a client masks and a server does not, and each
     // fails the connection when the other gets it wrong.
-    export maskedFrame(opcode: integer, payload: bytes | array) -> array
+    //
+    // **The masking loop is the one this kind cannot take away**, every byte being exclusive-or'd
+    // with a key byte -- but it writes into [`bytes`](bytes.md) now, so what it costs is a byte per
+    // byte rather than a whole tagged value per byte.
+    export maskedFrame(opcode: integer, payload: bytes | array) -> bytes
         val mask = randomBytes(4)
 
-        var out = [0x80 | opcode]
+        var out = bytes([0x80 | opcode])
         val n = payload.length
 
         if n < 126
@@ -144,8 +150,7 @@ ws_source() -> string = raw"""
             for i in 0..<8
                 push(out, (n >> ((7 - i) * 8)) & 0xFF)
 
-        for b in mask
-            push(out, b)
+        push(out, mask)
 
         var i = 0
 
@@ -197,12 +202,17 @@ ws_source() -> string = raw"""
 
         if buf.length - at < n then return null
 
-        var payload = []
+        // **An unmasked payload is CUT OUT and a masked one is walked**, and that is the whole of the
+        // difference: the cut is one copy of a run of memory, where the walk has to exclusive-or each
+        // byte with its key byte. Both answer [`bytes`](bytes.md), so what a handler is given is a
+        // buffer either way.
+        var payload = bytes(0)
 
-        for i in 0..<n
-            val byte = buf[at + i]
-
-            push(payload, if key == null then byte else byte ^ key[i % 4])
+        if key == null
+            payload = concat(payload, buf[at..<at + n])
+        else
+            for i in 0..<n
+                push(payload, buf[at + i] ^ key[i % 4])
 
         { tooBig: false,
           fin: ((b0 >> 7) & 1) == 1,
@@ -259,7 +269,11 @@ ws_source() -> string = raw"""
     // receives; a server does the exact opposite. Everything else -- the reassembly, the control
     // frames, the close handshake, the UTF-8 check -- is the protocol and not the direction.
     connected(socket, head: bytes | array, masking: boolean) -> Connection
-        var buf = []
+        // **What has arrived and is not yet a whole frame, as [`bytes`](bytes.md).** A connection's
+        // reassembly buffer is the hottest byte store in the module -- every chunk off the socket is
+        // appended to it and every frame taken off the front -- and as an array of numbers that was a
+        // `Value` per byte of every message the connection ever carried.
+        var buf = bytes(0)
         var heardText = null
         var heardBytes = null
         var gone = null
@@ -274,12 +288,11 @@ ws_source() -> string = raw"""
 
         // **Whatever arrived behind the handshake.** A client may send its first frame in the same packet
         // as the handshake, and those bytes have already been read off the socket by the HTTP parser.
-        for b in head
-            push(buf, b)
+        buf = concat(buf, head)
 
         // **One place decides whether a frame is masked**, so no site that writes one has to
         // remember which end this is.
-        outgoing(opcode: integer, payload: bytes | array) -> array =
+        outgoing(opcode: integer, payload: bytes | array) -> bytes =
             if masking then maskedFrame(opcode, payload) else framed(opcode, payload)
 
         write(bs: bytes | array)
@@ -303,11 +316,9 @@ ws_source() -> string = raw"""
 
             closing = true
 
-            var payload = [(code >> 8) & 0xFF, code & 0xFF]
+            var payload = bytes([(code >> 8) & 0xFF, code & 0xFF])
 
-            for b in toBytes(why)
-                push(payload, b)
-
+            push(payload, toBytes(why))
             write(outgoing(CloseFrame, payload))
             finish(code, why)
 
@@ -347,8 +358,7 @@ ws_source() -> string = raw"""
 
                     return
 
-                for b in f.payload
-                    push(partial, b)
+                push(partial, f.payload)
             else if f.opcode == TextFrame || f.opcode == BinaryFrame
                 if partial != null
                     goodbye(1002, "a new message began before the last one had finished")
@@ -421,9 +431,7 @@ ws_source() -> string = raw"""
 
                 return
 
-            for b in chunk
-                push(buf, b)
-
+            push(buf, chunk)
             step()
 
         onBytes(socket, heard)
@@ -663,12 +671,14 @@ ws_source() -> string = raw"""
         { ok: true, value: connected(sock, answered.value, true) }
 
     // The bytes just past the first blank line, or `null` while it has not arrived.
-    headerEnd(buf: bytes | array) -> integer | null
-        for i in 0..<(buf.length - 3)
-            if buf[i] == 13 && buf[i + 1] == 10 && buf[i + 2] == 13 && buf[i + 3] == 10
-                return i + 4
+    //
+    // **`indexOf` of a RUN is the scan**, which is what that call was put there for: finding the blank
+    // line used to be four index reads per position written out in slate, and it is a memory search
+    // now.
+    headerEnd(buf: bytes) -> integer | null
+        val end = indexOf(buf, toBytes("\r\n\r\n"))
 
-        null
+        if end == null then null else end + 4
 
     // Read the server's answer to the handshake, and hand back whatever came behind it.
     //
@@ -678,7 +688,7 @@ ws_source() -> string = raw"""
     handshake(sock, key: string)
         val p = pending()
 
-        var buf = []
+        var buf = bytes(0)
         var done = false
 
         finish(answer)
@@ -696,8 +706,7 @@ ws_source() -> string = raw"""
 
                 return
 
-            for b in chunk
-                push(buf, b)
+            push(buf, chunk)
 
             val end = headerEnd(buf)
 
@@ -725,10 +734,10 @@ ws_source() -> string = raw"""
     // **Its own type and not `Opened`**, which the annotation caught: what this carries is the
     // LEFTOVER BYTES and what `open` carries is the connection, so one type for both would be a
     // shape that is sometimes an array and sometimes an object.
-    type Handshake = { ok: boolean, value?: array, error?: string }
+    type Handshake = { ok: boolean, value?: bytes, error?: string }
 
     // Whether that answer is the one RFC 6455 says a server gives.
-    checked(head: string, key: string, rest: array) -> Handshake
+    checked(head: string, key: string, rest: bytes) -> Handshake
         val lines = split(head, "\r\n")
         val status = split(lines[0], " ")
 

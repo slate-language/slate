@@ -20,16 +20,19 @@ val page = toBytes(repeat("<p>hello</p>", 40))
 val small = zstd(page, 3)                   // the level: 1 fast, 3 the default, 19 for storage
 val back = unzstd(small, 1 << 20)           // the limit is not optional
 
-print(small.length < page.length)
-print(back.ok, fromBytes(back.value).value == fromBytes(page).value)
+print(small.length < page.length, small is bytes)
+print(back.ok, back.value == page)
 print(unzstd(toBytes("not zstd"), 1 << 20).ok)
 ```
 
 ```output
-true
+true true
 true true
 false
 ```
+
+**A frame and what comes back out of one are both [`bytes`](bytes.md)**, and `data` may be text, a
+buffer or an array of numbers — so nothing written against the array shape stops working.
 
 ## Why it is here beside brotli and gzip
 

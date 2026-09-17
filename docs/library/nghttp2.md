@@ -70,7 +70,7 @@ h2Respond(s, stream, { ":status": "200", "content-type": "text/plain" }, "hello 
 pump(s, c)
 
 for e in seen(c)
-    if e.kind == "data" then print(fromBytes(e.bytes).value)
+    if e.kind == "data" then print(e.bytes is bytes, fromBytes(e.bytes).value)
 
 h2Close(c)
 h2Close(s)
@@ -78,14 +78,19 @@ h2Close(s)
 
 ```output
 asked for [":path", "/things"]
-hello from h2
+true hello from h2
 ```
+
+**Every run of bytes here is [`bytes`](bytes.md)** — what `h2Send` hands over, the body a `data` event
+carries, and a block out of `hpackDeflate`. Each of them goes straight to a socket or straight back
+into a session, so a buffer is the shape both ends of that journey want; anything a program gives
+*in* may be a buffer, an array of numbers or text.
 
 | | |
 |---|---|
 | `h2Client(options?)` / `h2Server(options?)` | a session |
 | `h2Receive(session, bytes)` | `null`, or `{ error }` where the peer spoke nonsense |
-| `h2Send(session)` | the bytes to write, as an array |
+| `h2Send(session)` | the bytes to write, as [`bytes`](bytes.md) |
 | `h2Next(session)` | the next event, or `null` |
 | `h2Request(session, headers, body?)` | a client's; answers the stream number |
 | `h2Respond(session, stream, headers, body?)` | a server's |

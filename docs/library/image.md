@@ -24,10 +24,12 @@ val square = { width: 2, height: 2, channels: 3,
 val png = encodePNG(square)
 
 print(png[0], png[1], png[2], png[3])        // the PNG signature
+print(png is bytes)                          // an encoded image is a buffer
 
 val back = readImage(png)
 
 print(back.ok, back.value.width, back.value.height, back.value.channels)
+print(back.value.pixels is bytes, back.value.pixels.toArray() == square.pixels)
 
 val bigger = resizeImage(back.value, 4, 4)
 
@@ -41,7 +43,9 @@ print(readImage(toBytes("not an image")).ok)
 
 ```output
 137 80 78 71
+true
 true 2 2 3
+true true
 4 4 48
 2 2
 false
@@ -49,17 +53,23 @@ false
 
 ## An image is a record, not a handle
 
-`{ width, height, channels, pixels }`, where `pixels` is a byte array of `width * height * channels`
-— rows packed with no padding, the top row first, and the channels interleaved. Every name here
-either answers one or takes one, so a thumbnail is one expression:
+`{ width, height, channels, pixels }`, where `pixels` is [`bytes`](bytes.md) of
+`width * height * channels` — rows packed with no padding, the top row first, and the channels
+interleaved. Every name here either answers one or takes one, so a thumbnail is one expression:
 
 ```slate
 val small = encodeJPEG(resizeImage(readImage(upload).value, 200, 200), 80)
 ```
 
-Nothing in the middle is a resource to give back, and the pixels are ordinary slate values: a program
+Nothing in the middle is a resource to give back, and the pixels are an ordinary slate value: a program
 can read them, store them, send them, or build an image itself and encode that — which is what the
 runnable program above does.
+
+**A `pixels` a program builds may be an array of numbers**, which is what the programs on this page do,
+and what comes back from `readImage` is a buffer. That is the one thing to know when comparing them:
+`decoded.pixels == [255, 0, 0]` is false because a buffer is not an array, and
+`decoded.pixels.toArray() == [255, 0, 0]` is the comparison that was meant. It matters most here —
+a 1024×1024 RGBA decode is four megabytes, which as an array of numbers was sixty-four.
 
 ## What it reads and what it writes
 
@@ -97,7 +107,7 @@ print(file[8], file[9], file[10], file[11])     // "WEBP"
 val shape = imageShape(file).value
 
 print(shape.width, shape.height, shape.channels)
-print(readImage(file).value.pixels == src.pixels)
+print(readImage(file).value.pixels.toArray() == src.pixels)
 
 // A quality instead of a record is the lossy coder, which keeps the alpha either way.
 print(encodeWebP(src, 40).length < encodeWebP(src, 100).length)

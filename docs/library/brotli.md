@@ -18,16 +18,19 @@ val page = toBytes(repeat("<p>hello</p>", 40))
 val small = compress(page, 5)               // quality 0-11
 val back = decompress(small, 1 << 20)       // the limit is not optional
 
-print(small.length < page.length)
-print(back.ok, fromBytes(back.value).value == fromBytes(page).value)
+print(small.length < page.length, small is bytes)
+print(back.ok, back.value == page)
 print(decompress(toBytes("not brotli"), 1 << 20).ok)
 ```
 
 ```output
-true
+true true
 true true
 false
 ```
+
+**Both answer [`bytes`](bytes.md)**, and `data` may be text, a buffer or an array of numbers — so a
+program written against the array shape reads exactly as it did.
 
 ## The two channels
 

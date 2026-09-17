@@ -177,7 +177,7 @@ import { md5, sha1, sha256, sha512, hmac, pbkdf2, randomBytes, timingSafeEqual }
 
 val digits = "0123456789abcdef"
 
-hex(bs) = join(map(bs, b -> digits[b / 16] + digits[b % 16]), "")
+hex(bs) = join(map(bs.toArray(), b -> digits[b / 16] + digits[b % 16]), "")
 
 print(hex(sha256("abc")))
 print(hex(md5("abc")), hex(sha1("abc")))
@@ -196,7 +196,7 @@ ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
 
 **`crypto.subtle` IS NOT USED, AND THAT IS THE DECISION EVERYTHING HERE FOLLOWS FROM.** The web
 platform's only digest is asynchronous and always has been — there is no synchronous hash in a browser
-at all — so a `sha256` built on it would answer a *promise* here and a byte array under the
+at all — so a `sha256` built on it would answer a *promise* here and a buffer under the
 interpreter. **Two back ends disagreeing about the shape of an answer is worse than either being
 slow**, and it would have taken a breaking change to the interpreter to fix, over a call that costs
 microseconds. So the digests are written out in JavaScript and stay synchronous. `md5` would have had

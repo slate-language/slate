@@ -15,8 +15,8 @@ async main()
     val small = await gzip(page)
     val back = await gunzip(small, 1 << 20)        // the limit is not optional
 
-    print(small.length < page.length)
-    print(back.ok, fromBytes(back.value).value == fromBytes(page).value)
+    print(small.length < page.length, small is bytes)
+    print(back.ok, back.value == page)
 
     val zipped = await deflate("the same text, wrapped as zlib instead")
     val flat = await inflate(zipped, 1 << 20)
@@ -28,7 +28,7 @@ main()
 ```
 
 ```output
-true
+true true
 true true
 the same text, wrapped as zlib instead
 false
@@ -41,7 +41,9 @@ false
 | `deflate(data)` | a promise of the bytes, wrapped as zlib |
 | `inflate(data, limit)` | a promise of `{ ok, value }` |
 
-`data` is text or bytes; text crosses as its UTF-8, which is what goes on a wire either way.
+`data` is text, [`bytes`](bytes.md) or an array of numbers; text crosses as its UTF-8, which is what
+goes on a wire either way. **What comes back is always a buffer** — a compressed body is the one thing
+a program is certain to write to a socket or a file, and both of those take one.
 
 ## Which of the two wrappers
 

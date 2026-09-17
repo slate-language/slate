@@ -232,6 +232,12 @@ which is character 256 and has no byte
 |---|---|
 | `onBytes(sock, fn)` | each chunk, as a buffer |
 | `readBytes(path)` `readBytesSync(path)` | the whole file, as a buffer |
+| `sha256(x)` and every digest, `hmac`, `pbkdf2`, `randomBytes`, `jwsSign` | [`slate:crypto`](crypto.md) |
+| `gzip` `gunzip` `deflate` `inflate`, `zstd` `unzstd`, `compress` `decompress` | [gzip](gzip.md), [zstd](zstd.md), [brotli](brotli.md) |
+| `encodePNG` `encodeJPEG` `encodeWebP`, and a decoded image's `pixels` | [`slate:image`](image.md) |
+| a `BLOB` column, an LMDB value and key | [sqlite](sqlite.md), [lmdb](lmdb.md) |
+| `h2Send`, a DATA frame's body, `hpackDeflate` | [`slate:nghttp2`](nghttp2.md) |
+| a binary WebSocket message, `framed` and `maskedFrame` | [`slate:ws`](ws.md) |
 
 Both answered an array of numbers before. A 64 KiB read built 65,536 values and a megabyte of heap to
 hand back 64 KiB of data; everything a program did with that array it does with the buffer — `for`,
@@ -250,6 +256,13 @@ program can see:
   `sha256`, `gzip` and `toJSON` all read the same as they did;
 - `toBytes(s).map(…)`, `.sort()` and the rest of the array's own names are `toBytes(s).toArray().map(…)`;
 - `toBytes(s) == [104, 105]` is now false — it is a buffer against an array, two kinds.
+
+**And every library that answered an array of bytes answers a buffer**, which the table above lists:
+a digest, a compressed body, an encoded image or its pixels, a BLOB, an LMDB value, an HTTP/2 frame
+and a binary WebSocket message. The same three lines apply to each — `.length`, `[i]` and a `for`
+read as they did, `.map` and the rest are behind `.toArray()`, and `==` against an array literal is
+now false. **Nothing changed about what they TAKE**: every one of them still reads an array of
+numbers wherever it reads bytes.
 
 ## `bytes` is a type word
 

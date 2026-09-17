@@ -72,10 +72,10 @@ table handed to a call that wants another is refused rather than misread.
 | `lmdbGet` `lmdbHas` `lmdbPut` `lmdbDelete` | one key |
 | `lmdbCursor(txn, db)` `lmdbFirst` `lmdbNext` `lmdbSeek(cur, key)` `lmdbCursorClose` | a range |
 
-**A key or a value may be text or bytes, and what comes back is always bytes.** Text crosses as its
-UTF-8, which is what `toBytes` would have made of it and what would have gone onto a wire either
-way; LMDB records nothing about which of the two it was given, so `fromBytes` is how a program that
-wrote text reads it back.
+**A key or a value may be text, [`bytes`](bytes.md) or an array of numbers, and what comes back is
+always a buffer.** Text crosses as its UTF-8, which is what `toBytes` would have made of it and what
+would have gone onto a wire either way; LMDB records nothing about which of the two it was given, so
+`fromBytes` is how a program that wrote text reads it back.
 
 **A named database is itself a key in the unnamed one**, which is where LMDB keeps the name-to-handle
 mapping — so the unnamed database of a store with three named ones has three keys in it before a

@@ -153,8 +153,8 @@ and `split` all hand back the same kind of thing.
 
 **`.length` is that count read as a property** — a name a `.` answers with a value and no brackets
 after it, exactly as a class's `get` is read. `s.length` counts characters and not UTF-16 units, so
-a string of one emoji is 1 here where JavaScript says 2. An array carries one too, and so therefore
-do the bytes under a string, an array of numbers being the only shape bytes have.
+a string of one emoji is 1 here where JavaScript says 2. An array carries one too, and so does a
+[buffer](../library/bytes.md), which is the shape the bytes under a string come back in.
 
 ```slate
 print("日本語".length, "a👋".length)
@@ -179,7 +179,7 @@ s.length = 5
 `length` is a read-only property of a string
 ```
 
-`toBytes(s)` answers an array of numbers and `fromBytes(bs)` answers a [result](faults.md); those two
+`toBytes(s)` answers a [buffer](../library/bytes.md) and `fromBytes(bs)` answers a [result](faults.md); those two
 are the only place a slate program sees UTF-8, and `toBytes(s).length` is the byte count.
 
 **Case and whitespace are the whole database and not the ASCII range.** `upper` and `lower` answer

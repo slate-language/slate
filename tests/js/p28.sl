@@ -48,7 +48,7 @@ db.run("insert into anything values (?)", null)
 // **The type belongs to the value and not to the column**, SQLite being dynamically typed — so one
 // column answers five different kinds of slate value here and both back ends have to agree which.
 for row in db.query("select v from anything")
-    print("stored", row.v is integer, row.v is real, row.v is string, row.v is array, row.v == null)
+    print("stored", row.v is integer, row.v is real, row.v is string, row.v is bytes, row.v == null)
 
 print("bytes back", toJSON(db.query("select v from anything where typeof(v) = 'blob'")[0].v))
 

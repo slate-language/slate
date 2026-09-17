@@ -17,7 +17,9 @@ import { sign, verify } from slate:jwt
 
 val Digits = "0123456789abcdef"
 
-hex(bs) = join(map(bs, b -> Digits[b / 16] + Digits[b % 16]), "")
+// **`toArray` is the door onto the array's names**, a digest being `bytes` and `map` belonging to
+// the kind that holds values.
+hex(bs) = join(map(bs.toArray(), b -> Digits[b / 16] + Digits[b % 16]), "")
 
 // The empty message, which is where a padding mistake shows first.
 print(hex(md5("")), hex(sha1("")))
@@ -98,7 +100,7 @@ print(verify(sign({ sub: "u1" }, "secret", "HS512"), "secret", "HS512").ok)
 print(randomBytes(1).length, randomBytes(32).length, randomBytes(1000).length)
 print(randomBytes(32) != randomBytes(32))
 
-allBytes(bs) = filter(bs, b -> b >= 0 && b <= 255).length == bs.length
+allBytes(bs) = filter(bs.toArray(), b -> b >= 0 && b <= 255).length == bs.length
 
 print(allBytes(randomBytes(64)))
 

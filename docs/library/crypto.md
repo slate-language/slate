@@ -14,15 +14,24 @@ val nonce = randomBytes(18)
 val tag = hmac("SHA-256", "a key", "the message")
 
 print(nonce.length, sha256("abc").length, tag.length)
+print(nonce is bytes, sha256("abc") is bytes)
 print(timingSafeEqual(tag, hmac("SHA-256", "a key", "the message")))
 print(timingSafeEqual(tag, hmac("SHA-256", "a key", "another message")))
+print(sha256("abc"))
 ```
 
 ```output
 18 32 32
+true true
 true
 false
+<bytes 32: ba 78 16 bf 8f 01 cf ea 41 41 40 de 5d ae 22 23 ...>
 ```
+
+**Every answer here is [`bytes`](bytes.md), and every argument may be an array of numbers.** A digest,
+a tag, a derived key and the kernel's randomness are all buffers — `sha256("abc").toArray()` is the
+array of numbers where a program genuinely wants one, and `hmac("SHA-256", [1, 2], [3])` still reads
+exactly as it did.
 
 | | |
 |---|---|
@@ -61,7 +70,7 @@ eight thousand SHA-256 compressions — a millisecond as a native and seconds in
 
 ## `timingSafeEqual`
 
-**What a program checks a tag it was sent with.** `==` on two byte arrays stops at the first byte that
+**What a program checks a tag it was sent with.** `==` on two buffers stops at the first byte that
 differs, which tells an attacker how much of a forged tag was right, and a tag can be guessed a byte at a
 time from that.
 

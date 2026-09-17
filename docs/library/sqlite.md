@@ -89,7 +89,7 @@ do: `where id = ?` called with no parameter would otherwise run, match nothing, 
 | `INTEGER` | an integer, read as 64 bits |
 | `REAL` | a real |
 | `TEXT` | text |
-| `BLOB` | an array of bytes |
+| `BLOB` | [`bytes`](bytes.md) |
 | `NULL` | `null` |
 
 **The type belongs to the value and not to the column.** SQLite is dynamically typed: a column
@@ -97,8 +97,13 @@ declared `integer` holds whatever was put in it, and two rows of one column may 
 cell comes back as is decided per row, by what is actually stored there.
 
 Going out: text as itself, an integer and a real as themselves, `null` as SQL NULL, `true` and
-`false` as 1 and 0 (SQLite has no boolean storage class), and **an array as a blob**. That last one is
-simpler here than in PostgreSQL, which has both `int[]` and `bytea` and needs to be told which.
+`false` as 1 and 0 (SQLite has no boolean storage class), and **bytes — or an array of numbers — as a
+blob**. That last one is simpler here than in PostgreSQL, which has both `int[]` and `bytea` and needs
+to be told which.
+
+**A blob comes back as a buffer and goes out as either**, which is the rule everywhere in the
+language: `row.avatar` is [`bytes`](bytes.md), `row.avatar.toArray()` is the array where a program
+wants one, and a parameter written as `[1, 2, 3]` binds exactly as it did.
 
 ## A transaction commits on a return and rolls back on a fault
 
