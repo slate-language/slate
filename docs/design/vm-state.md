@@ -9,10 +9,11 @@ slate's interpreter keeps its state in a `Vm` struct, and `current()` answers th
 of execution belongs to. This page says why, what is in it, what is deliberately not, and how to move
 the next file.
 
-**This one is half built, unlike its neighbours.** The struct, the accessor and the core of the
-runtime are on `dev`; the forty-nine declarations listed below are not, and neither is the per-actor
-heap. It is here rather than under `reference/` because what it is *for* is the actors design, and the
-list of what is left is the next piece of that work rather than a description of the language.
+**The struct is now whole.** Every module-level `var` that was per-VM state has moved into `Vm`; what
+is still process-wide is marked as such and stays where it is, and what is still missing is the
+per-actor heap. It is here rather than under `reference/` because what it is *for* is the actors
+design, and a VM with a heap of its own is the next piece of that work rather than a description of
+the language.
 
 ## Why
 
@@ -63,10 +64,11 @@ Four things, and `tests_vm_state.sysl` counts each of them:
 | the VM | `the_vm` in `vm_state.sysl` | by name | 1 |
 | **B**, a native's id | `var n_<name>: NativeFn = 0` | by shape | 367 |
 | **B/C**, process-wide | marked `process-wide:` in the comment above it | by the marker | 14 |
-| **A**, still owed | anything else | by elimination | 49 |
+| **A**, still owed | anything else | by elimination | 0 |
 
 **A new global is none of the first three**, so it lands in the fourth and fails the census until its
-file's number is raised — which is a decision somebody makes rather than an accident.
+file's number is raised — which is a decision somebody makes rather than an accident. The fourth is
+zero now, and stays zero unless a file grows one back.
 
 ### Class B — process-wide, and why each one qualifies
 
@@ -88,19 +90,53 @@ file's number is raised — which is a decision somebody makes rather than an ac
   `root_values`, `root_envs`, the spares, the counters and `heap_limit` are all `Vm` fields — so the
   day a VM is spawned with a block of its own, the only thing left to move is the heap handle itself.
 
-### Class A — the 49 still owed
+### Class A — none owed, and the two shapes the 49 turned out to be
 
-`tests_vm_state.sysl` carries the list as `file count`. In rough order of how obviously per-VM they
-are: `async.sysl` 4 (the ready queue and the rejection list), `generator.sysl` 2, `runtime.sysl` 1
-(`current_source`), `check.sysl` 2 (the checker's view of the builtin scope), `window.sysl` 4,
-`process.sysl` 4, `lmdb.sysl` 4, `nghttp2.sysl` 3, `sqlite.sysl` 2, `signals.sysl` 2, `channel.sysl` 2,
-`define.sysl` 2, `regex.sysl` 2, `ast.sysl` 2, `gzip.sysl` 2, and one each in `argon2.sysl`,
+Every file that owed a move -- `async.sysl`, `generator.sysl`, `runtime.sysl`, `check.sysl`,
+`window.sysl`, `process.sysl`, `lmdb.sysl`, `nghttp2.sysl`, `sqlite.sysl`, `signals.sysl`,
+`channel.sysl`, `spawn.sysl`, `define.sysl`, `regex.sysl`, `ast.sysl`, `gzip.sysl`, `argon2.sysl`,
 `client.sysl`, `combine.sysl`, `http_parse.sysl`, `packages.sysl`, `pattern.sysl`, `redis_parse.sysl`,
-`shape.sysl`, `spawn.sysl`, `time.sysl` and `tls.sysl`.
+`shape.sysl` and `tls.sysl` -- has made its move. `tests_vm_state.sysl`'s `StateOwed` is empty and
+`StateOwedTotal` is `0`.
 
-**`gzip.sysl`'s two are the one shape that needs a decision rather than a move**: they are fixed-size
-`u8` arrays of miniz scratch, so whether `Vm` carries them or points at them is a question about how
-big a VM is allowed to be, and the answer belongs with the per-actor heap ceiling.
+**`gzip.sysl`'s two needed a decision rather than a plain move, and it was decided this way**: the
+compressor's `miniz.DEFLATE_BYTES` and the decompressor's `miniz.INFLATE_BYTES` (each a `sizeof` plus
+its alignment, around 168 KB and 8 KB) are each a heap-allocated `Buf[u8]` (`current().deflate_state`,
+`current().inflate_state`), not an inline array on `Vm` -- a struct field that size would be copied
+every time a `Vm` is, and `new_vm()` allocates each once instead. Passed to
+`miniz.deflate`/`miniz.inflate` as `.view()`, which is the slice the binding actually wants.
+
+**`buf_with_capacity(n, fill)` was the wrong tool here and cost a red gate finding it out.** Its own
+doc comment says why: *"a buffer that has already been given room for `n` elements"* is CAPACITY, not
+LENGTH -- `count` starts at zero, matching `Vec::with_capacity`'s rule rather than a fill. miniz's
+`deflate`/`inflate` check `storage.len < N`, so a capacity-only buffer answers `NoRoom` on the very
+first call: `.len()` is 0 regardless of how large `n` was. `zeroed_scratch(n)` in `vm_state.sysl`
+pushes `n` zero bytes one at a time instead, which is the one place `buf_with_capacity`'s name invites
+exactly the mistake it does not do.
+
+**Two things cost a rebuild each and are worth knowing before the next VM field:**
+
+- **A type a new `Vm` field names must be at least as visible as the field.** `Vm` is public, so a
+  field of type `Buf[Slot]` or `Buf[Option[&Argon2Job]]` forces `Slot`/`Argon2Job` (and anything
+  *they* name, transitively -- `Slot.arrived: &Arrived` dragged `Arrived`, and `Arrived` dragged
+  `Held` and `Piece`) out of `private`. The compiler catches every one of these by name --
+  *"a declaration may not be more visible than the types it names"* -- so it costs a rebuild rather
+  than a silent gap, but expect to walk a small tree of types outward from the field you are adding.
+- **Type names are module-wide even where the declaration is `private`.** Two files each had their
+  own `private struct Slot` (`http_parse.sysl`, `shape.sysl`) and a third had one too
+  (`tls.sysl`'s table, then renamed): fine as long as both stay private, but the first one a field
+  drags public collides with the compiler's *"type 'Slot' is already declared"* the moment a second
+  file's `Slot` needs to travel the same way. `shape.sysl`'s became `ShapeSlot` and `tls.sysl`'s
+  table field became `tls_slots` for this reason -- rename on the way out rather than after the
+  collision.
+
+**A field behind a feature is gated in `Vm` exactly as its file is.** `window.sysl` (`webview`),
+`lmdb.sysl` (`lmdb`), `nghttp2.sysl` (`http2`) and `redis_parse.sysl` (`redis`) each declare types
+that do not exist without their feature, so the corresponding `Vm` fields, the matching slice of
+`new_vm()`'s constructor call, and any import those types need are each wrapped in the same
+`#if feature_x` / `#endif` the source file uses -- `#if` gates a struct's field list and a
+constructor's argument list exactly as it gates any other run of lines. Built and checked under both
+`sysl build .` (all features) and `sysl build . --no-default-features`.
 
 ## How to move a file
 

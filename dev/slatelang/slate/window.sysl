@@ -66,7 +66,9 @@ import sysl.buf.{Buf, buf}
 // -- the tables --------------------------------------------------------------------------------------
 
 // One window, and the promise `windowDone` answers about it.
-private struct OpenWindow
+//
+// Not `private`: `vm_state.sysl` names it in `Vm`.
+struct OpenWindow
     // The window, and `None` once it has gone. Dropping it here is what frees it.
     w: Option[&webview.Webview]
 
@@ -82,14 +84,18 @@ end OpenWindow
 // is `event.sysl`'s arrangement and is not a style choice: a counted box may not live in GC memory,
 // and the collector cannot see through one into a slate value a sysl closure captured. So what the
 // closure carries is a number, and this table is what the mark phase walks.
-private struct PageBinding
+//
+// Not `private`: `vm_state.sysl` names it in `Vm`.
+struct PageBinding
     win: usize
     f: Value
     live: bool
 end PageBinding
 
 // One call a page made that has not been answered, because the handler gave back a promise.
-private struct PageCall
+//
+// Not `private`: `vm_state.sysl` names it in `Vm`.
+struct PageCall
     // The promise the handler answered with. **A collector root**, for `PageBinding.f`'s reason.
     answer: *PromiseObj
 
@@ -99,12 +105,11 @@ private struct PageCall
     call: string
 end PageCall
 
-private var windows: Buf[OpenWindow] = buf()
-private var bounds: Buf[PageBinding] = buf()
-private var page_calls: Buf[PageCall] = buf()
+// The open windows, the page-bound functions and the calls awaiting an answer are now
+// `current().windows`, `current().bounds` and `current().page_calls` -- see `vm_state.sysl`.
 
-// The slot in `event.sysl`'s table that the pump timer lives in, and `None` while no window is open.
-private var pump_slot: Option[usize] = None
+// The slot in `event.sysl`'s table that the pump timer lives in, and `None` while no window is open,
+// is `current().pump_slot`.
 
 // How often the platform's loop is turned over, in milliseconds. **About 120 Hz**, so the worst a
 // click waits to be seen is eight milliseconds and an idle window costs 125 wake-ups a second.
@@ -115,15 +120,17 @@ private val PumpEvery: u64 = 8
 // **Called from `roots` and not from `mark_pending`**, for `mark_watches`' reason: a bound function
 // is neither waiting for an answer nor outstanding on the loop -- it lasts as long as its window.
 mark_windows(h: *gc.Heap)
-    for i in 0..<windows.len()
-        if windows.at(i).done != null
-            gc.mark(h, ptr_cast(windows.at(i).done))
+    val v = current()
 
-    for i in 0..<bounds.len()
-        if bounds.at(i).live then mark_value(h, bounds.at(i).f)
+    for i in 0..<v.windows.len()
+        if v.windows.at(i).done != null
+            gc.mark(h, ptr_cast(v.windows.at(i).done))
 
-    for i in 0..<page_calls.len()
-        gc.mark(h, ptr_cast(page_calls.at(i).answer))
+    for i in 0..<v.bounds.len()
+        if v.bounds.at(i).live then mark_value(h, v.bounds.at(i).f)
+
+    for i in 0..<v.page_calls.len()
+        gc.mark(h, ptr_cast(v.page_calls.at(i).answer))
 end mark_windows
 
 // Give every window back between runs, which is what the socket table does and for the same reason:
@@ -133,8 +140,10 @@ end mark_windows
 // one process, so a window a faulted program never closed would still be there while the next test
 // ran, and the pump timer would still be turning its loop over.
 forget_windows()
-    for i in 0..<windows.len()
-        var open = windows.at(i)
+    val v = current()
+
+    for i in 0..<v.windows.len()
+        var open = v.windows.at(i)
 
         open.w match
             Some(w) -> w.terminate().unwrap_or(())
@@ -142,15 +151,15 @@ forget_windows()
 
         open.w = None
         open.done = null
-        windows.set(i, open)
+        v.windows.set(i, open)
 
-    windows.clear()
-    bounds.clear()
-    page_calls.clear()
+    v.windows.clear()
+    v.bounds.clear()
+    v.page_calls.clear()
 
     // **The slot itself is `reset_events`' to give back**, it being one of the slots that function
     // surrenders; what is put back here is only this file's name for it.
-    pump_slot = None
+    v.pump_slot = None
 end forget_windows
 
 // -- what a program calls ------------------------------------------------------------------------------
@@ -178,9 +187,9 @@ do_window(args: Buf[Value], at: Span) -> Step
     else
         w.html(how.html).unwrap_or(())
 
-    windows.push(OpenWindow(Some(w), null))
+    current().windows.push(OpenWindow(Some(w), null))
     start_pump(at)?
-    Ok(Int(long(windows.len() - 1)))
+    Ok(Int(long(current().windows.len() - 1)))
 end do_window
 
 // `windowBind(w, name, fn)` -- make `name` an asynchronous function on the page's `window` object.
@@ -204,20 +213,20 @@ do_window_bind(args: Buf[Value], at: Span) -> Step
         Native(_) -> ()
         other -> return fault(at, s"`windowBind` needs a function to call, and this is ${other.type_name()}")
 
-    bounds.push(PageBinding(id, args.at(2), true))
+    current().bounds.push(PageBinding(id, args.at(2), true))
 
-    val bid = bounds.len() - 1
+    val bid = current().bounds.len() - 1
 
     // **The closure captures the index and not the value**, which is the whole arrangement: the
     // collector cannot see through this box, so what it holds must be something it does not have to.
     w.bind_async(name, (call, page_args) -> page_called(bid, call, page_args)) match
         Ok(_) -> Ok(Null)
         Err(why) ->
-            var b = bounds.at(bid)
+            var b = current().bounds.at(bid)
 
             b.live = false
             b.f = Null
-            bounds.set(bid, b)
+            current().bounds.set(bid, b)
             fault(at, s"`${name}` could not be given to the page: ${why.message()}")
 end do_window_bind
 
@@ -279,10 +288,10 @@ do_window_close(args: Buf[Value], at: Span) -> Step
 
     val id = handle_of_window(args.at(0), at, "windowClose")?
 
-    if id >= windows.len()
+    if id >= current().windows.len()
         return fault(at, "`windowClose` was given something that is not a window")
 
-    windows.at(id).w match
+    current().windows.at(id).w match
         Some(w) ->
             w.terminate().unwrap_or(())
             window_gone(id)
@@ -300,10 +309,10 @@ do_window_closed(args: Buf[Value], at: Span) -> Step
 
     val id = handle_of_window(args.at(0), at, "windowClosed")?
 
-    if id >= windows.len()
+    if id >= current().windows.len()
         return fault(at, "`windowClosed` was given something that is not a window")
 
-    Ok(Bool(windows.at(id).w.is_none()))
+    Ok(Bool(current().windows.at(id).w.is_none()))
 end do_window_closed
 
 // `windowDone(w)` -- a promise that settles when the window has gone.
@@ -317,10 +326,10 @@ do_window_done(args: Buf[Value], at: Span) -> Step
 
     val id = handle_of_window(args.at(0), at, "windowDone")?
 
-    if id >= windows.len()
+    if id >= current().windows.len()
         return fault(at, "`windowDone` was given something that is not a window")
 
-    var open = windows.at(id)
+    var open = current().windows.at(id)
 
     if open.done == null
         val pr = new_promise()
@@ -328,12 +337,12 @@ do_window_done(args: Buf[Value], at: Span) -> Step
 
         hold(Promise(pr))
         open.done = pr
-        windows.set(id, open)
+        current().windows.set(id, open)
         release(mark)
 
         if open.w.is_none() then settle_ok(pr, Null)
 
-    Ok(Promise(windows.at(id).done))
+    Ok(Promise(current().windows.at(id).done))
 end do_window_done
 
 // -- the loop ------------------------------------------------------------------------------------------
@@ -344,8 +353,8 @@ end do_window_done
 // happens between two slate statements and nothing crosses a thread: a page's click reaches a slate
 // closure on the thread that built it.
 private pump_windows()
-    for i in 0..<windows.len()
-        windows.at(i).w match
+    for i in 0..<current().windows.len()
+        current().windows.at(i).w match
             Some(w) ->
                 w.pump() match
                     Ok(_) -> ()
@@ -361,32 +370,35 @@ end pump_windows
 
 // A window has gone: free it, settle what was waiting on it, and forget what it was bound to.
 private window_gone(id: usize)
-    var open = windows.at(id)
+    val v = current()
+    var open = v.windows.at(id)
 
     open.w = None
-    windows.set(id, open)
+    v.windows.set(id, open)
 
-    for i in 0..<bounds.len()
-        if bounds.at(i).live && bounds.at(i).win == id
-            var b = bounds.at(i)
+    for i in 0..<v.bounds.len()
+        if v.bounds.at(i).live && v.bounds.at(i).win == id
+            var b = v.bounds.at(i)
 
             b.live = false
             b.f = Null
-            bounds.set(i, b)
+            v.bounds.set(i, b)
 
     // **A call the page will never hear the answer to is dropped rather than answered**, the window
     // it would have been answered through being gone.
     var left: Buf[PageCall] = buf()
 
-    for i in 0..<page_calls.len()
-        if page_calls.at(i).win != id then left.push(page_calls.at(i))
+    for i in 0..<v.page_calls.len()
+        if v.page_calls.at(i).win != id then left.push(v.page_calls.at(i))
 
-    page_calls = left
+    v.page_calls = left
 
     if open.done != null then settle_ok(open.done, Null)
 end window_gone
 
 private no_window_is_open() -> bool
+    val windows = current().windows
+
     for i in 0..<windows.len()
         if windows.at(i).w.is_some() then return false
 
@@ -398,18 +410,18 @@ end no_window_is_open
 // **It claims an ordinary slot**, so `outstanding` counts it and a program with a window up does not
 // exit -- which is what a listening socket does and is the behaviour a program expects.
 private start_pump(at: Span) -> Result[unit, Signal]
-    if pump_slot.is_some() then return Ok(())
+    if current().pump_slot.is_some() then return Ok(())
 
     libuv.timer() match
         Err(e) -> Err(failure(at, s"a window's timer could not be made: ${e}"))
         Ok(t) ->
             val id = claim(Pending(Null, Null, null, Some(t), None, true, true, 0))
 
-            pump_slot = Some(id)
+            current().pump_slot = Some(id)
 
             t.start(0, PumpEvery, () -> pump_windows()) match
                 Err(e) ->
-                    pump_slot = None
+                    current().pump_slot = None
                     surrender(id)
                     Err(failure(at, s"a window's timer could not be started: ${e}"))
                 Ok(_) -> Ok(())
@@ -417,9 +429,9 @@ end start_pump
 
 // Stop it, which closes the handle and gives the slot back -- so the drain ends and the program can.
 private stop_pump()
-    pump_slot match
+    current().pump_slot match
         Some(id) ->
-            pump_slot = None
+            current().pump_slot = None
             surrender(id)
         None -> ()
 
@@ -427,9 +439,9 @@ private stop_pump()
 
 // A page called a bound function. **This runs on slate's thread**, being reached from the pump timer.
 private page_called(bid: usize, call: string, page_args: string)
-    if bid >= bounds.len() then return
+    if bid >= current().bounds.len() then return
 
-    val b = bounds.at(bid)
+    val b = current().bounds.at(bid)
 
     if !b.live then return
 
@@ -475,7 +487,7 @@ private page_called(bid: usize, call: string, page_args: string)
     answered match
         Promise(pr) ->
             pr.handled = true
-            page_calls.push(PageCall(pr, b.win, call))
+            current().page_calls.push(PageCall(pr, b.win, call))
 
             if pr.settled then settle_page_calls(pr)
         v -> answer_page(b.win, call, v)
@@ -488,15 +500,16 @@ end page_called
 // **Reached from `wake` in `async.sysl`**, which is where a promise tells everything watching it. The
 // entries are taken off the list before any of them is answered, for `settle_watches`' reason.
 settle_page_calls(pr: *PromiseObj)
+    val v = current()
     var taken: Buf[PageCall] = buf()
     var left: Buf[PageCall] = buf()
 
-    for i in 0..<page_calls.len()
-        if page_calls.at(i).answer == pr then taken.push(page_calls.at(i)) else left.push(page_calls.at(i))
+    for i in 0..<v.page_calls.len()
+        if v.page_calls.at(i).answer == pr then taken.push(v.page_calls.at(i)) else left.push(v.page_calls.at(i))
 
     if taken.is_empty() then return
 
-    page_calls = left
+    v.page_calls = left
 
     for i in 0..<taken.len()
         val c = taken.at(i)
@@ -519,9 +532,9 @@ private reject_page(id: usize, call: string, why: string)
     tell_page(id, call, Err(json_text(why)))
 
 private tell_page(id: usize, call: string, result: webview.Answer)
-    if id >= windows.len() then return
+    if id >= current().windows.len() then return
 
-    windows.at(id).w match
+    current().windows.at(id).w match
         Some(w) -> w.answer(call, result).unwrap_or(())
         None -> ()
 
@@ -642,9 +655,9 @@ private handle_of_window(v: Value, at: Span, name: string) -> Result[usize, Sign
         other -> Err(failure(at, s"`${name}` takes a window, and this is ${other.type_name()}"))
 
 private live_window(id: usize, at: Span, name: string) -> Result[&webview.Webview, Signal]
-    if id >= windows.len() then return Err(failure(at, s"`${name}` was given something that is not a window"))
+    if id >= current().windows.len() then return Err(failure(at, s"`${name}` was given something that is not a window"))
 
-    windows.at(id).w match
+    current().windows.at(id).w match
         Some(w) -> Ok(w)
         None -> Err(failure(at, s"this window has closed, and `${name}` needs an open one"))
 end live_window

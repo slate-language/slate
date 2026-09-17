@@ -1,8 +1,17 @@
 module dev.slatelang.slate
 
+import sh.sysl.miniz
 import sh.sysl.parsing.*
+import sh.sysl.sqlite
 import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
 import sysl.rand.{Rng, rng}
+#if feature_lmdb
+import sh.sysl.lmdb
+#endif
+#if feature_http2
+import sh.sysl.nghttp2.*
+#endif
 
 // The runtime's own state, gathered into one thing a VM owns.
 //
@@ -70,6 +79,55 @@ struct Vm
 
     // The first fault a callback raised, if any. Read once the loop stops.
     loop_fault: Option[Signal]
+
+    // -- promises and the scheduler that resumes what they wake (`async.sysl`) -----------------------
+
+    // The answers waiting to be handed back. **Not `private`: `vm.sysl`'s `Await` queues onto it.**
+    ready: Buf[Resumption]
+
+    // How far down `ready` the drain has got. A cursor rather than a shift, so that a resumption which
+    // queues more work does not move the entries behind it.
+    ready_head: usize
+
+    // Every promise that has failed, whether or not anything was waiting.
+    //
+    // **Kept until the program ends, because "was this handled?" cannot be answered when it fails.** A
+    // promise may be awaited long after it settles -- `val p = risky()` and then `await p` three lines
+    // later is the ordinary shape -- so the question is asked once, at the end, of everything that failed.
+    rejections: Buf[*PromiseObj]
+
+    // The watches still owed an answer.
+    //
+    // **A root the collector has to walk**, for `rejections`' reason and more sharply: between the native
+    // answering and the promise settling, nothing else holds either of these.
+    fault_watches: Buf[FaultWatch]
+
+    // The `all`/`allSettled`/`race`/`any` combinations still owed an answer (`combine.sysl`). A root
+    // the collector has to walk, for `fault_watches`' reason.
+    combinations: Buf[Combination]
+
+    // -- generators, `await`'s machinery driven by the program (`generator.sysl`) --------------------
+
+    // Every generator a program is holding, and every one it has abandoned half-finished.
+    //
+    // **Module storage, for the reason the event table is**: a `Machine` holds counted buffers and may
+    // not live in the collected heap, so what a `Value` carries is a slot number and the machine lives
+    // here. Nothing here needs marking of its own -- the suspended machine is in `parked`, which
+    // `mark_vm` already walks, and that is what keeps a half-run generator's locals alive.
+    generators: Buf[GenSlot]
+
+    // The number the next claim stamps its slot with. Never reused and never reset within a run.
+    gen_stamp: usize
+
+    // -- which file the running line came from (`runtime.sysl`) --------------------------------------
+
+    // Which file the machine is currently running code from, as an index into the unit's sources.
+    //
+    // **Set by the machine as it enters and leaves a chunk**, because the alternative is threading a
+    // file through every one of the 116 places that can raise a fault. A chunk knows which file it was
+    // compiled from; the machine knows which chunk it is in; so this is the two facts joined at the
+    // one moment anybody needs them.
+    current_source: usize
 
     // -- what the program printed, and what the running test asked (`builtin.sysl`) ------------------
 
@@ -166,6 +224,194 @@ struct Vm
     compile_faults: Report
     compile_fault_srcs: Buf[usize]
 
+    // -- the checker's view of the builtin scope (`check.sysl`) --------------------------------------
+
+    // The scope every program starts in, built once per check. A root nothing else refers to, thrown
+    // away when the next program is checked.
+    builtin_scope: *EnvObj
+
+    // The builtins' TYPES, kept apart from the walking scope so that a name the program took cannot be
+    // mistaken for the builtin a method call means.
+    builtin_types: TypeEnv
+
+    // -- running another program, and what this one was started as (`process.sysl`) ------------------
+
+    // Every `run` in flight.
+    running: Buf[Run]
+
+    // The executable this program was started as, and the file it was asked to run. Empty where
+    // nothing set them: a program under `slate test` or inside the compiler's own suite was not
+    // started from a command line of its own.
+    program_exec: string
+    program_script: string
+
+    // What was on the command line after the program's name, set by the driver before the program
+    // starts. A test sets it too, which is what makes `args` reachable from the suite.
+    program_args: Buf[string]
+
+    // -- SQLite connections and compiled statements (`sqlite.sysl`) ----------------------------------
+    //
+    // **The statements are given back FIRST wherever both are.** A statement holds the connection it
+    // came from, so clearing the connections while a statement is live would drop a reference that
+    // is not the last one and close nothing.
+    databases: Buf[Option[&sqlite.Db]]
+    statements: Buf[Option[&sqlite.Query]]
+
+    // -- signal watchers (`signals.sysl`) -------------------------------------------------------------
+
+    // Every signal this program is watching. A collector root: this table is the only thing standing
+    // between a registered handler and the sweep.
+    watches: Buf[Watch]
+
+    // The number the next registration will stamp its slot with. Never reused, never reset within a
+    // run.
+    watch_generation: usize
+
+    // -- child processes (`spawn.sysl`) and the channel wire (`channel.sysl`) -----------------------
+
+    // Every child this program has started. Nothing is reused: a value the program still holds names
+    // this slot for as long as the program runs.
+    children: Buf[Child]
+
+    // This program's own end of the channel it was started with, one slot to a program.
+    channels: Buf[Channel]
+
+    // The slot `channel()` has already opened, so that asking twice answers the same thing.
+    own_channel: Option[usize]
+
+    // -- reading parameters (`define.sysl`, `declare.sysl`) -----------------------------------------
+
+    // Whether each parameter of the definition just read was written `var`, parallel to its
+    // `params`. `parse_def` writes it LAST, after its body.
+    param_declares: Buf[bool]
+
+    // Whether a `var` parameter is legal where the definition being read stands -- true only in a
+    // class's `new`.
+    allow_declaring_params: bool
+
+    // -- compiled regular expressions (`regex.sysl`) ---------------------------------------------
+
+    // Every pattern this program has compiled. Never released: a compiled pattern has no `close`
+    // and a program cannot ask for one.
+    compiled: Buf[Compiled]
+
+    // Keyed by the pattern text and its flags, so an identical pattern compiles once.
+    pattern_ids: Map[string, usize]
+
+    // -- function bodies, interned while parsing (`ast.sysl`) --------------------------------------
+
+    // Every function body in the program, and a `Lambda` or a `Def` names one by its index here.
+    bodies: Buf[Expr]
+
+    // Whether the body at the same index yields, parallel to `bodies`. Answered by the parser
+    // rather than by a walk of the tree.
+    body_yields: Buf[bool]
+
+    // -- miniz's scratch state (`gzip.sysl`) --------------------------------------------------------
+    //
+    // **Heap-allocated rather than an inline array**, so a `Vm` itself stays small: `miniz.DEFLATE_BYTES`
+    // for the compressor and `miniz.INFLATE_BYTES` for the decompressor -- each a `sizeof` plus its
+    // alignment, around 168 KB and 8 KB -- both sized in `new_vm()` and never resized. Nothing here
+    // runs while anything else here is running, so one of each is enough.
+    deflate_state: Buf[u8]
+    inflate_state: Buf[u8]
+
+    // -- argon2 jobs handed to the thread pool (`argon2.sysl`) --------------------------------------
+
+    // The jobs the pool may still be reading, indexed by the request id that will answer them. A raw
+    // pointer keeps nothing alive, so the box is held here for as long as the pool may still read it.
+    argon2_jobs: Buf[Option[&Argon2Job]]
+
+    // -- outbound `fetch` calls (`client.sysl`) ------------------------------------------------------
+    fetches: Buf[Fetch]
+
+    // -- streaming HTTP parsers (`http_parse.sysl`) --------------------------------------------------
+    http_slots: Buf[Slot]
+
+    // -- declared types held as values (`shape.sysl`) ------------------------------------------------
+    //
+    // **Never given back**: a type declaration runs once and there is no `close` for a shape, so a
+    // slot names the same shape for as long as the program runs.
+    shape_slots: Buf[ShapeSlot]
+
+    // -- where packages are kept (`packages.sysl`) ---------------------------------------------------
+    //
+    // A setting rather than a constant, so a test can point it at a fixture. Empty means the ordinary
+    // answer: `$SLATE_CACHE`, or `$HOME/.slate/pkg`.
+    package_cache_dir: string
+
+    // -- the type parameters a definition is inside (`pattern.sysl`) --------------------------------
+    //
+    // One parse running at a time, and a region per definition -- `outer[T]` holding `inner[U]`
+    // leaves `U` unspellable the moment `inner` ends.
+    active_params: ScopedNames
+
+    // -- time zones, interned as they are asked for (`time.sysl`) --------------------------------
+    zones: Buf[ZoneEntry]
+
+    // -- TLS state per socket (`tls.sysl`) -----------------------------------------------------------
+    tls_slots: Buf[Tls]
+
+    // -- LMDB's four tables (`lmdb.sysl`), behind the `lmdb` feature ---------------------------------
+    //
+    // **Gated exactly as `lmdb.sysl` itself is**, `OpenTxn`, `OpenCursor` and `OpenDb` being declared
+    // inside that file's own `#if feature_lmdb`.
+#if feature_lmdb
+
+    // An environment, a transaction, a database and a cursor, each a number into the table it names.
+    envs: Buf[Option[&lmdb.Env]]
+    txns: Buf[Option[OpenTxn]]
+    cursors: Buf[Option[OpenCursor]]
+    dbs: Buf[OpenDb]
+#endif
+
+    // -- HTTP/2 sessions and HPACK conversations (`nghttp2.sysl`), behind the `http2` feature --------
+    //
+    // **Three tables rather than three variants of one**: nothing ever holds two of these at once,
+    // so the check is which table a handle is looked up in.
+#if feature_http2
+    sessions: Buf[Option[&Session]]
+    deflaters: Buf[Option[&Deflater]]
+    inflaters: Buf[Option[&Inflater]]
+#endif
+
+    // -- RESP reader slots (`redis_parse.sysl`), behind the `redis` feature --------------------------
+#if feature_redis
+    redis_slots: Buf[RedisSlot]
+#endif
+
+    // -- the desktop window bridge (`window.sysl`), behind the `webview` feature ---------------------
+    //
+    // **Gated exactly as `window.sysl` itself is.** `OpenWindow`, `PageBinding` and `PageCall` are
+    // declared inside that file's own `#if feature_webview`, so a build without the feature has no
+    // such types -- these fields have to be absent along with them rather than merely unused.
+#if feature_webview
+
+    // The open windows, and the promise `windowDone` answers about each.
+    windows: Buf[OpenWindow]
+
+    // Every `windowBind` registration: which window, and the slate function to call.
+    bounds: Buf[PageBinding]
+
+    // Every call a page made that has not been answered, because the handler gave back a promise.
+    page_calls: Buf[PageCall]
+
+    // The slot in `event.sysl`'s table that the pump timer lives in, and `None` while no window is
+    // open.
+    pump_slot: Option[usize]
+#endif
+
+// `n` zero bytes, with `len() == n` -- **not `buf_with_capacity`, whose `len()` stays 0** ("A buffer
+// that has already been given room for `n` elements" is capacity, not length; `count` starts at
+// zero, so its bytes are unread until something pushes into them). miniz's `deflate`/`inflate` check
+// `storage.len < N`, so a capacity-only buffer answers `NoRoom` on the first call. Runs once per `Vm`.
+private zeroed_scratch(n: usize) -> Buf[u8]
+    var b: Buf[u8] = buf()
+
+    for i in 0..<n do b.push(0u8)
+
+    b
+
 // A runtime with nothing in it yet.
 //
 // **Positional and in field order, because that is the shape sysl gives**, so a field added above is
@@ -177,12 +423,46 @@ new_vm() -> Vm
         new_unit(), buf(),
         buf(), no_hooks(), no_hook_names(),
         buf(), 0, 0, None,
+        buf(), 0, buf(), buf(),
+        buf(),
+        buf(), 0,
+        0,
         buf(), false, no_live_sink, false, "",
         rng(0u64, 0u64), false,
         HeapBytes, buf(), buf(), 0, CollectFloor, false,
         null, null, null, null, null, null, null, null,
         buf(), buf(),
-        0, buf(), buf(), buf(), buf(), buf(), buf(), report(), buf())
+        0, buf(), buf(), buf(), buf(), buf(), buf(), report(), buf(),
+        null, type_env(),
+        buf(), "", "", buf(),
+        buf(), buf(),
+        buf(), 0,
+        buf(), buf(), None,
+        buf(), false,
+        buf(), map(),
+        buf(), buf(),
+        zeroed_scratch(miniz.DEFLATE_BYTES), zeroed_scratch(miniz.INFLATE_BYTES),
+        buf(),
+        buf(),
+        buf(),
+        buf(),
+        "",
+        scoped_names(),
+        buf(),
+        buf()
+#if feature_lmdb
+        , buf(), buf(), buf(), buf()
+#endif
+#if feature_http2
+        , buf(), buf(), buf()
+#endif
+#if feature_redis
+        , buf()
+#endif
+#if feature_webview
+        , buf(), buf(), buf(), None
+#endif
+        )
 
 // The one module-level `var` the runtime keeps, and it is the VM itself.
 //
