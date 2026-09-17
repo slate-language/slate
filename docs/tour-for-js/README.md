@@ -485,9 +485,11 @@ its own sentence.
 **`//` is the only comment** — there is no block comment, and `#` is not a comment at all, being the
 shebang and nothing else.
 
-**A trailing operator does not continue a line.** `a +` followed by `b` on the next line is two
-statements. Where an expression has to span lines, brackets say so, and inside them the off-side rule
-is suspended.
+**A binary operator left dangling at the end of a line continues the statement**, JavaScript's own
+rule for automatic semicolon insertion, read the other way — `a +` followed by `b` on the next line
+is a sum, at whatever indentation `b` sits at. A line that instead starts with the operator is a
+statement of its own. Brackets suspend the off-side rule too, which is the other way to spread an
+expression across lines.
 
 ## Where to go next
 
