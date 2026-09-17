@@ -177,6 +177,18 @@ push_refuses_a_byte_outside_the_range_and_a_value_that_is_not_one() =
     assert(contains(push(b, anything("x")) catch e -> e.message, "a byte or more bytes"))
     assertEq(b.length, 0)
 
+// **A NAME STATICALLY KNOWN TO BE `bytes` USED TO REFUSE `push` AT COMPILE TIME**, which stopped
+// this program before either back end got to run it -- so a checker defect here is a differential
+// test by construction, both hosts failing alike until `signatures.sysl`'s `push` accepted `bytes`.
+@test
+push_TAKES_A_PARAMETER_ANNOTATED_bytes() =
+    putBytes(out: bytes, s) = push(out, toBytes(s, "latin1"))
+    val out = bytes(0)
+
+    putBytes(out, "hi")
+
+    assertEq(fromBytes(out).value, "hi")
+
 @test
 indexOf_finds_a_byte_or_a_run_and_answers_null_for_a_miss() =
     val head = toBytes("GET / HTTP/1.1\r\n\r\n")
