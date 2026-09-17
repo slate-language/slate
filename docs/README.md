@@ -6,8 +6,8 @@ summary: A small indentation-structured, garbage-collected language with a gradu
 
 # The slate documentation
 
-Four sections, and the split is between what the compiler enforces, what ships beside it, and what
-somebody else has written.
+The split is between what the compiler enforces, what ships beside it, what somebody else has
+written — and, last, what is still only a design.
 
 | | |
 |---|---|
@@ -16,6 +16,7 @@ somebody else has written.
 | [Language reference](reference/) | every construct written down once, in its own place, with the rules complete |
 | [The library](library/) | what a program has without writing it: the globals, and the `slate:` modules |
 | [The packages](packages/) | what is written in slate today — a server, a client, a framework |
+| [Design](design/) | what is not built yet, argued before the work — and not run, where everything above is |
 
 The [README](https://github.com/slate-language/slate) on the repository is the shorter thing: what
 slate is, how to install it, and enough of a taste to decide whether to read further.
