@@ -503,6 +503,51 @@ clear_timer(v: Value, at: Span) -> Step
             Ok(Null)
         other -> fault(at, s"a timer is cancelled by its id, and this is ${other.type_name()}")
 
+// Everything claimed since `gen_floor` and still open, closed and named -- called AFTER the ordinary
+// drain has already had its turn, so this finds something only where that drain gave up on it.
+//
+// **Walked by GENERATION, not by count.** `outstanding` says how many slots are live and nothing
+// about which ones: a slot spent and reused between two tests leaves the count exactly where it was
+// while naming something new. `Pending.gen` only ever goes up, so a slot claimed after the floor is a
+// slot this scope opened, whether or not its number was reused from one that closed cleanly. Closing
+// it here is what keeps a leak from being inherited by whatever runs next -- the next test's own
+// floor, or the file's drain after `@teardownAll` -- and naming it here is what turns a bare timeout
+// into a report that says WHAT was left rather than only how long the wait was.
+leaked_since(gen_floor: usize) -> string
+    var named: Buf[string] = buf()
+
+    for i in 0..<current().pending.len()
+        val slot = current().pending.at(i)
+
+        if slot.live && slot.gen > gen_floor
+            named.push(leak_description(slot))
+            surrender(i)
+
+    if named.is_empty() then return ""
+
+    var joined = named.at(0)
+
+    for i in 1..<named.len()
+        joined = s"${joined}, ${named.at(i)}"
+
+    val word = if named.len() == 1 then "handle" else "handles"
+
+    s"left ${named.len()} ${word} open: ${joined}"
+end leaked_since
+
+// What a leaked slot was, for the sentence `leaked_since` reports.
+private leak_description(slot: Pending) -> string
+    slot.socket match
+        Some(sock) -> sock.sockname() match
+            Err(_) -> "a socket"
+            Ok(addr) -> sock.peername() match
+                Ok(_) -> s"a TCP connection on :${addr.port()}"
+                Err(_) -> s"a TCP server on :${addr.port()}"
+        None -> slot.timer match
+            Some(_) -> "a timer"
+            None -> "a handle"
+end leak_description
+
 // Run until nothing is outstanding and nothing is owed.
 //
 // **This is what makes a slate program with a timer in it not exit immediately.** node does the same:
@@ -531,6 +576,19 @@ drain_events_to(floor: usize) -> Result[unit, Signal]
     // guard below for what it is for.
     var idle = 0
 
+    // **A per-scope drain is bounded; the whole program's is not.** `floor == 0` is `run` and
+    // `prepare` draining an ENTIRE program, where a server that never closes its own listener is
+    // running exactly as it was written to -- there is no time after which that becomes wrong. Above
+    // a floor this stands in for one test's own scope, and the ordinary case is a handle that is
+    // ALWAYS going to close on its own -- a backoff timer a moment from firing -- which this waits
+    // out exactly as it always did. The bound is what stops that same wait for a handle that is
+    // NEVER going to close: `run_guarded` reads a timeout here and calls `leaked_since` to say what
+    // was still open and close it, so a leak becomes a named failure at a few seconds rather than an
+    // unbounded hang.
+    val bounded = floor > 0
+    val started = libuv.hrtime()
+    val backstop_ms: u64 = 5000
+
     loop
         run_microtasks()
 
@@ -541,6 +599,9 @@ drain_events_to(floor: usize) -> Result[unit, Signal]
             None -> ()
 
         if current().outstanding <= floor then break
+
+        if bounded && libuv.hrtime() - started > backstop_ms * 1000000
+            return Err(failure(point(0), s"the event loop did not drain: ${current().outstanding - floor} handle(s) still open after ${backstop_ms}ms"))
 
         // **A turn reporting nothing active does NOT end the drain, and thinking it did cost a
         // working file system.** A timer is a handle and libuv counts it, so a loop with one
