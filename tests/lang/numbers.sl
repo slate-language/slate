@@ -26,6 +26,16 @@ the_two_kinds_are_equal_when_they_stand_for_the_same_number() =
     assert(!(1 == 1.5))
 
 @test
+a_real_literal_rounds_to_the_nearest_double_however_many_digits_it_has() =
+    // A real literal used to be refused as "too large to hold" past twenty digits of fraction, the
+    // lexer having built the fraction into a 64-bit integer on the way to finding where it ends. It
+    // has to round to the nearest double whatever its length, exactly as node's reader does for the
+    // same text -- which is what makes this a differential test rather than one pinned by hand.
+    assertEq(0.123456789012345678901, 0.12345678901234568)
+    assertEq(0.1234567890123456789012345678901234567890, 0.12345678901234568)
+    assertEq(99999999999999999999.5, 100000000000000000000.0)
+
+@test
 shifting_is_to_sixty_three_places() =
     assertEq(1 << 3, 8)
     assertEq(-8 >> 1, -4)
@@ -216,8 +226,10 @@ log_OF_A_NON_POSITIVE_NUMBER_ANSWERS_NAN_OR_MINUS_INFINITY_RATHER_THAN_FAULTING(
 
 @test
 cbrt_ANSWERS_THE_REAL_CUBE_ROOT_INCLUDING_OF_A_NEGATIVE_NUMBER() =
-    assertEq(cbrt(27), 3.0)
-    assertEq(cbrt(-27), -3.0)
+    // Compared within a tolerance rather than for equality: glibc's cbrt and macOS's disagree in the
+    // last bit for these inputs, so an exact assertion is a test of which libm the machine has.
+    assert((cbrt(27) - 3.0).abs() < 1e-12)
+    assert((cbrt(-27) - (-3.0)).abs() < 1e-12)
 
 @test
 hypot_IS_THE_LENGTH_OF_THE_HYPOTENUSE() =
@@ -229,7 +241,7 @@ a_number_answers_the_single_argument_ones_as_methods_too() =
     // `sqrt`'s own precedent: a free function of one number is that number's method as well.
     assert(((PI / 2).sin() - 1).abs() < 1e-12)
     assertEq((0).cos(), 1.0)
-    assertEq((27).cbrt(), 3.0)
+    assert(((27).cbrt() - 3.0).abs() < 1e-12)
     assert(((1.0).log() - 0).abs() < 1e-12)
 
 @test
