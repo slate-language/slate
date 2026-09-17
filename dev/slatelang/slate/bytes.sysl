@@ -1,0 +1,318 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{from_utf8, str_builder}
+
+// A buffer of raw bytes, and what a program does to one.
+//
+// **ONE BYTE PER BYTE, WHICH IS THE WHOLE OF WHY THIS KIND EXISTS.** Until now a slate program held
+// bytes as an array of numbers: sixteen bytes of storage for each one, every read through a tagged
+// union, and an encoder that had to undo UTF-8 one element at a time inside the interpreter. There
+// was also no way at all to say *the bytes of this string, in this encoding*, or to append one run of
+// bytes to another -- so a protocol encoder wrote both of those out by hand.
+//
+// **The operations here are memory operations and none of them loops in slate.** `concat` and `push`
+// are a copy of a run of memory with amortised growth, `slice` is a copy, `indexOf` is a scan, and
+// `length` is a field. What a program used to write as a `for` over an array is one call.
+//
+// **The names are the ARRAY'S names** -- `push`, `concat`, `slice`, `indexOf`, `contains`, `at`,
+// `clear` -- because a program that held bytes as an array of numbers keeps the sentence it already
+// wrote. The few that are about values rather than about bytes are not here: `map`, `sort` and
+// `groupBy` belong to the kind that holds values, and `b.toArray()` is how a program reaches them.
+
+// -- the shapes these take ------------------------------------------------------------------------
+
+private bytes_of_value(v: Value, at: Span, name: string) -> Result[*BytesObj, Signal] = v match
+    Bytes(b) -> Ok(b)
+    other -> Err(failure(at, s"`${name}` takes bytes, and this is ${other.type_name()}"))
+
+// A byte a program wrote as a number, or the complaint about what it wrote instead.
+//
+// **Not `private`: every site that stores one asks this** -- `bytes([...])`, `push`, `b[i] = v` --
+// and three readings of "between 0 and 255" would be three places for the bound to be got wrong.
+byte_of_value(v: Value, at: Span) -> Result[u8, Signal] = v match
+    Int(n) ->
+        if n < 0 || n > 255
+            Err(failure(at, s"a byte is between 0 and 255, and this is ${n}"))
+        else
+            Ok(u8(n))
+    other -> Err(failure(at, s"a byte is a whole number between 0 and 255, and this is ${other.type_name()}"))
+
+// The bytes of whatever was given, where either a buffer or an array of numbers is meant.
+//
+// **THE ONE READING OF "bytes arrived here", so the two spellings cannot drift.** Every builtin that
+// took an array of numbers takes a buffer as well -- that is what keeps the old shape working -- and
+// this is one line at each of those sites rather than two arms and two sentences apiece.
+//
+// **The answer SHARES the buffer's storage when a buffer was given**, which is what makes it free:
+// a `Buf` copies as a counted handle onto the same bytes. Callers read it and hand it to a host call;
+// nothing here writes through one.
+bytes_like(v: Value, at: Span, name: string) -> Result[Buf[u8], Signal] = v match
+    Bytes(b) -> Ok(b.data)
+    Array(a) -> bytes_of(a, at, name)
+    other -> Err(failure(at, s"`${name}` takes bytes or an array of numbers, and this is ${other.type_name()}"))
+
+// A copy of a run of bytes, as a buffer a value can own.
+private copied(xs: []const u8) -> Buf[u8]
+    var out: Buf[u8] = buf()
+
+    out.extend(xs)
+    out
+end copied
+
+// -- making one -----------------------------------------------------------------------------------
+
+// `bytes(n)` -- that many zero bytes. `bytes([1, 2, 255])` -- those bytes. `bytes(b)` -- a copy.
+//
+// **A COUNT AND NOT A LIST WHEN IT IS A NUMBER**, which is JavaScript's `Buffer.alloc` and Python's
+// `bytes(n)`: a program asking for a buffer of a size wants room, and a program that meant one byte
+// wrote `bytes([n])`. The two readings are told apart by the kind of the argument, so neither is a
+// flag.
+//
+// **A copy where a buffer was given**, because there is no other reading: `bytes(b)` handing back `b`
+// would be a call that did nothing, and a program writes it exactly when it wants a buffer the other
+// one's `push` cannot reach.
+do_bytes(args: Buf[Value], at: Span) -> Step
+    if args.len() != 1
+        return fault(at, s"`bytes` takes a count, an array of numbers or bytes to copy, and was given ${counted(args.len(), "argument")}")
+
+    args.at(0) match
+        Int(n) ->
+            if n < 0 then return fault(at, s"`bytes` takes a count that is not negative, and this is ${n}")
+
+            // A count the machine cannot honour is a sentence and not an abort, which is `repeat`'s
+            // rule for the same reason: the number came from the program.
+            if n > 2147483647 then return fault(at, s"`bytes` was asked for ${n} bytes, which is past the 2147483647 a buffer can hold")
+
+            var out: Buf[u8] = buf()
+            var i: long = 0
+
+            while i < n
+                out.push(0u8)
+                i += 1
+
+            Ok(bytes_value(out))
+        Array(a) -> Ok(bytes_value(bytes_of(a, at, "bytes")?))
+        Bytes(b) -> Ok(bytes_value(copied(b.data.view())))
+        other -> fault(at, s"`bytes` takes a count, an array of numbers or bytes to copy, and this is ${other.type_name()}")
+end do_bytes
+
+// -- reading one ----------------------------------------------------------------------------------
+
+// `at(b, i)` -- one byte, counted from either end. Out of range is a fault, as `xs.at(i)`'s is.
+do_bytes_at(args: Buf[Value], at: Span) -> Step
+    if args.len() != 2 then return fault(at, s"`at` takes bytes and a position, and was given ${counted(args.len(), "argument")}")
+
+    val b = bytes_of_value(args.at(0), at, "at")?
+    val n = b.data.len()
+    val i = from_either_end(args.at(1), at, "at", n)?
+
+    if i < 0 || usize(i) >= n
+        return fault(at, s"`at` was given the position ${i}, and these bytes have ${n} of them")
+
+    Ok(Int(long(b.data.at(usize(i)))))
+end do_bytes_at
+
+// `slice(b, from)` and `slice(b, from, to)` -- a NEW buffer of the part between two positions.
+//
+// **Both ends clamp and `to` is exclusive**, which is what the array's `slice` does -- and it is a
+// copy rather than a view for the reason the array's is: a view whose source is then `push`ed would
+// answer bytes the program never put in it, and slate has no lifetime to say otherwise with.
+do_bytes_slice(args: Buf[Value], at: Span) -> Step
+    if args.len() != 2 && args.len() != 3
+        return fault(at, s"`slice` takes bytes, a position and an optional end, and was given ${counted(args.len(), "argument")}")
+
+    val b = bytes_of_value(args.at(0), at, "slice")?
+    val n = b.data.len()
+    val lo = clamped_into(from_either_end(args.at(1), at, "slice", n)?, n)
+
+    val hi = if args.len() == 3
+        clamped_into(from_either_end(args.at(2), at, "slice", n)?, n)
+    else
+        n
+
+    if hi <= lo then return Ok(bytes_value(buf()))
+
+    Ok(bytes_value(copied(b.data.view()[lo..<hi])))
+end do_bytes_slice
+
+// A position clamped into a buffer, which is what slicing means: asking for more than is there gives
+// what is there. **Not `private`: `read_at` slices a buffer with a range and clamps it the same way.**
+clamped_into(i: long, n: usize) -> usize
+    if i < 0 then return 0
+    if usize(i) > n then return n
+
+    usize(i)
+end clamped_into
+
+// `concat(a, b, ...)` -- every byte of every buffer given, in one new buffer.
+//
+// **An array of numbers is accepted beside a buffer**, which is what keeps the old shape working:
+// a program joining a header it built as an array onto a body it read off a socket says what it
+// means without converting either.
+do_bytes_concat(args: Buf[Value], at: Span) -> Step
+    if args.len() == 0 then return fault(at, "`concat` takes at least one buffer and was given none")
+
+    var out: Buf[u8] = buf()
+
+    for i in 0..<args.len()
+        out.extend(bytes_like(args.at(i), at, "concat")?.view())
+
+    Ok(bytes_value(out))
+end do_bytes_concat
+
+// `indexOf(b, what)` -- where a byte or a run of bytes first occurs, or `null`.
+//
+// **A RUN AND NOT ONLY A BYTE, because that is the question a protocol asks**: finding `\r\n\r\n` in
+// what has arrived so far is how every framed reader knows it has a header, and a program without
+// this wrote the scan itself.
+//
+// **A MISS ANSWERS `null` AND NEVER `-1`**, which is the array's answer and the string's: slate has
+// no out-of-band integer, so the absence of a position is the absence value.
+do_bytes_index_of(args: Buf[Value], at: Span) -> Step
+    if args.len() != 2 then return fault(at, s"`indexOf` takes bytes and what to look for, and was given ${counted(args.len(), "argument")}")
+
+    val b = bytes_of_value(args.at(0), at, "indexOf")?
+
+    args.at(1) match
+        Int(_) ->
+            val one = byte_of_value(args.at(1), at)?
+
+            for i in 0..<b.data.len()
+                if b.data.at(i) == one then return Ok(Int(long(i)))
+
+            Ok(Null)
+        _ ->
+            val what = bytes_like(args.at(1), at, "indexOf")?
+            val found = find_run(b.data.view(), what.view())
+
+            if found < 0 then Ok(Null) else Ok(Int(found))
+end do_bytes_index_of
+
+// `contains(b, what)` -- whether `indexOf` would find it.
+do_bytes_contains(args: Buf[Value], at: Span) -> Step
+    do_bytes_index_of(args, at)? match
+        Int(_) -> Ok(Bool(true))
+        _ -> Ok(Bool(false))
+
+// Where a run of bytes first occurs inside another, or `-1` -- which the caller turns into `null`.
+//
+// **An empty needle is found at 0**, which is what every `indexOf` in every language answers and what
+// `"abc".indexOf("")` answers here.
+private find_run(hay: []const u8, needle: []const u8) -> long
+    if needle.len == 0 then return 0
+    if needle.len > hay.len then return -1
+
+    val last = hay.len - needle.len
+    var i: usize = 0
+
+    while i <= last
+        var j: usize = 0
+        var same = true
+
+        while j < needle.len
+            if hay[i + j] != needle[j]
+                same = false
+                break
+
+            j += 1
+
+        if same then return long(i)
+
+        i += 1
+
+    -1
+end find_run
+
+// `toArray(b)` -- the bytes as an array of numbers.
+//
+// **The door back to the forty names an array has**, and the shape every builtin that took bytes as
+// an array still accepts. It is a copy and says so by being a call: an array of a megabyte of bytes
+// is sixteen megabytes, which is the cost this kind exists to avoid paying by default.
+do_to_array(args: Buf[Value], at: Span) -> Step
+    if args.len() != 1 then return fault(at, s"`toArray` takes bytes and was given ${counted(args.len(), "argument")}")
+
+    val b = bytes_of_value(args.at(0), at, "toArray")?
+    var items: Buf[Value] = buf()
+
+    for i in 0..<b.data.len()
+        items.push(Int(long(b.data.at(i))))
+
+    Ok(Array(new_array(items)))
+end do_to_array
+
+// -- the encodings ---------------------------------------------------------------------------------
+
+// The two names `toBytes` and `fromBytes` take, and what a third one is told.
+//
+// **TWO AND NOT A TABLE OF THIRTY.** UTF-8 is what slate's strings are and latin1 is the one other
+// encoding a byte-oriented protocol needs -- it is how every byte value is carried through a string
+// unharmed, which is what a Redis reply, an HTTP body read as text and node's own `'binary'` all
+// mean by it. Anything else is a conversion table, which belongs in a package rather than in the
+// language.
+// Not `private`: `toBytes` and `fromBytes` live in `text.sysl`, beside the rest of the text surface.
+encoding_named(v: Value, at: Span, name: string) -> Result[bool, Signal] = v match
+    Str(p) ->
+        if p.s == "utf8" || p.s == "utf-8" then Ok(true)
+        elif p.s == "latin1" then Ok(false)
+        else Err(failure(at, s"`${name}` knows the encodings `utf8` and `latin1`, and this is `${p.s}`"))
+    other -> Err(failure(at, s"`${name}` takes the name of an encoding as text, and this is ${other.type_name()}"))
+
+// The UTF-8 bytes of a string. **The bytes are already there**, a slate string being UTF-8, so this
+// is a copy of a run of memory and not an encoding pass.
+utf8_bytes(s: string) -> Buf[u8] = copied(s.bytes)
+
+// The latin1 bytes of a string -- each character below 256 as one byte.
+//
+// **A character at or above 256 FAULTS AND THE SENTENCE NAMES IT**, because there is no byte for it
+// and the alternatives are both worse: a `?` silently corrupts the data a program was trying to
+// carry, and a truncation to the low eight bits corrupts it while looking like it worked.
+latin1_bytes(s: string, at: Span, name: string) -> Result[Buf[u8], Signal]
+    var out: Buf[u8] = buf()
+
+    for c in s.chars
+        val code = u32(c)
+
+        if code > 255u32
+            var one = str_builder()
+
+            one.push_char(c)
+
+            return Err(failure(at, s"`${name}` was asked for latin1 and this text holds `${one.finish()}`, which is character ${code} and has no byte"))
+
+        out.push(u8(code))
+
+    Ok(out)
+end latin1_bytes
+
+// A run of bytes read back as latin1 -- each byte as the character of that number.
+//
+// **This never fails, which is the whole point of it.** Every one of the 256 byte values names a
+// character in latin1, so a buffer of arbitrary bytes always decodes -- where UTF-8 may refuse, and
+// has to.
+latin1_text(xs: []const u8) -> string
+    var out = str_builder()
+
+    for i in 0..<xs.len
+        out.push_char(char(u32(xs[i])))
+
+    out.finish()
+end latin1_text
+
+// -- what this file registers -----------------------------------------------------------------------
+
+// **`bytes` and `toArray` are GLOBAL, for `toBytes`'s reason**: a buffer is one of the kinds a
+// program already has, and a protocol that has to build one should not have to say where the making
+// of it lives. Every other name a buffer answers to is a name some other kind already had, and is
+// registered where that kind registered it.
+var n_bytes: NativeFn = 0
+var n_to_array: NativeFn = 0
+
+install_bytes(env: *EnvObj)
+    n_bytes = register("bytes", do_bytes)
+    n_to_array = register("toArray", do_to_array)
+
+    declare(env, "bytes", Native(n_bytes), false)
+    declare(env, "toArray", Native(n_to_array), false)
+end install_bytes

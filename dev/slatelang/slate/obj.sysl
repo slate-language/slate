@@ -104,6 +104,20 @@ struct StrObj
 struct ArrayObj
     items: Buf[Value]
 
+// A slate byte buffer: a run of raw bytes, one byte per byte, that a program may grow and write
+// through.
+//
+// **A `Buf[u8]` and not a `Buf[Value]`, and that is the whole reason this kind exists.** An array of
+// numbers holding bytes costs a `Value` per byte -- sixteen bytes of storage for one byte of data --
+// and every read of one goes through a tagged union. Here a byte is a byte, `length` is `data.len()`,
+// and appending a whole buffer to another is one `extend` rather than a loop in the interpreter.
+//
+// **Nothing in the region is a `Value`, so the tracer walks nothing** -- `trace_bytes` is empty for
+// `trace_str`'s reason, and the `Buf` is reference counted outside the collected heap the way a
+// string's `string` and an array's `Buf` are, given back by the finalizer.
+struct BytesObj
+    data: Buf[u8]
+
 // A slate object: a record, keyed by any value at all.
 //
 // **The layout is `table.sysl`'s compact dict**, so the fields keep the order they were written in
@@ -227,6 +241,7 @@ mark_value(h: *gc.Heap, v: Value)
     v match
         Str(p) -> gc.mark(h, ptr_cast(p))
         Array(p) -> gc.mark(h, ptr_cast(p))
+        Bytes(p) -> gc.mark(h, ptr_cast(p))
         Object(p) -> gc.mark(h, ptr_cast(p))
 
         // **The same object kind, so the same tracer walks it**: a set and a map are an
@@ -255,6 +270,7 @@ end mark_value
 private object_of(v: Value) -> *u8 = v match
     Str(p) -> ptr_cast(p)
     Array(p) -> ptr_cast(p)
+    Bytes(p) -> ptr_cast(p)
     Object(p) -> ptr_cast(p)
     SetVal(p) -> ptr_cast(p)
     MapVal(p) -> ptr_cast(p)
@@ -303,6 +319,17 @@ finalize_array(p: *u8)
     val o: *ArrayObj = ptr_cast(p)
 
     o.items = buf()
+
+// **A byte buffer holds no `Value`, so the collector walks none of it** -- which is `trace_str`'s
+// arrangement and is what makes a megabyte of bytes cost the tracer one object rather than a million
+// edges. The `Buf` is counted storage outside the heap, so the finalizer is what gives it back.
+trace_bytes(p: *u8, h: *gc.Heap)
+    ()
+
+finalize_bytes(p: *u8)
+    val o: *BytesObj = ptr_cast(p)
+
+    o.data = buf()
 
 // **A key is traced as well as a value**, which is new: a field name used to be a sysl `string` that
 // the collector never saw, and it is now a `Value` that may be an array or an object of its own.
@@ -418,11 +445,13 @@ weaken_weak_ref(p: *u8, h: *gc.Heap)
 // A `Kind` must outlive every object naming it and its address must not move, so these are module
 // storage. Module storage states its type, which is why each is written out.
 //
-// process-wide: eight tables of function addresses, built at startup and never written again. A VM
-// of its own would hold the same eight, so each is one table and not one per VM.
+// process-wide: nine tables of function addresses, built at startup and never written again. A VM
+// of its own would hold the same nine, so each is one table and not one per VM.
 var str_kind: gc.Kind = gc.Kind(&trace_str, &finalize_str, null, null)
 // process-wide: see `str_kind`.
 var array_kind: gc.Kind = gc.Kind(&trace_array, &finalize_array, null, null)
+// process-wide: see `str_kind`.
+var bytes_kind: gc.Kind = gc.Kind(&trace_bytes, &finalize_bytes, null, null)
 // process-wide: see `str_kind`.
 var object_kind: gc.Kind = gc.Kind(&trace_object, &finalize_object, null, null)
 // process-wide: see `str_kind`.
@@ -624,7 +653,7 @@ reset_heap()
 // A reserve is a real object in the heap with a real header, so it can be written to, traced and
 // marked like any other. Handing the same one out twice makes two slate values share it, which is
 // wrong and does not matter: the program stops at the end of the statement that got it.
-// They are the eight `current().spare_*` fields -- see `vm_state.sysl`.
+// They are the nine `current().spare_*` fields -- see `vm_state.sysl`.
 
 // Take the reserves. Called with an empty heap, where the allocation cannot fail.
 private reserve_spares()
@@ -632,6 +661,7 @@ private reserve_spares()
 
     v.spare_str = ptr_cast(gc.alloc(slate_heap(), sizeof(StrObj), &str_kind))
     v.spare_array = ptr_cast(gc.alloc(slate_heap(), sizeof(ArrayObj), &array_kind))
+    v.spare_bytes = ptr_cast(gc.alloc(slate_heap(), sizeof(BytesObj), &bytes_kind))
     v.spare_object = ptr_cast(gc.alloc(slate_heap(), sizeof(ObjectObj), &object_kind))
     v.spare_closure = ptr_cast(gc.alloc(slate_heap(), sizeof(ClosureObj), &closure_kind))
     v.spare_env = ptr_cast(gc.alloc(slate_heap(), sizeof(EnvObj), &env_kind))
@@ -644,7 +674,7 @@ private reserve_spares()
     v.spare_weak_ref = ptr_cast(gc.alloc(slate_heap(), sizeof(WeakRefObj), &weak_ref_kind))
 
     // A zeroed payload is a valid object of each of these kinds except the ones holding a `Buf` or a
-    // `Map`, which a tracer walks -- and a zero `Buf` is an empty one, so all eight are safe to trace
+    // `Map`, which a tracer walks -- and a zero `Buf` is an empty one, so all nine are safe to trace
     // from the moment they exist.
     v.heap_exhausted = false
 end reserve_spares
@@ -656,6 +686,7 @@ private mark_spares(h: *gc.Heap)
 
     gc.mark(h, ptr_cast(v.spare_str))
     gc.mark(h, ptr_cast(v.spare_array))
+    gc.mark(h, ptr_cast(v.spare_bytes))
     gc.mark(h, ptr_cast(v.spare_object))
     gc.mark(h, ptr_cast(v.spare_closure))
     gc.mark(h, ptr_cast(v.spare_env))
@@ -691,6 +722,14 @@ new_array(items: Buf[Value]) -> *ArrayObj
     var o: *ArrayObj = ptr_cast(alloc_or_collect(sizeof(ArrayObj), &array_kind, ptr_cast(current().spare_array)))
 
     o.items = items
+    o
+
+// **The `Buf` is taken by value and this object becomes its owner**, which is `new_str`'s bargain: the
+// caller's copy dies with the caller's frame and the finalizer is what takes the count to zero.
+new_bytes(data: Buf[u8]) -> *BytesObj
+    var o: *BytesObj = ptr_cast(alloc_or_collect(sizeof(BytesObj), &bytes_kind, ptr_cast(current().spare_bytes)))
+
+    o.data = data
     o
 
 new_object() -> *ObjectObj

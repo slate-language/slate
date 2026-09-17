@@ -397,6 +397,17 @@ first_is_array(args: Buf[Value]) -> bool
         _ -> false
 end first_is_array
 
+// Whether these arguments begin with a buffer of bytes, which is the third reading the three shared
+// names have: `indexOf` finds a byte or a run of bytes in one, where the array form compares values
+// and the string form compares characters.
+first_is_bytes(args: Buf[Value]) -> bool
+    if args.is_empty() then return false
+
+    args.at(0) match
+        Bytes(_) -> true
+        _ -> false
+end first_is_bytes
+
 
 // -- TCP ------------------------------------------------------------------------------------------
 
@@ -442,6 +453,9 @@ private do_send(args: Buf[Value], at: Span) -> Step
         // characters `[72, 105]` is not something anybody wants, and bytes are how a program sends
         // what is not text -- an image, a compressed body, a string it read with `onBytes` and never
         // decoded.
+        // **A buffer is the shape a program reaches for now**, and it is the cheap one: the bytes are
+        // already bytes, so nothing is decoded on the way to the socket.
+        Bytes(p) -> send_bytes(args.at(0), p.data.view(), at)
         Array(p) ->
             val payload = bytes_of(p, at, "send")?
 
@@ -513,8 +527,9 @@ private with_bytes(args: Buf[Value], at: Span, name: string, go: &Fn(string, Buf
     val path = path_of(args.at(0), at, name)?
 
     args.at(1) match
+        Bytes(p) -> go(path, p.data, at)
         Array(p) -> go(path, bytes_of(p, at, name)?, at)
-        other -> fault(at, s"`${name}` takes an array of numbers, and this is ${other.type_name()} -- `${write_twin(name)}` is what writes anything else")
+        other -> fault(at, s"`${name}` takes bytes or an array of numbers, and this is ${other.type_name()} -- `${write_twin(name)}` is what writes anything else")
 end with_bytes
 
 // The name a program reaching `writeBytes` with text was probably after.
@@ -734,6 +749,11 @@ private do_len(args: Buf[Value], at: Span) -> Step
 
     args.at(0) match
         Array(a) -> Ok(Int(long(a.items.len())))
+
+        // **Bytes, because that is what a buffer holds.** This is the number a `Content-Length` and
+        // every length prefix on a wire is, which is why `toBytes(s).length` has always been how a
+        // slate program asks for it.
+        Bytes(b) -> Ok(Int(long(b.data.len())))
         // **Characters, not bytes.** `"日本語".length` is three; it answered nine until the day the
         // rule was settled, and every slice taken from that count cut a character in half.
         Str(p) -> Ok(Int(long(char_count(p.s))))
@@ -744,7 +764,7 @@ private do_len(args: Buf[Value], at: Span) -> Step
                 return fault(at, "a range with an end left out has no length until it is used on something")
 
             Ok(Int(long(range_count(lo, hi, inclusive, step))))
-        other -> fault(at, s"`.length` needs an array, a string or a range, and this is ${other.type_name()}")
+        other -> fault(at, s"`.length` needs an array, bytes, a string or a range, and this is ${other.type_name()}")
 end do_len
 
 // `push(xs, v)` -- onto the end of an array, which it changes.
@@ -760,7 +780,32 @@ private do_push(args: Buf[Value], at: Span) -> Step
             keepable(args.at(1), at, "stored")?
             a.items.push(args.at(1))
             Ok(Null)
-        other -> fault(at, s"`push` needs an array, and this is ${other.type_name()}")
+
+        // **ONE BYTE OR A WHOLE BUFFER, and the second is the reason this kind exists.** Appending
+        // one buffer to another used to be a loop in the program, one `Value` per byte; here it is
+        // an `extend`, which is a copy of a run of memory. A number is a byte and must be one --
+        // `push(b, 256)` is a mistake in the program, not a truncation.
+        Bytes(b) -> args.at(1) match
+            Int(_) ->
+                b.data.push(byte_of_value(args.at(1), at)?)
+                Ok(Null)
+            Bytes(other) ->
+                // **`push(b, b)` IS COPIED FIRST, and that is not fussiness**: `extend` reads a view
+                // into the very storage it is growing, which a reallocation moves out from under it.
+                val ba: *u8 = ptr_cast(b)
+                val oa: *u8 = ptr_cast(other)
+
+                if ba == oa
+                    var copy: Buf[u8] = buf()
+
+                    copy.extend(other.data.view())
+                    b.data.extend(copy.view())
+                else
+                    b.data.extend(other.data.view())
+
+                Ok(Null)
+            other -> fault(at, s"`push` onto bytes takes a byte or more bytes, and this is ${other.type_name()}")
+        other -> fault(at, s"`push` needs an array or bytes, and this is ${other.type_name()}")
 end do_push
 
 // `str(x)` -- what `print` would have shown.

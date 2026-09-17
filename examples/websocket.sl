@@ -64,7 +64,7 @@ async main()
         return
 
     val client = opened.value
-    var got = []
+    var got = bytes(0)
     var upgraded = false
 
     onBytes(client, chunk ->

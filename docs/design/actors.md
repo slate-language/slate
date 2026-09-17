@@ -201,11 +201,11 @@ external values, weak maps and weak references, LMDB handles, and windows. Each 
 naming what it is. A **promise** is the one worth saying twice: it is not a value in flight, it is a
 suspended call on one machine's parked list, and there is nothing to copy.
 
-**Bytes are the open question rather than an exception.** slate has no byte-buffer kind — bytes are an
-array of integers — so a megabyte of them crosses as a megabyte of copies. `transfer(xs)` is reserved
-for the form that makes this pay: the sender's array detaches and the receiver receives the storage
-itself, at no copy at all. It is written down here and not designed here, because what it wants first
-is a byte-buffer type in the language.
+**Bytes have something to transfer now.** A [`bytes`](../library/bytes.md) buffer is a run of raw bytes
+that holds no values at all, so it is the one container whose storage can move between heaps whole:
+`transfer(b)` detaches the sender's buffer and hands the receiver the storage itself, at no copy.
+Without a byte-buffer kind there was nothing to move — a megabyte of bytes was a megabyte of separate
+values, and every one of them had to be copied.
 
 ## Failure
 

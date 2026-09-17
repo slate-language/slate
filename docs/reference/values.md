@@ -17,6 +17,7 @@ slate is dynamically typed. Every value is one of a fixed set of kinds, and a pr
 | `real` | `3.14`, `2e10` | a double |
 | `string` | `"text"` | a sequence of **characters**, never of bytes |
 | `array` | `[1, 2]` | reference type, compares by contents |
+| `bytes` | `bytes([1, 2])`, `toBytes(s)` | reference type, compares by contents — [Bytes](../library/bytes.md) |
 | `object` | `{ a: 1 }` | reference type, compares by contents |
 | `function` | `x -> x`, a definition | |
 | promise | answered by an `async` call | see [Asynchrony](asynchrony.md) |
@@ -231,10 +232,15 @@ raising. `integer` and `real` move between the two numeric kinds; the four round
 `min` and `max` take as many arguments as they are given and answer an **integer when every one of
 them was**.
 
+**`bytes` is the one word that is a kind and a constructor without being a conversion of a value.**
+`bytes(n)` makes a buffer of `n` zero bytes rather than reading `n` as one; the conversions between
+text and bytes are `toBytes` and `fromBytes`, since each needs an encoding named or defaulted. See
+[Bytes](../library/bytes.md).
+
 ## Reference and copy
 
-Arrays and objects are reference types: two names may hold the same array, and a write through one is
-visible through the other. Everything else is a scalar.
+Arrays, buffers of bytes and objects are reference types: two names may hold the same one, and a write
+through one is visible through the other. Everything else is a scalar.
 
 `a with { f: v }` answers a **copy** of `a` with `f` changed, which is how a record is updated without
 mutating it. `concat(xs, ys)` is the array counterpart.

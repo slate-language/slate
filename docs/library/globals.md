@@ -342,22 +342,24 @@ two alike.
 
 | | |
 |---|---|
-| `toBytes(s)` | an array of numbers |
-| `fromBytes(bs)` | a **result** — arbitrary bytes are not text |
+| `bytes(n)` `bytes(xs)` `bytes(b)` | a buffer of that many zero bytes, of those numbers, or a copy |
+| `toBytes(s)` `toBytes(s, encoding)` | a **buffer** — UTF-8, or `"latin1"` |
+| `fromBytes(b)` `fromBytes(b, encoding)` | a **result** — arbitrary bytes are not text |
+| `toArray(b)` | the bytes as an array of numbers |
 
-`toBytes(s).length` is the byte count, so there is no third name. These are the one place a slate program
-sees UTF-8, and two things need them: a `Content-Length`, and a read where a character may be split across
-two arrivals.
+**`bytes` is a kind of its own** — one byte per byte, grown and cut with memory operations rather
+than a loop. [Bytes](bytes.md) is the page: what a buffer can do, what the two encodings mean, and
+what changed for a program that held bytes as an array of numbers.
 
-Bytes are an array of numbers, so they carry the same `length` any array does — there is no third kind
-here either:
+`toBytes(s).length` is the byte count, so there is no third name. Two things need it: a
+`Content-Length`, and a read where a character may be split across two arrivals.
 
 ```slate
-print(toBytes("héllo").length, toBytes("héllo").length)
+print(toBytes("héllo").length, toBytes("héllo"))
 ```
 
 ```output
-6 6
+6 <bytes 6: 68 c3 a9 6c 6c 6f>
 ```
 
 ## Timers

@@ -35,7 +35,7 @@ main()
 | | |
 |---|---|
 | `readFile(path)` | text |
-| `readBytes(path)` | an array of numbers |
+| `readBytes(path)` | [`bytes`](bytes.md) |
 | `writeFile(path, v)` | replaces whatever was there |
 | `appendFile(path, v)` | adds to it, and makes the file where there is none |
 | `writeBytes(path, bs)` | the same, given the bytes themselves |
@@ -73,9 +73,9 @@ A file that is not valid UTF-8 has no slate string to become, so `readFile` answ
 `readBytes`**. `writeFile` renders anything that is not a string the way `print` would.
 
 **`writeBytes` and `appendBytes` are the writing side of `readBytes`**, and they are what a program
-holding bytes wants: `writeFile` would render an array of numbers as the text `[137, 80, ...]`, which
-is a picture of a PNG rather than one. Each takes an array of numbers from 0 to 255; anything
-else is a fault naming `writeFile` as the call that renders things.
+holding bytes wants: `writeFile` would render a buffer as the text `<bytes 8192: 89 50 ...>`, which
+is a picture of a PNG rather than one. Each takes a [buffer](bytes.md) or an array of numbers from 0
+to 255; anything else is a fault naming `writeFile` as the call that renders things.
 
 ## Why the plain names are the asynchronous ones
 

@@ -9,6 +9,7 @@ What a program has without writing it.
 
 - **[Globals](globals.md)** — the names in scope with no import: printing, text, numbers, arrays,
   objects, JSON, bytes, timers, promises and `fetch`.
+- **[Bytes](bytes.md)** — the `bytes` kind: a buffer of raw bytes, its operations and its encodings.
 - **The `slate:` modules** — everything else, reached by `import { … } from slate:name`.
 
 | module | |

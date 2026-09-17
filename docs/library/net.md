@@ -36,9 +36,9 @@ main()
 | `listen(port, fn)` or `listen({ port, cert, key, alpn }, fn)` | a server |
 | `connect(host, port)` | a promise of a result |
 | `onData(sock, fn)` | each chunk as text, and `null` at the end |
-| `onBytes(sock, fn)` | the same reader for something that is not text |
+| `onBytes(sock, fn)` | each chunk as [`bytes`](bytes.md), for something that is not text |
 | `onError(sock, fn)` | a sentence, *instead of* that `null` |
-| `send(sock, v)` | a promise of a result; an **array is sent as bytes** |
+| `send(sock, v)` | a promise of a result; **bytes or an array of numbers go as bytes** |
 | `close(sock)` | |
 | `localPort(server)` | |
 | `remoteAddress(conn)` | the IP at the other end, or `null` where there is no other end |
