@@ -559,7 +559,14 @@ end leak_description
 // libuv to completion in one go, as this used to, would have batched every callback ahead of every
 // resumption and interleaved them in an order nothing could predict. JavaScript's microtask rule is
 // exactly this, and it is why `RUN_ONCE` is asked for rather than the default.
-drain_events() -> Result[unit, Signal] = drain_events_to(0)
+drain_events() -> Result[unit, Signal] = drain_events_to(0, false)
+
+// Close a bounded drain's watchdog timer, where it armed one. Not `pending`-tracked and not
+// counted in `outstanding`, so this is the only thing that ever gives it back.
+private close_watchdog(watchdog: Option[&libuv.Timer])
+    watchdog match
+        Some(t) -> t.close(() -> ())
+        None -> ()
 
 // The same drain, stopping once nothing beyond `floor` is outstanding.
 //
@@ -570,24 +577,45 @@ drain_events() -> Result[unit, Signal] = drain_events_to(0)
 // test's drain is owed is what the test itself left behind, which is everything above the count
 // standing when it began.
 //
-// A floor of zero is the whole program, which is what `run` and `prepare` ask for.
-drain_events_to(floor: usize) -> Result[unit, Signal]
+// **`bounded` is SAID, not read off `floor`.** The obvious shortcut -- `floor == 0` means the whole
+// program -- is wrong: a per-test drain's floor is `current().outstanding` at the moment the test
+// began, which is 0 for the ordinary case of a file with no `@setupAll` and nothing outstanding yet.
+// So a test-scoped drain and a whole-program one are not told apart by the NUMBER, only by which one
+// the caller meant, and only the caller knows that.
+drain_events_to(floor: usize, bounded: bool) -> Result[unit, Signal]
     // How many turns in a row have reported nothing active and settled nothing of ours. See the
     // guard below for what it is for.
     var idle = 0
 
-    // **A per-scope drain is bounded; the whole program's is not.** `floor == 0` is `run` and
-    // `prepare` draining an ENTIRE program, where a server that never closes its own listener is
-    // running exactly as it was written to -- there is no time after which that becomes wrong. Above
-    // a floor this stands in for one test's own scope, and the ordinary case is a handle that is
-    // ALWAYS going to close on its own -- a backoff timer a moment from firing -- which this waits
-    // out exactly as it always did. The bound is what stops that same wait for a handle that is
-    // NEVER going to close: `run_guarded` reads a timeout here and calls `leaked_since` to say what
-    // was still open and close it, so a leak becomes a named failure at a few seconds rather than an
-    // unbounded hang.
-    val bounded = floor > 0
+    // **A per-scope drain is bounded; the whole program's is not.** `run` and `prepare` drain an
+    // ENTIRE program, where a server that never closes its own listener is running exactly as it was
+    // written to -- there is no time after which that becomes wrong. A per-test drain's ordinary
+    // case is a handle that is ALWAYS going to close on its own -- a backoff timer a moment from
+    // firing -- which this waits out exactly as it always did. The bound is what stops that same
+    // wait for a handle that is NEVER going to close: `run_guarded` reads a timeout here and calls
+    // `leaked_since` to say what was still open and close it, so a leak becomes a named failure at a
+    // few seconds rather than an unbounded hang.
     val started = libuv.hrtime()
     val backstop_ms: u64 = 5000
+
+    // **THE BACKSTOP CHECK BELOW IS NOT ENOUGH ON ITS OWN, because `RUN_ONCE` BLOCKS ON WHAT IT IS
+    // ASKED TO.** `uv_run(UV_RUN_ONCE)` waits for the nearest thing that could wake it -- a timer
+    // due, or an fd becoming readable -- and a listening socket that nobody ever connects to offers
+    // neither. With no timer of the PROGRAM's own outstanding, that wait has no upper bound, so the
+    // elapsed-time check a few lines down never gets a turn to run again: the process blocks inside
+    // the poll syscall, at 0% CPU, for as long as the leaked handle stays open. A raw watchdog timer
+    // -- outside `pending`, so it is invisible to `outstanding` and to a leak report -- gives that
+    // wait a ceiling: libuv computes `RUN_ONCE`'s timeout from its OWN nearest timer, so one due at
+    // `backstop_ms` is what makes the poll return on schedule even when nothing else ever will.
+    var watchdog: Option[&libuv.Timer] = None
+
+    if bounded
+        libuv.timer() match
+            Ok(t) ->
+                t.start(backstop_ms, 0u64, () -> ()) match
+                    Ok(_) -> watchdog = Some(t)
+                    Err(_) -> t.close(() -> ())
+            Err(_) -> ()
 
     loop
         run_microtasks()
@@ -595,12 +623,15 @@ drain_events_to(floor: usize) -> Result[unit, Signal]
         // A resumption may have faulted its way out to a promise nobody holds, and a callback may
         // have faulted outright. Either ends the program.
         current().loop_fault match
-            Some(s) -> return Err(s)
+            Some(s) ->
+                close_watchdog(watchdog)
+                return Err(s)
             None -> ()
 
         if current().outstanding <= floor then break
 
         if bounded && libuv.hrtime() - started > backstop_ms * 1000000
+            close_watchdog(watchdog)
             return Err(failure(point(0), s"the event loop did not drain: ${current().outstanding - floor} handle(s) still open after ${backstop_ms}ms"))
 
         // **A turn reporting nothing active does NOT end the drain, and thinking it did cost a
@@ -622,20 +653,27 @@ drain_events_to(floor: usize) -> Result[unit, Signal]
         val before = current().outstanding
 
         val more = libuv.default_loop().run(libuv.RUN_ONCE) match
-            Err(e) -> return Err(failure(point(0), s"the event loop stopped: ${e}"))
+            Err(e) ->
+                close_watchdog(watchdog)
+                return Err(failure(point(0), s"the event loop stopped: ${e}"))
             Ok(alive) -> alive
 
         idle = if !more && current().outstanding == before then idle + 1 else 0
     end loop
 
+    // The watchdog's job ends with the loop above -- the closing turn below is `RUN_NOWAIT` for a
+    // bounded drain, which never blocks at all, so nothing past this point can hang.
+    close_watchdog(watchdog)
+
     // A handle that was closed needs one more turn for its close callback, and there is nothing left
     // to wait for -- so this returns as soon as those have run.
     //
-    // **`RUN_NOWAIT` ABOVE A FLOOR, BECAUSE THE DEFAULT MODE RUNS UNTIL THE LOOP IS EMPTY.** A drain
-    // that stopped at a floor stopped with a handle still open by construction, and asking the
-    // default mode for one more turn there is asking it to wait for that handle to close -- which
-    // is the very wait the floor exists to avoid.
-    val mode = if floor == 0 then libuv.RUN_DEFAULT else libuv.RUN_NOWAIT
+    // **`RUN_NOWAIT` FOR A BOUNDED DRAIN, BECAUSE THE DEFAULT MODE RUNS UNTIL THE LOOP IS EMPTY.**
+    // A per-scope drain stopped at a floor that may still have a handle open above it by
+    // construction, and asking the default mode for one more turn there is asking it to wait for
+    // that handle to close -- which is the very wait the floor exists to avoid. **This reads
+    // `bounded` and not `floor`**, for the reason above: a per-test drain's floor can be zero too.
+    val mode = if bounded then libuv.RUN_NOWAIT else libuv.RUN_DEFAULT
 
     val closed: Result[unit, Signal] = libuv.default_loop().run(mode) match
         Err(e) -> Err(failure(point(0), s"the event loop stopped: ${e}"))
