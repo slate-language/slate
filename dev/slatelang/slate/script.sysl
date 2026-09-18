@@ -1,0 +1,425 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.read_bytes
+import sysl.process
+import sysl.text.{fields, from_utf8_unchecked, split, str_builder, Search}
+
+// `slate run <script>` -- the scripts a project declares, and the three things one may be.
+//
+// **This is the ONE place a manifest is evaluated, and it is only ever the project's own.** Reading
+// a `package.sl` to work out what to fetch stays what it has always been: a parse and a restriction
+// pass over data, with `scripts` skipped rather than understood (`manifest.sysl`). A dependency's
+// manifest is read that way and no other, so nothing a project installs can run a line of anything
+// at install time. Evaluating begins here, at a command a person typed, about a file in the
+// directory they are standing in.
+//
+// **A script is a function, a slate file, or a command line, and the manifest says which by what it
+// wrote.** A function value is called; a string whose first word names a slate file runs that file;
+// any other string is handed to a shell. One key, three forms, and no flag to tell them apart --
+// which is the same rule an import already follows, where a quoted path is a file and a bare word is
+// a package.
+
+// -- the command -------------------------------------------------------------------------------------
+
+// `slate run` with nothing after it lists what the project declared; with a name it runs that one and
+// hands it everything after it.
+run_command(args: []string, say: string -> unit) -> int
+    val root = project_root_of(ManifestFile)
+
+    if root == ""
+        say(s"slate: there is no `${ManifestFile}` here or above, and a script is something a project declares")
+
+        return Misused
+    end if
+
+    val path = s"${root}/${ManifestFile}"
+
+    read_bytes(path) match
+        Err(e) ->
+            say(s"slate: cannot read ${path}: ${e}")
+
+            return Failed
+        Ok(bytes) ->
+            val src = source(path, bytes)
+
+            // **Read as DATA first, and its complaints are the manifest's own.** That is not
+            // ceremony: it is what says the file is one object with the keys a project may have, so
+            // what runs below is a manifest rather than whatever else a `.sl` file could be.
+            val f = read_project(src)
+
+            if !f.ok()
+                say(f.report.render(src))
+
+                return Failed
+            end if
+
+            val said = prepare_manifest(src)
+
+            if said != ""
+                say(said)
+
+                return Failed
+            end if
+
+            chosen(root, args, say)
+end run_command
+
+// The manifest has run; what was asked for decides the rest.
+private chosen(root: string, args: []string, say: string -> unit) -> int
+    val scripts = scripts_object()
+
+    if args.len < 3 then return listed(scripts, root, say)
+
+    val name = args[2]
+
+    var extra: Buf[string] = buf()
+
+    for i in 3..<args.len
+        extra.push(args[i])
+
+    script_named(scripts, name) match
+        None ->
+            say(s"slate: this project declares no script called `${name}`")
+            say(known_scripts(scripts))
+
+            Misused
+        Some(v) -> started(root, args[0], name, v, extra, say)
+end chosen
+
+// What `scripts` came to, or `Null` where the manifest wrote none.
+private scripts_object() -> Value
+    manifest_value() match
+        Object(o) -> obj_get_name(o, ScriptsField) match
+            Some(v) -> v
+            None -> Null
+        other -> Null
+end scripts_object
+
+private val ScriptsField: string = "scripts"
+
+private script_named(scripts: Value, name: string) -> Option[Value]
+    scripts match
+        Object(o) ->
+            for i in 0..<o.entries.len()
+                val e = o.entries.at(i)
+
+                if !e.dead && walked_key(o, e.key) && key_text(e.key) == name then return Some(e.value)
+
+            None
+        other -> None
+end script_named
+
+// A key as a sysl string, and the empty string for a key that is not text.
+private key_text(k: Value) -> string
+    k match
+        Str(p) -> p.s
+        other -> ""
+end key_text
+
+// -- which of the three -----------------------------------------------------------------------------
+
+// **The form is read off the VALUE, and a string is read off its FIRST WORD.** A function is a
+// function; a command line whose first word names a slate file is a slate program and is run in this
+// process, where the alternative -- shelling out to `slate` -- would make a script's fault a
+// diagnostic printed by a child nobody can see the exit status of separately.
+private started(root: string, exec: string, name: string, v: Value, extra: Buf[string],
+                say: string -> unit) -> int
+    v match
+        Fn(_) -> called_script(v, extra, say)
+        Native(_) -> called_script(v, extra, say)
+        Str(p) ->
+            val words = fields(p.s)
+
+            if words.len == 0
+                say(s"slate: the script `${name}` is an empty command line")
+
+                return Misused
+            end if
+
+            if ends_with_sl(words[0])
+                var argv: Buf[string] = buf()
+
+                for i in 1..<words.len
+                    argv.push(words[i])
+
+                for i in 0..<extra.len()
+                    argv.push(extra.at(i))
+
+                return run_program(exec, under(root, words[0]), argv, say)
+            end if
+
+            shelled(root, p.s, extra, say)
+        other ->
+            say(s"slate: the script `${name}` is ${v.type_name()}, and a script is a function or a command line")
+
+            Misused
+end started
+
+// A path a script named, made relative to the MANIFEST rather than to wherever `slate` was run.
+//
+// **The manifest's directory is the project's, and a script belongs to the project.** A path read
+// against the current directory would mean a different file depending on which subdirectory somebody
+// happened to be standing in, which is the whole thing walking up to find the manifest exists to
+// avoid.
+private under(root: string, p: string) -> string =
+    if p.starts_with("/") then p else normalize_path(s"${root}/${p}")
+
+// -- a command line ---------------------------------------------------------------------------------
+
+// **A shell line is given to `/bin/sh -c`, and that is what it is on every platform slate runs on
+// today.** sysl offers no way to ask which operating system this is, so there is no branch here to
+// write: a Windows build would want `cmd /c` and slate does not have one. The child shares this
+// program's streams, so what it prints appears as it prints it.
+private shelled(root: string, line: string, extra: Buf[string], say: string -> unit) -> int
+    var out = str_builder()
+
+    out.push(line)
+
+    // **Appended QUOTED, one word each.** The line itself is the author's and is handed over as
+    // written; what a person typed after `slate run <name>` is an argument rather than shell text,
+    // so a file name with a space in it stays one argument.
+    for i in 0..<extra.len()
+        out.push(" ")
+        out.push(shell_quoted(extra.at(i)))
+
+    process.run(ShellProgram, [ShellFlag, out.finish()], root) match
+        Err(e) ->
+            say(s"slate: cannot run ${ShellProgram}: ${e}")
+
+            Failed
+        Ok(state) ->
+            state match
+                Exited(code) -> code
+                Signalled(sig) ->
+                    say(s"slate: the script was stopped by signal ${sig}")
+
+                    Failed
+end shelled
+
+private val ShellProgram: string = "/bin/sh"
+private val ShellFlag: string = "-c"
+
+// One argument, wrapped so that a shell hands it over as itself.
+//
+// **Single quotes, with the one character they cannot hold written out.** Inside `'...'` a shell
+// reads every byte literally, so the only thing to say is what happens to a `'`: close the quoting,
+// write an escaped one, open it again. Splitting on the quote and joining with that is the whole of
+// it, and it needs no walk over bytes.
+private shell_quoted(s: string) -> string
+    val parts = split(s, "'")
+    var out = str_builder()
+
+    out.push("'")
+
+    for i in 0..<parts.len
+        if i > 0 then out.push("'\\''")
+
+        out.push(parts[i])
+
+    out.push("'")
+    out.finish()
+end shell_quoted
+
+// -- a function ---------------------------------------------------------------------------------------
+
+// **A function script is handed ONE argument, the array of what came after its name.** Not a
+// parameter each: a script is written once and called with whatever a person typed, so an arity that
+// depended on the command line would be a function that faults on a word nobody warned about. A
+// script that wants none simply declares none, every call dropping what it cannot bind.
+private called_script(fn: Value, extra: Buf[string], say: string -> unit) -> int
+    val mark = root_mark()
+    val arr = new_array(buf())
+
+    // **Held before a single string is made.** A `Value` in a sysl local is not a root, and every
+    // `str_value` below can collect -- so the array has to be reachable before it is filled rather
+    // than once it is full.
+    hold(Array(arr))
+
+    for i in 0..<extra.len()
+        arr.items.push(str_value(extra.at(i)))
+
+    var args: Buf[Value] = buf()
+
+    args.push(Array(arr))
+
+    // Live, for `run_program`'s reason: a script may never return, and what it prints has to reach
+    // the terminal as it prints it rather than being collected and handed over at the end.
+    current().live_output = true
+    current().live_sink = say
+
+    val code = verdict(fn, args, say)
+
+    current().live_output = false
+    current().live_sink = no_live_sink
+
+    release(mark)
+    code
+end called_script
+
+// Call it, wait for it alone, drain what it left, and say what the shell hears.
+private verdict(fn: Value, args: Buf[Value], say: string -> unit) -> int
+    apply_callback(fn, args, point(0), "slate run") match
+        Err(Quit(_, _, n)) -> int(n)
+        Err(sig) ->
+            say(complaint(sig))
+
+            Failed
+        Ok(v) ->
+            // **Rooted across the settling**, which is `settled_call`'s rule and binds here for its
+            // reason: the promise is in a sysl local, the collector cannot see one, and the drain is
+            // where a script that allocates will collect.
+            val mark = root_mark()
+
+            hold(v)
+
+            v match
+                Promise(pr) -> pr.handled = true
+                other -> ()
+
+            val code = settle_call(v) match
+                Err(Quit(_, _, n)) -> int(n)
+                Err(sig) ->
+                    say(complaint(sig))
+
+                    Failed
+                Ok(_) -> answered(v, say)
+
+            release(mark)
+            code
+end verdict
+
+// What an `async` script's promise came to, and then what the rest of the loop came to.
+private answered(v: Value, say: string -> unit) -> int
+    val got = v match
+        Promise(pr) ->
+            if !pr.settled
+                say("slate: this script never finished -- something it awaited was never going to settle")
+
+                return Failed
+            end if
+
+            if pr.quit then return int(pr.quit_status)
+
+            if pr.failed
+                say(said_at(pr.message, pr.at))
+
+                return Failed
+            end if
+
+            pr.value
+        other -> v
+
+    // **The loop drains as it does for a program**, a script that armed a timer or opened a socket
+    // being a program like any other -- and a failure nothing was waiting for is the script's, said
+    // once everything has settled.
+    drain_events() match
+        Err(Quit(_, _, n)) -> return int(n)
+        Err(sig) ->
+            say(complaint(sig))
+
+            return Failed
+        Ok(_) -> ()
+
+    unhandled_rejection() match
+        Some(sig) ->
+            say(complaint(sig))
+
+            return Failed
+        None -> ()
+
+    // **An integer is a status and anything else is success.** A script that answers nothing is the
+    // ordinary one, and reading a truthiness out of whatever it happened to end with would make the
+    // last line of a body decide what a shell hears.
+    got match
+        Int(n) -> int(n)
+        other -> Fine
+end answered
+
+// -- listing ------------------------------------------------------------------------------------------
+
+// `slate run` with no name: what there is to run, one per line.
+private listed(scripts: Value, root: string, say: string -> unit) -> int
+    scripts match
+        Object(o) ->
+            var any = false
+
+            for i in 0..<o.entries.len()
+                val e = o.entries.at(i)
+
+                if !e.dead && walked_key(o, e.key)
+                    any = true
+
+                    say(described(key_text(e.key), e.value, root))
+
+            if !any then say(NoScripts)
+
+            Fine
+        other ->
+            say(NoScripts)
+
+            Fine
+end listed
+
+private val NoScripts: string = "this project declares no scripts"
+
+// One line of the listing: the name, and whatever is cheap to say about it.
+//
+// **A function gets its name and nothing else.** What a function does is its body, and a body is not
+// a thing a listing can summarise -- so the honest line is the name, exactly as it is written in the
+// manifest. A command line is its own description and is printed; a slate file's first comment is
+// one read of one file away, so that is printed instead of the path.
+private described(name: string, v: Value, root: string) -> string
+    v match
+        Str(p) ->
+            val words = fields(p.s)
+            val about = if words.len > 0 && ends_with_sl(words[0]) then headline(under(root, words[0]), p.s) else p.s
+
+            s"${name}  ${about}"
+        other -> name
+end described
+
+// The first comment line of a slate file, or the command line as written where there is none.
+private headline(path: string, line: string) -> string
+    read_bytes(path) match
+        Err(_) -> line
+        Ok(bytes) ->
+            val text = from_utf8_unchecked(bytes.view())
+
+            for one in split(text, "\n")
+                val t = one.trim()
+
+                // A shebang is the kernel's and says nothing about the script; a blank line says
+                // nothing either. The first line that is neither decides, so a comment has to be at
+                // the top of the file to count.
+                if t == "" || t.starts_with("#!") then continue
+
+                if t.starts_with("//") then return t
+
+                return line
+
+            line
+end headline
+
+// The names a mistyped one is measured against.
+private known_scripts(scripts: Value) -> string
+    var out = str_builder()
+    var n: usize = 0
+
+    scripts match
+        Object(o) ->
+            for i in 0..<o.entries.len()
+                val e = o.entries.at(i)
+
+                if !e.dead && walked_key(o, e.key)
+                    if n > 0 then out.push(", ")
+
+                    out.push(s"`${key_text(e.key)}`")
+                    n += 1
+        other -> ()
+
+    if n == 0 then return s"       ${NoScripts}"
+
+    s"       it declares ${out.finish()}"
+end known_scripts

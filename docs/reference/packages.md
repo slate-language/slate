@@ -88,6 +88,55 @@ make that a code-execution step. So the reader is a restriction pass over an ord
   something a person wrote.
 - **The walk carries on after a refusal**, so a manifest with three mistakes reports three.
 
+## Scripts
+
+A project may write a `scripts` block, and `slate run <name>` runs one of them:
+
+```slate
+{
+    name: "board",
+    version: "0.1.0",
+
+    scripts: {
+        // A function, called with the arguments that followed the script's name.
+        greet: (args) -> print("hello " + (args[0] ?? "world")),
+
+        // A first word ending in `.sl` names a slate program, run with the rest as its arguments.
+        migrate: "scripts/migrate.sl --up",
+
+        // Anything else is a command line, handed to a shell.
+        up: "docker compose up -d",
+    },
+}
+```
+
+```
+slate run              # every script, one per line
+slate run up           # the command line
+slate run greet ed     # the function, with ["ed"]
+```
+
+**The first whitespace-separated word decides which of the two string forms it is**, and nothing else
+does. A path is taken relative to the manifest's own directory rather than to wherever `slate` was run,
+so a script means the same thing from any subdirectory of the project.
+
+**A file script is split on whitespace and no shell is involved** — there is no quoting and no
+expansion, and anything typed after `slate run <name>` is appended as further arguments. A shell line
+is given to `/bin/sh -c` as written, with those extra arguments appended singly quoted. There is no
+`cmd /c` branch: slate has no Windows build today, and sysl offers no way to ask which operating
+system this is.
+
+**What a script leaves behind is what the shell hears**: a function answering an integer gives that
+status and anything else gives 0, a fault or a rejected promise gives 1 with the ordinary
+caret-drawing report, and a file or a command line gives whatever it exited with. An `async` script is
+awaited, and the event loop then drains exactly as it does for a program.
+
+**Nothing runs a script by itself.** `slate install`, `slate fetch`, `slate deps` and resolution read
+every manifest they touch as *data* — the restriction pass above skips the `scripts` block rather than
+reading it, so a function written there is recorded as nothing at all. **Only `slate run` evaluates a
+manifest, and only ever the project's own**: a dependency's scripts are never read and never run, however
+deep it sits.
+
 ## What a package exposes
 
 **Its `main`, and whatever its own manifest lists under `modules`** — which is what the slash names.

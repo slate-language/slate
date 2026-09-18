@@ -17,6 +17,10 @@ which writes the dependency into `package.sl`, fetches it into `$HOME/.slate/pkg
 hash of the extracted tree in `slate.sum`. [Packages](../reference/packages.md) is the reference for
 the manifest, the cache and what that hash guarantees.
 
+**Installing one runs nothing.** A manifest is read as data wherever a tool is working out what to
+fetch, so the `scripts` a project may declare for `slate run` are its own and are never read out of
+anything it depends on — see [Scripts](../reference/packages.md).
+
 **These are packages rather than `slate:` modules on purpose.** What ships inside the compiler is the
 infrastructure an API server needs — sockets, TLS, HTTP, a file system, digests. A framework is not
 that: it iterates far faster than the language does, and baking one in would tie every framework fix
