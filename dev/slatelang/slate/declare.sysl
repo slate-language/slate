@@ -30,6 +30,19 @@ at_class_decl(p: *Parser, i: usize) -> bool
     p.peek_kind_at(i + 1) == Ident
 end at_class_decl
 
+// The same question about `actor Name`.
+//
+// **An `actor` body is a class body with `on` in front of the handlers**, and that similarity is
+// deliberate: state is `val` and `var` fields, a handler is written in the ordinary definition
+// syntax, and the generated constructor takes every field -- so `spawn(Worker, 7)` is `Worker.new(7)`
+// run on the new thread. One rule read twice is cheaper than two rules.
+at_actor_decl(p: *Parser, i: usize) -> bool
+    if p.peek_kind_at(i) != Ident then return false
+    if p.text_at(i) != "actor" then return false
+
+    p.peek_kind_at(i + 1) == Ident
+end at_actor_decl
+
 // Everything a class body is being gathered into.
 //
 // **A struct rather than a dozen pointers**, one loop filling all of it. The two halves are the whole
@@ -65,6 +78,12 @@ private struct ClassBody
     maker_declares: Buf[bool]
     maker_body: usize
     has_maker: bool
+
+    // The names written `on` in front of, which only an `actor` has.
+    //
+    // **What another thread may reach, and nothing else.** An actor's ordinary methods are its own
+    // business -- a handler may call one -- so a message naming one is refused where it arrives.
+    handlers: Buf[string]
 end ClassBody
 
 // The name a constructor holds the object under while it is being made.
@@ -94,15 +113,31 @@ private const Made: string = "(new)"
 // type: `p is Square` asks whether this object was made from that class, which no structural pattern
 // can ask and which `p.proto == Square` gets wrong twice over -- `==` on objects is deep, so it
 // answers true for any class holding the same fields, and it looks only one link up the chain.
-parse_class_decl(p: *Parser, public: bool) -> Stmt
+parse_class_decl(p: *Parser, public: bool) -> Stmt = class_shaped(p, public, false)
+
+// `actor Counter`, and the handlers written under it.
+//
+// **An actor is a DECLARATION like a class, and everything below is the class's own reading.** What
+// differs is three things: a member may be written `on`, which is what another thread may reach; the
+// object carries an `(actor)` tag, which is what `spawn` asks about; and it carries the list of
+// handler names, which is what the drain on the actor's own thread asks before it calls anything.
+//
+// **"spawn a function" is not on offer and the reason is the sentence this form never has to say.** A
+// lambda handed to `spawn` would capture its enclosing scope, and those names live on another heap --
+// so every such program would have to be refused. A body written at the top level closes over
+// nothing, so there is nothing of the spawner's for it to reach.
+parse_actor_decl(p: *Parser, public: bool) -> Stmt = class_shaped(p, public, true)
+
+private class_shaped(p: *Parser, public: bool, actor: bool) -> Stmt
+    val what = if actor then "actor" else "class"
     val start = p.here()
     val top = p.depth == 0
 
     p.bump()
 
-    val name = parse_name(p, "a name for the class")
+    val name = parse_name(p, s"a name for the ${what}")
 
-    var b = ClassBody(buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), false,start, buf(), buf(), buf(), 0, false)
+    var b = ClassBody(buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), false,start, buf(), buf(), buf(), 0, false, buf())
 
     // **`from` takes an EXPRESSION rather than a name**, because the field it becomes takes one: a
     // base may arrive under an import alias, out of a module object, or be chosen at run time. The
@@ -139,7 +174,7 @@ parse_class_decl(p: *Parser, public: bool) -> Stmt
 
             if !p.accept(Comma) then break
 
-    if p.at(Indent) then class_members(p, name, &b)
+    if p.at(Indent) then class_members(p, name, &b, actor)
 
     accept_end_named(p, name)
 
@@ -147,14 +182,35 @@ parse_class_decl(p: *Parser, public: bool) -> Stmt
 
     make_constructor(p, name, &b, span, false)
 
+    // **What `spawn` asks about, and what the drain on the actor's own thread asks before it calls
+    // anything.** A handler is reachable from another thread and an ordinary method is not, so the
+    // list is written down rather than guessed at from what happens to be callable.
+    if actor
+        var names: Buf[Expr] = buf()
+
+        for i in 0..<b.handlers.len()
+            names.push(expr(span, StrLit(b.handlers.at(i))))
+
+        b.keys.push(ActorTag)
+        b.key_spans.push(start)
+        b.values.push(expr(start, StrLit(name)))
+        b.keys.push(HandlerTag)
+        b.key_spans.push(span)
+        b.values.push(expr(span, ArrayLit(names)))
+    end if
+
     val shape = pattern(span, ProtoPat(name, b.ctor_fields, b.ctor_positional))
 
     if !top
-        p.fault(start, "a class belongs to the top level of a file -- its name is a type as well as a value, and one declared inside a block would not be there for `is` to resolve against")
+        val a = if actor then "an" else "a"
+
+        p.fault(start, s"${a} ${what} belongs to the top level of a file -- its name is a type as well as a value, and one declared inside a block would not be there for `is` to resolve against")
     else
         p.type_names.push(name)
         p.type_pats.push(shape)
         p.type_public.push(public)
+
+        if actor then p.actor_names.push(name)
 
     // **The class carries its own shape, so the name that is a type is a shape value too.** It is
     // the pattern just registered and not a second one: `Square.test(v)` and `v is Square` are one
@@ -183,10 +239,10 @@ parse_class_decl(p: *Parser, public: bool) -> Stmt
     checked.push(stmt(span, Eval(expr(span, Name(name)))))
 
     stmt(span, Val(name, expr(span, Block(checked))))
-end parse_class_decl
+end class_shaped
 
 // The members under a class, which are slate's ordinary declarations.
-private class_members(p: *Parser, cls: string, b: *ClassBody)
+private class_members(p: *Parser, cls: string, b: *ClassBody, actor: bool)
     p.expect(Indent, "an indented block")
 
     p.depth += 1
@@ -196,7 +252,7 @@ private class_members(p: *Parser, cls: string, b: *ClassBody)
         if p.at(Eof) then break
         if p.at(Dedent) then break
 
-        one_member(p, "class", cls, b, true)
+        one_member(p, if actor then "actor" else "class", cls, b, true, actor)
 
         if !p.end_of_statement()
             p.fault(p.here(), "this is where the member should have ended")
@@ -206,7 +262,7 @@ private class_members(p: *Parser, cls: string, b: *ClassBody)
     end loop
 
     p.depth -= 1
-    p.expect(Dedent, "the end of the class")
+    p.expect(Dedent, if actor then "the end of the actor" else "the end of the class")
 end class_members
 
 // Whether a class already has something under this name, on either side.
@@ -295,13 +351,66 @@ private declare_accessor(p: *Parser, what: string, cls: string, b: *ClassBody, w
         _ -> ()
 end declare_accessor
 
+// `on total(self)`, and `async on fetch(self, url)` for a handler that awaits.
+//
+// **A handler takes `self` exactly as a method does**, because that is how slate spells a receiver
+// everywhere else. The caller never passes it: `send(l.record, 5, "stamps")` binds the two after it.
+//
+// **The `async` is taken off the front and put back on the LAMBDA**, which is why this reads the
+// definition itself rather than letting `parse_def` see the word: `async on fetch` is the spelling
+// the design page uses and `on` stands between the two.
+private declare_handler(p: *Parser, what: string, cls: string, b: *ClassBody, said_async: bool, s: Stmt)
+    *s.kind match
+        Def(name, params, defaults, body, is_async) ->
+            if params.len() == 0
+                p.fault(s.span, s"a handler is handed the actor it belongs to, so `${name}` is written `on ${name}(self)` -- the caller never passes it")
+                return
+            end if
+
+            if proto_member(p, what, cls, name, s.span) then return
+
+            if property_taken(b, name)
+                p.fault(s.span, s"`${name}` is given twice in ${what} `${cls}`")
+                return
+            end if
+
+            b.keys.push(name)
+            b.key_spans.push(s.span)
+            b.values.push(expr(s.span, Lambda(params, defaults, body, is_async || said_async)))
+            b.handlers.push(name)
+        _ -> ()
+end declare_handler
+
 // One member: a `var` field, a `val` the class holds, or a definition.
 // **`what` is the word the reader wrote and `fields_ok` is whether a `var` means anything here**,
 // which is the whole of the difference between a class body and a data type's. A class's `var`
 // declares a field on every object it makes; a data type makes no objects itself -- its variants do
 // -- so a `var` under `data` is refused with the line that would have worked.
-private one_member(p: *Parser, what: string, cls: string, b: *ClassBody, fields_ok: bool)
+private one_member(p: *Parser, what: string, cls: string, b: *ClassBody, fields_ok: bool, handlers_ok: bool)
     val at = p.here()
+
+    // **`on name(self, ...)` is a HANDLER, which is the one thing an actor's body has that a class's
+    // does not.** It is read before everything else here for the accessor's reason: it is a
+    // definition with a soft word in front of it, and nothing later could tell the two apart.
+    //
+    // **`on` stays a SOFT word**, so `on(self, e)` is still an ordinary method called `on` -- two
+    // tokens settle it, as `class`, `get` and `set` are settled.
+    val on_async = p.at(Async) && p.peek_kind_at(1) == Ident && p.text_at(1) == "on" && at_definition_from(p, 2)
+    val on_plain = p.at(Ident) && p.text_at(0) == "on" && at_definition_from(p, 1)
+
+    if on_async || on_plain
+        if !handlers_ok
+            p.fault(at, s"`on` declares a HANDLER and only an `actor` has handlers -- ${what} `${cls}`'s members are ordinary methods, written `${p.text_at(if on_async then 2 else 1)}(self, ...)`")
+            parse_expr_stmt(p)
+            return
+        end if
+
+        if on_async then p.bump()
+
+        p.bump()
+        declare_handler(p, what, cls, b, on_async, parse_def(p))
+        return
+    end if
 
     if p.at(Var)
         if !fields_ok
@@ -787,7 +896,7 @@ parse_data_decl(p: *Parser, public: bool) -> Stmt
     if p.at(Ident) && p.text(p.here()) == "from"
         p.fault(p.here(), s"a data type has no `from` -- it IS the base its variants descend from, and each of them has `${name}` as its `proto` already")
 
-    var shared = ClassBody(buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), false,start, buf(), buf(), buf(), 0, false)
+    var shared = ClassBody(buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), false,start, buf(), buf(), buf(), 0, false, buf())
     var d = DataBody(buf(), buf(), buf())
 
     if p.at(Indent) then data_members(p, name, &shared, &d, public)
@@ -839,7 +948,7 @@ private data_members(p: *Parser, data: string, b: *ClassBody, d: *DataBody, publ
         if p.at(Eof) then break
         if p.at(Dedent) then break
 
-        if at_variant(p) then one_variant(p, data, d, public) else one_member(p, "data", data, b, false)
+        if at_variant(p) then one_variant(p, data, d, public) else one_member(p, "data", data, b, false, false)
 
         if !p.end_of_statement()
             p.fault(p.here(), "this is where the variant should have ended")
@@ -868,7 +977,7 @@ private one_variant(p: *Parser, data: string, d: *DataBody, public: bool)
         return
     end if
 
-    var vb = ClassBody(buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), false,named, buf(), buf(), buf(), 0, false)
+    var vb = ClassBody(buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), false,named, buf(), buf(), buf(), 0, false, buf())
 
     vb.keys.push("proto")
     vb.key_spans.push(named)

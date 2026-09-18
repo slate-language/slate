@@ -5,8 +5,11 @@ weight: 10
 
 # Actors
 
-**A design, not a feature — none of this is built.** The blocks on this page are untagged for that
-reason: the suite runs every fenced `slate` block under `docs/`, and nothing here would compile today.
+**Built: the native back end.** `slate:actor` and the `actor` declaration are in the interpreter; the
+JavaScript half below is not, and a program that declares an actor is refused by `slate js` where it is
+written. [`docs/library/actor.md`](../library/actor.md) is the page a program is written against and
+carries the runnable programs; the blocks here stay untagged, this page being the argument rather than
+the surface.
 
 **An actor is a thread with a whole slate runtime on it**: its own machine, its own heap, its own
 event loop and its own collector. Nothing is shared. Two actors cannot see one object between them,
@@ -64,14 +67,14 @@ definition syntax, and the generated constructor takes every field — so `spawn
 ```
 actor Ledger
     var name
-    val entries = []
+    var entries = []
 
     on record(self, amount, note)
-        self.entries.push({ amount, note })
+        self.entries.push({ amount: amount, note: note })
 
     on total(self) = self.entries.reduce((sum, e) -> sum + e.amount, 0)
 
-    on report(self) = s"${self.name}: ${len(self.entries)} entries"
+    on report(self) = s"${self.name}: ${self.entries.length} entries"
 end Ledger
 
 val l = spawn(Ledger, "petty cash")

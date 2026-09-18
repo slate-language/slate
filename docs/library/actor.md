@@ -1,0 +1,349 @@
+---
+title: "slate:actor"
+weight: 76
+---
+
+# `slate:actor`
+
+An actor is a thread with a whole slate runtime on it, and a message between two of them is copied.
+
+Its own machine, its own heap, its own event loop and its own collector. Nothing is shared, so there is
+no lock to take, no value to tear and no rule about which thread may touch what. Reach for one when the
+work is **CPU** — a computation to fan out, a long job that must not stall the loop, a component that
+owns a piece of state and answers questions about it. An actor for a job that is entirely I/O buys a
+thread, a heap and a copy per message in exchange for nothing; that is what [`async`](../reference/asynchrony.md)
+is for.
+
+**This module runs in the interpreter only.** The JavaScript back end refuses an `actor` declaration
+where it is written, and every name here refuses at the call.
+
+```slate
+import { spawn, send, ask } from slate:actor
+
+actor Counter
+    var n = 0
+
+    on bump(self, by = 1)
+        self.n += by
+
+    on total(self) = self.n
+
+val c = spawn(Counter)
+
+send(c.bump, 2)
+send(c.bump)
+
+print(await ask(c.total))
+```
+
+```output
+3
+```
+
+Four workers, asked at once, gathered with the `all` every other promise is gathered with:
+
+```slate
+import { spawn, ask } from slate:actor
+
+actor Squarer
+    on square(self, n) = n * n
+
+val workers = [spawn(Squarer), spawn(Squarer), spawn(Squarer), spawn(Squarer)]
+
+print(await all(workers.map((w, i) -> ask(w.square, i + 1))))
+```
+
+```output
+[1, 4, 9, 16]
+```
+
+## Declaring one
+
+**An `actor` body is a [class](../reference/classes.md) body with `on` in front of the handlers.** State
+is `val` and `var` fields, a handler is written in the ordinary definition syntax, and the generated
+constructor takes every field — so `spawn(Worker, 7)` is `Worker.new(7)` run on the new thread.
+
+**A handler takes `self` exactly as a method does.** The caller never passes it: `send(l.record, 5,
+"stamps")` binds the two parameters after it. **A handler may be `async`**, and then the answer to an
+`ask` is what its promise settles to.
+
+```slate
+import { spawn, send, ask } from slate:actor
+
+actor Ledger
+    var name
+    var entries = []
+
+    on record(self, amount, note)
+        self.entries.push({ amount: amount, note: note })
+
+    on total(self) = self.entries.reduce((sum, e) -> sum + e.amount, 0)
+
+    on report(self) = s"${self.name}: ${self.entries.length} entries"
+
+val l = spawn(Ledger, "petty cash")
+
+send(l.record, 5, "stamps")
+send(l.record, 12, "coffee")
+
+print(await ask(l.total))
+print(await ask(l.report))
+```
+
+```output
+17
+petty cash: 2 entries
+```
+
+**A member written without `on` is an ordinary method and is not reachable from outside.** A handler
+may call one; a message naming one is refused where it arrives.
+
+**An actor is declared at the top level of a file**, as a class and a `type` are. That is not a
+restriction invented here; it is what makes the whole design sound. A body written at the top level
+closes over nothing, so there is nothing of the spawner's for it to reach — which is also why there is
+no `spawn(fn)`: a lambda handed to `spawn` would capture its enclosing scope, and those names live on
+another heap.
+
+**An actor's VM learns the program's names by running its DECLARATIONS**, which is what
+[`docs/reference/modules.md`](../reference/modules.md) states for a reader: a definition, a `class`, a
+`data`, a `type`, an `external` and an `import` are declarations, and everything else at a file's top
+level is an effect. So a **top-level `val` is not bound** inside an actor, and a handler that names one
+faults with the ordinary sentence about a name that is not defined. An actor's state belongs in its own
+fields, which is what the declaration form already says.
+
+## Spawning, sending, asking, stopping
+
+**These eight are functions, not methods of a handle.** A handle's field namespace belongs entirely to
+the program: `a.stop` is the handler somebody wrote called `stop`, and nothing built in can collide
+with a name they chose.
+
+| | |
+|---|---|
+| `spawn(A, args…)` | start an actor, answer its handle |
+| `spawn(A, args…, options)` | …with `{ heap, mailbox, name }` |
+| `send(m, args…)` | post; answers nothing; never waits |
+| `ask(m, args…)` | post; answer a promise of what the handler answers |
+| `done(a)` | a promise that settles when the actor has stopped |
+| `stop(a)` | ask it to stop once its mailbox is empty |
+| `detach(a)` | this actor is no longer waited for at the end of the program |
+| `me()` | inside a handler: this actor's own handle |
+| `transfer(b)` | hand a buffer's storage over rather than copying it |
+
+**The options are the last argument only where there is one more than the constructor takes**, which
+is what keeps `spawn(A, args…, options)` unambiguous — an actor whose own constructor wants an object
+still gets it.
+
+**Reading a handler off a handle answers a `message`, which is a value.** `c.total` sends nothing and
+asks nothing; it names an actor and one of its handlers. Because a message is an ordinary value it can
+itself be sent, which is how a reply address travels. `send(c, "total")` is the same thing with the
+name as text, for a program that builds one.
+
+**A handler's return value *is* the answer to an `ask`**, and a `send` runs the same handler and throws
+the answer away — which is why one handler serves both. **`ask` is a promise like any other**: it
+composes with `all`, `race`, `any` and `allSettled`, and a fault inside the handler arrives as a
+rejection at the `await`.
+
+**A handle is a value and compares by identity**, as a promise, a function and a socket already do.
+There is no registry and no name service: an actor is reachable by whoever was given its handle. **A
+dead actor's handle is still a value** — it prints, it compares, it can be stored; what it cannot do is
+deliver.
+
+**Per sender, in order. Between senders, no order at all.** Two `send`s from one actor arrive in the
+order they were written; a `send` from A and a `send` from B race.
+
+```slate
+import { spawn, send, ask, me } from slate:actor
+
+actor Worker
+    on introduce(self, boss)
+        send(boss.enrol, me())
+
+actor Boss
+    var seen = []
+
+    on enrol(self, who)
+        self.seen.push(who)
+
+    on count(self) = self.seen.length
+
+val b = spawn(Boss)
+val w = spawn(Worker)
+
+send(w.introduce, b)
+
+await sleep(50)
+print(await ask(b.count))
+```
+
+```output
+1
+```
+
+## What crosses, and how
+
+A message is serialised out of the sender's heap and rebuilt in the receiver's. The sender's values are
+untouched and the receiver's are new.
+
+| what was sent | what arrives |
+|---|---|
+| integer, real, boolean, `null` | itself |
+| string | a copy, in the receiver's heap |
+| array | a new array, its elements copied by these rules |
+| object | a new object, keys in the same order |
+| a class instance | an instance of the same class, its fields copied |
+| a data variant | the same variant, its fields copied |
+| `Set`, `Map` | rebuilt, insertion order kept |
+| `bytes` | a copy — or the storage itself, with `transfer` |
+| a date, time, duration, zone or period | itself; a zone travels as its IANA name |
+| a regex | rebuilt from its pattern and flags |
+| an actor handle, a message | itself — it names an actor, not memory |
+| a range | itself |
+| a shared structure | shared structure: two fields holding one object arrive holding one object |
+| a cycle | a cycle |
+
+**A class instance crosses as an instance and not as a plain object**, because both actors are running
+the same program: a class is identified by the name it was declared under, and the receiver looks it up
+and rebuilds. It does not have to be exported.
+
+```slate
+import { spawn, ask } from slate:actor
+
+class Point
+    var x
+    var y
+
+actor Mover
+    on shift(self, p, by) = Point.new(p.x + by, p.y + by)
+
+val m = spawn(Mover)
+val moved = await ask(m.shift, Point.new(1, 2), 10)
+
+print(moved is Point, moved.x, moved.y)
+```
+
+```output
+true 11 12
+```
+
+**Bytes have something to transfer.** A [`bytes`](bytes.md) buffer holds no values at all, so it is the
+one container whose storage can move between heaps whole: `transfer(b)` detaches the sender's buffer
+and hands the receiver the storage itself. The sender's buffer is left empty.
+
+```slate
+import { spawn, ask, transfer } from slate:actor
+
+actor Sizer
+    on size(self, b) = b.length
+
+val s = spawn(Sizer)
+val copied = toBytes("hello")
+val moved = toBytes("goodbye")
+
+print(await ask(s.size, copied), copied.length)
+print(await ask(s.size, transfer(moved)), moved.length)
+```
+
+```output
+5 5
+7 0
+```
+
+### What does not cross
+
+**Anything holding a resource the other thread has no business touching is refused, and the refusal
+names the field it found** — not the message, not the type, because a message ten fields deep is
+exactly where this happens.
+
+```slate
+import { spawn, send } from slate:actor
+
+actor Sink
+    on take(self, v) = 1
+
+val s = spawn(Sink)
+
+send(s.take, { handlers: { onDone: () -> 1 } })
+```
+
+```error
+a message may not carry a function: `handlers.onDone` is a function
+```
+
+The set is functions and lambdas, promises, generators, sockets, child processes, channels, externals,
+weak maps, weak references and declared types — and a `class` or `data` name itself, the receiver
+having its own. A **promise** is the one worth saying twice: it is not a value in flight, it is a
+suspended call on one machine's parked list, so await it and send what it answers.
+
+**A handle that slate represents as a plain number crosses as that number and means nothing on the
+other side.** An LMDB environment and a window are the two, and neither is a value another thread can
+use; what is listed above is every kind slate can tell apart.
+
+**`undefined` raises no question**, slate [refusing to store it anywhere](../reference/values.md): it
+cannot be in an array, a field or a variable, so it cannot be in a message.
+
+## Failure
+
+**An actor that faults dies.** There is no supervisor built in and no restart: a fault that reaches the
+top of a handler stops that actor, exactly as an unhandled fault stops a program. When it dies, all at
+once: **every pending `ask` rejects with the fault**, **`done(a)` settles with it**, **every later
+`send` is dropped** and **every later `ask` rejects at once** with *the actor is not running*.
+
+```slate
+import { spawn, ask, done } from slate:actor
+
+actor Brittle
+    on burst(self)
+        throw "it broke"
+
+val b = spawn(Brittle)
+val ended = done(b)
+
+try
+    await ask(b.burst)
+catch e
+    print("asked: " + e.message)
+
+try
+    await ended
+catch e
+    print("done: " + e.message)
+```
+
+```output
+asked: it broke
+done: it broke
+```
+
+**Supervision is a library on top of `done`**, and deliberately not part of this: a supervisor is a loop
+that awaits `done`, decides whether to spawn again, and counts restarts against a window — a page of
+slate, with policy in it that nobody should have to take from the language.
+
+**`stop(a)` is orderly**: the actor takes no new messages, drains the ones it has, runs its loop down,
+and settles `done` with `null`. A message in flight when an actor stops is dropped, and its `ask`
+rejects with *the actor stopped before it answered this*.
+
+**The program ends when its own loop has drained and every actor it spawned has stopped.** A drained
+program has nothing left to say to an actor, so each is asked to stop — orderly, which is what makes a
+`send` written on the last line still served — and then waited for. `detach(a)` opts one out of that
+wait, for a logger or a metrics sink.
+
+## Limits
+
+- **A heap ceiling per actor**, passed at spawn and 64 MiB where nobody says. An actor that outgrows it
+  faults; it does not take the process with it.
+- **A mailbox soft limit**, 65,536 where nobody says. Past it an `ask` rejects and a `send` faults in
+  the sender — a refusal, never a wait, because a server that stalls its own loop waiting for a slow
+  actor has stopped serving everybody else.
+- **A thread per actor means tens to thousands, not millions**, and this process holds at most 1,024 at
+  a time. A thread costs a stack and a scheduler slot; a program spawning a million of them is asking
+  the wrong question.
+- **An actor compiles the program's declarations when it starts**, which is what makes a class instance
+  able to cross. That is milliseconds per actor, so an actor is something a program makes tens of and
+  keeps, not something it makes per request.
+
+## What actors are not for
+
+**They are not [`slate:cluster`](cluster.md)**, and the two solve different halves of one problem. A
+cluster is *processes*: one copy of the program per core, a supervisor in front, and a worker that dies
+taking nothing with it — the answer for a **server**, where the work is already separated by connection.
+Actors are threads inside one process, for work that is one program's. A server may well use both.

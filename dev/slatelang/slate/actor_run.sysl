@@ -1,0 +1,647 @@
+module dev.slatelang.slate
+
+import sh.sysl.gc
+import sh.sysl.libuv
+import sh.sysl.libuv.Handle
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// An actor's thread, its loop, and the table every actor in the process is reached through.
+//
+// **One OS thread per actor, and on it a whole runtime**: its own machine, its own heap, its own
+// event loop and its own collector. `actor.sysl` is the surface a program writes, `actor_copy.sysl`
+// is what crosses, and this is what runs.
+//
+// **The thread learns the program's names by running its DECLARATIONS.** `load_declarations` gives a
+// fresh VM every definition, class, data type and type the program declares and runs not one line of
+// what it does -- so nothing is printed on the way up, no server is started twice and no timer is
+// armed on the new loop. That is what makes a class instance able to cross: the receiver looks the
+// class up by the name it was declared under, and it is there because declaring it is all that ran.
+//
+// **The end-of-life rule is `tests_actor_probe.sysl`'s and it is exact.** A mailbox's `Async` is an
+// ACTIVE handle, so the receiving thread's `uv_run` never returns on its own -- and a `join` on that
+// thread waits for a loop that waits for a handle nobody closes. The order this file keeps is: the
+// drain stops taking messages, the serve loop ends, the handle is CLOSED, the loop is turned once
+// more so the close callback fires, and only then does the thread leave its VM and exit.
+
+// -- the table every actor is reached through ---------------------------------------------------------
+
+// **A thread per actor means tens to thousands, not millions**, which is the design's own limit and
+// is what makes a fixed table the right shape here: a `&sync` struct may hold no `Buf`, and a handle
+// carried to a third actor has to be able to find the mailbox it names from any thread at all.
+const MaxActors: usize = 1024
+
+// Every actor in the process, and the lock that orders a claim against a lookup.
+//
+// **A slot is reused and a generation is what makes that safe** -- the `Socket` arrangement exactly:
+// a bare slot number would name a *position*, so a handle held across an actor's death would come to
+// mean whatever took the position next.
+struct ActorTable
+    lock: &sync libuv.Mutex
+    boxes: [MaxActors]Option[&sync ActorBox]
+    next_gen: usize
+end ActorTable
+
+// process-wide: THE ACTORS OF THIS PROCESS, which is a different thing from the actors a VM spawned.
+// A handle names an actor wherever it is carried -- into a third actor's heap, back to the program --
+// so what resolves one cannot be per-VM. Every field of it is read and written under its own lock.
+private var the_actors: &sync ActorTable = ActorTable(
+    libuv.mutex().expect("a lock for the actor table"), [None; MaxActors], 0)
+
+// Take a slot for a new mailbox, and answer the id and generation it was given.
+//
+// **`None` where the table is full**, which the caller turns into a fault naming the limit rather
+// than a silence.
+take_actor_slot(b: &sync ActorBox) -> Option[usize]
+    the_actors.lock.lock()
+
+    var found: Option[usize] = None
+
+    for i in 0..<MaxActors
+        if the_actors.boxes[i].is_none()
+            the_actors.next_gen += 1
+            b.id = i
+            b.gen = the_actors.next_gen
+            the_actors.boxes[i] = Some(b)
+            found = Some(i)
+            break
+
+    the_actors.lock.unlock()
+    found
+end take_actor_slot
+
+// The mailbox an id and a generation name, and nothing where they name a dead one.
+actor_box_at(id: usize, gen: usize) -> Option[&sync ActorBox]
+    if id >= MaxActors then return None
+
+    the_actors.lock.lock()
+
+    val found = the_actors.boxes[id] match
+        Some(b) -> if b.gen == gen then Some(b) else None
+        None -> None
+
+    the_actors.lock.unlock()
+    found
+end actor_box_at
+
+// Give a slot back, once nothing will ever look it up again.
+free_actor_slot(id: usize)
+    if id >= MaxActors then return
+
+    the_actors.lock.lock()
+    the_actors.boxes[id] = None
+    the_actors.lock.unlock()
+end free_actor_slot
+
+// -- posting ----------------------------------------------------------------------------------------
+
+// Put a note on a mailbox and wake it.
+//
+// **`send` never blocks the sender's loop**: it takes a mutex over a list append and lets it go.
+// There is no bounded queue to wait on, because a server that stalls its own event loop waiting for a
+// slow actor has stopped serving everybody else.
+//
+// Answers `PostOk`, `PostGone` or `PostFull`. **The sentence is the CALLER's**, a refused `send` and
+// a refused `ask` having different things to say about one refusal.
+post_note(target: &sync ActorBox, note: &sync ActorNote, always: bool) -> u8
+    target.lock.lock()
+
+    var refused = PostOk
+
+    if !target.running || (target.stopping && !always)
+        refused = PostGone
+    elif !always && target.queued >= target.limit
+        refused = PostFull
+    else
+        note.next = target.head
+        target.head = Some(note)
+        target.queued += 1
+
+    val wake = target.wake
+
+    target.lock.unlock()
+
+    if refused != PostOk
+        drop_block(note.data)
+        return refused
+
+    wake match
+        Some(w) -> w.send() match
+            Ok(_) -> ()
+            Err(_) -> ()
+        None -> ()
+
+    PostOk
+end post_note
+
+// A fresh note carrying a payload.
+note_of(kind: u8, data: *u8, len: usize) -> &sync ActorNote =
+    ActorNote(None, kind, data, len, 0, 0, 0, 0)
+
+// -- the thread ---------------------------------------------------------------------------------------
+
+// A whole slate runtime on a thread of its own.
+//
+// **Nothing of the spawner's crosses into this body but the `&sync` box**, which is what sysl allows
+// and what the design is shaped by: the program's source, the actor's name and its constructor's
+// arguments are `malloc`ed blocks the box carries, read once here and given back.
+actor_thread(box: &sync ActorBox)
+    libuv.new_loop() match
+        Err(e) ->
+            failed_to_start(box, s"an actor could not be given an event loop of its own: ${e}")
+        Ok(lp) ->
+            var mine = new_vm(box.ceiling, lp)
+            val was = enter(&mine)
+
+            actor_body(box, lp)
+
+            leave(was)
+            dispose_vm(&mine)
+            lp.close() match
+                Ok(_) -> ()
+                Err(_) -> ()
+end actor_thread
+
+// Say the thread never got going, and let the spawner past its wait.
+private failed_to_start(box: &sync ActorBox, why: string)
+    box.lock.lock()
+    box.started = false
+    box.running = false
+    box.dead = true
+    box.start_fault = block_of_text(why)
+    box.start_fault_len = why.bytes.len
+    box.lock.unlock()
+    box.ready.post()
+end failed_to_start
+
+// Everything the actor does, from its first line to its last.
+private actor_body(box: &sync ActorBox, lp: &libuv.Loop)
+    val src_name = text_of_block(box.src_name, box.src_name_len)
+    val src_text = text_of_block(box.src_text, box.src_text_len)
+    val cls_name = text_of_block(box.cls_name, box.cls_name_len)
+
+    val v = current()
+
+    v.is_actor = true
+    v.actor_self = box.id
+    v.actor_self_gen = box.gen
+
+    // **The declarations and nothing else.** A top-level `val` is simply not bound here, so a handler
+    // reaching one faults with the ordinary sentence about a name that is not defined -- which is the
+    // consequence `docs/reference/modules.md` states for a reader.
+    val complaint = load_declarations(source_of(src_name, src_text))
+
+    if complaint != ""
+        failed_to_start(box, s"an actor's VM could not load the program's declarations:\n${complaint}")
+        return
+
+    val made = build_actor(cls_name, box) match
+        Err(sig) ->
+            failed_to_start(box, signal_message(sig))
+            return
+        Ok(made) -> made
+
+    v.actor_value = made
+
+    // The waker is the one thing another thread may hold, and it is published only once there is
+    // something behind it.
+    val note = libuv.notifier(() -> drain_inbox_now(), lp) match
+        Err(e) ->
+            failed_to_start(box, s"an actor's mailbox could not be made: ${e}")
+            return
+        Ok(n) -> n
+
+    v.inbox = Some(box)
+    v.inbox_note = Some(note)
+
+    box.lock.lock()
+    box.wake = Some(note.waker())
+    box.started = true
+    box.running = true
+    box.lock.unlock()
+    box.ready.post()
+
+    actor_serve(box, lp)
+
+    // **An actor's own children are stopped and JOINED here**, this VM never being `reset`: a thread
+    // nobody joins is a body leaked, and a grandchild's is nobody else's to wait for.
+    stop_spawned_actors()
+
+    // **The handle is CLOSED and not merely dropped, and the loop is turned once more so the close
+    // callback fires** -- without which `loop_close` answers EBUSY and the next run would block.
+    v.inbox_note = None
+    note.close(() -> ())
+
+    lp.run(libuv.RUN_DEFAULT) match
+        Ok(_) -> ()
+        Err(_) -> ()
+
+    announce_death(box)
+end actor_body
+
+// Run the actor's declaration's constructor with the arguments the spawner encoded.
+private build_actor(cls_name: string, box: &sync ActorBox) -> Step
+    val cls = declared_here(cls_name) match
+        Some(c) -> c
+        None -> return fault(point(0), s"`${cls_name}` is not an actor this program declares")
+
+    val mark = root_mark()
+
+    hold(cls)
+
+    val made = instantiate(cls, cls_name, box)
+
+    release(mark)
+    made
+end build_actor
+
+private instantiate(cls: Value, cls_name: string, box: &sync ActorBox) -> Step
+    var w = wire_over(box.args, box.args_len)
+    var args: Buf[Value] = buf()
+
+    loop_args(&w, &args, w.count())?
+
+    val maker = read_field(cls, "new", point(0))?
+
+    // **A declaration with no fields has no constructor at all**, which is `make_constructor`'s own
+    // rule: there is nothing for one to fill. The instance is then the object every instance is --
+    // its declaration as its `proto` and nothing of its own.
+    maker match
+        Fn(_) -> apply_callback(maker, args, point(0), cls_name)
+        Native(_) -> apply_callback(maker, args, point(0), cls_name)
+        _ ->
+            if args.len() != 0
+                return fault(point(0), s"`${cls_name}` declares no state, so `spawn` takes no arguments for it and was given ${counted(args.len(), "argument")}")
+
+            val o = new_object()
+            val made = Object(o)
+
+            hold(made)
+            obj_put_name(o, "proto", cls)
+            Ok(made)
+end instantiate
+
+private loop_args(w: *Wire, args: *Buf[Value], n: usize) -> Result[unit, Signal]
+    for _ in 0..<n
+        val v = decode_value(w, point(0))?
+
+        hold(v)
+        args.push(v)
+
+    Ok(())
+end loop_args
+
+// The actor's own turn of the loop.
+//
+// **This is `drain_events_to` written for a thread that is waiting to be told something**, and the
+// difference is the end condition: an actor stops when it has been asked to, its mailbox is empty,
+// nothing of its own is outstanding, and no handler is still working out an answer. A drain written
+// against `outstanding` alone would end the moment the actor went idle.
+private actor_serve(box: &sync ActorBox, lp: &libuv.Loop)
+    loop
+        run_microtasks()
+        settle_actor_answers()
+
+        current().loop_fault match
+            Some(sig) ->
+                current().actor_fault = signal_message(sig)
+                current().loop_fault = None
+                stop_this_actor(box)
+            None -> ()
+
+        if actor_is_finished(box) then break
+
+        lp.run(libuv.RUN_ONCE) match
+            Err(_) -> break
+            Ok(_) -> ()
+    end loop
+end actor_serve
+
+private stop_this_actor(box: &sync ActorBox)
+    box.lock.lock()
+    box.stopping = true
+    box.lock.unlock()
+end stop_this_actor
+
+private actor_is_finished(box: &sync ActorBox) -> bool
+    box.lock.lock()
+
+    val done = box.stopping && box.head.is_none()
+
+    box.lock.unlock()
+
+    if !done then return false
+    if current().outstanding > 0 then return false
+
+    for i in 0..<current().actor_answers.len()
+        if current().actor_answers.at(i).live then return false
+
+    true
+end actor_is_finished
+
+// Tell everybody, and let the storage go.
+//
+// **A broadcast rather than a list of watchers**, which is the cheap answer at this scale and the
+// only one that is complete: every pending `ask` on this actor has to reject, every `done` has to
+// settle, and whoever is holding either may be any actor in the process.
+private announce_death(box: &sync ActorBox)
+    val why = current().actor_fault
+
+    box.lock.lock()
+    box.running = false
+    box.stopping = true
+    box.dead = true
+
+    if why != ""
+        box.death = block_of_text(why)
+        box.death_len = why.bytes.len
+
+    val id = box.id
+    val gen = box.gen
+
+    box.lock.unlock()
+
+    var out: Buf[u8] = buf()
+
+    put_usize(&out, id)
+    put_usize(&out, gen)
+    put_text(&out, why)
+
+    the_actors.lock.lock()
+
+    var targets: Buf[usize] = buf()
+
+    for i in 0..<MaxActors
+        the_actors.boxes[i] match
+            Some(b) -> if b.id != id then targets.push(i)
+            None -> ()
+
+    the_actors.lock.unlock()
+
+    for i in 0..<targets.len()
+        the_actors.lock.lock()
+
+        val who = the_actors.boxes[targets.at(i)]
+
+        the_actors.lock.unlock()
+
+        who match
+            Some(b) ->
+                val note = note_of(NoteDied, block_of(out), out.len())
+
+                post_note(b, note, true)
+            None -> ()
+end announce_death
+
+// -- the drain both sides share -------------------------------------------------------------------
+
+// Called from the `Async` callback, which runs on the loop of whichever VM owns the mailbox.
+//
+// **`Async.send` coalesces**, so the callback's job is to drain whatever is there rather than to be
+// counted: one wake-up, one drain, however many messages arrived.
+drain_inbox_now()
+    current().inbox match
+        Some(box) -> drain_inbox(box)
+        None -> ()
+
+// Take everything on the list, oldest first, and act on it.
+drain_inbox(box: &sync ActorBox)
+    box.lock.lock()
+
+    var here = box.head
+
+    box.head = None
+    box.queued = 0
+    box.lock.unlock()
+
+    // **The list is newest first, so it is reversed** -- which is what makes delivery arrival order,
+    // and therefore per-sender order.
+    var ordered: Buf[&sync ActorNote] = buf()
+
+    loop
+        here match
+            Some(n) ->
+                ordered.push(n)
+                here = n.next
+            None -> break
+
+    var i = ordered.len()
+
+    loop
+        if i == 0 then break
+
+        i -= 1
+        take_note(box, ordered.at(i))
+end drain_inbox
+
+private take_note(box: &sync ActorBox, note: &sync ActorNote)
+    if note.kind == NoteStop
+        stop_this_actor(box)
+        drop_block(note.data)
+        return
+
+    if note.kind == NoteDied
+        take_death(note)
+        drop_block(note.data)
+        return
+
+    if note.kind == NoteReply || note.kind == NoteReject
+        take_answer(note)
+        drop_block(note.data)
+        return
+
+    take_call(box, note)
+    drop_block(note.data)
+end take_note
+
+// An actor that has stopped: reject what was asked of it, settle what was watching it, and let the
+// program stop waiting for it.
+private take_death(note: &sync ActorNote)
+    var w = wire_over(note.data, note.data_len)
+
+    val id = w.count()
+    val gen = w.count()
+    val why = w.text()
+
+    val v = current()
+
+    for i in 0..<v.spawned.len()
+        var s = v.spawned.at(i)
+
+        if s.live && s.id == id && s.gen == gen
+            s.live = false
+            v.spawned.set(i, s)
+
+    var i: usize = 0
+
+    loop
+        if i >= v.actor_waits.len() then break
+
+        val wt = v.actor_waits.at(i)
+
+        i += 1
+
+        if !wt.live || wt.target != id || wt.target_gen != gen then continue
+
+        finish_wait(wt, why)
+end take_death
+
+// An answer, or the fault a handler raised instead of one.
+private take_answer(note: &sync ActorNote)
+    val v = current()
+
+    if !holds(note.ticket, note.ticket_gen) then return
+
+    if note.kind == NoteReject
+        var w = wire_over(note.data, note.data_len)
+
+        forget_wait(note.ticket)
+        actor_waited_less()
+        fail_request(note.ticket, w.text(), point(0))
+        return
+
+    val mark = root_mark()
+    var w = wire_over(note.data, note.data_len)
+
+    val answer = decode_value(&w, point(0)) match
+        Ok(a) -> a
+        Err(sig) ->
+            release(mark)
+            forget_wait(note.ticket)
+            actor_waited_less()
+            fail_request(note.ticket, signal_message(sig), point(0))
+            return
+
+    hold(answer)
+    forget_wait(note.ticket)
+    actor_waited_less()
+    answer_plain_request(note.ticket, answer)
+    release(mark)
+end take_answer
+
+// A message for this actor's own handlers.
+private take_call(box: &sync ActorBox, note: &sync ActorNote)
+    val v = current()
+
+    // **The program's own VM has no handlers**, so a call that reaches it is a message sent to a
+    // handle nobody could serve -- which cannot happen through `send` or `ask` and is reported rather
+    // than ignored.
+    if !v.is_actor
+        reject_call(note, "this is the program's own line of execution, which declares no handlers")
+        return
+
+    val mark = root_mark()
+
+    var w = wire_over(note.data, note.data_len)
+
+    val call = decode_call(&w, point(0)) match
+        Ok(c) -> c
+        Err(sig) ->
+            release(mark)
+            reject_call(note, signal_message(sig))
+            return
+
+    val handler = read_field(v.actor_value, call.name, point(0)) match
+        Ok(h) -> h
+        Err(sig) ->
+            release(mark)
+            reject_call(note, signal_message(sig))
+            return
+
+    if !is_handler(v.actor_value, call.name)
+        release(mark)
+        reject_call(note, s"`${call.name}` is not a handler of this actor -- an actor answers the names it wrote `on` in front of")
+        return
+
+    hold(handler)
+
+    var args: Buf[Value] = buf()
+
+    args.push(v.actor_value)
+
+    for i in 0..<call.args.len()
+        args.push(call.args.at(i))
+
+    val answered = apply_callback(handler, args, point(0), call.name)
+
+    release(mark)
+
+    answered match
+        Err(sig) ->
+            // **An actor that faults dies**, exactly as an unhandled fault stops a program. The
+            // pending `ask` is rejected with the fault and so is every other one, by the death
+            // broadcast that follows.
+            reject_call(note, signal_message(sig))
+            v.actor_fault = signal_message(sig)
+            stop_this_actor(box)
+        Ok(answer) -> keep_answer(note, answer)
+end take_call
+
+// What a handler answered: the value itself, or a promise this VM watches until it settles.
+private keep_answer(note: &sync ActorNote, answer: Value)
+    if note.ticket_gen == 0 then return
+
+    answer match
+        Promise(pr) ->
+            pr.handled = true
+            current().actor_answers.push(ActorAnswer(pr, note.reply_id, note.reply_gen, note.ticket, note.ticket_gen, true))
+        _ -> send_reply(note.reply_id, note.reply_gen, note.ticket, note.ticket_gen, answer)
+end keep_answer
+
+// A promise a handler gave back, once it has settled.
+//
+// **Polled once per turn of the actor's own loop rather than watched**, which needs no promise
+// machinery of its own: a settled promise is a flag, and the actor's loop turns for every reason one
+// could settle for.
+settle_actor_answers()
+    val v = current()
+
+    for i in 0..<v.actor_answers.len()
+        var a = v.actor_answers.at(i)
+
+        if !a.live then continue
+        if !a.answer.settled then continue
+
+        a.live = false
+        v.actor_answers.set(i, a)
+
+        if a.answer.failed
+            send_rejection(a.reply_id, a.reply_gen, a.ticket, a.ticket_gen, a.answer.message)
+        else
+            send_reply(a.reply_id, a.reply_gen, a.ticket, a.ticket_gen, a.answer.value)
+end settle_actor_answers
+
+private reject_call(note: &sync ActorNote, why: string)
+    if note.ticket_gen == 0 then return
+
+    send_rejection(note.reply_id, note.reply_gen, note.ticket, note.ticket_gen, why)
+end reject_call
+
+send_reply(who: usize, gen: usize, ticket: usize, ticket_gen: usize, v: Value)
+    encode_single(v, point(0)) match
+        Err(sig) -> send_rejection(who, gen, ticket, ticket_gen, signal_message(sig))
+        Ok(bytes) ->
+            actor_box_at(who, gen) match
+                Some(b) ->
+                    var note = note_of(NoteReply, block_of(bytes), bytes.len())
+
+                    note.ticket = ticket
+                    note.ticket_gen = ticket_gen
+                    post_note(b, note, true)
+                None -> ()
+end send_reply
+
+send_rejection(who: usize, gen: usize, ticket: usize, ticket_gen: usize, why: string)
+    var out: Buf[u8] = buf()
+
+    put_text(&out, why)
+
+    actor_box_at(who, gen) match
+        Some(b) ->
+            var note = note_of(NoteReject, block_of(out), out.len())
+
+            note.ticket = ticket
+            note.ticket_gen = ticket_gen
+            post_note(b, note, true)
+        None -> ()
+end send_rejection

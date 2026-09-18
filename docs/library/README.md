@@ -21,6 +21,7 @@ What a program has without writing it.
 | [`slate:time`](time.md) | eight temporal types, and the arithmetic over them |
 | [`slate:process`](process.md) | another program, this program's environment, signals |
 | [`slate:cluster`](cluster.md) | one worker per core, and the supervisor that keeps them alive |
+| [`slate:actor`](actor.md) | a thread with a whole runtime on it, and a message that is copied |
 | [`slate:regex`](regex.md) | PCRE2 patterns |
 | [`slate:crypto`](crypto.md) | digests, HMAC, Argon2id, key derivation, randomness |
 | [`slate:jwt`](jwt.md) | JSON Web Tokens |

@@ -1,0 +1,287 @@
+module dev.slatelang.slate
+
+import sh.sysl.libuv
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8_unchecked
+
+// The shapes two actors share, and the raw blocks a message travels in.
+//
+// **Nothing here is a slate value, and that is the whole point.** Two actors are two heaps, so a
+// value cannot be handed over -- it is written out of the sender's heap into a flat run of bytes and
+// read back into the receiver's. `docs/design/actors.md` is the design, `actor_copy.sysl` does the
+// writing and reading, `actor_run.sysl` is the thread and its loop, and `actor.sysl` is the surface
+// a program writes.
+//
+// **A `&sync` struct may hold no `Buf`**, a growable collection owning its elements through a count
+// that is not atomic -- so the queue is an INTRUSIVE list of the messages themselves and a message's
+// payload is a `malloc`ed block with a length beside it. That is the shape
+// `tests_actor_probe.sysl` proved before any of this was written.
+
+// -- the tags a value crosses under ------------------------------------------------------------------
+
+// **A number rather than a name**, a tag being read a great many times and written once.
+const TagNull: u8 = 0u8
+const TagFalse: u8 = 1u8
+const TagTrue: u8 = 2u8
+const TagInt: u8 = 3u8
+const TagReal: u8 = 4u8
+const TagStr: u8 = 5u8
+const TagArray: u8 = 6u8
+const TagObject: u8 = 7u8
+const TagBytes: u8 = 8u8
+const TagInstant: u8 = 9u8
+const TagDuration: u8 = 10u8
+const TagDate: u8 = 11u8
+const TagTime: u8 = 12u8
+const TagDateTime: u8 = 13u8
+const TagZone: u8 = 14u8
+const TagZoned: u8 = 15u8
+const TagPeriod: u8 = 16u8
+const TagRange: u8 = 17u8
+const TagSet: u8 = 18u8
+const TagMap: u8 = 19u8
+const TagRegex: u8 = 20u8
+const TagActor: u8 = 21u8
+const TagMessage: u8 = 22u8
+
+// A value already written, named by the position it was written at. **This is what makes shared
+// structure survive and a cycle terminate**: two fields holding one object arrive holding one object,
+// and a list that holds itself is read back holding itself.
+const TagAgain: u8 = 23u8
+
+// An instance of a `class` or a `data` variant, by the name it was declared under. The receiver has
+// run the same program's declarations, so it looks the name up and rebuilds.
+const TagInstance: u8 = 24u8
+
+// -- what a note is ----------------------------------------------------------------------------------
+
+// **Read before its payload**, so a drain can route a note without decoding it.
+const NoteCall: u8 = 0u8
+const NoteReply: u8 = 1u8
+const NoteReject: u8 = 2u8
+const NoteStop: u8 = 3u8
+const NoteDied: u8 = 4u8
+
+// -- what the two threads share ----------------------------------------------------------------------
+
+// One message, and the list it is a node of.
+//
+// **The list is the messages themselves**, which is what "intrusive" means here and is forced rather
+// than chosen: a `Buf` cannot live in a `&sync` struct, so the queue has nowhere else to be.
+//
+// **`data` is a `malloc`ed block and the RECEIVER frees it.** A raw pointer carries no count, which
+// is exactly why it may cross: nothing about it is shared but the address, and the handover is
+// complete the moment the note is on the list.
+struct ActorNote
+    next: Option[&sync ActorNote]
+
+    kind: u8
+
+    // The encoded payload, and how long it is. `null` for a note that carries nothing.
+    data: *u8
+    data_len: usize
+
+    // Where an answer goes: the actor that asked, and the request slot in its VM. `ticket_gen` is
+    // zero for a `send`, which is fire-and-forget and has nothing to answer.
+    reply_id: usize
+    reply_gen: usize
+    ticket: usize
+    ticket_gen: usize
+end ActorNote
+
+// An actor's mailbox, and everything another thread may know about it.
+//
+// **Every field is read and written under `lock`**, except the run of them the thread reads once
+// before it publishes its waker, which nobody else looks at at all.
+struct ActorBox
+    lock: &sync libuv.Mutex
+
+    // Posted once by the thread when it has either published its waker or failed to start.
+    ready: &sync libuv.Semaphore
+
+    // The queue, newest first. The drain reverses it, which is what makes delivery arrival order --
+    // and therefore per-sender order, a sender's own posts being made one after another under this
+    // very lock.
+    head: Option[&sync ActorNote]
+
+    // The one thing another thread may hold, and `uv_async_send` is the one libuv call that is safe
+    // from any thread at all.
+    wake: Option[libuv.Waker]
+
+    // How many notes are queued, and the most this actor will hold at once. **A soft limit is a
+    // refusal and never a wait** -- a server that stalls its own loop waiting for a slow actor has
+    // stopped serving everybody else.
+    queued: usize
+    limit: usize
+
+    // Which actor this is, in the process-wide table `actor_run.sysl` keeps, and which occupant of
+    // that slot -- the `Socket` arrangement, and for its reason.
+    id: usize
+    gen: usize
+
+    // What the thread has to build itself out of: the program's source, the name of the actor
+    // declaration to instantiate, and the constructor's arguments already encoded. Each is a
+    // `malloc`ed block the thread frees once it has read it.
+    src_name: *u8
+    src_name_len: usize
+    src_text: *u8
+    src_text_len: usize
+    cls_name: *u8
+    cls_name_len: usize
+    args: *u8
+    args_len: usize
+
+    // How big a heap this actor was spawned with.
+    ceiling: usize
+
+    // Whether the thread got as far as publishing its waker, and the complaint where it did not.
+    started: bool
+    start_fault: *u8
+    start_fault_len: usize
+
+    // Whether it will still take messages, whether somebody has asked it to stop, and whether it has
+    // finished.
+    running: bool
+    stopping: bool
+    dead: bool
+
+    // The fault it died with, and `null` where it stopped cleanly.
+    death: *u8
+    death_len: usize
+end ActorBox
+
+// -- raw blocks ----------------------------------------------------------------------------------
+
+// **`malloc` and `free` are `vm_state.sysl`'s**, an `extern` being module-wide in sysl -- a second
+// declaration of one is ambiguous rather than a second name for it. A VM's heap and a message's
+// payload are the two things in the runtime that ask the allocator for a block directly.
+//
+// A `malloc`ed copy of a run of bytes, which is how anything variable-length crosses.
+//
+// **Zero bytes answer `null` rather than a block of nothing**, so every reader's test is the same one
+// and no caller has to remember which case it is in.
+block_of(b: Buf[u8]) -> *u8
+    if b.len() == 0 then return null
+
+    val p = malloc(b.len())
+
+    if p == null then panic("slate could not take the storage a message needed")
+
+    for i in 0..<b.len()
+        p[i] = b.at(i)
+
+    p
+end block_of
+
+// The same, for text.
+block_of_text(s: string) -> *u8
+    var b: Buf[u8] = buf()
+
+    for c in s.bytes
+        b.push(c)
+
+    block_of(b)
+end block_of_text
+
+// A block read back as text. **The block is not freed here**, a reader often wanting it twice.
+text_of_block(p: *u8, n: usize) -> string
+    if p == null || n == 0 then return ""
+
+    var b: Buf[u8] = buf()
+
+    for i in 0..<n
+        b.push(p[i])
+
+    from_utf8_unchecked(b.view())
+end text_of_block
+
+// Give a block back, where there is one.
+drop_block(p: *u8)
+    if p != null then free(p)
+
+// -- numbers on the wire ---------------------------------------------------------------------------
+
+// **A real crosses as its BITS and not as its text.** A decimal round trip is a second question --
+// whether the shortest representation reads back exactly -- and a message is not the place to ask it.
+real_bits(x: real) -> u64
+    var box: [1]real = [x]
+    val p: *u64 = ptr_cast(&box[0])
+
+    p[0]
+end real_bits
+
+bits_real(b: u64) -> real
+    var box: [1]u64 = [b]
+    val p: *real = ptr_cast(&box[0])
+
+    p[0]
+end bits_real
+
+// Little-endian, eight bytes, for every number that crosses. **One width for all of them**: a
+// message is not a format anybody else reads, so there is nothing to be gained by packing it.
+put_u64(out: *Buf[u8], n: u64)
+    var v = n
+
+    for _ in 0..<8
+        out.push(u8(v & 0xffu64))
+        v = v >> 8u64
+end put_u64
+
+put_usize(out: *Buf[u8], n: usize) = put_u64(out, u64(n))
+
+put_long(out: *Buf[u8], n: long) = put_u64(out, u64(n))
+
+put_text(out: *Buf[u8], s: string)
+    val bs = s.bytes
+
+    put_usize(out, bs.len)
+
+    for i in 0..<bs.len
+        out.push(bs[i])
+end put_text
+
+// Where a decode has got to.
+//
+// **A struct rather than a returned pair**, a reader stepping through one buffer being exactly what a
+// cursor is for. `seen` is every reference value already read, in the order it was read, so that
+// `TagAgain` can name one.
+struct Wire
+    p: *u8
+    len: usize
+    at: usize
+    seen: Buf[Value]
+
+    // The next byte, and zero past the end -- a truncated message is a defect in this file rather
+    // than something a program can cause, so there is nothing here for a diagnostic to say.
+    byte(*self) -> u8
+        if self.at >= self.len then return 0u8
+
+        val b = self.p[self.at]
+
+        self.at += 1
+        b
+    end byte
+
+    word(*self) -> u64
+        var v: u64 = 0u64
+
+        for i in 0..<8
+            v = v | (u64(self.byte()) << u64(i * 8))
+
+        v
+    end word
+
+    count(*self) -> usize = usize(self.word())
+
+    text(*self) -> string
+        val n = self.count()
+        var b: Buf[u8] = buf()
+
+        for _ in 0..<n
+            b.push(self.byte())
+
+        if n == 0 then "" else from_utf8_unchecked(b.view())
+    end text
+end Wire
+
+wire_over(p: *u8, n: usize) -> Wire = Wire(p, n, 0, buf())

@@ -1,0 +1,714 @@
+module dev.slatelang.slate
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.text.Search
+
+// `actor` and `slate:actor`, driven as a program writes them.
+//
+// **Every one of these runs a whole program**, because that is what an actor is: a second thread with
+// a second slate runtime on it, reached from the first by a message. `tests_actor_probe.sysl` is the
+// transport underneath and asks its question in sysl; this asks the program's.
+//
+// **Every name here carries the word ACTOR**, which is what makes `sysl test . --filter ACTOR` this
+// file and nothing else -- the filter matching a test's name and this suite having no other subject
+// that word belongs to.
+
+private val ActorImport: string = "import { spawn, send, ask, done, stop, detach, me, transfer } from slate:actor\n"
+
+// Room for a small program and the objects its declarations make.
+private const ProbeCeiling: usize = 16777216
+
+// -- what makes a class able to cross ----------------------------------------------------------------
+
+// **A class instance crosses by the NAME it was declared under**, which only works if both sides can
+// look that name up -- and a class a file did not export is not a key of the module object a file
+// answers. `each_module` records every module's SCOPE for exactly this, and this is the test that
+// says so at the seam rather than four layers up in a program that sends one.
+@test
+AN_ACTOR_FINDS_A_CLASS_ITS_FILE_DECLARED_WHETHER_OR_NOT_THE_FILE_EXPORTED_IT()
+    // **An IMPORT is in here on purpose.** A program of several modules answers one object per
+    // module, and what a lookup has to do is walk all of them -- so a fixture with nothing imported
+    // would pass against a walk that only ever looked at one.
+    val program = ActorImport + "import { regex } from slate:regex\n" +
+        "class Point\n    var x\n\ndata Shape\n    Circle(r)\n\nexport val n = 1\n"
+
+    // The declarations chunk, which is what an actor's own VM runs.
+    reset_vm()
+    current().output.clear()
+
+    var second = new_vm(ProbeCeiling)
+    val was = enter(&second)
+    val complaint = load_declarations(source_of("t", program))
+    // **Asked while that VM is still the one this thread is in.** `declared_here` reads
+    // `current().module_values`, so a question asked after `leave` is a question about the VM that
+    // was put back -- which is the shape of mistake this whole file exists to make impossible.
+    val in_decls = declared_here("Point").is_some()
+    val variant = declared_here("Circle").is_some()
+    val no_such = declared_here("Nope").is_none()
+
+    leave(was)
+    dispose_vm(&second)
+
+    assert_eq(complaint, "", "the declarations ran")
+    assert(in_decls, "a class a file did not export is findable by name in a VM that ran the declarations")
+    assert(variant, "and so is a data variant")
+    assert(no_such, "and a name no file declared is not")
+
+    // And the module's own chunk, which is what the PROGRAM runs -- a message comes back the other
+    // way, so the program has to be able to look a class up too.
+    reset_vm()
+    current().output.clear()
+    assert_eq(out(program), "")
+
+    val in_program = declared_here("Point").is_some()
+
+    // **A builtin is not a declaration**, which the guard in `declared_here` is what says: a module
+    // scope's chain reaches the builtins, so an unguarded lookup would answer `print` for a message
+    // naming a class that is not there.
+    val not_a_builtin = declared_here("print").is_none()
+
+    current().output.clear()
+    assert(in_program, "and in the VM that ran the file itself")
+    assert(not_a_builtin, "and a builtin is not a class a message may name")
+end AN_ACTOR_FINDS_A_CLASS_ITS_FILE_DECLARED_WHETHER_OR_NOT_THE_FILE_EXPORTED_IT
+
+// -- the surface -------------------------------------------------------------------------------------
+
+@test
+AN_ACTOR_IS_A_DECLARATION_AND_ASKING_ONE_ANSWERS_A_PROMISE()
+    assert_eq(out(ActorImport + raw"""
+        actor Counter
+            var n = 0
+
+            on bump(self, by = 1)
+                self.n += by
+
+            on total(self) = self.n
+
+        val c = spawn(Counter)
+
+        send(c.bump, 2)
+        send(c.bump)
+
+        print(await ask(c.total))
+        """), "3")
+end AN_ACTOR_IS_A_DECLARATION_AND_ASKING_ONE_ANSWERS_A_PROMISE
+
+@test
+AN_ACTORS_HANDLER_IS_NAMED_BY_TEXT_AS_WELL_AS_BY_READING_IT_OFF_A_HANDLE()
+    assert_eq(out(ActorImport + raw"""
+        actor Echo
+            on say(self, what) = "said " + what
+
+        val e = spawn(Echo)
+
+        print(await ask(e, "say", "hello"))
+        send(e, "say", "ignored")
+        print(await ask(e.say, "again"))
+        """), "said hello\nsaid again")
+end AN_ACTORS_HANDLER_IS_NAMED_BY_TEXT_AS_WELL_AS_BY_READING_IT_OFF_A_HANDLE
+
+@test
+FOUR_ACTORS_ARE_ASKED_AT_ONCE_AND_GATHERED_WITH_THE_ORDINARY_all()
+    assert_eq(out(ActorImport + raw"""
+        actor Squarer
+            on square(self, n) = n * n
+
+        val workers = [spawn(Squarer), spawn(Squarer), spawn(Squarer), spawn(Squarer)]
+
+        print(await all(workers.map((w, i) -> ask(w.square, i + 1))))
+        """), "[1, 4, 9, 16]")
+end FOUR_ACTORS_ARE_ASKED_AT_ONCE_AND_GATHERED_WITH_THE_ORDINARY_all
+
+@test
+AN_ACTORS_ASYNC_HANDLER_ANSWERS_WHAT_ITS_PROMISE_SETTLES_TO()
+    assert_eq(out(ActorImport + raw"""
+        actor Waiter
+            async on later(self, n)
+                await sleep(5)
+                n * 10
+
+        val w = spawn(Waiter)
+
+        print(await ask(w.later, 4))
+        """), "40")
+end AN_ACTORS_ASYNC_HANDLER_ANSWERS_WHAT_ITS_PROMISE_SETTLES_TO
+
+@test
+AN_ACTOR_HANDS_ITS_OWN_ADDRESS_TO_SOMEBODY_WITH_me()
+    assert_eq(out(ActorImport + raw"""
+        actor Worker
+            on introduce(self, boss)
+                send(boss.enrol, me())
+
+        actor Boss
+            var seen = 0
+
+            on enrol(self, who)
+                self.seen += 1
+
+            on count(self) = self.seen
+
+        val b = spawn(Boss)
+        val w = spawn(Worker)
+
+        send(w.introduce, b)
+
+        await sleep(80)
+        print(await ask(b.count))
+        """), "1")
+end AN_ACTOR_HANDS_ITS_OWN_ADDRESS_TO_SOMEBODY_WITH_me
+
+@test
+AN_ACTOR_DECLARING_NO_STATE_NEEDS_NO_CONSTRUCTOR_AND_STILL_ANSWERS()
+    assert_eq(out(ActorImport + raw"""
+        actor Adder
+            on add(self, a, b) = a + b
+
+        print(await ask(spawn(Adder).add, 20, 22))
+        """), "42")
+end AN_ACTOR_DECLARING_NO_STATE_NEEDS_NO_CONSTRUCTOR_AND_STILL_ANSWERS
+
+// -- ordering and delivery -----------------------------------------------------------------------
+
+@test
+A_THOUSAND_SENDS_TO_ONE_ACTOR_ARRIVE_IN_THE_ORDER_THEY_WERE_WRITTEN()
+    assert_eq(out(ActorImport + raw"""
+        actor Tally
+            var last = -1
+            var wrong = 0
+            var seen = 0
+
+            on step(self, n)
+                if n != self.last + 1 then self.wrong += 1
+
+                self.last = n
+                self.seen += 1
+
+            on report(self) = [self.seen, self.wrong]
+
+        val t = spawn(Tally)
+
+        for i in 0..<1000
+            send(t.step, i)
+
+        print(await ask(t.report))
+        """), "[1000, 0]")
+end A_THOUSAND_SENDS_TO_ONE_ACTOR_ARRIVE_IN_THE_ORDER_THEY_WERE_WRITTEN
+
+@test
+SENDING_TO_AN_ACTOR_NEVER_WAITS_FOR_ONE_THAT_IS_BUSY()
+    assert_eq(out(ActorImport + "import { monotonic, millis } from slate:time\n" + raw"""
+        actor Slow
+            on work(self, until)
+                val began = monotonic()
+                var k = 0
+
+                while monotonic() - began < until
+                    k += 1
+
+                k
+
+            on ping(self) = "awake"
+
+        val s = spawn(Slow)
+        val began = monotonic()
+
+        send(s.work, millis(120))
+        send(s.work, millis(120))
+
+        val took = monotonic() - began
+
+        print(if took < millis(80) then "the sender did not wait" else "the sender waited")
+        print(await ask(s.ping))
+        """), "the sender did not wait\nawake")
+end SENDING_TO_AN_ACTOR_NEVER_WAITS_FOR_ONE_THAT_IS_BUSY
+
+// -- what crosses ----------------------------------------------------------------------------------
+
+@test
+EVERY_SENDABLE_KIND_ARRIVES_AS_ITSELF_IN_THE_RECEIVING_ACTORS_HEAP()
+    assert_eq(out(ActorImport + "import { date, seconds, months } from slate:time\nimport { regex } from slate:regex\n" + raw"""
+        class Point
+            var x
+            var y
+
+        data Shape
+            Circle(r)
+            Sq(side)
+
+        actor Mirror
+            on bounce(self, v) = v
+
+        val m = spawn(Mirror)
+
+        val sent = {
+            whole: 7,
+            real: 2.5,
+            yes: true,
+            nothing: null,
+            text: "héllo",
+            list: [1, [2, 3]],
+            keyed: { b: 1, a: 2 },
+            members: Set([1, 2, 2]),
+            table: Map([["k", 1]]),
+            span: 2..<5,
+            when: date(2026, 9, 17),
+            howLong: seconds(90),
+            calendar: months(2),
+            pattern: regex("a+", "i"),
+            spot: Point.new(1, 2),
+            round: Circle(3)
+        }
+
+        val back = await ask(m.bounce, sent)
+
+        print(back.whole == 7 && back.real == 2.5 && back.yes && back.nothing == null && back.text == "héllo")
+        print(back.list == [1, [2, 3]])
+        print(keys(back.keyed).join(","))
+        print(back.members.size == 2 && back.table.get("k") == 1)
+        print(back.span == 2..<5)
+        print(back.when == date(2026, 9, 17) && back.howLong == seconds(90) && back.calendar == months(2))
+        print(back.pattern.test("AAA"))
+        print(back.spot is Point && back.spot.x == 1 && back.spot.y == 2)
+        print(back.round is Shape && back.round.r == 3)
+        """), "true\ntrue\nb,a\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue")
+end EVERY_SENDABLE_KIND_ARRIVES_AS_ITSELF_IN_THE_RECEIVING_ACTORS_HEAP
+
+@test
+AN_ACTOR_IS_SENT_A_CLASS_INSTANCE_AND_READS_ITS_FIELDS()
+    assert_eq(out(ActorImport + raw"""
+        class Point
+            var x
+            var y
+
+        actor Reader
+            on sum(self, p) = p.x + p.y
+
+            on named(self, p) = p is Point
+
+        val m = spawn(Reader)
+
+        print(await ask(m.sum, Point.new(1, 2)))
+        print(await ask(m.named, Point.new(1, 2)))
+        """), "3\ntrue")
+end AN_ACTOR_IS_SENT_A_CLASS_INSTANCE_AND_READS_ITS_FIELDS
+
+@test
+AN_ACTOR_ANSWERS_WITH_A_CLASS_INSTANCE_AND_IT_KEEPS_ITS_CLASS()
+    assert_eq(out(ActorImport + raw"""
+        class Point
+            var x
+            var y
+
+        actor Maker
+            on at(self, x, y) = Point.new(x, y)
+
+        val m = spawn(Maker)
+        val made = await ask(m.at, 2, 3)
+
+        print(made is Point, made.x, made.y)
+        """), "true 2 3")
+end AN_ACTOR_ANSWERS_WITH_A_CLASS_INSTANCE_AND_IT_KEEPS_ITS_CLASS
+
+@test
+AN_ACTOR_IS_SENT_SHARED_STRUCTURE_SHARED_AND_A_CYCLE_AS_A_CYCLE()
+    assert_eq(out(ActorImport + raw"""
+        actor Mirror
+            on bounce(self, v) = v
+
+        val m = spawn(Mirror)
+        val one = { n: 1 }
+        val both = { left: one, right: one }
+        val ring = { name: "ring" }
+
+        ring.self = ring
+
+        val back = await ask(m.bounce, [both, ring])
+
+        back[0].left.n = 99
+        print(back[0].right.n)
+        print(back[1].self.self.name)
+        """), "99\nring")
+end AN_ACTOR_IS_SENT_SHARED_STRUCTURE_SHARED_AND_A_CYCLE_AS_A_CYCLE
+
+@test
+AN_ACTOR_IS_SENT_BYTES_COPIED_AND_transfer_LEAVES_THE_SENDERS_BUFFER_EMPTY()
+    assert_eq(out(ActorImport + raw"""
+        actor Sizer
+            on size(self, b) = b.length
+
+        val s = spawn(Sizer)
+        val copied = toBytes("hello")
+
+        print(await ask(s.size, copied))
+        print(copied.length)
+
+        val moved = toBytes("goodbye")
+
+        print(await ask(s.size, transfer(moved)))
+        print(moved.length)
+        """), "5\n5\n7\n0")
+end AN_ACTOR_IS_SENT_BYTES_COPIED_AND_transfer_LEAVES_THE_SENDERS_BUFFER_EMPTY
+
+@test
+AN_ACTOR_HANDLE_COMPARES_BY_IDENTITY_AND_CROSSES_TO_A_THIRD_ACTOR()
+    assert_eq(out(ActorImport + raw"""
+        actor Adder
+            on add(self, a, b) = a + b
+
+        actor Broker
+            async on relay(self, who, a, b) = await ask(who.add, a, b)
+
+            on same(self, one, two) = one == two
+
+        val a = spawn(Adder)
+        val b = spawn(Broker)
+        val copies = [a, a]
+
+        print(copies[0] == copies[1])
+        print(await ask(b.same, a, a))
+        print(await ask(b.relay, a, 20, 22))
+        """), "true\ntrue\n42")
+end AN_ACTOR_HANDLE_COMPARES_BY_IDENTITY_AND_CROSSES_TO_A_THIRD_ACTOR
+
+// -- what does not cross ---------------------------------------------------------------------------
+
+@test
+A_MESSAGE_TO_AN_ACTOR_MAY_NOT_CARRY_A_FUNCTION_AND_THE_REFUSAL_NAMES_THE_FIELD()
+    val said = fails(ActorImport + raw"""
+        actor Sink
+            on take(self, v) = 1
+
+        val s = spawn(Sink)
+
+        send(s.take, { handlers: { onDone: () -> 1 } })
+        """)
+
+    assert(said.contains("a message may not carry a function"), said)
+    assert(said.contains("`handlers.onDone` is a function"),
+        s"the refusal names the field it found and not the message -- ${said}")
+end A_MESSAGE_TO_AN_ACTOR_MAY_NOT_CARRY_A_FUNCTION_AND_THE_REFUSAL_NAMES_THE_FIELD
+
+@test
+A_MESSAGE_TO_AN_ACTOR_MAY_NOT_CARRY_A_PROMISE_A_TYPE_OR_A_GENERATOR()
+    val promised = fails(ActorImport + raw"""
+        actor Sink
+            on take(self, v) = 1
+
+        val s = spawn(Sink)
+
+        send(s.take, [sleep(5)])
+        """)
+
+    assert(promised.contains("a message may not carry a promise"), promised)
+    assert(promised.contains("`[0]`"), s"the path names the element -- ${promised}")
+
+    val typed = fails(ActorImport + raw"""
+        type Note = { title: string }
+
+        actor Sink
+            on take(self, v) = 1
+
+        val s = spawn(Sink)
+
+        send(s.take, { shape: Note })
+        """)
+
+    assert(typed.contains("a message may not carry a type"), typed)
+    assert(typed.contains("`shape`"), s"the path names the field -- ${typed}")
+
+    val stepped = fails(ActorImport + raw"""
+        actor Sink
+            on take(self, v) = 1
+
+        counted() =
+            yield 1
+
+        val s = spawn(Sink)
+
+        send(s.take, counted())
+        """)
+
+    assert(stepped.contains("a message may not carry a generator"), stepped)
+end A_MESSAGE_TO_AN_ACTOR_MAY_NOT_CARRY_A_PROMISE_A_TYPE_OR_A_GENERATOR
+
+@test
+A_MESSAGE_TO_AN_ACTOR_MAY_NOT_CARRY_A_DECLARATION_ITSELF()
+    val said = fails(ActorImport + raw"""
+        class Point
+            var x
+
+        actor Sink
+            on take(self, v) = 1
+
+        val s = spawn(Sink)
+
+        send(s.take, Point)
+        """)
+
+    assert(said.contains("a message may not carry a declaration"), said)
+end A_MESSAGE_TO_AN_ACTOR_MAY_NOT_CARRY_A_DECLARATION_ITSELF
+
+// -- failure ---------------------------------------------------------------------------------------
+
+@test
+AN_ACTOR_THAT_FAULTS_DIES_AND_EVERY_PENDING_ASK_REJECTS_WITH_THE_FAULT()
+    assert_eq(out(ActorImport + raw"""
+        actor Brittle
+            on burst(self)
+                throw "it broke"
+
+            on later(self) = "never"
+
+        val b = spawn(Brittle)
+        val watching = done(b)
+
+        try
+            await ask(b.burst)
+        catch e
+            print("asked: " + e.message)
+
+        try
+            await watching
+        catch e
+            print("done: " + e.message)
+
+        send(b.later)
+
+        try
+            await ask(b.later)
+        catch e
+            print("after: " + e.message)
+        """), "asked: it broke\ndone: it broke\nafter: the actor is not running")
+end AN_ACTOR_THAT_FAULTS_DIES_AND_EVERY_PENDING_ASK_REJECTS_WITH_THE_FAULT
+
+@test
+STOPPING_AN_ACTOR_DRAINS_IT_AND_SETTLES_done()
+    assert_eq(out(ActorImport + raw"""
+        actor Counter
+            var n = 0
+
+            on bump(self)
+                self.n += 1
+
+            on total(self) = self.n
+
+        val c = spawn(Counter)
+
+        send(c.bump)
+        send(c.bump)
+
+        val ended = done(c)
+
+        stop(c)
+        print(await ended)
+
+        try
+            await ask(c.total)
+        catch e
+            print(e.message)
+        """), "null\nthe actor is not running")
+end STOPPING_AN_ACTOR_DRAINS_IT_AND_SETTLES_done
+
+@test
+AN_ACTORS_MAILBOX_PAST_ITS_SOFT_LIMIT_REFUSES_RATHER_THAN_WAITING()
+    val said = fails(ActorImport + "import { monotonic, millis } from slate:time\n" + raw"""
+        actor Slow
+            on work(self, until)
+                val began = monotonic()
+                var k = 0
+
+                while monotonic() - began < until
+                    k += 1
+
+                k
+
+        val s = spawn(Slow, { mailbox: 2 })
+
+        for i in 0..<200
+            send(s.work, millis(200))
+        """)
+
+    assert(said.contains("mailbox is full"),
+        s"a soft limit turns overflow into a refusal, never into a wait -- ${said}")
+end AN_ACTORS_MAILBOX_PAST_ITS_SOFT_LIMIT_REFUSES_RATHER_THAN_WAITING
+
+@test
+A_SMALL_HEAP_CEILING_FAULTS_THE_ACTOR_AND_NOT_THE_PROGRAM()
+    val said = out(ActorImport + raw"""
+        actor Hungry
+            on gorge(self)
+                var xs = []
+
+                for i in 0..<4000000
+                    xs.push("a string of some length, to fill a small heap")
+
+                xs.length
+
+        val h = spawn(Hungry, { heap: 8388608 })
+
+        try
+            await ask(h.gorge)
+        catch e
+            print("the actor: " + e.message)
+
+        print("the program is still here")
+        """)
+
+    assert(said.contains("the program is still here"),
+        s"an actor that outgrows its heap faults; it does not take the process with it -- ${said}")
+    assert(said.contains("the actor: "), said)
+end A_SMALL_HEAP_CEILING_FAULTS_THE_ACTOR_AND_NOT_THE_PROGRAM
+
+// -- the shape of the declaration ------------------------------------------------------------------
+
+@test
+AN_ACTORS_HANDLER_NAMING_A_TOP_LEVEL_val_FAULTS_WITH_THE_ORDINARY_SENTENCE()
+    val said = out(ActorImport + raw"""
+        val marker = 41
+
+        actor Peeker
+            on peek(self) = marker + 1
+
+        val p = spawn(Peeker)
+
+        try
+            print(await ask(p.peek))
+        catch e
+            print(e.message)
+        """)
+
+    assert(said.contains("`marker` is not defined"),
+        s"an actor's VM runs the declarations and not the effects, so a top-level `val` is simply not bound there -- ${said}")
+end AN_ACTORS_HANDLER_NAMING_A_TOP_LEVEL_val_FAULTS_WITH_THE_ORDINARY_SENTENCE
+
+@test
+AN_ACTOR_BELONGS_TO_THE_TOP_LEVEL_OF_A_FILE()
+    val said = fails(raw"""
+        maker() =
+            actor Inner
+                on ping(self) = 1
+
+            Inner
+        """)
+
+    assert(said.contains("an actor belongs to the top level of a file"), said)
+end AN_ACTOR_BELONGS_TO_THE_TOP_LEVEL_OF_A_FILE
+
+@test
+on_DECLARES_A_HANDLER_AND_ONLY_AN_ACTOR_HAS_HANDLERS()
+    val said = fails(raw"""
+        class Point
+            var x
+
+            on ping(self) = 1
+        """)
+
+    assert(said.contains("only an `actor` has handlers"), said)
+end on_DECLARES_A_HANDLER_AND_ONLY_AN_ACTOR_HAS_HANDLERS
+
+@test
+A_MESSAGE_NAMING_AN_ACTORS_METHOD_RATHER_THAN_A_HANDLER_IS_REFUSED_WHERE_IT_ARRIVES()
+    assert_eq(out(ActorImport + raw"""
+        actor Guarded
+            helper(self) = "private"
+
+            on ping(self) = self.helper()
+
+        val g = spawn(Guarded)
+
+        print(await ask(g.ping))
+
+        try
+            await ask(g.helper)
+        catch e
+            print(e.message)
+        """), "private\n`helper` is not a handler of this actor -- an actor answers the names it wrote `on` in front of")
+end A_MESSAGE_NAMING_AN_ACTORS_METHOD_RATHER_THAN_A_HANDLER_IS_REFUSED_WHERE_IT_ARRIVES
+
+@test
+spawn_TAKES_AN_ACTOR_AND_SAYS_SO_WHEN_IT_IS_HANDED_A_CLASS()
+    val said = fails(ActorImport + raw"""
+        class Point
+            var x
+
+        val p = spawn(Point, 1)
+        """)
+
+    assert(said.contains("is a class"), said)
+end spawn_TAKES_AN_ACTOR_AND_SAYS_SO_WHEN_IT_IS_HANDED_A_CLASS
+
+// -- the end of the program -------------------------------------------------------------------------
+
+@test
+A_DETACHED_ACTOR_DOES_NOT_HOLD_THE_PROGRAM_OPEN()
+    assert_eq(out(ActorImport + raw"""
+        actor Logger
+            on note(self, line) = 1
+
+        val l = spawn(Logger)
+
+        detach(l)
+        send(l.note, "a line nobody waits for")
+        print("done")
+        """), "done")
+end A_DETACHED_ACTOR_DOES_NOT_HOLD_THE_PROGRAM_OPEN
+
+@test
+A_SEND_TO_AN_ACTOR_ON_THE_LAST_LINE_IS_STILL_SERVED_BEFORE_THE_PROGRAM_ENDS()
+    assert_eq(out(ActorImport + raw"""
+        actor Counter
+            var n = 0
+
+            on bump(self)
+                self.n += 1
+
+            on total(self) = self.n
+
+        val c = spawn(Counter)
+
+        send(c.bump)
+        send(c.bump)
+        send(c.bump)
+        print(await ask(c.total))
+        """), "3")
+end A_SEND_TO_AN_ACTOR_ON_THE_LAST_LINE_IS_STILL_SERVED_BEFORE_THE_PROGRAM_ENDS
+
+@test
+A_HUNDRED_ACTORS_SPAWN_ANSWER_AND_STOP_CLEANLY()
+    assert_eq(out(ActorImport + raw"""
+        actor Adder
+            var base
+
+            on plus(self, n) = self.base + n
+
+        var made = []
+
+        for i in 0..<100
+            made.push(spawn(Adder, i))
+
+        val answers = await all(made.map(a -> ask(a.plus, 1)))
+
+        for a in made
+            stop(a)
+
+        print(answers.reduce((sum, n) -> sum + n, 0))
+        """), "5050")
+end A_HUNDRED_ACTORS_SPAWN_ANSWER_AND_STOP_CLEANLY
+
+// -- the JavaScript back end ------------------------------------------------------------------------
+
+@test
+THE_JAVASCRIPT_BACK_END_REFUSES_AN_ACTOR_DECLARATION()
+    val said = js_program(ActorImport + raw"""
+        actor Counter
+            on ping(self) = 1
+
+        print(spawn(Counter))
+        """)
+
+    assert(said.contains("the JavaScript back end has no actors"), said)
+    assert(said.contains("`actor Counter`"), s"the refusal names the declaration -- ${said}")
+end THE_JAVASCRIPT_BACK_END_REFUSES_AN_ACTOR_DECLARATION

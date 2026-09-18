@@ -1,0 +1,792 @@
+module dev.slatelang.slate
+
+import sh.sysl.gc
+import sh.sysl.libuv
+import sh.sysl.libuv.Handle
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// `slate:actor` -- what a program writes, and the tables a VM keeps about the actors around it.
+//
+// **An actor is a thread with a whole slate runtime on it.** Nothing is shared: two actors cannot see
+// one object between them, so there is no lock to take and no rule about which thread may touch what.
+// What crosses is messages, and a message is copied. `docs/design/actors.md` is the design,
+// `docs/library/actor.md` is the page a program is written against, `actor_run.sysl` is the thread
+// and `actor_copy.sysl` is what crosses.
+//
+// **The names here are the module's and the natives' are prefixed**, which is `slate:url`'s
+// arrangement and is forced rather than chosen: `spawn` and `send` are already a native each --
+// `slate:process`'s child and `slate:net`'s write -- and the registry is keyed by name. So the
+// natives are `actorSpawn`, `actorSend` and their neighbours, and `actor_source.sysl` is eight lines
+// of slate giving them the names the design page uses.
+
+// -- what a VM keeps about actors ------------------------------------------------------------------
+
+// An actor this VM spawned.
+//
+// **The thread is held here and nowhere else**, `libuv.thread` keeping a reference to its own body
+// only while it runs: `join` is what drops it, and a thread never joined is a body leaked.
+//
+// Not `private`: `vm_state.sysl` names it in `Vm`.
+struct Spawned
+    box: &sync ActorBox
+    thread: &sync libuv.Thread
+
+    // **Whether the program still waits for it.** `detach` opts one out, for a logger or a metrics
+    // sink that would otherwise hold the program open.
+    detached: bool
+
+    // Whether it is still running, as far as this VM has been told.
+    live: bool
+
+    id: usize
+    gen: usize
+end Spawned
+
+// Something only an actor can answer: an `ask`, or a `done`.
+//
+// Not `private`: `vm_state.sysl` names it in `Vm`.
+struct ActorWait
+    // The request slot in `event.sysl`'s table, and which occupant of it this is.
+    ticket: usize
+    ticket_gen: usize
+
+    target: usize
+    target_gen: usize
+
+    // `WaitAsk` or `WaitDone`.
+    kind: u8
+    live: bool
+end ActorWait
+
+// A promise a handler answered with, and where its answer goes when it settles.
+//
+// **`answer` is a collector root**, for `PageBinding.f`'s reason: between the handler answering and
+// the promise settling, this table is the only thing holding it.
+//
+// Not `private`: `vm_state.sysl` names it in `Vm`.
+struct ActorAnswer
+    answer: *PromiseObj
+    reply_id: usize
+    reply_gen: usize
+    ticket: usize
+    ticket_gen: usize
+    live: bool
+end ActorAnswer
+
+const WaitAsk: u8 = 0u8
+const WaitDone: u8 = 1u8
+
+// What `post_note` answered.
+const PostOk: u8 = 0u8
+const PostGone: u8 = 1u8
+const PostFull: u8 = 2u8
+
+// How many messages an actor holds before it starts refusing, where nobody said.
+//
+// **A soft limit is a refusal and never a wait**, so this is a number that says "something is wrong"
+// rather than one that has to be right.
+private const DefaultMailbox: usize = 65536
+
+// How big an actor's heap is where nobody said. **Smaller than the program's**, an actor being a
+// component rather than a whole program, and raised at spawn by whoever knows better.
+private const DefaultActorHeap: usize = 67108864
+
+// -- the collector, and putting the tables back ------------------------------------------------------
+
+// Mark what an actor's answers can still reach.
+//
+// **Called from `roots` and not from `mark_pending`**, for `mark_windows`' reason: a handler's
+// promise is neither waiting for an answer of its own nor outstanding on the loop.
+mark_actors(h: *gc.Heap)
+    val v = current()
+
+    for i in 0..<v.actor_answers.len()
+        if v.actor_answers.at(i).live && v.actor_answers.at(i).answer != null
+            gc.mark(h, ptr_cast(v.actor_answers.at(i).answer))
+
+    mark_value(h, v.actor_value)
+end mark_actors
+
+// Stop every actor this VM spawned, wait for each thread, and put the mailbox back.
+//
+// **A thread outlives the program that started it unless it is joined**, which is the sharpest entry
+// on `reset_events`' list: the suite is one process, so an actor left running is a thread of the next
+// test's.
+forget_actors()
+    val v = current()
+
+    stop_spawned_actors()
+
+    v.inbox_note match
+        Some(n) -> n.close(() -> ())
+        None -> ()
+
+    v.inbox_note = None
+
+    v.inbox match
+        Some(b) -> free_actor_slot(b.id)
+        None -> ()
+
+    v.inbox = None
+    v.actor_value = Null
+    v.actor_fault = ""
+    v.message_names.clear()
+end forget_actors
+
+// The children half of it, which an actor's own thread runs before it dies.
+//
+// **An actor's VM is never `reset`, so this is the only thing that joins a grandchild's thread.** It
+// leaves this VM's own mailbox alone, because the death broadcast has still to be made through it and
+// whoever spawned this actor may still ask about it.
+//
+// Not `private`: `actor_run.sysl` calls it as the thread winds down.
+stop_spawned_actors()
+    val v = current()
+
+    for i in 0..<v.spawned.len()
+        post_note(v.spawned.at(i).box, note_of(NoteStop, null, 0), true)
+
+    for i in 0..<v.spawned.len()
+        val s = v.spawned.at(i)
+
+        s.thread.join() match
+            Ok(_) -> ()
+            Err(_) -> ()
+
+        free_actor_slot(s.id)
+
+    v.spawned.clear()
+    v.actor_waits.clear()
+    v.actor_answers.clear()
+    v.actor_waiting = 0
+end stop_spawned_actors
+
+// -- this VM's own mailbox ---------------------------------------------------------------------------
+
+// Make sure this VM can be written to, which every VM that spawns or is spawned needs.
+//
+// **The program's own line of execution is the first actor and has a mailbox too**, because it is
+// what receives `ask` replies.
+ensure_inbox(at: Span) -> Result[unit, Signal]
+    val v = current()
+
+    if v.inbox.is_some() then return Ok(())
+
+    val lock = libuv.mutex() match
+        Err(e) -> return Err(failure(at, s"an actor mailbox could not be locked: ${e}"))
+        Ok(m) -> m
+
+    val ready = libuv.semaphore(0u32) match
+        Err(e) -> return Err(failure(at, s"an actor mailbox could not be made: ${e}"))
+        Ok(sm) -> sm
+
+    var box: &sync ActorBox = ActorBox(lock, ready, None, None, 0, DefaultMailbox, 0, 0,
+        null, 0, null, 0, null, 0, null, 0, 0,
+        true, null, 0, true, false, false, null, 0)
+
+    take_actor_slot(box) match
+        None -> return Err(failure(at, s"this program has ${MaxActors} actors at once, which is as many as one process holds"))
+        Some(_) -> ()
+
+    val note = libuv.notifier(() -> drain_inbox_now(), event_loop()) match
+        Err(e) ->
+            free_actor_slot(box.id)
+            return Err(failure(at, s"an actor mailbox could not be woken: ${e}"))
+        Ok(n) -> n
+
+    box.wake = Some(note.waker())
+
+    // **The program's own mailbox does not hold its loop open**, which is what `unref` says: the
+    // handle goes on working and simply stops counting. It is made to count again while something
+    // only an actor can answer is outstanding, and that pair is the whole of how a program waits for
+    // an actor without waiting for one forever.
+    note.unref()
+
+    v.inbox = Some(box)
+    v.inbox_note = Some(note)
+    Ok(())
+end ensure_inbox
+
+// This VM's own address, as a message names it.
+private inbox_id() -> usize = current().inbox match
+    Some(b) -> b.id
+    None -> 0
+
+private inbox_gen() -> usize = current().inbox match
+    Some(b) -> b.gen
+    None -> 0
+
+// One more thing only an actor can answer.
+actor_waited_more()
+    val v = current()
+
+    v.actor_waiting += 1
+
+    if v.is_actor then return
+
+    if v.actor_waiting == 1
+        v.inbox_note match
+            Some(n) -> n.keep()
+            None -> ()
+end actor_waited_more
+
+// One fewer.
+actor_waited_less()
+    val v = current()
+
+    if v.actor_waiting == 0 then return
+
+    v.actor_waiting -= 1
+
+    if v.is_actor then return
+
+    if v.actor_waiting == 0
+        v.inbox_note match
+            Some(n) -> n.unref()
+            None -> ()
+end actor_waited_less
+
+// -- what this VM is owed ------------------------------------------------------------------------
+
+private record_wait(ticket: usize, target: usize, target_gen: usize, kind: u8)
+    current().actor_waits.push(ActorWait(ticket, gen_at(ticket), target, target_gen, kind, true))
+
+// Not `private`: `actor_run.sysl` drops one as it answers it.
+forget_wait(ticket: usize)
+    val v = current()
+
+    for i in 0..<v.actor_waits.len()
+        var w = v.actor_waits.at(i)
+
+        if w.live && w.ticket == ticket
+            w.live = false
+            v.actor_waits.set(i, w)
+end forget_wait
+
+// An actor this VM was waiting on has stopped.
+//
+// **Every pending `ask` rejects with the fault**, so a caller awaiting an answer learns what happened
+// rather than waiting for ever -- and `done` settles, which is how a third party watching learns.
+//
+// Not `private`: `actor_run.sysl`'s death drain is the caller.
+finish_wait(w: ActorWait, why: string)
+    forget_wait(w.ticket)
+    actor_waited_less()
+
+    if !holds(w.ticket, w.ticket_gen) then return
+
+    if w.kind == WaitDone
+        if why == "" then answer_plain_request(w.ticket, Null) else fail_request(w.ticket, why, point(0))
+        return
+
+    val said = if why == "" then "the actor stopped before it answered this" else why
+
+    fail_request(w.ticket, said, point(0))
+end finish_wait
+
+// -- the handler names a message can carry ------------------------------------------------------------
+
+// **A message carries a name, and a `Value` may hold no `string`** -- so the name is interned per VM
+// and the value carries the number, which is `RegexVal`'s arrangement and for its reason.
+//
+// Not `private`: `actor_copy.sysl` reads one back on to the wire.
+message_name_id(name: string) -> usize
+    val v = current()
+
+    for i in 0..<v.message_names.len()
+        if v.message_names.at(i) == name then return i
+
+    v.message_names.push(name)
+    v.message_names.len() - 1
+end message_name_id
+
+message_name_of(id: usize) -> string =
+    if id >= current().message_names.len() then "" else current().message_names.at(id)
+
+// -- reading the arguments -----------------------------------------------------------------------
+
+// Which actor a handle names.
+private struct Handle
+    id: usize
+    gen: usize
+end Handle
+
+private handle_of(v: Value, at: Span, name: string) -> Result[Handle, Signal] = v match
+    ActorVal(id, gen) -> Ok(Handle(id, gen))
+    other -> Err(failure(at, s"`${name}` takes an actor, and this is ${other.type_name()}"))
+
+// Where a message is going and what it is called.
+private struct Addressed
+    id: usize
+    gen: usize
+    name: string
+    args: Buf[Value]
+end Addressed
+
+// **Both spellings, because a message is a value and a handle is one too.** `send(c.bump, 2)` names
+// the handler by reading it off the handle; `send(c, "bump", 2)` names it as text. The first is what
+// the design page writes and the second is what a program building a name at run time needs.
+private addressed(args: Buf[Value], at: Span, name: string) -> Result[Addressed, Signal]
+    if args.len() == 0
+        return Err(failure(at, s"`${name}` takes a message or an actor and a handler name, and was given nothing"))
+
+    var rest: Buf[Value] = buf()
+
+    args.at(0) match
+        MessageVal(id, gen, which) ->
+            for i in 1..<args.len()
+                rest.push(args.at(i))
+
+            Ok(Addressed(id, gen, message_name_of(which), rest))
+        ActorVal(id, gen) ->
+            if args.len() < 2
+                return Err(failure(at, s"`${name}` takes an actor and the name of a handler -- `${name}(a, \"total\")`, or `${name}(a.total)`"))
+
+            val which = args.at(1) match
+                Str(p) -> p.s
+                other -> return Err(failure(at, s"`${name}` takes a handler's name as text, and this is ${other.type_name()}"))
+
+            for i in 2..<args.len()
+                rest.push(args.at(i))
+
+            Ok(Addressed(id, gen, which, rest))
+        other -> Err(failure(at, s"`${name}` takes a message or an actor, and this is ${other.type_name()}"))
+end addressed
+
+// Whether a name is one this actor wrote `on` in front of.
+//
+// Not `private`: the drain in `actor_run.sysl` asks before it calls.
+is_handler(actor: Value, name: string) -> bool
+    read_field(actor, HandlerTag, point(0)) match
+        Ok(Array(p)) ->
+            for i in 0..<p.items.len()
+                p.items.at(i) match
+                    Str(s) -> if s.s == name then return true
+                    _ -> ()
+
+            false
+        _ -> false
+end is_handler
+
+// -- spawn -------------------------------------------------------------------------------------------
+
+do_actor_spawn(args: Buf[Value], at: Span) -> Step
+    if args.len() == 0
+        return fault(at, "`spawn` takes an actor declaration and its constructor's arguments, and was given nothing")
+
+    val cls = args.at(0)
+
+    val shape = cls match
+        Object(o) -> o
+        other -> return fault(at, s"`spawn` takes an actor declaration, and this is ${other.type_name()}")
+
+    val name = class_own_name(shape) match
+        Some(n) -> n
+        None -> return fault(at, "`spawn` takes an `actor` declaration, and this object is not one")
+
+    if obj_get_name(shape, ActorTag).is_none()
+        return fault(at, s"`spawn` takes an `actor` declaration, and `${name}` is a class -- an actor is declared with `actor`, which is what gives it handlers another thread can reach")
+
+    val given = args.len() - 1
+    val takes = maker_arity(cls, at)?
+
+    var how = SpawnHow(DefaultActorHeap, DefaultMailbox)
+    var upto = args.len()
+
+    // **The options are the last argument only where there is one more argument than the constructor
+    // takes**, which is what makes `spawn(A, args..., options)` unambiguous: an actor whose own
+    // constructor wants an object still gets it.
+    if given == takes + 1
+        how = spawn_options(args.at(args.len() - 1), at)?
+        upto = args.len() - 1
+    elif given > takes + 1
+        return fault(at, s"`${name}` takes ${counted(takes, "argument")} and `spawn` was given ${given}")
+
+    var made: Buf[Value] = buf()
+
+    for i in 1..<upto
+        made.push(args.at(i))
+
+    val payload = encode_ctor(made, at)?
+
+    ensure_inbox(at)?
+    start_actor(name, payload, how, at)
+end do_actor_spawn
+
+private struct SpawnHow
+    heap: usize
+    mailbox: usize
+end SpawnHow
+
+private spawn_options(v: Value, at: Span) -> Result[SpawnHow, Signal]
+    var how = SpawnHow(DefaultActorHeap, DefaultMailbox)
+
+    val o = v match
+        Object(o) -> o
+        other -> return Err(failure(at, s"`spawn`'s options are an object, and this is ${other.type_name()}"))
+
+    for i in 0..<o.entries.len()
+        val e = o.entries.at(i)
+
+        if e.dead then continue
+
+        val key = e.key match
+            Str(p) -> p.s
+            other -> return Err(failure(at, s"an option is named, and this is ${other.type_name()}"))
+
+        if key == "heap"
+            how.heap = positive(e.value, at, "`heap`")?
+        elif key == "mailbox"
+            how.mailbox = positive(e.value, at, "`mailbox`")?
+        elif key == "name"
+            // **Accepted and not used for anything a program can see.** It is what a debugger and
+            // `ps` show, which `libuv.set_thread_name` names on the thread's own side.
+            ()
+        else
+            return Err(failure(at, s"`spawn` has no option called `${key}` -- it takes `heap`, `mailbox` and `name`"))
+
+    Ok(how)
+end spawn_options
+
+private positive(v: Value, at: Span, what: string) -> Result[usize, Signal] = v match
+    Int(n) ->
+        if n <= 0 then Err(failure(at, s"${what} is a positive whole number, and this is ${n}"))
+        else Ok(usize(n))
+    other -> Err(failure(at, s"${what} is a whole number, and this is ${other.type_name()}"))
+
+// The most arguments a declaration's constructor takes.
+private maker_arity(cls: Value, at: Span) -> Result[usize, Signal]
+    read_field(cls, "new", at)? match
+        Fn(c) ->
+            val chunk = running_unit().chunks.at(c.body)
+
+            if chunk.variadic then Ok(0xffffffffusize) else Ok(chunk.params.len())
+        _ -> Ok(0)
+
+// The constructor's arguments, written out of this heap.
+private encode_ctor(made: Buf[Value], at: Span) -> Result[Buf[u8], Signal]
+    var out: Buf[u8] = buf()
+    var seen: Buf[usize] = buf()
+
+    put_usize(&out, made.len())
+
+    for i in 0..<made.len()
+        encode_value(&out, &seen, made.at(i), "", at)?
+
+    Ok(out)
+end encode_ctor
+
+// Start the thread, and wait until it has either published its waker or failed.
+//
+// **The spawner waits**, so a program that cannot start an actor is told where it wrote `spawn`
+// rather than at some later `ask`.
+private start_actor(name: string, payload: Buf[u8], how: SpawnHow, at: Span) -> Step
+    val src = running_unit().sources.at(0)
+
+    val lock = libuv.mutex() match
+        Err(e) -> return fault(at, s"an actor's mailbox could not be locked: ${e}")
+        Ok(m) -> m
+
+    val ready = libuv.semaphore(0u32) match
+        Err(e) -> return fault(at, s"an actor could not be started: ${e}")
+        Ok(sm) -> sm
+
+    var text: Buf[u8] = buf()
+
+    for i in 0..<src.bytes.len
+        text.push(src.bytes[i])
+
+    var box: &sync ActorBox = ActorBox(lock, ready, None, None, 0, how.mailbox, 0, 0,
+        block_of_text(src.name), src.name.bytes.len,
+        block_of(text), text.len(),
+        block_of_text(name), name.bytes.len,
+        block_of(payload), payload.len(),
+        how.heap,
+        false, null, 0, false, false, false, null, 0)
+
+    take_actor_slot(box) match
+        None -> return fault(at, s"this program has ${MaxActors} actors at once, which is as many as one process holds")
+        Some(_) -> ()
+
+    val t = libuv.thread(() -> actor_thread(box)) match
+        Err(e) ->
+            free_actor_slot(box.id)
+            return fault(at, s"an actor could not be given a thread: ${e}")
+        Ok(t) -> t
+
+    box.ready.wait()
+
+    box.lock.lock()
+
+    val started = box.started
+    val why = text_of_block(box.start_fault, box.start_fault_len)
+
+    box.lock.unlock()
+
+    if !started
+        t.join() match
+            Ok(_) -> ()
+            Err(_) -> ()
+
+        free_actor_slot(box.id)
+        return fault(at, why)
+
+    current().spawned.push(Spawned(box, t, false, true, box.id, box.gen))
+    Ok(ActorVal(box.id, box.gen))
+end start_actor
+
+// -- send, ask, done, stop, detach, me, transfer -----------------------------------------------------
+
+do_actor_send(args: Buf[Value], at: Span) -> Step
+    val to = addressed(args, at, "send")?
+
+    val bytes = encode_call(to.name, to.args, at)?
+
+    actor_box_at(to.id, to.gen) match
+        // **A dead actor's handle is still a value. What it cannot do is deliver**: `send` on it is
+        // dropped, which is the design page's rule word for word.
+        None -> Ok(Null)
+        Some(b) ->
+            var note = note_of(NoteCall, block_of(bytes), bytes.len())
+
+            val said = post_note(b, note, false)
+
+            if said == PostFull
+                return fault(at, s"`${to.name}` was sent to an actor whose mailbox is full -- a full mailbox is a refusal rather than a wait, so either the receiver is too slow or its `mailbox` limit is too low")
+
+            Ok(Null)
+end do_actor_send
+
+do_actor_ask(args: Buf[Value], at: Span) -> Step
+    val to = addressed(args, at, "ask")?
+
+    ensure_inbox(at)?
+
+    val bytes = encode_call(to.name, to.args, at)?
+    val ticket = begin_request()
+    val promised = awaited_request(ticket)
+
+    record_wait(ticket, to.id, to.gen, WaitAsk)
+    actor_waited_more()
+
+    actor_box_at(to.id, to.gen) match
+        None ->
+            finish_wait(current().actor_waits.at(current().actor_waits.len() - 1), "the actor is not running")
+            return Ok(promised)
+        Some(b) ->
+            var note = note_of(NoteCall, block_of(bytes), bytes.len())
+
+            note.reply_id = inbox_id()
+            note.reply_gen = inbox_gen()
+            note.ticket = ticket
+            note.ticket_gen = gen_at(ticket)
+
+            val said = post_note(b, note, false)
+
+            if said != PostOk
+                val why = if said == PostFull then "this actor's mailbox is full" else "the actor is not running"
+
+                finish_wait(current().actor_waits.at(current().actor_waits.len() - 1), why)
+
+    Ok(promised)
+end do_actor_ask
+
+do_actor_done(args: Buf[Value], at: Span) -> Step
+    if args.len() != 1 then return fault(at, s"`done` takes an actor, and was given ${counted(args.len(), "argument")}")
+
+    val h = handle_of(args.at(0), at, "done")?
+
+    ensure_inbox(at)?
+
+    val ticket = begin_request()
+    val promised = awaited_request(ticket)
+
+    record_wait(ticket, h.id, h.gen, WaitDone)
+    actor_waited_more()
+
+    val last = current().actor_waits.at(current().actor_waits.len() - 1)
+
+    actor_box_at(h.id, h.gen) match
+        // **An actor nobody can find has stopped**, and a `done` about one settles at once rather
+        // than waiting for a broadcast that has already been made.
+        None -> finish_wait(last, "")
+        Some(b) ->
+            b.lock.lock()
+
+            val dead = b.dead
+            val why = text_of_block(b.death, b.death_len)
+
+            b.lock.unlock()
+
+            if dead then finish_wait(last, why)
+
+    Ok(promised)
+end do_actor_done
+
+do_actor_stop(args: Buf[Value], at: Span) -> Step
+    if args.len() != 1 then return fault(at, s"`stop` takes an actor, and was given ${counted(args.len(), "argument")}")
+
+    val h = handle_of(args.at(0), at, "stop")?
+
+    actor_box_at(h.id, h.gen) match
+        Some(b) -> post_note(b, note_of(NoteStop, null, 0), true)
+        None -> PostGone
+
+    Ok(Null)
+end do_actor_stop
+
+do_actor_detach(args: Buf[Value], at: Span) -> Step
+    if args.len() != 1 then return fault(at, s"`detach` takes an actor, and was given ${counted(args.len(), "argument")}")
+
+    val h = handle_of(args.at(0), at, "detach")?
+    val v = current()
+
+    for i in 0..<v.spawned.len()
+        var s = v.spawned.at(i)
+
+        if s.id == h.id && s.gen == h.gen
+            s.detached = true
+            v.spawned.set(i, s)
+
+    Ok(Null)
+end do_actor_detach
+
+do_actor_me(args: Buf[Value], at: Span) -> Step
+    if args.len() != 0 then return fault(at, s"`me` takes nothing, and was given ${counted(args.len(), "argument")}")
+
+    if !current().is_actor
+        return fault(at, "`me()` is an actor's own handle and is answered inside a handler -- the program's own line of execution has no handle, being the one nobody spawned")
+
+    Ok(ActorVal(current().actor_self, current().actor_self_gen))
+end do_actor_me
+
+do_actor_transfer(args: Buf[Value], at: Span) -> Step
+    if args.len() != 1 then return fault(at, s"`transfer` takes bytes, and was given ${counted(args.len(), "argument")}")
+
+    args.at(0) match
+        Bytes(_) -> ()
+        other -> return fault(at, s"`transfer` takes bytes, and this is ${other.type_name()} -- a buffer is the one container whose storage can move between heaps whole")
+
+    val o = new_object()
+
+    obj_put_name(o, TransferTag, args.at(0))
+    Ok(Object(o))
+end do_actor_transfer
+
+// -- the end of the program --------------------------------------------------------------------------
+
+// Whether this VM is still waiting for an actor it spawned.
+private any_live_actor() -> bool
+    val v = current()
+
+    for i in 0..<v.spawned.len()
+        val s = v.spawned.at(i)
+
+        if s.live && !s.detached then return true
+
+    false
+end any_live_actor
+
+// Stop every actor the program still waits for, and wait until each has said it has.
+//
+// **The program ends when its own loop has drained and every actor it spawned has stopped**, which
+// is the design page's rule; what makes it terminate rather than hang is that a drained program has
+// nothing left to say to an actor, so the actors are asked to stop and then waited for. `stop` is
+// ORDERLY -- the actor takes no new messages, drains the ones it has, runs its loop down and settles
+// `done` -- so a `send` written on the program's last line is still served.
+//
+// Answers whether anything was waited for, which is what tells the caller to drain again: an answer
+// that arrives here can resume a coroutine that starts more work.
+finish_actors() -> Result[bool, Signal]
+    if !any_live_actor() then return Ok(false)
+
+    val v = current()
+
+    for i in 0..<v.spawned.len()
+        val s = v.spawned.at(i)
+
+        if s.live && !s.detached then post_note(s.box, note_of(NoteStop, null, 0), true)
+
+    // **The mailbox counts again while this wait is on**, or `RUN_ONCE` would answer at once and the
+    // loop would spin against a thread that is still running its last handler down.
+    v.inbox_note match
+        Some(n) -> n.keep()
+        None -> ()
+
+    val began = libuv.hrtime()
+
+    loop
+        run_microtasks()
+
+        if !any_live_actor() then break
+
+        // **A ceiling, because an actor that will not drain would otherwise hold the program for
+        // ever** -- which is the one honest answer the design leaves open, `stop` not being forcible.
+        if libuv.hrtime() - began > ActorStopMillis * 1000000u64 then break
+
+        event_loop().run(libuv.RUN_ONCE) match
+            Err(_) -> break
+            Ok(_) -> ()
+    end loop
+
+    if v.actor_waiting == 0
+        v.inbox_note match
+            Some(n) -> n.unref()
+            None -> ()
+
+    run_microtasks()
+
+    current().loop_fault match
+        Some(sig) ->
+            current().loop_fault = None
+            return Err(sig)
+        None -> ()
+
+    Ok(true)
+end finish_actors
+
+// How long the program waits for an actor that was asked to stop.
+//
+// **Thirty seconds, which is a number that says "something is wrong" rather than one that has to be
+// right.** An actor drains its mailbox and runs its own loop down before it ends, so a handler
+// waiting on something that never arrives is the only way to reach this.
+private const ActorStopMillis: u64 = 30000
+
+// -- what this file registers ---------------------------------------------------------------------
+
+// **The natives keep an `actor` prefix and the MODULE gives them the design page's names**, which is
+// `slate:url`'s arrangement: `spawn` and `send` are already a native each, and the registry is keyed
+// by name. `actor_source.sysl` is the eight lines of slate that do the renaming.
+var n_actor_spawn: NativeFn = 0
+var n_actor_send: NativeFn = 0
+var n_actor_ask: NativeFn = 0
+var n_actor_done: NativeFn = 0
+var n_actor_stop: NativeFn = 0
+var n_actor_detach: NativeFn = 0
+var n_actor_me: NativeFn = 0
+var n_actor_transfer: NativeFn = 0
+
+install_actor(env: *EnvObj, everything: bool)
+    n_actor_spawn = register("actorSpawn", do_actor_spawn)
+    n_actor_send = register("actorSend", do_actor_send)
+    n_actor_ask = register("actorAsk", do_actor_ask)
+    n_actor_done = register("actorDone", do_actor_done)
+    n_actor_stop = register("actorStop", do_actor_stop)
+    n_actor_detach = register("actorDetach", do_actor_detach)
+    n_actor_me = register("actorMe", do_actor_me)
+    n_actor_transfer = register("actorTransfer", do_actor_transfer)
+
+    // **Declared only into the scope a built-in module compiles in**, never into a program's: which
+    // implementation answers is the module's business, and a program reaches these through
+    // `slate:actor` under the names the design page gives them.
+    if everything
+        declare(env, "actorSpawn", Native(n_actor_spawn), false)
+        declare(env, "actorSend", Native(n_actor_send), false)
+        declare(env, "actorAsk", Native(n_actor_ask), false)
+        declare(env, "actorDone", Native(n_actor_done), false)
+        declare(env, "actorStop", Native(n_actor_stop), false)
+        declare(env, "actorDetach", Native(n_actor_detach), false)
+        declare(env, "actorMe", Native(n_actor_me), false)
+        declare(env, "actorTransfer", Native(n_actor_transfer), false)
+end install_actor

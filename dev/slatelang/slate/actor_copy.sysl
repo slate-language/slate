@@ -1,0 +1,602 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// A message out of one heap and into another.
+//
+// **The sender's values are untouched and the receiver's are new**, which is the whole bargain: no
+// shared object means no rule about sharing one. What is written here is a flat run of bytes with no
+// pointer in it, so the block that carries it is `malloc`ed storage one thread hands to another and
+// nothing about it is counted.
+//
+// **A refusal names the FIELD it found and not the message**, which is the rule
+// `docs/design/actors.md` states and the reason this walk carries a path: a message ten fields deep
+// is exactly where an unsendable value turns up, and "a message may not carry a function" on its own
+// sends the reader to read the whole thing.
+
+// -- what may not cross ------------------------------------------------------------------------------
+
+// The rest of the sentence for a value that belongs to the heap it was made on, or `""` for one that
+// crosses.
+//
+// **Each has its own words rather than a shared "is not sendable"**, because what a reader has to do
+// about it differs: a function is rewritten as data, a promise is awaited before the send, a socket
+// is simply not a thing another thread can have.
+private not_sendable(v: Value) -> string = v match
+    Fn(_) -> "a function, and a function belongs to the heap it was made on"
+    Native(_) -> "a function, and a function belongs to the heap it was made on"
+
+    // **The one worth saying twice.** A promise is not a value in flight; it is a suspended call on
+    // one machine's parked list, and there is nothing to copy.
+    Promise(_) -> "a promise -- a promise is a suspended call on one machine's parked list rather than a value in flight, so await it and send what it answers"
+    Gen(_, _) -> "a generator, which is a line of execution on one machine rather than a value"
+    Socket(_, _) -> "a socket, which belongs to the event loop it was opened on"
+    ChildVal(_, _) -> "a child process, which belongs to the program that started it"
+    ChannelVal(_) -> "a channel, which belongs to the program that was started with it"
+    External(_) -> "an external, which is a value of the JavaScript host rather than of slate"
+    WeakMapVal(_) -> "a weak map, whose entries are one collector's business"
+    WeakRefVal(_) -> "a weak reference, whose target is one collector's business"
+    Shape(_) -> "a type, which is a pattern held on the heap it was declared on"
+
+    // **`undefined` cannot be in a message because it cannot be in anything**, slate refusing to
+    // store it in a field, an array or a variable -- so this arm is only reached by a value handed
+    // straight to `send`.
+    Undefined -> "undefined, which slate refuses to store anywhere at all"
+    _ -> ""
+
+// How a complaint names the place it found one.
+private at_path(path: string) -> string = if path == "" then "this value" else s"`${path}`"
+
+private under(path: string, key: string) -> string = if path == "" then key else s"${path}.${key}"
+
+private nth(path: string, i: usize) -> string = s"${path}[${i}]"
+
+// -- writing --------------------------------------------------------------------------------------
+
+// A whole call: the handler's name, then its arguments.
+//
+// **One copier for the lot**, so two arguments holding one object arrive holding one object -- which
+// is the same guarantee the design states about two fields of one argument.
+encode_call(name: string, args: Buf[Value], at: Span) -> Result[Buf[u8], Signal]
+    var out: Buf[u8] = buf()
+    var seen: Buf[usize] = buf()
+
+    put_text(&out, name)
+    put_usize(&out, args.len())
+
+    for i in 0..<args.len()
+        encode_value(&out, &seen, args.at(i), "", at)?
+
+    Ok(out)
+end encode_call
+
+// One value on its own, which is what an answer and a fault are.
+encode_single(v: Value, at: Span) -> Result[Buf[u8], Signal]
+    var out: Buf[u8] = buf()
+    var seen: Buf[usize] = buf()
+
+    encode_value(&out, &seen, v, "", at)?
+    Ok(out)
+end encode_single
+
+// The position a pointer was written at, or nothing where this is the first time it has been reached.
+//
+// **Compared by ADDRESS**, which is what makes shared structure and a cycle one mechanism: the second
+// time an object is reached, its position is written instead of its contents.
+private seen_at(seen: *Buf[usize], p: usize) -> Option[usize]
+    for i in 0..<seen.len()
+        if seen.at(i) == p then return Some(i)
+
+    None
+end seen_at
+
+// Write one value, naming where in the message it was found if it cannot cross.
+encode_value(out: *Buf[u8], seen: *Buf[usize], v: Value, path: string, at: Span) -> Result[unit, Signal]
+    val refused = not_sendable(v)
+
+    if refused != ""
+        return Err(failure(at, s"a message may not carry ${short_kind(v)}: ${at_path(path)} is ${refused}"))
+
+    v match
+        Null -> out.push(TagNull)
+        Bool(b) -> out.push(if b then TagTrue else TagFalse)
+        Int(n) ->
+            out.push(TagInt)
+            put_long(out, n)
+        Real(x) ->
+            out.push(TagReal)
+            put_u64(out, real_bits(x))
+        Str(p) ->
+            out.push(TagStr)
+            put_text(out, p.s)
+        InstantVal(us) ->
+            out.push(TagInstant)
+            put_long(out, us)
+        DurationVal(us) ->
+            out.push(TagDuration)
+            put_long(out, us)
+        DateVal(d) ->
+            out.push(TagDate)
+            put_long(out, long(d))
+        TimeVal(us) ->
+            out.push(TagTime)
+            put_long(out, us)
+        DateTimeVal(d, us) ->
+            out.push(TagDateTime)
+            put_long(out, long(d))
+            put_long(out, us)
+        PeriodVal(m, d) ->
+            out.push(TagPeriod)
+            put_long(out, long(m))
+            put_long(out, long(d))
+        RangeVal(lo, hi, inc, has_lo, has_hi, step) ->
+            out.push(TagRange)
+            put_long(out, lo)
+            put_long(out, hi)
+            out.push(if inc then 1u8 else 0u8)
+            out.push(if has_lo then 1u8 else 0u8)
+            out.push(if has_hi then 1u8 else 0u8)
+            put_long(out, step)
+
+        // **A zone travels as its IANA name**, which is what the design table says and the only thing
+        // that means the same on two heaps: the slot it sits in here is this VM's.
+        ZoneVal(id) ->
+            out.push(TagZone)
+            put_text(out, zone_title(id))
+        ZonedVal(us, z) ->
+            out.push(TagZoned)
+            put_long(out, us)
+            put_text(out, zone_title(z))
+
+        // **A regular expression is rebuilt from its pattern and flags**, a compiled pattern being a
+        // slot in a table this VM keeps.
+        RegexVal(id) ->
+            out.push(TagRegex)
+            put_text(out, regex_source(id))
+            put_text(out, regex_flags(id))
+
+        // **A handle names an actor rather than memory**, so it crosses as itself.
+        ActorVal(id, gen) ->
+            out.push(TagActor)
+            put_usize(out, id)
+            put_usize(out, gen)
+        MessageVal(id, gen, name) ->
+            out.push(TagMessage)
+            put_usize(out, id)
+            put_usize(out, gen)
+            put_text(out, message_name_of(name))
+
+        Bytes(p) -> encode_bytes(out, seen, p, at)
+        Array(p) -> encode_array(out, seen, p, path, at)?
+        SetVal(p) -> encode_members(out, seen, p, TagSet, path, at)?
+        MapVal(p) -> encode_pairs(out, seen, p, TagMap, path, at)?
+        Object(p) -> encode_object(out, seen, p, path, at)?
+        _ -> return Err(failure(at, s"a message may not carry ${v.type_name()}: ${at_path(path)}"))
+
+    Ok(())
+end encode_value
+
+// The words a refusal opens with, which name the KIND before the path names the place.
+private short_kind(v: Value) -> string = v match
+    Undefined -> "undefined"
+
+    // **"a type" and not "a shape"**, which is what the program wrote: a reader who put a `type`
+    // declaration in a message is looking for the word they used.
+    Shape(_) -> "a type"
+    _ -> v.type_name()
+
+private encode_bytes(out: *Buf[u8], seen: *Buf[usize], p: *BytesObj, at: Span)
+    seen_at(seen, usize(p)) match
+        Some(i) ->
+            out.push(TagAgain)
+            put_usize(out, i)
+        None ->
+            seen.push(usize(p))
+            out.push(TagBytes)
+            put_usize(out, p.data.len())
+
+            for i in 0..<p.data.len()
+                out.push(p.data.at(i))
+end encode_bytes
+
+private encode_array(out: *Buf[u8], seen: *Buf[usize], p: *ArrayObj, path: string, at: Span) -> Result[unit, Signal]
+    seen_at(seen, usize(p)) match
+        Some(i) ->
+            out.push(TagAgain)
+            put_usize(out, i)
+            return Ok(())
+        None -> seen.push(usize(p))
+
+    out.push(TagArray)
+    put_usize(out, p.items.len())
+
+    for i in 0..<p.items.len()
+        encode_value(out, seen, p.items.at(i), nth(path, i), at)?
+
+    Ok(())
+end encode_array
+
+// A set: its members, in the order they were added.
+private encode_members(out: *Buf[u8], seen: *Buf[usize], o: *ObjectObj, tag: u8, path: string, at: Span) -> Result[unit, Signal]
+    seen_at(seen, usize(o)) match
+        Some(i) ->
+            out.push(TagAgain)
+            put_usize(out, i)
+            return Ok(())
+        None -> seen.push(usize(o))
+
+    out.push(tag)
+    put_usize(out, o.live)
+
+    var n: usize = 0
+
+    for i in 0..<o.entries.len()
+        val e = o.entries.at(i)
+
+        if !e.dead
+            encode_value(out, seen, e.key, nth(path, n), at)?
+            n += 1
+
+    Ok(())
+end encode_members
+
+// A map: its keys and values, in the order the keys were first written.
+private encode_pairs(out: *Buf[u8], seen: *Buf[usize], o: *ObjectObj, tag: u8, path: string, at: Span) -> Result[unit, Signal]
+    seen_at(seen, usize(o)) match
+        Some(i) ->
+            out.push(TagAgain)
+            put_usize(out, i)
+            return Ok(())
+        None -> seen.push(usize(o))
+
+    out.push(tag)
+    put_usize(out, o.live)
+
+    var n: usize = 0
+
+    for i in 0..<o.entries.len()
+        val e = o.entries.at(i)
+
+        if !e.dead
+            encode_value(out, seen, e.key, nth(path, n), at)?
+            encode_value(out, seen, e.value, nth(path, n), at)?
+            n += 1
+
+    Ok(())
+end encode_pairs
+
+// An object, and the one place the design leans on both actors being copies of one program.
+//
+// **A class instance crosses as an instance and not as a plain object**, because the receiver ran the
+// same declarations: the class is identified by the name it was declared under, looked up there, and
+// the fields are rebuilt on an instance of it.
+private encode_object(out: *Buf[u8], seen: *Buf[usize], o: *ObjectObj, path: string, at: Span) -> Result[unit, Signal]
+    // **`transfer(b)` HANDS THE STORAGE OVER, so the sender's buffer is left empty.** A byte buffer
+    // holds no values at all, so it is the one container whose contents can move between heaps whole
+    // -- and what makes that observable rather than an optimisation is exactly this: the sender no
+    // longer has them.
+    //
+    // **The wrapper is looked for BEFORE anything else**, since it is an object in every other
+    // respect and would otherwise be copied as one.
+    obj_get_name(o, TransferTag) match
+        Some(Bytes(b)) ->
+            encode_bytes(out, seen, b, at)
+            b.data.clear()
+            return Ok(())
+        _ -> ()
+
+    seen_at(seen, usize(o)) match
+        Some(i) ->
+            out.push(TagAgain)
+            put_usize(out, i)
+            return Ok(())
+        None -> seen.push(usize(o))
+
+    // **A class, a data type and a variant's maker are declarations rather than values to copy.** The
+    // receiver already has all three under their own names; sending one would be sending a second
+    // copy of something both sides declared.
+    if obj_get_name(o, ClassTag).is_some() || obj_get_name(o, DataTag).is_some() || obj_get_name(o, ShapeTag).is_some()
+        return Err(failure(at, s"a message may not carry a declaration: ${at_path(path)} is a `class` or `data` name, and the receiver has its own -- send an instance instead"))
+
+    val named = variant_name(o) match
+        Some(n) -> n
+        None -> class_name(o) match
+            Some(n) -> n
+            None -> ""
+
+    if named == ""
+        out.push(TagObject)
+    else
+        out.push(TagInstance)
+        put_text(out, named)
+        out.push(if o.frozen then 1u8 else 0u8)
+
+    // **`walked_key` is what says which keys are the program's**, so a tag and an instance's `proto`
+    // are left out and a `proto` a program wrote on a plain object is carried like any other field.
+    var n: usize = 0
+
+    for i in 0..<o.entries.len()
+        val e = o.entries.at(i)
+
+        if !e.dead && walked_key(o, e.key) then n += 1
+
+    put_usize(out, n)
+
+    for i in 0..<o.entries.len()
+        val e = o.entries.at(i)
+
+        if !e.dead && walked_key(o, e.key)
+            val key = e.key match
+                Str(p) -> p.s
+                other -> ""
+
+            encode_value(out, seen, e.key, under(path, key), at)?
+            encode_value(out, seen, e.value, under(path, key), at)?
+
+    Ok(())
+end encode_object
+
+// -- reading ----------------------------------------------------------------------------------------
+
+// What a call arrived as.
+struct ActorCall
+    name: string
+    args: Buf[Value]
+end ActorCall
+
+// **Everything read is HELD, and the caller releases when it has done with it.** A `Value` in a sysl
+// local is not a root, and building an array allocates once per element -- so a decode that did not
+// hold would sweep what it had already built. `root_mark()` before and `release(mark)` after the
+// value has been used is the shape every caller here takes.
+decode_call(w: *Wire, at: Span) -> Result[ActorCall, Signal]
+    val name = w.text()
+    val n = w.count()
+    var args: Buf[Value] = buf()
+
+    for _ in 0..<n
+        val v = decode_value(w, at)?
+
+        hold(v)
+        args.push(v)
+
+    Ok(ActorCall(name, args))
+end decode_call
+
+decode_value(w: *Wire, at: Span) -> Step
+    val tag = w.byte()
+
+    if tag == TagNull then return Ok(Null)
+    if tag == TagTrue then return Ok(Bool(true))
+    if tag == TagFalse then return Ok(Bool(false))
+    if tag == TagInt then return Ok(Int(long(w.word())))
+    if tag == TagReal then return Ok(Real(bits_real(w.word())))
+
+    if tag == TagStr
+        val v = str_value(w.text())
+
+        hold(v)
+        return Ok(v)
+
+    if tag == TagInstant then return Ok(InstantVal(long(w.word())))
+    if tag == TagDuration then return Ok(DurationVal(long(w.word())))
+    if tag == TagDate then return Ok(DateVal(int(long(w.word()))))
+    if tag == TagTime then return Ok(TimeVal(long(w.word())))
+
+    if tag == TagDateTime
+        val d = int(long(w.word()))
+
+        return Ok(DateTimeVal(d, long(w.word())))
+
+    if tag == TagPeriod
+        val m = int(long(w.word()))
+
+        return Ok(PeriodVal(m, int(long(w.word()))))
+
+    if tag == TagRange
+        val lo = long(w.word())
+        val hi = long(w.word())
+        val inc = w.byte() == 1u8
+        val has_lo = w.byte() == 1u8
+        val has_hi = w.byte() == 1u8
+
+        return Ok(RangeVal(lo, hi, inc, has_lo, has_hi, long(w.word())))
+
+    if tag == TagZone
+        val name = w.text()
+
+        zone_named(name) match
+            Ok(id) -> return Ok(ZoneVal(id))
+            Err(e) -> return Err(failure(at, s"a message carried the zone `${name}`, which this actor cannot read: ${e}"))
+
+    if tag == TagZoned
+        val us = long(w.word())
+        val name = w.text()
+
+        zone_named(name) match
+            Ok(id) -> return Ok(ZonedVal(us, id))
+            Err(e) -> return Err(failure(at, s"a message carried the zone `${name}`, which this actor cannot read: ${e}"))
+
+    if tag == TagRegex
+        val source = w.text()
+
+        return regex_value_of(source, w.text(), at)
+
+    if tag == TagActor
+        val id = w.count()
+
+        return Ok(ActorVal(id, w.count()))
+
+    if tag == TagMessage
+        val id = w.count()
+        val gen = w.count()
+
+        return Ok(MessageVal(id, gen, message_name_id(w.text())))
+
+    if tag == TagAgain
+        val i = w.count()
+
+        if i >= w.seen.len() then return Err(failure(at, "a message referred to a value that is not in it"))
+
+        return Ok(w.seen.at(i))
+
+    if tag == TagBytes
+        val n = w.count()
+        var b: Buf[u8] = buf()
+
+        for _ in 0..<n
+            b.push(w.byte())
+
+        val v = bytes_value(b)
+
+        hold(v)
+        w.seen.push(v)
+        return Ok(v)
+
+    if tag == TagArray then return decode_array(w, at)
+    if tag == TagSet then return decode_set(w, at)
+    if tag == TagMap then return decode_map(w, at)
+    if tag == TagObject then return decode_object(w, "", false, at)
+
+    if tag == TagInstance
+        val name = w.text()
+
+        return decode_object(w, name, w.byte() == 1u8, at)
+
+    Err(failure(at, "a message carried something this actor does not know how to read"))
+end decode_value
+
+// **The value is put into `seen` BEFORE its elements are read**, which is what lets a cycle
+// terminate: an array that holds itself refers back to a slot that already exists.
+private decode_array(w: *Wire, at: Span) -> Step
+    var items: Buf[Value] = buf()
+    val p = new_array(items)
+    val v = Array(p)
+
+    hold(v)
+    w.seen.push(v)
+
+    val n = w.count()
+
+    for _ in 0..<n
+        val e = decode_value(w, at)?
+
+        hold(e)
+        p.items.push(e)
+
+    Ok(v)
+end decode_array
+
+private decode_set(w: *Wire, at: Span) -> Step
+    val p = new_object()
+    val v = SetVal(p)
+
+    hold(v)
+    w.seen.push(v)
+
+    val n = w.count()
+
+    for _ in 0..<n
+        val e = decode_value(w, at)?
+
+        hold(e)
+        obj_put(p, e, Null, at)?
+
+    Ok(v)
+end decode_set
+
+private decode_map(w: *Wire, at: Span) -> Step
+    val p = new_object()
+    val v = MapVal(p)
+
+    hold(v)
+    w.seen.push(v)
+
+    val n = w.count()
+
+    for _ in 0..<n
+        val k = decode_value(w, at)?
+
+        hold(k)
+
+        val e = decode_value(w, at)?
+
+        hold(e)
+        obj_put(p, k, e, at)?
+
+    Ok(v)
+end decode_map
+
+// A plain object, or an instance of the class or variant the sender named.
+private decode_object(w: *Wire, named: string, frozen: bool, at: Span) -> Step
+    val p = new_object()
+    val v = Object(p)
+
+    hold(v)
+    w.seen.push(v)
+
+    if named != ""
+        declared_here(named) match
+            Some(maker) ->
+                hold(maker)
+                obj_put_name(p, "proto", maker)
+            // **The sentence says WHICH SIDE could not find it**, because the two are different
+            // mistakes: an actor that cannot find a class was handed a program whose declarations it
+            // could not load, and a program that cannot find one was sent an instance of something
+            // its own file does not declare.
+            None ->
+                val whose = if current().is_actor then "this actor" else "the program that asked"
+
+                return Err(failure(at, s"a message carried an instance of `${named}`, and ${whose} declares no such class -- a class crosses by the name it was declared under, so both sides have to have it"))
+
+    val n = w.count()
+
+    for _ in 0..<n
+        val k = decode_value(w, at)?
+
+        hold(k)
+
+        val e = decode_value(w, at)?
+
+        hold(e)
+        obj_put(p, k, e, at)?
+
+    p.frozen = frozen
+    Ok(v)
+end decode_object
+
+// The `class`, `data` or `actor` declaration a name stands for in this VM, if there is one.
+//
+// **It is asked of the module SCOPES and not of the module objects, and that is not a detail.** A
+// module's object is its exports, so a class a file did not export would not be in it -- and worse,
+// the object does not exist until the file has finished: a program whose own top level `await`s an
+// actor is still inside its own chunk when the answer comes back, so the entry module's value has not
+// been recorded yet. The scope is there from the module's first statement and holds every name the
+// file binds, exported or not.
+//
+// **The entry module is the LAST scope**, which is the order `each_module` walks in, so a program's
+// own class shadows an imported one of the same name -- which is what a reader would expect, a name
+// in the file in front of them being the one they mean.
+//
+// **Only a DECLARATION answers**, checked rather than assumed: a scope's chain reaches the builtins,
+// so an unguarded lookup would answer a builtin for a message naming one.
+//
+// Not `private`: `actor_run.sysl` finds the actor declaration the same way.
+declared_here(name: string) -> Option[Value]
+    val scopes = current().module_scopes
+    var i = scopes.len()
+
+    loop
+        if i == 0 then return None
+
+        i -= 1
+
+        lookup(scopes.at(i), name) match
+            Some(v) -> if is_declaration(v) then return Some(v)
+            None -> ()
+end declared_here
+
+// Whether a value is what a `class`, a `data` or an `actor` declaration bound.
+private is_declaration(v: Value) -> bool = v match
+    Object(o) -> obj_get_name(o, ClassTag).is_some() || obj_get_name(o, DataTag).is_some()
+    _ -> false
