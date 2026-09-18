@@ -176,6 +176,43 @@ async bytes_are_copied_and_transfer_leaves_the_senders_buffer_empty() =
     assertEq(await ask(s.size, transfer(moved)), 7)
     assertEq(moved.length, 0)
 
+// A run of 256 bytes holding every value once, doubled up to at least `n` and cut back to it --
+// so a message of any of the sizes below carries every byte value rather than a run of zeros,
+// which is what would hide a copy that mishandled one value or one position.
+patterned(n) =
+    var block = bytes(0)
+
+    for i in 0..<256
+        push(block, i)
+
+    var out = bytes(0)
+
+    while out.length < n
+        push(out, block)
+
+    out[0..<n]
+
+@test
+async bytes_of_every_size_cross_byte_for_byte() =
+    val e = spawn(Echo)
+
+    for n in [0, 1, 255, 256, 65536, 1048576]
+        val original = patterned(n)
+        val back = await ask(e.back, original)
+
+        assertEq(back.length, n)
+        assertEq(back, original)
+
+@test
+async a_bytes_buffer_referenced_twice_in_one_message_arrives_shared() =
+    val e = spawn(Echo)
+    val original = toBytes("shared")
+    val back = await ask(e.back, { first: original, second: original })
+
+    back.first[0] = 90
+
+    assertEq(back.second[0], 90)
+
 // -- identity, addressing and `me` --------------------------------------------------------------
 
 actor Worker
