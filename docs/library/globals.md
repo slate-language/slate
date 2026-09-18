@@ -202,6 +202,12 @@ print(map(["a", "bb"], _.length))
 [1, 2]
 ```
 
+**A builtin is counted where the call is written.** Its parameters are fixed, so the checker can see
+every call made by name and refuses one giving too few or too many, in the same words it uses for a
+function you wrote — see [the call rule](../reference/functions.md). Reached through a value instead,
+a builtin obeys the run-time half like anything else: the surplus is dropped, and a builtin that did
+not get the value it needs says what it wanted.
+
 **A CALLBACK IS HANDED THE ELEMENT, ITS POSITION AND THE ARRAY**, which is what JavaScript hands
 one. `reduce` puts the running answer in front of those three. A function declares as many of them as
 it wants and is given that many — every call drops what it cannot bind — so `x -> x * 2` is written

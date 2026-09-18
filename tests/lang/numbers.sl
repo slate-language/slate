@@ -245,13 +245,17 @@ a_number_answers_the_single_argument_ones_as_methods_too() =
     assert(((1.0).log() - 0).abs() < 1e-12)
 
 @test
-the_new_math_functions_take_exactly_the_numbers_they_say() =
-    assert((sin(1, 2) catch e -> e.message).contains("`sin` takes one number, and was given 2 arguments"))
+the_new_math_functions_take_the_numbers_they_say_and_drop_the_rest() =
+    // **A count a builtin is given is a FLOOR**, which is the call rule read at a native: a surplus
+    // argument is dropped here exactly as it is at a function the program wrote.
+    assert(sin(1, 2) == sin(1))
+    assert(hypot(1, 2, 3) == hypot(1, 2))
+
+    // What each one still says is what it WANTS, whether that is a count it did not reach or an
+    // argument of the wrong kind.
     assert((sin() catch e -> e.message).contains("`sin` takes one number, and was given 0 arguments"))
     assert((sin("x") catch e -> e.message).contains("`sin` takes a number, and this is a string"))
     assert((atan2(1) catch e -> e.message).contains("`atan2` takes two numbers, and was given 1 argument"))
-    assert((hypot(1, 2, 3) catch e -> e.message)
-        .contains("`hypot` takes two numbers, and was given 3 arguments"))
 
 @test
 a_binary_operator_left_dangling_at_the_end_of_a_line_continues_the_statement() =

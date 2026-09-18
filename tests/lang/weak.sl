@@ -152,9 +152,12 @@ a_weak_map_has_no_size_no_clear_and_no_walk() =
 the_two_constructors_say_what_they_take() =
     anything(v) = v
 
+    // **`WeakMap` takes nothing, so there is no count it can fail to reach** -- an argument it has
+    // no room for is dropped, which is the call rule read at a builtin and is what the JavaScript
+    // host's own `WeakMap` does anyway.
     val make = anything(WeakMap)
 
-    assert((make(1) catch e -> e.message).contains("`WeakMap` takes nothing, and was given 1 argument"))
+    assert(make(1) != null)
 
     val wm = anything(WeakMap())
 

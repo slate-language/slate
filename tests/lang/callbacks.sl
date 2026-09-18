@@ -93,10 +93,10 @@ THE_ARRAY_A_CALLBACK_IS_HANDED_IS_THE_ONE_BEING_WALKED() =
     assertEq(map([1, 2, 3], (x, i, ys) -> if i + 1 < ys.length then ys[i + 1] else 0), [2, 3, 0])
 
 @test
-A_CALLBACK_DECLARING_A_FOURTH_IS_REFUSED_AND_THE_SENTENCE_NAMES_THE_NATIVE() =
-    // Three is what an element-wise builtin has, so a fourth parameter has nothing to fill it -- the
-    // reader's function is not wrong, and the surface they attached it to is named.
-    assertFaults(() -> map([1], anything((a, b, c, d) -> a)),
-        "`map` calls this with 3 arguments and it takes 4 arguments")
-    assertFaults(() -> reduce([1], anything((a, b, c, d, e) -> a), 0),
-        "`reduce` calls this with 4 arguments and it takes 5 arguments")
+A_CALLBACK_DECLARING_ONE_MORE_THAN_THE_NATIVE_HAS_LEAVES_IT_ABSENT() =
+    // Three is what an element-wise builtin has, so a fourth parameter has nothing to fill it --
+    // and too few is not an error anywhere now, so it simply reads as `undefined`, exactly as an
+    // ordinary call leaving a parameter out would. Neither callback reads the extra parameter, so
+    // both run as they would with one fewer written.
+    assertEq(map([1], anything((a, b, c, d) -> a)), [1])
+    assertEq(reduce([1], anything((a, b, c, d, e) -> a), 0), 0)

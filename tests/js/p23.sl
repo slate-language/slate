@@ -1,49 +1,56 @@
-// What a call is refused for, on both back ends.
+// What a call does with the arguments it was given, on both back ends.
 //
-// **Arity is a thing the two back ends used to disagree about, and not in wording -- in MEANING.**
-// A JavaScript function ignores an argument it was not expecting and binds `undefined` for one it
-// was not given, so an emitted `f(1, 2)` for a one-parameter `f` quietly dropped the `2` and ran,
-// where the interpreter faulted. A call with too few failed further in, with a sentence about
-// `undefined` that named neither the function nor the count.
+// **The call rule is JavaScript's at run time and the two back ends have to agree about it exactly.**
+// A surplus argument is dropped and a parameter the call left out reads as the absence a missing
+// field reads as -- neither machine refuses a count any more, so what is pinned here is what each
+// call ANSWERS rather than what it refuses.
 //
-// **Every one of these goes through `anything`**, because the checker refuses most of them before a
-// program runs -- which is the good case and is not what this file is about. What is pinned here is
-// the MACHINE's answer, for the calls a checker cannot see: a function reached through a value.
+// **Every call with a wrong count goes through `anything`**, because the checker refuses most of
+// them where they are written -- which is the good case, is TypeScript's half of the rule, and is
+// pinned in the compiler's own suite. What is pinned here is the MACHINE's answer, for the calls a
+// checker cannot see: a function reached through a value.
 
 anything(v) = v
 
 // -- the shapes a call can be wrong ---------------------------------------------------------------
 
 one(a) = a
+second(a, b) = b
 two(a, b) = string(a) + "/" + string(b)
 defaulted(a, b = 5) = string(a) + "+" + string(b)
 gathering(a, b, ...rest) = string(a) + string(b) + toJSON(rest)
+boxed(x) = [x]
 
-print(anything(one)() catch e -> e.message)
-print(anything(one)(1, 2) catch e -> e.message)
-print(anything(two)(1) catch e -> e.message)
-print(anything(defaulted)(1, 2, 3) catch e -> e.message)
-print(anything(gathering)(1) catch e -> e.message)
+// **A surplus is dropped**, whatever the callee is.
+print(anything(one)(1, 2))
+print(anything(defaulted)(1, 2, 3))
+print(anything(gathering)(1, 2, 3, 4))
 
 // **A function that takes NOTHING is the case the emitter used to leave unchecked**, having written
-// no signature for an empty parameter list -- so this is the one that was silent rather than merely
-// worded differently. It is also the commonest shape of the mistake: a framework handing props to a
-// component that ignores them.
+// no signature for an empty parameter list. It is also the commonest shape of the mistake: a
+// framework handing props to a component that ignores them.
 none() = "nothing wanted"
 
-print(anything(none)({ start: 1 }) catch e -> e.message)
+print(anything(none)({ start: 1 }))
 print(anything(none)())
 
-// -- what is named, and what cannot be ------------------------------------------------------------
+// A lambda written at the call site, and one bound to a name, read the same way.
+print(anything((a) -> a)(1, 2))
 
-// **A lambda written at the call site keeps the old wording**, there being nothing to name and the
-// caret already pointing at it.
-print(anything((a) -> a)(1, 2) catch e -> e.message)
-
-// A lambda BOUND to a name has that name, which is what a reader would look for.
 val held = (a) -> a
 
-print(anything(held)(1, 2) catch e -> e.message)
+print(anything(held)(1, 2))
+
+// -- a parameter nobody gave reads as an absence ---------------------------------------------------
+
+print(anything(second)(1) == null)
+print(anything(second)(1) ?? "absent")
+print(if anything(second)(1) then "yes" else "no")
+
+// **And it goes no further than the read**, which is slate's own rule and is untouched: passing one
+// on or putting one in a container is refused where it is attempted.
+print(anything(two)(1) catch e -> e.message)
+print(anything(boxed)() catch e -> e.message)
 
 // -- a method and a maker --------------------------------------------------------------------------
 
@@ -54,8 +61,8 @@ class Box
 
 val b = Box(2)
 
-print(anything(b.fits)() catch e -> e.message)
-print(anything(Box)(1, 2) catch e -> e.message)
+print(anything(b).fits("x", "spare"))
+print(anything(Box)(1, 2).size)
 
 // -- the two other things said about a callee ------------------------------------------------------
 
@@ -72,14 +79,15 @@ print(defaulted(b = 9, a = 1))
 // -- a CALLBACK is a different question from a call ------------------------------------------------
 
 // **A native hands a callback as many arguments as the callback declares.** A call the program WROTE
-// is strict, above; this is the other side of the same rule, and it is TypeScript's line in the same
-// place -- a function of fewer parameters is assignable where more are supplied, and a direct call
-// with the wrong count is an error.
+// is counted by the checker; this is the other side of the same rule, and it is TypeScript's line in
+// the same place -- a function of fewer parameters is assignable where more are supplied.
 //
 // What it buys is the shape a person actually writes: a handler that does not read the event, a
 // `forEach` that does not read the element, a timer that ignores everything.
 print(map([1, 2, 3], () -> 9))
 print(map([1, 2, 3], (v) -> v * 2))
+print(map([1, 2, 3], (v, i) -> v + i))
+print(map([1, 2, 3], (v, i, all) -> v + all.length))
 print(filter([1, 2, 3], () -> true))
 print(reduce([1, 2, 3], (a) -> a, 0))
 print(reduce([1, 2, 3], (a, b) -> a + b, 0))
@@ -88,12 +96,11 @@ print(every([1, 2], () -> true), some([1, 2], () -> false))
 
 forEach([1], () -> print("forEach ran with nothing"))
 
-// **A callback that declares MORE than the native can supply is still a fault, and it names the
-// NATIVE** -- the reader's function is not wrong, and the surface they attached it to cannot feed
-// it, which is what they need to be told.
-print(map([1], anything((a, b) -> a)) catch e -> e.message)
-print(reduce([1], anything((a, b, c) -> a), 0) catch e -> e.message)
-print(forEach([1], anything((a, b) -> a)) catch e -> e.message)
+// **A callback that declares MORE than the native can supply is no longer refused either** -- the
+// parameter the native did not feed is simply absent, exactly as it is at an ordinary call. Neither
+// of these reads the parameter it was not given.
+print(map([1], anything((a, b) -> a)))
+print(reduce([1], anything((a, b, c) -> a), 0))
 
 // -- and a call that is right is still right --------------------------------------------------------
 

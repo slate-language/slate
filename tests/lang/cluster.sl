@@ -94,8 +94,10 @@ async pid_IS_THE_NUMBER_A_CHILD_SEES_AS_ITS_PARENT()
     assertEq(seen[0], pid())
 
 @test
-pid_TAKES_NO_ARGUMENTS_AND_AN_EXTRA_ONE_IS_REFUSED()
-    assertFaults(() -> pid(1), "`pid` takes no arguments")
+pid_TAKES_NO_ARGUMENTS_AND_AN_EXTRA_ONE_IS_DROPPED()
+    // A builtin reads the count it was given as a floor, exactly as every other call does, so an
+    // argument `pid` has no room for goes the way a surplus always goes.
+    assertEq(pid(1), pid())
 
 @test
 A_CLUSTER_OF_NO_WORKERS_IS_REFUSED()

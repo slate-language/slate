@@ -120,7 +120,6 @@ async main()
     // -- what a call may not be --------------------------------------------------------------------
 
     print(gzip() catch e -> e.message)
-    print(gzip("a", "b") catch e -> e.message)
     print(gzip(5) catch e -> e.message)
     print(gzip([1, 2, "x"]) catch e -> e.message)
     print(gzip([1, 2, 300]) catch e -> e.message)

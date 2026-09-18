@@ -220,10 +220,32 @@ from that:
 argument one place left. The parser says so where it is written, and an arity complaint then names a
 **range** rather than only its upper end.
 
-**A parameter nobody gave is not bound at all**, which is why there is no sentinel: slate refuses to
-store absence, so there is no "given, and the value was absence" to tell from "not given". `f(1, null)`
-therefore passes `null` and does **not** take the default — which is the simpler rule, JavaScript's
-`f(1, undefined)` doing the opposite.
+**The guard is whether the call gave the argument, not what it gave**, so `f(1, null)` passes `null`
+and does **not** take the default — the simpler rule, where JavaScript's `f(1, undefined)` does the
+opposite. There is nothing to write in its place either way: an absence cannot be
+[passed to a function](values.md), so `f(1, undefined)` is refused where it is written.
+
+## Optional parameters
+
+**`b?` marks a parameter optional with no value of its own.** It comes out of the count exactly as a
+default does — a call may leave it off — and where nobody gives it, it reads as the absence a missing
+field reads as, which `??` resolves:
+
+```slate
+greet(name, title?) = (title ?? "friend") + " " + name
+
+print(greet("ada"))
+print(greet("ada", "captain"))
+```
+
+```output
+friend ada
+captain ada
+```
+
+It is `b = undefined` written in one character, and it obeys the same rule defaults do: **a parameter
+that may be left out has to come last.** Reach for a default where there is a sensible value and for
+`?` where the whole point is that there is none.
 
 ## Named arguments
 
@@ -278,17 +300,19 @@ print(total(...xs))         // the spread it is the counterpart of
 so there is no absence to test for. It must be last and takes no default — one could never fire. A
 default *before* it is fine.
 
-## A function takes as many arguments as it declares, and the rest are dropped
+## The call rule, which is JavaScript's at run time and TypeScript's where the callee can be seen
 
-**A call may give more than the function declares. The surplus is dropped**, wherever the call is
-written and whoever is making it:
+**At run time a call binds what the function declares and nothing else.** A surplus argument is
+dropped, and a parameter nobody gave reads as an absence — exactly JavaScript's rule, on both back
+ends. This is what a call through a value does, which is every call something else makes on your
+behalf:
 
 ```slate
+call3(g) = g(1, 2, 3)
 f(a) = a
-val g = (a, b) -> a + b
 
-print(f(1, 2, 3))
-print(g(1, 2, 3))
+print(call3(f))
+print(call3((a, b) -> a + b))
 print(map([1, 2, 3], v -> v * 2))
 print(map([1, 2, 3], () -> 9))
 ```
@@ -320,9 +344,10 @@ print(on2(a -> a))
 later
 ```
 
-**Too FEW is still a fault**, and that is not the same question: a parameter with no default has
-nothing to bind, and slate stores no absence, so there is no value to give it. Give it a
-[default](#defaults) where leaving it out is meant to be allowed.
+**Where the call is WRITTEN OUT and the checker can see what it is calling, a wrong count is refused
+before the program runs.** That is TypeScript's half of the same rule, and it is the half that
+catches mistakes: a call you wrote by name is a call you meant, so a count that does not match is
+worth saying rather than quietly obeying. Too few:
 
 ```slate
 f(a, b) = a + b
@@ -334,8 +359,21 @@ print(f(1))
 `f` takes 2 arguments and this gives it 1
 ```
 
-**A builtin is the exception**, because its parameters are not slate's: it cannot drop what it was
-given, and says so.
+Give the parameter a [default](#defaults), or mark it [optional with `?`](#optional-parameters),
+where leaving it out is meant to be allowed. And too many, at the same call:
+
+```slate
+f(a) = a
+
+print(f(1, 2))
+```
+
+```error
+`f` takes 1 argument and this gives it 2
+```
+
+**A builtin is counted the same way**, its signature being fixed and the call therefore always one
+the checker can see:
 
 ```slate
 print(chars("a", "b"))
@@ -345,8 +383,10 @@ print(chars("a", "b"))
 `chars` takes 1 argument and this gives it 2
 ```
 
-**So a function declaring MORE than its caller will supply is still refused, and the complaint names
-the caller**, your function not being the thing that is wrong:
+**A function handed over as a VALUE is judged by whether it FITS, never by a count**, which is why
+the first block on this page runs: a callback declaring fewer parameters than its caller supplies is
+what `x -> x * 2` is. One declaring MORE than its caller will supply is refused, and the complaint
+names the caller, your function not being the thing that is wrong:
 
 ```slate
 map([1], (a, b, c, d) -> a)
@@ -358,8 +398,7 @@ map([1], (a, b, c, d) -> a)
 
 That is the checker, which knows what `map` hands over — the element, its position and the array, so
 three is what there is and a fourth parameter has nothing to fill it. Reached through a value it
-cannot see, the machine says the same thing in its own words — *"`map` calls this with 3 arguments
-and it takes 4 arguments"*.
+cannot see, nothing refuses it and the fourth parameter is simply absent.
 
 The same rule read as a type: a function of fewer parameters fits wherever more are supplied, and
 one of more does not.
@@ -373,6 +412,31 @@ print(apply((a, b) -> a))
 ```error
 `apply` takes (integer) -> integer here, and this is (any, any) -> any
 ```
+
+### A parameter the call left out reads as an absence
+
+Where a call the checker could not see gives too few, the parameters nobody filled read as
+`undefined` — the same value a [missing field](values.md) reads as, resolved the same ways:
+
+```slate
+call1(g) = g(1)
+second(a, b) = b
+
+print(call1(second) == null)
+print(call1(second) ?? "gone")
+print(if call1(second) then "yes" else "no")
+```
+
+```output
+true
+gone
+no
+```
+
+**And it goes no further than the read.** An absence cannot be stored in a container, bound to a
+name or passed on to another function, so a function that puts an unfilled parameter into an array
+faults there rather than carrying the hole along — which is the rule that keeps `undefined` from
+surfacing far from where it came.
 
 ## Destructuring parameters
 
