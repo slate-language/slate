@@ -38,7 +38,9 @@ separate values: a guard about arithmetic would otherwise have to be written twi
 
 ## Truth
 
-**Only `false` and `null` are false.** Zero, the empty string and the empty array are all true.
+**slate follows JavaScript's rule.** `false`, `null`, an absent value, `0` (and `-0`), `NaN` and `""`
+are false; everything else is true — including `[]`, `{}`, `"0"` and an empty `bytes` buffer, which
+is an object in JS terms and stays true however long it is.
 
 ```slate
 print(if 0 then "true" else "false")
@@ -47,10 +49,14 @@ print(if [] then "true" else "false")
 ```
 
 ```output
-true
-true
+false
+false
 true
 ```
+
+**`??` is unchanged and asks a different question.** It tests whether a value is *absent*, not
+whether it is true — zero and the empty string are values, not absences, so `0 ?? 5` is still `0`
+and `"" ?? "d"` is still `""`. See [Logic](expressions.md#logic).
 
 ## Equality
 
