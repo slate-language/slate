@@ -1,0 +1,186 @@
+module dev.slatelang.slate
+@tests
+
+import sh.sysl.libuv
+import sh.sysl.libuv.Handle
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8_unchecked
+
+// The transport an actor's mailbox is made of, probed before any of it is built.
+//
+// **This file is a feasibility probe and not the mailbox.** What it asks is whether sysl and
+// `sh.sysl.libuv` 0.1.6 give the shape `docs/design/actors.md` assumes: an intrusive list of `&sync`
+// message boxes under a mutex, a `Waker` the sending thread holds, and a whole slate VM on the
+// receiving thread with a loop of its own. Every one of those is a rule the compiler enforces rather
+// than something that can be read off a page, so it is answered by running.
+//
+// **A THREAD WITH A LOOP ON IT MUST BE ABLE TO END, AND THAT IS THE RULE THE FIRST VERSION BROKE.**
+// A mailbox's `Async` is an ACTIVE handle, so the receiving thread's `uv_run` never returns on its
+// own -- and a `join` on that thread waits for a loop that waits for a handle nobody closes. The
+// order below is the one the runtime owes: the drain stops the loop, `uv_run` returns, the handle is
+// CLOSED, the loop is turned once more so the close callback fires, and only then does the thread
+// leave its VM and exit.
+
+// How many bytes a probe message carries. **A fixed array and not a `Buf`**: a growable collection
+// owns its elements through a count that is not atomic, so a `&sync` struct may not hold one.
+private const ProbeBytes: usize = 128
+
+// A heap small enough that the second VM is cheap and large enough to run a statement.
+private const ProbeCeiling: usize = 4194304
+
+// One message, and the list it is a node of.
+//
+// **The list is the messages themselves**, which is what "intrusive" means here and is forced rather
+// than chosen: `Buf` cannot live in a `&sync` struct, so the queue has nowhere else to be.
+//
+// `data`/`data_len` are the variable-length shape the real copier needs -- a raw pointer carries no
+// count, which is why `@crossing` looks through one -- and are here to prove the field types compile
+// inside a `&sync` struct rather than to be read.
+private struct ProbeNote
+    next: Option[&sync ProbeNote]
+    payload: [ProbeBytes]u8
+    payload_len: usize
+    data: *u8
+    data_len: usize
+end ProbeNote
+
+// The mailbox: a lock, a head, the address the sender wakes, and what came back.
+private struct ProbeBox
+    lock: &sync libuv.Mutex
+    ready: &sync libuv.Semaphore
+    head: Option[&sync ProbeNote]
+    wake: Option[libuv.Waker]
+
+    // What the VM on that thread printed, which says a whole runtime ran there.
+    said: [ProbeBytes]u8
+    said_len: usize
+
+    // What arrived through the mailbox, which says the wake-up and the queue work.
+    got: [ProbeBytes]u8
+    got_len: usize
+
+    ran: bool
+end ProbeBox
+
+// Take everything in the list and stop this thread's loop.
+//
+// **The callback's job is to drain whatever is there rather than to be counted**, `Async.send`
+// coalescing, which is the rule the real mailbox is written to. **Stopping the loop is what lets the
+// thread end** -- the `Async` is an active handle, so `uv_run` would otherwise never return.
+private probe_drain(box: &sync ProbeBox, lp: &libuv.Loop)
+    box.lock.lock()
+
+    var here = box.head
+
+    box.head = None
+    box.lock.unlock()
+
+    here match
+        Some(n) ->
+            var i: usize = 0
+
+            while i < n.payload_len && i < ProbeBytes
+                box.got[i] = n.payload[i]
+                i += 1
+
+            box.got_len = i
+        None -> ()
+
+    lp.stop()
+end probe_drain
+
+// A whole slate runtime on a thread of its own, reached from another thread by a wake-up.
+private probe_thread(box: &sync ProbeBox)
+    val lp = libuv.new_loop().expect("a loop of this thread's own")
+
+    var mine = new_vm(ProbeCeiling, lp)
+
+    val was = enter(&mine)
+
+    // A program of this VM's own, on this thread, before anybody can reach it. **Run here rather
+    // than inside the drain callback**: `run` turns the loop itself, and a loop may not be run from
+    // inside its own callback.
+    val said = out("print(6 * 7)")
+    val bytes = said.bytes
+
+    var n: usize = 0
+
+    while n < bytes.len && n < ProbeBytes
+        box.said[n] = bytes[n]
+        n += 1
+
+    box.said_len = n
+
+    // Now the mailbox. The waker is the one thing another thread may hold, and it is published only
+    // once there is something behind it.
+    val note = libuv.notifier(() -> probe_drain(box, lp), lp).expect("a notifier on it")
+
+    box.wake = Some(note.waker())
+    box.ready.post()
+
+    lp.run().expect("the thread's loop ran until the drain stopped it")
+
+    // The handle is CLOSED and not merely dropped, and the loop is turned once more so that the
+    // close callback fires -- without which `loop_close` answers EBUSY and the next run would block.
+    note.close(() -> ())
+    lp.run().expect("the thread's loop ran its close callback")
+
+    leave(was)
+    dispose_vm(&mine)
+    lp.close().expect("the thread's loop closes with nothing left on it")
+
+    box.ran = true
+end probe_thread
+
+@test
+A_MAILBOX_IS_AN_INTRUSIVE_LIST_UNDER_A_MUTEX_AND_A_WAKER_REACHES_A_VM_ON_ANOTHER_THREAD()
+    reset_vm()
+    current().output.clear()
+
+    // The process-wide native table is built here, before the second thread exists: `register` is
+    // append-only, so two threads installing the builtins at once would be two threads writing one
+    // `Map`.
+    assert_eq(out("print(\"warm\")"), "warm")
+
+    var box: &sync ProbeBox = ProbeBox(
+        libuv.mutex().expect("a lock"),
+        libuv.semaphore(0u32).expect("a handshake"),
+        None, None,
+        [0u8; ProbeBytes], 0,
+        [0u8; ProbeBytes], 0,
+        false)
+
+    val t = libuv.thread(() -> probe_thread(box)).expect("a thread of its own")
+
+    box.ready.wait()
+
+    val wake = box.wake.expect("the thread published its waker")
+    val text = "a message that crossed"
+    val bytes = text.bytes
+
+    var note: &sync ProbeNote = ProbeNote(None, [0u8; ProbeBytes], 0, null, 0)
+    var i: usize = 0
+
+    while i < bytes.len && i < ProbeBytes
+        note.payload[i] = bytes[i]
+        i += 1
+
+    note.payload_len = i
+
+    box.lock.lock()
+    note.next = box.head
+    box.head = Some(note)
+    box.lock.unlock()
+
+    wake.send().expect("the wake-up is the one libuv call safe from any thread")
+
+    t.join().expect("the second thread was waited for")
+
+    assert(box.ran, "the second VM ran to the end on a thread of its own")
+    assert_eq(from_utf8_unchecked(box.said[0..<box.said_len]), "42",
+        "a whole slate VM ran a program on that thread, on its own heap and its own loop")
+    assert_eq(from_utf8_unchecked(box.got[0..<box.got_len]), text,
+        "and the message reached it through the mailbox and the waker")
+
+    current().output.clear()
+end A_MAILBOX_IS_AN_INTRUSIVE_LIST_UNDER_A_MUTEX_AND_A_WAKER_REACHES_A_VM_ON_ANOTHER_THREAD
