@@ -181,12 +181,15 @@ an_if_is_an_expression() =
     assertEq(if false then 1 else 2, 2)
 
 @test
-only_null_undefined_and_false_are_falsy() =
-    assert(boolean(0))
-    assert(boolean(""))
-    assert(boolean([]))
+truthiness_follows_javascripts_rule() =
+    // false, null, an absent value, 0 (and -0), NaN and "" are falsy; everything else is truthy --
+    // see tests/lang/values.sl for the full table over every value kind.
+    assert(!boolean(0))
+    assert(!boolean(""))
     assert(!boolean(null))
     assert(!boolean(false))
+    assert(boolean([]))
+    assert(boolean({}))
 
 @test
 a_closure_keeps_the_scope_that_made_it() =

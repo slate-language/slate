@@ -31,7 +31,7 @@ ranges and not of objects.
 print(string(123) + "!")
 print(number("42"), number("nonsense"))
 print(integer(2.9))
-print(boolean(0))           // only false and null are false
+print(boolean(0))           // slate's truthiness is JavaScript's: zero is false
 print("日本語".length)        // in characters
 ```
 
@@ -39,7 +39,7 @@ print("日本語".length)        // in characters
 123!
 42 null
 2
-true
+false
 3
 ```
 
@@ -257,7 +257,8 @@ Where slate parts from JavaScript it is **to remove a case rather than add one**
   JavaScript grew `at` beside `xs[i]`.
 - **A comparator answers a boolean: whether the first value comes before the second.** `sorted(xs,
   _.age < _.age)` is the whole of one. A comparator answering `-1`, `0` or `1` is refused by name:
-  `0` is true in slate, so a three-way answer would read as "yes, yes, yes".
+  `-1` and `1` are both true and `0` is false, so a three-way answer would read as "before, not
+  before, before" rather than the ternary comparison it meant.
 
 ## Objects
 
