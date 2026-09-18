@@ -106,6 +106,27 @@ wait for it, which is a cost paid by every file rather than by the ones that wan
 What it costs is that **a path cannot be computed**, which is the same bargain sysl takes and is what
 makes the set of files a program is made of knowable by reading it.
 
+## A file's top level is declarations and effects
+
+**A declaration says what a name is; an effect is the file doing something.** A definition, a `class`, a
+`data`, a `type`, an `external` and an `import` are declarations. Everything else at the top level is an
+effect: a `val` or a `var` binding, an expression, a `for`, an `if`, a `match`, a top-level `await`.
+
+**A program runs exactly as it reads** — the split changes nothing about that. What it is for is that a
+fresh machine can be given a program's **names** without running the program: an actor's VM, or a host
+embedding slate, runs each module's declarations alone and has every definition and every class the program
+declares, with nothing printed, nothing opened and no timer armed.
+
+A method may name a top-level `val`, and that stays an ordinary program: the name is looked up when the
+method is **called**, not when the class is declared. In a machine that ran only the declarations there is
+nothing bound to it, so reaching it faults with the same sentence any undefined name gets. A module's
+exports are all there in such a machine; the ones an effect would have bound are `null`.
+
+What such a machine cannot load at all is a **declaration whose value needs an effect's binding** — a class
+field written `val defaults = Defaults`, where `Defaults` is a top-level `val`. The initialiser is worked
+out where the class stands, so loading the declarations alone stops there, naming the name. State a class
+depends on belongs in its own fields, which is also what lets it travel to an actor.
+
 ## A module is an object
 
 So there is no new kind of value and nothing new for the collector to trace — `util.double` is the field

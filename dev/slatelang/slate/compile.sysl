@@ -554,8 +554,27 @@ end open_imported_types
 // **The object is a snapshot taken when the file finishes.** An `export var` that the module changes
 // afterwards is not seen changing from outside, which is where this parts company with TypeScript's
 // live bindings -- and is the honest reading of "a module is an object".
+// **A MODULE IS TWO CHUNKS: THE ONE A PROGRAM RUNS, AND ITS DECLARATIONS ALONE.** The first is the
+// chunk this has always emitted, statement for statement -- so an ordinary run is unchanged down to
+// the instruction. The second holds only the file's declarations, in source order: its definitions,
+// classes, data types, types, externals and imports.
+//
+// **What the second buys is a VM that can learn a program's names without running it.** An actor's
+// machine, or an embedder's, runs `load_declarations` and has every definition and every class the
+// program declares, with nothing printed, nothing opened and no timer armed. A top-level `val` is
+// simply not bound there, so a method reaching one faults with the ordinary sentence about a name
+// that is not defined -- which is the consequence `docs/reference/modules.md` states for a reader.
+//
+// **THE DECLARATIONS ARE COMPILED TWICE RATHER THAN CUT OUT OF THE ONE CHUNK, AND THE REASON IS THAT
+// A DECLARATION IS NOT ALWAYS FIRST.** Cutting them out would mean running them ahead of the file's
+// effects, and slate has two rules that says otherwise: an `import` binds where it is written, and a
+// class field's initialiser is worked out where the class stands, so `class Config` carrying
+// `val defaults = Defaults` reads a `val` written above it. Both are pinned by tests and both would
+// have had to change. The price is a chunk per declared function on each side, which nothing but a
+// program's size can see.
 compile_module(u: *Unit, prog: Program, src: usize, name: string, is_entry: bool) -> usize
-    val at = u.chunks.len()
+    val at_decls = u.chunks.len()
+    val at = at_decls + 1
     var params: Buf[string] = buf()
 
     current().compiling_source = src
@@ -566,7 +585,20 @@ compile_module(u: *Unit, prog: Program, src: usize, name: string, is_entry: bool
     // exactly as a parse error does -- and it has to be after `open_types` because an annotation
     // naming a declared type cannot be read until that type is registered.
     check_program(prog, is_slate_module(name))
+
+    // **Both chunks are reserved before either is compiled**, because compiling one pushes a chunk
+    // for every definition in it and an index handed out afterwards would not be the one a caller was
+    // promised. The declarations chunk never waits: an `await` at the top level is an effect, so it
+    // is in the other one and the flag that makes a chunk a coroutine belongs there.
+    u.chunks.push(Chunk(buf(), buf(), 0, false, name, false, false, 0, false, src))
     u.chunks.push(Chunk(buf(), params, 0, false, name, prog.awaits, false, 0, false, src))
+
+    // The two halves of the file, each in the order it was written.
+    var decl_stmts: Buf[Stmt] = buf()
+    var body_stmts: Buf[Stmt] = buf()
+
+    for i in 0..<prog.stmts.len()
+        if i < prog.decls.len() && prog.decls.at(i) then decl_stmts.push(prog.stmts.at(i)) else body_stmts.push(prog.stmts.at(i))
 
     // **A file's body is an async context where the file waits for something, and an ordinary chunk
     // where it does not**, which is an ES module's rule: `await` at the top level is legal and the
@@ -598,23 +630,95 @@ compile_module(u: *Unit, prog: Program, src: usize, name: string, is_entry: bool
         emit_hook(u, &e, HookSetupAll, prog.setup_all)
         emit_hook(u, &e, HookTeardownAll, prog.teardown_all)
 
-    for i in 0..<prog.exports.len()
-        val k = intern_str(u, prog.exports.at(i))
-
-        push_n(&e, PushStr(k), point(0), 0, 1)
-        push_n(&e, LoadName(k), point(0), 0, 1)
-
-    push_n(&e, MakeObject(prog.exports.len()), point(0), prog.exports.len() * 2, 1)
-    put(&e, Ret, point(0))
+    export_object(u, &e, prog.exports, buf())
 
     var c = u.chunks.at(at)
 
     c.code = e.code
     u.chunks.set(at, c)
+
+    // And the declarations a second time, on their own. **Nothing here may complain**: these are
+    // statements the chunk above has just compiled, so every diagnostic they can draw has been drawn.
+    val was = quiet_compiling()
+
+    var de = fresh_emit(false, false, false, false, buf())
+
+    compile_stmts(u, &de, decl_stmts, point(0))
+    push_n(&de, Discard, point(0), 1, 0)
+    export_object(u, &de, prog.exports, effect_names(body_stmts))
+    say_again(was)
+
+    var dc = u.chunks.at(at_decls)
+
+    dc.code = de.code
+    u.chunks.set(at_decls, dc)
+
     u.modules.push(at)
+    u.module_decls.push(at_decls)
     u.module_paths.push(name)
     u.modules.len() - 1
 end compile_module
+
+// Put the compiler's report aside, and hand back what was there.
+//
+// **`sh.sysl.parsing`'s `Report` has no rewind**, which is what makes this a swap rather than a
+// truncation: a fresh one takes every complaint the next pass makes and is thrown away with them.
+// The declarations chunk is the one caller, and it compiles statements the module's own chunk has
+// already compiled -- so a complaint raised there would be the second copy of one the reader has.
+private quiet_compiling() -> (Report, Buf[usize])
+    val v = current()
+    val was = (v.compile_faults, v.compile_fault_srcs)
+
+    v.compile_faults = report()
+    v.compile_fault_srcs = buf()
+    was
+end quiet_compiling
+
+private say_again(was: (Report, Buf[usize]))
+    val v = current()
+
+    v.compile_faults = was.0
+    v.compile_fault_srcs = was.1
+end say_again
+
+// What a module answers: an object of the names the file marked `export`.
+//
+// **`absent` is the names a chunk cannot load, and it is empty for every chunk but a declarations
+// one.** A file may export a `val`, which is an effect -- so the declarations chunk has never bound
+// it and a `LoadName` there would fault on a name the file is perfectly entitled to have. It is
+// written as `null` instead, which is what a VM that has run only declarations knows about it: the
+// key is there because the file exports it, and nothing is behind it because nothing has run.
+private export_object(u: *Unit, e: *Emit, names: Buf[string], absent: Buf[string])
+    for i in 0..<names.len()
+        val k = intern_str(u, names.at(i))
+
+        push_n(e, PushStr(k), point(0), 0, 1)
+
+        if names_one(absent, names.at(i))
+            push_n(e, PushNull, point(0), 0, 1)
+        else
+            push_n(e, LoadName(k), point(0), 0, 1)
+
+    push_n(e, MakeObject(names.len()), point(0), names.len() * 2, 1)
+    put(e, Ret, point(0))
+end export_object
+
+// The names a run of statements BINDS, for the two forms that bind one and can be exported.
+//
+// **A `val` and a `var` are the whole list**, because they are the only effects `export` takes: a
+// destructuring binding has no single name and `parse_export` pushes nothing for one, so a name that
+// is exported and not declared arrived through one of these two.
+private effect_names(stmts: Buf[Stmt]) -> Buf[string]
+    var found: Buf[string] = buf()
+
+    for i in 0..<stmts.len()
+        *stmts.at(i).kind match
+            Val(name, _) -> found.push(name)
+            Var(name, _) -> found.push(name)
+            _ -> ()
+
+    found
+end effect_names
 
 // One `@setup`, `@teardown`, `@setupAll` or `@teardownAll`, where the file wrote one.
 private emit_hook(u: *Unit, e: *Emit, kind: usize, name: string)
