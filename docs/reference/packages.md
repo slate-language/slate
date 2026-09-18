@@ -88,6 +88,11 @@ make that a code-execution step. So the reader is a restriction pass over an ord
   something a person wrote.
 - **The walk carries on after a refusal**, so a manifest with three mistakes reports three.
 
+**A manifest may open with any number of `import` lines before its one object**, and the reader skips
+every one of them without reading a word out of it — resolution, `slate install` and a dependency's own
+manifest all still touch nothing of the machine; only `slate run` evaluates the imports for real, which
+is what lets a script reach `slate:process` or one of the project's own dependencies.
+
 ## Scripts
 
 A project may write a `scripts` block, and `slate run <name>` runs one of them:
@@ -136,6 +141,25 @@ every manifest they touch as *data* — the restriction pass above skips the `sc
 reading it, so a function written there is recorded as nothing at all. **Only `slate run` evaluates a
 manifest, and only ever the project's own**: a dependency's scripts are never read and never run, however
 deep it sits.
+
+**The `import` lines at the top of the file are what let a function script reach past `args`**, so a
+script may run another program and answer what it left behind:
+
+```slate
+import { run } from slate:process
+
+{
+    name: "board",
+    version: "0.1.0",
+
+    scripts: {
+        deploy: async (args) -> (await run("./deploy.sh", args)).status,
+    },
+}
+```
+
+`slate deps` and `slate install` still see only `dependencies` here, an import above the object being a
+statement the restriction pass skips rather than a second kind of dependency.
 
 ## What a package exposes
 
