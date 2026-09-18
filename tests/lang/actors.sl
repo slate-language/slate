@@ -79,6 +79,30 @@ async sends_from_one_actor_arrive_in_the_order_they_were_written() =
     assertEq(seen[0], 0)
     assertEq(seen[199], 199)
 
+// -- what a handler cannot reach -----------------------------------------------------------------
+
+val topLevelLimit = 512
+
+actor NameLeaker
+    on read(self) = topLevelLimit
+
+@test
+async a_handler_reaching_a_top_level_val_faults_with_the_same_sentence_on_both_back_ends() =
+    // **`docs/reference/modules.md` says a handler's own module gives it declarations and nothing
+    // else**, so a top-level `val` is simply not bound where the handler runs -- reaching it faults
+    // exactly as any other undefined name does. This is the interpreter's own sentence, and the
+    // JavaScript back end must say the same words rather than the host's -- V8's own `ReferenceError`
+    // has no backticks around the name.
+    val a = spawn(NameLeaker)
+    var said = ""
+
+    try
+        await ask(a.read)
+    catch e
+        said = e.message
+
+    assertEq(said, "`topLevelLimit` is not defined")
+
 // -- what crosses ------------------------------------------------------------------------------
 
 class Point
