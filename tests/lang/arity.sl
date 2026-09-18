@@ -128,11 +128,17 @@ A_QUESTION_MARK_MARKS_A_PARAMETER_OPTIONAL_WITH_NO_VALUE_OF_ITS_OWN() =
 A_BUILTIN_REACHED_THROUGH_A_VALUE_DROPS_A_SURPLUS_TOO() =
     // A builtin's parameters are not slate's, so this is the one half of the rule it could have got
     // wrong -- the count it is given is its own to read, and reading it as a floor is what makes a
-    // builtin behave like everything else.
+    // builtin behave like everything else. Every one-and-two-argument math builtin has to agree,
+    // not only the one the checker's own test happens to pin.
     val g = anything(sqrt)
 
     assert(g(4, 5) == 2)
     assert(anything(abs)(-2, "spare") == 2)
+    assert(anything(floor)(3.7, "spare") == 3.0)
+    assert(anything(ceil)(3.2, "spare") == 4.0)
+    assert(anything(round)(3.5, "spare") == 4.0)
+    assert(anything(trunc)(3.9, "spare") == 3.0)
+    assert(anything(pow)(2, 3, "spare") == 8)
 
 @test
 AN_ANNOTATED_FUNCTION_TYPE_ASKS_ONLY_WHETHER_A_CALL_OF_THAT_SIZE_IS_TAKEN() =
