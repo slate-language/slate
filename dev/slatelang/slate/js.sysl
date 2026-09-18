@@ -177,17 +177,44 @@ end Emitted
 // **The runtime is not part of this, which is what makes the output readable and testable.** A test
 // pins what a program compiles to; prepending nine hundred lines of runtime to every expectation
 // would pin nothing but the runtime.
-emit_module(prog: Program, src: Source) -> Emitted = emit_one(prog, src, 0, false, false)
+emit_module(prog: Program, src: Source) -> Emitted =
+    emit_one(prog, src, 0, false, false, false, prog.actors.len() > 0)
+
+// Whether any file of this program declares an actor.
+//
+// **Asked of the whole PROGRAM and not per file**, because what it decides is the shape of the
+// bundle: a program that declares one anywhere is emitted with a declarations-only copy of every
+// module beside the ordinary one, and a program that declares none is emitted exactly as it was.
+//
+// Not `private`: `main.sysl` builds a suite a file at a time and asks the same question.
+program_declares_an_actor(l: Loaded) -> bool
+    for i in 0..<l.order.len()
+        if l.programs.at(l.order.at(i)).actors.len() > 0 then return true
+
+    false
+end program_declares_an_actor
 
 // One module of a program, told which file it is and whether the markers name it.
-private emit_one(prog: Program, src: Source, file: usize, stamp: bool, testing: bool) -> Emitted
+//
+// **`decls_only` is the SECOND CHUNK the design page calls for**, and it is a second emission of the
+// same tree rather than a cut through the first: the module's own statements are compiled and run
+// statement for statement as they always were, and this is written beside them. A declaration is a
+// definition, a `class`, a `data`, a `type`, an `external` or an `import` -- `Program.decls` says
+// which, the parser being the one pass that knows which rule it read a line by.
+//
+// **`with_actors` is what turns the name registry on**, and it is off for every program that
+// declares no actor -- which is what keeps those programs' emitted text byte for byte what it was.
+private emit_one(prog: Program, src: Source, file: usize, stamp: bool, testing: bool, decls_only: bool, with_actors: bool) -> Emitted
     // **The top level is `async` where the file waits and not otherwise, which is `compile_module`'s
     // `fresh_emit(prog.awaits, false, ...)` said once more here.** The function this file's code is
     // written into is made `async` by the same flag, so an `await` that is legal to the interpreter
     // is legal to JavaScript -- and a file that waits for nothing is emitted into a plain function,
     // which is what keeps every other program's output byte for byte what it was. **A top-level
     // `yield` is still refused by both hosts**, there being nothing to yield to.
-    var j = Js(str_builder(), src, file, stamp, 0, 0, 0, report(), buf(), prog.awaits, false, buf(), buf(), buf(), buf(), buf(), buf(), "", None)
+    //
+    // **The declarations-only copy never waits**, whatever the file does: an `await` at a file's top
+    // level is an effect, so there is none left in what this emits.
+    var j = Js(str_builder(), src, file, stamp, 0, 0, 0, report(), buf(), prog.awaits && !decls_only, false, buf(), buf(), buf(), buf(), buf(), buf(), "", None)
 
     for i in 0..<prog.type_names.len()
         j.type_names.push(prog.type_names.at(i))
@@ -198,23 +225,42 @@ private emit_one(prog: Program, src: Source, file: usize, stamp: bool, testing: 
     // this is what it reads.
     open_module_types(running_unit(), prog, file)
 
-    // **An `actor` declaration is refused by this back end, and it is refused HERE rather than at the
-    // call that spawns one.** An actor is an OS thread with a whole slate runtime on it: its own
-    // machine, its own heap, its own event loop and its own collector. A JavaScript host has no such
-    // thing to give -- what it has is a worker, which is a second *program* reached by a structured
-    // clone, and `docs/design/actors.md` has the design for that and it is not built.
+    // **Every name the program declares, under the name it was declared under**, which is what a
+    // message carrying a class instance is rebuilt against: `Vm.module_scopes` in the interpreter,
+    // and a table in the runtime here. It is filled on BOTH paths, the main thread having to rebuild
+    // what arrives from a worker exactly as a worker rebuilds what arrives from the main thread.
     //
-    // **The name is what tells the reader which line of their program it is**, exactly as the
-    // refusals in `js_rt_lmdb.sysl` do.
-    for i in 0..<prog.actors.len()
-        complain(&j, src.all(), s"`actor ${prog.actors.at(i)}` is an actor, and the JavaScript back end has no actors -- an actor is a thread with a whole slate runtime on it, which the interpreter can give and a JavaScript host cannot. `slate:actor` runs under the interpreter only")
+    // **`type_names` is the list because a class, a data type, a variant and a `type` alias all bind
+    // a value under the name they declared**, and `$.declared` keeps only the two that a message can
+    // name -- which is `declared_here`'s own guard.
+    //
+    // **REGISTERED AT THE TOP OF THE MODULE AND AS A THUNK, which is `each_module` filling
+    // `Vm.module_scopes` BEFORE each module runs.** Written at the bottom beside the exports, these
+    // lines run only once the module's last statement has -- and a program whose own top level
+    // `await`s an actor is still inside its own chunk when the answer arrives, so the reply would be
+    // rebuilt against an empty table. The thunk is what lets the line stand above the declaration it
+    // names: a `const` is in its dead zone until the line that fills it, and nothing calls one of
+    // these until a message carrying that name arrives.
+    if with_actors
+        for i in 0..<prog.type_names.len()
+            val name = prog.type_names.at(i)
 
-    emit_stmts(&j, prog.stmts)
+            line(&j, s"$$.declared(${quoted_js(name)}, () => ${js_name(name)});")
+
+    emit_stmts(&j, if decls_only then declarations_of(prog) else prog.stmts)
 
     for i in 0..<prog.exports.len()
         val name = prog.exports.at(i)
 
-        line(&j, s"$$exports.setName(${quoted_js(name)}, ${js_name(name)});")
+        // **An export bound by an EFFECT is not there at all in the declarations-only copy**, a
+        // `export val port = 8080` being a line that copy deliberately does not run. Reading it
+        // would be a `ReferenceError` that took the worker with it, so the write is guarded -- and
+        // guarded by `try` rather than by `typeof`, which answers about an outer name of the same
+        // spelling where this has to answer about this scope's.
+        if decls_only
+            line(&j, s"try { $$exports.setName(${quoted_js(name)}, ${js_name(name)}); } catch (e) {}")
+        else
+            line(&j, s"$$exports.setName(${quoted_js(name)}, ${js_name(name)});")
 
     // **A `@test` registers here, beside the exports, and for the export list's reason**: this is the
     // one place a name the program declared is still in scope. Only the ENTRY file's tests are
@@ -239,6 +285,20 @@ private emit_one(prog: Program, src: Source, file: usize, stamp: bool, testing: 
 
     Emitted(j.out.finish(), j.report, srcs)
 end emit_one
+
+// A file's DECLARATIONS alone, in the order it wrote them.
+//
+// **`Program.decls` is in step with `Program.stmts`**, so this is a filter and nothing more -- the
+// judgement about which line is a declaration was made by the parser, which is the one pass that
+// could make it.
+private declarations_of(prog: Program) -> Buf[Stmt]
+    var out: Buf[Stmt] = buf()
+
+    for i in 0..<prog.stmts.len()
+        if i < prog.decls.len() && prog.decls.at(i) then out.push(prog.stmts.at(i))
+
+    out
+end declarations_of
 
 // One `@setup`, `@teardown`, `@setupAll` or `@teardownAll`, where the file wrote one.
 private hook_line(j: *Js, kind: usize, name: string)
@@ -296,6 +356,17 @@ emit_program(l: Loaded, testing: bool) -> Emitted
 
     val waits = program_awaits(l)
 
+    // **A PROGRAM THAT DECLARES AN ACTOR IS THE BUNDLE THAT PLAYS BOTH ROLES**, and this is the whole
+    // of the fork: the same file, run as a worker, runs the program's declarations and then serves
+    // messages instead of running the program. A program that declares none is emitted exactly as it
+    // was, down to the byte -- which is what `tests/js/`'s corpus is the check on.
+    val actors = program_declares_an_actor(l)
+
+    if actors
+        out.push("\n;if ($.inWorker) $.actorWorker(() => {\n")
+        out.push(program_decls(l).code)
+        out.push("}); else {\n")
+
     if testing
         // **A file run for its tests is a SUITE OF ONE**, so that there is one runner and not two.
         // `slate js --test p.sl | node -` and `slate test --js .` then report in the same words
@@ -315,6 +386,8 @@ emit_program(l: Loaded, testing: bool) -> Emitted
         out.push(if waits then "\n;(async () => {\n" else "\n;(() => {\n")
         out.push(body.code)
         out.push("})();\n")
+
+    if actors then out.push("}\n")
 
     out.push(scope_shuts(names))
 
@@ -359,14 +432,31 @@ end one_entry
 // per file would be a second place for the report to be written.
 //
 // Not `private`: `main.sysl` is what assembles a suite.
-js_suite(entries: Buf[string], only: string) -> string
+// **`decls` is one declarations-only copy per file that declared an actor**, and it is a list rather
+// than one body because a suite is many programs: each copy is wrapped in a scope of its own, so two
+// files' `$m0` are two names, and `$.declared` is what the worker looks a class up in.
+js_suite(entries: Buf[string], decls: Buf[string], only: string) -> string
     var out = str_builder()
 
     val names = builtin_names()
 
     out.push(js_runtime())
     out.push(scope_opens(names))
+
+    if decls.len() > 0
+        out.push("\n;if ($.inWorker) $.actorWorker(() => {\n")
+
+        for i in 0..<decls.len()
+            out.push(";(() => {\n")
+            out.push(decls.at(i))
+            out.push("})();\n")
+
+        out.push("}); else {\n")
+
     out.push(suite_text(joined_entries(entries), only))
+
+    if decls.len() > 0 then out.push("}\n")
+
     out.push(scope_shuts(names))
 
     out.finish()
@@ -421,7 +511,18 @@ end joined_entries
 // The statements a program is, with no runtime in front and no wrapper around them.
 //
 // Not `private`: `main.sysl` emits one of these per file of a suite.
-program_body(l: Loaded, testing: bool) -> Emitted
+program_body(l: Loaded, testing: bool) -> Emitted = program_body_of(l, testing, false)
+
+// The same program with every EFFECT left out -- what a worker runs before it serves its first
+// message, and what makes a class instance able to cross.
+//
+// **Wrapped by the caller and never joined to the ordinary body**, so the two copies share no scope:
+// each declares its own `$m0`, `$m1` and `$exports`, and only one of them ever runs.
+//
+// Not `private`: `main.sysl` needs one of these per file of a suite.
+program_decls(l: Loaded) -> Emitted = program_body_of(l, false, true)
+
+private program_body_of(l: Loaded, testing: bool, decls_only: bool) -> Emitted
     var out = str_builder()
     var rep = report()
     var srcs: Buf[usize] = buf()
@@ -435,9 +536,11 @@ program_body(l: Loaded, testing: bool) -> Emitted
     // into whatever this last set.
     out.push(s"    $$.files([${files_text(l)}]);\n")
 
+    val with_actors = program_declares_an_actor(l)
+
     for i in 0..<l.order.len()
         val which = l.order.at(i)
-        val body = emit_one(l.programs.at(which), l.sources.at(which), which, many, testing && i == l.order.len() - 1)
+        val body = emit_one(l.programs.at(which), l.sources.at(which), which, many, testing && i == l.order.len() - 1, decls_only, with_actors)
 
         rep.absorb(body.report)
 
@@ -449,7 +552,7 @@ program_body(l: Loaded, testing: bool) -> Emitted
             // makes an export the importer reads one the imported file has finished writing -- the
             // interpreter's `run_top_level` settling a module before the next one runs, said in
             // JavaScript. A file that waits for nothing is the plain function it always was.
-            val waits = l.programs.at(which).awaits
+            val waits = l.programs.at(which).awaits && !decls_only
 
             out.push(s"\n    const $$m${which} = ${if waits then "await (async () => {" else "(() => {"}\n")
             out.push(s"        $$.at(0, ${which});\n")
@@ -461,7 +564,7 @@ program_body(l: Loaded, testing: bool) -> Emitted
             out.push(indented(body.code))
 
     Emitted(out.finish(), rep, srcs)
-end program_body
+end program_body_of
 
 // The files, in the order a marker names them by.
 private files_text(l: Loaded) -> string

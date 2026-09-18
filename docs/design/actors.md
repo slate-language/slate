@@ -301,6 +301,9 @@ messages through exactly that arrangement. A mailbox is that shape: an unbounded
 
 ### The JavaScript back end
 
+**Built, and the same programs run on both back ends.** [`docs/library/actor.md`](../library/actor.md)'s
+*Under JavaScript* section is what a reader is told; what follows is why it is shaped as it is.
+
 **An actor is a worker and a message is `postMessage`.** A browser's `Worker` and node's
 `worker_threads` agree on the part that matters: one thread, one heap, structured clone between them.
 
@@ -317,6 +320,14 @@ messages through exactly that arrangement. A mailbox is that shape: an unbounded
   the sharp case — structured clone drops the prototype and hands over a plain object — so the runtime
   tags and rebuilds them itself rather than leaning on the host, which is what keeps the two back ends
   saying the same thing about a domain type in a message.
+- **So a message is ENCODED before it is cloned, and that is the decision the built version turns on.**
+  The copy rules above are slate's own on both back ends — the seen table that keeps shared structure
+  and cycles, the name a class instance is rebuilt against, and every refusal naming the field it
+  found — and what the host clones is the encoded form. A byte buffer is the one value handed to the
+  host as itself, `transfer` being the transfer list exactly.
+- **A worker has ONE port, to whoever started it, so worker-to-worker traffic relays through the main
+  thread.** Direct ports are a `MessageChannel` per pair and a handshake to set each one up; the relay
+  costs a hop and keeps every ordering guarantee, since what the design promises is per SENDER.
 
 ## What actors are not for
 

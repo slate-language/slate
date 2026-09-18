@@ -14,8 +14,9 @@ owns a piece of state and answers questions about it. An actor for a job that is
 thread, a heap and a copy per message in exchange for nothing; that is what [`async`](../reference/asynchrony.md)
 is for.
 
-**This module runs in the interpreter only.** The JavaScript back end refuses an `actor` declaration
-where it is written, and every name here refuses at the call.
+**It runs on both back ends.** Under the interpreter an actor is an OS thread with a whole slate
+runtime on it; under `slate js` it is a worker, and [*Under JavaScript*](#under-javascript) below is
+what differs.
 
 ```slate
 import { spawn, send, ask } from slate:actor
@@ -327,10 +328,51 @@ program has nothing left to say to an actor, so each is asked to stop — orderl
 `send` written on the last line still served — and then waited for. `detach(a)` opts one out of that
 wait, for a logger or a metrics sink.
 
+## Under JavaScript
+
+**An actor is a worker and a message is `postMessage`.** node's `worker_threads` and a browser's
+`Worker` agree on the part that matters — one thread, one heap, one message queue between them — so
+every program above runs under `slate js` and says the same thing.
+
+**The worker runs the same file.** `slate js` emits one bundle that plays both roles: started as a
+worker it runs the program's *declarations* — every definition, `class`, `data`, `type` and `import` —
+and then serves messages, and it runs not one line of what the program *does*. That is the same rule
+the interpreter follows, and it is what lets a class instance cross: the receiver looks the class up
+by the name it was declared under, and it is there because declaring it is all that ran.
+
+- **node** starts the worker from the file the bundle was read from. A bundle that was never a file —
+  one piped into `node -e`, say — cannot start one, and says so.
+- **a browser** starts it from the `<script>` the bundle came in: its `src` where it has one, and its
+  own text through a blob where it was written inline.
+
+**A message is encoded by slate and not by the host.** Structured clone drops a prototype, so a class
+instance would arrive as a plain object; it refuses a function with a sentence naming nothing a reader
+wrote; and it takes some things slate refuses. So the copy rules above are slate's own on both back
+ends — the same refusals, naming the same field, and shared structure and cycles kept — and what the
+host clones is the encoded form. `transfer(b)` is the one thing handed over as itself, riding
+`postMessage`'s transfer list.
+
+**Four differences, and each is a host limit rather than a gap:**
+
+- **`heap` does nothing in a browser.** Under node it is the worker's
+  `maxOldGenerationSizeMb`, which is the nearest thing a JavaScript host has to a per-actor heap; a
+  page offers no such knob at all, and the option is accepted and ignored there.
+- **A message from one actor to another goes by way of the main thread.** A worker has one port, to
+  whoever started it, so worker-to-worker traffic is relayed. Ordering is unaffected — one sender's
+  messages still arrive in the order they were written — and the cost is a hop.
+- **An actor spawned *by an actor* reports a worker that will not start as having died**, rather than
+  as a fault where `spawn` was written: `spawn` answers a handle on the spot, and the worker is built
+  a moment later on the main thread. Everything `spawn` can refuse about its *arguments* is still
+  refused where it was written, on both threads.
+- **A page has no end.** The program ends when its loop has drained and every actor it spawned has
+  stopped, which is what node's `beforeExit` means; a page's script has no such moment and each actor
+  there runs until it is stopped.
+
 ## Limits
 
 - **A heap ceiling per actor**, passed at spawn and 64 MiB where nobody says. An actor that outgrows it
-  faults; it does not take the process with it.
+  faults; it does not take the process with it. Under `slate js` this is node's own ceiling and a page
+  has none.
 - **A mailbox soft limit**, 65,536 where nobody says. Past it an `ask` rejects and a `send` faults in
   the sender — a refusal, never a wait, because a server that stalls its own loop waiting for a slow
   actor has stopped serving everybody else.

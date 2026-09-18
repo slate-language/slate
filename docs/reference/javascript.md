@@ -125,6 +125,25 @@ supervisor, the socket that crosses to a worker, the restart and the drain are t
 hosts. A page has no second process to start and no port to share, so the module is one of those a
 browser bundle never reaches for.
 
+**[`slate:actor`](../library/actor.md) is WHOLE here, on both JavaScript hosts**, and it was a refusal
+until the worker version was built. An actor is a worker — node's `worker_threads` and a browser's
+`Worker` — and the bundle `slate js` writes plays both roles: started as a worker it runs the
+program's *declarations* and then serves messages, which is the interpreter's own arrangement said in
+JavaScript and is what lets a class instance cross.
+
+**A message is ENCODED by slate and then cloned by the host, rather than handed to structured clone
+as it stands.** Structured clone drops a prototype, so a class instance would arrive as a plain
+object; it throws a `DataCloneError` for a function, which names nothing a reader wrote; and its
+unsendable set is not slate's in either direction. So the copy rules are slate's own on both back
+ends — the same kinds crossing, the same refusals naming the same field, shared structure and cycles
+kept — and `transfer(b)` is the one value handed over as itself, riding `postMessage`'s transfer list.
+
+**Four differences, each a host limit and each named in [`slate:actor`](../library/actor.md)'s *Under
+JavaScript* section**: `heap` is node's `maxOldGenerationSizeMb` and does nothing in a page; a message
+from one actor to another relays through the main thread, a worker having one port; an actor spawned
+*by an actor* whose worker will not start is reported as having died rather than at the `spawn`; and
+a page has no moment at which the program has ended, where node's `beforeExit` is exactly that moment.
+
 ### `slate:gzip` is whole here, and the container is read by slate rather than by the host
 
 **This is the module the parity rule was written for.** A browser has `CompressionStream` and

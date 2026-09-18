@@ -94,6 +94,16 @@ happening between them, a timer armed below an `await` being armed in the resump
 before it, and a `for await` walking its source once over both an asynchronous source and a
 generator.
 
+**`p38.sl` is about actors, and it is here rather than only in `tests/lang/` because a node worker is
+the bundle read back from the FILE it was written to.** `slate test --js` compiles a whole directory
+into one program and hands it to node; this path writes one program to a file and runs it, which is
+the path `new Worker(__filename)` actually takes. What it asserts is what a program can see about an
+actor on both back ends: state kept and answered about, a class instance and a data variant crossing
+as themselves, bytes copied and `transfer` emptying the sender's buffer, a cycle arriving as a cycle,
+an actor that faults rejecting both its `ask` and its `done` with the same sentence, and `stop`
+settling `done` with `null`. **Nothing in it prints a handle** — an actor's number is the
+interpreter's slot on one side and a worker's id on the other.
+
 **`dom/` is a run of its own and needs jsdom** — see `dom/README.md`.
 
 **`p8.sl` writes into `tests/js/scratch/` and takes it away again**, so that running it twice says
