@@ -123,20 +123,23 @@ padEnd number integer real boolean string`.
   them; `atan2(y, x)` keeps `Math.atan2`'s own argument order, `y` before `x`. `log` is the natural
   logarithm, `log2` and `log10` the other two bases, and `exp` is `log`'s inverse. `cbrt` is the real
   cube root, defined for a negative number where `sqrt` refuses one. `hypot(a, b)` is the length of
-  a right triangle's hypotenuse. **A domain error answers `nan` or `-inf`, not a fault** — `log(0)`
-  and `log(-1)` are exactly what JavaScript's `Math.log` answers, on both back ends.
+  a right triangle's hypotenuse. **A domain error answers `NaN` or `-Infinity`, not a fault** —
+  `log(0)` and `log(-1)` are exactly what JavaScript's `Math.log` answers, on both back ends.
 - **`PI` and `E`** are the two constants, not calls — `PI` rather than `PI()`.
+- **Where a result is not exactly representable the last bit is the machine's**, so `cbrt(27)` and
+  `log(E)` are compared within a tolerance rather than printed: one C library answers them exactly
+  and another a bit out, and `print` now shows every digit it is holding.
 
 ```slate
 print(sin(PI / 2), cos(0), atan2(1, 1) == PI / 4)
-print(log(E), exp(0), hypot(3, 4), cbrt(27))
+print(log10(1000), exp(0), hypot(3, 4), log2(8))
 print(log(0), log(-1))
 ```
 
 ```output
 1 1 true
-1 1 5 3
--inf nan
+3 1 5 3
+-Infinity NaN
 ```
 
 ```slate

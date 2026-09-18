@@ -104,6 +104,14 @@ an actor that faults rejecting both its `ask` and its `done` with the same sente
 settling `done` with `null`. **Nothing in it prints a handle** — an actor's number is the
 interpreter's slot on one side and a worker's id on the other.
 
+**`p39.sl` is about how a real is written, and the two halves of that share no code.** Under `slate
+js` the host's own `String(x)` is the answer; in the interpreter `real_text` searches `%g` from one
+significant figure to seventeen for the first that reads back, and then lays the digits out by
+JavaScript's rule rather than C's. So the file is heavy on exactly the values where a fixed number of
+figures and the shortest one part company — `0.1 + 0.2`, a seventeen-figure double, the ends of the
+plain band at `1e21` and `1e-7` — and it pins the whole-number cases beside them, those being the
+ones both rules already agreed about.
+
 **`dom/` is a run of its own and needs jsdom** — see `dom/README.md`.
 
 **`p8.sl` writes into `tests/js/scratch/` and takes it away again**, so that running it twice says

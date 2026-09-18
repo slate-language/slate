@@ -1,8 +1,10 @@
 module dev.slatelang.slate
 
 import sh.sysl.parsing.*
-import sysl.buf.{Buf, buf}
-import sysl.text.{str_builder, StrBuilder}
+import sysl.{FormatSpec, display_real}
+import sysl.buf.{Buf, buf, byte_sink}
+import sysl.math.Float
+import sysl.text.{from_utf8, parse_real, str_builder, StrBuilder}
 
 // How a value is WRITTEN -- what `print` puts on a line, what a diagnostic quotes, and what a
 // `toString` hook is allowed to change about either.
@@ -94,6 +96,165 @@ plain_name(s: string) -> bool
     // is text slate cannot read back -- which was the case this check was missing.
     word_kind(b) == Tok.Ident
 end plain_name
+
+// `x` at `digits` significant figures, which is C's `%g`: an exponent where the value is far from
+// one, a plain decimal where it is near it, and no trailing zeros either way.
+private g_text(x: real, digits: int) -> string
+    var sink = byte_sink()
+
+    display_real(x, &sink, FormatSpec(0, digits, false))
+    from_utf8(sink.text()).unwrap()
+end g_text
+
+// A `real` written the way JavaScript's `Number.prototype.toString` writes one -- what `print` puts
+// on a line, what `string` answers, and what a diagnostic quotes.
+//
+// **The digits are the SHORTEST decimal that reads back as the same double.** Six significant
+// figures -- `%g`'s default, and what this replaced -- writes `0.1 + 0.2` as `0.3`, so a program
+// cannot see the value it is holding and two reals that differ print identically. Where a choice
+// like this is arbitrary slate answers as JavaScript does, and JavaScript's answer is Steele and
+// White's: one to seventeen significant figures, stopped at the first that reads back equal.
+// Seventeen always does, so the search ends.
+//
+// **The reader is the one a program would use.** `parse_real` is where `number(text)` goes, so a
+// value written here and read back there is the same double by construction; a check against some
+// other conversion would say nothing about the round trip anybody actually makes.
+//
+// **The LAYOUT is JavaScript's rather than `%g`'s**, which is the other half of the job. `%g` moves
+// its exponent boundary with the precision and pads the exponent to two digits, while JavaScript
+// writes a number plainly for `1e-7 <= |x| < 1e21` and as `1e+21` or `1e-7` outside that band.
+// Reading the `%g` text back as `0.<digits> x 10^n` -- the significant digits with no point among
+// them, and `n` saying where the point belongs -- turns that rule into four cases on `n`.
+real_text(x: real) -> string
+    if x.is_nan() then return "NaN"
+
+    if x.is_infinite() then return if x > 0.0 then "Infinity" else "-Infinity"
+
+    // **A negative zero keeps its sign, which JavaScript does not give it.** `String(-0)` is `"0"`
+    // there, which hides the one thing a reader printing a zero is likely to be asking; slate has
+    // always shown the minus and goes on showing it. `1 / x` is what tells the two zeros apart.
+    if x == 0.0 then return if 1.0 / x < 0.0 then "-0" else "0"
+
+    var shortest = ""
+    var figures = 1
+
+    while figures <= 17
+        shortest = g_text(x, figures)
+
+        if parse_real(shortest).unwrap() == x then break
+
+        figures = figures + 1
+
+    val b = shortest.bytes
+    val negative = b[0] == u8('-')
+    var i: usize = 0
+
+    if negative then i = 1
+
+    // Where the mantissa stops. `%g` writes an exponent or it does not, and everything after this
+    // point reads the two forms the same way.
+    var mantissa_end = b.len
+    var j = i
+
+    while j < b.len
+        if b[j] == u8('e')
+            mantissa_end = j
+            break
+
+        j = j + 1
+
+    var exponent: long = 0
+
+    if mantissa_end < b.len
+        var e = mantissa_end + 1
+        val exponent_negative = b[e] == u8('-')
+
+        if b[e] == u8('-') || b[e] == u8('+') then e = e + 1
+
+        while e < b.len
+            exponent = exponent * 10 + long(b[e] - u8('0'))
+            e = e + 1
+
+        if exponent_negative then exponent = -exponent
+
+    // The significant digits, and the two counts that place the point among them: how many digits
+    // the `%g` text wrote before its own point, and how many leading zeros were dropped. Seventeen
+    // is the most a round trip can need and `%g` writes no more than it was asked for, so the run
+    // cannot reach this array's end.
+    var digits: [24]u8
+    var k: usize = 0
+    var whole: long = 0
+    var dropped: long = 0
+    var after_point = false
+
+    while i < mantissa_end
+        val c = b[i]
+
+        if c == u8('.')
+            after_point = true
+        else
+            if !after_point then whole = whole + 1
+
+            if k == 0 && c == u8('0')
+                dropped = dropped + 1
+            else
+                digits[k] = c
+                k = k + 1
+
+        i = i + 1
+
+    // `x` is `0.<digits> x 10^n`, which is the form ECMAScript's own rule is written over.
+    val n = whole - dropped + exponent
+    val count = long(k)
+    var out = str_builder()
+
+    if negative then out.push_char('-')
+
+    if n >= count && n <= 21
+        push_digits(&out, digits[0..<k])
+
+        var zeros = n - count
+
+        while zeros > 0
+            out.push_char('0')
+            zeros = zeros - 1
+    else if n > 0 && n <= 21
+        push_digits(&out, digits[0..<usize(n)])
+        out.push_char('.')
+        push_digits(&out, digits[usize(n)..<k])
+    else if n > -6 && n <= 0
+        out.push("0.")
+
+        var zeros = -n
+
+        while zeros > 0
+            out.push_char('0')
+            zeros = zeros - 1
+
+        push_digits(&out, digits[0..<k])
+    else
+        push_digits(&out, digits[0..<1])
+
+        if k > 1
+            out.push_char('.')
+            push_digits(&out, digits[1..<k])
+
+        out.push_char('e')
+
+        if n > 0
+            out.push_char('+')
+            out.push_int(n - 1)
+        else
+            out.push_char('-')
+            out.push_int(1 - n)
+
+    out.finish()
+end real_text
+
+private push_digits(out: *StrBuilder, digits: []const u8)
+    for i in 0..<digits.len
+        out.push_char(char(digits[i]))
+end push_digits
 
 // A value as a program would print it.
 //
@@ -329,7 +490,7 @@ private write_value(out: *StrBuilder, v: Value, quoted: bool, path: *Buf[*u8], h
         Undefined -> out.push("undefined")
         Bool(b) -> out.push_bool(b)
         Int(n) -> out.push_int(n)
-        Real(n) -> out.push_real(n)
+        Real(n) -> out.push(real_text(n))
         Str(p) ->
             if quoted then out.push(quoted_text(p.s)) else out.push(p.s)
         // **A set prints as the array of what is in it and a map as the array of its pairs**, which

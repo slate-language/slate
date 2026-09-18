@@ -135,6 +135,10 @@ print(7 / 2, 7.0 / 2, -7 / 2)
 **A real that is whole prints as an integer does.** `string(1.0)` is `"1"`. Only `%`, indexing, or a
 kind test can tell the two apart, so a function that must answer an integer is worth annotating.
 
+**Otherwise a real prints the shortest text that reads back as the same double**, exactly as
+JavaScript's own `String` does — so `0.1 + 0.2` prints `0.30000000000000004` rather than rounding to
+a tidy `0.3` a program is not actually holding, and `number(string(x))` is always `x` again.
+
 ## Strings
 
 **A slate string is a sequence of characters**, so every position, length and slice is counted the way

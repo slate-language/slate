@@ -65,18 +65,18 @@ number_OF_A_TEXT_DENOTING_NEGATIVE_ZERO_KEEPS_THE_SIGN_THE_WAY_JAVASCRIPT_DOES()
     // `1.0` divides rather than off `==`.
     assert(number("-0") is real)
     assert(number("0") is integer)
-    assertEq(string(1.0 / number("-0")), "-inf")
-    assertEq(string(1.0 / number("0")), "inf")
+    assertEq(string(1.0 / number("-0")), "-Infinity")
+    assertEq(string(1.0 / number("0")), "Infinity")
 
     // The neighbours: any run of zero digits after the sign, and a `+` that leaves zero positive
     // exactly as a bare `0` does.
-    assertEq(string(1.0 / number("-00")), "-inf")
-    assertEq(string(1.0 / number("-0.0")), "-inf")
-    assertEq(string(1.0 / number("+0")), "inf")
+    assertEq(string(1.0 / number("-00")), "-Infinity")
+    assertEq(string(1.0 / number("-0.0")), "-Infinity")
+    assertEq(string(1.0 / number("+0")), "Infinity")
 
     // Leading whitespace already went through `strtod`, which reads the sign correctly by itself --
     // this is not new here, only checked, since it shares `number`'s path with the fix above.
-    assertEq(string(1.0 / number(" -0")), "-inf")
+    assertEq(string(1.0 / number(" -0")), "-Infinity")
 
 @test
 rounding_and_magnitude() =
@@ -97,9 +97,51 @@ a_number_says_what_it_is_when_printed() =
     // A real whose value is whole prints as a whole number, so the rendering does not say which of
     // the two kinds it was -- `1.0 is real` is the question that does.
     assertEq(string(1.0), "1")
+    assertEq(string(2.0), "2")
+    assertEq(string(-2.0), "-2")
+    assertEq(string(100.0), "100")
 
-    // The shortest text that reads back as the same double, which is why this is not 0.30000000000000004.
-    assertEq(string(0.1 + 0.2), "0.3")
+@test
+a_real_prints_the_shortest_text_that_reads_back_as_the_same_double() =
+    // **`0.1 + 0.2` IS NOT `0.3`, AND THE TEXT SAYS SO.** Six significant figures said it was, which
+    // left a program unable to see the value it was holding and two different reals printing alike.
+    assertEq(string(0.1 + 0.2), "0.30000000000000004")
+    assertEq(string(1 / 3.0), "0.3333333333333333")
+    assertEq(string(123456789.123), "123456789.123")
+
+    // Seventeen figures where sixteen would name a different double, and one where the value's own
+    // expansion has hundreds.
+    assertEq(string(1.7976931348623157e308), "1.7976931348623157e+308")
+    assertEq(string(5e-324), "5e-324")
+
+@test
+the_plain_band_ends_at_1e21_and_1e_minus_7_as_it_does_in_javascript() =
+    assertEq(string(1e20), "100000000000000000000")
+    assertEq(string(1e21), "1e+21")
+    assertEq(string(1.5e21), "1.5e+21")
+    assertEq(string(1e-6), "0.000001")
+    assertEq(string(1e-7), "1e-7")
+
+    // No zero padding the exponent out to two digits, which is where C's `%g` and JavaScript part.
+    assertEq(string(1e100), "1e+100")
+
+@test
+not_a_number_and_the_infinities_are_spelled_as_javascript_spells_them() =
+    assertEq(string(0.0 / 0.0), "NaN")
+    assertEq(string(1.0 / 0.0), "Infinity")
+    assertEq(string(-1.0 / 0.0), "-Infinity")
+
+    // A negative zero keeps its sign, which is the one place this rule does not follow the host:
+    // `String(-0)` is `"0"` in JavaScript, hiding the thing a reader printing a zero is asking.
+    assertEq(string(0.0), "0")
+    assertEq(string(-0.0), "-0")
+
+@test
+the_text_a_real_prints_reads_back_as_the_same_real() =
+    // The property the whole rule exists for, and the one a fixed number of figures cannot have.
+    for x in [0.1 + 0.2, 1 / 3.0, 1e21, 1e-7, 1e20, 123456789.123, 1.7976931348623157e308, 5e-324,
+            2.0, -0.5, 0.000001]
+        assertEq(number(string(x)), x)
 
 @test
 a_draw_is_a_real_between_zero_and_one() =
@@ -162,7 +204,7 @@ toFixed_PAST_1e21_ANSWERS_WHAT_STRING_WOULD_RATHER_THAN_REFUSING() =
 @test
 toFixed_OF_NAN_AND_INFINITY_ANSWERS_THEIR_NAMES() =
     // Also never a fault in JavaScript: `NaN.toFixed(2)` is `"NaN"` and `Infinity.toFixed(2)` is
-    // `"Infinity"`, spelled out in full rather than in `string`'s own `nan`/`inf`.
+    // `"Infinity"`, which is what `string` spells them as well.
     assertEq(toFixed(0.0 / 0.0, 2), "NaN")
     assertEq(toFixed(1.0 / 0.0, 2), "Infinity")
     assertEq(toFixed(-1.0 / 0.0, 2), "-Infinity")
@@ -221,7 +263,7 @@ log_log2_log10_and_exp_are_the_inverses_of_each_other() =
 log_OF_A_NON_POSITIVE_NUMBER_ANSWERS_NAN_OR_MINUS_INFINITY_RATHER_THAN_FAULTING() =
     // Exactly what JavaScript's `Math.log` answers, on both back ends: a domain error here is not a
     // fault, unlike `sqrt`'s.
-    assertEq(string(log(0)), "-inf")
+    assertEq(string(log(0)), "-Infinity")
     assert(log(-1) != log(-1))
 
 @test
