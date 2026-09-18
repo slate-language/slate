@@ -305,6 +305,8 @@ private actor_serve(box: &sync ActorBox, lp: &libuv.Loop)
         current().loop_fault match
             Some(sig) ->
                 current().actor_fault = signal_message(sig)
+                current().actor_fault_file = signal_file(sig)
+                current().actor_fault_at = signal_span(sig)
                 current().loop_fault = None
                 stop_this_actor(box)
             None -> ()
@@ -346,6 +348,8 @@ end actor_is_finished
 // settle, and whoever is holding either may be any actor in the process.
 private announce_death(box: &sync ActorBox)
     val why = current().actor_fault
+    val fault_file = current().actor_fault_file
+    val fault_at = current().actor_fault_at
 
     box.lock.lock()
     box.running = false
@@ -353,8 +357,11 @@ private announce_death(box: &sync ActorBox)
     box.dead = true
 
     if why != ""
-        box.death = block_of_text(why)
-        box.death_len = why.bytes.len
+        var encoded: Buf[u8] = buf()
+
+        put_fault(&encoded, why, fault_file, fault_at)
+        box.death = block_of(encoded)
+        box.death_len = encoded.len()
 
     val id = box.id
     val gen = box.gen
@@ -365,7 +372,7 @@ private announce_death(box: &sync ActorBox)
 
     put_usize(&out, id)
     put_usize(&out, gen)
-    put_text(&out, why)
+    put_fault(&out, why, fault_file, fault_at)
 
     the_actors.lock.lock()
 
@@ -461,7 +468,7 @@ private take_death(note: &sync ActorNote)
 
     val id = w.count()
     val gen = w.count()
-    val why = w.text()
+    val (why, fault_file, fault_at) = read_fault(&w)
 
     val v = current()
 
@@ -483,7 +490,7 @@ private take_death(note: &sync ActorNote)
 
         if !wt.live || wt.target != id || wt.target_gen != gen then continue
 
-        finish_wait(wt, why)
+        finish_wait(wt, why, fault_file, fault_at)
 end take_death
 
 // An answer, or the fault a handler raised instead of one.
@@ -494,10 +501,11 @@ private take_answer(note: &sync ActorNote)
 
     if note.kind == NoteReject
         var w = wire_over(note.data, note.data_len)
+        val (message, file, at) = read_fault(&w)
 
         forget_wait(note.ticket)
         actor_waited_less()
-        fail_request(note.ticket, w.text(), point(0))
+        fail_request_elsewhere(note.ticket, message, file, at)
         return
 
     val mark = root_mark()
@@ -570,9 +578,15 @@ private take_call(box: &sync ActorBox, note: &sync ActorNote)
         Err(sig) ->
             // **An actor that faults dies**, exactly as an unhandled fault stops a program. The
             // pending `ask` is rejected with the fault and so is every other one, by the death
-            // broadcast that follows.
-            reject_call(note, signal_message(sig))
+            // broadcast that follows -- both carrying the handler's own file and line rather than
+            // this thread's.
+            val fault_file = signal_file(sig)
+            val fault_at = signal_span(sig)
+
+            reject_fault(note, signal_message(sig), fault_file, fault_at)
             v.actor_fault = signal_message(sig)
+            v.actor_fault_file = fault_file
+            v.actor_fault_at = fault_at
             stop_this_actor(box)
         Ok(answer) -> keep_answer(note, answer)
 end take_call
@@ -606,7 +620,14 @@ settle_actor_answers()
         v.actor_answers.set(i, a)
 
         if a.answer.failed
-            send_rejection(a.reply_id, a.reply_gen, a.ticket, a.ticket_gen, a.answer.message)
+            // **A promise a handler answered with carries its own place**, set by `settle_err` on
+            // this very thread -- `a.answer.src` indexes this thread's own sources, so its name is
+            // read here, before the fault crosses to whichever thread is holding the ticket.
+            val src = a.answer.src
+            val u = running_unit()
+            val fault_file = if src < u.sources.len() then u.sources.at(src).name else ""
+
+            send_rejection_at(a.reply_id, a.reply_gen, a.ticket, a.ticket_gen, a.answer.message, fault_file, a.answer.at)
         else
             send_reply(a.reply_id, a.reply_gen, a.ticket, a.ticket_gen, a.answer.value)
 end settle_actor_answers
@@ -616,6 +637,14 @@ private reject_call(note: &sync ActorNote, why: string)
 
     send_rejection(note.reply_id, note.reply_gen, note.ticket, note.ticket_gen, why)
 end reject_call
+
+// A rejection that names where it happened, for a fault raised in a handler's own body rather than
+// a refusal about the call's shape.
+private reject_fault(note: &sync ActorNote, message: string, file: string, at: Span)
+    if note.ticket_gen == 0 then return
+
+    send_rejection_at(note.reply_id, note.reply_gen, note.ticket, note.ticket_gen, message, file, at)
+end reject_fault
 
 send_reply(who: usize, gen: usize, ticket: usize, ticket_gen: usize, v: Value)
     encode_single(v, point(0)) match
@@ -631,10 +660,17 @@ send_reply(who: usize, gen: usize, ticket: usize, ticket_gen: usize, v: Value)
                 None -> ()
 end send_reply
 
+// **A refusal about the CALL's shape, not about anything the program wrote** -- an unknown
+// handler, a mailbox that would not take the note, a target that has already gone. None of those
+// has a line to point at, so this is `send_rejection_at` with no place.
 send_rejection(who: usize, gen: usize, ticket: usize, ticket_gen: usize, why: string)
+    send_rejection_at(who, gen, ticket, ticket_gen, why, "", point(0))
+end send_rejection
+
+send_rejection_at(who: usize, gen: usize, ticket: usize, ticket_gen: usize, message: string, file: string, at: Span)
     var out: Buf[u8] = buf()
 
-    put_text(&out, why)
+    put_fault(&out, message, file, at)
 
     actor_box_at(who, gen) match
         Some(b) ->
@@ -644,4 +680,4 @@ send_rejection(who: usize, gen: usize, ticket: usize, ticket_gen: usize, why: st
             note.ticket_gen = ticket_gen
             post_note(b, note, true)
         None -> ()
-end send_rejection
+end send_rejection_at
