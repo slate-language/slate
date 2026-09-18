@@ -166,6 +166,10 @@ _.length
 f()` all mean the wildcard they always did — the notation here is about `_` standing where a
 *value* goes.
 
+**`_` in a PARAMETER position is a discarded parameter, not a placeholder** — `_ -> 7` and `(_, x)
+-> x` are ordinary lambdas whose `_` parameter cannot be read back, the same idiom JavaScript
+writes as `_ => 7`; the placeholder rule above is only for a `_` where a value goes.
+
 ## Type parameters
 
 `[T]` after the name says the definition is generic over a type, and the answer is said in terms of

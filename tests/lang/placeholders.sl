@@ -95,3 +95,65 @@ a_placeholder_function_closes_over_what_is_around_it() =
     val by = 10
 
     assertEq(map([1, 2], _ * by), [10, 20])
+
+// -- `_` in a PARAMETER position is discarded, not a placeholder --------------------------------
+//
+// A `_` where a value goes stands for the parameter of a function nobody wrote; a `_` where a
+// PARAMETER's name goes is that function's own parameter, discarded -- the idiom every JS
+// programmer already writes as `_ => body`. Before this was fixed, `_ -> 7` read as a placeholder
+// standing for the whole lambda, wrapping it in a second one nobody meant: `(_ -> 7)(1)` answered
+// a function instead of `7`.
+
+@test
+a_bare_arrow_lambdas_discarded_parameter_works_when_called() =
+    val f = _ -> 7
+
+    assertEq(f(1), 7)
+    assertEq(f("anything"), 7)
+
+@test
+map_over_a_discarded_parameter_answers_the_body_for_every_element() =
+    assertEq(map([1, 2], _ -> 7), [7, 7])
+
+@test
+a_bracketed_parameter_list_may_discard_either_parameter() =
+    assertEq(((_, x) -> x)(1, 2), 2)
+    assertEq(((x, _) -> x)(1, 2), 1)
+
+@test
+two_discarded_parameters_in_one_list_are_both_allowed() =
+    // `match`'s own wildcard may repeat with no complaint -- `(_, _) -> 1` is the same rule read
+    // in binding position, and the two parameters do not collide with one another.
+    assertEq(((_, _) -> 1)(1, 2), 1)
+
+@test
+a_definitions_discarded_parameter_works_the_same_way() =
+    f(_, y) = y
+
+    assertEq(f(1, 2), 2)
+
+@test
+the_existing_placeholder_shapes_are_unchanged() =
+    // The fix above is about a `_` in a PARAMETER position; a `_` where a value goes is still a
+    // placeholder standing for the smallest thing around it.
+    assertEq(map([1, 2, 3], _ * 2), [2, 4, 6])
+    assertEq(filter([1, 2, 5], _ > 3), [5])
+
+    twice(n) = n * 2
+
+    assertEq(map([1, 2, 3], twice(_)), [2, 4, 6])
+
+@test
+a_discarded_parameter_does_not_reach_a_placeholder_written_in_the_body() =
+    // The discarded parameter is never in scope under a spellable name -- `_` written in the
+    // body is a fresh placeholder, exactly as it would be inside a `match` arm that named
+    // nothing, and not a way of reading the parameter back.
+    assertEq(map([1, 2], _ -> map([10, 20], _ + 1)), [[11, 21], [11, 21]])
+
+@test
+a_placeholder_in_a_match_arm_is_still_unaffected_by_this() =
+    val said = 7 match
+        0 -> "zero"
+        _ -> "something"
+
+    assertEq(said, "something")
