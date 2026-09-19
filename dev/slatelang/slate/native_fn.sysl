@@ -1,5 +1,6 @@
 module dev.slatelang.slate
 
+import sh.sysl.libuv
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map}
@@ -25,55 +26,124 @@ import sysl.container.{Map, map}
 // entry would silently be `print` -- which is the kind of aliasing that costs an afternoon. It
 // faults with a sentence instead.
 
-// What a `Value.Native` holds: a builtin's id, one past its slot in `natives`.
+// **THE REGISTRY IS READ BY EVERY THREAD AT ONCE, WHICH IS WHAT DECIDES ITS SHAPE.** An actor is a
+// second runtime on a second OS thread, and both dispatch builtins while the other is running -- so
+// the table a dispatch reads has to be one that neither reference counting nor a reallocation can
+// move under it. Reference counting in sysl is NOT atomic, so a value copied out of a shared table by
+// two threads at once has its count torn and is freed while the other thread is using it; a `Buf`
+// that grows replaces its storage, which is worse again. Both are avoided here rather than locked
+// against, a lock on the dispatch being a lock on every builtin call slate makes:
+//
+// - **the function table is a FIXED module array of `&sync Fn`.** A module array never moves, and
+//   `&sync` is sysl's atomically counted reference -- so reading a slot to call it is safe from any
+//   number of threads without a lock;
+// - **the name and id tables are ordinary counted `Buf`/`Map`s, read and written under
+//   `registry_lock`.** They are touched once per name per program load and never by a dispatch.
+
+// What a `Value.Native` holds: a builtin's id, one past its slot in the table.
 type NativeFn = u32
 
-// One builtin.
+// What a builtin runs, as the table holds it.
+//
+// **`&sync` and not `&Fn`, and that is the whole of the thread safety.** An ordinary `&Fn` is a
+// counted box whose count is bumped without an atomic, so one slot read by two VMs at once loses
+// counts and frees the box under the thread still calling it.
+type NativeGo = &sync Fn(Buf[Value], Span) -> Step
+
+// How many builtins the table has room for. Registration faults past it rather than growing, a table
+// that grows being one that can move while another thread is reading it.
+const MaxNatives: usize = 1024
+
+// process-wide: the function for every id, in registration order, and `None` for a slot no name has
+// been given yet. A fixed array so that the storage a dispatch reads never moves, and `&sync` so that
+// reading one costs an atomic rather than a lock.
+private var native_go: [MaxNatives]Option[NativeGo] = [None; MaxNatives]
+
+// process-wide: the name every id was registered under, for a diagnostic to read back. Written and
+// read under `registry_lock`.
 //
 // **The name is for a reader rather than for dispatch** -- a diagnostic, and the answer to "what did
 // this program actually install". `render.sysl` prints every builtin as `<function>`, and
 // `builtin_names()` reads the scope rather than this table, so nothing a slate program can see
 // depends on it.
-struct NativeEntry
-    name: string
-    go: &Fn(Buf[Value], Span) -> Step
+private var native_names: Buf[string] = buf()
 
-// Every builtin that has been registered, in registration order.
-//
-// Not `private`: `builtin.sysl` dispatches through it.
-//
-// process-wide: append-only, and `register` answers the first id for a name it already has -- so an
-// id, once handed out, never moves and two VMs in one process would agree on every one of them.
-var natives: Buf[NativeEntry] = buf()
-
-// process-wide: the index into `natives`, which is process-wide for the same reason.
+// process-wide: the id each name was given, which is the index into both tables above. Written and
+// read under `registry_lock`.
 private var native_ids: Map[string, NativeFn] = map()
+
+// process-wide: what the two counted tables above are read and written under. A dispatch never takes
+// it -- only registration, and the two lookups a test asks.
+private var registry_lock: &sync libuv.Mutex = libuv.mutex().expect("a lock for the builtin registry")
 
 // Put a builtin in the registry and answer its id.
 //
 // **Registering a name twice answers the FIRST id rather than making a second entry**, which is what
 // lets an `install_` function be called once per program the process runs -- `install_builtins` is,
-// and the suite runs thousands of programs in one process -- without the table growing without
-// bound or an id moving under a `var` that already holds it.
-register(name: string, go: &Fn(Buf[Value], Span) -> Step) -> NativeFn
-    native_ids.get(name) match
-        Some(id) -> id
+// and the suite runs thousands of programs in one process, one per VM -- without the table growing
+// without bound or an id moving under a `var` that already holds it.
+//
+// **The function is written into its slot BEFORE the name is published**, so a thread that can find
+// an id can call it: the id is only reachable through `native_ids`, and that is written last.
+register(name: string, go: NativeGo) -> NativeFn
+    registry_lock.lock()
+
+    val id = native_ids.get(name) match
+        Some(known) -> known
         None ->
-            natives.push(NativeEntry(name, go))
+            native_names.push(name)
 
-            val id = u32(natives.len())
+            val fresh = u32(native_names.len())
 
-            native_ids.put(name, id)
-            id
+            if usize(fresh) > MaxNatives
+                print("panic: slate registered more than", MaxNatives, "builtins")
+                exit(1)
+
+            native_go[usize(fresh) - 1] = Some(go)
+            native_ids.put(name, fresh)
+            fresh
+
+    registry_lock.unlock()
+    id
 end register
 
+// Run the builtin an id names.
+//
+// **One indirection and no match over builtins.** A builtin's id is its slot, so what used to be a
+// 371-line match over every arm of a closed enum is a bounds check and a call through the slot the
+// registry already holds.
+run_native(f: NativeFn, args: Buf[Value], at: Span) -> Step
+    if f == 0u32 || usize(f) > MaxNatives
+        return fault(at, "this builtin was never registered, which is a defect in slate itself")
+
+    native_go[usize(f) - 1] match
+        None -> fault(at, "this builtin was never registered, which is a defect in slate itself")
+        Some(go) -> go(args, at)
+end run_native
+
 // The name a builtin was registered under.
-native_name(f: NativeFn) -> string =
-    if f == 0u32 || usize(f) > natives.len() then "(unregistered)" else natives.at(usize(f) - 1).name
+native_name(f: NativeFn) -> string
+    registry_lock.lock()
+
+    val name = if f == 0u32 || usize(f) > native_names.len()
+        "(unregistered)"
+    else
+        native_names.at(usize(f) - 1)
+
+    registry_lock.unlock()
+    name
+end native_name
 
 // The builtin registered under this name, where there is one.
 //
 // **A name here is not a name a PROGRAM can write.** A native reachable only as a method is
 // registered under a qualified name -- `Map.get`, `Set.add`, `Regex.test` -- because the registry is
 // keyed by name and a set's `has` and an object's `has` are two different functions.
-native_of(name: string) -> Option[NativeFn] = native_ids.get(name)
+native_of(name: string) -> Option[NativeFn]
+    registry_lock.lock()
+
+    val id = native_ids.get(name)
+
+    registry_lock.unlock()
+    id
+end native_of
