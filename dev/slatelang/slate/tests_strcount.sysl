@@ -1,0 +1,229 @@
+module dev.slatelang.slate
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{entries, read_bytes}
+import sysl.slices.sort_by
+import sysl.text.{from_utf8_unchecked, Search, split, str_builder}
+
+// What a character position COSTS, which is the one thing a benchmark cannot say.
+//
+// **A slate position is a character and the storage is UTF-8**, so `s.length` and `s[i]` both used to
+// walk the string from the front every time they were asked -- which makes the ordinary
+// `while i < s.length ... s[i]` walk quadratic twice over. `StrObj` carries the character count now,
+// a string all of whose characters are one byte is indexed by arithmetic, and one that is not is
+// walked from where it was last read.
+//
+// **The instrument is a COUNT and not a clock.** `Vm.chars_scanned` is every byte the
+// character-position routines in `text.sysl` have walked over, and a test can assert a bound on it
+// where it can assert nothing at all about a wall time. What each test below pins is that the total
+// grows with the LENGTH of the string and not with its square: the old arrangement read about
+// 200,000,000 bytes to walk 20,000 characters and each of these bounds is a small multiple of the
+// string's own size.
+
+// The string every walk here is over, in characters. Big enough that a quadratic walk is four
+// hundred million bytes of scanning and a linear one is a rounding error.
+private const Walked: usize = 20000
+
+// What a program costs in bytes walked, which is the difference either side of the run.
+private scanning(text: string) -> usize
+    val before = bytes_scanned()
+
+    out(text)
+    bytes_scanned() - before
+end scanning
+
+@test
+WALKING_A_ONE_BYTE_STRING_BY_INDEX_READS_NO_TEXT_AT_ALL()
+    // **Every character is one byte, so a position IS a byte offset** and nothing is walked to find
+    // one. What is left is the counting of the pieces the program built, which is a handful of
+    // literals: the bound is the length of the string once, and the truth is very much less.
+    val cost = scanning(s"""
+        var text = ""
+        var k = 0
+
+        while k < ${Walked / 10}
+            text = text + "abcdexfghi"
+            k = k + 1
+
+        var found = 0
+        var i = 0
+
+        while i < text.length
+            if text[i] == "x" then found = found + 1
+
+            i = i + 1
+
+        print(found)
+    """)
+
+    assert(cost < Walked, s"walking ${Walked} one-byte characters read ${cost} bytes")
+
+@test
+ASKING_A_ONE_BYTE_STRING_ITS_LENGTH_READS_NOTHING()
+    // The loop CONDITION on its own, which is the half nobody would think to look at: it asked the
+    // string how long it was twenty thousand times, and the answer cost a walk of the string every
+    // time.
+    val cost = scanning(s"""
+        val text = repeat("a", ${Walked})
+        var i = 0
+
+        while i < text.length
+            i = i + 1
+
+        print(i)
+    """)
+
+    assert(cost < Walked, s"asking a ${Walked}-character string its length ${Walked} times read ${cost} bytes")
+
+@test
+WALKING_A_STRING_THAT_IS_NOT_ONE_BYTE_READS_IT_ABOUT_ONCE()
+    // **A three-byte character cannot be found by arithmetic**, so this is where the cursor earns
+    // its place: a left-to-right walk steps from where it last was, so the whole walk reads the
+    // string's bytes once rather than once per character. Four times the byte length is the bound,
+    // which leaves room for the counting at construction and is a hundredth of what the square
+    // would be.
+    val bytes = Walked * 3
+    val cost = scanning(s"""
+        val text = repeat("日", ${Walked})
+        var found = 0
+        var i = 0
+
+        while i < text.length
+            if text[i] == "本" then found = found + 1
+
+            i = i + 1
+
+        print(found)
+    """)
+
+    assert(cost < 4 * bytes, s"walking ${Walked} three-byte characters read ${cost} bytes, of ${bytes}")
+
+@test
+TAKING_A_STRING_APART_INTO_ITS_CHARACTERS_READS_IT_ONCE()
+    // `chars` asked twice per character which character a byte offset was, and each of those two
+    // questions walked the whole string -- so a text of any size was the square of its length before
+    // its first piece was made.
+    val cost = scanning(s"""
+        val text = repeat("ab", ${Walked / 2})
+
+        print(chars(text).length)
+    """)
+
+    assert(cost < 2 * Walked, s"taking ${Walked} characters apart read ${cost} bytes")
+
+@test
+A_STRING_BUILT_A_PIECE_AT_A_TIME_IS_NEVER_COUNTED_AGAIN()
+    // **Joining two strings adds their counts**, so the text a program assembles knows its length
+    // for nothing. Counting the answer instead would read the whole of it once per join, which over
+    // a loop is the square of the result.
+    val cost = scanning(s"""
+        var text = ""
+        var k = 0
+
+        while k < ${Walked / 10}
+            text = text + "abcdefghij"
+            k = k + 1
+
+        print(text.length)
+    """)
+
+    assert(cost < Walked, s"building ${Walked} characters a piece at a time read ${cost} bytes")
+
+@test
+A_LITERAL_IS_COUNTED_WHEN_IT_IS_COMPILED_AND_NOT_WHEN_IT_IS_PUSHED()
+    // The same literal, pushed a hundred thousand times. It is one entry in the unit's string table
+    // and the table carries its count, so the loop reads no text whatever.
+    val cost = scanning(s"""
+        var n = 0
+        var i = 0
+
+        while i < 100000
+            n = n + "日本語".length
+            i = i + 1
+
+        print(n)
+    """)
+
+    assert(cost < 1000, s"pushing one literal 100000 times read ${cost} bytes")
+
+@test
+TEXT_FROM_OUTSIDE_THE_MACHINE_IS_COUNTED_ONCE()
+    // **The one place a scan is owed**, and it is owed exactly once: nothing upstream of a decoded
+    // buffer counted anything, so the cell is made with a walk -- and every question asked of it
+    // afterwards is answered off the count that walk produced.
+    val cost = scanning(s"""
+        val text = fromBytes(toBytes(repeat("日", 1000)))
+        var i = 0
+        var found = 0
+
+        while i < text.length
+            if text[i] == "日" then found = found + 1
+
+            i = i + 1
+
+        print(found)
+    """)
+
+    // Three thousand bytes of text, read for the `toBytes`/`fromBytes` round trip and the walk, with
+    // room for the literal and the `repeat`.
+    assert(cost < 20000, s"one walk of 3000 bytes of text read ${cost} bytes")
+
+// -- every string cell is made with a count, and the census is what keeps it that way --------------
+
+// Where the runtime's source is, relative to the project root, which is where `sysl test .` runs.
+private const RuntimeDir: string = "dev/slatelang/slate"
+
+// The two ways to make a string cell, and the files each may be written in.
+//
+// **`new_str_counted` IS THE ONLY ALLOCATOR AND IT TAKES THE COUNT AS A PARAMETER**, so a site that
+// makes a string cannot fail to say how long it is -- the compiler asks. `new_str_scanned` is the
+// one way to say "nobody counted this", and it is a walk of the text, so it belongs to the boundary
+// where text arrives from outside the machine. Everywhere else the count is already in hand.
+//
+// A file that wants to construct a string reaches for `str_value` or `str_counted` in `value.sysl`,
+// which is what every site outside these two does.
+private const CountedIn: string = "obj.sysl value.sysl"
+
+@test
+EVERY_STRING_CELL_IS_MADE_WITH_A_CHARACTER_COUNT()
+    // **The two names are built rather than written**, so that this file's own census does not find
+    // itself: a line here saying what it is looking for is a line containing what it is looking for.
+    val forgetful_call = "new_str" + "("
+    val counted_call = "new_str" + "_counted("
+
+    var names = entries(RuntimeDir).unwrap()
+
+    sort_by(names.view(), (a, b) -> a < b)
+
+    var makes = str_builder()
+    var forgetful: usize = 0
+    var first = true
+
+    for i in 0..<names.len()
+        if !names.at(i).ends_with(".sysl") then continue
+
+        val text = from_utf8_unchecked(read_bytes(s"${RuntimeDir}/${names.at(i)}").unwrap())
+        val lines = split(text, "\n")
+        var allocates = false
+
+        for j in 0..<lines.len
+            val line = lines[j]
+
+            if line.starts_with("//") then continue
+
+            // **The constructor that took no count is gone and may not come back**, a string made
+            // without one being exactly what this whole arrangement is against.
+            if line.contains(forgetful_call) then forgetful += 1
+            if line.contains(counted_call) then allocates = true
+
+        if allocates
+            makes.push(if first then names.at(i) else s" ${names.at(i)}")
+            first = false
+
+    assert_eq(forgetful, 0, "calls to a string constructor that does not take a character count")
+
+    // **Who may allocate a string cell at all.** The count is a claim nothing checks, exactly as an
+    // array's `Buf` is, so the files that make one are the ones a reader has to trust -- and a third
+    // appearing here is a decision rather than an accident.
+    assert_eq(makes.finish(), CountedIn, "the files that make a string cell")
