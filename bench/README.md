@@ -477,6 +477,69 @@ asserts that ten thousand positional calls charge it **nothing** — and that a 
 a variadic callee and a builtin each charge it once per call, which is the negative control that makes
 the first claim worth anything.
 
+### A module's blocks are asked whether they declare anything — shortlist item 2, `de4e7c4`
+
+Taken 2026-09-19 on this machine, both locks held, under `caffeinate`, box at 89.8% idle before and
+97.7% after. **Both binaries were built in this session from the two ends of one merge**: `dev` is
+**`c31e658`** — which already carries items 1, 4 and 8 — and `item 2` is that same tree with this
+change and nothing else on it.
+
+**THE NEIGHBOUR IS NAMED RATHER THAN WAITED OUT.** A `mimic` conformance run held one slate process at
+about a quarter of one core throughout, on an eighteen-core box that stayed above 89% idle. It is in
+both columns equally and the ratios against Lua, taken in the same passes, are what carries the
+reading.
+
+**The instruction counts are the evidence and they are exact.** A count is an increment where a time
+is a measurement, and this item's whole claim is visible in one pair of rows:
+
+| `globals.sl`, 6,000,000 turns | dev `c31e658` | item 2 |
+|---|---|---|
+| instructions | 126,000,020 | **114,000,020** |
+| instructions per loop turn | 21 | **19** |
+| `PushScope` | 6,000,000 | **0** |
+| `PopScope` | 6,000,000 | **0** |
+| allocator steps | 5,998,602 | **0** |
+| collections | 4,285 → 4,288 | **0** |
+| collector | 46,643 us | **0 us** |
+
+**The twelve million instructions that went are exactly the six million pairs**, which is checkable
+rather than asserted: 126,000,020 − 114,000,020 = 12,000,000, and no other kind moved by a single
+execution. **A loop at the top of a file now allocates nothing**, so the benchmark that ran four
+thousand collections for a body declaring no name runs none.
+
+**`arith` is the control and did not move** — 190,000,026 both sides — its loop being inside a
+function, where the question was already asked. `loops` and `nested` each lose 2,000 instructions and
+609 allocator steps, which is their thousand-turn module-level **setup** loop and nothing they
+measure.
+
+| wall clock, best of 5 | dev `c31e658` | item 2 | change | dev/lua | item 2/lua |
+|---|---|---|---|---|---|
+| globals | 2215.7 | **1888.5** | **-14.8%** | 21.8x | **18.1x** |
+| loops | 930.1 | 943.4 | *+1.4%* | 8.0x | 8.0x |
+| nested | 1741.1 | 1756.9 | *+0.9%* | 13.4x | 13.7x |
+| strindex | 11.3 | 11.3 | — | 4.6x | 4.8x |
+| strwalk | 13.0 | 13.2 | — | 0.1x | 0.1x |
+
+Those five are the only benchmarks with a loop at module level at all, and **`globals` is the only one
+whose module-level loop does any work**; the other four put theirs in a function and keep a thousand
+turns of setup outside it, which is why the counts move and the clocks do not.
+
+**Over the whole set, best of 3, run ITEM FIRST so the order favours the baseline** — a box that
+quietens across twenty minutes buys the second pass a few percent, and here the second pass is `dev`:
+
+| | against lua | against node --jitless | against python3 |
+|---|---|---|---|
+| dev `c31e658` | 9.5x | 7.8x | 5.3x |
+| item 2 | **9.5x** | **7.7x** | **5.3x** |
+
+**THE GEOMETRIC MEANS DO NOT MOVE AND THAT IS THE HONEST READING OF THIS ITEM, not a disappointment.**
+The shortlist said *`globals` only*, and it was right: one benchmark of twenty-two going 21.8x to
+17.6x (its whole-set figures) moves a mean of twenty-two rows by about a tenth of one, which rounds
+away. **What the item buys is not on this page's mean at all** — it is that every top-level script,
+which is what most slate programs are until they grow a function, stops paying a heap object and a
+collection schedule for every turn of every loop. `bench/` measures twenty-one programs written to
+put their work in functions; the ordinary script is the case with no benchmark.
+
 ## The profiler
 
 **`SLATE_PROFILE=1 slate program.sl` writes a report to stderr**, leaving stdout exactly as it was,
@@ -608,6 +671,10 @@ item 3.
 
 ### 3. A module-level loop allocates a scope every turn, and a function-level one allocates nothing
 
+**FIXED — see *A module's blocks are asked whether they declare anything* above.** The finding is kept
+because it is what the fix was chosen from, and because the shape of it recurs: a shortcut that reads
+"this chunk cannot be asked the question" where the truth was "this chunk answers it differently".
+
 `globals.sl` and `arith.sl` are the same loop at two levels:
 
 | | instructions | `PushScope` | allocator steps | collections | collector |
@@ -691,13 +758,13 @@ functions that have no defaults at all.
 
 ## The ranked shortlist for 0.0.58 and after
 
-Every line points at a number above. **Nothing here has been implemented** -- this release is the
-instruments.
+Every line points at a number above. **Four have landed since** — 1, 2, 4 and 8, each struck through
+with what it measured; the ranking of what is left is unchanged.
 
 | # | change | reach | kind |
 |---|---|---|---|
 | 1 | ~~**Stop emitting `PushNull`/`Discard` for a statement whose value nothing reads**~~ — **DONE, `fa327b6`**: 20.6% of all instructions gone, `arith` -24.0%, geometric mean against Lua 17.6x -> **16.4x** | measured above | INCREMENTAL |
-| 2 | **Fix the module-level loop's per-turn scope** (finding 3) | `globals` only -- but it is 6M allocations and 4,285 collections for nothing, and every top-level script pays it | INCREMENTAL, and possibly a defect |
+| 2 | ~~**Fix the module-level loop's per-turn scope**~~ — **DONE, `de4e7c4`**: it WAS a defect. A module has no cells, and the `scoped_*` questions read `!e.cells` as "do not ask" rather than as "this chunk binds by name"; a module's blocks are asked `block_declares` now, guarded by the one binding form an expression can hide (`Emit.tests_bind`). `globals` 6,000,000 `PushScope`/`PopScope` pairs, 5,998,602 allocator steps and 4,288 collections all to **zero**, -14.8% wall, 21.8x -> **18.1x** Lua. **The three geometric means do not move** — one benchmark of twenty-two — and the win is in every top-level script instead | measured above | INCREMENTAL, and it was a defect |
 | 3 | **Make `Tick` cheaper or rarer** -- a counter tested every N statements, or folded into the back edge of a loop rather than emitted per statement | 7.1% of all instructions | INCREMENTAL |
 | 4 | ~~**Cache a string's character count on the `StrObj`, and index from a cached cursor**~~ — **DONE, `7478d4b`**: the count is CARRIED rather than cached, so `.length` is O(1) always; `strindex` 980x -> **5.5x** Lua (190x faster), the new `strwalk` 30.3x -> **0.1x** (322x faster), geometric mean against Lua over the original twenty **17.4x -> 13.4x** by this item alone | measured above | INCREMENTAL |
 | 5 | **Resolve a module-level definition's call target at compile time** so `add3(...)` is not a `LoadName` (finding 7) | 2.7% of all instructions, 2.9% of `funcs`, all of `globals`'s 14.8% `LoadName` | INCREMENTAL |
