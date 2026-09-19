@@ -11,7 +11,28 @@ import sysl.buf.{Buf, buf}
 // and `module_index`, each of which says so where it is declared.
 // -- statements -----------------------------------------------------------------------------------
 
-// A run of statements, leaving the last one's value.
+// What a statement is asked to leave behind, which is what tells a statement somebody reads from one
+// nobody does.
+//
+// **The two unread answers differ in what becomes of a dropped PROMISE, and nothing else.**
+// `Discard` marks one orphaned, so a rejection nobody waited for is still reported; `Pop` cuts the
+// stack back and says nothing. A loop body's last statement has always met a `Pop`, and a statement
+// standing in front of another has always met a `Discard`.
+//
+// Not `private`: reached from `compile.sysl` and `compile_expr.sysl`.
+enum StmtValue
+    Kept
+    Dropped
+    Cut
+
+// A run of statements, leaving the last one's value where somebody reads it.
+//
+// **NOTHING IS PUSHED FOR A STATEMENT WHOSE VALUE NOBODY READS.** slate is expression-oriented, so
+// every statement answers something -- but every statement except the last stands where that answer
+// is thrown away, and the last one does too where the run itself is unread. Such a statement is
+// compiled without producing a value at all, which takes with it the `PushNull` a binding used to
+// leave and the `Discard` that used to take it away. What is left for a bare expression, whose value
+// exists whatever is done with it, is the one instruction that drops it.
 //
 // **A FUNCTION DECLARATION IS HOISTED TO THE TOP OF THE RUN, AS JAVASCRIPT'S IS.** `val sink =
 // written` above `written(r) = …` is what a module with a default in it writes, and it answered
@@ -24,18 +45,35 @@ import sysl.buf.{Buf, buf}
 // that matters: a binding may read what is above it and not what is below, so nothing here makes a
 // program's data flow depend on where a function happens to sit.
 //
-// **The chunk is compiled ONCE**, here, and the statement that declared it leaves the null every
-// statement leaves. Compiling it again where it stands would double every complaint its body makes.
-compile_stmts(u: *Unit, e: *Emit, stmts: Buf[Stmt], at: Span)
-    push_n(e, PushNull, at, 0, 1)
+// **The chunk is compiled ONCE**, here. Compiling it again where it stands would double every
+// complaint its body makes.
+compile_stmts(u: *Unit, e: *Emit, stmts: Buf[Stmt], at: Span, wants: StmtValue)
+    if stmts.len() == 0
+        nothing_left(e, at, wants)
+        return
 
     hoist_defs(u, e, stmts)
 
+    val last = stmts.len() - 1
+
     for i in 0..<stmts.len()
-        push_n(e, Discard, stmts.at(i).span, 1, 0)
+        val leaves: StmtValue = if i == last then wants else Dropped
+
         push_n(e, Tick, stmts.at(i).span, 0, 0)
-        compile_stmt(u, e, stmts.at(i), true)
+        compile_stmt(u, e, stmts.at(i), true, leaves)
 end compile_stmts
+
+// A statement that computed nothing, which is most of them: the null it used to leave is pushed only
+// where somebody is going to read it.
+private nothing_left(e: *Emit, at: Span, wants: StmtValue)
+    if wants == Kept then push_n(e, PushNull, at, 0, 1)
+
+// A statement whose value is on the stack, dropped where nobody reads it.
+private drop_value(e: *Emit, at: Span, wants: StmtValue)
+    wants match
+        Kept -> ()
+        Dropped -> push_n(e, Discard, at, 1, 0)
+        Cut -> push_n(e, Pop, at, 1, 0)
 
 // Every definition in a run of statements, bound before the run begins.
 //
@@ -103,18 +141,18 @@ private check_answer(u: *Unit, e: *Emit, at: Span)
             push_n(e, CheckResult(intern_str(u, e.result_declared), intern_pattern(u, resolve_pattern(pat, 0))), at, 0, 0)
         None -> ()
 
-private compile_stmt(u: *Unit, e: *Emit, s: Stmt, hoisted: bool)
+private compile_stmt(u: *Unit, e: *Emit, s: Stmt, hoisted: bool, wants: StmtValue)
     val at = s.span
 
     *s.kind match
         Val(name, init) ->
             compile_expr(u, e, init)
             declare_name(u, e, name, at, false)
-            push_n(e, PushNull, at, 0, 1)
+            nothing_left(e, at, wants)
         Var(name, init) ->
             compile_expr(u, e, init)
             declare_name(u, e, name, at, true)
-            push_n(e, PushNull, at, 0, 1)
+            nothing_left(e, at, wants)
         Unpack(pat, init, immutable) ->
             compile_expr(u, e, init)
 
@@ -126,28 +164,29 @@ private compile_stmt(u: *Unit, e: *Emit, s: Stmt, hoisted: bool)
             // Interned through `resolve_pattern` like every other pattern, so a declared type
             // stands in a destructuring binding exactly as it stands in a `match` arm.
             bind_pattern(u, e, pat, at, !immutable)
-            push_n(e, PushNull, at, 0, 1)
-        // **`hoist_defs` has already bound it**, so what is left here is the null every statement
-        // leaves. A definition reached any other way still binds itself.
+            nothing_left(e, at, wants)
+        // **`hoist_defs` has already bound it**, so there is nothing left here to do. A definition
+        // reached any other way still binds itself.
         Def(name, params, defaults, body, is_async) ->
             if !hoisted
                 val c = compile_chunk(u, params, defaults, body_at(body), name, is_async, body_is_gen(body))
 
                 push_n(e, DefineFn(intern_str(u, name), c), at, 0, 0)
 
-            push_n(e, PushNull, at, 0, 1)
+            nothing_left(e, at, wants)
         // **Each is compiled where the group stands**, which is what makes it not a `Block`: the
-        // names land in the scope around them. Every statement leaves one value, so each is popped
-        // and one null stands for the group.
+        // names land in the scope around them. A group answers null rather than its last statement's
+        // value, so every one of them is unread.
         Group(stmts) ->
             for i in 0..<stmts.len()
-                compile_stmt(u, e, stmts.at(i), hoisted)
-                push_n(e, Discard, stmts.at(i).span, 1, 0)
+                compile_stmt(u, e, stmts.at(i), hoisted, Dropped)
 
-            push_n(e, PushNull, at, 0, 1)
-        Eval(x) -> compile_expr(u, e, x)
-        Assign(op, target, value) -> compile_assign(u, e, op, target, value, at)
-        MultiAssign(op, targets, values) -> compile_multi_assign(u, e, op, targets, values, at)
+            nothing_left(e, at, wants)
+        Eval(x) ->
+            compile_expr(u, e, x)
+            drop_value(e, at, wants)
+        Assign(op, target, value) -> compile_assign(u, e, op, target, value, at, wants)
+        MultiAssign(op, targets, values) -> compile_multi_assign(u, e, op, targets, values, at, wants)
         Return(value) ->
             // **The complaint points at what was RETURNED, not at the `return` keyword in front of
             // it** -- the same reason the fall-out path points at the tail expression rather than at
@@ -168,18 +207,18 @@ private compile_stmt(u: *Unit, e: *Emit, s: Stmt, hoisted: bool)
             check_answer(u, e, result_span)
             put(e, Ret, at)
 
-            // Nothing after a `return` runs, but the block it sits in still has to typecheck as
-            // leaving one value, so the counter is told what the machine would have had.
+            // Nothing after a `return` runs, but the block it sits in still has to count as leaving
+            // what it owes, so the counter is told what the machine would have had.
             e.sp = e.sp - 1
-            push_n(e, PushNull, at, 0, 1)
+            nothing_left(e, at, wants)
         Throw(x) ->
             compile_expr(u, e, x)
             put(e, Raise, at)
 
             // The same bookkeeping a `return` needs, and for the same reason: nothing after this
-            // runs, and the block still has to leave one value behind for the counter.
+            // runs, and the block still has to leave behind what the counter expects.
             e.sp = e.sp - 1
-            push_n(e, PushNull, at, 0, 1)
+            nothing_left(e, at, wants)
         // **A TYPE IS A VALUE UNDER ITS OWN NAME**, the way a class, a data type and a variant
         // already were -- a `type` name was the only one in the language that bound nothing, which
         // is why adding this breaks no program.
@@ -191,14 +230,14 @@ private compile_stmt(u: *Unit, e: *Emit, s: Stmt, hoisted: bool)
         TypeDecl(name, pat) ->
             push_n(e, PushShape(intern_resolved(u, pat), intern_str(u, name)), at, 0, 1)
             push_n(e, DeclareVal(intern_str(u, name)), at, 1, 0)
-            push_n(e, PushNull, at, 0, 1)
+            nothing_left(e, at, wants)
         // **An external is one instruction and a `val`**, which is `ImportAsset`'s shape: the path
         // is interned, and the interned index IS the value -- so two declarations of one path bind
         // one value and `==` is identity with nothing to keep.
         ExternalDecl(name, path) ->
             push_n(e, PushExternal(intern_str(u, path)), at, 0, 1)
             push_n(e, DeclareVal(intern_str(u, name)), at, 1, 0)
-            push_n(e, PushNull, at, 0, 1)
+            nothing_left(e, at, wants)
         CheckType(name, declared, pat) ->
             // **AN ANNOTATION THAT NAMES NOTHING WOULD CHECK NOTHING, SILENTLY.** A bare name in
             // pattern position is a binding where it names no type, and a binding matches anything --
@@ -217,7 +256,7 @@ private compile_stmt(u: *Unit, e: *Emit, s: Stmt, hoisted: bool)
                 Some(i) -> push_n(e, CheckSlot(e.slot_of.at(i), intern_str(u, name), intern_str(u, declared), pk), at, 0, 0)
                 None -> push_n(e, Op.CheckType(intern_str(u, name), intern_str(u, declared), pk), at, 0, 0)
 
-            push_n(e, PushNull, at, 0, 1)
+            nothing_left(e, at, wants)
 
         // **A precondition runs where it stands and a postcondition's declaration runs nowhere.**
         // The head clause is what tells the ways out what to check; the parser has already put a copy
@@ -238,9 +277,9 @@ private compile_stmt(u: *Unit, e: *Emit, s: Stmt, hoisted: bool)
             else
                 e.ensures.push(s)
 
-            push_n(e, PushNull, at, 0, 1)
-        Break(label, value) -> jump_out(u, e, at, true, label, value)
-        Continue(label) -> jump_out(u, e, at, false, label, None)
+            nothing_left(e, at, wants)
+        Break(label, value) -> jump_out(u, e, at, true, label, value, wants)
+        Continue(label) -> jump_out(u, e, at, false, label, None, wants)
 
         // **An import is three ordinary instructions per name and no new machinery.** The module is
         // already an object sitting in a slot, so taking a name out of it is the same `GetField` a
@@ -262,7 +301,7 @@ private compile_stmt(u: *Unit, e: *Emit, s: Stmt, hoisted: bool)
                         push_n(e, DeclareVal(intern_str(u, locals.at(i))), at, 1, 0)
                 None -> push_n(e, FailWith(intern_str(u, s"the module `${path}` was never loaded")), at, 0, 0)
 
-            push_n(e, PushNull, at, 0, 1)
+            nothing_left(e, at, wants)
         ImportAll(path, _, origin, alias) ->
             module_index(u, path, origin) match
                 Some(m) ->
@@ -270,7 +309,7 @@ private compile_stmt(u: *Unit, e: *Emit, s: Stmt, hoisted: bool)
                     push_n(e, DeclareVal(intern_str(u, alias)), at, 1, 0)
                 None -> push_n(e, FailWith(intern_str(u, s"the module `${path}` was never loaded")), at, 0, 0)
 
-            push_n(e, PushNull, at, 0, 1)
+            nothing_left(e, at, wants)
 
         // **An asset is a string literal and a `val`, which is the whole of it.** The loader read
         // the file before anything was compiled, so what reaches the machine is one `PushStr` into
@@ -279,14 +318,14 @@ private compile_stmt(u: *Unit, e: *Emit, s: Stmt, hoisted: bool)
         ImportAsset(path, _, name) ->
             push_n(e, PushStr(intern_str(u, asset_here(u, path))), at, 0, 1)
             push_n(e, DeclareVal(intern_str(u, name)), at, 1, 0)
-            push_n(e, PushNull, at, 0, 1)
+            nothing_left(e, at, wants)
 end compile_stmt
 // `x = e`, and `x += e` and the rest.
 //
 // **A compound form evaluates its place ONCE**, which is the whole reason it is not desugared into
 // `x = x + e`: `xs[next()] += 1` calls `next` a single time. The place's parts are computed, copied
 // with `DupAt` for the read, and the copies underneath are what the write consumes.
-private compile_assign(u: *Unit, e: *Emit, op: Tok, target: Expr, value: Expr, at: Span)
+private compile_assign(u: *Unit, e: *Emit, op: Tok, target: Expr, value: Expr, at: Span, wants: StmtValue)
     val plain = op == Assign
 
     *target.kind match
@@ -330,7 +369,7 @@ private compile_assign(u: *Unit, e: *Emit, op: Tok, target: Expr, value: Expr, a
             push_n(e, SetIndex, target.span, 3, 0)
         _ -> push_n(e, FailWith(intern_str(u, "this cannot be assigned to")), at, 0, 0)
 
-    push_n(e, PushNull, at, 0, 1)
+    nothing_left(e, at, wants)
 end compile_assign
 
 // `a, b = b, a`.
@@ -338,7 +377,7 @@ end compile_assign
 // **Every value is computed before any place is written**, which is what makes the swap a swap. They
 // stay on the stack while the writes happen, and each write reaches back down to the one it wants --
 // so nothing needs a temporary the program could name.
-private compile_multi_assign(u: *Unit, e: *Emit, op: Tok, targets: Buf[Expr], values: Buf[Expr], at: Span)
+private compile_multi_assign(u: *Unit, e: *Emit, op: Tok, targets: Buf[Expr], values: Buf[Expr], at: Span, wants: StmtValue)
     val n = values.len()
 
     for i in 0..<n
@@ -396,7 +435,7 @@ private compile_multi_assign(u: *Unit, e: *Emit, op: Tok, targets: Buf[Expr], va
     for i in 0..<n
         push_n(e, Pop, at, 1, 0)
 
-    push_n(e, PushNull, at, 0, 1)
+    nothing_left(e, at, wants)
 end compile_multi_assign
 
 // `break` and `continue`, which have to leave the loop as they found it.
@@ -404,7 +443,7 @@ end compile_multi_assign
 // **A `break` leaves its value where the loop's own would have gone**, which is why the value is
 // compiled AFTER the unwind: everything the loop had is dropped first, and what is pushed onto the
 // bare stack is what the loop answers.
-private jump_out(u: *Unit, e: *Emit, at: Span, breaking: bool, label: string, value: Option[Expr])
+private jump_out(u: *Unit, e: *Emit, at: Span, breaking: bool, label: string, value: Option[Expr], wants: StmtValue)
     val which = loop_named(e, label)
 
     if which == 0
@@ -416,7 +455,7 @@ private jump_out(u: *Unit, e: *Emit, at: Span, breaking: bool, label: string, va
             "`continue` outside a loop"
 
         push_n(e, FailWith(intern_str(u, word)), at, 0, 0)
-        push_n(e, PushNull, at, 0, 1)
+        nothing_left(e, at, wants)
         return
     end if
 
@@ -472,7 +511,7 @@ private jump_out(u: *Unit, e: *Emit, at: Span, breaking: bool, label: string, va
     e.sp = sp
     e.scopes = scopes
     e.handlers = handlers
-    push_n(e, PushNull, at, 0, 1)
+    nothing_left(e, at, wants)
 end jump_out
 
 private open_loop(e: *Emit, label: string)
@@ -726,11 +765,14 @@ private compile_body(u: *Unit, e: *Emit, body: Expr)
 end compile_body
 
 // The inside of a loop body, with its own scope already open.
+//
+// **A body written as a block answers nothing, so not one of its statements does either** -- which
+// is where most of the bookkeeping a loop used to run every turn came from: a null pushed for each
+// statement, a `Discard` to take each one away, and a `Pop` at the end for the last. A body that is
+// a bare expression still computes a value, and that one value is still cut back.
 private compile_stmt_body(u: *Unit, e: *Emit, body: Expr)
     *body.kind match
-        Block(stmts) ->
-            compile_stmts(u, e, stmts, body.span)
-            push_n(e, Pop, body.span, 1, 0)
+        Block(stmts) -> compile_stmts(u, e, stmts, body.span, Cut)
         _ ->
             compile_expr(u, e, body)
             push_n(e, Pop, body.span, 1, 0)

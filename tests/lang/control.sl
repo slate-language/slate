@@ -587,3 +587,127 @@ by_IS_A_SOFT_WORD_AND_STAYS_AN_ORDINARY_NAME() =
     double(by) = by * 2
 
     assertEq(double(5), 10)
+
+// Every statement here stands where its value goes unread, which is the one position the compiler
+// no longer produces a value for. What each of them ANSWERS where somebody does read it is the half
+// these pin, on both back ends.
+
+@test
+an_assignment_answers_null_where_a_block_ends_with_one() =
+    counted()
+        var x = 1
+
+        x = 2
+
+    swapped()
+        var a = 1
+        var b = 2
+
+        a, b = b, a
+
+    assertEq(counted(), null)
+    assertEq(swapped(), null)
+
+@test
+A_LOOP_AS_A_FUNCTIONS_LAST_STATEMENT_ANSWERS_WHAT_THE_LOOP_ANSWERS() =
+    // A loop is an expression, so the value of a function ending in one is the loop's -- null where
+    // it ran out, the `break`'s value where one was taken, and the `else`'s where there was one.
+    counted()
+        var i = 0
+
+        while i < 3
+            i = i + 1
+
+    searched(xs)
+        for x in xs
+            if x > 1 then break x
+        else
+            "none"
+
+    assertEq(counted(), null)
+    assertEq(searched([1, 2]), 2)
+    assertEq(searched([1]), "none")
+
+@test
+break_and_continue_and_return_stand_in_statement_position() =
+    var seen = []
+
+    for x in [1, 2, 3, 4]
+        if x == 2 then continue
+        if x == 4 then break
+
+        push(seen, x)
+
+    find(xs, want)
+        for x in xs
+            if x == want
+                return "found"
+
+        "missing"
+
+    assertEq(seen, [1, 3])
+    assertEq(find([1, 2], 2), "found")
+    assertEq(find([1, 2], 3), "missing")
+
+@test
+a_match_a_try_and_an_if_read_alike_as_statements_and_as_expressions() =
+    var side = ""
+
+    tell(n)
+        n match
+            0 -> side = "zero"
+            _ -> side = "other"
+
+        side
+
+    named(n) = n match
+        0 -> "zero"
+        _ -> "other"
+
+    handled()
+        var seen = ""
+
+        try
+            throw "boom"
+        catch e
+            seen = "caught"
+
+        seen
+
+    assertEq(tell(0), "zero")
+    assertEq(tell(5), "other")
+    assertEq(named(0), "zero")
+    assertEq(handled(), "caught")
+
+    val said = try
+        throw "boom"
+    catch e
+        "caught"
+
+    assertEq(said, "caught")
+
+@test
+a_generator_called_as_a_statement_still_runs_nothing() =
+    var steps = 0
+
+    counting()
+        steps = steps + 1
+
+        yield 1
+
+    counting()
+
+    assertEq(steps, 0)
+
+@test
+async an_async_call_whose_promise_nobody_reads_still_runs() =
+    var ran = false
+
+    async go()
+        ran = true
+
+    go()
+
+    await null
+
+    assertEq(ran, true)
