@@ -1,0 +1,223 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// **THE ORDER CHECK, used only by `slate js`.** The interpreter never needs one: running the
+// bytecode a module compiles to IS the check, and a name read before the statement that binds it
+// faults right there with the machine's own `` `name` is not defined `` (`run_frames.sysl`) --
+// `compile_module`'s own static pass, `check_program` in `check.sysl`, is deliberately permissive
+// about order, because a closure may legitimately name something a later statement in the same
+// block declares.
+//
+// **`slate js` runs nothing, so that permissiveness has no run behind it to catch the mistake.** A
+// name read out of order still compiles -- `val`/`var`/an import become a JavaScript `const`, and a
+// `const` read before its own line is a `ReferenceError` in its temporal dead zone -- so what
+// reached the reader was node's own wording, at node's own line, after `slate js` had already
+// written the file and exited 0. This walks the same order the machine would run in and raises the
+// identical complaint first, through the compiler's own channel (`complain_here`), so a program
+// that would have faulted never becomes somebody else's stack trace.
+//
+// **A definition hoists, matching `hoist_defs` in `compile_stmt.sysl` exactly** -- bound from the
+// top of the run it stands in, so a call to one written above it is untouched here, the same as it
+// is untouched at the machine. Everything else that binds a name -- `val`, `var`, an unpacked
+// binding, an import, a type, an external -- binds only where it stands, which is the order
+// `compile_stmts` gives the machine and the order this walks.
+//
+// **Only the flat run of top-level statements is modelled, not what a block, branch, loop or
+// `match` opens inside one.** Those run the machine's own way when `slate js`'s OUTPUT runs, and a
+// mistake inside one still reaches a reader as a `ReferenceError` rather than this diagnostic --
+// same gap the rest of this file exists to close, just not the shape asked for here. Modelling
+// them would mean re-deriving reachability (an `if false` that never runs its branch must not be
+// refused for a mistake inside it), which is a different and larger pass than a straight run of
+// statements needs.
+check_order(prog: Program)
+    var bound: Buf[string] = buf()
+
+    hoist_order_defs(prog.stmts, &bound)
+
+    for i in 0..<prog.stmts.len()
+        check_order_stmt(prog.stmts.at(i), &bound)
+end check_order
+
+// Every definition in a run of statements, bound before any of them is walked -- `hoist_defs`'
+// own rule, asked here of names rather than of chunks. **A `Group` is walked into**, for the same
+// reason `hoist_defs` does: a definition inside one is a definition of the block around it.
+private hoist_order_defs(stmts: Buf[Stmt], bound: *Buf[string])
+    for i in 0..<stmts.len()
+        *stmts.at(i).kind match
+            Def(name, _, _, _, _) -> bound.push(name)
+            Group(inner) -> hoist_order_defs(inner, bound)
+            _ -> ()
+end hoist_order_defs
+
+// One top-level statement: what it reads, checked against what has bound so far, and then what it
+// itself binds, added for the statements after it.
+private check_order_stmt(s: Stmt, bound: *Buf[string])
+    *s.kind match
+        Val(name, init) ->
+            check_order_expr(init, bound)
+            bound.push(name)
+        Var(name, init) ->
+            check_order_expr(init, bound)
+            bound.push(name)
+        Unpack(pat, init, _) ->
+            check_order_expr(init, bound)
+            pattern_binders(pat, bound)
+        Group(stmts) ->
+            for i in 0..<stmts.len()
+                check_order_stmt(stmts.at(i), bound)
+        Assign(_, target, value) ->
+            check_order_assign_target(target, bound)
+            check_order_expr(value, bound)
+        MultiAssign(_, targets, values) ->
+            for i in 0..<values.len()
+                check_order_expr(values.at(i), bound)
+
+            for i in 0..<targets.len()
+                check_order_assign_target(targets.at(i), bound)
+
+        // **Hoisted already**, by `hoist_order_defs` above -- a definition's own body is deferred
+        // and is not walked here, the same reasoning `check_order_expr`'s `Lambda` arm carries.
+        Def(_, _, _, _, _) -> ()
+        Eval(x) -> check_order_expr(x, bound)
+        Return(value) -> maybe_order_expr(value, bound)
+        Throw(value) -> check_order_expr(value, bound)
+        Break(_, value) -> maybe_order_expr(value, bound)
+        Continue(_) -> ()
+        ImportNames(_, _, _, _, locals) ->
+            for i in 0..<locals.len()
+                bound.push(locals.at(i))
+        ImportAll(_, _, _, alias) -> bound.push(alias)
+        ImportAsset(_, _, name) -> bound.push(name)
+        ExternalDecl(name, _) -> bound.push(name)
+        TypeDecl(name, _) -> bound.push(name)
+        CheckType(_, _, _) -> ()
+        Clause(_, _, _, _, cond) -> check_order_expr(cond, bound)
+end check_order_stmt
+
+// **A write is not a read.** An assignment's target is walked only for what it reads FROM to reach
+// the place written -- the object an `o.f = v` or an `xs[i] = v` steps through -- never the bare
+// name a plain `x = v` writes TO, which is not a use this pass is asked about.
+private check_order_assign_target(target: Expr, bound: *Buf[string])
+    *target.kind match
+        Field(obj, _, _) -> check_order_expr(obj, bound)
+        Index(t, key) ->
+            check_order_expr(t, bound)
+            check_order_expr(key, bound)
+        _ -> ()
+end check_order_assign_target
+
+// Every name an expression reads, checked as it is found, in the order the machine would read it.
+//
+// **Exhaustive over `ExprKind` on purpose, matching `free_names`' own reason in `slots.sysl`**: a
+// node added later that quietly falls into "reads nothing" is a mistake this pass would stop
+// catching without anybody noticing.
+//
+// **A lambda's body, and everything that opens a scope of its own, is left untouched** -- see the
+// header above `check_order` for why.
+private check_order_expr(x: Expr, bound: *Buf[string])
+    *x.kind match
+        Name(n) -> check_order_name(x.span, n, bound)
+
+        // **NOT A NAME READ.** `name` here is the string a `class` or `data` declaration interns
+        // for ITS OWN shape, carried as data rather than looked up -- it is part of the very
+        // initialiser that binds that name, so checking it against `bound` would refuse a class
+        // for mentioning itself. `v is Circle` resolves through the PATTERN, at match time, which
+        // is a different question this pass is not asked.
+        ShapeLit(_, _) -> ()
+        Spread(inner) -> check_order_expr(inner, bound)
+        Named(_, value) -> check_order_expr(value, bound)
+        Unary(_, rhs) -> check_order_expr(rhs, bound)
+        Binary(_, lhs, rhs) ->
+            check_order_expr(lhs, bound)
+            check_order_expr(rhs, bound)
+        Call(callee, args) ->
+            check_order_expr(callee, bound)
+            each_order_expr(args, bound)
+        Index(target, key) ->
+            check_order_expr(target, bound)
+            check_order_expr(key, bound)
+        Field(target, _, _) -> check_order_expr(target, bound)
+        ArrayLit(items) -> each_order_expr(items, bound)
+        ArrayRepeat(value, count) ->
+            check_order_expr(value, bound)
+            check_order_expr(count, bound)
+        Interp(pieces) -> each_order_expr(pieces, bound)
+        WithFields(base, _, values) ->
+            check_order_expr(base, bound)
+            each_order_expr(values, bound)
+        WithAll(base, other, _) ->
+            check_order_expr(base, bound)
+            check_order_expr(other, bound)
+        ObjectLit(_, _, values) -> each_order_expr(values, bound)
+        DataLit(inner) -> check_order_expr(inner, bound)
+        Compare(operands, _) -> each_order_expr(operands, bound)
+        Range(lo, hi, _, step) ->
+            maybe_order_expr(lo, bound)
+            maybe_order_expr(hi, bound)
+            maybe_order_expr(step, bound)
+        IsPattern(subject, _, _) -> check_order_expr(subject, bound)
+        IncDec(target, _, _) -> check_order_expr(target, bound)
+        Await(inner) -> check_order_expr(inner, bound)
+        Yield(inner) -> check_order_expr(inner, bound)
+        Ensures(value, _, _) -> check_order_expr(value, bound)
+
+        // **Deferred, or a scope of its own -- either way, not this walk's.** A lambda's body runs
+        // only when it is called, which is `hoist_defs`' own reasoning for a top-level definition
+        // carried one node further; a block, a branch, a loop and a `match` each open a scope that
+        // may re-order or shadow a name in ways a flat walk does not model, and are outside this
+        // pass by the header's own account.
+        Lambda(_, _, _, _) -> ()
+        Block(_) -> ()
+        IfExpr(_, _, _) -> ()
+        MatchExpr(_, _) -> ()
+        For(_, _, _, _, _, _) -> ()
+        While(_, _, _, _) -> ()
+        DoWhile(_, _, _, _) -> ()
+        Loop(_, _) -> ()
+        TryCatch(_, _, _) -> ()
+
+        IntLit(_) -> ()
+        RealLit(_) -> ()
+        StrLit(_) -> ()
+        BoolLit(_) -> ()
+        NullLit -> ()
+        UndefinedLit -> ()
+
+        // A node the parser put down where it could not read one; the file will not compile and
+        // there is nothing here to check.
+        Bad -> ()
+end check_order_expr
+
+private each_order_expr(xs: Buf[Expr], bound: *Buf[string])
+    for i in 0..<xs.len()
+        check_order_expr(xs.at(i), bound)
+end each_order_expr
+
+private maybe_order_expr(x: Option[Expr], bound: *Buf[string])
+    x match
+        Some(e) -> check_order_expr(e, bound)
+        None -> ()
+end maybe_order_expr
+
+// One name, read where it stands: bound already, a builtin, or the same complaint the machine
+// would raise reaching this line.
+//
+// **No "did you mean"**, unlike `check_expr.sysl`'s own version of this sentence -- this is
+// standing in for a RUN-TIME fault (`run_frames.sysl`'s `fault(at, s"\`${name}\` is not
+// defined")`), which carries none, and matching it is the point.
+private check_order_name(at: Span, name: string, bound: *Buf[string])
+    if order_bound(bound, name) then return
+    if current().builtin_scope == null then return
+    if knows(current().builtin_scope, name) then return
+
+    complain_here(at, s"`${name}` is not defined")
+end check_order_name
+
+private order_bound(bound: *Buf[string], name: string) -> bool
+    for i in 0..<bound.len()
+        if bound.at(i) == name then return true
+
+    false
+end order_bound
