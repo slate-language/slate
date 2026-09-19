@@ -1,0 +1,309 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.{BigInt, abs as big_abs, add as big_add, cmp as big_cmp, div as big_div,
+                         from_int as big_of, mul as big_mul, pow as big_pow, to_string as big_text}
+import sysl.text.{repeat, str_builder}
+
+// The two that write a number in scientific form -- `toExponential` and `toPrecision` -- and the
+// exact decimal arithmetic all three of the number writers stand on.
+//
+// **CUT OUT OF `number.sysl` BECAUSE THE ARITHMETIC IS THE SUBJECT.** `toFixed` had its own reading
+// of "a `real` is `m * 2^e`, so round it with whole numbers"; the two here ask that same arithmetic
+// a different question -- how many SIGNIFICANT digits rather than how many decimal places -- so the
+// exact fraction a `real` is, the rounding and the exact decimal exponent are written once here and
+// `number.sysl` asks them too. Four names cross.
+//
+// **THE DEFINITION IS ECMAScript's, READ LITERALLY, AND THERE IS NO FLOATING POINT BELOW THIS
+// LINE.** JavaScript rounds a tie AWAY from zero on the exact decimal value the double holds, where
+// C's `printf` rounds one to the even digit -- so a back end that handed this to `printf` would
+// disagree with the other about `(1.25).toExponential(1)`, and about every value that lands exactly
+// halfway. `sysl.math.bigint` does the arithmetic at whatever width the value needs.
+
+// The most digits either of these will write. **JavaScript's range for both**, and a range for the
+// same reason `toFixed`'s is: past this the digits are noise about a binary value.
+private const MostDigits: long = 100
+
+// -- the exact decimal machinery ---------------------------------------------------------------------
+
+// A positive `real` as the exact fraction `num / den`, both whole.
+//
+// **A `real` is `m * 2^e` for whole `m` and `e`**, found by doubling until it is a whole number --
+// every step exact, because doubling a binary float is. A subnormal takes the most turns of it and
+// still cannot overflow, `2^52` being far below the largest `real`.
+//
+// Not `private`: `number.sysl`'s `toFixed` rounds the same fraction to a number of places.
+// `a` must be greater than zero.
+real_fraction(a: real) -> (BigInt, BigInt)
+    var v = a
+    var e: long = 0
+
+    // Up into `[2^52, 2^53)`, where the value is a whole number and the doubling was exact.
+    while v < 4503599627370496.0
+        v = v * 2.0
+        e -= 1
+
+    while v >= 9007199254740992.0
+        v = v / 2.0
+        e += 1
+
+    val m = big_of(long(v))
+
+    if e >= 0
+        (big_mul(m, big_pow(big_of(2), usize(e))), big_of(1))
+    else
+        (m, big_pow(big_of(2), usize(-e)))
+end real_fraction
+
+// The digits of `round(num / den * 10^shift)`, a tie going away from zero, as text with no point in
+// it. **`floor((2n + d) / 2d)` is the whole number nearest `n / d` with a tie going up**, which for
+// a value that is not negative is the rule ECMAScript states -- so the tie is settled by integers
+// rather than by a rounding mode somebody chose.
+//
+// Not `private`: `number.sysl`'s `toFixed` is this asked for a number of decimal places.
+rounded_digits(num: BigInt, den: BigInt, shift: long) -> string
+    var n = num
+    var d = den
+
+    if shift >= 0 then n = big_mul(n, big_pow(big_of(10), usize(shift)))
+    else d = big_mul(d, big_pow(big_of(10), usize(-shift)))
+
+    big_text(big_div(big_add(big_mul(n, big_of(2)), d), big_mul(d, big_of(2))))
+end rounded_digits
+
+// Whether `num / den` is at least `10^e`, asked without dividing.
+private at_least(num: BigInt, den: BigInt, e: long) -> bool
+    if e >= 0
+        big_cmp(num, big_mul(den, big_pow(big_of(10), usize(e)))) >= 0
+    else
+        big_cmp(big_mul(num, big_pow(big_of(10), usize(-e))), den) >= 0
+
+// `floor(log10(num / den))` for a positive value, exactly.
+//
+// **The digit counts give it to within one and a comparison settles which**, so nothing here reads
+// a logarithm: a number of `a` digits over one of `b` digits lies in `[10^(a-b-1), 10^(a-b+1))`, so
+// `a - b` is either the answer or one above it and each loop turns at most twice.
+private decimal_exponent(num: BigInt, den: BigInt) -> long
+    var e = long(char_count(big_text(num))) - long(char_count(big_text(den)))
+
+    while !at_least(num, den, e)
+        e = e - 1
+
+    while at_least(num, den, e + 1)
+        e = e + 1
+
+    e
+end decimal_exponent
+
+// `sig` significant digits of the positive value `num / den`, correctly rounded, and the power of
+// ten the first of them stands on -- so the value is `d1.d2... x 10^exponent`.
+//
+// **Rounding up can carry past the last place, which is the one case the exponent moves**: `9.99`
+// to two digits is `10` at `10^1` and not `9.9...` at `10^0`. The carry always lands on exactly
+// `10^sig`, whose last digit is a zero, so cutting that digit off is exact rather than a second
+// rounding.
+private significant_digits(num: BigInt, den: BigInt, sig: usize) -> (string, long)
+    val e = decimal_exponent(num, den)
+    val text = rounded_digits(num, den, long(sig) - 1 - e)
+
+    if char_count(text) > sig then (char_slice(text, 0, sig), e + 1) else (text, e)
+end significant_digits
+
+// -- how the digits are laid out ---------------------------------------------------------------------
+
+// `d1.d2...e+n` -- JavaScript's exponential layout: one digit, a point only where there is something
+// to put after it, and an exponent that always carries its sign.
+private exponential_layout(negative: bool, digits: string, exponent: long) -> string
+    val k = char_count(digits)
+    var b = str_builder()
+
+    if negative then b.push_char('-')
+
+    b.push(char_slice(digits, 0, 1))
+
+    if k > 1
+        b.push_char('.')
+        b.push(char_slice(digits, 1, k))
+
+    b.push_char('e')
+
+    if exponent < 0
+        b.push_char('-')
+        b.push_int(-exponent)
+    else
+        b.push_char('+')
+        b.push_int(exponent)
+
+    b.finish()
+end exponential_layout
+
+// The choice ECMAScript's `toPrecision` makes between the plain form and the exponential one: plain
+// while the exponent sits in `-6 <= e < p`, exponential outside it.
+//
+// **That band is NARROWER than `string`'s**, which is why `(123456).toPrecision(2)` is `1.2e+5`
+// where `string(123456)` is `123456`: the count of significant digits asked for is what decides,
+// rather than the magnitude alone.
+private precision_layout(negative: bool, digits: string, e: long, p: long) -> string
+    if e < -6 || e >= p then return exponential_layout(negative, digits, e)
+
+    var b = str_builder()
+
+    if negative then b.push_char('-')
+
+    if e == p - 1
+        b.push(digits)
+    else if e >= 0
+        b.push(char_slice(digits, 0, usize(e) + 1))
+        b.push_char('.')
+        b.push(char_slice(digits, usize(e) + 1, char_count(digits)))
+    else
+        b.push("0.")
+        b.push(repeat("0", usize(-e - 1)))
+        b.push(digits)
+
+    b.finish()
+end precision_layout
+
+// A run of digit bytes as text.
+private digits_text(d: []const u8) -> string
+    var b = str_builder()
+
+    for i in 0..<d.len
+        b.push_char(char(d[i]))
+
+    b.finish()
+
+// `d` with its trailing zeros taken off, which is what "as many digits as it takes" means for a
+// whole number: `100` names its value with one digit standing on `10^2`.
+private without_trailing_zeros(d: string) -> string
+    var cut = char_count(d)
+
+    while cut > 1 && char_slice(d, cut - 1, cut) == "0"
+        cut = cut - 1
+
+    char_slice(d, 0, cut)
+
+// -- what a program calls ----------------------------------------------------------------------------
+
+// How many digits a call asked for, or `-1` where it named none. **One sentence serves both
+// builtins**, naming the method and its own range, which is what a reader who believes it can act
+// on -- JavaScript throws a `RangeError` here, and this is the one thing either of these refuses.
+private digits_asked(args: Buf[Value], at: Span, name: string, low: long, what: string) -> Result[long, Signal]
+    if args.len() < 2 then return Ok(-1)
+
+    args.at(1) match
+        Int(n) ->
+            if n < low || n > MostDigits
+                return Err(failure(at, s"`${name}` writes from ${low} to ${MostDigits} ${what}, and was asked for ${n}"))
+
+            Ok(n)
+        other -> Err(failure(at, s"`${name}` takes a whole number of ${what}, and this is ${other.type_name()}"))
+end digits_asked
+
+// `toExponential(x)` and `toExponential(x, digits)` -- the number in scientific notation, as text.
+//
+// **WITH NO DIGIT COUNT IT WRITES THE SHORTEST DIGITS THAT NAME THE VALUE**, which is the very
+// digit generation `string(x)` uses: `real_shortest` in `render.sysl` takes `%g`'s shortest
+// round-trip text apart, and this lays those digits out its own way. Two answers about which digits
+// a value has could not then disagree, which is the whole reason it is reused rather than written
+// again. A whole number's trailing zeros are not digits it needs, so `(100).toExponential()` is
+// `1e+2`.
+//
+// **WITH A COUNT IT WRITES EXACTLY THAT MANY AFTER THE POINT, CORRECTLY ROUNDED** -- a tie away
+// from zero on the exact decimal value, which is `significant_digits` above.
+//
+// **A negative zero loses its sign here and JavaScript's own does too**: `(-0).toExponential()` is
+// `0e+0`. The sign is taken off before anything is written and negative zero is not less than zero,
+// which is the specification's own order. `string(-0)` is still `-0` in slate and is untouched.
+//
+// **An integer is written out rather than measured**, which is `toFixed`'s rule: the digits come
+// off the integer itself, so a value past `2^53` keeps every one of them.
+do_to_exponential(args: Buf[Value], at: Span) -> Step
+    wants(args, 1, at, "toExponential", "a number and how many digits")?
+
+    val wanted = digits_asked(args, at, "toExponential", 0, "digits")?
+
+    args.at(0) match
+        Int(n) ->
+            if n == 0 then return Ok(str_value(exponential_layout(false, zero_run(wanted + 1), 0)))
+
+            val whole = big_abs(big_of(n))
+
+            if wanted < 0
+                Ok(str_value(exponential_layout(n < 0, without_trailing_zeros(big_text(whole)),
+                                                long(char_count(big_text(whole))) - 1)))
+            else
+                val (digits, e) = significant_digits(whole, big_of(1), usize(wanted) + 1)
+
+                Ok(str_value(exponential_layout(n < 0, digits, e)))
+        Real(x) ->
+            // JavaScript's own never faults on the number itself, exactly as `toFixed` does not.
+            if x != x then return Ok(str_value("NaN"))
+            if x.is_infinite() then return Ok(str_value(if x > 0.0 then "Infinity" else "-Infinity"))
+            if x == 0.0 then return Ok(str_value(exponential_layout(false, zero_run(wanted + 1), 0)))
+
+            val negative = x < 0.0
+            val a = if negative then -x else x
+
+            if wanted < 0
+                val found = real_shortest(a)
+                val d = found.digits
+
+                Ok(str_value(exponential_layout(negative,
+                                                without_trailing_zeros(digits_text(d[0..<found.count])),
+                                                found.point - 1)))
+            else
+                val (num, den) = real_fraction(a)
+                val (digits, e) = significant_digits(num, den, usize(wanted) + 1)
+
+                Ok(str_value(exponential_layout(negative, digits, e)))
+        other -> fault(at, s"`toExponential` takes a number, and this is ${other.type_name()}")
+end do_to_exponential
+
+// A run of `n` zeros, with one for a count of nothing -- zero's own digits, which no arithmetic
+// finds.
+private zero_run(n: long) -> string = if n < 1 then "0" else repeat("0", usize(n))
+
+// `toPrecision(x)` and `toPrecision(x, digits)` -- the number to that many significant digits.
+//
+// **WITH NO COUNT IT IS `string(x)`**, which is ECMAScript's own rule: the shortest text that reads
+// back, laid out the way `print` lays it out. So `(-0).toPrecision()` is `-0` here where
+// JavaScript's is `0`, slate's `string` having always shown that sign; both back ends agree, which
+// is the property that matters.
+//
+// **WITH A COUNT, THE LAYOUT IS CHOSEN BY THE EXPONENT AND NOT BY THE MAGNITUDE** -- see
+// `precision_layout`. The rounding is `toExponential`'s, asked for `p` digits rather than `f + 1`.
+do_to_precision(args: Buf[Value], at: Span) -> Step
+    wants(args, 1, at, "toPrecision", "a number and how many significant digits")?
+
+    val wanted = digits_asked(args, at, "toPrecision", 1, "significant digits")?
+
+    args.at(0) match
+        Int(n) ->
+            if wanted < 0
+                var b = str_builder()
+
+                b.push_int(n)
+
+                return Ok(str_value(b.finish()))
+
+            if n == 0 then return Ok(str_value(precision_layout(false, zero_run(wanted), 0, wanted)))
+
+            val (digits, e) = significant_digits(big_abs(big_of(n)), big_of(1), usize(wanted))
+
+            Ok(str_value(precision_layout(n < 0, digits, e, wanted)))
+        Real(x) ->
+            if x != x then return Ok(str_value("NaN"))
+            if x.is_infinite() then return Ok(str_value(if x > 0.0 then "Infinity" else "-Infinity"))
+            if wanted < 0 then return Ok(str_value(real_text(x)))
+            if x == 0.0 then return Ok(str_value(precision_layout(false, zero_run(wanted), 0, wanted)))
+
+            val negative = x < 0.0
+            val a = if negative then -x else x
+            val (num, den) = real_fraction(a)
+            val (digits, e) = significant_digits(num, den, usize(wanted))
+
+            Ok(str_value(precision_layout(negative, digits, e, wanted)))
+        other -> fault(at, s"`toPrecision` takes a number, and this is ${other.type_name()}")
+end do_to_precision

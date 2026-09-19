@@ -96,7 +96,8 @@ padEnd number integer real boolean string`.
 
 ## Numbers
 
-`abs  floor  ceil  round  trunc  sqrt  pow  min  max  random  toFixed  formatNumber`
+`abs  floor  ceil  round  trunc  sqrt  pow  min  max  random`
+`toFixed  toExponential  toPrecision  formatNumber`
 `sin  cos  tan  asin  acos  atan  atan2  sinh  cosh  tanh  log  log2  log10  exp  cbrt  hypot`
 `PI  E`
 
@@ -114,6 +115,20 @@ padEnd number integer real boolean string`.
   C's `printf` does. **It never faults on the number itself** — past `1e21` it gives up on decimal
   places and answers what `string` would in exponential form, `NaN` answers `"NaN"`, and an
   infinity answers `"Infinity"`/`"-Infinity"`. Only the place count, outside `0..100`, is refused.
+- **`toExponential(x)` and `toExponential(x, digits)` write a number in scientific notation.** With
+  no count it uses as many digits as the value needs to name itself — the same digits `string`
+  would show — so `toExponential(0.1)` is `1e-1`. With one it writes exactly that many after the
+  point, correctly rounded, and the count runs from 0 to 100. A negative zero loses its sign here,
+  which is JavaScript's answer too.
+- **`toPrecision(x)` and `toPrecision(x, digits)` count SIGNIFICANT digits rather than decimal
+  places**, and the count runs from 1 to 100. With none it is `string(x)`. **The layout is chosen
+  by the exponent and not by the magnitude**: plain while the exponent sits in `-6 <= e < digits`
+  and exponential outside it, so `toPrecision(123456, 2)` is `1.2e+5` where `string(123456)` is
+  `123456`.
+- **All three round a tie AWAY from zero on the exact value the number holds**, which is
+  JavaScript's rule and not C's `printf`'s, and neither of these faults on the number either —
+  `NaN`, an infinity and a whole number past `2^53` all answer rather than refuse. Only the digit
+  count, outside its range, is refused.
 - **`formatNumber` groups the digits in threes**, taking a whole number or the text `toFixed`
   answered — never a `real`, which has no one written form of its own. `formatNumber(toFixed(total,
   2))` is a price. The defaults are a comma and a full stop; `{ separator: " ", decimal: "," }` is
@@ -156,6 +171,20 @@ print(toFixed(1e21, 2), toFixed(1.0 / 0.0, 2), toFixed(0.0 / 0.0, 2))
 1e+21 Infinity NaN
 ```
 
+```slate
+print(toExponential(0.1), toExponential(123456), toExponential(1.5e21))
+print(toExponential(255, 2), toExponential(9.99, 1))
+print(toPrecision(123.456, 4), toPrecision(0.000123, 2), toPrecision(123456, 2))
+print(toPrecision(1e21, 3), toPrecision(1.5))
+```
+
+```output
+1e-1 1.23456e+5 1.5e+21
+2.55e+2 1.0e+1
+123.5 0.00012 1.2e+5
+1.00e+21 1.5
+```
+
 A draw cannot be printed and checked — what it *is* can:
 
 ```slate
@@ -169,7 +198,8 @@ true true
 ```
 
 As methods, a number answers: `abs floor ceil round trunc sqrt sin cos tan asin acos atan sinh cosh
-tanh log log2 log10 exp cbrt integer real boolean string toFixed formatNumber`. `atan2`, `hypot`,
+tanh log log2 log10 exp cbrt integer real boolean string toFixed toExponential toPrecision
+formatNumber`. `atan2`, `hypot`,
 `pow`, `min` and `max` take a second number and stay bare calls, the way `pow` already does.
 
 ## Arrays
