@@ -3,19 +3,15 @@
 // speeds it up as much as the others is suspicious.
 //
 // The loop is inside a function for the reason `arith.sl` says.
-import { now } from slate:time
 
 run()
     var out = ""
     var i = 0
 
-    while i < 80000
+    while i < 150000
         out = out + "x" + string(i % 10)
         i = i + 1
 
     out.length
 
-val started = now()
-
 print(run())
-print((now() - started).millis())

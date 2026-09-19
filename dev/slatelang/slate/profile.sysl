@@ -1,0 +1,369 @@
+module dev.slatelang.slate
+
+import sh.sysl.gc
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+import sysl.env
+import sysl.posix.time.monotonic
+import sysl.slices.sort_by
+import sysl.text.str_builder
+
+// Where a run's time went: how many of each instruction the machine ran, what each builtin cost, and
+// what the collector did.
+//
+// **IT IS OFF UNLESS IT IS ASKED FOR, AND WHAT IT COSTS WHEN OFF IS ONE BOOLEAN PER INSTRUCTION.**
+// The instruction loop is the hottest code in the project, so the whole instrument sits behind
+// `profile_on`: `run_frames` reads that flag and calls nothing, `call_native` reads it and takes no
+// clock reading, and `collect_now` reads it and does the same. Nothing is allocated, no table is
+// touched and no counter moves. The benchmarks in `bench/` are what say that is true rather than
+// likely, and `bench/README.md` carries the before-and-after.
+//
+// **THE INTERFACE IS AN ENVIRONMENT VARIABLE AND NOT A FLAG, AND THAT IS FORCED.** `main.sysl` says
+// it in as many words: everything after a program's name on the command line belongs to the program,
+// so `slate` has no flag it could add that a script had not already taken. `SLATE_PROFILE=1` is read
+// where the program is started and the report goes to STDERR, which leaves what the program printed
+// on stdout exactly as it was -- so a profiled run can still be checked against its own expected
+// output.
+//
+// **WHAT IS COUNTED IS EXACT AND WHAT IS TIMED IS NOT.** Counting is an increment and cannot drift;
+// timing is two readings of a microsecond clock either side of a call, so a builtin that takes a
+// tenth of a microsecond is measured as nought or one and only the total over many calls means
+// anything. **And a profiled run is a slower run** -- every instruction hashes a name into a table --
+// so a builtin's figure is comparable to another builtin's and is NOT a share of an unprofiled run's
+// wall time. Read the shares against `bench/run.sh`'s own numbers.
+//
+// **A BUILTIN THAT CALLS BACK INTO slate IS TIMED INCLUSIVELY.** `map`, `filter`, `sort` and the
+// seven others run a slate function inside the window being measured, so their microseconds contain
+// the callback's instructions and the callback's own builtins. There is nothing wrong with the
+// figure; it is an answer to "what did this call cost", not to "what did this builtin's own code
+// cost".
+
+// What one run came to.
+private struct Profile
+    // Instructions executed, which is the denominator every per-kind count is read against.
+    steps: u64
+
+    // Executions per instruction kind, keyed by the name of the `Op` variant.
+    ops: Map[string, u64]
+
+    // Calls per builtin, and microseconds in them, keyed by the name the builtin was registered
+    // under. Two tables rather than one of pairs, because a `Map` of a struct would copy the struct
+    // on every read-modify-write and this is the hot path when the instrument is on.
+    calls: Map[string, u64]
+    spent: Map[string, long]
+
+    // Microseconds inside `collect_now`, which is the mark and the sweep and nothing else.
+    gc_us: long
+
+    // The monotonic reading `profile_start` took, so the report can say what the whole run took by
+    // the same clock everything else here is measured with.
+    began: long
+
+// Whether this build counts instructions, which is `--features profile` and nothing else.
+//
+// **IT IS A CONSTANT SO THAT THE OPTIMISER DELETES THE BRANCH, and that is the whole mechanism.**
+// `run_frames` reads `profile_on && CountingInstructions`; where the constant is false the condition
+// folds and the instruction loop is byte for byte the loop it was, which is what the control build in
+// `bench/README.md` measured at 0.999 times the geometric mean. Where it is true the loop pays one
+// predicted branch per instruction, which measured 1.024.
+// Not `private`: `run_frames.sysl` reads it directly, which is what lets the branch fold. A function
+// answering it would be a call the optimiser has to see through first, and the whole point here is
+// that nothing is left to see through.
+#if feature_profile
+const CountingInstructions: bool = true
+#else
+const CountingInstructions: bool = false
+#endif
+
+// Whether the instrument is on.
+//
+// process-wide: an instrument is the PROCESS's rather than a VM's. It is set once from the
+// environment before anything runs and read from the instruction loop, so putting it in `Vm` would
+// put an indirection on the hottest read in the interpreter to say something no two VMs in one
+// process would ever disagree about.
+var profile_on: bool = false
+
+// What has been counted so far.
+//
+// process-wide: the tally belongs to the same instrument `profile_on` switches, and for its reason.
+// A run that starts a second VM -- an actor, a nested `run` -- is still one profile of one process,
+// which is what a person asking where the time went is asking about.
+private var profile_tally: Profile = Profile(0u64, map(), map(), map(), 0, 0)
+
+// The tally, as a pointer, so a caller writes to the one table rather than to a copy of it. This is
+// `machine()`'s arrangement in `execute.sysl` and is here for its reason.
+private tallied() -> *Profile = &profile_tally
+
+// Start counting, from nothing.
+//
+// Not `private`: `main.sysl` calls it where `SLATE_PROFILE` says to, and `tests_profile.sysl` calls
+// it to ask what a known program executes.
+profile_start()
+    profile_tally = Profile(0u64, map(), map(), map(), 0, monotonic().us)
+    profile_on = true
+
+// Stop counting, leaving the tally to be read.
+//
+// Not `private`: the suite turns the instrument off after every test that turned it on, a test that
+// left it on being one that slows down every test after it.
+profile_stop()
+    profile_on = false
+
+// Whether the instrument is on, which is what a test asserts about a fresh process.
+profiling() -> bool = profile_on
+
+// Whether the environment asked for a profile.
+//
+// **Anything but `0` and the empty string means yes**, which is what every other tool on the machine
+// does with a variable of this shape -- a person writing `SLATE_PROFILE=true` or `SLATE_PROFILE=yes`
+// meant the same thing, and a variable that quietly did nothing unless it said exactly `1` is a
+// twenty-minute mistake.
+//
+// Not `private`: `main.sysl` asks it where a program is started.
+asked_to_profile() -> bool = env.get("SLATE_PROFILE") match
+    Some(v) -> v != "" && v != "0"
+    None -> false
+
+// -- what the machine calls -------------------------------------------------------------------------
+
+// Count one instruction. **Called only from behind `if profile_on`**, which is the whole of what
+// makes this free when it is off.
+//
+// Not `private`: `run_frames.sysl` is the caller.
+profile_step(op: Op)
+    val p = tallied()
+    val label = op_label(op)
+
+    p.steps += 1u64
+    p.ops.put(label, p.ops.get_or(label, 0u64) + 1u64)
+
+// The clock reading a builtin's call should be measured from, or nothing where the instrument is off.
+//
+// Not `private`: `builtin.sysl` and `obj.sysl` are the callers.
+profile_began() -> long = if profile_on then monotonic().us else 0
+
+// Count a builtin call and what it took.
+//
+// Not `private`: `builtin.sysl` is the caller.
+profile_native(f: NativeFn, began: long)
+    if !profile_on then return
+
+    val p = tallied()
+    val name = native_name(f)
+
+    p.calls.put(name, p.calls.get_or(name, 0u64) + 1u64)
+    p.spent.put(name, p.spent.get_or(name, 0) + (monotonic().us - began))
+
+// Count what a collection took.
+//
+// Not `private`: `obj.sysl` is the caller.
+profile_collected(began: long)
+    if !profile_on then return
+
+    tallied().gc_us += monotonic().us - began
+
+// -- what a test asks ---------------------------------------------------------------------------
+
+// How many instructions have been counted.
+profile_steps() -> u64 = tallied().steps
+
+// How many of that instruction kind have been counted.
+profile_op_count(label: string) -> u64 = tallied().ops.get_or(label, 0u64)
+
+// How many calls to that builtin have been counted.
+profile_call_count(name: string) -> u64 = tallied().calls.get_or(name, 0u64)
+
+// Every instruction kind that has been counted at least once, in no particular order.
+profile_op_labels() -> Buf[string]
+    var out: Buf[string] = buf()
+    var walk = tallied().ops.walk()
+
+    loop
+        walk.next() match
+            None -> break
+            Some(pair) -> out.push(pair.0)
+
+    out
+end profile_op_labels
+
+// -- the report -------------------------------------------------------------------------------------
+
+// One line of a table: a name and the two numbers it is sorted and shown by.
+private struct Row
+    name: string
+    count: u64
+    us: long
+
+// The rows of a table, heaviest first.
+private ranked(counts: Map[string, u64], times: Map[string, long]) -> Buf[Row]
+    var out: Buf[Row] = buf()
+    var walk = counts.walk()
+
+    loop
+        walk.next() match
+            None -> break
+            Some(pair) -> out.push(Row(pair.0, pair.1, times.get_or(pair.0, 0)))
+
+    sort_by(out.view(), (a, b) -> if a.us == b.us then a.count > b.count else a.us > b.us)
+    out
+end ranked
+
+// The rows of a table with no times in it, heaviest first.
+private ranked_by_count(counts: Map[string, u64]) -> Buf[Row]
+    var out: Buf[Row] = buf()
+    var walk = counts.walk()
+
+    loop
+        walk.next() match
+            None -> break
+            Some(pair) -> out.push(Row(pair.0, pair.1, 0))
+
+    sort_by(out.view(), (a, b) -> a.count > b.count)
+    out
+end ranked_by_count
+
+// A count as a percentage of the total, in tenths of a percent, where the total is not zero.
+//
+// **Integer arithmetic and not a real**, because how a language writes a double is a thing this file
+// would then have to care about: `x / 10` and `x % 10` say `12.3` in one spelling on every platform.
+private share(part: u64, whole: u64) -> string
+    if whole == 0u64 then return "0.0"
+
+    val tenths = part * 1000u64 / whole
+
+    s"${tenths / 10u64}.${tenths % 10u64}"
+end share
+
+// What the run came to, ready to be written to a terminal.
+//
+// **The instruction table is a COUNT and the builtin table is a TIME**, and that division is the
+// finding the instrument was built around: an instruction is too cheap to time one at a time without
+// the clock costing more than the instruction, and a builtin is not.
+profile_report() -> string
+    val p = tallied()
+    var out = str_builder()
+
+    out.push(s"slate profile\n")
+    out.push(s"  wall             ${monotonic().us - p.began} us\n")
+    // **`0` would be a lie of exactly the shape this codebase keeps catching**: a build that does not
+    // count instructions reads as a program that ran none, which is a true number about the wrong
+    // thing and sends the reader to their own program.
+    out.push(if CountingInstructions then s"  instructions     ${p.steps}\n"
+             else s"  instructions     not counted in this build\n")
+    out.push(s"  collections      ${current().collections}\n")
+    out.push(s"  collector        ${p.gc_us} us\n")
+    out.push(s"  allocator steps  ${gc.alloc_steps(slate_heap())}\n")
+    out.push(s"  heap in use      ${heap_in_use()} bytes\n")
+
+    if !CountingInstructions
+        // **The reader is told, rather than shown an empty table.** A profile with no instruction
+        // counts in it looks exactly like a program that ran no instructions, and the reader would go
+        // looking for the fault in their program instead of in how slate was built.
+        out.push(s"\n  instruction kinds are not counted in this build -- rebuild with\n")
+        out.push(s"  `sysl build . --features profile` to count them\n")
+    else
+        val ops = ranked_by_count(p.ops)
+
+        out.push(s"\n  instruction kinds executed (${ops.len()} of them)\n")
+
+        for i in 0..<ops.len()
+            out.push(s"    ${ops.at(i).name} ${ops.at(i).count} ${share(ops.at(i).count, p.steps)}%\n")
+
+    val calls = ranked(p.calls, p.spent)
+
+    out.push(s"\n  builtins, by time (${calls.len()} of them)\n")
+
+    for i in 0..<calls.len()
+        out.push(s"    ${calls.at(i).name} ${calls.at(i).count} calls ${calls.at(i).us} us\n")
+
+    out.finish()
+end profile_report
+
+// -- the name of an instruction -------------------------------------------------------------------
+
+// What an instruction is called, which is the key every count is filed under.
+//
+// **THE MATCH IS EXHAUSTIVE ON PURPOSE AND MUST STAY SO.** An `Op` added later and not named here
+// would be counted under nothing, which is the one way a profile can be wrong and say nothing about
+// it -- so the arms are written out and the compiler is what keeps this in step with `code.sysl`.
+private op_label(op: Op) -> string = op match
+    PushNull -> "PushNull"
+    PushUndefined -> "PushUndefined"
+    PushBool(_) -> "PushBool"
+    PushInt(_) -> "PushInt"
+    PushReal(_) -> "PushReal"
+    PushStr(_) -> "PushStr"
+    PushShape(_, _) -> "PushShape"
+    PushExternal(_) -> "PushExternal"
+    LoadName(_) -> "LoadName"
+    DeclareVal(_) -> "DeclareVal"
+    DeclareVar(_) -> "DeclareVar"
+    StoreName(_) -> "StoreName"
+    DeclareAbsent(_) -> "DeclareAbsent"
+    LoadSlot(_) -> "LoadSlot"
+    DeclareSlot(_) -> "DeclareSlot"
+    StoreSlot(_) -> "StoreSlot"
+    StoreAbsentSlot(_) -> "StoreAbsentSlot"
+    ImmutableSlot(_) -> "ImmutableSlot"
+    CheckSlot(_, _, _, _) -> "CheckSlot"
+    UnaryOp(_) -> "UnaryOp"
+    BinaryOp(_) -> "BinaryOp"
+    MakeArray(_) -> "MakeArray"
+    MakeObject(_) -> "MakeObject"
+    SealData -> "SealData"
+    GetIndex -> "GetIndex"
+    SetIndex -> "SetIndex"
+    GetField(_) -> "GetField"
+    SetField(_) -> "SetField"
+    Jump(_) -> "Jump"
+    JumpIfFalse(_) -> "JumpIfFalse"
+    JumpIfPresentKeep(_) -> "JumpIfPresentKeep"
+    JumpIfAbsentKeep(_) -> "JumpIfAbsentKeep"
+    JumpIfTrueKeep(_) -> "JumpIfTrueKeep"
+    JumpIfFalseKeep(_) -> "JumpIfFalseKeep"
+    Pop -> "Pop"
+    Discard -> "Discard"
+    Dup -> "Dup"
+    DupAt(_) -> "DupAt"
+    RotUp(_) -> "RotUp"
+    PushScope -> "PushScope"
+    PopScope -> "PopScope"
+    JumpIfBound(_, _) -> "JumpIfBound"
+    JumpIfGiven(_, _) -> "JumpIfGiven"
+    MakeClosure(_) -> "MakeClosure"
+    DefineFn(_, _) -> "DefineFn"
+    CallFn(_, _) -> "CallFn"
+    CallMethod(_, _, _) -> "CallMethod"
+    CallSpread -> "CallSpread"
+    CallMethodSpread(_) -> "CallMethodSpread"
+    JoinArrays(_) -> "JoinArrays"
+    Ret -> "Ret"
+    Await -> "Await"
+    Yield -> "Yield"
+    Join(_) -> "Join"
+    Repeat -> "Repeat"
+    WithObject(_) -> "WithObject"
+    WithMerge(_) -> "WithMerge"
+    MakeRange(_, _, _, _) -> "MakeRange"
+    IsPat(_, _) -> "IsPat"
+    Unpack(_, _) -> "Unpack"
+    UnpackSlots(_, _, _) -> "UnpackSlots"
+    TestPat(_) -> "TestPat"
+    TestSlots(_, _) -> "TestSlots"
+    JumpIfSet(_, _) -> "JumpIfSet"
+    IterInit -> "IterInit"
+    IterNext(_) -> "IterNext"
+    IterAwaitCheck -> "IterAwaitCheck"
+    FailWith(_) -> "FailWith"
+    FailShowing(_) -> "FailShowing"
+    FailNoArm -> "FailNoArm"
+    CheckResult(_, _) -> "CheckResult"
+    CheckType(_, _, _) -> "CheckType"
+    DefineTest(_) -> "DefineTest"
+    DefineHook(_, _) -> "DefineHook"
+    PushHandler(_) -> "PushHandler"
+    PopHandler -> "PopHandler"
+    Raise -> "Raise"
+    PushModule(_) -> "PushModule"
+    Tick -> "Tick"
+end op_label

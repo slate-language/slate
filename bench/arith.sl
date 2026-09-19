@@ -4,19 +4,15 @@
 // top of a module is a module-level binding that an importer reads by name, so it stays in a table
 // however locals are resolved; a name inside a function is the one that can become a numbered slot.
 // A benchmark at the margin would measure the half this work does not change.
-import { now } from slate:time
 
 run()
     var total = 0
     var i = 0
 
-    while i < 3000000
+    while i < 10000000
         total = total + i * 2 - 1
         i = i + 1
 
     total
 
-val started = now()
-
 print(run())
-print((now() - started).millis())
