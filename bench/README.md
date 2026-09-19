@@ -1,7 +1,7 @@
 # The benchmarks, and what the first profile says
 
-Twenty programs, each written four times -- in slate, in Lua, in JavaScript and in Python -- and a
-profiler for the interpreter that runs them. **Nothing here makes slate faster.** It exists so that
+Twenty-one programs, each written four times -- in slate, in Lua, in JavaScript and in Python -- and
+a profiler for the interpreter that runs them. **Nothing here makes slate faster.** It exists so that
 the next thing that does can be chosen from a number rather than from an opinion, and so that the
 claim afterwards can be checked.
 
@@ -20,7 +20,7 @@ bench/run.sh ./slate
 bench/run.sh -n 9 --tsv ./slate arith fib mapset
 ```
 
-`check.sh` runs all four implementations of all twenty and diffs every answer against
+`check.sh` runs all four implementations of all twenty-one and diffs every answer against
 `expected.txt`. **A twin that has drifted from its slate program shows up there** -- a loop bound
 edited on one side, a 1-based index off by one, an integer that stopped being exact in a double --
 rather than as a benchmark that quietly measures something else.
@@ -65,11 +65,15 @@ wherever it lands and is indistinguishable from a benchmark being slow.
 | `dispatch` | `match` on a string, against a chain of comparisons and a `switch` |
 | `strings` | a string built a piece at a time by concatenation |
 | `strindex` | reading a 16,000-character string one character at a time BY INDEX |
+| `strwalk` | the same walk over text that is NOT one byte a character, where a position cannot be arithmetic |
 | `sorting` | `sorted` over 20,000 numbers, two hundred times |
 | `csv` | the realistic mix: generate a comma-separated text, split it, convert and add |
 
 **Each is sized so that Lua takes roughly a fifth of a second**, which is long enough to measure and
-short enough that slate finishes in a couple. **`strindex` is deliberately outside that band**: sized
+short enough that slate finishes in a couple. **`strindex` and `strwalk` are deliberately outside
+that band, and `strwalk` is the one benchmark here Lua is not a yardstick for** -- Lua has no
+character indexing at all, so its own twin is quadratic in the same way slate's used to be, which the
+twin's header says. `strindex` is the ASCII case: sized
 for Lua it would run for hours under slate, and sized for slate the other three finish before their
 own start-up is over. That gap is the measurement.
 
@@ -160,6 +164,65 @@ count an increment. With a `--features profile` build:
 | `fields` | 135,000,043 | 105,000,033 | **-22.2%** |
 | `funcs` | 136,000,040 | 112,000,028 | **-17.6%** |
 | all twenty | 2,425,522,165 | 1,925,846,289 | **-20.6%** |
+
+### A string carries its own character count — shortlist item 4, `7478d4b`
+
+Taken 2026-09-19 on this machine, best of 5, under `caffeinate`, box at 95.8% idle, `pgrep -x java`
+empty, both locks held. **Both columns are binaries I built and kept**, and each is named: `0.0.57`
+is `dev` at `e3ed5ff`, which is this branch's own starting point, and `item 4` is that same commit
+with this change and nothing else on it. Measuring the two ends of one commit is what keeps the
+figure this item's rather than the week's.
+
+|  | 0.0.57 | item 4 | change | 0.0.57/lua | item 4/lua |
+|---|---|---|---|---|---|
+| `strindex` | 2506.1 | **13.2** | **190x faster** | 980.1x | **5.5x** |
+| `strwalk` | 4830.8 | **15.0** | **322x faster** | 30.3x | **0.1x** |
+| `strings` | 883.1 | 939.8 | — | 2.4x | 2.4x |
+
+**`strings` did not move and the two figures either side of it say why.** Lua read 365.5 and 386.8 on
+the same two runs, `node --jitless` 24.9 and 26.8, `python3` 625.6 and 646.8 — the whole second
+column is about 5% up, which is the machine and not the build. The RATIO is 2.4x in both, and a
+ratio is what this table is for: `strings` concatenates and never asks a position, so nothing here
+reaches it.
+
+**`strwalk` IS NEW AND IT IS THE HALF `strindex` COULD NOT SEE.** `strindex` walks ASCII, where a
+character is one byte and a position can be arithmetic; `strwalk` walks 20,000 characters of
+Japanese, where it cannot. **Lua is NOT the yardstick on that one** — it has no character indexing at
+all, and the idiomatic `utf8.offset` counts from the front, so Lua's own walk is quadratic exactly as
+slate's was. That is why the ratio reads 0.1x, and the twin's header says so.
+
+**The whole set, with the merged build** (`dev` `a42c2f1` plus this item, so items 1 and 4 together):
+
+| | against lua | against node --jitless | against python3 |
+|---|---|---|---|
+| the original twenty, 2026-09-18 | 17.4x | 12.4x | 8.3x |
+| the original twenty, now | **12.4x** | **8.9x** | **5.9x** |
+| all twenty-one, with `strwalk` | 9.9x | 7.9x | 5.4x |
+
+**Of that 17.4 → 12.4, this item is 17.4 → 13.4** — substituting `strindex`'s new ratio into the
+September 18 row and changing nothing else — and item 1 and run-to-run drift are the rest. The
+twenty-one row is what `bench/run.sh` prints with no names given; the twenty is the comparable one,
+and both are here so neither reading has to be worked out from the other.
+
+**WHAT THE COUNT COSTS IS THREE WORDS PER STRING CELL AND NOTHING ELSE.** `StrObj` carries the
+character count, the last position it was asked about and that position's byte offset. The count is
+written when the cell is made and a string is immutable, so it can never go stale —
+`new_str_counted(s, chars)` is the only constructor and takes the number as a parameter, which is
+what stops a site forgetting it. Nearly every string is derived from one already counted (a join adds
+two counts, a slice subtracts two positions, `repeat` multiplies, a literal is counted when it is
+interned), so the one place a walk is owed is text arriving from outside the machine.
+
+**`chars == bytes.len` IS THE TEST FOR "EVERY CHARACTER IS ONE BYTE"** and it falls out of keeping the
+count rather than costing a flag. For such a string a position IS a byte offset. For one that is not,
+the cursor makes a left-to-right walk cost one step per character instead of one walk per character —
+**forward only, because the decoder counts a run of ill-formed bytes as one character and that rule
+has no reverse**; a position behind the cursor is walked from the front with the same iterator that
+did the counting, so the two can never disagree about where a character begins.
+
+**The evidence that is not a clock is `Vm.chars_scanned`**, every byte the character-position
+routines walk over, asserted in `tests_strcount.sysl`. Walking 20,000 one-byte characters by index
+now reads **fewer bytes than the string is long**; the same walk over 20,000 three-byte characters
+reads the string about once. Before this it was some 200,000,000 bytes for the first.
 
 | kind, over all twenty | 0.0.57 | item 1 |
 |---|---|---|
@@ -340,6 +403,10 @@ cheapest thing on this page to check.
 
 ### 4. `s.length` and `s[i]` are both O(n), so an ordinary character walk is quadratic twice over
 
+**FIXED — see *A string carries its own character count* above.** The finding is kept because it is
+what the fix was chosen from, and because the shape of it recurs: a position in one unit over storage
+in another is where a language quietly becomes quadratic.
+
 `strindex` walks a 16,000-character string once. It is 987x Lua.
 
 | | calls | microseconds | per call |
@@ -412,7 +479,7 @@ instruments.
 | 1 | ~~**Stop emitting `PushNull`/`Discard` for a statement whose value nothing reads**~~ — **DONE, `fa327b6`**: 20.6% of all instructions gone, `arith` -24.0%, geometric mean against Lua 17.6x -> **16.4x** | measured above | INCREMENTAL |
 | 2 | **Fix the module-level loop's per-turn scope** (finding 3) | `globals` only -- but it is 6M allocations and 4,285 collections for nothing, and every top-level script pays it | INCREMENTAL, and possibly a defect |
 | 3 | **Make `Tick` cheaper or rarer** -- a counter tested every N statements, or folded into the back edge of a loop rather than emitted per statement | 7.1% of all instructions | INCREMENTAL |
-| 4 | **Cache a string's character count on the `StrObj`, and index from a cached cursor** (finding 4) | `strindex` 987x -> ~2x; every `s.length` in every program; `arrays`'s 15% | INCREMENTAL |
+| 4 | ~~**Cache a string's character count on the `StrObj`, and index from a cached cursor**~~ — **DONE, `7478d4b`**: the count is CARRIED rather than cached, so `.length` is O(1) always; `strindex` 980x -> **5.5x** Lua (190x faster), the new `strwalk` 30.3x -> **0.1x** (322x faster), geometric mean against Lua over the original twenty **17.4x -> 13.4x** by this item alone | measured above | INCREMENTAL |
 | 5 | **Resolve a module-level definition's call target at compile time** so `add3(...)` is not a `LoadName` (finding 7) | 2.7% of all instructions, 2.9% of `funcs`, all of `globals`'s 14.8% `LoadName` | INCREMENTAL |
 | 6 | **Emit `JumpIfGiven` only for a parameter that can be absent** at a call the checker has already counted (finding 7) | 2.5% of all instructions, 8.8% of `funcs` | INCREMENTAL |
 | 7 | **Raise `Headroom` with the payload, or schedule payload separately from cells** (finding 6) | `strings` 27%; any program building text | INCREMENTAL |

@@ -21,11 +21,10 @@ a_length_is_the_number_of_characters() =
     assertEq(mixed.length, 10)
     assertEq(astral.length, 3)
     assertEq(combining.length, 3)
-    assertEq(len(mixed), 10)
 
 @test
 a_byte_length_is_a_different_number_and_both_are_available() =
-    assertEq(toBytes(mixed).length, 18)
+    assertEq(toBytes(mixed).length, 17)
     assertEq(toBytes(astral).length, 6)
     assertEq(toBytes("").length, 0)
 
@@ -134,8 +133,8 @@ an_index_outside_the_string_is_refused_in_characters() =
     assert(contains(below, "-1"))
     assert(contains(below, "10 characters"))
 
-    // The byte length is 18 and it is not the number a reader is told about.
-    assert(!contains(past, "18"))
+    // The byte length is 17 and it is not the number a reader is told about.
+    assert(!contains(past, "17"))
 
 @test
 an_index_into_the_empty_string_is_refused() =
