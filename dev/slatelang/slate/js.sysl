@@ -248,6 +248,22 @@ private emit_one(prog: Program, src: Source, file: usize, stamp: bool, testing: 
 
             line(&j, s"$$.declared(${quoted_js(name)}, () => ${js_name(name)});")
 
+    // **The names this copy is deliberately not going to bind**, which is `Vm.entry_effects` in the
+    // interpreter: a handler naming one of them is told where the value belongs rather than only that
+    // it is not defined. Emitted for the entry file's declarations-only copy alone, that being the one
+    // file a worker does not run.
+    if decls_only
+        val bound = top_level_effect_names(prog)
+
+        var listed = str_builder()
+
+        for i in 0..<bound.len()
+            if i > 0 then listed.push(", ")
+
+            listed.push(quoted_js(bound.at(i)))
+
+        line(&j, s"$$.entryBound([${listed.finish()}]);")
+
     emit_stmts(&j, if decls_only then declarations_of(prog) else prog.stmts)
 
     for i in 0..<prog.exports.len()
@@ -363,8 +379,12 @@ emit_program(l: Loaded, testing: bool) -> Emitted
     // was, down to the byte -- which is what `tests/js/`'s corpus is the check on.
     val actors = program_declares_an_actor(l)
 
+    // **The worker's loader is `async` and the runtime AWAITS it.** An imported module is run in full
+    // here and a module may wait at its own top level, which is emitted as `await (async () => …)()`
+    // -- legal only inside an `async` function. A loader that answers a promise costs the sync case
+    // nothing, `await` of a plain value being the value.
     if actors
-        out.push("\n;if ($.inWorker) $.actorWorker(() => {\n")
+        out.push("\n;if ($.inWorker) $.actorWorker(async () => {\n")
         out.push(program_decls(l).code)
         out.push("}); else {\n")
 
@@ -445,10 +465,13 @@ js_suite(entries: Buf[string], decls: Buf[string], only: string) -> string
     out.push(scope_opens(names))
 
     if decls.len() > 0
-        out.push("\n;if ($.inWorker) $.actorWorker(() => {\n")
+        out.push("\n;if ($.inWorker) $.actorWorker(async () => {\n")
 
+        // **Each file's copy is awaited in turn**, a file's own imported module being allowed to wait
+        // at its top level -- and awaiting them one at a time is what keeps two files' modules from
+        // loading interleaved.
         for i in 0..<decls.len()
-            out.push(";(() => {\n")
+            out.push("await (async () => {\n")
             out.push(decls.at(i))
             out.push("})();\n")
 
@@ -541,19 +564,30 @@ private program_body_of(l: Loaded, testing: bool, decls_only: bool) -> Emitted
 
     for i in 0..<l.order.len()
         val which = l.order.at(i)
-        val body = emit_one(l.programs.at(which), l.sources.at(which), which, many, testing && i == l.order.len() - 1, decls_only, with_actors)
+
+        // **The declarations-only copy is the ENTRY file's alone.** A worker runs every module the
+        // program imports exactly as an importer runs it -- its constants, its tables, its own
+        // effects -- and that is what the interpreter's `each_module` does on the same walk. What it
+        // does not run is the entry file, whose top level is what spawns the workers in the first
+        // place.
+        val entry_only = decls_only && i == l.order.len() - 1
+        val body = emit_one(l.programs.at(which), l.sources.at(which), which, many, testing && i == l.order.len() - 1, entry_only, with_actors)
 
         rep.absorb(body.report)
 
         for k in 0..<body.srcs.len()
             srcs.push(body.srcs.at(k))
 
+        // **What `spawn` is refused against while a worker loads, and it names the file.** Written
+        // only into the declarations copy, so an ordinary program's emitted text is unchanged.
+        if decls_only then out.push(s"\n    $$.loadingModule(${quoted_js(l.sources.at(which).name)});\n")
+
         if many
             // **A file that waits becomes an `async` function the importer AWAITS**, which is what
             // makes an export the importer reads one the imported file has finished writing -- the
             // interpreter's `run_top_level` settling a module before the next one runs, said in
             // JavaScript. A file that waits for nothing is the plain function it always was.
-            val waits = l.programs.at(which).awaits && !decls_only
+            val waits = l.programs.at(which).awaits && !entry_only
 
             out.push(s"\n    const $$m${which} = ${if waits then "await (async () => {" else "(() => {"}\n")
             out.push(s"        $$.at(0, ${which});\n")
@@ -563,6 +597,8 @@ private program_body_of(l: Loaded, testing: bool, decls_only: bool) -> Emitted
         else
             out.push("\n    const $exports = $.obj([]);\n\n")
             out.push(indented(body.code))
+
+        if decls_only then out.push("\n    $.loadingModule(\"\");\n")
 
     Emitted(out.finish(), rep, srcs)
 end program_body_of

@@ -112,20 +112,36 @@ makes the set of files a program is made of knowable by reading it.
 `data`, a `type`, an `external` and an `import` are declarations. Everything else at the top level is an
 effect: a `val` or a `var` binding, an expression, a `for`, an `if`, a `match`, a top-level `await`.
 
-**A program runs exactly as it reads** — the split changes nothing about that. What it is for is that a
-fresh machine can be given a program's **names** without running the program: an actor's VM, or a host
-embedding slate, runs each module's declarations alone and has every definition and every class the program
-declares, with nothing printed, nothing opened and no timer armed.
+**A program runs exactly as it reads** — the split changes nothing about that. What it is for is the
+**entry file**, and one machine in particular: an actor's VM, or a host embedding slate, runs every module
+the program **imports** in full, exactly as an importer runs it, and runs only the *declarations* of the
+entry file. So it has every definition and every class the program declares, and none of what the program
+itself does — nothing of the entry file is printed, opened or armed there.
 
-A method may name a top-level `val`, and that stays an ordinary program: the name is looked up when the
-method is **called**, not when the class is declared. In a machine that ran only the declarations there is
-nothing bound to it, so reaching it faults with the same sentence any undefined name gets. A module's
-exports are all there in such a machine; the ones an effect would have bound are `null`.
+**A module is instantiated once per such machine.** Its constants are bound again, its tables are built
+again and its own top-level effects happen again — in that machine and nowhere else. So module-level state
+is **per actor**: a `Map` the main program filled is empty inside an actor until the actor fills its own,
+and neither sees the other's. State that is meant to be shared belongs in one actor that owns it, never at
+a module's top level.
 
-What such a machine cannot load at all is a **declaration whose value needs an effect's binding** — a class
-field written `val defaults = Defaults`, where `Defaults` is a top-level `val`. The initialiser is worked
-out where the class stands, so loading the declarations alone stops there, naming the name. State a class
-depends on belongs in its own fields, which is also what lets it travel to an actor.
+A method may name a top-level `val` **of the entry file**, and that stays an ordinary program: the name is
+looked up when the method is **called**, not when the class is declared. In such a machine nothing is bound
+to it, so reaching it faults — and the fault says so, rather than only that the name is not defined:
+
+```
+`maxItems` is not defined -- the entry file's top level is not run inside an actor, and `maxItems`
+is bound there. Put it in a module the actor imports, or in the actor's own fields.
+```
+
+The entry module's exports are all there in such a machine; the ones an effect would have bound are `null`.
+
+What such a machine cannot load at all is a **declaration in the entry file whose value needs an effect's
+binding** — a class field written `val defaults = Defaults`, where `Defaults` is a top-level `val`. The
+initialiser is worked out where the class stands, so loading the declarations alone stops there, naming the
+name. State a class depends on belongs in its own fields, which is also what lets it travel to an actor.
+
+**A `spawn` at a module's top level is refused**, naming the module: the actor it started would run that
+module, which would spawn again, without end.
 
 ## A module is an object
 
