@@ -110,6 +110,80 @@ process wall time.
 | csv | 612.4 | 301.4 | 134.0 | 85.4 | 2.0x | 4.6x | 7.2x | *99.8* |
 | **geomean** | | | | | **17.4x** | **12.4x** | **8.3x** | |
 
+### Statement bookkeeping removed — shortlist item 1, `fa327b6`
+
+Taken 2026-09-19 on this machine, best of 5, under `caffeinate`, box at 91.3% idle, `pgrep -x java`
+empty. **Both columns were measured in the same session**, so they are comparable to each other and
+not to the table above: the `0.0.57` column is the installed release and `item 1` is `fa327b6` on
+`unread-values`. Milliseconds of process wall time.
+
+|  | 0.0.57 | item 1 | change | lua | 0.0.57/lua | item 1/lua |
+|---|---|---|---|---|---|---|
+| startup | 4.7 | 4.7 | -- | 1.8 | 2.6x | 2.6x |
+| arith | 1488.4 | **1245.1** | **-16.3%** | 47.6 | 31.1x | 26.1x |
+| reals | 1481.6 | **1258.8** | **-15.0%** | 57.7 | 25.6x | 21.8x |
+| arrays | 1446.3 | **1216.9** | **-15.9%** | 92.5 | 15.9x | 13.2x |
+| loops | 1056.8 | 942.8 | -10.8% | 119.4 | 8.8x | 7.9x |
+| alloc | 1497.3 | 1358.0 | -9.3% | 160.0 | 9.6x | 8.5x |
+| dispatch | 2125.9 | 1929.9 | -9.2% | 88.3 | 24.7x | 21.9x |
+| closures | 1209.0 | 1098.8 | -9.1% | 45.0 | 28.8x | 24.4x |
+| options | 1909.1 | 1751.3 | -8.3% | 84.9 | 23.7x | 20.6x |
+| funcs | 1479.2 | 1365.6 | -7.7% | 47.4 | 30.4x | 28.8x |
+| globals | 2468.1 | 2280.4 | -7.6% | 98.2 | 23.8x | 23.2x |
+| fields | 1345.8 | 1257.2 | -6.6% | 60.9 | 21.7x | 20.6x |
+| nested | 1843.9 | 1757.6 | -4.7% | 130.0 | 14.1x | 13.5x |
+| mapset | 932.0 | 894.5 | -4.0% | 17.4 | 52.8x | 51.4x |
+| fib | 2783.1 | 2679.5 | -3.7% | 79.6 | 34.5x | 33.6x |
+| methods | 2411.2 | 2327.8 | -3.5% | 141.6 | 16.8x | 16.4x |
+| csv | 588.2 | 568.8 | -3.3% | 297.7 | 2.0x | 1.9x |
+| calls | 1516.9 | 1468.8 | -3.2% | 146.6 | 9.9x | 10.0x |
+| sorting | 754.1 | 750.7 | -0.5% | 560.4 | 1.3x | 1.3x |
+| strindex | 2471.9 | 2485.4 | *+0.5%* | 2.3 | 1045.6x | 1062.6x |
+| strings | 858.4 | 872.9 | *+1.7%* | 359.0 | 2.4x | 2.4x |
+| **geomean** | | | | | **17.6x** | **16.4x** |
+
+Against `node --jitless` the mean went **12.5x to 11.6x** and against `python3` **8.2x to 7.7x**.
+
+**THE THREE THAT MOVED LEAST ARE THE THREE WHOSE WORK IS INSIDE A BUILTIN**, which is finding 5
+read from the other end: `strings`, `strindex` and `sorting` run almost no instructions per unit of
+work, so taking instructions away buys them nothing and the two small rises are noise at this
+sample size. The three that moved most — `arith`, `arrays` and `reals` — are the tight loops where a
+quarter of every turn was bookkeeping.
+
+**The instruction counts are exact and are the real evidence**, a time being a measurement and a
+count an increment. With a `--features profile` build:
+
+| benchmark | 0.0.57 | item 1 | change |
+|---|---|---|---|
+| `arith` | 250,000,036 | 190,000,026 | **-24.0%** |
+| `loops` | 112,210,055 | 80,174,041 | **-28.6%** |
+| `fields` | 135,000,043 | 105,000,033 | **-22.2%** |
+| `funcs` | 136,000,040 | 112,000,028 | **-17.6%** |
+| all twenty | 2,425,522,165 | 1,925,846,289 | **-20.6%** |
+
+| kind, over all twenty | 0.0.57 | item 1 |
+|---|---|---|
+| `PushNull` | 249,873,014 | **35,076** |
+| `Discard` | 173,086,794 | **4,577,096** |
+| `Pop` | 90,356,320 | **9,028,080** |
+
+**NO OTHER KIND MOVED BY A SINGLE EXECUTION, and that is checkable rather than asserted**: the fall
+in those three sums to 499,675,876, which is exactly the fall in the total. `Tick` is unchanged at
+every benchmark — it is still emitted once per statement, in the same place, and making it cheaper
+is item 3.
+
+**`arith`'s loop is 19 instructions a turn where it was 25.** What went is three `PushNull`, two
+`Discard` and one `Pop`; what is left computes.
+
+**An `if`, a `match` and a `try` written as statements are DELIBERATELY UNTOUCHED.** Each is
+compiled as the expression it is wherever it stands, so both arms still leave a value and the
+statement still drops one — three instructions per execution, paid once per `if` rather than once
+per turn of anything. Teaching the arms to leave nothing needs its own argument about the two stack
+depths meeting at the jump they share, and the benchmarks here do not ask for it: `dispatch`'s
+`match` is a function's answer and is read. A **loop** written as a statement is untouched for the
+same reason plus one more: `break` gives a loop a value, so the value is genuinely produced and the
+one instruction that drops it is paid once per loop, not per turn.
+
 **START-UP IS ALREADY GOOD AND IS THE ONE COLUMN slate WINS.** 4.6 ms against node's 14.2 and
 Python's 13.1, and only 2.8 ms behind Lua -- so a short program's wall time is mostly the work, and
 nothing here is a start-up artefact. It also means the ratios above are honest at this size: at a
@@ -245,6 +319,10 @@ JumpIfFalse 1   Jump 1   Pop 1
 throws away, and every statement carries a `Tick` that asks the collector whether it is time. On
 `arith` that is 32% of the instructions, and `arith` is the benchmark that is 30x off Lua.
 
+*This section is the FIRST profile and is kept as the reading that chose the shortlist.* Six of those
+eight are gone as of `fa327b6` — see *Statement bookkeeping removed* above — and the two `Tick`s are
+item 3.
+
 ### 3. A module-level loop allocates a scope every turn, and a function-level one allocates nothing
 
 `globals.sl` and `arith.sl` are the same loop at two levels:
@@ -331,7 +409,7 @@ instruments.
 
 | # | change | reach | kind |
 |---|---|---|---|
-| 1 | **Stop emitting `PushNull`/`Discard` for a statement whose value nothing reads** | 17.4% of all instructions; 20% of `arith`, `reals`, `globals`, `funcs`, `fields`, `dispatch`, `closures` | INCREMENTAL |
+| 1 | ~~**Stop emitting `PushNull`/`Discard` for a statement whose value nothing reads**~~ — **DONE, `fa327b6`**: 20.6% of all instructions gone, `arith` -24.0%, geometric mean against Lua 17.6x -> **16.4x** | measured above | INCREMENTAL |
 | 2 | **Fix the module-level loop's per-turn scope** (finding 3) | `globals` only -- but it is 6M allocations and 4,285 collections for nothing, and every top-level script pays it | INCREMENTAL, and possibly a defect |
 | 3 | **Make `Tick` cheaper or rarer** -- a counter tested every N statements, or folded into the back edge of a loop rather than emitted per statement | 7.1% of all instructions | INCREMENTAL |
 | 4 | **Cache a string's character count on the `StrObj`, and index from a cached cursor** (finding 4) | `strindex` 987x -> ~2x; every `s.length` in every program; `arrays`'s 15% | INCREMENTAL |
@@ -341,6 +419,12 @@ instruments.
 | 8 | **Make `Map`/`Set` cheaper for scalar keys** -- skip the structural hash and the `==`/`hash` lookup where the key is an integer or a string | `mapset` 53.8x, the worst honest ratio here | INCREMENTAL |
 | 9 | **A register machine instead of a stack machine** -- `LoadSlot` is 18.0% and `PushInt` 8.6%, and most of both exist only to feed the next instruction | 26.6% of all instructions, and it would take most of 1, 3 and 5 with it | **STRUCTURAL -- not piecemeal** |
 | 10 | **A narrower `Value`, or NaN-boxing** | every instruction; nothing here measures it directly | **STRUCTURAL -- not piecemeal** |
+
+**THE RANKING BELOW ITEM 1 IS UNCHANGED, AND THE PROFILE THAT WOULD HAVE CHANGED IT DID NOT.** Item
+1 took away instructions and moved none, so every other line's absolute count is exactly what it
+was and only its SHARE rose — `Tick` from 7.1% of all instructions to 9.0%, `LoadSlot` from 18.0% to
+22.6%, `JumpIfGiven` from 2.5% to 3.1%, `LoadName` from 2.7% to 3.3%. Nothing overtook anything, and
+items 2 and 4 are still the two cheapest large wins on the page.
 
 **1 through 8 can ship one at a time**, each with a benchmark that says whether it worked. **9 and 10
 must not be done piecemeal**: a register instruction set changes every arm of `run_frames`, both
