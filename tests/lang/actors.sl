@@ -79,6 +79,30 @@ async sends_from_one_actor_arrive_in_the_order_they_were_written() =
     assertEq(seen[0], 0)
     assertEq(seen[199], 199)
 
+// -- what a handler cannot reach -----------------------------------------------------------------
+
+val topLevelLimit = 512
+
+actor NameLeaker
+    on read(self) = topLevelLimit
+
+@test
+async a_handler_reaching_a_top_level_val_faults_with_the_same_sentence_on_both_back_ends() =
+    // **`docs/reference/modules.md` says a handler's own module gives it declarations and nothing
+    // else**, so a top-level `val` is simply not bound where the handler runs -- reaching it faults
+    // exactly as any other undefined name does. This is the interpreter's own sentence, and the
+    // JavaScript back end must say the same words rather than the host's -- V8's own `ReferenceError`
+    // has no backticks around the name.
+    val a = spawn(NameLeaker)
+    var said = ""
+
+    try
+        await ask(a.read)
+    catch e
+        said = e.message
+
+    assertEq(said, "`topLevelLimit` is not defined")
+
 // -- what crosses ------------------------------------------------------------------------------
 
 class Point
@@ -175,6 +199,43 @@ async bytes_are_copied_and_transfer_leaves_the_senders_buffer_empty() =
 
     assertEq(await ask(s.size, transfer(moved)), 7)
     assertEq(moved.length, 0)
+
+// A run of 256 bytes holding every value once, doubled up to at least `n` and cut back to it --
+// so a message of any of the sizes below carries every byte value rather than a run of zeros,
+// which is what would hide a copy that mishandled one value or one position.
+patterned(n) =
+    var block = bytes(0)
+
+    for i in 0..<256
+        push(block, i)
+
+    var out = bytes(0)
+
+    while out.length < n
+        push(out, block)
+
+    out[0..<n]
+
+@test
+async bytes_of_every_size_cross_byte_for_byte() =
+    val e = spawn(Echo)
+
+    for n in [0, 1, 255, 256, 65536, 1048576]
+        val original = patterned(n)
+        val back = await ask(e.back, original)
+
+        assertEq(back.length, n)
+        assertEq(back, original)
+
+@test
+async a_bytes_buffer_referenced_twice_in_one_message_arrives_shared() =
+    val e = spawn(Echo)
+    val original = toBytes("shared")
+    val back = await ask(e.back, { first: original, second: original })
+
+    back.first[0] = 90
+
+    assertEq(back.second[0], 90)
 
 // -- identity, addressing and `me` --------------------------------------------------------------
 
