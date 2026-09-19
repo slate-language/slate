@@ -315,6 +315,69 @@ and the same loop calling `abs(k)` instead runs in 833.0 ms. So **208 ns of ever
 and the call, and 49 ns is everything the table does** — the table is no longer where `mapset`'s
 time is. That is shortlist item 11 below and is a bigger piece of work than this one.
 
+#### Re-measured over the WHOLE set, on the merged branch, 2026-09-19
+
+The pair above measures this change alone against `0.0.57`, on four benchmarks. This one measures it
+where it will actually land: both binaries were built in this session from the two ends of one merge,
+so `dev` is **`67de3bf`** — which already carries items 1 and 4 — and `map-keys` is that same tree
+with this change and nothing else on it. Best of 5, under `caffeinate`, holding both locks, box at
+97.3% idle. Milliseconds of process wall time.
+
+|  | dev `67de3bf` | map-keys | change | dev/lua | map-keys/lua |
+|---|---|---|---|---|---|
+| mapset | 902.0 | **799.3** | **-11.4%** | 54.0x | 46.1x |
+| alloc | 1372.1 | **1236.5** | **-9.9%** | 8.0x | 7.8x |
+| calls | 1516.8 | **1387.1** | **-8.6%** | 9.9x | 8.8x |
+| funcs | 1433.8 | 1361.5 | -5.0% | 28.5x | 28.4x |
+| fields | 1239.6 | 1196.4 | -3.5% | 19.8x | 19.3x |
+| options | 1777.9 | 1716.7 | -3.4% | 21.1x | 21.0x |
+| arith | 1293.2 | 1254.2 | -3.0% | 26.5x | 26.5x |
+| fib | 2768.1 | 2688.9 | -2.9% | 34.1x | 33.2x |
+| globals | 2320.5 | 2265.4 | -2.4% | 23.3x | 23.4x |
+| loops | 957.6 | 937.0 | -2.2% | 8.0x | 7.7x |
+| dispatch | 1963.3 | 1924.8 | -2.0% | 22.3x | 21.7x |
+| methods | 2385.1 | 2339.6 | -1.9% | 16.2x | 16.8x |
+| closures | 1121.0 | 1101.1 | -1.8% | 22.2x | 24.6x |
+| nested | 1775.0 | 1748.7 | -1.5% | 13.5x | 13.5x |
+| arrays | 1226.3 | 1208.1 | -1.5% | 13.1x | 12.9x |
+| sorting | 759.3 | 751.9 | -1.0% | 1.3x | 1.3x |
+| reals | 1274.1 | 1272.5 | -0.1% | 23.1x | 21.8x |
+| csv | 568.9 | 569.7 | *+0.1%* | 1.9x | 1.9x |
+| strings | 852.6 | 864.0 | *+1.3%* | 2.4x | 2.4x |
+| strindex | 11.8 | 11.2 | -- | 5.0x | 4.7x |
+| strwalk | 13.9 | 13.1 | -- | 0.1x | 0.1x |
+| startup | 5.1 | 4.7 | -- | 2.7x | 2.8x |
+| **geomean** | | | | **9.9x** | **9.7x** |
+
+Against `node --jitless` the mean went **7.9x to 7.8x** and against `python3` **5.4x to 5.3x**.
+
+**FOUR OF THESE HAVE A MECHANISM AND THE REST DO NOT, AND SAYING WHICH IS THE WHOLE VALUE OF THE
+TABLE.** `mapset` is the hook lookup; `alloc` and `fields` are object literals no longer allocating an
+index; and **`calls` is the one that was not predicted** — it builds two million `Counter` instances,
+each of which used to take an eight-slot index before its one field was written, so the change moves
+it as hard as it moves a benchmark about tables. `methods` declares a class too and moves far less,
+its loop making one instance rather than one per turn.
+
+**Everything under about 3% has no mechanism in this diff and should be read as code layout.**
+`funcs` allocates nothing, holds no `==` and has no object in it, and it moved 5% in two independent
+passes; `arith`, `fib`, `globals` and `loops` are the same case. A change to `obj.sysl` and
+`table.sysl` moves every later function in the binary, and the instruction loop is sensitive to where
+it lands. **Do not build an explanation for these rows.**
+
+**THE ORDER THE TWO PASSES RAN IN WAS CONTROLLED FOR, and it had to be**: the whole set was measured
+before-then-after, and a machine that quietens across twenty minutes buys the second pass a few
+percent for nothing. Re-run with the binaries in the **opposite** order, `map-keys` still wins every
+one, and Lua moved the other way in that pass (`calls` 159.5 ms beside `map-keys` against 154.7 beside
+`dev`), which is the control saying the conditions favoured `dev` there:
+
+| | map-keys (first) | dev (second) | change |
+|---|---|---|---|
+| mapset | **773.5** | 876.4 | **-11.7%** |
+| alloc | **1202.6** | 1338.2 | **-10.1%** |
+| calls | **1357.9** | 1456.5 | **-6.8%** |
+| funcs | 1323.2 | 1389.0 | -4.7% |
+| fields | 1166.5 | 1215.8 | -4.1% |
+
 **START-UP IS ALREADY GOOD AND IS THE ONE COLUMN slate WINS.** 4.6 ms against node's 14.2 and
 Python's 13.1, and only 2.8 ms behind Lua -- so a short program's wall time is mostly the work, and
 nothing here is a start-up artefact. It also means the ratios above are honest at this size: at a
