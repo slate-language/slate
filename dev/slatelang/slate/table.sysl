@@ -55,15 +55,19 @@ private const Bias: usize = 2
 // Where an index array starts. A power of two, because the probe masks rather than divides.
 private const InitialSlots: usize = 8
 
-// Make the index of an empty table.
-fresh_index() -> Buf[usize]
-    var ix: Buf[usize] = buf()
-
-    for i in 0..<InitialSlots
-        ix.push(Empty)
-
-    ix
-end fresh_index
+// How many entries a table holds before it has an index at all.
+//
+// **BELOW THIS THERE IS NO INDEX AND A LOOKUP WALKS THE ENTRIES**, which is what Ruby's `Hash` does
+// up to eight and what Scala's `Map1`..`Map4` do up to four. A handful of comparisons costs less
+// than a hash and a probe, and the index is storage a small table never earns.
+//
+// **It matters more here than it does anywhere else, because this one table serves `Map`, `Set`,
+// every object literal and every class instance.** Most objects a program builds have a handful of
+// fields, so the small case is the ordinary case rather than a corner of it -- and an object used
+// to allocate an eight-slot index before its first field was written.
+//
+// Eight is where the measurement put it; see `bench/README.md`.
+private const SmallTable: usize = 8
 
 // -- hashing --------------------------------------------------------------------------------------
 
@@ -107,17 +111,24 @@ hook_of(v: Value, name: string) -> Option[Value] = v match
     _ -> None
 
 private hash_at(v: Value, depth: usize, at: Span) -> Hashed
-    var none: Buf[Value] = buf()
-
+    // **ONLY AN OBJECT CAN CARRY A HOOK, SO ONLY AN OBJECT PAYS FOR THE LOOKUP.** `call_hook`
+    // answers nothing for every other kind, and asking it anyway built an argument buffer and made
+    // a call for an integer key -- which is the commonest key there is.
+    //
     // **The receiver rule, as `==` and the operator methods take it**, so a class writes
     // `hash(self)` with the definition syntax every other member uses -- and a captured
     // `{ hash: () -> 7 }` sitting on the object itself still takes none, which is the difference
     // `call_hook` answers for.
-    call_hook(v, "hash", none, at) match
-        Some(step) -> step? match
-            Int(n) -> return Ok(u64(n))
-            other -> return Err(failure(at, s"`hash` must answer an integer, and this answered ${other.type_name()}"))
-        None -> ()
+    v match
+        Object(_) ->
+            var none: Buf[Value] = buf()
+
+            call_hook(v, "hash", none, at) match
+                Some(step) -> step? match
+                    Int(n) -> return Ok(u64(n))
+                    other -> return Err(failure(at, s"`hash` must answer an integer, and this answered ${other.type_name()}"))
+                None -> ()
+        _ -> ()
 
     hash_plain(v, depth, at)
 end hash_at
@@ -310,6 +321,8 @@ private keys_match(o: *ObjectObj, a: Value, b: Value, at: Span) -> Result[bool, 
 // **A search ends at an `Empty` and walks through a `Dead`**, because an entry inserted later may
 // have probed past the slot this one used to hold.
 private find_entry(o: *ObjectObj, k: Value, h: u64, at: Span) -> Result[Option[usize], Signal]
+    if o.index.len() == 0 then return scan_entry(o, k, h, at)
+
     val slots = o.index.len()
     val mask = slots - 1
     var probe = usize(h) & mask
@@ -331,6 +344,21 @@ private find_entry(o: *ObjectObj, k: Value, h: u64, at: Span) -> Result[Option[u
 
     Ok(None)
 end find_entry
+
+// Where a key sits in a table too small to have an index, or nothing.
+//
+// **The entries are walked in the order they were written and the hash each one carries is
+// compared first**, so a step is one integer comparison and a key is only looked at where the
+// hashes agree. The answer is the same one the index would have given: a table holds at most one
+// live entry per key, so the first match is the only match.
+private scan_entry(o: *ObjectObj, k: Value, h: u64, at: Span) -> Result[Option[usize], Signal]
+    for i in 0..<o.entries.len()
+        val e = o.entries.at(i)
+
+        if e.hash == h && !e.dead && keys_match(o, e.key, k, at)? then return Ok(Some(i))
+
+    Ok(None)
+end scan_entry
 
 // Put a position into the index, at the first slot free for it.
 private place(ix: *Buf[usize], h: u64, at: usize)
@@ -361,6 +389,17 @@ private grow(o: *ObjectObj)
 
         if !e.dead then kept.push(e)
 
+    o.entries = kept
+    o.live = kept.len()
+
+    // **A table still small once its tombstones have gone keeps no index**, which is what stops a
+    // small table that is written to and deleted from being indexed the first time it fills. It is
+    // also how a large table that has shrunk comes back to the cheap case.
+    if kept.len() + 1 <= SmallTable
+        o.index = buf()
+        object_recharged(o, was)
+        return
+
     var slots = InitialSlots
 
     while slots < (kept.len() + 1) * 2
@@ -371,9 +410,7 @@ private grow(o: *ObjectObj)
     for i in 0..<slots
         ix.push(Empty)
 
-    o.entries = kept
     o.index = ix
-    o.live = kept.len()
 
     for i in 0..<o.entries.len()
         place(&o.index, o.entries.at(i).hash, i)
@@ -412,13 +449,20 @@ obj_put(o: *ObjectObj, k: Value, v: Value, at: Span) -> Step
             e.value = v
             o.entries.set(where, e)
         None ->
-            // Two thirds full is where an open-addressed table's probes start to lengthen.
-            if (o.entries.len() + 1) * 3 >= o.index.len() * 2 then grow(o)
+            // **Two thirds full is where an open-addressed table's probes start to lengthen** --
+            // and below `SmallTable` there is no index to fill, so what makes one is passing that
+            // line rather than filling anything.
+            if o.index.len() == 0
+                if o.entries.len() + 1 > SmallTable then grow(o)
+            elif (o.entries.len() + 1) * 3 >= o.index.len() * 2
+                grow(o)
 
             val where = o.entries.len()
 
             entry_push(o, Entry(h, k, v, false))
-            place(&o.index, h, where)
+
+            if o.index.len() != 0 then place(&o.index, h, where)
+
             o.live += 1
 
     Ok(Null)
@@ -507,6 +551,10 @@ obj_drop_at(o: *ObjectObj, where: usize)
     o.entries.set(where, e)
     o.live -= 1
 
+    // A table with no index has no position to take back -- the tombstone in the entries is the
+    // whole of the removal there.
+    if o.index.len() == 0 then return
+
     val slots = o.index.len()
     val mask = slots - 1
     var probe = usize(h) & mask
@@ -537,6 +585,24 @@ end obj_keys
 // a `Value` now, so the obvious spelling of a field read would box the name into a `StrObj` on the
 // collected heap once per access, and then drop it. These take the sysl `string` straight and hash it
 // exactly as `hash_value` hashes a `Str`, so the two agree on every bucket.
+
+// Where a named field sits in a table too small to have an index, or nothing.
+//
+// **THE NAME IS COMPARED OUTRIGHT AND NEVER HASHED, which is the whole of what the small case buys
+// a field read.** Hashing a string walks its bytes, and a handful of string comparisons -- nearly
+// all of which stop at the first character, and every one of which stops at the length -- costs
+// less than one walk of the name being looked up.
+private scan_named(o: *ObjectObj, name: string) -> Option[usize]
+    for i in 0..<o.entries.len()
+        val e = o.entries.at(i)
+
+        if !e.dead
+            e.key match
+                Str(p) -> if p.s == name then return Some(i)
+                _ -> ()
+
+    None
+end scan_named
 
 private find_named(o: *ObjectObj, name: string, h: u64) -> Option[usize]
     val slots = o.index.len()
@@ -590,26 +656,37 @@ field_through(o: *ObjectObj, name: string) -> Option[Value]
 end field_through
 
 obj_get_name(o: *ObjectObj, name: string) -> Option[Value]
-    find_named(o, name, name.hash()) match
+    val found = if o.index.len() == 0 then scan_named(o, name) else find_named(o, name, name.hash())
+
+    found match
         None -> None
         Some(at) -> Some(o.entries.at(at).value)
 
-// Write a named field. **Only an insert boxes the name**, because only then is a key stored.
+// Write a named field. **Only an insert boxes the name**, because only then is a key stored -- and
+// only an insert hashes it, a small table finding an existing field by comparing the name.
 obj_put_name(o: *ObjectObj, name: string, v: Value)
-    val h = name.hash()
+    val small = o.index.len() == 0
+    val found = if small then scan_named(o, name) else find_named(o, name, name.hash())
 
-    find_named(o, name, h) match
+    found match
         Some(at) ->
             var e = o.entries.at(at)
 
             e.value = v
             o.entries.set(at, e)
         None ->
-            if (o.entries.len() + 1) * 3 >= o.index.len() * 2 then grow(o)
+            val h = name.hash()
+
+            if small
+                if o.entries.len() + 1 > SmallTable then grow(o)
+            elif (o.entries.len() + 1) * 3 >= o.index.len() * 2
+                grow(o)
 
             val at = o.entries.len()
 
             entry_push(o, Entry(h, str_value(name), v, false))
-            place(&o.index, h, at)
+
+            if o.index.len() != 0 then place(&o.index, h, at)
+
             o.live += 1
 end obj_put_name
