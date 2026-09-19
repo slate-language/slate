@@ -16,6 +16,17 @@ event loop and its own collector. Nothing is shared. Two actors cannot see one o
 so there is no lock to take, no value to tear, and no rule about which thread may touch what. What
 crosses between them is messages, and a message is **copied**.
 
+**"Nothing is shared" is a claim about what a PROGRAM can reach, and the runtime's own tables are the
+exception it does not cover.** A builtin's id, the function that id names and the name it was
+registered under live in module storage, one copy for the process, because an id has to mean the same
+thing in every VM. Those are shared, and reference counting in sysl is not atomic — so a counted
+value read out of one of them by two threads at once loses counts and is freed under the thread still
+using it. Two rules follow, and `dev/slatelang/slate/native_fn.sysl` is the worked example of both:
+the table a builtin call reads is a fixed array of `&sync`, which is the atomically counted
+reference, so no lock stands in front of a builtin call; and the counted `Buf` and `Map` beside it are
+read and written under a lock and never touched by a dispatch. `tests_vm_state.sysl` pins the type of
+every process-wide global so that the next one has to answer the same question.
+
 The program's own body is the first actor. `spawn` makes another, `send` posts a message nobody waits
 for, and `ask` posts one and answers a promise — the same promise every other part of slate answers,
 awaited in the same `await`.

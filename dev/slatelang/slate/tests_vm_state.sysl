@@ -60,18 +60,61 @@ private const NativeHandles: usize = 377
 // everything -- went in. What is left is the eight `gc.Kind` tables, the native index's four, one
 // for the storage, and none for a heap.
 //
-// **The fifteenth is the ACTOR TABLE**, which is process-wide for a reason of its own: a handle names
-// an actor wherever it is carried -- into a third actor's heap, back to the program -- so what
-// resolves one cannot be per-VM. See `actor_run.sysl`.
+// **The ACTOR TABLE** is process-wide for a reason of its own: a handle names an actor wherever it is
+// carried -- into a third actor's heap, back to the program -- so what resolves one cannot be per-VM.
+// See `actor_run.sysl`.
 //
-// **The sixteenth is the test HARNESS's own probe-name counter** (`probe_seq` in
-// `tests_kit_cli.sysl`), one per `sysl test` process and unrelated to any VM the suite starts.
+// **The test HARNESS's own probe-name counter** (`probe_seq` in `tests_kit_cli.sysl`) is one per
+// `sysl test` process and unrelated to any VM the suite starts.
 //
-// **The seventeenth and eighteenth are the PROFILER's** (`profile_on` and `profile_tally` in
-// `profile.sysl`). An instrument measures a process rather than a VM, and the flag in particular is
-// read once per instruction in the hottest loop in the project -- reaching it through `current()`
-// would put an indirection there to say something no two VMs in one process could disagree about.
-private const ProcessWideGlobals: usize = 18
+// **The last two are the PROFILER's** (`profile_on` and `profile_tally` in `profile.sysl`). An
+// instrument measures a line of execution rather than a VM, and the flag in particular is read where
+// the instruction loop starts -- reaching it through `current()` would put an indirection into the
+// hottest code in the project to say something no two VMs in one process could disagree about.
+private const ProcessWideGlobals: usize = 21
+
+// The TYPE of every process-wide global, as `file type`, in the order the files sort and each file
+// declares.
+//
+// **A PROCESS-WIDE GLOBAL IS READ BY EVERY THREAD AT ONCE, AND WHAT TORE WAS ITS TYPE.** An actor is
+// a second VM on a second OS thread, so a `Buf`, a `Map`, a `string` or a `&Fn` declared here is a
+// counted value two threads retain and release together -- and sysl's reference counting is not
+// atomic, so the count is lost and the storage is freed under the thread still using it. The count
+// above says somebody looked at a new global; this says what they looked at, which is the question
+// that actually decides whether it is safe:
+//
+// - **a raw table** -- `gc.Kind` is four function addresses, `long` is a number, `bool` is a flag --
+//   is not counted at all, so nothing can tear;
+// - **`&sync`** is sysl's atomically counted reference, which is why the builtin table is a fixed
+//   array of them and why the actor table is one;
+// - **a counted `Buf`, `Map` or `string`** is safe only under a lock, and the comment beside it has
+//   to name the lock. `native_fn.sysl` and `natives.sysl` are the worked examples.
+//
+// **THERE IS ONE MORE ANSWER AND `profile.sysl` IS THE ONLY THING THAT GIVES IT: a counted value
+// ONE THREAD CAN REACH.** `profile_tally` holds three `Map`s and takes no lock, which is safe
+// because nothing touches it unless `profile_on` is true and `profile_on` is `@thread_local` -- so
+// an actor's thread reads `false`, counts nothing and never sees the tables. What has to be named
+// there is not a lock but **what keeps it to one thread**, and a second writer would be the same
+// defect a missing lock is.
+//
+// A global whose type is not already on this list fails the test until the list is raised, which is
+// where that question gets asked.
+private val ProcessWideTypes: string =
+    "actor_run.sysl &sync ActorTable\n" +
+    "native_fn.sysl [MaxNatives]Option[NativeGo]\n" +
+    "native_fn.sysl Buf[string]\n" +
+    "native_fn.sysl Map[string, NativeFn]\n" +
+    "native_fn.sysl &sync libuv.Mutex\n" +
+    "natives.sysl Map[string, NativeFn]\n" +
+    "natives.sysl bool\n" +
+    "natives.sysl &sync libuv.Mutex\n" +
+    "obj.sysl gc.Kind\n" + "obj.sysl gc.Kind\n" + "obj.sysl gc.Kind\n" +
+    "obj.sysl gc.Kind\n" + "obj.sysl gc.Kind\n" + "obj.sysl gc.Kind\n" +
+    "obj.sysl gc.Kind\n" + "obj.sysl gc.Kind\n" + "obj.sysl gc.Kind\n" +
+    "profile.sysl bool\n" +
+    "profile.sysl Profile\n" +
+    "tests_kit_cli.sysl long\n" +
+    "vm_state.sysl Vm\n"
 
 private const StateOwedTotal: usize = 0
 
@@ -107,7 +150,22 @@ end runtime_files
 //
 // **A declaration is one that starts at the left margin**, which is what makes it module storage: a
 // `var` inside a function is indented, and a `var` inside a struct is a field.
-private counted_in(name: string) -> Counted
+// The type a module-level `var` declares, read off its first line.
+//
+// **`name: TYPE = init` and nothing cleverer**, which is all a declaration at the left margin ever
+// is: everything after the first `: ` and before the first ` = `. A declaration whose initializer
+// runs onto later lines still says its type on the first one.
+private declared_type(line: string) -> string
+    val after = split(line, ": ")
+
+    if after.len < 2 then return "?"
+
+    val parts = split(after[1], " = ")
+
+    if parts.len < 1 then "?" else parts[0]
+end declared_type
+
+private counted_in(name: string, types: *Buf[string]) -> Counted
     val text = from_utf8_unchecked(read_bytes(s"${RuntimeDir}/${name}").unwrap())
     val lines = split(text, "\n")
 
@@ -142,6 +200,7 @@ private counted_in(name: string) -> Counted
             out.handles += 1
         elif marked
             out.marked += 1
+            types.push(s"${name} ${declared_type(line)}\n")
         else
             out.owed += 1
 
@@ -155,13 +214,14 @@ THE_RUNTIMES_STATE_LIVES_IN_VM_AND_A_NEW_GLOBAL_HAS_TO_BE_ARGUED_FOR()
     val names = runtime_files()
 
     var owed_census = str_builder()
+    var types: Buf[string] = buf()
     var handles: usize = 0
     var marked: usize = 0
     var owed: usize = 0
     var the_vm: usize = 0
 
     for i in 0..<names.len()
-        val c = counted_in(names.at(i))
+        val c = counted_in(names.at(i), &types)
 
         handles += c.handles
         marked += c.marked
@@ -177,6 +237,15 @@ THE_RUNTIMES_STATE_LIVES_IN_VM_AND_A_NEW_GLOBAL_HAS_TO_BE_ARGUED_FOR()
     assert_eq(owed, StateOwedTotal, "module-level `var`s still owed the move into `Vm`")
     assert_eq(handles, NativeHandles, "`n_<name>: NativeFn` ids, which are process-wide by design")
     assert_eq(marked, ProcessWideGlobals, "globals marked `process-wide:` with a reason beside them")
+
+    // **The TYPE of each one, which is what says whether two threads may read it.** See
+    // `ProcessWideTypes`.
+    var type_census = str_builder()
+
+    for i in 0..<types.len()
+        type_census.push(types.at(i))
+
+    assert_eq(type_census.finish(), ProcessWideTypes)
 
     // **The VM is ONE global and the test says so**, that being the whole claim: a second `var` in
     // `vm_state.sysl` would be state outside the struct, which is the thing this file exists to stop.
