@@ -54,7 +54,7 @@ names=$*
 
 if [ -z "$names" ]; then
     names="arith reals globals funcs fib calls methods closures nested loops options
-           fields alloc arrays mapset dispatch strings strindex sorting csv"
+           fields alloc arrays mapset dispatch strings strindex strwalk sorting csv"
 fi
 
 out=$(mktemp)
