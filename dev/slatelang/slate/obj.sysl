@@ -708,6 +708,19 @@ collect_now()
 // Not `private`: `new_vm` in `vm_state.sysl` starts a VM's `collect_above` here.
 const CollectFloor: usize = 262144
 
+// The same question asked about payload, and the answer is sixteen times larger because a byte of
+// payload is nothing like a byte of cells to reclaim.
+//
+// **A collection costs what the OBJECT GRAPH costs and not what the bytes cost.** `gc.collect` walks
+// the heap's object list once per phase and the mark phase follows every pointer a live object has,
+// so a sweep that hands back a megabyte of string storage costs exactly what one handing back a
+// kilobyte of cells costs -- the megabyte is one `finalize` call. **So the two figures cannot share
+// a floor.** 256 KiB is a sensible smallest-worth-collecting for cells, where it is thousands of
+// objects; for payload it is one medium string, which is why a program building text crossed its
+// threshold every turn.
+// Not `private`: `new_vm` in `vm_state.sysl` starts a VM's `payload_above` here.
+const PayloadFloor: usize = 4194304
+
 // How much the live set may grow to before the next collection is `current().collect_above`. Raised
 // after every collection to a multiple of what survived it.
 
@@ -748,16 +761,36 @@ private const Headroom: usize = 2
 // **The ceiling is read here too, and it is the same combined figure.** A collection is attempted
 // first whichever of the two questions brought us here, so a program is never told it has run out of
 // memory over storage a sweep was about to give back.
+//
+// **CELLS AND PAYLOAD ARE TWO SCHEDULES, AND ONE THRESHOLD OVER THE COMBINED FIGURE WAS THE FOURTH
+// HALF OF THE SAME MISTAKE.** Doubling is right for both, and the FLOOR is not: a single threshold
+// of `max(Headroom × (cells + payload), CollectFloor)` gives payload a smallest-worth-collecting of
+// 256 KiB, which one medium string is already past. A program whose live set is one growing string
+// then allocates about as much payload per turn as it is holding, crosses its own threshold every
+// turn, and collects almost once a statement -- 123,884 collections over 150,000 turns of
+// `bench/strings`, a quarter of its wall time, each one walking the object graph to hand back the
+// previous copy of the string. So each figure is compared against a threshold of its own, raised to
+// `Headroom ×` what survived with its own floor under it, and a collection either question asks for
+// re-schedules both.
 maybe_collect()
     val v = current()
     val capped = v.payload_capped
+    val cells = gc.live_size(slate_heap())
+    val in_use = cells + v.payload
 
-    if (capped && heap_in_use() > v.heap_limit) || heap_in_use() > v.collect_above
+    // **The high-water mark is taken HERE and not in `charge`**, which is what makes it the figure
+    // the schedule is answerable for: the largest combined size the schedule ever let stand at a
+    // statement boundary, read where the decision to collect is made and before it is made.
+    if in_use > v.high_water then v.high_water = in_use
+
+    if (capped && in_use > v.heap_limit) || cells > v.collect_above || v.payload > v.payload_above
         collect_now()
 
-        val survived = heap_in_use() * Headroom
+        val cells_left = gc.live_size(slate_heap()) * Headroom
+        val payload_left = v.payload * Headroom
 
-        v.collect_above = if survived > CollectFloor then survived else CollectFloor
+        v.collect_above = if cells_left > CollectFloor then cells_left else CollectFloor
+        v.payload_above = if payload_left > PayloadFloor then payload_left else PayloadFloor
 
     if capped && heap_in_use() > v.heap_limit then v.heap_exhausted = true
 end maybe_collect
@@ -780,10 +813,12 @@ reset_heap()
     v.root_envs.clear()
     v.collections = 0
     v.collect_above = CollectFloor
+    v.payload_above = PayloadFloor
 
     // `dispose` ran every finalizer, so nothing is held outside the heap any more.
     v.payload = 0
     v.payload_marked = 0
+    v.high_water = 0
 
     v.heap_exhausted = false
     reserve_spares()
