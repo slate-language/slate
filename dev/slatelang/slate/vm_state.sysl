@@ -216,6 +216,31 @@ struct Vm
     // a multiple of what survived it.
     collect_above: usize
 
+    // How many bytes of PAYLOAD the live objects on this heap hold OUTSIDE it.
+    //
+    // **A cell is small and what it owns is not.** A slate string is a `StrObj` holding a sysl
+    // `string`, an array a `Buf`, an object two `Buf`s, a byte buffer its bytes -- all of it counted
+    // storage the collector never sees. Neither the schedule nor the ceiling could see it either, so
+    // a program moving megabyte buffers piled up garbage a collection would have taken and an actor
+    // outgrew its named heap without ever being told. `obj.sysl`'s `charge`/`credit` keep this, and
+    // the mark phase recomputes it exactly at every collection.
+    payload: usize
+
+    // What the tracers have counted so far in the collection now running. `collect_now` zeroes it,
+    // every `trace_*` hook adds its object's payload to it, and it becomes `payload` at the end --
+    // which is what makes a missed charge cost a stale schedule rather than a permanent drift.
+    payload_marked: usize
+
+    // Whether `heap_limit` bounds payload as well as cells.
+    //
+    // **A ceiling somebody NAMED bounds everything; a default nobody chose bounds cells.** An actor
+    // is spawned with a heap it asked for and `docs/library/actor.md` promises the actor faults when
+    // it outgrows it, so payload counts there. The program's own VM takes `HeapBytes` because nothing
+    // said otherwise, and charging payload against it would newly refuse programs that read a large
+    // file today. `set_heap_limit` turns it on for a limit below the block and off again at the
+    // block, which is what lets a test measure the bound.
+    payload_capped: bool
+
     // Whether the heap has been handed out to the last byte, which is what turns the next allocation
     // into a diagnostic rather than a crash.
     heap_exhausted: bool
@@ -520,7 +545,10 @@ extern free(block: *u8)
 // **`lp` is the loop this VM's handles go on**, and it defaults to the process's own so that every
 // call written before there was a second thread means what it always did. A VM that is going to run
 // on a thread of its own is given `libuv.new_loop()`, a loop being turnable by one thread at a time.
-new_vm(ceiling: usize, lp: &libuv.Loop = libuv.default_loop()) -> Vm
+// **`capped` says whether that ceiling bounds PAYLOAD as well as cells**, and it defaults to true so
+// that every VM a program spawns is bounded by the number it named. The program's own VM is the one
+// exception and passes false; see `Vm.payload_capped`.
+new_vm(ceiling: usize, lp: &libuv.Loop = libuv.default_loop(), capped: bool = true) -> Vm
     val block = malloc(ceiling)
 
     // **Loud rather than degraded.** A null block would be a heap whose first allocation answers null,
@@ -539,7 +567,7 @@ new_vm(ceiling: usize, lp: &libuv.Loop = libuv.default_loop()) -> Vm
         0,
         buf(), false, no_live_sink, false, "",
         rng(0u64, 0u64), false,
-        block, ceiling, gc.heap(block, ceiling), ceiling, buf(), buf(), 0, CollectFloor, false,
+        block, ceiling, gc.heap(block, ceiling), ceiling, buf(), buf(), 0, CollectFloor, 0, 0, capped, false,
         null, null, null, null, null, null, null, null, null,
         buf(), buf(),
         0, buf(), buf(), buf(), buf(), buf(), buf(), report(), buf(),
@@ -580,7 +608,7 @@ new_vm(ceiling: usize, lp: &libuv.Loop = libuv.default_loop()) -> Vm
 // program on -- and it is module storage because it has to outlive everything, including a `main`
 // that has returned into a libuv callback. A second VM is an ordinary local somebody owns; see
 // `enter` below.
-private var main_vm: Vm = new_vm(HeapBytes)
+private var main_vm: Vm = new_vm(HeapBytes, libuv.default_loop(), false)
 
 // The one module-level `var` the runtime keeps, and it is a POINTER to the VM in charge OF THIS
 // THREAD.
@@ -644,3 +672,7 @@ dispose_vm(v: *Vm)
     v.region = null
     v.heap_ceiling = 0
     v.heap = gc.heap(null, 0)
+
+    // Every finalizer has run, so nothing this VM owned is held outside its heap any more.
+    v.payload = 0
+    v.payload_marked = 0

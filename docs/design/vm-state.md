@@ -80,6 +80,14 @@ dispose_vm(&second)
 - **`heap_ceiling` is the block and `heap_limit` is the setting.** `set_heap_limit` clamps to the
   VM's own ceiling, so a VM spawned with a megabyte runs out of *its* megabyte with the ordinary
   *"this program has run out of memory"* and the process's own VM never hears about it.
+- **`payload` is what this VM's values hold OUTSIDE that block**, and both the collection schedule
+  and the ceiling read cells plus payload rather than cells alone. A string's bytes, an array's
+  `Buf` and a buffer's storage are all reference-counted memory the collector never sees, so a
+  heap measured in cells said almost nothing about what a program was holding. `charge`/`credit` in
+  `obj.sysl` keep the count between collections and the mark phase recomputes it exactly at each
+  one, which is what bounds a missed charge to a stale schedule. `payload_capped` says whether
+  `heap_limit` bounds it: true for a ceiling somebody named, false for the program's own VM, which
+  takes `HeapBytes` because nothing said otherwise.
 
 **`the_vm` IS `@thread_local`, so the pointer is per thread and two VMs run at once.** Every thread
 reads its own copy, which is what makes `current()` answer the VM the *line of execution* belongs to

@@ -81,10 +81,55 @@ slate_heap() -> *gc.Heap = &current().heap
 // **The ceiling is this VM's own block and not `HeapBytes`**, which is the whole of what a per-VM
 // region changed here: a VM spawned with a megabyte cannot be asked for more than a megabyte, where
 // the shared arena would have handed it 256.
+// **A named limit below the block bounds PAYLOAD too**, which is what `Vm.payload_capped` says and
+// is the whole of how a test measures that bound: the program's own VM is uncapped by default, and
+// putting the limit back to the block puts that default back with it.
 set_heap_limit(bytes: usize)
     val v = current()
 
     v.heap_limit = if bytes > v.heap_ceiling then v.heap_ceiling else bytes
+    v.payload_capped = v.heap_limit < v.heap_ceiling
+
+// -- what a cell owns outside the heap ------------------------------------------------------------
+//
+// **A cell is small and what it owns is not**, so a heap measured in cells alone says almost nothing
+// about what a program is holding: a one-megabyte byte buffer is a `BytesObj` of a few words with a
+// megabyte of counted storage hanging off it. Neither the collection schedule nor the ceiling could
+// see that storage, which made two separate failures out of one hole -- garbage piling up because a
+// collection was never due, and an actor outgrowing the heap it named without ever being told.
+//
+// **`current().payload` is the figure and it is kept two ways at once.** Every site that allocates
+// or grows a payload charges it, and every site that hands one back credits it; and because a charge
+// without its credit would grow for ever, the mark phase recomputes the whole figure from the live
+// objects at every collection. So a missed charge costs a stale schedule until the next collection
+// and can never become a false out-of-memory.
+//
+// **The measure is CAPACITY and not length.** A `Buf` that has grown to a thousand slots is holding
+// a thousand slots' worth of storage whatever its count says, and `clear` and `pop` give none of it
+// back -- so charging by length would report a buffer a program emptied as costing nothing while the
+// pages are still committed.
+
+// Take note of payload just allocated.
+charge(n: usize)
+    current().payload += n
+
+// Take note of payload just given back. **Clamped at zero**: the figure is an estimate between
+// collections, and a credit larger than the running count must not wrap a `usize`.
+credit(n: usize)
+    val v = current()
+
+    v.payload = if v.payload > n then v.payload - n else 0
+
+// Move the count from one footprint to another, which is what a container that was regrown owes.
+recharge(was: usize, now: usize)
+    if now > was
+        charge(now - was)
+    elif was > now
+        credit(was - now)
+
+// What the heap and everything hanging off it hold, which is the number both the schedule and the
+// ceiling read. **Cells alone is the figure that took a bug to learn was wrong.**
+heap_in_use() -> usize = gc.live_size(slate_heap()) + current().payload
 
 // -- the objects --------------------------------------------------------------------------------
 
@@ -298,9 +343,50 @@ private mark_map(h: *gc.Heap, m: Map[string, Value])
             Some(pair) -> mark_value(h, pair.1)
 end mark_map
 
+// -- what each kind holds outside the heap --------------------------------------------------------
+//
+// **One function per kind, read by three callers that must agree**: the constructor charging what it
+// was handed, the mutators charging what a regrow took, and the mark phase recounting what survived.
+// A fourth would be a second opinion about the same bytes.
+
+// A string is its bytes. The `string` box itself is a word or two and is not worth counting.
+str_payload(o: *StrObj) -> usize = o.s.bytes.len
+
+array_payload(o: *ArrayObj) -> usize = o.items.cap() * sizeof(Value)
+
+bytes_payload(o: *BytesObj) -> usize = o.data.cap()
+
+// Both halves of the compact dict: the entries and the index that probes into them.
+object_payload(o: *ObjectObj) -> usize = o.entries.cap() * sizeof(Entry) + o.index.cap() * sizeof(usize)
+
+closure_payload(o: *ClosureObj) -> usize = o.params.cap() * sizeof(string)
+
+promise_payload(o: *PromiseObj) -> usize = o.message.bytes.len + o.waiters.cap() * sizeof(usize)
+
+// A map's table costs a key, a value and the slot's own state per slot. **`Slot` is
+// `sysl.container`'s own type and cannot be named from here**, so the width is spelled out -- and
+// because the charge and the recount both read this one function, the two agree whatever the real
+// figure turns out to be.
+private map_slot(key: usize, value: usize) -> usize = key + value + 8
+
+env_payload(o: *EnvObj) -> usize = o.names.capacity() * map_slot(sizeof(string), sizeof(Value)) + o.mutable.capacity() * map_slot(sizeof(string), sizeof(bool))
+
+// Count an object the mark phase has just reached. **Every kind's tracer calls this exactly once per
+// collection**, because `gc.drain` traces an object only on the pass that marks it -- which is what
+// makes the total an exact recount of the live payload rather than an accumulation.
+private mark_payload(n: usize)
+    current().payload_marked += n
+
+// **A FINALIZER DOES NOT CREDIT, AND THAT IS DELIBERATE.** A finalizer touches no VM state, which is
+// what makes `dispose_vm(v)` safe to call for a VM that is not the current one -- a credit there
+// would take the bytes off whichever VM happened to be running. The recount in the mark phase is
+// what makes the figure right after a sweep, and it needs nothing from the sweep to do it.
+
 // A string owns its sysl `string` and points at nothing, so it needs a finalizer and no tracer.
 trace_str(p: *u8, h: *gc.Heap)
-    ()
+    val o: *StrObj = ptr_cast(p)
+
+    mark_payload(str_payload(o))
 
 finalize_str(p: *u8)
     val o: *StrObj = ptr_cast(p)
@@ -311,6 +397,8 @@ finalize_str(p: *u8)
 
 trace_array(p: *u8, h: *gc.Heap)
     val o: *ArrayObj = ptr_cast(p)
+
+    mark_payload(array_payload(o))
 
     for i in 0..<o.items.len()
         mark_value(h, o.items.at(i))
@@ -324,7 +412,9 @@ finalize_array(p: *u8)
 // arrangement and is what makes a megabyte of bytes cost the tracer one object rather than a million
 // edges. The `Buf` is counted storage outside the heap, so the finalizer is what gives it back.
 trace_bytes(p: *u8, h: *gc.Heap)
-    ()
+    val o: *BytesObj = ptr_cast(p)
+
+    mark_payload(bytes_payload(o))
 
 finalize_bytes(p: *u8)
     val o: *BytesObj = ptr_cast(p)
@@ -335,6 +425,8 @@ finalize_bytes(p: *u8)
 // the collector never saw, and it is now a `Value` that may be an array or an object of its own.
 trace_object(p: *u8, h: *gc.Heap)
     val o: *ObjectObj = ptr_cast(p)
+
+    mark_payload(object_payload(o))
 
     for i in 0..<o.entries.len()
         val e = o.entries.at(i)
@@ -352,6 +444,7 @@ finalize_object(p: *u8)
 trace_closure(p: *u8, h: *gc.Heap)
     val o: *ClosureObj = ptr_cast(p)
 
+    mark_payload(closure_payload(o))
     gc.mark(h, ptr_cast(o.scope))
 
 finalize_closure(p: *u8)
@@ -364,6 +457,7 @@ finalize_closure(p: *u8)
 trace_promise(p: *u8, h: *gc.Heap)
     val o: *PromiseObj = ptr_cast(p)
 
+    mark_payload(promise_payload(o))
     mark_value(h, o.value)
 
 finalize_promise(p: *u8)
@@ -375,6 +469,7 @@ finalize_promise(p: *u8)
 trace_env(p: *u8, h: *gc.Heap)
     val o: *EnvObj = ptr_cast(p)
 
+    mark_payload(env_payload(o))
     gc.mark(h, ptr_cast(o.parent))
     mark_map(h, o.names)
 
@@ -388,8 +483,12 @@ finalize_env(p: *u8)
 // nothing else holds is free to go; a value is marked by the ephemeron below, and only because its
 // key turned out live. The table's `Buf`s are reference counted and belong to a finalizer, which is
 // `finalize_object` -- the storage is an `ObjectObj` and only the hooks differ.
+// **The storage is still charged even though neither half is marked** -- the table is an `ObjectObj`
+// and its two `Buf`s cost what any object's do.
 trace_weak_map(p: *u8, h: *gc.Heap)
-    ()
+    val o: *ObjectObj = ptr_cast(p)
+
+    mark_payload(object_payload(o))
 
 // Mark the values whose keys turned out live, and answer whether that marked anything new.
 //
@@ -566,9 +665,21 @@ heap_used() -> usize = gc.used(slate_heap())
 // about *when* slate collects something a test can check rather than something a comment asserts.
 
 // Collect, at a point the interpreter has chosen because it knows what is live.
+//
+// **The payload count is RECOMPUTED here and not adjusted**, which is what bounds the damage a
+// missed charge can do: the tracers add up what every surviving object holds, and that total
+// replaces whatever the running estimate had become. So a charge whose credit was forgotten costs a
+// schedule that collects a little early until the next collection, and never a figure that grows
+// without bound into a false out-of-memory.
 collect_now()
-    current().collections += 1
+    val v = current()
+
+    v.collections += 1
+    v.payload_marked = 0
+
     gc.collect(slate_heap(), &roots)
+
+    v.payload = v.payload_marked
 
 // The smallest live set worth collecting over. Below this a program is cheap enough that tracing it
 // costs more than the storage it would give back.
@@ -603,13 +714,31 @@ private const Headroom: usize = 2
 // whose genuine live set sits above it straight back into the same loop -- so the threshold is
 // raised to a multiple of what survived, which is what makes the cost of collecting proportional to
 // the garbage produced rather than to the statements executed.
+// **The number read is cells PLUS PAYLOAD, and reading cells alone was the third half of the same
+// mistake.** A slate string is a cell of a few words owning a sysl `string`; an array owns a `Buf`,
+// an object a `Map`, a byte buffer its bytes -- none of it inside the block the collector manages.
+// A program making and dropping four thousand one-megabyte buffers therefore moved `live_size` by
+// almost nothing, no collection was ever due, and 1.67 GB of garbage piled up that a collection
+// would have taken. `Headroom ×` applies to the COMBINED figure for the reason it applies to the
+// cells: a threshold below a program's genuine live payload puts it straight back into
+// collect-every-statement.
+//
+// **The ceiling is read here too, and it is the same combined figure.** A collection is attempted
+// first whichever of the two questions brought us here, so a program is never told it has run out of
+// memory over storage a sweep was about to give back.
 maybe_collect()
-    if gc.live_size(slate_heap()) > current().collect_above
+    val v = current()
+    val capped = v.payload_capped
+
+    if (capped && heap_in_use() > v.heap_limit) || heap_in_use() > v.collect_above
         collect_now()
 
-        val survived = gc.live_size(slate_heap()) * Headroom
+        val survived = heap_in_use() * Headroom
 
-        current().collect_above = if survived > CollectFloor then survived else CollectFloor
+        v.collect_above = if survived > CollectFloor then survived else CollectFloor
+
+    if capped && heap_in_use() > v.heap_limit then v.heap_exhausted = true
+end maybe_collect
 
 // Give the heap back, and run every finalizer still outstanding.
 //
@@ -629,6 +758,11 @@ reset_heap()
     v.root_envs.clear()
     v.collections = 0
     v.collect_above = CollectFloor
+
+    // `dispose` ran every finalizer, so nothing is held outside the heap any more.
+    v.payload = 0
+    v.payload_marked = 0
+
     v.heap_exhausted = false
     reserve_spares()
 
@@ -717,16 +851,21 @@ private alloc_or_collect(size: usize, kind: *gc.Kind, spare: *u8) -> *u8
     current().heap_exhausted = true
     spare
 end alloc_or_collect
+// **Each of these charges what it was handed**, the object becoming the owner of storage that was a
+// caller's local a moment ago. The mutators below charge what a regrow took; between them that is
+// every byte a slate value holds outside the heap.
 new_str(s: string) -> *StrObj
     var o: *StrObj = ptr_cast(alloc_or_collect(sizeof(StrObj), &str_kind, ptr_cast(current().spare_str)))
 
     o.s = s
+    charge(str_payload(o))
     o
 
 new_array(items: Buf[Value]) -> *ArrayObj
     var o: *ArrayObj = ptr_cast(alloc_or_collect(sizeof(ArrayObj), &array_kind, ptr_cast(current().spare_array)))
 
     o.items = items
+    charge(array_payload(o))
     o
 
 // **The `Buf` is taken by value and this object becomes its owner**, which is `new_str`'s bargain: the
@@ -735,6 +874,7 @@ new_bytes(data: Buf[u8]) -> *BytesObj
     var o: *BytesObj = ptr_cast(alloc_or_collect(sizeof(BytesObj), &bytes_kind, ptr_cast(current().spare_bytes)))
 
     o.data = data
+    charge(bytes_payload(o))
     o
 
 new_object() -> *ObjectObj
@@ -745,6 +885,7 @@ new_object() -> *ObjectObj
     o.live = 0
     o.frozen = false
     o.by_identity = false
+    charge(object_payload(o))
     o
 
 // **A weak map is `new_object`'s twin under another kind**, and the two must be built alike: the
@@ -758,6 +899,7 @@ new_weak_map() -> *ObjectObj
     o.live = 0
     o.frozen = false
     o.by_identity = true
+    charge(object_payload(o))
     o
 
 new_weak_ref(target: Value) -> *WeakRefObj
@@ -772,6 +914,7 @@ new_closure(params: Buf[string], body: usize, scope: *EnvObj) -> *ClosureObj
     o.params = params
     o.body = body
     o.scope = scope
+    charge(closure_payload(o))
     o
 
 new_promise() -> *PromiseObj
@@ -797,3 +940,79 @@ new_env(parent: *EnvObj) -> *EnvObj
     o.mutable = map()
     o.parent = parent
     o
+
+// -- growing a payload ----------------------------------------------------------------------------
+//
+// **A container that GROWS is where the charge would otherwise be missed**, and missing it is the
+// same hole the constructors close wearing another hat: an array built by pushing a million elements
+// is one small cell whose `Buf` has quietly taken sixteen megabytes. Each of these measures the
+// capacity either side of the operation and charges the difference, which is nothing at all on the
+// pushes that fit in storage the buffer already had.
+//
+// **`pop`, `remove`, `truncate` and `clear` are NOT here and need nothing**, a `Buf` keeping its
+// storage when its count falls -- so a program that empties a buffer is still holding what it grew,
+// and saying otherwise would report pages that are still committed as free.
+
+// Append to a slate array.
+array_push(o: *ArrayObj, v: Value)
+    val was = o.items.cap()
+
+    o.items.push(v)
+    charge((o.items.cap() - was) * sizeof(Value))
+
+// Put a value at a position, moving everything from there on up one.
+array_insert(o: *ArrayObj, i: usize, v: Value)
+    val was = o.items.cap()
+
+    o.items.insert(i, v)
+    charge((o.items.cap() - was) * sizeof(Value))
+
+// Append one byte to a byte buffer.
+bytes_push(o: *BytesObj, b: u8)
+    val was = o.data.cap()
+
+    o.data.push(b)
+    charge(o.data.cap() - was)
+
+// Append a run of bytes to a byte buffer.
+bytes_extend(o: *BytesObj, bs: []const u8)
+    val was = o.data.cap()
+
+    o.data.extend(bs)
+    charge(o.data.cap() - was)
+
+// Hand a byte buffer's storage back, which is what `transfer` does to the sender's.
+//
+// **`clear` would not do it**: a `Buf` that is emptied keeps its storage, so a transferred buffer
+// would read as empty to the program while still holding every page it grew.
+bytes_release(o: *BytesObj)
+    credit(bytes_payload(o))
+    o.data = buf()
+
+// Append an entry to an object's table.
+entry_push(o: *ObjectObj, e: Entry)
+    val was = o.entries.cap()
+
+    o.entries.push(e)
+    charge((o.entries.cap() - was) * sizeof(Entry))
+
+// Note that an object's two buffers have been rebuilt, which is what a rehash does to them.
+object_recharged(o: *ObjectObj, was: usize)
+    recharge(was, object_payload(o))
+
+// Add a parked machine to what a promise will hand its answer to.
+waiter_push(o: *PromiseObj, id: usize)
+    val was = o.waiters.cap()
+
+    o.waiters.push(id)
+    charge((o.waiters.cap() - was) * sizeof(usize))
+
+// Give a promise the complaint it failed with.
+promise_says(o: *PromiseObj, message: string)
+    credit(o.message.bytes.len)
+    o.message = message
+    charge(o.message.bytes.len)
+
+// Note that a scope's tables have grown, which is what declaring a name into one may do.
+env_recharged(o: *EnvObj, was: usize)
+    recharge(was, env_payload(o))
