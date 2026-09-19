@@ -388,6 +388,158 @@ fifth of a second of Lua, start-up is under 1% of every figure but `strindex`'s.
 those two groups is exactly whether the work happens inside a builtin or inside the instruction loop
 -- which is what the profile below says in numbers.
 
+### An ordinary call stopped copying its arguments — shortlist item 11, half of it, 2026-09-19
+
+**EVERY CALL WITH AN ARGUMENT USED TO MALLOC.** `CallFn` copied each argument off the operand stack
+into a fresh `Buf`, truncated the stack, and `lay_frame` pushed the very same values back on — at the
+very cells they had just been standing in, because a frame's `base` *is* where the stack top is once
+the callee and its arguments have come off. So a slate-to-slate call cost one malloc, one free and two
+copies of every argument to move nothing anywhere.
+
+**The ordinary positional call now leaves them where they stand.** `in_place_call` in `execute.sysl`
+answers whether anything has to look at the arguments before the frame exists — a named call arranges
+them against the parameter list, a spread call has them in an array, a variadic callee gathers its
+surplus, an `async` or a generator carries them onto a machine of its own, and a chunk that is not
+`slotted` binds its parameters by name. Where none of those is true the whole of the move is taking the
+**callee** out from under its own arguments, one shift of `argc` cells; `lay_standing` then does what is
+left, which is dropping a surplus, padding the rest of the window and setting the mask.
+
+**A DELEGATED METHOD CALL MOVES NOTHING AT ALL.** The receiver is parameter zero and the target is
+already sitting directly under the written arguments, so `base` is where it stands and there is nothing
+to shift. A method found as the object's own field takes no receiver and is `CallFn`'s case again.
+
+**It is also SAFER rather than merely faster.** A `Value` in a sysl local is not a root (`CLAUDE.md`
+says why), and this path never takes one off the stack at all — where the buffered path holds the
+window open between `invoke` and `lay_frame` on purpose.
+
+Best of 5, under `caffeinate`, holding both locks, box at 93.6% idle. Both binaries built in this
+session from the two ends of one merge, so `dev` is **`c31e658`** and `call-args` is that tree with this
+change and nothing else on it. Milliseconds of process wall time.
+
+|  | dev `c31e658` | call-args | change | dev/lua | call-args/lua |
+|---|---|---|---|---|---|
+| fib | 2676.7 | **1887.1** | **-29.5%** | 33.4x | 24.3x |
+| funcs | 1352.2 | **1041.9** | **-22.9%** | 28.0x | 22.2x |
+| closures | 1099.3 | **867.0** | **-21.1%** | 24.0x | 20.9x |
+| nested | 1743.6 | **1427.4** | **-18.1%** | 13.4x | 11.1x |
+| methods | 2343.5 | **1932.5** | **-17.5%** | 17.2x | 14.1x |
+| dispatch | 1917.3 | **1605.1** | **-16.3%** | 21.6x | 17.9x |
+| options | 1730.6 | **1498.6** | **-13.4%** | 21.1x | 18.7x |
+| calls | 1384.1 | **1272.4** | **-8.1%** | 9.2x | 8.5x |
+| strings | 868.8 | 857.4 | -1.3% | 2.4x | 2.4x |
+| alloc | 1231.0 | 1216.6 | -1.2% | 7.5x | 7.7x |
+| arrays | 1217.2 | 1207.5 | -0.8% | 13.4x | 13.1x |
+| reals | 1235.6 | 1235.1 | 0.0% | 22.0x | 20.7x |
+| loops | 940.7 | 940.7 | 0.0% | 7.9x | 7.9x |
+| fields | 1186.7 | 1190.2 | *+0.3%* | 19.3x | 18.8x |
+| arith | 1211.6 | 1228.9 | *+1.4%* | 26.0x | 25.6x |
+| mapset | 799.7 | 811.7 | *+1.5%* | 45.0x | 48.3x |
+| csv | 567.1 | 577.3 | *+1.8%* | 1.9x | 1.9x |
+| globals | 2239.8 | 2300.0 | *+2.7%* | 23.1x | 22.4x |
+| sorting | 754.4 | 790.3 | *+4.8%* | 1.3x | 1.4x |
+| **geomean** | | | | **9.7x** | **9.0x** |
+
+Against `node --jitless` the mean went **7.8x to 7.2x** and against `python3` **5.3x to 4.9x**.
+
+**`fib` IS THE HONEST NANOSECOND FIGURE, BEING NOTHING BUT CALLS.** `fib(33)` makes 11,405,773 of
+them, so 2676.7 ms is **234.7 ns a call** and 1887.1 ms is **165.5 ns** — **69 ns off every ordinary
+positional call**, which is what one malloc, one free and two copies of one argument cost.
+
+**`calls` MOVES LEAST OF THE CALL BENCHMARKS AND THE REASON IS A FINDING.** Its loop makes two calls a
+turn — `c.bump(1)`, which takes the fast path, and `Counter(...)`, which does not: **a constructor call
+is an `Object` with a `new`, and `invoke` is what resolves that hook**, so it goes back to the buffered
+path and pays what it always did. Half the calls in that benchmark are still allocating, and closing it
+is a small piece of work on top of this one.
+
+**THE FIVE ROWS THAT ROSE HAVE NO MECHANISM AND ONE OF THEM MIGHT.** `arith`, `globals`, `loops`,
+`fields` and `reals` make no call this change can reach and moved within the band a code-layout shift
+moves things (the `map-keys` section above states that rule and it holds here). `mapset` and `sorting`
+are the two where a mechanism is *available*: both are builtin-dominated, and a builtin call now pays
+one extra `Option` match and one counter increment on its way to the same buffer. Lua's own `sorting`
+moved 564.7 to 568.6 and its `globals` 96.9 to 102.8 across the two passes, so the box drifted upward
+under the second one — but `sorting` is +4.8% against a control that moved +0.7%, and that is reported
+as a small real cost rather than as noise.
+
+#### THE BUILTIN HALF IS THE REST OF ITEM 11 AND IT IS A BIGGER PIECE OF WORK THAN IT LOOKS
+
+`NativeGo` is `&sync Fn(Buf[Value], Span) -> Step`, so **every builtin takes its arguments as a `Buf`
+by the shape of the registry**. Handing one a VIEW of the operand stack instead — a start index and a
+count, by index rather than by pointer, since a native that runs a callback pushes onto that same stack
+— would take the malloc away and make `call_native`'s hold/release rooting unnecessary, the stack being
+a root already. What it costs is the signature: **381 `register(...)` calls across 38 files and 1,083
+`args.at(...)`/`args.len()` sites**. That is not a mechanical edit and it is its own item.
+
+**`Vm.args_buffered` IS THE WITNESS AND IT IS A COUNT RATHER THAN A CLOCK**, which is
+`Vm.chars_scanned`'s reason: an argument buffer is sysl memory rather than the collected heap, so the
+allocator's own counters cannot see it and a benchmark can only say that a program got faster. Every
+call that takes the buffered path charges it and `calls_buffered()` reads it, so `tests_slots.sysl`
+asserts that ten thousand positional calls charge it **nothing** — and that a named call, a spread call,
+a variadic callee and a builtin each charge it once per call, which is the negative control that makes
+the first claim worth anything.
+
+### A module's blocks are asked whether they declare anything — shortlist item 2, `de4e7c4`
+
+Taken 2026-09-19 on this machine, both locks held, under `caffeinate`, box at 89.8% idle before and
+97.7% after. **Both binaries were built in this session from the two ends of one merge**: `dev` is
+**`c31e658`** — which already carries items 1, 4 and 8 — and `item 2` is that same tree with this
+change and nothing else on it.
+
+**THE NEIGHBOUR IS NAMED RATHER THAN WAITED OUT.** A `mimic` conformance run held one slate process at
+about a quarter of one core throughout, on an eighteen-core box that stayed above 89% idle. It is in
+both columns equally and the ratios against Lua, taken in the same passes, are what carries the
+reading.
+
+**The instruction counts are the evidence and they are exact.** A count is an increment where a time
+is a measurement, and this item's whole claim is visible in one pair of rows:
+
+| `globals.sl`, 6,000,000 turns | dev `c31e658` | item 2 |
+|---|---|---|
+| instructions | 126,000,020 | **114,000,020** |
+| instructions per loop turn | 21 | **19** |
+| `PushScope` | 6,000,000 | **0** |
+| `PopScope` | 6,000,000 | **0** |
+| allocator steps | 5,998,602 | **0** |
+| collections | 4,285 → 4,288 | **0** |
+| collector | 46,643 us | **0 us** |
+
+**The twelve million instructions that went are exactly the six million pairs**, which is checkable
+rather than asserted: 126,000,020 − 114,000,020 = 12,000,000, and no other kind moved by a single
+execution. **A loop at the top of a file now allocates nothing**, so the benchmark that ran four
+thousand collections for a body declaring no name runs none.
+
+**`arith` is the control and did not move** — 190,000,026 both sides — its loop being inside a
+function, where the question was already asked. `loops` and `nested` each lose 2,000 instructions and
+609 allocator steps, which is their thousand-turn module-level **setup** loop and nothing they
+measure.
+
+| wall clock, best of 5 | dev `c31e658` | item 2 | change | dev/lua | item 2/lua |
+|---|---|---|---|---|---|
+| globals | 2215.7 | **1888.5** | **-14.8%** | 21.8x | **18.1x** |
+| loops | 930.1 | 943.4 | *+1.4%* | 8.0x | 8.0x |
+| nested | 1741.1 | 1756.9 | *+0.9%* | 13.4x | 13.7x |
+| strindex | 11.3 | 11.3 | — | 4.6x | 4.8x |
+| strwalk | 13.0 | 13.2 | — | 0.1x | 0.1x |
+
+Those five are the only benchmarks with a loop at module level at all, and **`globals` is the only one
+whose module-level loop does any work**; the other four put theirs in a function and keep a thousand
+turns of setup outside it, which is why the counts move and the clocks do not.
+
+**Over the whole set, best of 3, run ITEM FIRST so the order favours the baseline** — a box that
+quietens across twenty minutes buys the second pass a few percent, and here the second pass is `dev`:
+
+| | against lua | against node --jitless | against python3 |
+|---|---|---|---|
+| dev `c31e658` | 9.5x | 7.8x | 5.3x |
+| item 2 | **9.5x** | **7.7x** | **5.3x** |
+
+**THE GEOMETRIC MEANS DO NOT MOVE AND THAT IS THE HONEST READING OF THIS ITEM, not a disappointment.**
+The shortlist said *`globals` only*, and it was right: one benchmark of twenty-two going 21.8x to
+17.6x (its whole-set figures) moves a mean of twenty-two rows by about a tenth of one, which rounds
+away. **What the item buys is not on this page's mean at all** — it is that every top-level script,
+which is what most slate programs are until they grow a function, stops paying a heap object and a
+collection schedule for every turn of every loop. `bench/` measures twenty-one programs written to
+put their work in functions; the ordinary script is the case with no benchmark.
+
 ## The profiler
 
 **`SLATE_PROFILE=1 slate program.sl` writes a report to stderr**, leaving stdout exactly as it was,
@@ -519,6 +671,10 @@ item 3.
 
 ### 3. A module-level loop allocates a scope every turn, and a function-level one allocates nothing
 
+**FIXED — see *A module's blocks are asked whether they declare anything* above.** The finding is kept
+because it is what the fix was chosen from, and because the shape of it recurs: a shortcut that reads
+"this chunk cannot be asked the question" where the truth was "this chunk answers it differently".
+
 `globals.sl` and `arith.sl` are the same loop at two levels:
 
 | | instructions | `PushScope` | allocator steps | collections | collector |
@@ -602,13 +758,13 @@ functions that have no defaults at all.
 
 ## The ranked shortlist for 0.0.58 and after
 
-Every line points at a number above. **Nothing here has been implemented** -- this release is the
-instruments.
+Every line points at a number above. **Four have landed since** — 1, 2, 4 and 8, each struck through
+with what it measured; the ranking of what is left is unchanged.
 
 | # | change | reach | kind |
 |---|---|---|---|
 | 1 | ~~**Stop emitting `PushNull`/`Discard` for a statement whose value nothing reads**~~ — **DONE, `fa327b6`**: 20.6% of all instructions gone, `arith` -24.0%, geometric mean against Lua 17.6x -> **16.4x** | measured above | INCREMENTAL |
-| 2 | **Fix the module-level loop's per-turn scope** (finding 3) | `globals` only -- but it is 6M allocations and 4,285 collections for nothing, and every top-level script pays it | INCREMENTAL, and possibly a defect |
+| 2 | ~~**Fix the module-level loop's per-turn scope**~~ — **DONE, `de4e7c4`**: it WAS a defect. A module has no cells, and the `scoped_*` questions read `!e.cells` as "do not ask" rather than as "this chunk binds by name"; a module's blocks are asked `block_declares` now, guarded by the one binding form an expression can hide (`Emit.tests_bind`). `globals` 6,000,000 `PushScope`/`PopScope` pairs, 5,998,602 allocator steps and 4,288 collections all to **zero**, -14.8% wall, 21.8x -> **18.1x** Lua. **The three geometric means do not move** — one benchmark of twenty-two — and the win is in every top-level script instead | measured above | INCREMENTAL, and it was a defect |
 | 3 | **Make `Tick` cheaper or rarer** -- a counter tested every N statements, or folded into the back edge of a loop rather than emitted per statement | 7.1% of all instructions | INCREMENTAL |
 | 4 | ~~**Cache a string's character count on the `StrObj`, and index from a cached cursor**~~ — **DONE, `7478d4b`**: the count is CARRIED rather than cached, so `.length` is O(1) always; `strindex` 980x -> **5.5x** Lua (190x faster), the new `strwalk` 30.3x -> **0.1x** (322x faster), geometric mean against Lua over the original twenty **17.4x -> 13.4x** by this item alone | measured above | INCREMENTAL |
 | 5 | **Resolve a module-level definition's call target at compile time** so `add3(...)` is not a `LoadName` (finding 7) | 2.7% of all instructions, 2.9% of `funcs`, all of `globals`'s 14.8% `LoadName` | INCREMENTAL |
@@ -617,7 +773,7 @@ instruments.
 | 8 | ~~**Make `Map`/`Set` cheaper for scalar keys**~~ — **DONE, `06b2b6c`**: the hook lookup was two mallocs a call and is gone; a table under nine entries has no index. `mapset` 53.9x -> **49.1x**, `alloc` -6.8%, `fields` -2.4% | measured above | INCREMENTAL |
 | 9 | **A register machine instead of a stack machine** -- `LoadSlot` is 18.0% and `PushInt` 8.6%, and most of both exist only to feed the next instruction | 26.6% of all instructions, and it would take most of 1, 3 and 5 with it | **STRUCTURAL -- not piecemeal** |
 | 10 | **A narrower `Value`, or NaN-boxing** | every instruction; nothing here measures it directly | **STRUCTURAL -- not piecemeal** |
-| 11 | **Make the BUILTIN CALL PATH cheaper** -- the argument `Buf` is a malloc per call, `Buf.at` retains and releases it on every read, and `methods_of` looks a method up by name every time | measured on `mapset` after item 8: ~208 ns of every turn is the loop and the call against ~49 ns of table work; `Buf.push`/`Buf.at`/`methods_of`/`call_native` are ~28% of that benchmark | INCREMENTAL, but it reaches `call_native`, `method.sysl` and `run_frames` together |
+| 11 | **Make the CALL PATH cheaper** -- the argument `Buf` is a malloc per call, `Buf.at` retains and releases it on every read, and `methods_of` looks a method up by name every time | measured on `mapset` after item 8: ~208 ns of every turn is the loop and the call against ~49 ns of table work; `Buf.push`/`Buf.at`/`methods_of`/`call_native` are ~28% of that benchmark | **HALF DONE, `call-args`**: the slate-to-slate half is below -- an ordinary positional call allocates nothing, 69 ns off every one of `fib`'s eleven million. **The BUILTIN half is still owed**, and the section below says what it would take |
 
 **THE RANKING BELOW ITEM 1 IS UNCHANGED, AND THE PROFILE THAT WOULD HAVE CHANGED IT DID NOT.** Item
 1 took away instructions and moved none, so every other line's absolute count is exactly what it

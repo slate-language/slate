@@ -41,11 +41,22 @@ private slot_count(program: string, name: string) -> usize
 end slot_count
 
 // How many scopes that chunk pushes at run time, read off the code itself.
+// **A NAME BELONGS TO TWO CHUNKS AND THE ANSWER IS THE LARGEST.** `compile_module` compiles a file
+// twice -- once whole and once as its declarations alone -- so a module has its own chunk beside a
+// declarations-only one holding a subset of its statements, and a top-level definition has two
+// chunks of one name that are copies of each other. Reading the FIRST match answers a module's
+// question about whichever of the two it met, which is the way a test of this kind rots without ever
+// going red; the declarations are a subset either way, so the largest count is the real one.
 private scope_pushes(program: string, name: string) -> usize
     out(program)
 
+    var most: usize = 0
+    var found = false
+
     for i in 0..<running_unit().chunks.len()
         if running_unit().chunks.at(i).name != name then continue
+
+        found = true
 
         val code = running_unit().chunks.at(i).code
         var n: usize = 0
@@ -55,10 +66,10 @@ private scope_pushes(program: string, name: string) -> usize
                 PushScope -> n += 1
                 _ -> ()
 
-        return n
+        if n > most then most = n
 
-    assert(false, s"no chunk is called `${name}`")
-    0
+    assert(found, s"no chunk is called `${name}`")
+    most
 end scope_pushes
 
 @test
@@ -369,3 +380,134 @@ A_break_POPS_EXACTLY_THE_SCOPES_THAT_WERE_PUSHED()
     // a pop too many makes fail.
     assert_eq(out(prog), "6")
 end A_break_POPS_EXACTLY_THE_SCOPES_THAT_WERE_PUSHED
+
+// -- what a call COSTS, which is the other thing a benchmark cannot say ----------------------------
+//
+// **An ordinary positional call leaves its arguments standing on the operand stack.** They are
+// already at the cells the callee's frame begins at, so the buffer a call used to copy them into --
+// one `malloc`, one free and two copies of every argument -- is not made at all. That is an
+// optimisation, so every question about what a program ANSWERS is green either way; `Vm.args_buffered`
+// is the instrument that is not.
+//
+// **It is a COUNT and it counts the SLOW path**, which is what makes each of these a claim with a
+// negative control beside it: the fast path is asserted to charge nothing, and the four shapes that
+// genuinely cannot take it are asserted to charge once per call. A change that quietly stopped taking
+// the fast path would make the first group fail, and one that took it where it must not would make
+// the second.
+
+// How many calls in that program copied their arguments into a buffer.
+//
+// **The program's own output is asserted rather than dropped**, which is what stops every test below
+// passing on a program that never compiled: a count of nothing looks exactly like a count of zero.
+private buffering(program: string, said: string) -> usize
+    val before = calls_buffered()
+    val printed = out(program)
+
+    assert_eq(printed, said)
+    calls_buffered() - before
+end buffering
+
+// How many calls each loop below makes. Large enough that the handful a program's own start-up makes
+// is noise against it.
+private const Calls: usize = 10000
+
+// What each loop adds up to, which is what says the program ran rather than being refused.
+private const Summed: string = "50005000"
+
+// The program's own start-up and its `print` are calls too, so "nothing" is a small constant rather
+// than a zero.
+private const Incidental: usize = 200
+
+// The tail every loop below shares: add to the running total, step, and say what it came to.
+private counted(step: string) -> string =
+    s"var total = 0\nvar i = 0\nwhile i < ${Calls}\n    total = total + ${step}\n    i = i + 1\nprint(total)"
+
+@test
+A_POSITIONAL_CALL_TO_A_SLOTTED_FUNCTION_COPIES_NO_ARGUMENTS()
+    val cost = buffering("add(a, b) = a + b\n" + counted("add(i, 1)"), Summed)
+
+    assert(cost < Incidental, s"${Calls} positional calls copied ${cost} argument lists")
+
+@test
+A_POSITIONAL_METHOD_CALL_COPIES_NO_ARGUMENTS_EITHER()
+    // The receiver is parameter zero of a method reached through its class, and it is already
+    // standing directly under the written arguments -- so this path moves nothing at all.
+    val cost = buffering("class Tally\n    var n = 0\n\n    add(self, by) = self.n + by\nval t = Tally.new(1)\n" + counted("t.add(i)"), Summed)
+
+    assert(cost < Incidental, s"${Calls} method calls copied ${cost} argument lists")
+
+@test
+A_NAMED_ARGUMENT_CALL_STILL_COPIES_ITS_ARGUMENTS()
+    // Which parameter a name fills is a question about the callee, so the arguments have to be
+    // arranged against its parameter list before there is a frame to put them in.
+    val cost = buffering("add(a, b = 1) = a + b\n" + counted("add(i, b = 1)"), Summed)
+
+    assert(cost >= Calls, s"${Calls} named calls copied only ${cost} argument lists")
+
+@test
+A_SPREAD_CALL_AND_A_VARIADIC_CALLEE_BOTH_STILL_COPY()
+    // A spread's arguments arrive in an array rather than on the stack, and a variadic callee's
+    // surplus is gathered into a fresh one -- two more things that have to be done to the arguments
+    // before the frame exists.
+    val spread = buffering("add(a, b) = a + b\n" + counted("add(...[i, 1])"), Summed)
+    val gathering = buffering("add(a, ...rest) = a + rest.length\n" + counted("add(i, 1)"), Summed)
+
+    assert(gathering >= Calls, s"${Calls} variadic calls copied only ${gathering} argument lists")
+    assert(spread >= Calls, s"${Calls} spread calls copied only ${spread} argument lists")
+
+@test
+A_BUILTIN_CALL_STILL_COPIES_ITS_ARGUMENTS()
+    // A builtin's arguments are a `Buf[Value]` by the shape of the registry, so it takes the buffered
+    // path and says so. **This is the one that is still owed the work**, and the count is what will
+    // say when it stops being.
+    val cost = buffering(counted("abs(0 - i)"), "49995000")
+
+    assert(cost >= Calls, s"${Calls} builtin calls copied only ${cost} argument lists")
+
+@test
+A_MODULE_LEVEL_LOOP_WHOSE_BODY_DECLARES_NOTHING_OPENS_NO_SCOPE()
+    // **THE SAME RULE ASKED OF A MODULE, WHICH IS WHERE IT WAS NEVER ASKED AT ALL.** A module keeps
+    // every name in its scope -- an import reads them by name -- so it has no cells, and the
+    // question each `scoped_*` used to open with read that as "do not ask" rather than as "this
+    // chunk binds by name". A loop body that declares nothing therefore built an `EnvObj`, wrote
+    // nothing into it and threw it away, once a turn, in every file's top level.
+    val prog = "var total = 0\nvar i = 0\n\nwhile i < 3\n    total = total + i\n    i = i + 1\n\nprint(total)"
+
+    assert_eq(scope_pushes(prog, "t"), 0)
+    assert_eq(out(prog), "3")
+end A_MODULE_LEVEL_LOOP_WHOSE_BODY_DECLARES_NOTHING_OPENS_NO_SCOPE
+
+@test
+A_MODULE_LEVEL_LOOP_THAT_BINDS_A_NAME_STILL_OPENS_ONE_PER_TURN()
+    // **The other side of it, and the one a program can SEE.** A closure made in a loop captures the
+    // scope the turn is standing in, so a name bound per turn has to have a scope of its own per
+    // turn -- which is JavaScript's `let` and is what these six answers are. A body that declares,
+    // and a head that binds, each open one.
+    val prog = "var fs = []\nvar i = 0\n\nwhile i < 3\n    val n = i\n    push(fs, () -> n)\n    i = i + 1\n\nvar gs = []\n\nfor k in 0..<3\n    push(gs, () -> k)\n\nprint([fs[0](), fs[1](), fs[2](), gs[0](), gs[1](), gs[2]()])"
+
+    assert_eq(scope_pushes(prog, "t"), 2)
+    assert_eq(out(prog), "[0, 1, 2, 0, 1, 2]")
+end A_MODULE_LEVEL_LOOP_THAT_BINDS_A_NAME_STILL_OPENS_ONE_PER_TURN
+
+@test
+AN_is_WHOSE_PATTERN_BINDS_KEEPS_EVERY_SCOPE_IN_THE_CHUNK_IT_IS_WRITTEN_IN()
+    // **`v is n` BINDS INTO THE SCOPE THE MATCH IS RUNNING IN, AND IT IS AN EXPRESSION** -- so
+    // reading a block's STATEMENTS says nothing about it, and a block that stopped pushing would
+    // land that binding one level out, over an outer name of the same spelling. `Emit.tests_bind` is
+    // the chunk-wide answer, and a chunk holding one keeps the scopes it always kept.
+    //
+    // **The failure is silent and is the printed `99`**: without the guard the loop body opens
+    // nothing, `n` is rebound at module level twice, and the last line says `1`.
+    val binds = "val n = 99\nvar i = 0\n\nwhile i < 2\n    i is n\n    i = i + 1\n\nprint(n)"
+
+    assert_eq(scope_pushes(binds, "t"), 1)
+    assert_eq(out(binds), "99")
+
+    // **And a bare name is a binding only where nothing declares a type of that name**, so the
+    // control is the same loop testing against something that is LOOKED UP. Nothing binds, nothing
+    // is kept, and the body opens no scope at all.
+    val looks_up = "val n = 99\nvar i = 0\n\nwhile i < 2\n    i is integer\n    i = i + 1\n\nprint(n)"
+
+    assert_eq(scope_pushes(looks_up, "t"), 0)
+    assert_eq(out(looks_up), "99")
+end AN_is_WHOSE_PATTERN_BINDS_KEEPS_EVERY_SCOPE_IN_THE_CHUNK_IT_IS_WRITTEN_IN

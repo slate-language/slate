@@ -430,3 +430,124 @@ A_CLOSURE_MADE_IN_A_LOOP_SEES_THE_TURN_IT_WAS_MADE_ON()
         map(out, (f) -> f())
 
     assertEq(made([1, 2, 3]), [11, 12, 13])
+
+// -- where a call's arguments actually go ----------------------------------------------------------
+//
+// **An ordinary positional call leaves its arguments standing on the operand stack**, at the very
+// cells the callee's frame begins at, so nothing is copied out of the stack and nothing is copied
+// back onto it. Each shape below is a way that could be wrong while an ordinary call still looked
+// right: a receiver that is parameter zero, a receiver that is not one at all, a surplus with nowhere
+// to go, an argument list the names rearrange, and a fault that has to leave the caller's stack where
+// the caller left it.
+
+// A value whose type nobody wrote down, so a call through it reaches the machine rather than the
+// checker.
+loosely(v) = v
+
+shared(a, b) = a * 10 + b
+
+class Tally
+    var n = 0
+
+    // Reached through the class, which is a proto of the instance -- so the object is handed over as
+    // parameter zero.
+    add(self, by, again = 0) = self.n + by + again
+
+class Holder
+    // A function stored on the instance itself, which takes no receiver: it has already captured
+    // whatever it needs, there being one of it per instance.
+    var run = shared
+
+@test
+A_METHOD_REACHED_THROUGH_ITS_CLASS_IS_HANDED_THE_OBJECT_AS_PARAMETER_ZERO()
+    val t = Tally.new(5)
+
+    assertEq(t.add(1), 6)
+    assertEq(t.add(1, 2), 8)
+
+    // A surplus through a method is dropped exactly as it is through a plain call, and the receiver
+    // is still where the callee expects it afterwards.
+    assertEq(loosely(t).add(1, 2, 99), 8)
+    assertEq(t.add(1), 6)
+
+@test
+A_FUNCTION_AN_OBJECT_CARRIES_ITSELF_IS_CALLED_WITHOUT_THE_OBJECT()
+    val h = Holder.new()
+
+    assertEq(h.run(1, 2), 12)
+
+    // The same function reached as a plain name answers the same, which is what says the object was
+    // not quietly pushed in front of the arguments.
+    assertEq(shared(1, 2), 12)
+
+@test
+A_CONSTRUCTOR_CALL_IS_AN_ORDINARY_CALL_OF_THE_GENERATED_new()
+    assertEq(Tally.new(7).n, 7)
+    assertEq(Tally(7).n, 7)
+    assertEq(Tally().n, 0)
+
+@test
+A_CONTRACT_READS_THE_ARGUMENTS_THE_CALL_ACTUALLY_PUT_DOWN()
+    stepped(n, by = 1)
+        require n > 0
+        ensure result >= 0
+
+        n - by
+
+    assertEq(stepped(5), 4)
+    assertEq(stepped(5, 2), 3)
+    assertEq((stepped(0)) catch e -> e.message, "`stepped` requires `n > 0`, and this call does not meet it")
+    assertEq((stepped(1, 9)) catch e -> e.message, "`stepped` ensures `result >= 0`, and gave back -8")
+
+    // The frame still works after a clause refused one, which is what says the stack was cut back to
+    // the right cell.
+    assertEq(stepped(5), 4)
+
+@test
+NAMED_POSITIONAL_AND_SPREAD_CALLS_OF_ONE_FUNCTION_ALL_AGREE()
+    three(a, b = 2, c = 3) = [a, b, c]
+
+    assertEq(three(1), [1, 2, 3])
+    assertEq(three(1, 9), [1, 9, 3])
+    assertEq(three(1, c = 9), [1, 2, 9])
+    assertEq(three(...[1, 9, 8]), [1, 9, 8])
+    assertEq(three(...[4]), [4, 2, 3])
+
+    // Interleaved, so a path that left the stack one cell out would show up on the call after it
+    // rather than on its own.
+    assertEq([three(1), three(1, c = 9), three(...[4]), three(5, 6)], [[1, 2, 3], [1, 2, 9], [4, 2, 3], [5, 6, 3]])
+
+@test
+A_FAULT_INSIDE_A_CALLEE_LEAVES_THE_CALLERS_STACK_WHERE_IT_WAS()
+    // The caller is part way through an expression when the callee fails, so what it has already
+    // computed is standing on the stack and the `catch` has to cut back past all of it.
+    blows(n)
+        if n > 2
+            throw "too big"
+
+        n
+
+    tryish(n)
+        var seen = 0
+
+        try
+            seen = 1 + blows(n) + blows(n + 1) + blows(n + 2)
+        catch e
+            seen = -1
+
+        seen
+
+    assertEq(tryish(0), 4)
+    assertEq(tryish(1), -1)
+    assertEq(tryish(5), -1)
+
+    // And the frame still answers afterwards, which is what says the cut landed on the right cell.
+    assertEq(tryish(0), 4)
+
+@test
+A_DEEP_RECURSION_UNWINDS_TO_EXACTLY_WHERE_IT_STARTED()
+    descend(n, acc = 0) = if n == 0 then acc else descend(n - 1, acc + n)
+
+    assertEq(descend(500), 125250)
+    assertEq(descend(1), 1)
+    assertEq(descend(500), 125250)
