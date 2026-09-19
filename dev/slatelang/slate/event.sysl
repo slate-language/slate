@@ -76,6 +76,22 @@ struct Pending
     // and every lookup misses. It is never reused and never reset.
     gen: usize
 
+    // **WHICH HANDLE THIS ONE CAME OUT OF, as a generation, and its own where it came out of
+    // nothing.** A connection a server accepts is the case: a listener is asked for connections once
+    // and answers for as long as it is open, so a slot for one is claimed whenever a client happens to
+    // dial -- which under `slate test` is inside whichever test was running. The connection belongs to
+    // whoever opened the listener all the same.
+    //
+    // Read against a scope's own generation, it says whether a handle is that scope's: one whose owner
+    // is older than the scope is something the scope came across rather than opened, so its drain does
+    // not wait for it and `leaked_since` neither names nor closes it. Taking a connection for a
+    // `@setupAll`'s server as a test's own is what made that test wait five seconds for a handle it
+    // never asked for, report it as its leak, and close it under every test still to come.
+    //
+    // `inherit_scope` sets it, and passes an owner's owner along so that a chain of handles is
+    // attributed to the one thing at the bottom of it.
+    owner_gen: usize
+
 // Everything the loop may still call is `current().pending`, how many callbacks are still owed is
 // `current().outstanding`, and the number the next claim will stamp its slot with is
 // `current().generation`. See `Pending.gen`, and `vm_state.sysl` for why the three are fields of the
@@ -159,6 +175,7 @@ reset_events()
     // -- and letting it carry over would make a socket's printed name a function of the suite's
     // order.
     current().generation = 0
+    current().scope_gen = 0
     current().loop_fault = None
 
 // Take a slot, reusing a spent one where there is one.
@@ -173,6 +190,10 @@ claim(p: Pending) -> usize
     v.generation += 1
     slot.gen = v.generation
 
+    // A handle owns itself until something says it came out of another one, which only `inherit_scope`
+    // ever does.
+    slot.owner_gen = v.generation
+
     for i in 0..<v.pending.len()
         if !v.pending.at(i).live
             v.pending.set(i, slot)
@@ -183,6 +204,50 @@ claim(p: Pending) -> usize
     v.outstanding += 1
     v.pending.len() - 1
 end claim
+
+// Say that the handle in `id` came out of the one in `owner`, so that what `owner` belongs to is what
+// it belongs to. See `Pending.owner_gen`.
+//
+// **A connection a server accepted is the whole of this**, and the rule it states is that a listener's
+// connections are the listener's: a test that opened one owns what it hands out, and a file that
+// opened one in its `@setupAll` owns those for the whole file. `owner`'s own owner is what is passed
+// along, so a listener that was itself inherited hands that on rather than claiming the connection
+// for the scope it was accepted in.
+inherit_scope(owner: usize, id: usize)
+    val v = current()
+
+    if owner >= v.pending.len() || id >= v.pending.len() then return
+
+    var slot = v.pending.at(id)
+
+    slot.owner_gen = v.pending.at(owner).owner_gen
+    v.pending.set(id, slot)
+end inherit_scope
+
+// How many live slots this scope claimed on behalf of something older than it -- connections a
+// listener from below handed over while this scope was current. A drain down to a floor may not wait
+// for these, they being nothing this scope can close.
+//
+// **Only the ones claimed HERE**, which is what `gen > scope_gen` says. One claimed during an earlier
+// test is already under this scope's floor, and counting it again would lift the floor past a handle
+// this scope really did open.
+private inherited_here() -> usize
+    val v = current()
+
+    // **A whole program is one scope with nothing below it**, so nothing in it can be owned from
+    // outside and this is the answer without a walk. It matters: a server's own drain is the whole of
+    // its running, and the table it would otherwise walk every turn is one entry per open connection.
+    if v.scope_gen == 0 then return 0
+
+    var n: usize = 0
+
+    for i in 0..<v.pending.len()
+        val slot = v.pending.at(i)
+
+        if slot.live && slot.gen > v.scope_gen && slot.owner_gen <= v.scope_gen then n += 1
+
+    n
+end inherited_here
 
 // Which occupant of a slot is in it now. `0` for a slot that has never been claimed, which no live
 // id can carry -- `generation` counts from one.
@@ -309,7 +374,7 @@ begin_request() -> usize
 
     hold(Promise(pr))
 
-    val id = claim(Pending(Null, Null, pr, None, None, true, false, 0))
+    val id = claim(Pending(Null, Null, pr, None, None, true, false, 0, 0))
 
     release(mark)
     id
@@ -480,7 +545,7 @@ set_timer(cb: Value, ms: long, repeating: bool, at: Span) -> Step
     libuv.timer(event_loop()) match
         Err(e) -> fault(at, s"this timer could not be made: ${e}")
         Ok(t) ->
-            val id = claim(Pending(cb, Null, null, Some(t), None, true, repeating, 0))
+            val id = claim(Pending(cb, Null, null, Some(t), None, true, repeating, 0, 0))
 
             // **The closure captures the id and not the value**, which is the whole arrangement: the
             // collector cannot see through this box, so what it holds must be something the collector
@@ -508,7 +573,7 @@ sleep_promise(ms: long, at: Span) -> Step
 
             hold(Promise(pr))
 
-            val id = claim(Pending(Null, Null, pr, Some(t), None, true, false, 0))
+            val id = claim(Pending(Null, Null, pr, Some(t), None, true, false, 0, 0))
 
             release(mark)
 
@@ -555,7 +620,11 @@ leaked_since(gen_floor: usize) -> string
     for i in 0..<current().pending.len()
         val slot = current().pending.at(i)
 
-        if slot.live && slot.gen > gen_floor
+        // **A handle owned from below is not this scope's to name or to close.** A connection a
+        // `@setupAll`'s server accepted while this test ran was claimed after the floor and is the
+        // file's, and closing it here would take it away from every test still to come. See
+        // `Pending.owner_gen`.
+        if slot.live && slot.gen > gen_floor && slot.owner_gen > gen_floor
             named.push(leak_description(slot))
             surrender(i)
 
@@ -675,11 +744,17 @@ drain_events_to(floor: usize, bounded: bool) -> Result[unit, Signal]
                 return Err(s)
             None -> ()
 
-        if current().outstanding <= floor then break
+        // **What this drain is owed is the floor plus whatever it took on for somebody else.** A
+        // connection this scope's turns accepted for a listener a lower one opened is claimed here
+        // and belongs there, so it lifts the floor for as long as it is live -- read every turn,
+        // because a turn of the loop is exactly when another one can arrive. See `Pending.owner_gen`.
+        val owed = floor + inherited_here()
+
+        if current().outstanding <= owed then break
 
         if bounded && libuv.hrtime() - started > backstop_ms * 1000000
             close_watchdog(watchdog)
-            return Err(failure(point(0), s"the event loop did not drain: ${current().outstanding - floor} handle(s) still open after ${backstop_ms}ms"))
+            return Err(failure(point(0), s"the event loop did not drain: ${current().outstanding - owed} handle(s) still open after ${backstop_ms}ms"))
 
         // **A turn reporting nothing active does NOT end the drain, and thinking it did cost a
         // working file system.** A timer is a handle and libuv counts it, so a loop with one
