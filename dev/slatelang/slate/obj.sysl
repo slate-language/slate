@@ -142,8 +142,28 @@ heap_in_use() -> usize = gc.live_size(slate_heap()) + current().payload
 // caller that squirrels a second copy away somewhere would break exactly that, which is why nothing
 // in slate holds a sysl `string` for a slate string value: a `Value` holds a `*StrObj` and nothing
 // else.
+// **THE CELL CARRIES THE CHARACTER COUNT, AND IT IS NEVER WORKED OUT TWICE.** A slate position is a
+// character and the bytes are UTF-8, so `s.length` and `s[i]` used to walk the string every time
+// they were asked -- which makes an ordinary left-to-right read quadratic. The count is written when
+// the cell is made and a string is immutable, so it can never go stale.
+//
+// **`chars == s.bytes.len` IS THE TEST FOR "EVERY CHARACTER IS ONE BYTE"**, and that falls out of
+// keeping the count rather than costing a flag of its own. For such a string a character position
+// *is* a byte offset, so indexing and slicing are arithmetic.
+//
+// **The cursor is the answer for a string that is NOT all one-byte**: the last position asked about
+// and the byte offset it landed on, so a walk forwards or backwards costs the distance from the last
+// question rather than the distance from the start. `(0, 0)` is what a zeroed cell holds and is also
+// the right answer for character zero, so there is no sentinel and nothing to initialise.
+//
+// **It is mutable state on an immutable value and it needs no lock.** A string never crosses a
+// thread by reference -- an actor message copies every value into the receiving heap -- so the only
+// writer of a cell's cursor is the one VM that can reach it.
 struct StrObj
     s: string
+    chars: usize
+    cursor_char: usize
+    cursor_byte: usize
 
 // A slate array. Its elements are `Value`s, which is what `trace` walks.
 struct ArrayObj
@@ -856,12 +876,33 @@ end alloc_or_collect
 // **Each of these charges what it was handed**, the object becoming the owner of storage that was a
 // caller's local a moment ago. The mutators below charge what a regrow took; between them that is
 // every byte a slate value holds outside the heap.
-new_str(s: string) -> *StrObj
+// **THE COUNT IS A PARAMETER SO THAT NO CALLER CAN FORGET IT**, which is why there is no
+// `new_str(s)` to reach for: a string's length is O(1) only if every cell that is ever made carries
+// the number, and a constructor that worked it out itself would scan text whose count the caller
+// already knew. Nearly every string a program makes is derived from one it already had --
+// concatenation adds two counts, a slice subtracts two positions, `repeat` multiplies -- and the
+// count travels with it for nothing.
+//
+// `chars` must be the number of characters `s` holds. It is the caller's claim and nothing checks
+// it, exactly as `new_array`'s `Buf` is; `new_str_scanned` is the way to say "I do not know".
+//
+// **The cursor starts at the front**, which is where a zeroed cell already is.
+new_str_counted(s: string, chars: usize) -> *StrObj
     var o: *StrObj = ptr_cast(alloc_or_collect(sizeof(StrObj), &str_kind, ptr_cast(current().spare_str)))
 
     o.s = s
+    o.chars = chars
+    o.cursor_char = 0
+    o.cursor_byte = 0
     charge(str_payload(o))
     o
+
+// A string whose count nobody knows, which is one walk of the bytes.
+//
+// **This is for text arriving from OUTSIDE the machine** -- a file, a socket, a child's output,
+// decoded bytes, a database column -- where nothing upstream counted anything. Everywhere else the
+// count is already in hand and `new_str_counted` is what says so.
+new_str_scanned(s: string) -> *StrObj = new_str_counted(s, char_count(s))
 
 new_array(items: Buf[Value]) -> *ArrayObj
     var o: *ArrayObj = ptr_cast(alloc_or_collect(sizeof(ArrayObj), &array_kind, ptr_cast(current().spare_array)))

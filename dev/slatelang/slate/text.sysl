@@ -32,13 +32,118 @@ import sysl.text.{Search, char_indices, chars_of, from_utf8, from_utf8_unchecked
 //
 // **Bytes that are not text count as the one replacement character a walk would hand back**, so this
 // agrees with what `chars` produces rather than with the byte length.
-char_count(s: string) -> usize = chars_of(s.bytes).count()
+//
+// **THIS IS THE SLOW ANSWER AND IS FOR TEXT NOBODY HAS COUNTED YET.** A string a program holds
+// carries its count on the cell (`StrObj.chars`), so `str_count` is what every builtin asks; this is
+// what makes that number in the first place, and every byte it reads is charged to `scanned`.
+char_count(s: string) -> usize
+    scanned(s.bytes.len)
+    chars_of(s.bytes).count()
 
-// The byte offsets a run of characters occupies.
+// -- the cell's own count, and the cursor that walks a string that is not all one-byte -------------
+//
+// **A POSITION IS A CHARACTER AND THE STORAGE IS UTF-8, so something has to turn one into the
+// other.** These are the four functions that do it, and the point of every one of them is that it
+// reads the count the cell already carries rather than walking the text again.
+
+// How many characters a string holds, off the cell. This is `s.length`.
+str_count(o: *StrObj) -> usize = o.chars
+
+// Whether every character in the string is a single byte, in which case a character position and a
+// byte offset are the same number. **This is the case nearly every program is in**, and it costs a
+// comparison rather than a flag because the count is already there.
+str_one_byte(o: *StrObj) -> bool = o.chars == o.s.bytes.len
+
+// The byte offset character `i` begins at, with the count itself answering the end of the string.
+//
+// **A string that is not all one-byte is walked from the CURSOR**, which is the last position this
+// cell was asked about -- so reading such a string left to right costs one step per character
+// however long the string is, where walking from the front every time is the square of its length.
+//
+// **THE CURSOR IS FORWARD-ONLY, AND THAT IS A CORRECTNESS DECISION RATHER THAN AN OMISSION.** The
+// walk has to agree with `char_count`, which is `sysl.text`'s decoder -- and that decoder counts a
+// run of bytes that are not text as ONE character per maximal ill-formed subsequence, a rule with
+// no reverse: stepping back over continuation bytes answers the right position for well-formed
+// UTF-8 and a different one for text that arrived broken from a file or a socket. So a position
+// behind the cursor is walked from the front, with the same iterator that did the counting, and the
+// two can never come to disagree about where a character begins. A one-byte string is O(1) in both
+// directions, which is what nearly every program is reading.
+str_byte_at(o: *StrObj, i: usize) -> usize
+    if i >= o.chars then return o.s.bytes.len
+    if str_one_byte(o) then return i
+
+    val bytes = o.s.bytes
+    val behind = i < o.cursor_char
+    val from = if behind then 0 else o.cursor_byte
+    var n = if behind then 0 else o.cursor_char
+    var at = from
+
+    for entry in char_indices(bytes[from..])
+        if n == i
+            at = from + entry.0
+            break
+
+        n += 1
+
+    scanned(at - from)
+    o.cursor_char = i
+    o.cursor_byte = at
+    at
+end str_byte_at
+
+// The byte offsets a run of characters occupies, off the cell.
+str_byte_span(o: *StrObj, from: usize, to: usize) -> (usize, usize)
+    val lo = str_byte_at(o, from)
+
+    (lo, str_byte_at(o, to))
+
+// The characters a run of them is, off the cell. The answer's own count is the difference between
+// the two positions, so nothing counts it again.
+str_slice(o: *StrObj, from: usize, to: usize) -> Value
+    if to <= from then return str_counted("", 0)
+
+    val hi = if to > o.chars then o.chars else to
+
+    if from >= hi then return str_counted("", 0)
+
+    val span = str_byte_span(o, from, hi)
+
+    str_counted(from_utf8_unchecked(o.s.bytes[span.0..<span.1]), hi - from)
+end str_slice
+
+// The text of one character, for a caller assembling a string out of several -- where `str_slice`
+// would make a cell per character that nothing keeps.
+str_char_text(o: *StrObj, i: usize) -> string
+    val a = str_byte_at(o, i)
+    val b = str_byte_at(o, i + 1)
+
+    if b <= a then "" else from_utf8_unchecked(o.s.bytes[a..<b])
+
+// Which character a byte offset falls on, off the cell -- for turning a byte search's answer into a
+// position a program can use.
+str_char_at_byte(o: *StrObj, b: usize) -> usize
+    if str_one_byte(o) then return if b > o.chars then o.chars else b
+
+    var n: usize = 0
+
+    for entry in char_indices(o.s.bytes)
+        if entry.0 >= b then break
+
+        n += 1
+
+    scanned(if b > o.s.bytes.len then o.s.bytes.len else b)
+    n
+end str_char_at_byte
+
+// The byte offsets a run of characters occupies, for text that is not a slate string and so has no
+// cell to read a count off -- a rendered number, a filler, a piece of a diagnostic. **A slate string
+// goes through `str_byte_span`**, which costs the distance rather than the length.
 //
 // Either end past the last character lands at the end of the string, which is what a slice of a
 // range running off the end means and is what keeps this out of the business of refusing one.
 char_span(s: string, from: usize, to: usize) -> (usize, usize)
+    scanned(s.bytes.len)
+
     var lo = s.bytes.len
     var hi = s.bytes.len
     var i: usize = 0
@@ -61,17 +166,17 @@ char_slice(s: string, from: usize, to: usize) -> string
     from_utf8_unchecked(s.bytes[span.0..<span.1])
 end char_slice
 
-// Which character a byte offset falls on, for turning a search's answer into one a program can use.
-private char_of_byte(s: string, b: usize) -> usize
-    var n: usize = 0
+// The bytes the routines above have walked over, which is what says an ordinary character walk is
+// linear in the length of the string rather than quadratic.
+//
+// **It is a COUNT and not a time, which is what makes it testable.** A benchmark says a program got
+// faster and cannot say why; this says how much text was read to answer the questions the program
+// asked, and a test can assert a bound on it.
+private scanned(n: usize)
+    current().chars_scanned += n
 
-    for entry in char_indices(s.bytes)
-        if entry.0 >= b then return n
-
-        n += 1
-
-    n
-end char_of_byte
+// Not `private`: the suite asserts a bound on it, and nothing else reads it.
+bytes_scanned() -> usize = current().chars_scanned
 
 // -- what a program calls: text --------------------------------------------------------------------
 
@@ -80,6 +185,15 @@ end char_of_byte
 text_of(v: Value, at: Span, name: string, which: string) -> Result[string, Signal]
     v match
         Str(p) -> Ok(p.s)
+        other -> Err(failure(at, s"`${name}` takes ${which}, and this is ${other.type_name()}"))
+
+// The same check answering the CELL rather than its text, for a builtin that counts or cuts by
+// character: the count and the cursor are on the cell, and a builtin that took the string alone
+// would have thrown both away.
+// Not `private`: `case.sysl` trims by character and asks it too.
+str_cell(v: Value, at: Span, name: string, which: string) -> Result[*StrObj, Signal]
+    v match
+        Str(p) -> Ok(p)
         other -> Err(failure(at, s"`${name}` takes ${which}, and this is ${other.type_name()}"))
 
 // Not `private`, for `text_of`'s reason: every builtin checks its count the same way.
@@ -94,15 +208,31 @@ wants(args: Buf[Value], n: usize, at: Span, name: string, what: string) -> Resul
 do_chars(args: Buf[Value], at: Span) -> Step
     wants(args, 1, at, "chars", "one string")?
 
-    val s = text_of(args.at(0), at, "chars", "a string")?
+    // **One walk of the bytes and one character out of each step**, where this used to ask twice per
+    // character which character a byte offset was -- two walks of the whole string per character, so
+    // `chars` of a long text was the square of its length before its first piece was made.
+    val o = str_cell(args.at(0), at, "chars", "a string")?
+    val bytes = o.s.bytes
     val mark = root_mark()
     var items: Buf[Value] = buf()
+    var start: usize = 0
+    var started = false
 
-    for entry in char_indices(s.bytes)
-        val one = str_value(char_slice(s, char_of_byte(s, entry.0), char_of_byte(s, entry.0) + 1))
+    for entry in char_indices(bytes)
+        if started
+            val one = str_counted(from_utf8_unchecked(bytes[start..<entry.0]), 1)
 
-        hold(one)
-        items.push(one)
+            hold(one)
+            items.push(one)
+
+        start = entry.0
+        started = true
+
+    if started
+        val last = str_counted(from_utf8_unchecked(bytes[start..<bytes.len]), 1)
+
+        hold(last)
+        items.push(last)
 
     val made = Array(new_array(items))
 
@@ -117,7 +247,8 @@ end do_chars
 do_split(args: Buf[Value], at: Span) -> Step
     wants(args, 2, at, "split", "a string and a separator")?
 
-    val s = text_of(args.at(0), at, "split", "a string")?
+    val o = str_cell(args.at(0), at, "split", "a string")?
+    val s = o.s
     val sep = text_of(args.at(1), at, "split", "a separator")?
 
     // **An empty separator splits into characters**, and hands the work to the builtin that already
@@ -133,8 +264,13 @@ do_split(args: Buf[Value], at: Span) -> Step
     val parts = split(s, sep)
     var items: Buf[Value] = buf()
 
+    // **A piece of a one-byte string is one byte a character too**, so its count is its byte length
+    // and nothing walks it. Where the text is not, each piece is counted on its own -- which over
+    // all the pieces is one walk of the string, the same as before.
+    val plain = str_one_byte(o)
+
     for i in 0..<parts.len
-        val one = str_value(parts[i])
+        val one = if plain then str_counted(parts[i], parts[i].bytes.len) else str_value(parts[i])
 
         hold(one)
         items.push(one)
@@ -149,18 +285,33 @@ end do_split
 do_join(args: Buf[Value], at: Span) -> Step
     wants(args, 2, at, "join", "an array and a separator")?
 
-    val sep = text_of(args.at(1), at, "join", "a separator")?
+    val sepc = str_cell(args.at(1), at, "join", "a separator")?
+    val sep = sepc.s
 
     args.at(0) match
         Array(a) ->
             var out = str_builder()
 
+            // **The answer's count is the sum of the pieces' and the separators'**, which costs
+            // nothing: a piece that is already a string carries its own, and one that had to be
+            // rendered is counted where it is made rather than by a walk of the whole answer.
+            var n: usize = 0
+
             for i in 0..<a.items.len()
-                if i > 0 then out.push(sep)
+                if i > 0
+                    out.push(sep)
+                    n += sepc.chars
 
-                out.push(printed(a.items.at(i), at)?)
+                val piece = a.items.at(i)
+                val text = printed(piece, at)?
 
-            Ok(str_value(out.finish()))
+                n += piece match
+                    Str(p) -> p.chars
+                    _ -> char_count(text)
+
+                out.push(text)
+
+            Ok(str_counted(out.finish(), n))
         other -> fault(at, s"`join` takes an array, and this is ${other.type_name()}")
 end do_join
 
@@ -187,9 +338,10 @@ do_index_of(args: Buf[Value], at: Span, last: bool) -> Step
     if args.len() != 2 && args.len() != 3
         return fault(at, s"`${name}` takes a string, what to look for and an optional position, and was given ${counted(args.len(), "argument")}")
 
-    val s = text_of(args.at(0), at, name, "a string")?
+    val o = str_cell(args.at(0), at, name, "a string")?
+    val s = o.s
     val sub = text_of(args.at(1), at, name, "what to look for")?
-    val n = char_count(s)
+    val n = o.chars
 
     // **Given no position a forward search starts at the beginning and a backward one at the end**,
     // which is what the two-argument form has always meant and is why the default is not one number.
@@ -205,8 +357,8 @@ do_index_of(args: Buf[Value], at: Span, last: bool) -> Step
 
         val start = if asked > long(n) then n else usize(asked)
 
-        find_backward(s.bytes, sub.bytes, char_span(s, start, n).0) match
-            Some(b) -> Ok(Int(long(char_of_byte(s, b))))
+        find_backward(s.bytes, sub.bytes, str_byte_at(o, start)) match
+            Some(b) -> Ok(Int(long(str_char_at_byte(o, b))))
             None -> Ok(Null)
     else
         // Past the end there is nothing at or after it.
@@ -214,8 +366,8 @@ do_index_of(args: Buf[Value], at: Span, last: bool) -> Step
 
         val start = if asked < 0 then 0 else usize(asked)
 
-        find_forward(s.bytes, sub.bytes, char_span(s, start, n).0) match
-            Some(b) -> Ok(Int(long(char_of_byte(s, b))))
+        find_forward(s.bytes, sub.bytes, str_byte_at(o, start)) match
+            Some(b) -> Ok(Int(long(str_char_at_byte(o, b))))
             None -> Ok(Null)
 end do_index_of
 
@@ -352,13 +504,32 @@ do_edge(args: Buf[Value], at: Span, start: bool) -> Step
 do_replace(args: Buf[Value], at: Span) -> Step
     wants(args, 3, at, "replace", "a string, what to replace, and what to put there")?
 
-    val s = text_of(args.at(0), at, "replace", "a string")?
-    val old = text_of(args.at(1), at, "replace", "what to replace")?
-    val new = text_of(args.at(2), at, "replace", "what to put there")?
+    val subject = str_cell(args.at(0), at, "replace", "a string")?
+    val s = subject.s
+    val gone = str_cell(args.at(1), at, "replace", "what to replace")?
+    val old = gone.s
+    val put = str_cell(args.at(2), at, "replace", "what to put there")?
+    val new = put.s
 
     if old == "" then return fault(at, "`replace` cannot replace the empty string -- there is one of it between every pair of characters")
 
-    Ok(str_value(replace_all(s, old, new)))
+    val made = replace_all(s, old, new)
+
+    // **A replacement of the same LENGTH leaves the count alone however many there were**, which is
+    // the ordinary case -- one character for another, or a word for a word of the same size.
+    if put.chars == gone.chars then return Ok(str_counted(made, subject.chars))
+
+    // **Otherwise how many times it replaced is the difference in BYTES divided by the difference
+    // each one makes**, which is exact: every occurrence moved the byte length by the same amount.
+    // Where the two spellings are the same number of BYTES and a different number of characters
+    // nothing in the length says how many there were, so that one is counted.
+    if new.bytes.len == old.bytes.len then return Ok(str_value(made))
+
+    val each = if new.bytes.len > old.bytes.len then new.bytes.len - old.bytes.len else old.bytes.len - new.bytes.len
+    val moved = if made.bytes.len > s.bytes.len then made.bytes.len - s.bytes.len else s.bytes.len - made.bytes.len
+    val times = moved / each
+
+    Ok(str_counted(made, subject.chars + times * put.chars - times * gone.chars))
 end do_replace
 
 // `padStart(s, n)` and `padEnd(s, n)`, with an optional filler -- the string brought up to a width.
@@ -379,7 +550,8 @@ do_pad(args: Buf[Value], at: Span, start: bool) -> Step
     if args.len() != 2 && args.len() != 3
         return fault(at, s"`${name}` takes a string, a width and an optional filler, and was given ${counted(args.len(), "argument")}")
 
-    val s = text_of(args.at(0), at, name, "a string")?
+    val o = str_cell(args.at(0), at, name, "a string")?
+    val s = o.s
 
     val width = args.at(1) match
         Int(n) ->
@@ -388,16 +560,24 @@ do_pad(args: Buf[Value], at: Span, start: bool) -> Step
             usize(n)
         other -> return fault(at, s"`${name}` takes a whole number of characters, and this is ${other.type_name()}")
 
-    val filler = if args.len() == 3 then text_of(args.at(2), at, name, "a filler")? else " "
+    // The filler's own count comes off its cell beside its text, a filler being a string like any
+    // other; the default is one space, which is one character.
+    var filler = " "
+    var each: usize = 1
+
+    if args.len() == 3
+        val f = str_cell(args.at(2), at, name, "a filler")?
+
+        filler = f.s
+        each = f.chars
 
     if filler == "" then return fault(at, s"`${name}` cannot pad with the empty string -- no amount of it reaches a width")
 
-    val have = char_count(s)
+    val have = o.chars
 
-    if have >= width then return Ok(str_value(s))
+    if have >= width then return Ok(args.at(0))
 
     val short = width - have
-    val each = char_count(filler)
     var pad = str_builder()
     var made: usize = 0
 
@@ -409,13 +589,15 @@ do_pad(args: Buf[Value], at: Span, start: bool) -> Step
 
     val fill = pad.finish()
 
-    Ok(str_value(if start then fill + s else s + fill))
+    // The padding brought it up to the width, which is what the answer's count is.
+    Ok(str_counted(if start then fill + s else s + fill, width))
 end do_pad
 
 do_repeat(args: Buf[Value], at: Span) -> Step
     wants(args, 2, at, "repeat", "a string and a count")?
 
-    val s = text_of(args.at(0), at, "repeat", "a string")?
+    val o = str_cell(args.at(0), at, "repeat", "a string")?
+    val s = o.s
 
     args.at(1) match
         Int(n) ->
@@ -430,7 +612,8 @@ do_repeat(args: Buf[Value], at: Span) -> Step
             if wide > 0 && usize(n) > limit / wide
                 return fault(at, s"`repeat` was asked for ${n} copies of a ${wide}-byte string, and the result would be past the 2147483648 bytes a string can hold")
 
-            Ok(str_value(repeat(s, usize(n))))
+            // Copies of one string, so the count is that string's, that many times.
+            Ok(str_counted(repeat(s, usize(n)), o.chars * usize(n)))
         other -> fault(at, s"`repeat` takes a whole number of times, and this is ${other.type_name()}")
 end do_repeat
 
