@@ -1,0 +1,172 @@
+module dev.slatelang.slate
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, str_builder}
+
+// What a slate value holds OUTSIDE the collected heap, and the two things that used to be blind to
+// it: the collection schedule and the ceiling.
+//
+// **A cell is small and what it owns is not.** A `StrObj` is a few words owning a sysl `string`, an
+// `ArrayObj` a `Buf`, a `BytesObj` its bytes -- so a program moving megabyte buffers moved
+// `gc.live_size` by almost nothing, no collection was ever due, and the garbage piled up until the
+// operating system noticed. `Vm.payload` is the count and `obj.sysl`'s `charge`/`credit` keep it.
+//
+// **The invariant every one of these is really about is that a charge has a credit.** A charge with
+// no credit grows for ever and ends in either collect-every-statement or a false out-of-memory, so
+// the first test here is the one to read: after building and dropping a great many values of every
+// kind, a collection must put the count back exactly where it started.
+
+// A string long enough that its bytes are worth counting beside its cell.
+private padded(n: usize) -> string
+    var out = str_builder()
+
+    for i in 0..<n
+        out.push("payload ")
+
+    out.finish()
+end padded
+
+// One round of building a value of every kind that owns storage, and dropping all of them.
+//
+// **Nothing here is rooted and that is the point** -- a `Value` in a sysl local is invisible to the
+// collector, so every object this makes is garbage the moment the call returns.
+private a_round_of_garbage(n: usize)
+    val s = new_str(padded(n))
+    val a = new_array(buf())
+    val b = new_bytes(buf())
+    val o = new_object()
+    val e = new_env(null)
+
+    var names: Buf[string] = buf()
+
+    for i in 0..<n
+        names.push(padded(1) + str(i))
+
+    for i in 0..<n
+        array_push(a, Str(s))
+        bytes_push(b, 7u8)
+        obj_put_name(o, names.at(i), Str(s))
+        declare(e, names.at(i), Str(s), true)
+
+    val run_of_bytes = padded(4)
+
+    bytes_extend(b, run_of_bytes.bytes)
+
+    // A closure owns its parameter names, which is the seventh thing a finalizer gives back.
+    val c = new_closure(names, 0, e)
+
+    ()
+end a_round_of_garbage
+
+@test
+EVERY_BYTE_A_VALUE_HOLDS_OUTSIDE_THE_HEAP_IS_CHARGED_AND_GIVEN_BACK()
+    reset_vm()
+    reset_heap()
+    collect_now()
+
+    val start = current().payload
+
+    for round in 0..<40
+        a_round_of_garbage(30)
+
+    assert(current().payload > start, "building all of that charged something")
+
+    // **The figure must come back EXACTLY, not nearly.** The mark phase recounts what survived, so
+    // anything left over is storage a live object is genuinely holding -- and nothing built above
+    // is live.
+    collect_now()
+    assert_eq(current().payload, start, "a collection puts every byte of dropped payload back")
+
+    // And a second collection over an unchanged live set moves nothing, which is what says the
+    // recount is a measurement rather than an accumulation.
+    collect_now()
+    assert_eq(current().payload, start, "and a second collection over the same live set moves nothing")
+end EVERY_BYTE_A_VALUE_HOLDS_OUTSIDE_THE_HEAP_IS_CHARGED_AND_GIVEN_BACK
+
+@test
+A_CONTAINER_THAT_GROWS_IS_CHARGED_AND_KEEPS_ITS_STORAGE_WHEN_IT_SHRINKS()
+    reset_vm()
+    reset_heap()
+    collect_now()
+
+    val start = current().payload
+    val a = new_array(buf())
+
+    for i in 0..<4000
+        array_push(a, Int(long(i)))
+
+    val grown = current().payload
+
+    assert(grown >= start + 4000 * sizeof(Value), "the storage a growing array took is charged")
+
+    // **`pop` and `clear` give a `Buf` no storage back**, so the charge does not fall with the count
+    // -- reporting an emptied buffer as costing nothing would be describing pages that are still
+    // committed.
+    a.items.clear()
+    assert_eq(current().payload, grown, "and emptying it gives none of that storage back")
+
+    // What DOES give it back is the object dying, which is what the recount at a collection sees.
+    collect_now()
+    assert_eq(current().payload, start, "where collecting the array does")
+end A_CONTAINER_THAT_GROWS_IS_CHARGED_AND_KEEPS_ITS_STORAGE_WHEN_IT_SHRINKS
+
+@test
+TRANSFERRING_A_BUFFER_MOVES_THE_CHARGE_OFF_THE_SENDER()
+    reset_vm()
+    reset_heap()
+    collect_now()
+
+    val start = current().payload
+    val b = new_bytes(buf())
+
+    for i in 0..<20000
+        bytes_push(b, 3u8)
+
+    val held = current().payload
+
+    assert(held >= start + 20000, "a byte buffer is charged for the bytes it holds")
+
+    // **This is what `transfer` does to the sender**, in `actor_copy.sysl`: the storage goes to the
+    // receiver's heap and the sender's buffer is left with none. `clear` would leave the sender
+    // holding every page it grew while the receiver held a copy of them.
+    bytes_release(b)
+
+    assert_eq(current().payload, start, "and transferring it takes the whole charge off the sender")
+    assert_eq(b.data.len(), 0usize, "leaving the sender's buffer empty")
+end TRANSFERRING_A_BUFFER_MOVES_THE_CHARGE_OFF_THE_SENDER
+
+@test
+A_PROGRAM_THAT_DROPS_MEGABYTE_BUFFERS_COLLECTS_THEM_RATHER_THAN_PILING_THEM_UP()
+    // **The witness is the COLLECTION COUNT and not the resident size**, which is the only thing a
+    // test can read and is the thing that was wrong: each buffer is one small cell, so `live_size`
+    // barely moved, the threshold was never met, and the garbage stayed in the process. Measured
+    // before this landed, the same shape of program ran no collection at all and peaked at 1.67 GB
+    // over four thousand buffers.
+    val said = out(raw"""
+        var total = 0
+
+        for i in 0..<200
+            val b = toBytes("x".repeat(1048576))
+            total += b.length
+
+        print(total)
+        """)
+
+    assert_eq(said, "209715200", "the program ran")
+    assert(current().collections > 100, s"two hundred megabytes of dropped buffers are collected, and this ran ${str(current().collections)} collections")
+end A_PROGRAM_THAT_DROPS_MEGABYTE_BUFFERS_COLLECTS_THEM_RATHER_THAN_PILING_THEM_UP
+
+@test
+A_HEAP_LIMIT_A_PROGRAM_NAMED_BOUNDS_ITS_PAYLOAD_AND_NOT_ONLY_ITS_CELLS()
+    // A megabyte of heap and a four-megabyte buffer: the cells are a handful of words, so nothing
+    // about the buffer was visible to the ceiling before this and the program ran happily.
+    val said = in_small_heap("val b = toBytes(\"x\".repeat(4194304))\nprint(b.length)")
+
+    assert(said.contains("run out of memory"), s"a named ceiling counts what a value holds outside the heap, and this said: ${said}")
+
+    // **And the default is uncapped**, which is the other half of the decision: `HeapBytes` is a
+    // number nobody chose, so charging payload against it would newly refuse a program that reads a
+    // large file today.
+    assert(!current().payload_capped, "the program's own VM is not payload-capped once the limit is back at the block")
+end A_HEAP_LIMIT_A_PROGRAM_NAMED_BOUNDS_ITS_PAYLOAD_AND_NOT_ONLY_ITS_CELLS

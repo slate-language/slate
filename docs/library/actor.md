@@ -372,7 +372,9 @@ host clones is the encoded form. `transfer(b)` is the one thing handed over as i
 
 - **A heap ceiling per actor**, passed at spawn and 64 MiB where nobody says. An actor that outgrows it
   faults; it does not take the process with it. Under `slate js` this is node's own ceiling and a page
-  has none.
+  has none. The ceiling counts what the actor's values **hold** as well as how many of them there are —
+  a string's bytes, an array's storage, a buffer's — so a handler that builds a hundred megabytes of
+  text is bounded by it whether or not it made a hundred megabytes of objects.
 - **A mailbox soft limit**, 65,536 where nobody says. Past it an `ask` rejects and a `send` faults in
   the sender — a refusal, never a wait, because a server that stalls its own loop waiting for a slow
   actor has stopped serving everybody else.
