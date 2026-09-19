@@ -99,18 +99,125 @@ petty cash: 2 entries
 **A member written without `on` is an ordinary method and is not reachable from outside.** A handler
 may call one; a message naming one is refused where it arrives.
 
+**An `async` handler is re-entrant, and that is worth knowing before you write one.** While it waits,
+the actor takes its next message and starts it — so two `ask`s posted together are both *started*
+before either ends, and state a handler read before an `await` may have been changed by another
+message by the time it comes back. A handler that is not `async` runs to its last line before the next
+message is looked at, and needs no such care.
+
+```slate
+import { spawn, ask } from slate:actor
+
+actor Slow
+    var seen = []
+
+    async on work(self, label)
+        self.seen.push("start " + label)
+
+        await sleep(30)
+
+        self.seen.push("end " + label)
+
+    on log(self) = self.seen
+
+val s = spawn(Slow)
+
+await all([ask(s.work, "a"), ask(s.work, "b")])
+
+print(await ask(s.log))
+```
+
+```output
+["start a", "start b", "end a", "end b"]
+```
+
 **An actor is declared at the top level of a file**, as a class and a `type` are. That is not a
 restriction invented here; it is what makes the whole design sound. A body written at the top level
 closes over nothing, so there is nothing of the spawner's for it to reach — which is also why there is
 no `spawn(fn)`: a lambda handed to `spawn` would capture its enclosing scope, and those names live on
 another heap.
 
-**An actor's VM learns the program's names by running its DECLARATIONS**, which is what
-[`docs/reference/modules.md`](../reference/modules.md) states for a reader: a definition, a `class`, a
-`data`, a `type`, an `external` and an `import` are declarations, and everything else at a file's top
-level is an effect. So a **top-level `val` is not bound** inside an actor, and a handler that names one
-faults with the ordinary sentence about a name that is not defined. An actor's state belongs in its own
-fields, which is what the declaration form already says.
+## A module is instantiated once per actor
+
+**Starting an actor runs every module the program imports, in the new VM, exactly as importing it runs
+it in the main program.** A module's constants are bound there, its tables are built there and
+whatever its top level prints is printed there — so an ordinary library works in a handler, with
+nothing written for actors.
+
+**What that means is that each actor has its OWN copy of every module.** Module-level state is per
+actor: a table the main program filled is empty inside an actor until that actor fills its own, and
+nothing either of them does is seen by the other. It is the same bargain as everything else here —
+one heap each, nothing shared — and it is what a JavaScript worker does with its imports.
+
+**So state that is meant to be shared does not belong at a module's top level at all.** Put it in
+**one** actor that owns it and answers questions about it; that is what actors are for, and a
+module-level `Map` is a copy per thread wearing the look of one table.
+
+```slate
+import { spawn, ask } from slate:actor
+import { Limit, record, count } from "./registry.sl"
+
+record("main", 1)
+
+actor Counter
+    on limit(self) = Limit
+
+    on seen(self) = count()
+
+    on fill(self)
+        record("actor", 2)
+
+        count()
+
+val c = spawn(Counter)
+
+print(await ask(c.limit))
+print(count())
+print(await ask(c.seen))
+print(await ask(c.fill))
+print(count())
+```
+
+```output
+512
+1
+0
+1
+1
+```
+
+`Limit` reads the same on both sides, because the module was run on both. `count()` is the trap: the
+main program put one entry in **its** copy, the actor's copy started empty, and filling the actor's
+left the main program's alone.
+
+**The ENTRY file is the one file an actor does not run.** Its top level is what spawns the actors and
+prints the program's output, and running it again on every thread would spawn and print again. So only
+its *declarations* are made there — a definition, a `class`, a `data`, a `type`, an `external` and an
+`import`, which is the split
+[`docs/reference/modules.md`](../reference/modules.md) states — and a **top-level `val` of the entry
+file is not bound** inside an actor. A handler that names one says where the value belongs:
+
+```slate
+import { spawn, ask } from slate:actor
+
+val maxItems = 512
+
+actor Guard
+    on cap(self) = maxItems
+
+print(await ask(spawn(Guard).cap))
+```
+
+```error
+the entry file's top level is not run inside an actor
+```
+
+Move it into a module the actor imports, or into the actor's own fields — which is what the
+declaration form already says.
+
+**A `spawn` written at a module's top level is refused**, naming the module. An actor's VM runs that
+module, so it would start an actor whose VM ran it again, without end. Spawn from a definition the
+program calls.
 
 ## Spawning, sending, asking, stopping
 
@@ -335,10 +442,12 @@ wait, for a logger or a metrics sink.
 every program above runs under `slate js` and says the same thing.
 
 **The worker runs the same file.** `slate js` emits one bundle that plays both roles: started as a
-worker it runs the program's *declarations* — every definition, `class`, `data`, `type` and `import` —
-and then serves messages, and it runs not one line of what the program *does*. That is the same rule
-the interpreter follows, and it is what lets a class instance cross: the receiver looks the class up
-by the name it was declared under, and it is there because declaring it is all that ran.
+worker it runs every module the program imports, in full and once, and then the *declarations* of the
+entry file — every definition, `class`, `data`, `type` and `import` — and then serves messages. It
+runs not one line of what the entry file *does*. That is the same rule the interpreter follows, module
+state being per worker exactly as it is per thread, and it is what lets a class instance cross: the
+receiver looks the class up by the name it was declared under, and it is there because the file that
+declared it was run.
 
 - **node** starts the worker from the file the bundle was read from. A bundle that was never a file —
   one piped into `node -e`, say — cannot start one, and says so.
@@ -379,9 +488,10 @@ host clones is the encoded form. `transfer(b)` is the one thing handed over as i
 - **A thread per actor means tens to thousands, not millions**, and this process holds at most 1,024 at
   a time. A thread costs a stack and a scheduler slot; a program spawning a million of them is asking
   the wrong question.
-- **An actor compiles the program's declarations when it starts**, which is what makes a class instance
-  able to cross. That is milliseconds per actor, so an actor is something a program makes tens of and
-  keeps, not something it makes per request.
+- **An actor compiles the program when it starts and runs every module it imports**, which is what
+  makes a class instance able to cross and what makes an imported library usable. That is milliseconds
+  per actor and it grows with what the program imports, so an actor is something a program makes tens
+  of and keeps, not something it makes per request.
 
 ## What actors are not for
 

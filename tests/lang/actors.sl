@@ -11,6 +11,9 @@
 import { spawn, send, ask, done, stop, detach, me, transfer } from slate:actor
 import { date, seconds, months } from slate:time
 import { regex } from slate:regex
+import { encodeComponent } from slate:url
+import { Limit, addStock, stockCount, label, Keeper } from "./lib/shop.sl"
+import { timesLoaded } from "./lib/tag.sl"
 
 actor Counter
     var n = 0
@@ -79,6 +82,76 @@ async sends_from_one_actor_arrive_in_the_order_they_were_written() =
     assertEq(seen[0], 0)
     assertEq(seen[199], 199)
 
+// -- what a handler CAN reach: every module the program imports ----------------------------------
+
+actor Shopper
+    on limit(self) = Limit
+
+    on tag(self, n) = label(n)
+
+    on count(self) = stockCount()
+
+    on add(self, name, n)
+        addStock(name, n)
+
+        stockCount()
+
+    on loads(self) = timesLoaded()
+
+    on encoded(self, s) = encodeComponent(s)
+
+@test
+async A_MODULE_CONSTANT_IS_BOUND_INSIDE_A_HANDLER() =
+    // **An actor's VM runs every module the program imports, in full**, so an ordinary library works
+    // in a handler with nothing written for actors.
+    val a = spawn(Shopper)
+
+    assertEq(await ask(a.limit), 512)
+
+@test
+async A_MODULE_REACHED_ONLY_THROUGH_ANOTHER_MODULE_IS_LOADED_TOO() =
+    val a = spawn(Shopper)
+
+    assertEq(await ask(a.tag, 7), "tag-7")
+
+@test
+async A_MODULES_STATE_IS_THE_ACTORS_OWN_AND_THE_PROGRAMS_COPY_IS_UNTOUCHED() =
+    // **This is the trap the rule buys**, and it is worth reading twice: the main program filled its
+    // own copy of `stock`, and two actors each start with an empty one of their own. Neither sees
+    // what the other did, and filling an actor's leaves the program's alone.
+    addStock("main", 1)
+
+    val a = spawn(Shopper)
+    val b = spawn(Shopper)
+
+    assertEq(await ask(a.count), 0)
+    assertEq(await ask(a.add, "a", 1), 1)
+    assertEq(await ask(b.count), 0)
+    assertEq(stockCount(), 1)
+
+@test
+async A_MODULES_TOP_LEVEL_RUNS_ONCE_IN_EACH_ACTORS_VM() =
+    // **Counted rather than timed.** The module increments a counter it owns at its own top level and
+    // two files import it, so a VM that ran it twice would answer 2 here.
+    val a = spawn(Shopper)
+
+    assertEq(timesLoaded(), 1)
+    assertEq(await ask(a.loads), 1)
+
+@test
+async AN_ACTOR_DECLARED_IN_AN_IMPORTED_MODULE_WORKS() =
+    val k = spawn(Keeper)
+
+    assertEq(await ask(k.limit), 512)
+    assertEq(await ask(k.count), 0)
+    assertEq(await ask(k.add, "k", 2), 1)
+
+@test
+async A_BUILT_IN_MODULE_WRITTEN_IN_SLATE_IS_USABLE_FROM_A_HANDLER() =
+    val a = spawn(Shopper)
+
+    assertEq(await ask(a.encoded, "a b"), "a%20b")
+
 // -- what a handler cannot reach -----------------------------------------------------------------
 
 val topLevelLimit = 512
@@ -88,11 +161,10 @@ actor NameLeaker
 
 @test
 async a_handler_reaching_a_top_level_val_faults_with_the_same_sentence_on_both_back_ends() =
-    // **`docs/reference/modules.md` says a handler's own module gives it declarations and nothing
-    // else**, so a top-level `val` is simply not bound where the handler runs -- reaching it faults
-    // exactly as any other undefined name does. This is the interpreter's own sentence, and the
-    // JavaScript back end must say the same words rather than the host's -- V8's own `ReferenceError`
-    // has no backticks around the name.
+    // **The ENTRY file is the one file an actor does not run**, so a `val` written at its top level is
+    // not bound where the handler runs -- and the fault says where the value belongs rather than only
+    // that the name is not defined. Both back ends say these words: V8's own `ReferenceError` has no
+    // backticks around the name and nothing to add about actors, so `$.caught` rewords it.
     val a = spawn(NameLeaker)
     var said = ""
 
@@ -101,7 +173,7 @@ async a_handler_reaching_a_top_level_val_faults_with_the_same_sentence_on_both_b
     catch e
         said = e.message
 
-    assertEq(said, "`topLevelLimit` is not defined")
+    assertEq(said, "`topLevelLimit` is not defined -- the entry file's top level is not run inside an actor, and `topLevelLimit` is bound there. Put it in a module the actor imports, or in the actor's own fields.")
 
 // -- what crosses ------------------------------------------------------------------------------
 
