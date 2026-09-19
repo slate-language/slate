@@ -256,13 +256,16 @@ already run at once on two threads, each on its own heap and its own loop, which
 its own: a slate VM that a sysl program can hold is an **embeddable** library, which is a use nobody
 had while there was nothing to hold.
 
-**An actor's VM learns the program's names by running each module's DECLARATIONS.** A file's top level
-is declarations and effects — a definition, a `class`, a `data`, a `type`, an `external` and an `import`
-are the first, and everything else is the second — and `compile_module` emits a second chunk holding the
-declarations alone, so `load_declarations` gives a fresh machine every name the program declares and runs
-not one line of what the program does. Nothing is printed on the way up, no server is started twice and no
-timer is armed on the new loop. That is what makes a class instance able to cross: the receiver looks the
-class up by the name it was declared under, and it is there because declaring it is all that ran.
+**An actor's VM instantiates every module the program imports, and runs the ENTRY file's DECLARATIONS
+alone.** An imported module's whole top level runs there, exactly as importing it runs it in the main
+program — so an ordinary library works in a handler, and **each actor has its own copy of every
+module's state**. A file's top level is declarations and effects — a definition, a `class`, a `data`, a
+`type`, an `external` and an `import` are the first, and everything else is the second — and
+`compile_module` emits a second chunk holding the declarations alone, which is the chunk the entry file
+takes. That is what stops the program's own effects running again on every thread: the entry file is
+where the spawning and the printing are written. It is also what makes a class instance able to cross:
+the receiver looks the class up by the name it was declared under, and it is there because the file
+that declared it was loaded.
 
 **The program a person runs is untouched**, which is the constraint that decided the shape: the module's
 own chunk is compiled and run statement for statement as it always was, and the declarations chunk is a
@@ -270,12 +273,14 @@ second compilation beside it. Cutting the declarations *out* of the one chunk wo
 of the file's effects, and two of slate's rules say otherwise — an `import` binds where it is written,
 and a class field's initialiser is worked out where the class stands.
 
-The consequence a program can see is that a **top-level `val` is not bound in an actor's VM**. A method
-that names one is an ordinary program in an ordinary run — the name is looked up when the method is
-called — and reaching it inside an actor faults with the usual sentence about a name that is not defined.
-A **declaration that is built out of** such a name is the sharper case and is refused outright when the
-declarations are loaded. An actor's state belongs in its own fields, which is what the declaration form
-already says; `docs/reference/modules.md` is where a reader meets the rule.
+The consequence a program can see is that a **top-level `val` of the ENTRY file is not bound in an
+actor's VM**. A method that names one is an ordinary program in an ordinary run — the name is looked up
+when the method is called — and reaching it inside an actor faults with a sentence saying that the entry
+file's top level is not run there and where the value belongs instead. A **declaration that is built out
+of** such a name is the sharper case and is refused outright when the declarations are loaded. A
+**`spawn` at a module's top level** is refused too, naming the module: the actor it started would run
+that module, which would spawn again, without end. An actor's state belongs in its own fields, which is
+what the declaration form already says; `docs/reference/modules.md` is where a reader meets the rule.
 
 **The compiled chunks are shared rather than compiled again.** A `Unit` — bytecode, string table,
 patterns, the module list — is written once by the compiler and read-only afterwards, so an actor is

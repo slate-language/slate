@@ -466,6 +466,12 @@ js_runtime_actor() -> string = raw"""
             stopping: false,
             busy: 0,
 
+            // Whether this worker is still loading the program's modules, and what arrived while it
+            // was. **A module may wait at its own top level**, so the load is awaited and there is a
+            // window in which a call can land before the declaration this worker serves exists.
+            loading: false,
+            held: [],
+
             ticket: 0,
             minted: 0,
 
@@ -556,6 +562,11 @@ js_runtime_actor() -> string = raw"""
         // -- what arrives ------------------------------------------------------------------------------
 
         const arrived = (m) => {
+            // **Held while this worker's modules are loading**, and delivered in order once it is
+            // serving. Only the two a worker itself answers are queued: a reply or an ack belongs to
+            // something this side already started and can be settled at once.
+            if (ACT.loading && (m.k === "call" || m.k === "stop")) { ACT.held.push(m); return }
+
             if (m.k === "reply") { settle(m); return }
             if (m.k === "ack") { acked(m.of); return }
             if (m.k === "call") { serveCall(m); return }
@@ -1063,6 +1074,13 @@ js_runtime_actor() -> string = raw"""
         // **What the emitted bundle calls instead of running the program, when it is a worker.** The
         // declarations are run first -- every name the program declares and not one line of what it
         // does -- and then this side serves messages.
+        // Which module's top level is running while a worker loads, and `""` at every other moment.
+        // **The emitted declarations copy is what sets it**, one line either side of each module, so
+        // the refusal `spawn` raises can name the file the reader has to look at.
+        let LOADING_MODULE = ""
+
+        $.loadingModule = (name) => { LOADING_MODULE = name }
+
         $.actorWorker = (load) => {
             if (NODE_START !== null) {
                 ME.id = NODE_START.id
@@ -1091,9 +1109,18 @@ js_runtime_actor() -> string = raw"""
             }
         }
 
-        const startServing = (load, name, args) => {
+        // **The loader is AWAITED, because a module may wait at its own top level.** A worker runs
+        // every module the program imports in full, so `await` is legal there and the emitted loader
+        // is an `async` function; awaiting a loader that finished synchronously costs a microtask.
+        //
+        // **Anything that arrives while it loads is HELD.** Without the wait there was no window at
+        // all; with it, a call could reach a worker whose declaration has not been made yet, so the
+        // two kinds of message a worker serves are queued and delivered in order once it is serving.
+        const startServing = async (load, name, args) => {
             try {
-                load()
+                ACT.loading = true
+
+                await load()
 
                 const cls = declaredHere(name)
 
@@ -1101,7 +1128,12 @@ js_runtime_actor() -> string = raw"""
                     fault("`" + name + "` is not an actor this program declares")
 
                 ACT.serving = instantiate(cls, name, decodeAll(args))
+                ACT.loading = false
+
+                while (ACT.held.length > 0) arrived(ACT.held.shift())
             } catch (e) {
+                ACT.loading = false
+                ACT.held.length = 0
                 dieOf(faultParts(e))
             }
         }
@@ -1201,6 +1233,16 @@ js_runtime_actor() -> string = raw"""
         }
 
         B.actorSpawn = (...args) => {
+            // **A `spawn` while this worker is loading its modules would never stop.** A worker runs
+            // every module the program imports, so a module that spawns at its own top level starts
+            // an actor whose worker runs that module, which spawns again. The interpreter refuses it
+            // in these words too.
+            if (LOADING_MODULE !== "")
+                fault("`spawn` cannot be called while `" + LOADING_MODULE + "` is being loaded -- an " +
+                    "actor's VM runs every module the program imports, so an actor started from a " +
+                    "module's top level would start another for ever. Spawn from a definition the " +
+                    "program calls instead.")
+
             if (args.length === 0)
                 fault("`spawn` takes an actor declaration and its constructor's arguments, and was given nothing")
 
