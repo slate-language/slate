@@ -22,7 +22,7 @@ LLVM_VERSION="${LLVM_VERSION:-20}"
 # what the development machine has and what `crypto.argon2` and `node:sqlite` need.
 NODE_MAJOR="${NODE_MAJOR:-24}"
 
-# **Six libraries are newer than any distribution has, so they are built here from source and
+# **Five libraries are newer than any distribution has, so they are built here from source and
 # linked STATICALLY.** Each is pinned to a release whose headers carry a symbol a binding names:
 #
 #   hiredis  1.0.0+  the RESP3 reply kinds -- `REDIS_REPLY_DOUBLE`, `MAP`, `SET`, `PUSH`, `VERB`,
@@ -35,10 +35,9 @@ NODE_MAJOR="${NODE_MAJOR:-24}"
 #                    22.04 has 1.43.0 and 24.04 has 1.59.0, so again no LTS carries it.
 #   zstd     1.5.6+  the `ZSTD_error_*` enum, which only reached `zstd.h` through `zstd_errors.h`
 #                    in that release; the binding includes `zstd.h` alone. 22.04 has 1.4.8.
-#   pcre2    10.43+  a BOUNDED variable-length lookbehind -- `(?<=ab?)c` -- which earlier releases
-#                    refuse outright as "not fixed length". slate documents that PCRE2 takes a
-#                    bounded one and refuses only an unbounded one, and that is true from 10.43.
-#                    22.04 has 10.39.
+#
+# **PCRE2 was the sixth and is gone**: `slate:regex` is ECMAScript now, on QuickJS's
+# engine, whose C is inside the `libregexp` package and needs nothing of the machine.
 #
 # **Static is the answer rather than a shared build, and it is what makes the tarball portable.**
 # A shared build here would put a soname in the binary that the machine installing it does not have
@@ -50,7 +49,6 @@ LIBUV_VERSION="${LIBUV_VERSION:-1.51.0}"
 LMDB_VERSION="${LMDB_VERSION:-1.0.1}"
 NGHTTP2_VERSION="${NGHTTP2_VERSION:-1.67.0}"
 ZSTD_VERSION="${ZSTD_VERSION:-1.5.7}"
-PCRE2_VERSION="${PCRE2_VERSION:-10.48}"
 
 export DEBIAN_FRONTEND=noninteractive
 
@@ -67,7 +65,7 @@ apt-get install -y --no-install-recommends \
 
 # **The libraries the bound packages link, in Debian's spelling of the Homebrew formula's list.**
 # brotli, openssl and webp are found through pkg-config and none is vendored; SQLite is the machine's
-# own copy, which every distribution ships. hiredis, libuv, lmdb, nghttp2, zstd and pcre2 are
+# own copy, which every distribution ships. hiredis, libuv, lmdb, nghttp2 and zstd are
 # deliberately absent -- they are built below, and installing the distribution's headers beside them
 # would only give pkg-config two answers to the same question.
 #
@@ -205,37 +203,8 @@ Libs: -L\${libdir} -l:libzstd.a
 Cflags: -I\${includedir}
 PC
 
-echo "building pcre2 $PCRE2_VERSION (static)"
-curl -fsSL "https://github.com/PCRE2Project/pcre2/releases/download/pcre2-$PCRE2_VERSION/pcre2-$PCRE2_VERSION.tar.gz" \
-  | tar -xz -C "$work"
-cmake -S "$work/pcre2-$PCRE2_VERSION" -B "$work/pcre2-build" \
-  -DCMAKE_INSTALL_PREFIX=/usr/local \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DBUILD_SHARED_LIBS=OFF \
-  -DBUILD_STATIC_LIBS=ON \
-  -DPCRE2_BUILD_PCRE2_8=ON \
-  -DPCRE2_SUPPORT_UNICODE=ON \
-  -DPCRE2_SUPPORT_JIT=ON \
-  -DPCRE2_BUILD_TESTS=OFF \
-  -DPCRE2_BUILD_PCRE2GREP=OFF \
-  -DCMAKE_POSITION_INDEPENDENT_CODE=ON
-cmake --build "$work/pcre2-build" -j"$(nproc)"
-cmake --install "$work/pcre2-build"
-cat > /usr/local/lib/pkgconfig/libpcre2-8.pc <<PC
-prefix=/usr/local
-exec_prefix=\${prefix}
-libdir=\${exec_prefix}/lib
-includedir=\${prefix}/include
-
-Name: libpcre2-8
-Description: Perl compatible regular expressions library with 8 bit character support
-Version: $PCRE2_VERSION
-Libs: -L\${libdir} -l:libpcre2-8.a
-Cflags: -I\${includedir}
-PC
-
 ldconfig
 
 echo "toolchain is on /usr/lib/llvm-$LLVM_VERSION/bin"
 node --version
-pkg-config --modversion hiredis libuv lmdb libnghttp2 libzstd libpcre2-8
+pkg-config --modversion hiredis libuv lmdb libnghttp2 libzstd

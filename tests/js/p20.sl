@@ -1,16 +1,19 @@
 // `slate:regex`, on both back ends.
 //
-// **The two sides here are two ENGINES, not two implementations of one thing.** The interpreter's
-// patterns go to PCRE2 through `sh.sysl.pcre2`; the emitted program's are translated into `RegExp`
-// by `js_rt_regex.sysl`. So every line below is a claim that a translation is exact, and the ones
-// that matter most are the constructs both engines accept while meaning different things --
-// `\s`, `.`, and `^`/`$` under `m` -- because those are the only ones a program could get wrong
-// without anything refusing it.
+// **The two sides here are two ENGINES reading one dialect.** The interpreter's patterns go to
+// QuickJS's engine through `sh.sysl.libregexp`; the emitted program's go to the host's `RegExp`.
+// Neither side translates anything — that is what changed when slate's patterns stopped being
+// Perl's — so every line below is a claim that two implementations of ECMAScript agree, which
+// is a far narrower claim than the translator's and covers far more of the language.
 //
-// **What is deliberately NOT here.** A pattern that backtracks forever gives up under PCRE2 and runs
-// forever under `RegExp`, so `(a+)+$` against a subject with no `b` cannot be in a corpus that has
-// to finish; `docs/reference/javascript.md` names it. Neither can `\w` under `i` against `U+017F`,
-// which is the one measured difference left standing.
+// **`u` is set on both sides whether or not the program wrote it**, since slate indexes a string by
+// character; without it ECMAScript matches over UTF-16 code units and the two would not even agree
+// about how long a subject is.
+//
+// **What is deliberately NOT here.** A pattern that backtracks forever gives up under the
+// interpreter's step budget and runs forever under `RegExp`, so `(a+)+$` against a subject with no
+// `b` cannot be in a corpus that has to finish; `docs/reference/javascript.md` names it, and
+// `tests_regex.sysl` is where it is pinned.
 
 import { regex } from slate:regex
 
@@ -22,6 +25,12 @@ print(regex("foo(?=bar)").test("foobar"), regex("foo(?=bar)").test("foobaz"))
 print(regex("(?<=\\$)\\d+").find("costs $42").text)
 print(regex("(\\w)\\1").find("hello").text)
 print(regex("(?:ab)+").find("abab").text)
+print(regex("a{2,3}").find("aaaa").text, regex("a+?").find("aaa").text)
+
+// **A lookbehind of any length, and a scoped modifier.** PCRE2 refused an unbounded lookbehind and
+// had no `(?i:…)` at all, so both of these were refused by one back end or the other.
+print(regex("(?<=ab*)c").test("abbc"), regex("(?<=ab?)c").test("abc"))
+print(regex("(?i:a)b").test("Ab"), regex("(?i:a)b").test("aB"))
 
 val m = regex("(\\d+)-(\\w+)").find("xx 42-abc")
 
@@ -36,6 +45,7 @@ val e = regex("(a)|(b)").find("b")
 print(e.groups[1], e.groups[2])
 print(regex("(a*)b").find("b").groups[1] == "")
 print(regex("(a)(b)").find("ab").named)
+print(regex("(?:(?<n>a)|b)\\k<n>").test("aa"), regex("x").test("y"))
 
 // -- the flags -------------------------------------------------------------------------------------
 
@@ -43,70 +53,41 @@ print(regex("hello", "i").test("Hello"))
 print(regex("a.b", "s").test("a\nb"), regex("a.b").test("a\nb"))
 print(regex("foo$").test("foo\n"), regex("foo$").test("foo"))
 print(regex("a", "im").pattern(), regex("a", "im").flags())
-print(regex("a  b  # a comment\n c", "x").test("abc"))
-print(regex("a\\ b", "x").test("a b"))
+print(regex("a", "u").test("a"), regex("a", "u").flags())
 
-// **`^` and `$` under `m` are the first place `RegExp` means something else.** PCRE2 breaks a line
-// at a newline and nothing else; `RegExp` breaks it at a carriage return and at the two Unicode
-// separators too, so an unmodified `m` would find a line start in three places PCRE2 does not.
+// **`^` and `$` under `m` break a line at every ECMAScript line terminator**, which is four
+// characters and not one: the newline, the carriage return and the two Unicode separators.
 print(regex("^b", "m").find("a\nb").start)
 print(regex("^b", "m").test("a\rb"), regex("^b", "m").test("a\u{2028}b"))
 print(regex("a$", "m").test("a\rb"), regex("a$", "m").test("a\nb"))
 
-// **And `.` is the second.** PCRE2's excludes the newline alone.
+// **And `.` excludes all four.**
 print(regex("a.b").test("a\rb"), regex("a.b").test("a\u{2029}b"))
 
 // -- the sets ---------------------------------------------------------------------------------------
 
-// **`\s` IS THE DANGEROUS ONE.** PCRE2 here is not in UCP mode, so it is the six ASCII spaces;
-// `RegExp` reads it as every Unicode space there is. A field split on `\s` would cut on a
-// no-break space in a browser and not in the interpreter.
+// **`\s` is every Unicode space**, which is ECMAScript's rule and was `RegExp`'s all along; under
+// PCRE2 it was the six ASCII ones, so a field split on `\s` cut on a no-break space in a browser
+// and not in the interpreter. That difference is what moving the dialect closed.
 print(regex("\\s").test("\u{a0}"), regex("\\s").test(" "))
 print(regex("\\S").test("\u{a0}"), regex("[\\S]").test("\u{a0}"))
 print(regex("\\s+").split("a b\tc").length)
+print(regex("\\d").test("5"), regex("\\d").test("\u{0661}"))
+print(regex("[a-c]+").find("xabcy").text, regex("[^a-c]+").find("abcxy").text)
+print(regex("[\\w.-]+").find("a.b-c!").text)
 
-// `\h`, `\v` and `\R`, which `RegExp` does not have at all.
-print(regex("\\h").test("\u{a0}"), regex("\\h").test("\n"))
-print(regex("\\v").test("\n"), regex("\\v").test(" "))
-print(regex("\\H").test("\u{a0}"), regex("\\V").test("\n"))
-print(regex("\\R").findAll("a\r\nb\nc").length)
-print(regex("[\\h\\v]").test("\t"), regex("[\\H]").test("q"))
-
-// The POSIX classes, and the negations that are NOT ASCII.
-print(regex("[[:alpha:]]").test("a"), regex("[[:alpha:]]").test("1"))
-print(regex("[[:^alpha:]]").test("\u{e9}"), regex("[[:^alpha:]]").test("a"))
-print(regex("[[:digit:][:punct:]]+").find("a!5b").text)
-print(regex("[x[:^digit:]]").test("q"))
-print(regex("[[:xdigit:]]+").find("zz1aF!").text)
-print(regex("[[:cntrl:]]").test("\u{1}"), regex("[[:cntrl:]]").test("a"))
-
-// `\p{...}`, which PCRE2 writes with a bare script name and `RegExp` does not.
+// `\p{...}`, which is a property escape because `u` is always set.
 print(regex("\\p{L}+").find("42abc!").text)
-print(regex("\\p{Greek}+").find("ab\u{3b1}\u{3b2}!").text)
 print(regex("\\P{Nd}").test("5"), regex("\\P{Nd}").test("x"))
+print(regex("[\\p{Lu}]+").find("abCDe").text)
+print(regex("\\p{Script=Greek}+").find("ab\u{3b1}\u{3b2}!").text)
 
-// -- the anchors and the escapes PCRE2 spells differently ----------------------------------------
-
-print(regex("a\\z").test("a"), regex("a\\z", "m").test("a\nb"))
-print(regex("\\Aa").test("ab"), regex("\\Aa", "m").test("b\na"))
-print(regex("a\\Z").test("a\n"), regex("a\\Z").test("ab"))
-print(regex("\\Qa.b\\E").test("a.b"), regex("\\Qa.b\\E").test("axb"))
-print(regex("\\a").test("\u{7}"), regex("\\e").test("\u{1b}"))
-print(regex("a\\Nb").test("axb"), regex("a\\Nb").test("a\nb"))
-print(regex("\\x{263A}").test("\u{263a}"), regex("\\o{101}").test("A"))
-print(regex("(?P<x>a)(?P=x)").test("aa"))
-print(regex("a(?#a comment)b").test("ab"))
-print(regex("(?'y'a)\\k{y}").test("aa"))
-print(regex("a\\%b").test("a%b"), regex("a{b").test("a{b"), regex("a]b").test("a]b"))
-print(regex("[]a]").test("]"), regex("[a\\-z]").test("-"))
-
-// -- the walk, which is where 0.1.1 and 0.1.2 differ ----------------------------------------------
+// -- the walk ---------------------------------------------------------------------------------------
 
 // **`findAll`'s count must equal the number of substitutions `replace` makes**, and the two walks
-// are independent: one is this back end's own loop and the other is PCRE2's `SUBSTITUTE_GLOBAL`.
-// A zero-width pattern is where they came apart -- `find_at` searched unanchored and the loop
-// compared the match's end against where the SEARCH began, so an empty match found ahead of the
-// cursor was pushed twice.
+// are independent on each back end: `find_all`'s loop against `replace_all`'s in the interpreter,
+// this runtime's loop against the host's `String.prototype.replace` under `slate js`. A zero-width
+// pattern is where such a pair comes apart.
 zero(pat, subject)
     val re = regex(pat)
     var subs = 0
@@ -134,17 +115,20 @@ print(regex("(,)").split("a,b").join("|"))
 print(regex("abc").split("abc").join("|"))
 print(regex("x").findAll("abc").length)
 
-// -- replacing, whose syntax is PCRE2's and not JavaScript's --------------------------------------
+// -- replacing, whose syntax is ECMAScript's ------------------------------------------------------
 
 val at = regex("(\\w+)@(\\w+)")
 
 print(at.replace("a@b and c@d", "$2 at $1"))
 print(at.replaceFirst("a@b and c@d", "$2 at $1"))
 print(regex("(a)|(b)").replace("b", "[$1$2]"))
-print(regex("ab").replace("ab", "[$0][$&]"))
+print(regex("b").replace("abc", "[$&|$`|$']"))
 print(regex("a").replace("a", "$$"))
-print(regex("(?<x>a)").replace("a", "[$x][${x}]"))
-print(regex("(a)").replace("a", "[\\1]"))
+print(regex("(?<x>a)").replace("a", "[$<x>]"))
+print(regex("(a)").replace("a", "[$9][$0]"))
+print(regex("(?<x>a)").replace("a", "[$<nope>]"))
+print(regex("(a)").replace("a", "[$<nope>]"))
+print(regex("a*").replace("bb", "#"))
 
 // -- a pattern carries no position, and an identical one is one pattern ---------------------------
 
@@ -164,14 +148,16 @@ print(t[regex("a")], t[regex("a", "i")])
 
 // -- characters, not code units -------------------------------------------------------------------
 
-// **PCRE2 counts a subject in characters and `RegExp` counts one in UTF-16 code units**, so an
-// astral character before a match makes every offset after it one too many unless it is converted.
+// **The interpreter counts a subject in bytes and a JavaScript host counts one in UTF-16 code
+// units**, and slate counts characters — so each back end converts, by a different walk, and this
+// is where the two conversions are asserted to agree.
 val astral = regex("cd").find("\u{1f600}xcd")
 
 print(astral.start, astral.end, "\u{1f600}xcd".length)
 print(regex(".").findAll("\u{1f600}x").length)
 print(regex("^.$").test("\u{1f600}"))
 print(regex("\\w").find("\u{1f600}ab").start)
+print(regex("[\u{1f600}]").test("\u{1f600}"), regex("\u{1f600}").find("a\u{1f600}b").start)
 
 val bmp = regex("cd").find("\u{e9}xcd")
 

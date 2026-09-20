@@ -39,7 +39,8 @@ slate --version
 ```
 
 Swap `-linux-arm64` for `-linux-x86_64` on an x86_64 box. **Those four packages are the whole of what
-the binary needs at run time** — Redis, libuv, LMDB, HTTP/2, Zstandard, PCRE2 and the collector are
+the binary needs at run time** — Redis, libuv, LMDB, HTTP/2, Zstandard, regular expressions and the
+collector are
 linked in, so nothing has to match a version. A bare container image also wants `tzdata`, which
 `zone(...)` reads from and any real installation already has.
 

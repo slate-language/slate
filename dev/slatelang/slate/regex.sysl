@@ -1,18 +1,25 @@
 module dev.slatelang.slate
 
 import sh.sysl.parsing.*
-import sh.sysl.pcre2
+import sh.sysl.libregexp
 import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map}
 import sysl.text.{char_indices, from_utf8_unchecked}
 
-// Regular expressions, on PCRE2.
+// Regular expressions, on ECMAScript's dialect.
 //
-// **The dialect is Perl's, which is what a person writing a regular expression expects.** sysl's own
-// `sysl.regex` is POSIX extended syntax — no `\d`, no lazy quantifier, no lookaround, no
-// backreference — and under it `\d` is not an error but a literal `d`, which is the worst of both:
-// the pattern compiles and quietly matches nothing. PCRE2 is what `sh.sysl.pcre2` binds and what
-// this file reaches for.
+// **The dialect is the one a browser reads, and both back ends read it.** sysl's own `sysl.regex` is
+// POSIX extended syntax — no `\d`, no lazy quantifier, no lookaround, no backreference — and under it
+// `\d` is not an error but a literal `d`, which is the worst of both: the pattern compiles and
+// quietly matches nothing. `sh.sysl.libregexp` is QuickJS's engine carried as a package, so the
+// pattern this file compiles is the pattern `RegExp` compiles in the JavaScript back end, character
+// for character, and neither side translates anything.
+//
+// **`u` IS ALWAYS SET, ON BOTH BACK ENDS.** slate indexes a string by CHARACTER, and without `u`
+// ECMAScript matches over UTF-16 code units — `.` takes half of an emoji and `^.$` says one
+// character is two. So the flag a program writes is not the flag the engine is given: `u` is added
+// to it here and to the `RegExp` there, which is what makes a match's offsets characters on both
+// hosts. Writing `u` yourself is allowed and changes nothing.
 //
 // **THREE THINGS HERE ARE DELIBERATELY NOT JAVASCRIPT'S, AND EACH IS A DEFECT OF ITS DESIGN.**
 //
@@ -28,8 +35,9 @@ import sysl.text.{char_indices, from_utf8_unchecked}
 //   - **A group that took no part in the match is `null`.** It cannot be `undefined`: slate's
 //     absence may not be stored in a container, and a groups array is a container.
 //
-// **A pattern that will not compile is a fault where it is written**, naming the offset PCRE2
-// stopped at, rather than something that goes wrong later.
+// **A pattern that will not compile is a fault where it is written**, carrying the engine's own
+// complaint, rather than something that goes wrong later. A construct that is Perl's and not
+// ECMAScript's — a possessive quantifier, an atomic group, `\A`, `(?P<n>…)` — is one of those.
 
 // -- the table ------------------------------------------------------------------------------------
 
@@ -39,10 +47,10 @@ import sysl.text.{char_indices, from_utf8_unchecked}
 struct Compiled
     source: string
     flags: string
-    re: &pcre2.Regex
+    re: &libregexp.Regex
 end Compiled
 
-// **A slot in this table, and not the compiled pattern itself.** A `&pcre2.Regex` is a counted box,
+// **A slot in this table, and not the compiled pattern itself.** A `&libregexp.Regex` is a counted box,
 // and a counted box may not live in the collected heap at all (see `obj.sysl`) — so what a program
 // holds is the slot, exactly as it does for a socket.
 //
@@ -65,11 +73,16 @@ private regex_of(v: Value, at: Span, name: string) -> Result[usize, Signal] = v 
 // **The flags a program may write, and nothing else.** An unknown letter is a fault naming it rather
 // than a flag silently ignored — `g` is the one people will try, and telling them it does not exist
 // is the whole point of not having it.
-private options_for(flags: string, at: Span) -> Result[pcre2.Options, Signal]
+//
+// **The three letters ECMAScript has that slate does not take are refused in their own words**, `g`
+// and `y` because a pattern here carries no position for either of them to mean anything about, and
+// `x` because it was slate's own under PCRE2 and is nobody's here. **`u` is accepted and is on
+// whether it was written or not**, which is the whole of this function's second job: the letters
+// handed to the engine are built fresh rather than passed through.
+private flags_for(flags: string, at: Span) -> Result[libregexp.Flags, Signal]
     var icase = false
     var multiline = false
     var dotall = false
-    var extended = false
 
     for b in flags.bytes
         if b == u8('i') then
@@ -78,27 +91,43 @@ private options_for(flags: string, at: Span) -> Result[pcre2.Options, Signal]
             multiline = true
         elif b == u8('s') then
             dotall = true
-        elif b == u8('x') then
-            extended = true
+        elif b == u8('u') then
+            ()
         elif b == u8('g') then
             return Err(failure(at, "there is no `g` flag -- `replace` already replaces every match and `findAll` already finds every one"))
+        elif b == u8('y') then
+            return Err(failure(at, "there is no `y` flag -- a regular expression here carries no position for a sticky match to start from"))
+        elif b == u8('x') then
+            return Err(failure(at, "there is no `x` flag -- ECMAScript has no extended mode, so a space written in a pattern is part of it"))
         else
-            return Err(failure(at, s"`${char_text(b)}` is not a regular expression flag -- the flags are `i`, `m`, `s` and `x`"))
+            return Err(failure(at, s"`${char_text(b)}` is not a regular expression flag -- the flags are `i`, `m`, `s` and `u`"))
 
-    // The last two are `dollar_end_only` and `unicode_classes`, and both are JavaScript's answer:
-    // `$` means the very end rather than also the position before a final newline, and `\d` is
-    // `[0-9]` rather than every decimal digit in Unicode. A pattern wanting the second writes
-    // `\p{Nd}`, which works either way.
-    Ok(pcre2.Options(icase, multiline, dotall, true, extended, false))
-end options_for
+    var letters = "u"
+
+    if icase then letters += "i"
+    if multiline then letters += "m"
+    if dotall then letters += "s"
+
+    libregexp.parse_flags(letters) match
+        Ok(f) -> Ok(f)
+        Err(e) -> Err(failure(at, libregexp.describe(e)))
+end flags_for
 
 private char_text(b: u8) -> string = from_utf8_unchecked([b])
+
+// Why a pattern would not compile, in the engine's own words. **`describe` of a `Pattern` error
+// prefixes it with a sentence of its own** -- *"the pattern is not one: expecting ')'"* -- which
+// reads twice where slate has already said the same thing, so the detail alone is what goes after
+// the colon. Every other error keeps `describe`'s whole sentence, none of them being about syntax.
+private why(e: libregexp.Error) -> string = e match
+    Pattern(m) -> m
+    other -> libregexp.describe(other)
 
 // The slot for this pattern, compiling it if this is the first time it has been asked for.
 private pattern_slot(source: string, flags: string, at: Span) -> Result[usize, Signal]
     val v = current()
 
-    // The flags are only ever `imsx`, so a colon after them cannot be mistaken for part of one and
+    // The flags are only ever `imsu`, so a colon after them cannot be mistaken for part of one and
     // the key needs no escaping.
     val key = s"${flags}:${source}"
 
@@ -106,16 +135,20 @@ private pattern_slot(source: string, flags: string, at: Span) -> Result[usize, S
         Some(id) -> return Ok(id)
         None -> ()
 
-    val options = options_for(flags, at)?
+    val options = flags_for(flags, at)?
 
-    pcre2.compile_with(source, options, pcre2.default_limits()) match
+    // **Every match runs under the package's default budget**, which is generous enough that no
+    // ordinary pattern comes near it and small enough that `(a+)+$` on forty characters gives up
+    // rather than holding the program. `unlimited_budget()` is what a JavaScript engine gives you
+    // and is deliberately not what a pattern from outside the program is matched under.
+    libregexp.compile_with(source, options, libregexp.default_budget()) match
         Ok(re) ->
             val id = v.compiled.len()
 
             v.compiled.push(Compiled(source, flags, re))
             v.pattern_ids.put(key, id)
             Ok(id)
-        Err(e) -> Err(failure(at, s"this is not a regular expression: ${pcre2.describe(e)}"))
+        Err(e) -> Err(failure(at, s"this is not a regular expression: ${why(e)}"))
 end pattern_slot
 
 // A compiled pattern from its text and its flags, as a value.
@@ -128,22 +161,22 @@ end pattern_slot
 regex_value_of(source: string, flags: string, at: Span) -> Step =
     Ok(RegexVal(pattern_slot(source, flags, at)?))
 
-// What a match that would not finish is, said in slate's terms rather than PCRE2's.
+// What a match that would not finish is, said in slate's terms rather than the engine's.
 //
-// **The budget exists because PCRE2 backtracks.** `(a+)+$` against a subject with no `b` costs an
-// unbounded amount of time on a pattern and a subject both short enough to fit on one line, and
-// node has no limit at all — so a program there stops answering where a program here raises a fault
-// naming the pattern.
-private gave_up(name: string, source: string, e: pcre2.Error, at: Span) -> Signal = e match
-    MatchLimit -> failure(at, s"`${name}` gave up on /${source}/ -- this pattern and this subject need more backtracking than a match is allowed")
-    DepthLimit -> failure(at, s"`${name}` gave up on /${source}/ -- this pattern nests deeper than a match is allowed")
-    other -> failure(at, s"`${name}` could not match /${source}/: ${pcre2.describe(other)}")
+// **The budget exists because an ECMAScript regular expression backtracks.** `(a+)+$` against a
+// subject with no `b` costs an unbounded amount of time on a pattern and a subject both short enough
+// to fit on one line, and a browser has no limit at all — so a program there stops answering where a
+// program here raises a fault naming the pattern, which a `try` can catch.
+private gave_up(name: string, source: string, e: libregexp.Error, at: Span) -> Signal = e match
+    GaveUp -> failure(at, s"`${name}` gave up on /${source}/ -- this pattern and this subject need more backtracking than a match is allowed")
+    TooDeep -> failure(at, s"`${name}` gave up on /${source}/ -- this pattern nests deeper than a match is allowed")
+    other -> failure(at, s"`${name}` could not match /${source}/: ${libregexp.describe(other)}")
 
 // -- turning a match into a value -------------------------------------------------------------
 
 // Byte offsets into character positions, in ONE walk of the subject.
 //
-// **slate counts a string in characters and PCRE2 answers in bytes**, so every offset that crosses
+// **slate counts a string in characters and the engine answers in bytes**, so every offset that crosses
 // has to be converted. Doing it one offset at a time would walk the subject once per group and once
 // per match; a `findAll` over a long text would then cost the square of its length. This walks the
 // subject once and answers every offset asked for, which is the only reason it is worth its own
@@ -173,7 +206,7 @@ end char_positions
 //
 // **`groups` holds the whole match at 0**, which is what every other language answers and what makes
 // `m.groups[1]` the first written group rather than the second.
-private match_value(m: pcre2.Match, id: usize, subject: string) -> Value
+private match_value(m: libregexp.Match, id: usize, subject: string) -> Value
     val mark = root_mark()
     val o = new_object()
 
@@ -308,7 +341,7 @@ private substitute(args: Buf[Value], at: Span, name: string, every: bool) -> Ste
     val with = text_argument(args.at(2), at, name, "a replacement")?
     val c = current().compiled.at(id)
 
-    val r = if every then c.re.replace_all(subject, with) else c.re.replace_first(subject, with)
+    val r = if every then c.re.replace_all(subject, with) else c.re.replace(subject, with)
 
     r match
         Ok(s) -> Ok(str_value(s))
@@ -361,7 +394,7 @@ regex_flags(id: usize) -> string = current().compiled.at(id).flags
 
 // -- what this file registers ---------------------------------------------------------------------
 
-// Regular expressions, on PCRE2. **The names a regex answers to are its own** -- `Regex.replace` is
+// Regular expressions. **The names a regex answers to are its own** -- `Regex.replace` is
 // not `replace` and `Regex.split` is not `split`, because a method is looked up by the kind of its
 // receiver and the two do different things to different arguments. Sharing a native would give one
 // diagnostic for two calls, which is what the qualified registry names say.
