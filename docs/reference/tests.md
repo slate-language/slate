@@ -198,6 +198,13 @@ runs, and a timer the test armed is still armed while the teardown runs — whic
 only for what the three of them left behind: whatever the file's `@setupAll` opened is the file's, and
 settles after its `@teardownAll`.
 
+**A connection belongs to whoever opened the listener, not to whatever was running when it arrived.**
+A server accepts for as long as it is open, and when a client dials is the client's business — so a
+connection to a server the `@setupAll` opened may be handed over in the middle of any test in the
+file. It is the file's all the same: no test waits for it, no test is told it leaked it, and it is
+still open for the tests behind that one. A connection to a server a **test** opened is that test's,
+by the same rule.
+
 **A handle a test opened and never closed is a failure of that test, named, rather than a hang.** A
 socket a test opens and forgets stays open whether the test passed or not, so once the test and its
 `@teardown` have settled, anything the two of them opened and left open is closed and reported —
