@@ -22,6 +22,19 @@ toExponential_WITH_NO_COUNT_WRITES_THE_DIGITS_THE_VALUE_NEEDS() =
     assertEq(toExponential(120), "1.2e+2")
 
 @test
+THE_DIGITS_A_VALUE_NEEDS_ARE_THE_FEWEST_THAT_READ_BACK_AND_NOT_printf_S_ANSWER() =
+    // `2^-24` is the shortest value where C's `%g` writes a digit more than the value needs: at
+    // sixteen digits it falls exactly halfway, `printf` settles that on the even digit, and the
+    // reading that works is the other one. Both name one double and JavaScript writes the shorter,
+    // so `string` and both of these do too.
+    assertEq(string(5.960464477539063e-8), "5.960464477539063e-8")
+    assertEq(toExponential(5.960464477539063e-8), "5.960464477539063e-8")
+    assertEq(toPrecision(5.960464477539063e-8), "5.960464477539063e-8")
+
+    // The smallest subnormal is the same question at the other end of the range.
+    assertEq(string(4.9e-324), "5e-324")
+
+@test
 toExponential_OF_ZERO_IS_0e_PLUS_0_AND_A_NEGATIVE_ZERO_KEEPS_NO_SIGN() =
     // JavaScript's own drops the sign here, the sign being taken off before anything is written and
     // negative zero not being less than zero. `string(-0)` is `-0` in slate and stays that way.
@@ -93,6 +106,13 @@ BOTH_OF_THEM_ANSWER_THE_NAMES_OF_NAN_AND_INFINITY() =
     assertEq(toPrecision(0.0 / 0.0, 2), "NaN")
     assertEq(toPrecision(1.0 / 0.0, 2), "Infinity")
     assertEq(toPrecision(-1.0 / 0.0, 2), "-Infinity")
+
+    // **The count is not even read until the value is known to be finite**, so a count outside the
+    // range is no refusal here -- which is where ECMAScript puts the test for these two, and not
+    // where it puts it for `toFixed`, whose own range refusal fires on a `NaN` as well.
+    assertEq(toExponential(0.0 / 0.0, 500), "NaN")
+    assertEq(toPrecision(1.0 / 0.0, 0), "Infinity")
+    assertEq(toExponential(-1.0 / 0.0, -3), "-Infinity")
 
 @test
 BOTH_OF_THEM_ARE_METHODS_ON_A_NUMBER_TOO() =

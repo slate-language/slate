@@ -15,7 +15,13 @@
 val reals = [0.0, 0.0 * -1.0, 1.0, 1.5, 2.5, 0.5, 0.1, 0.125, 1.25, 1.35, 1.45, 1.005, 9.99,
     123.456, 1234.5678, 0.000123, 0.0000001, 0.000000123, 3.141592653589793, 2.718281828459045,
     -1.5, -2.5, -0.1, -123.456, -0.000123, 1e21, 1.5e21, 1e-7, 6.02e23, 1.6e-19,
-    1.7976931348623157e308, 5e-324, 2.2250738585072014e-308, 0.3333333333333333]
+    1.7976931348623157e308, 5e-324, 2.2250738585072014e-308, 0.3333333333333333,
+    // **The values a SHORTEST-DIGITS routine is judged on**, where a text that merely reads back is
+    // not the one a JavaScript host writes: each of these is a double whose decimal expansion runs
+    // far past the digits that name it, and `toExponential` with no count is the one path that asks
+    // which digits those are.
+    1e23, 9.999999999999999e22, 4.35, 8.98846567431158e307, 5.960464477539063e-8,
+    2.2250738585072011e-308, 123456789012345680000.0, 0.000001, 1e-6, 1.7e-308, 4.9e-324]
 
 val wholes = [0, 1, 7, 10, 100, 120, 255, 999, 1000, 123456, -255, -1000000,
     9007199254740993, -9007199254740993, 4611686018427387904]
@@ -62,6 +68,10 @@ print(toPrecision(0, 100))
 print((255).toExponential(2), (0.1).toExponential(), (123.456).toPrecision(4), (1.5).toPrecision())
 
 // -- and how each of them refuses ---------------------------------------------------------------------
+
+// A number that is not finite answers its own name whatever count came with it, the count being
+// read only once the value is known to be finite.
+print(toExponential(0.0 / 0.0, 500), toPrecision(1.0 / 0.0, 0), toExponential(-1.0 / 0.0, -3))
 
 print(toExponential(1, -1) catch e -> e.message)
 print(toExponential(1, 101) catch e -> e.message)

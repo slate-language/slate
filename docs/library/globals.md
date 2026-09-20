@@ -128,7 +128,9 @@ padEnd number integer real boolean string`.
 - **All three round a tie AWAY from zero on the exact value the number holds**, which is
   JavaScript's rule and not C's `printf`'s, and neither of these faults on the number either —
   `NaN`, an infinity and a whole number past `2^53` all answer rather than refuse. Only the digit
-  count, outside its range, is refused.
+  count, outside its range, is refused — and these two do not even read it until the value is known
+  to be finite, so `toExponential(x, 500)` of a `NaN` is `"NaN"` where `toFixed`'s own range refusal
+  would fire. Both orders are JavaScript's, read literally.
 - **`formatNumber` groups the digits in threes**, taking a whole number or the text `toFixed`
   answered — never a `real`, which has no one written form of its own. `formatNumber(toFixed(total,
   2))` is a price. The defaults are a comma and a full stop; `{ separator: " ", decimal: "," }` is
