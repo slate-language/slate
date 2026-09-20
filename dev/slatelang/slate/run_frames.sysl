@@ -11,6 +11,19 @@ import sysl.text.str_builder
 // `guarded` reaches in here for `run_frames`. **`lay_frame` and `lay_bindings` went back there** when
 // this file passed a thousand lines in its turn: laying a call's slots out before the first
 // instruction runs is arranging a call, which is that file's subject.
+//
+// **`run_compose.sysl` IS THE SECOND CUT, AND IT COULD ONLY BE MADE ACROSS THE `match`.** This file
+// is one function whose body is one arm-list over `Op`, so nothing stands outside that list to move:
+// what went instead is the ten arms that touch none of the loop's own state -- `MakeArray`,
+// `MakeObject`, `MakeRange`, `Join`, `Repeat`, `WithObject`, `WithMerge`, `JoinArrays`, `SetIndex`
+// and `SetField`. Each reads and writes the operand stack and nothing else, so each is expressible as
+// a function; an arm that enters a frame writes `pc`, `base`, `code`, `chunk_ix`, `given` and
+// `vm.scope` together and could not have gone.
+//
+// **THE ARMS THAT STAYED ARE THE CHEAP ONES, AND THAT IS THE RULE FOR THE NEXT CUT TOO.** A call
+// reaching a lifted arm is a fraction of an allocation, a list walk or a lookup, and nothing about
+// `PushInt`, `LoadSlot`, `Jump`, `Pop` or the arithmetic would survive being one. `bench/README.md`
+// carries the measurement that says the cut is timed neutral.
 
 // The sentence a thrown value carries.
 //
@@ -250,52 +263,15 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
 
                 vm.stack.push(on_values(op, a, b, at)?)
 
-            MakeArray(n) ->
-                var items: Buf[Value] = buf()
-
-                for i in 0..<n
-                    keepable(peek(n - 1 - i), at, "put in an array")?
-                    items.push(peek(n - 1 - i))
-
-                // **Allocated before the stack shrinks.** Between the truncate and the alloc the
-                // elements would live only in `items`, which the mark phase cannot see -- and `alloc`
-                // collects when the heap is full.
-                val made = Array(new_array(items))
-
-                vm.stack.truncate(vm.stack.len() - n)
-                vm.stack.push(made)
-            MakeObject(n) ->
-                val o = new_object()
-                val mark = root_mark()
-
-                hold(Object(o))
-
-                for i in 0..<n
-                    val key = peek((n - 1 - i) * 2 + 1)
-                    val value = peek((n - 1 - i) * 2)
-
-                    keepable(value, at, "put in an object")?
-
-                    obj_put(o, key, value, at)?
-
-                release(mark)
-                vm.stack.truncate(vm.stack.len() - n * 2)
-                vm.stack.push(Object(o))
+            MakeArray(n) -> compose_array(vm, n, at)?
+            MakeObject(n) -> compose_object(vm, n, at)?
 
             GetIndex ->
                 val k = pop()
                 val target = pop()
 
                 vm.stack.push(read_at(target, k, at)?)
-            SetIndex ->
-                val v = pop()
-                val k = pop()
-                val target = pop()
-
-                keepable(v, at, "stored")?
-                keepable(k, at, "used as a key")?
-
-                store_at(target, k, v, at)?
+            SetIndex -> write_indexed(vm, at)?
             // **THE SUBJECT STAYS ON THE STACK ACROSS THE READ**, because a `get` property runs
             // slate code and a `Value` in a sysl local is not a root. Popping first and then calling
             // a getter that allocates is exactly the shape `A `Value` IN A SYSL LOCAL IS NOT A ROOT`
@@ -305,42 +281,7 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
 
                 vm.stack.truncate(vm.stack.len() - 1)
                 vm.stack.push(got)
-            SetField(k) ->
-                val name = u.strings.at(k)
-                val v = peek(0)
-
-                keepable(v, at, s"stored in `${name}`")?
-
-                peek(1) match
-                    Object(o) ->
-                        // **A `set` property is consulted before the object is written to**, and
-                        // only where the object has no field of that name itself -- which is the
-                        // rule a read follows, read backwards.
-                        if !write_property(peek(1), o, name, v, at)?
-                            // **Asked here because `obj_put_name` has nowhere to report from**,
-                            // where the indexed form goes through `obj_put` and refuses it there.
-                            // The two answer the same sentence.
-                            if o.frozen then return fault(at, frozen_complaint(s"`${name}`"))
-
-                            obj_put_name(o, name, v)
-                    // **The dotted write and the bracketed one are one thing said two ways**, so they
-                    // answer one sentence: `globalThis.marker = 1` is a program reaching the host, not
-                    // a program mistaking an external for an object. `store_at` says it for the
-                    // bracketed form and this is the same refusal, naming the field the way the read
-                    // side does.
-                    External(_) -> return fault(at, js_host_only(s"writing `${name}` on an external"))
-                    other ->
-                        // **A PROPERTY OF A BUILTIN KIND IS READ-ONLY, AND THE COMPLAINT NAMES
-                        // IT.** `s.length = 3` is a mistake about what `length` is; told only that
-                        // a string has no fields, the reader is left thinking the name was never
-                        // there. `method.sysl` writes the sentence, a class's read-only property
-                        // saying the same thing in the same shape.
-                        if builtin_property(other, name).is_some()
-                            return fault(at, read_only_property(other, name))
-
-                        return fault(at, s"a field belongs to an object, and this is ${other.type_name()}")
-
-                vm.stack.truncate(vm.stack.len() - 2)
+            SetField(k) -> write_named(vm, u.strings.at(k), at)?
 
             Jump(to) -> pc = to
             JumpIfFalse(to) -> if !pop().truthy() then pc = to
@@ -373,153 +314,12 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
 
                 vm.stack.set(top - n, v)
 
-            Join(n) ->
-                var out = str_builder()
-
-                // **An interpolation's count is the sum of its pieces'**, so a string built out of
-                // one that is already long does not walk it again: the piece carries its own count
-                // and only a rendered value has to be counted, where it is made.
-                var chars: usize = 0
-
-                for i in 0..<n
-                    val piece = peek(n - 1 - i)
-
-                    keepable(piece, at, "put in a string")?
-
-                    val text = printed(piece, at)?
-
-                    chars += piece match
-                        Str(p) -> p.chars
-                        _ -> char_count(text)
-
-                    out.push(text)
-
-                val joined = str_counted(out.finish(), chars)
-
-                vm.stack.truncate(vm.stack.len() - n)
-                vm.stack.push(joined)
-            Repeat ->
-                val n = pop() match
-                    Int(k) ->
-                        if k < 0 then return fault(at, s"an array of ${k} copies is not something to make") else usize(k)
-                    other -> return fault(at, s"a repeat count is a whole number, and this is ${other.type_name()}")
-
-                keepable(peek(0), at, "put in an array")?
-
-                var items: Buf[Value] = buf()
-
-                for i in 0..<n
-                    items.push(peek(0))
-
-                // Allocated before the stack shrinks, for the reason `MakeArray` gives.
-                val made = Array(new_array(items))
-
-                vm.stack.truncate(vm.stack.len() - 1)
-                vm.stack.push(made)
-            WithObject(n) ->
-                val base = peek(n * 2)
-
-                val fields = base match
-                    Object(o) -> o
-                    other -> return fault(at, s"`with` copies an object, and this is ${other.type_name()}")
-
-                val o = new_object()
-                val mark = root_mark()
-
-                hold(Object(o))
-
-                // The base's own fields first, in the order it holds them, so that the copy keeps
-                // the order and a changed field keeps the place it already had.
-                for i in 0..<fields.entries.len()
-                    val entry = fields.entries.at(i)
-
-                    if !entry.dead then obj_put(o, entry.key, entry.value, at)?
-
-                for i in 0..<n
-                    val key = peek((n - 1 - i) * 2 + 1)
-                    val value = peek((n - 1 - i) * 2)
-
-                    // **Asked of the BASE and not of the copy**, or the second written key would find
-                    // the first one already there and be taken for a field the type has.
-                    unknown_field_complaint(fields, key) match
-                        Some(said) ->
-                            release(mark)
-                            return fault(at, said)
-                        None -> ()
-
-                    keepable(value, at, "put in an object")?
-                    obj_put(o, key, value, at)?
-
-                // A copy of a data value is a data value, which is what makes `with` the answer the
-                // refusal points at. Set last, the writes above being how the copy was filled.
-                o.frozen = fields.frozen
-
-                release(mark)
-                vm.stack.truncate(vm.stack.len() - n * 2 - 1)
-                vm.stack.push(Object(o))
-
-            // **`spread` picks the words and changes nothing else.** `{ ...o }` is this instruction
-            // and so is `a with b`; a message naming the spelling the reader did not write sends
-            // them looking for it.
-            WithMerge(spread) ->
-                val other = peek(0) match
-                    Object(o) -> o
-                    got ->
-                        return fault(at, if spread
-                            then s"`...` spreads the fields of an object, and this is ${got.type_name()}"
-                            else s"`with` copies the fields of an object, and this is ${got.type_name()}")
-
-                val fields = peek(1) match
-                    Object(o) -> o
-                    got -> return fault(at, s"`with` copies an object, and this is ${got.type_name()}")
-
-                val o = new_object()
-                val mark = root_mark()
-
-                hold(Object(o))
-
-                // The base's own fields first, in the order it holds them, so the copy keeps the
-                // order and a field the other object also has keeps the place it already had.
-                for i in 0..<fields.entries.len()
-                    val entry = fields.entries.at(i)
-
-                    if !entry.dead then obj_put(o, entry.key, entry.value, at)?
-
-                for i in 0..<other.entries.len()
-                    val entry = other.entries.at(i)
-
-                    if !entry.dead
-                        // `c with someObject` reaches a data value exactly as `c with { ... }` does,
-                        // and so does `{ ...c, x: 1 }` once `object_so_far` has desugared it.
-                        unknown_field_complaint(fields, entry.key) match
-                            Some(said) ->
-                                release(mark)
-                                return fault(at, said)
-                            None -> ()
-
-                        obj_put(o, entry.key, entry.value, at)?
-
-                // **A copy of a data value is a data value**, which is what makes `with` the answer
-                // the refusal points at: `c with { r: 5 }` is another `Circle`, still sealed, still
-                // usable as a key. The flag is set last, the writes above being how it was filled.
-                o.frozen = fields.frozen
-
-                release(mark)
-                vm.stack.truncate(vm.stack.len() - 2)
-                vm.stack.push(Object(o))
-
+            Join(n) -> compose_join(vm, n, at)?
+            Repeat -> compose_repeat(vm, at)?
+            WithObject(n) -> compose_with_object(vm, n, at)?
+            WithMerge(spread) -> compose_with_merge(vm, spread, at)?
             MakeRange(inclusive, has_lo, has_hi, has_step) ->
-                // **A COMPUTED ZERO IS CAUGHT HERE**, a written one having been refused where it
-                // stood. The sentence is the same either way, with the number that arrived in it.
-                val step = if has_step then range_end(pop(), at, "the step")? else 1
-
-                if step == 0
-                    return fault(at, "a range steps by 0, so it would never reach its end -- `by` takes a step that moves")
-
-                val hi = if has_hi then range_end(pop(), at, "the end")? else 0
-                val lo = if has_lo then range_end(pop(), at, "the start")? else 0
-
-                vm.stack.push(RangeVal(lo, hi, inclusive, has_lo, has_hi, step))
+                compose_range(vm, inclusive, has_lo, has_hi, has_step, at)?
             Unpack(k, immutable) ->
                 val subject = pop()
 
@@ -815,38 +615,7 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
                         given = mask
 
             // The top `n` arrays, made into one. What builds a spread argument list.
-            JoinArrays(n) ->
-                var items: Buf[Value] = buf()
-
-                for i in 0..<n
-                    peek(n - 1 - i) match
-                        Array(a) ->
-                            for j in 0..<a.items.len()
-                                items.push(a.items.at(j))
-
-                        // **A set and a map spread what a `for` over them yields**, which is the
-                        // rule JavaScript's `...` follows too: everything iterable spreads, and the
-                        // two agree about what each one gives.
-                        SetVal(_) ->
-                            val each = walked_values(peek(n - 1 - i), at, "`...`")?
-
-                            for j in 0..<each.len()
-                                items.push(each.at(j))
-                        MapVal(_) ->
-                            val each = walked_values(peek(n - 1 - i), at, "`...`")?
-
-                            for j in 0..<each.len()
-                                items.push(each.at(j))
-
-                        // **The complaint names the spread and not the call**, because that is where
-                        // the reader has to look: `f(...42)` is a mistake about what may be spread.
-                        other -> return fault(at, s"`...` spreads an array, a set or a map, and this is ${other.type_name()}")
-
-                // Allocated before the stack shrinks, for `MakeArray`'s reason.
-                val made = Array(new_array(items))
-
-                vm.stack.truncate(vm.stack.len() - n)
-                vm.stack.push(made)
+            JoinArrays(n) -> compose_joined_arrays(vm, n, at)?
 
             // `o.m(a)`, which is where the receiver rule lives.
             //
