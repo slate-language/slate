@@ -1,0 +1,133 @@
+module dev.slatelang.slate
+@tests
+
+// What holds a builtin's arguments while it runs, and what is left where they stood afterwards.
+//
+// **THE ARGUMENTS OF A BUILTIN ARE ROOTED BY STANDING ON THE OPERAND STACK AND BY NOTHING ELSE.**
+// They used to be popped into a sysl `Buf`, which the collector does not walk, so the dispatch held
+// every one of them on the shadow stack for the length of the call. They stay where the instruction
+// left them now: the stack is a root the tracer already walks, and `Args` is a window onto it -- a
+// base index and a count, an index rather than a pointer because a builtin that runs slate code runs
+// it on that same stack and a stack deep enough to grow replaces its storage.
+//
+// **`tests/lang/builtinargs.sl` asks what these programs ANSWER, on both back ends.** What is here is
+// what only this process can ask: the same programs against a heap small enough that a collection
+// happens inside the callback, and the interpreter's own sentences.
+//
+// **A test here that merely allocates a little proves nothing**, which is the lesson `map` cost an
+// afternoon for: the failure it produced was *"this array was changed while `map` was walking it"*
+// about a literal nothing can reach, and the array had been freed under the walk. The heap has to be
+// small enough that the collector actually runs while the builtin's arguments are standing.
+
+// A heap small enough that a callback allocating in a loop collects several times inside one builtin
+// call, and the one the rest of the suite runs against.
+private const Crowded: usize = 1048576
+private const Roomy: usize = 268435456
+
+// What a program PRINTED, run against a heap that collects under it. `tests_kit.sysl`'s
+// `in_small_heap` is the other half of the same idea and answers the complaint a program that ran out
+// drew; what is wanted here is the answer of a program that did not.
+//
+// **The limit is put back whatever happened**, so nothing after this runs in a megabyte by accident.
+private out_in_small_heap(text: string) -> string
+    set_heap_limit(Crowded)
+
+    val said = out(text)
+
+    set_heap_limit(Roomy)
+    said
+end out_in_small_heap
+
+// Something to allocate with, written as a recursion so that the stack GROWS while the builtin's own
+// arguments are standing underneath it -- which is what would move them if a window were a pointer.
+private const Allocating: string = "deep(n) = if n == 0 then { a: 1, b: [1, 2, 3], c: \"xxxxxxxx\" } else deep(n - 1)\n"
+
+@test
+A_CALLBACK_THAT_COLLECTS_CANNOT_FREE_THE_BUILTINS_OWN_ARGUMENTS()
+    // The receiver and the callback are `map`'s two arguments and are standing on the stack while the
+    // callback allocates hard enough to collect repeatedly.
+    val walked = out_in_small_heap(Allocating + "var i = 0\nwhile i < 300\n    map([\"a\", \"b\", \"c\"], r -> deep(400).a + i)\n    i = i + 1\nprint(map([1, 2, 3], x -> deep(400).a + x))")
+
+    assert_eq(walked, "[2, 3, 4]")
+
+@test
+filter_reduce_AND_sort_KEEP_THEIRS_THROUGH_A_COLLECTION_TOO()
+    val kept = out_in_small_heap(Allocating + "var i = 0\nwhile i < 200\n    filter([1, 2, 3, 4], x -> deep(300).a > 0 && x > 2)\n    reduce([1, 2, 3], (a, b) -> deep(300).a - 1 + a + b, 0)\n    i = i + 1\nprint([filter([1, 2, 3, 4], x -> deep(300).a > 0 && x > 2), reduce([1, 2, 3], (a, b) -> deep(300).a - 1 + a + b, 0)])")
+
+    assert_eq(kept, "[[3, 4], 6]")
+
+    val sorted = out_in_small_heap(Allocating + "var i = 0\nwhile i < 200\n    sort([5, 3, 4, 1, 2], (a, b) -> deep(300).a > 0 && a < b)\n    i = i + 1\nval xs = [5, 3, 4, 1, 2]\nsort(xs, (a, b) -> deep(300).a > 0 && a < b)\nprint(xs)")
+
+    assert_eq(sorted, "[1, 2, 3, 4, 5]")
+
+@test
+A_CALLBACK_THAT_CALLS_THE_SAME_BUILTIN_KEEPS_BOTH_SETS_OF_ARGUMENTS()
+    // Re-entrancy under a collection: the outer call's window is below the inner call's, and each has
+    // to come off exactly its own.
+    val nested = out_in_small_heap(Allocating + "var i = 0\nwhile i < 200\n    map([1, 2], x -> map([x, x + 1], y -> deep(250).a - 1 + y * 10))\n    i = i + 1\nprint(map([1, 2], x -> map([x, x + 1], y -> y * 10)))")
+
+    assert_eq(nested, "[[10, 20], [20, 30]]")
+
+@test
+A_CALLBACK_THAT_FAULTS_INSIDE_A_try_LEAVES_THE_STACK_WHERE_IT_WAS()
+    // **A ONE-CELL DRIFT PER TURN WOULD SHOW UP HERE AND NOWHERE ELSE.** A hundred thousand turns of
+    // a builtin call inside a `try`, one in seven of them caught: a leak of one operand a turn would
+    // run the stack away, and a pop too many would take the loop's own values with it.
+    val prog = "var total = 0\nvar caught = 0\nvar i = 0\nwhile i < 100000\n    total = total + ((map([i], x -> if x % 7 == 0 then throw \"no\" else x)[0]) catch e -> 0)\n    if i % 7 == 0 then caught = caught + 1\n    i = i + 1\nprint([total, caught])"
+
+    assert_eq(out(prog), "[4285685715, 14286]")
+
+@test
+A_BUILTIN_THAT_FAULTS_TAKES_ITS_OWN_ARGUMENTS_OFF_WITH_IT()
+    // The same balance asked of a builtin that refuses what it was handed rather than of a callback
+    // that throws, since the two leave the dispatch by different doors.
+    val prog = "anything(v) = v\nvar seen = 0\nvar i = 0\nwhile i < 100000\n    seen = seen + ((anything(push)(i)) catch e -> 1)\n    i = i + 1\nprint(seen)"
+
+    assert_eq(out(prog), "100000")
+
+@test
+A_BUILTIN_GIVEN_TOO_FEW_SAYS_HOW_MANY_IT_WAS_GIVEN()
+    // The count comes off the window now rather than off a buffer, and the sentence is the one it has
+    // always been. **The JavaScript back end says something else about the same call**, which is why
+    // this is here and not in `tests/lang/`.
+    val prog = "anything(v) = v\nprint((anything(push)()) catch e -> e.message)"
+
+    assert_eq(out(prog), "`push` takes two arguments and was given 0")
+
+@test
+A_GENERATOR_STEP_READS_ITS_ARGUMENTS_BEFORE_THE_MACHINE_IS_SWAPPED()
+    // **`next` is a builtin whose own arguments are on a stack that is SET ASIDE while it runs.**
+    // `gen_step` parks the caller and unparks the generator, so a window read across that swap would
+    // be pointing at the wrong machine's stack -- and everything `next` needs is read before it.
+    val prog = Allocating + "counting() =\n    val a = yield 1\n    val b = yield a + 1\n    a + b\nval g = counting()\nval one = g.next().value\nval two = g.next(10).value\nval last = g.next(deep(300).a + 4)\nprint([one, two, last.value, last.done])"
+
+    assert_eq(out_in_small_heap(prog), "[1, 11, 15, true]")
+
+@test
+A_NATIVE_THAT_ANSWERS_A_PROMISE_STILL_READS_ITS_ARGUMENTS()
+    // A timer and a file read both arm something and hand back a handle. Neither may read its
+    // arguments once the machine has been swapped, and both are asked here with the machine swapped
+    // afterwards by an `await`.
+    val timed = "val seen = []\nsetTimeout(() -> push(seen, \"fired\"), 0)\nasync go() = await sleep(5)\nawait go()\nprint(seen)"
+
+    assert_eq(out(timed), "[\"fired\"]")
+
+    // **A COUNT READ OFF THE WINDOW IS THE SAME COUNT**, which a native with its own arity rule is
+    // what proves: `setTimeout` refuses a third argument rather than dropping it, and says how many
+    // it saw.
+    val surplus = "anything(v) = v\nprint((anything(setTimeout)(() -> 1, 0, \"surplus\")) catch e -> e.message)"
+
+    assert_eq(out(surplus), "a timer takes a function and a delay, and was given 3 arguments")
+
+    val missing = "import { readFile } from slate:fs\nasync go() =\n    val r = await readFile(\"no/such/path/at/all\")\n    if r.ok then \"read\" else \"refused\"\nprint(await go())"
+
+    assert_eq(out(missing), "refused")
+
+@test
+AN_ACTOR_send_AND_ask_READ_THEIR_ARGUMENTS_WHERE_THEY_STAND()
+    // `send` and `ask` take an actor or a message and everything after it, which is a window read
+    // from one to the end -- and `ask` answers a promise, so its own arguments are on a stack the
+    // await parks.
+    val prog = "import { spawn, send, ask, stop } from slate:actor\nactor Counter\n    var n = 0\n\n    on add(self, by)\n        self.n = self.n + by\n\n    on total(self) = self.n\nasync go() =\n    val c = spawn(Counter)\n    send(c.add, 4)\n    send(c.add, 6)\n    val n = await ask(c.total)\n    stop(c)\n    n\nprint(await go())"
+
+    assert_eq(out(prog), "10")
