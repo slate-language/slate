@@ -597,3 +597,138 @@ private compile_match(u: *Unit, e: *Emit, subject: Expr, arms: Buf[Arm], at: Spa
     for i in 0..<leaves.len()
         patch(e, leaves.at(i), here(e))
 end compile_match
+
+// An expression standing where its value is thrown away, compiled to leave nothing behind at all.
+//
+// **`if`, `match` AND `try` ARE STILL EXPRESSIONS AND NO RULE OF THE LANGUAGE CHANGES HERE.** What
+// changes is the code emitted where the compiler can prove nobody reads the answer: written as a
+// statement, each of them used to make a value in every branch -- a `PushNull` where the branch had
+// none -- and meet a `Discard` on the far side of the join, three instructions per construct per
+// execution computing nothing.
+//
+// **EVERY WAY IN STILL REACHES THE JOIN AT ONE DEPTH, WHICH IS THE WHOLE OF THE ARGUMENT.** Call the
+// depth where the construct begins `S`:
+//
+// - an `if` computes its condition at `S + 1` and `JumpIfFalse` takes it back to `S`; each branch is
+//   compiled through here and so leaves `S`; and an `else` nobody wrote pushes nothing instead of a
+//   null, so no jump over it is emitted and the test aims straight at the join. Both ways in are `S`;
+// - a `match` holds its subject at `S + 1` while the arms are tried, and an arm that takes `Pop`s it
+//   and leaves `S`. Nothing falls out of the bottom -- `FailNoArm` reads the subject and faults --
+//   so the counter is simply told `S`, which is where every arm's jump arrives;
+// - a `try` establishes its handler at `S`, and that is the height the machine cuts back to: the body
+//   leaves `S`, and the handler is entered at `S + 1` with the fault on top, which the binding of the
+//   caught name takes off again. Both ways in are `S`;
+// - a `break`, a `continue` and a `return` never fall through, and each puts the counter back to what
+//   the code after it expects before leaving what the statement owes -- which here is nothing -- so a
+//   branch ending in one leaves the depth its neighbours leave;
+// - **unreadness travels INWARD**: a branch is a block, and its last statement is asked for exactly
+//   what the construct was asked for, so an `if` whose branch ends in another `if` costs nothing
+//   either.
+//
+// **A LOOP IS DELIBERATELY NOT ONE OF THESE.** `break x` gives a loop a value, pushed onto the bare
+// stack after the unwind, so a loop's two ways out meet carrying one value by construction. Taking
+// that away is an argument about `jump_out` rather than about a join, and it is not this one.
+//
+// Not `private`: reached from `compile_stmt.sysl`.
+compile_unread(u: *Unit, e: *Emit, x: Expr, wants: StmtValue)
+    val at = x.span
+
+    *x.kind match
+        IfExpr(cond, then_branch, else_branch) -> unread_if(u, e, cond, then_branch, else_branch, at, wants)
+        MatchExpr(subject, arms) -> unread_match(u, e, subject, arms, at, wants)
+        TryCatch(body, name, handler) -> compile_try_unread(u, e, body, name, handler, at, wants)
+        Block(stmts) ->
+            open_scope(e, at, scoped_block(e, stmts))
+            compile_stmts(u, e, stmts, at, wants)
+            shut_scope(e, at)
+
+        // Everything else computes a value whatever is done with it, so what is left is the one
+        // instruction that drops it -- which is what a statement emitted for it already.
+        _ ->
+            compile_expr(u, e, x)
+            drop_value(e, at, wants)
+end compile_unread
+
+// `compile_if` with no value produced by either branch.
+private unread_if(u: *Unit, e: *Emit, cond: Expr, then_branch: Expr, else_branch: Option[Expr], at: Span, wants: StmtValue)
+    compile_expr(u, e, cond)
+
+    val otherwise = push_n(e, JumpIfFalse(0), at, 1, 0)
+    val before = e.sp
+
+    open_scope(e, at, scoped_branch(e))
+    compile_unread(u, e, then_branch, wants)
+    shut_scope(e, at)
+
+    else_branch match
+        Some(x) ->
+            val done = put(e, Jump(0), at)
+
+            patch(e, otherwise, here(e))
+            e.sp = before
+
+            open_scope(e, at, scoped_branch(e))
+            compile_unread(u, e, x, wants)
+            shut_scope(e, at)
+            patch(e, done, here(e))
+
+        // **A missing `else` costs the `Jump` as well as the `PushNull`**, the branch that took now
+        // having nowhere to jump over.
+        None ->
+            patch(e, otherwise, here(e))
+            e.sp = before
+end unread_if
+
+// `compile_match` with no value produced by any arm.
+//
+// **`FailNoArm` READS THE SUBJECT, so the subject is still standing where it stood** -- what changes
+// is only what an arm leaves once it has taken, and where the counter is told the arms meet.
+private unread_match(u: *Unit, e: *Emit, subject: Expr, arms: Buf[Arm], at: Span, wants: StmtValue)
+    compile_expr(u, e, subject)
+
+    val subject_sp = e.sp
+    var leaves: Buf[usize] = buf()
+
+    for i in 0..<arms.len()
+        val arm = arms.at(i)
+
+        val armed = scoped_arm(e, arm.pattern)
+
+        open_scope(e, at, armed)
+
+        refuse_defaults(arm.pattern, "a `match` arm")
+        test_pattern(u, e, arm.pattern, at)
+
+        val missed = push_n(e, JumpIfFalse(0), at, 1, 0)
+        var guard_missed: usize = 0
+        var guarded = false
+
+        arm.guard match
+            Some(g) ->
+                compile_expr(u, e, g)
+                guard_missed = push_n(e, JumpIfFalse(0), at, 1, 0)
+                guarded = true
+            None -> ()
+
+        push_n(e, Pop, at, 1, 0)
+        compile_unread(u, e, arm.body, wants)
+        shut_scope(e, at)
+        leaves.push(put(e, Jump(0), at))
+
+        patch(e, missed, here(e))
+
+        if guarded then patch(e, guard_missed, here(e))
+
+        if armed then push_n(e, PopScope, at, 0, 0)
+
+        e.sp = subject_sp
+
+    push_n(e, FailNoArm, at, 0, 0)
+
+    // An arm that took dropped the subject and pushed nothing over it, so the join is one below where
+    // the subject stood.
+    e.sp = subject_sp - 1
+
+    for i in 0..<leaves.len()
+        patch(e, leaves.at(i), here(e))
+end unread_match
