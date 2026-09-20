@@ -14,7 +14,7 @@ slate=${1:?usage: bench/check.sh <path-to-slate>}
 dir=$(dirname "$0")
 
 names="arith reals globals funcs fib calls methods closures nested loops options
-       fields alloc arrays mapset dispatch strings strindex strwalk sorting csv"
+       fields alloc arrays mapset dispatch strings strindex strwalk sorting csv branches"
 
 failed=0
 

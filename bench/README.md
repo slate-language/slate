@@ -1,6 +1,6 @@
 # The benchmarks, and what the first profile says
 
-Twenty-one programs, each written four times -- in slate, in Lua, in JavaScript and in Python -- and
+Twenty-three programs, each written four times -- in slate, in Lua, in JavaScript and in Python -- and
 a profiler for the interpreter that runs them. **Nothing here makes slate faster.** It exists so that
 the next thing that does can be chosen from a number rather than from an opinion, and so that the
 claim afterwards can be checked.
@@ -20,7 +20,7 @@ bench/run.sh ./slate
 bench/run.sh -n 9 --tsv ./slate arith fib mapset
 ```
 
-`check.sh` runs all four implementations of all twenty-one and diffs every answer against
+`check.sh` runs all four implementations of all twenty-two and diffs every answer against
 `expected.txt`. **A twin that has drifted from its slate program shows up there** -- a loop bound
 edited on one side, a 1-based index off by one, an integer that stopped being exact in a double --
 rather than as a benchmark that quietly measures something else.
@@ -68,6 +68,7 @@ wherever it lands and is indistinguishable from a benchmark being slow.
 | `strwalk` | the same walk over text that is NOT one byte a character, where a position cannot be arithmetic |
 | `sorting` | `sorted` over 20,000 numbers, two hundred times |
 | `csv` | the realistic mix: generate a comma-separated text, split it, convert and add |
+| `branches` | ordinary decision-making code: a bare `if`, an `if`/`elif`/`elif`/`else` chain with a nested `if`, an early `continue`, a five-armed `match`, an `if` used as an expression, and a rare `try`/`catch` |
 
 **Each is sized so that Lua takes roughly a fifth of a second**, which is long enough to measure and
 short enough that slate finishes in a couple. **`strindex` and `strwalk` are deliberately outside
@@ -223,6 +224,43 @@ DECISION.** Every one of the twenty-two is a straight-line loop, so this page ca
 cannot see item 3 (`Tick`), and would not see a branch-prediction or a dispatch change either. A
 `branches` benchmark with its three twins would close it, and is not written here because the set
 these means are taken over is shared and several items are measuring against it this week.
+
+### `branches` — the missing benchmark that makes a decision, 2026-09-20
+
+**Added because of the gap named directly above**: nineteen of the twenty-two programs here held no
+`if`, `match` or `try` at all, so nothing on this page could see a branch misprediction, a `match`'s
+arm search, or `Tick`'s cost against real control flow rather than a straight-line loop. `branches`
+loops two million turns inside a function and every turn runs a bare `if`, an `if`/`elif`/`elif`/`else`
+chain with a nested `if` inside one arm, an early `continue`, a five-armed `match` on a small integer,
+an `if` used as an expression whose value is read, and — every thousandth turn — a `try`/`catch`
+around a call that faults on a rare input. The input is a Park-Miller LCG written out in-program, so
+all four twins walk the identical deterministic sequence and print the same checksum,
+`1064937133`. Twins: `dispatch.lua`'s `if`-chain style for Lua's missing `match`, a `switch` for
+JavaScript, Python's own `match`/`case`, `goto` for Lua's missing `continue`, and `pcall` / `try-except`
+/ `try-catch` for the rare fault.
+
+Taken 2026-09-20 on this machine, `slate` built from `dev` `6d0342b`, best of 5, under `caffeinate`,
+both locks held, box at 85.66% idle before and 98.79% after, `pgrep -x java` empty (no neighbour).
+Milliseconds of process wall time.
+
+| | slate | lua | node --jitless | python | slate/lua | slate/node-jl | slate/py |
+|---|---|---|---|---|---|---|---|
+| `branches`, solo (`-n 5`) | 1345.8 | 100.7 | 312.1 | 388.7 | 13.4x | 4.3x | 3.5x |
+| `branches`, in the full run | 1331.5 | 100.4 | 309.7 | 384.1 | 13.3x | 4.3x | 3.5x |
+
+**The geometric mean, both ways, from the same run** (the previous twenty-two programs — the 21 timed
+rows plus `startup` — against all twenty-three with `branches` added):
+
+| | against lua | against node --jitless | against python3 |
+|---|---|---|---|
+| the previous twenty-two | 8.71x | 7.03x | 4.77x |
+| all twenty-three, with `branches` | **8.88x** | **6.88x** | **4.70x** |
+
+One benchmark added to a mean of twenty-one moves it by about the same tenth of one that the shortlist
+items above already found — `branches` is 13.3x off Lua, near the middle of the existing spread, so it
+nudges the mean rather than shifting it. **The value is not in this mean**: it is that a change to
+`Tick`, to `match`'s arm search, or to branch prediction now has one place on this page to show up,
+where before it had none.
 
 ### A string carries its own character count — shortlist item 4, `7478d4b`
 
