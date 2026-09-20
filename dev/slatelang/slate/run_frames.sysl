@@ -76,6 +76,11 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
     // instruction.
     val vm = machine()
 
+    // **The VM itself, taken once for the same reason.** The witness a call charges when it has to
+    // buffer its arguments is a field of it, and a call is the hottest thing this loop does -- so
+    // the accessor is paid once per `run_frames` rather than once per call.
+    val here = current()
+
     // **Whether to count instructions, decided once for the whole of this loop.**
     // `CountingInstructions` is a build-time constant, so a default build folds this to `false` and
     // the optimiser deletes the branch below along with it -- which is what makes the profiler cost
@@ -697,41 +702,77 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
                 if current().heap_exhausted then return fault(at, "this program has run out of memory")
 
             CallFn(argc, names) ->
-                var written: Buf[Value] = buf()
-
-                for i in 0..<argc
-                    keepable(peek(argc - 1 - i), at, "passed to a function")?
-                    written.push(peek(argc - 1 - i))
-
                 val callee = peek(argc)
 
-                vm.stack.truncate(vm.stack.len() - argc - 1)
+                // **THE ORDINARY CALL LEAVES ITS ARGUMENTS WHERE THEY STAND.** They are already at
+                // the position the callee's slots want them in, so the only thing between here and
+                // a frame is the callee sitting underneath them -- and `in_place_call` is what says
+                // whether anything else has to look at them first. **Zero names means every
+                // argument was positional**, which is nearly every call.
+                val direct = if names == 0 then in_place_call(u, callee, vm.frames.len()) else None
 
-                // **Zero means every argument was positional**, which is nearly every call, and the
-                // whole of what it costs one is this comparison.
-                val args = if names == 0 then written else arrange_named(u, callee, written, u.arg_names.at(names), 0, at)?
+                direct match
+                    Some(entered) ->
+                        for i in 0..<argc
+                            keepable(peek(argc - 1 - i), at, "passed to a function")?
 
-                invoke(u, callee, args, at, vm.frames.len())? match
-                    Answered(v) -> vm.stack.push(v)
-                    Enter(body, called, laid) ->
-                        // **The arguments go down FIRST, before anything else in this arm.** They
-                        // are a sysl local until they are on the stack, and the mark phase cannot
-                        // see one -- so the fewer instructions between `invoke` releasing its hold
-                        // and this, the less there is to go wrong when one of them later learns to
-                        // allocate.
-                        val laid_base = vm.stack.len()
-                        val mask = lay_frame(u, body, laid)
+                        // **The callee comes out from under its own arguments**, which is the whole
+                        // of the move: one shift down of `argc` cells against a malloc, a free and
+                        // two copies of every argument. A slate value is plain storage -- it holds
+                        // nothing reference counted, which `obj.sysl` states as a rule -- so moving
+                        // one within the stack is a copy and no more.
+                        val top = vm.stack.len()
+                        val start = top - argc - 1
+
+                        for i in 0..<argc
+                            vm.stack.set(start + i, vm.stack.at(start + i + 1))
+
+                        vm.stack.truncate(top - 1)
+
+                        val mask = lay_standing(u, entered.0, argc)
 
                         // The frame this call is leaving is written back only here, which is what
                         // makes the ordinary instruction cheap.
                         vm.frames.push(Frame(chunk_ix, pc, vm.scope, base, vm.handlers.len(), given))
-                        chunk_ix = body
+                        chunk_ix = entered.0
                         code = u.chunks.at(chunk_ix).code
                         current().current_source = u.chunks.at(chunk_ix).source
                         pc = 0
-                        vm.scope = called
-                        base = laid_base
+                        vm.scope = entered.1
+                        base = start
                         given = mask
+                    None ->
+                        here.args_buffered += 1
+
+                        var written: Buf[Value] = buf()
+
+                        for i in 0..<argc
+                            keepable(peek(argc - 1 - i), at, "passed to a function")?
+                            written.push(peek(argc - 1 - i))
+
+                        vm.stack.truncate(vm.stack.len() - argc - 1)
+
+                        val args = if names == 0 then written else arrange_named(u, callee, written, u.arg_names.at(names), 0, at)?
+
+                        invoke(u, callee, args, at, vm.frames.len())? match
+                            Answered(v) -> vm.stack.push(v)
+                            Enter(body, called, laid) ->
+                                // **The arguments go down FIRST, before anything else in this arm.**
+                                // They are a sysl local until they are on the stack, and the mark
+                                // phase cannot see one -- so the fewer instructions between `invoke`
+                                // releasing its hold and this, the less there is to go wrong when one
+                                // of them later learns to allocate.
+                                val laid_base = vm.stack.len()
+                                val mask = lay_frame(u, body, laid)
+
+                                vm.frames.push(Frame(chunk_ix, pc, vm.scope, base, vm.handlers.len(), given))
+                                chunk_ix = body
+                                code = u.chunks.at(chunk_ix).code
+                                current().current_source = u.chunks.at(chunk_ix).source
+                                pc = 0
+                                vm.scope = called
+                                base = laid_base
+                                given = mask
 
             // `f(...xs)` -- the arguments are an array the instruction above it built.
             //
@@ -739,6 +780,8 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
             // whole point: everything after that -- the keepable check, the truncate, `invoke` and
             // the two ways a call can go -- is the same code doing the same thing.
             CallSpread ->
+                here.args_buffered += 1
+
                 val spread = pop()
                 val callee = pop()
 
@@ -835,57 +878,96 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
                         None -> looked
                 else looked
 
-                var args: Buf[Value] = buf()
+                // **THE ORDINARY METHOD CALL LEAVES ITS ARGUMENTS WHERE THEY STAND TOO, and a
+                // DELEGATED one does not even move the receiver.** The target sits directly under
+                // the written arguments, which is exactly the order a delegated method's parameters
+                // are in -- so parameter zero is already at `base` and there is nothing to do. A
+                // method the object carries itself takes no receiver, so the target comes out from
+                // under its arguments the way `CallFn`'s callee does.
+                val direct = if names == 0 then in_place_call(u, found.0, vm.frames.len()) else None
 
-                // **The object goes in front of the written arguments where it was delegated to.**
-                // A method the object carries itself has already captured what it needs; a shared
-                // one cannot have, there being one of it for every instance. A builtin method is
-                // delegated to by the same rule -- it is the free function of that name, and the
-                // receiver is its first argument.
-                if found.1 then args.push(target)
+                direct match
+                    Some(entered) ->
+                        for i in 0..<argc
+                            keepable(peek(argc - 1 - i), at, "passed to a function")?
 
-                for i in 0..<argc
-                    keepable(peek(argc - 1 - i), at, "passed to a function")?
-                    args.push(peek(argc - 1 - i))
+                        val top = vm.stack.len()
+                        val start = top - argc - 1
 
-                vm.stack.truncate(vm.stack.len() - argc - 1)
+                        var laid = argc + 1
 
-                if is_absent(found.0)
-                    // **A PROPERTY IS NOT A METHOD, AND THE SENTENCE SAYS SO RATHER THAN THAT THE
-                    // NAME IS MISSING.** `c.area()` reads the property and then calls whatever it
-                    // answered; left to the ordinary complaint the reader is told `area` is not a
-                    // field of an object that plainly has one.
-                    target match
-                        Object(o) ->
-                            if has_property(o, name, at)?
-                                return fault(at, s"`${name}` is a property, not a method -- it is read as `.${name}`, with no brackets after it")
-                        _ -> ()
+                        if !found.1
+                            for i in 0..<argc
+                                vm.stack.set(start + i, vm.stack.at(start + i + 1))
 
-                    return fault(at, s"`${name}` is not a field of this object, so there is nothing to call")
+                            vm.stack.truncate(top - 1)
+                            laid = argc
 
-                // **The receiver is parameter zero and is already in the list**, so the names cover
-                // what was written and the arrangement is told how many slots are spoken for.
-                val placed = if names == 0 then args else arrange_named(u, found.0, args, u.arg_names.at(names), if found.1 then 1 else 0, at)?
-
-                invoke(u, found.0, placed, at, vm.frames.len())? match
-                    Answered(v) -> vm.stack.push(v)
-                    Enter(body, called, laid) ->
-                        // **The arguments go down FIRST, before anything else in this arm.** They
-                        // are a sysl local until they are on the stack, and the mark phase cannot
-                        // see one -- so the fewer instructions between `invoke` releasing its hold
-                        // and this, the less there is to go wrong when one of them later learns to
-                        // allocate.
-                        val laid_base = vm.stack.len()
-                        val mask = lay_frame(u, body, laid)
+                        val mask = lay_standing(u, entered.0, laid)
 
                         vm.frames.push(Frame(chunk_ix, pc, vm.scope, base, vm.handlers.len(), given))
-                        chunk_ix = body
+                        chunk_ix = entered.0
                         code = u.chunks.at(chunk_ix).code
                         current().current_source = u.chunks.at(chunk_ix).source
                         pc = 0
-                        vm.scope = called
-                        base = laid_base
+                        vm.scope = entered.1
+                        base = start
                         given = mask
+                    None ->
+                        here.args_buffered += 1
+
+                        var args: Buf[Value] = buf()
+
+                        // **The object goes in front of the written arguments where it was delegated
+                        // to.** A method the object carries itself has already captured what it
+                        // needs; a shared one cannot have, there being one of it for every instance.
+                        // A builtin method is delegated to by the same rule -- it is the free
+                        // function of that name, and the receiver is its first argument.
+                        if found.1 then args.push(target)
+
+                        for i in 0..<argc
+                            keepable(peek(argc - 1 - i), at, "passed to a function")?
+                            args.push(peek(argc - 1 - i))
+
+                        vm.stack.truncate(vm.stack.len() - argc - 1)
+
+                        if is_absent(found.0)
+                            // **A PROPERTY IS NOT A METHOD, AND THE SENTENCE SAYS SO RATHER THAN
+                            // THAT THE NAME IS MISSING.** `c.area()` reads the property and then
+                            // calls whatever it answered; left to the ordinary complaint the reader
+                            // is told `area` is not a field of an object that plainly has one.
+                            target match
+                                Object(o) ->
+                                    if has_property(o, name, at)?
+                                        return fault(at, s"`${name}` is a property, not a method -- it is read as `.${name}`, with no brackets after it")
+                                _ -> ()
+
+                            return fault(at, s"`${name}` is not a field of this object, so there is nothing to call")
+
+                        // **The receiver is parameter zero and is already in the list**, so the
+                        // names cover what was written and the arrangement is told how many slots
+                        // are spoken for.
+                        val placed = if names == 0 then args else arrange_named(u, found.0, args, u.arg_names.at(names), if found.1 then 1 else 0, at)?
+
+                        invoke(u, found.0, placed, at, vm.frames.len())? match
+                            Answered(v) -> vm.stack.push(v)
+                            Enter(body, called, laid) ->
+                                // **The arguments go down FIRST, before anything else in this arm.**
+                                // They are a sysl local until they are on the stack, and the mark
+                                // phase cannot see one -- so the fewer instructions between `invoke`
+                                // releasing its hold and this, the less there is to go wrong when one
+                                // of them later learns to allocate.
+                                val laid_base = vm.stack.len()
+                                val mask = lay_frame(u, body, laid)
+
+                                vm.frames.push(Frame(chunk_ix, pc, vm.scope, base, vm.handlers.len(), given))
+                                chunk_ix = body
+                                code = u.chunks.at(chunk_ix).code
+                                current().current_source = u.chunks.at(chunk_ix).source
+                                pc = 0
+                                vm.scope = called
+                                base = laid_base
+                                given = mask
 
             // `o.m(...xs)`. The receiver rule is `CallMethod`'s and is not restated: what differs is
             // that the arguments arrive as an array, and the receiver goes in front of them where
@@ -911,6 +993,8 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
                         Some(pair) -> pair
                         None -> looked
                 else looked
+
+                here.args_buffered += 1
 
                 var args: Buf[Value] = buf()
 
