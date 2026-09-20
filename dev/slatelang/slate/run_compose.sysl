@@ -1,0 +1,321 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.str_builder
+
+// The instructions that COMPOSE a value out of what is standing on the stack -- an array, an object,
+// a range, a joined string, a repetition, a copy with fields changed -- and the two that WRITE
+// through a value already made.
+//
+// **Cut out of `run_frames.sysl`, which keeps the loop.** That file is one function whose body is one
+// `match` over `Op`, so there was nothing outside the match to move: what came here instead is the
+// arms that touch none of the loop's own state. Every one of these reads and writes the operand
+// stack and nothing else -- no `pc`, no `base`, no `code`, no `chunk_ix`, no `given`, no `vm.scope` --
+// which is what makes them expressible as functions at all. An arm that enters a frame writes all six
+// and could not have come.
+//
+// **They are also the arms that are COLD, and that is the other half of why these and not others.**
+// Each one already allocates, already walks a list, or already runs a lookup, so the call that
+// reaches it is a fraction of what it does; the cheap instructions the benchmarks are made of --
+// `PushInt`, `LoadSlot`, `Jump`, `Pop`, `Dup`, the arithmetic -- stay written out in the loop where a
+// call would be the whole cost. `bench/README.md` carries the measurement that says this cut is
+// timed neutral.
+//
+// **Allocate BEFORE the stack shrinks**, which is the one rule every function here obeys and the
+// reason several of them read odd. Between a truncate and an `alloc` the operands would live only in
+// a sysl `Buf`, which the mark phase cannot see -- and `alloc` collects when the heap is full.
+// `obj.sysl` states it as `A `Value` IN A SYSL LOCAL IS NOT A ROOT`.
+//
+// Nothing here is `private`: every name is reached from `run_frames.sysl`, which is the only caller
+// of any of them.
+
+// `[a, b, c]`.
+compose_array(vm: *Machine, n: usize, at: Span) -> Result[unit, Signal]
+    var items: Buf[Value] = buf()
+
+    for i in 0..<n
+        keepable(peek(n - 1 - i), at, "put in an array")?
+        items.push(peek(n - 1 - i))
+
+    // **Allocated before the stack shrinks.** Between the truncate and the alloc the elements would
+    // live only in `items`, which the mark phase cannot see -- and `alloc` collects when the heap is
+    // full.
+    val made = Array(new_array(items))
+
+    vm.stack.truncate(vm.stack.len() - n)
+    vm.stack.push(made)
+    Ok(())
+end compose_array
+
+// `{ a: 1, b: 2 }`.
+compose_object(vm: *Machine, n: usize, at: Span) -> Result[unit, Signal]
+    val o = new_object()
+    val mark = root_mark()
+
+    hold(Object(o))
+
+    for i in 0..<n
+        val key = peek((n - 1 - i) * 2 + 1)
+        val value = peek((n - 1 - i) * 2)
+
+        keepable(value, at, "put in an object")?
+
+        obj_put(o, key, value, at)?
+
+    release(mark)
+    vm.stack.truncate(vm.stack.len() - n * 2)
+    vm.stack.push(Object(o))
+    Ok(())
+end compose_object
+
+// `a..<b`, and every other way a range can be written.
+compose_range(vm: *Machine, inclusive: bool, has_lo: bool, has_hi: bool, has_step: bool,
+              at: Span) -> Result[unit, Signal]
+    // **A COMPUTED ZERO IS CAUGHT HERE**, a written one having been refused where it stood. The
+    // sentence is the same either way, with the number that arrived in it.
+    val step = if has_step then range_end(pop(), at, "the step")? else 1
+
+    if step == 0
+        return Err(failure(at, "a range steps by 0, so it would never reach its end -- `by` takes a step that moves"))
+
+    val hi = if has_hi then range_end(pop(), at, "the end")? else 0
+    val lo = if has_lo then range_end(pop(), at, "the start")? else 0
+
+    vm.stack.push(RangeVal(lo, hi, inclusive, has_lo, has_hi, step))
+    Ok(())
+end compose_range
+
+// The pieces of an interpolation, made into one string.
+compose_join(vm: *Machine, n: usize, at: Span) -> Result[unit, Signal]
+    var out = str_builder()
+
+    // **An interpolation's count is the sum of its pieces'**, so a string built out of one that is
+    // already long does not walk it again: the piece carries its own count and only a rendered value
+    // has to be counted, where it is made.
+    var chars: usize = 0
+
+    for i in 0..<n
+        val piece = peek(n - 1 - i)
+
+        keepable(piece, at, "put in a string")?
+
+        val text = printed(piece, at)?
+
+        chars += piece match
+            Str(p) -> p.chars
+            _ -> char_count(text)
+
+        out.push(text)
+
+    val joined = str_counted(out.finish(), chars)
+
+    vm.stack.truncate(vm.stack.len() - n)
+    vm.stack.push(joined)
+    Ok(())
+end compose_join
+
+// `[x] * n` -- one value, that many times.
+compose_repeat(vm: *Machine, at: Span) -> Result[unit, Signal]
+    val n = pop() match
+        Int(k) ->
+            if k < 0 then return Err(failure(at, s"an array of ${k} copies is not something to make")) else usize(k)
+        other -> return Err(failure(at, s"a repeat count is a whole number, and this is ${other.type_name()}"))
+
+    keepable(peek(0), at, "put in an array")?
+
+    var items: Buf[Value] = buf()
+
+    for i in 0..<n
+        items.push(peek(0))
+
+    // Allocated before the stack shrinks, for the reason `compose_array` gives.
+    val made = Array(new_array(items))
+
+    vm.stack.truncate(vm.stack.len() - 1)
+    vm.stack.push(made)
+    Ok(())
+end compose_repeat
+
+// `o with { a: 1 }` -- a copy of an object with the written fields changed.
+compose_with_object(vm: *Machine, n: usize, at: Span) -> Result[unit, Signal]
+    val subject = peek(n * 2)
+
+    val fields = subject match
+        Object(o) -> o
+        other -> return Err(failure(at, s"`with` copies an object, and this is ${other.type_name()}"))
+
+    val o = new_object()
+    val mark = root_mark()
+
+    hold(Object(o))
+
+    // The base's own fields first, in the order it holds them, so that the copy keeps the order and
+    // a changed field keeps the place it already had.
+    for i in 0..<fields.entries.len()
+        val entry = fields.entries.at(i)
+
+        if !entry.dead then obj_put(o, entry.key, entry.value, at)?
+
+    for i in 0..<n
+        val key = peek((n - 1 - i) * 2 + 1)
+        val value = peek((n - 1 - i) * 2)
+
+        // **Asked of the BASE and not of the copy**, or the second written key would find the first
+        // one already there and be taken for a field the type has.
+        unknown_field_complaint(fields, key) match
+            Some(said) ->
+                release(mark)
+                return Err(failure(at, said))
+            None -> ()
+
+        keepable(value, at, "put in an object")?
+        obj_put(o, key, value, at)?
+
+    // A copy of a data value is a data value, which is what makes `with` the answer the refusal
+    // points at. Set last, the writes above being how the copy was filled.
+    o.frozen = fields.frozen
+
+    release(mark)
+    vm.stack.truncate(vm.stack.len() - n * 2 - 1)
+    vm.stack.push(Object(o))
+    Ok(())
+end compose_with_object
+
+// `a with b`, and `{ ...o }`, which are one instruction.
+//
+// **`spread` picks the words and changes nothing else.** A message naming the spelling the reader did
+// not write sends them looking for it.
+compose_with_merge(vm: *Machine, spread: bool, at: Span) -> Result[unit, Signal]
+    val other = peek(0) match
+        Object(o) -> o
+        got ->
+            return Err(failure(at, if spread
+                then s"`...` spreads the fields of an object, and this is ${got.type_name()}"
+                else s"`with` copies the fields of an object, and this is ${got.type_name()}"))
+
+    val fields = peek(1) match
+        Object(o) -> o
+        got -> return Err(failure(at, s"`with` copies an object, and this is ${got.type_name()}"))
+
+    val o = new_object()
+    val mark = root_mark()
+
+    hold(Object(o))
+
+    // The base's own fields first, in the order it holds them, so the copy keeps the order and a
+    // field the other object also has keeps the place it already had.
+    for i in 0..<fields.entries.len()
+        val entry = fields.entries.at(i)
+
+        if !entry.dead then obj_put(o, entry.key, entry.value, at)?
+
+    for i in 0..<other.entries.len()
+        val entry = other.entries.at(i)
+
+        if !entry.dead
+            // `c with someObject` reaches a data value exactly as `c with { ... }` does, and so does
+            // `{ ...c, x: 1 }` once `object_so_far` has desugared it.
+            unknown_field_complaint(fields, entry.key) match
+                Some(said) ->
+                    release(mark)
+                    return Err(failure(at, said))
+                None -> ()
+
+            obj_put(o, entry.key, entry.value, at)?
+
+    // **A copy of a data value is a data value**, which is what makes `with` the answer the refusal
+    // points at: `c with { r: 5 }` is another `Circle`, still sealed, still usable as a key. The flag
+    // is set last, the writes above being how it was filled.
+    o.frozen = fields.frozen
+
+    release(mark)
+    vm.stack.truncate(vm.stack.len() - 2)
+    vm.stack.push(Object(o))
+    Ok(())
+end compose_with_merge
+
+// The top `n` arrays, made into one. What builds a spread argument list.
+compose_joined_arrays(vm: *Machine, n: usize, at: Span) -> Result[unit, Signal]
+    var items: Buf[Value] = buf()
+
+    for i in 0..<n
+        peek(n - 1 - i) match
+            Array(a) ->
+                for j in 0..<a.items.len()
+                    items.push(a.items.at(j))
+
+            // **A set and a map spread what a `for` over them yields**, which is the rule
+            // JavaScript's `...` follows too: everything iterable spreads, and the two agree about
+            // what each one gives.
+            SetVal(_) ->
+                val each = walked_values(peek(n - 1 - i), at, "`...`")?
+
+                for j in 0..<each.len()
+                    items.push(each.at(j))
+            MapVal(_) ->
+                val each = walked_values(peek(n - 1 - i), at, "`...`")?
+
+                for j in 0..<each.len()
+                    items.push(each.at(j))
+
+            // **The complaint names the spread and not the call**, because that is where the reader
+            // has to look: `f(...42)` is a mistake about what may be spread.
+            other -> return Err(failure(at, s"`...` spreads an array, a set or a map, and this is ${other.type_name()}"))
+
+    // Allocated before the stack shrinks, for `compose_array`'s reason.
+    val made = Array(new_array(items))
+
+    vm.stack.truncate(vm.stack.len() - n)
+    vm.stack.push(made)
+    Ok(())
+end compose_joined_arrays
+
+// `o[k] = v`.
+write_indexed(vm: *Machine, at: Span) -> Result[unit, Signal]
+    val v = pop()
+    val k = pop()
+    val target = pop()
+
+    keepable(v, at, "stored")?
+    keepable(k, at, "used as a key")?
+
+    store_at(target, k, v, at)?
+    Ok(())
+end write_indexed
+
+// `o.name = v`.
+write_named(vm: *Machine, name: string, at: Span) -> Result[unit, Signal]
+    val v = peek(0)
+
+    keepable(v, at, s"stored in `${name}`")?
+
+    peek(1) match
+        Object(o) ->
+            // **A `set` property is consulted before the object is written to**, and only where the
+            // object has no field of that name itself -- which is the rule a read follows, read
+            // backwards.
+            if !write_property(peek(1), o, name, v, at)?
+                // **Asked here because `obj_put_name` has nowhere to report from**, where the indexed
+                // form goes through `obj_put` and refuses it there. The two answer the same sentence.
+                if o.frozen then return Err(failure(at, frozen_complaint(s"`${name}`")))
+
+                obj_put_name(o, name, v)
+        // **The dotted write and the bracketed one are one thing said two ways**, so they answer one
+        // sentence: `globalThis.marker = 1` is a program reaching the host, not a program mistaking an
+        // external for an object. `store_at` says it for the bracketed form and this is the same
+        // refusal, naming the field the way the read side does.
+        External(_) -> return Err(failure(at, js_host_only(s"writing `${name}` on an external")))
+        other ->
+            // **A PROPERTY OF A BUILTIN KIND IS READ-ONLY, AND THE COMPLAINT NAMES IT.**
+            // `s.length = 3` is a mistake about what `length` is; told only that a string has no
+            // fields, the reader is left thinking the name was never there. `method.sysl` writes the
+            // sentence, a class's read-only property saying the same thing in the same shape.
+            if builtin_property(other, name).is_some()
+                return Err(failure(at, read_only_property(other, name)))
+
+            return Err(failure(at, s"a field belongs to an object, and this is ${other.type_name()}"))
+
+    vm.stack.truncate(vm.stack.len() - 2)
+    Ok(())
+end write_named
