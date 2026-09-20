@@ -1,8 +1,8 @@
-// Regular expressions: Perl's dialect, on PCRE2, with three of JavaScript's decisions reversed.
+// Regular expressions: ECMAScript's dialect, with three of JavaScript's decisions reversed.
 //
-// The pattern you would write anywhere else is the pattern that works here -- `\d`, `\w`, lazy
-// quantifiers, lookaround, backreferences and named groups all mean what they mean in Perl, Python,
-// Ruby and a browser.
+// The pattern you would write in a browser is the pattern that works here -- `\d`, `\w`, lazy
+// quantifiers, lookaround, backreferences, named groups and `\p{...}` all mean exactly what they
+// mean there, on both back ends and with nothing translated in between.
 
 import { regex } from slate:regex
 
@@ -66,7 +66,7 @@ try
 catch e
     print(e.message.contains("not a regular expression"))
 
-// The flags are `i`, `m`, `s` and `x`. There is no `g`, and asking for one says so.
+// The flags are `i`, `m`, `s` and `u`. There is no `g`, and asking for one says so.
 print(regex("hello", "i").test("Hello World"))
 print(regex("^\\w+", "m").findAll("one\ntwo").map((x) -> x.text).join(","))
 
