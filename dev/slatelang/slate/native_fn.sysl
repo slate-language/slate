@@ -43,12 +43,42 @@ import sysl.container.{Map, map}
 // What a `Value.Native` holds: a builtin's id, one past its slot in the table.
 type NativeFn = u32
 
+// A builtin's arguments, as a WINDOW onto the operand stack they are standing on.
+//
+// **Nothing is copied and nothing is held, because the stack is already a root.** A call used to pop
+// its arguments into a fresh `Buf` -- one `malloc`, one free, one copy of every argument and one
+// shadow-stack hold each, on every call of every builtin a program makes. They stand where the
+// instruction left them instead, and the dispatch cuts them off once the builtin has answered.
+//
+// **AN INDEX AND NOT A POINTER, WHICH IS THE WHOLE OF ITS SAFETY.** A builtin that calls back into
+// slate -- `map`, `filter`, `sort` with a comparator -- runs that callback on the SAME operand
+// stack, pushing above the arguments standing here; a stack deep enough to grow replaces its
+// storage, so a pointer or a slice taken before the callback names freed memory after it. An index
+// survives a reallocation, and `at` reads the running machine's stack afresh every time.
+struct Args
+    // Where the first argument stands, as an index into the running machine's operand stack.
+    base: usize
+
+    // How many of them there are.
+    count: usize
+
+    // The `i`th argument. The caller has already checked there is one -- `len` is how.
+    at(self, i: usize) -> Value = machine().stack.at(self.base + i)
+
+    len(self) -> usize = self.count
+
+    is_empty(self) -> bool = self.count == 0
+
+    // The first `n` of them, as a window of their own, for a builtin that hands its work to another
+    // one that takes fewer arguments. A window is two numbers, so this costs nothing.
+    take(self, n: usize) -> Args = Args(self.base, if n < self.count then n else self.count)
+
 // What a builtin runs, as the table holds it.
 //
 // **`&sync` and not `&Fn`, and that is the whole of the thread safety.** An ordinary `&Fn` is a
 // counted box whose count is bumped without an atomic, so one slot read by two VMs at once loses
 // counts and frees the box under the thread still calling it.
-type NativeGo = &sync Fn(Buf[Value], Span) -> Step
+type NativeGo = &sync Fn(Args, Span) -> Step
 
 // How many builtins the table has room for. Registration faults past it rather than growing, a table
 // that grows being one that can move while another thread is reading it.
@@ -112,7 +142,7 @@ end register
 // **One indirection and no match over builtins.** A builtin's id is its slot, so what used to be a
 // 371-line match over every arm of a closed enum is a bounds check and a call through the slot the
 // registry already holds.
-run_native(f: NativeFn, args: Buf[Value], at: Span) -> Step
+run_native(f: NativeFn, args: Args, at: Span) -> Step
     if f == 0u32 || usize(f) > MaxNatives
         return fault(at, "this builtin was never registered, which is a defect in slate itself")
 
@@ -120,6 +150,33 @@ run_native(f: NativeFn, args: Buf[Value], at: Span) -> Step
         None -> fault(at, "this builtin was never registered, which is a defect in slate itself")
         Some(go) -> go(args, at)
 end run_native
+
+// Run something that takes a builtin's arguments, over values made up here rather than written at a
+// call site.
+//
+// **THE VALUES GO ONTO THE OPERAND STACK AND COME OFF AGAIN, BECAUSE THERE IS NOWHERE ELSE AN `Args`
+// CAN POINT.** A window is an index into the running machine's stack, so anything that is not a call
+// instruction -- a builtin building arguments for another one, a callback reached from `apply`, a
+// property read -- has to put them there first. It is the same buffer the dispatch used to make on
+// every builtin call, kept by the handful of callers that genuinely have one.
+//
+// **The cut is skipped after a park**, as `run_chunk`'s is: a suspended call swapped the running
+// machine for a fresh one and this height belongs to the other stack.
+with_args(vals: Buf[Value], at: Span, go: &Fn(Args, Span) -> Step) -> Step
+    val vm = machine()
+    val base = vm.stack.len()
+
+    for i in 0..<vals.len()
+        vm.stack.push(vals.at(i))
+
+    val answer = go(Args(base, vals.len()), at)
+
+    answer match
+        Err(Wait) -> ()
+        _ -> vm.stack.truncate(base)
+
+    answer
+end with_args
 
 // The name a builtin was registered under.
 native_name(f: NativeFn) -> string

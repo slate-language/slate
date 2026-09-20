@@ -306,7 +306,7 @@ end param_list
 // Not `private`: reached from `run_frames.sysl`.
 invoke(u: *Unit, callee: Value, args: Buf[Value], at: Span, depth: usize) -> Result[Called, Signal]
     callee match
-        Native(f) -> Ok(Answered(call_native(f, args, at)?))
+        Native(f) -> Ok(Answered(call_native_buf(f, args, at)?))
         Fn(c) ->
             val chunk = u.chunks.at(c.body)
 
@@ -509,13 +509,30 @@ end fault_value
 // slot keeps the `Null` it was padded with, the head of the chunk works the default out, and no
 // sentinel value ever sits in a slot for a `LoadSlot` to have to check for.
 //
-// Whether a call may be entered with its arguments LEFT WHERE THEY STAND, and if so the chunk to run
-// and the scope to run it in.
+// What a call instruction does with the value it is calling.
+//
+// **THE THREE ARE TOLD APART BY WHETHER ANYTHING HAS TO LOOK AT THE ARGUMENTS FIRST**, which is the
+// one question the call instructions ask: two of them can read the arguments where they stand and the
+// third has to copy them out before it can do anything with them.
+//
+// Not `private`: `run_frames.sysl` matches on one.
+enum CallPlan
+    // A slate chunk entered with its arguments left exactly where they are.
+    InPlace(body: usize, scope: *EnvObj)
+
+    // A builtin, which reads its arguments where they stand and answers a value.
+    Builtin(f: NativeFn)
+
+    // Everything else, which copies them into a buffer and asks `invoke`.
+    Buffered
+
+// Which of the three a call is.
 //
 // **A call's arguments are already at the position the callee's slots want them**, which is what the
 // window's own design says: the stack top is the callee's `base` once the callee and the arguments
 // have come off. So copying them into a buffer and pushing them back puts every value down where it
-// was already standing, at the price of a malloc, a free and two copies of each one.
+// was already standing, at the price of a malloc, a free and two copies of each one. A builtin never
+// had a frame to lay, so for one the buffer bought nothing at all.
 //
 // **What is asked here is only whether the ordinary path is the whole story.** Everything that has to
 // look at the arguments *before* the frame exists takes the buffer: a named call arranges them
@@ -524,19 +541,26 @@ end fault_value
 // of its own. A chunk that is not `slotted` binds its parameters by name into a scope, which is a
 // second thing to do with them and not a place to put them.
 //
+// **A NAMED CALL IS THE BUFFER'S WHATEVER IT IS CALLING**, a builtin included: `arrange_named` is
+// where a name is matched against a parameter list, and it is where a builtin's *having no parameter
+// names* is said.
+//
 // Not `private`: `run_frames.sysl` is the one caller, and it is a different file.
-in_place_call(u: *Unit, callee: Value, depth: usize) -> Option[(usize, *EnvObj)]
+placed_call(u: *Unit, callee: Value, names: usize, depth: usize) -> CallPlan
+    if names != 0 then return Buffered
+
     callee match
         Fn(c) ->
             val chunk = u.chunks.at(c.body)
 
-            if !chunk.slotted || chunk.variadic || chunk.is_async || chunk.is_gen then return None
+            if !chunk.slotted || chunk.variadic || chunk.is_async || chunk.is_gen then return Buffered
 
             // **The depth limit is still the ordinary path's**, so a call that has run out of room
             // goes back there and is refused with the sentence it has always been refused with.
-            if depth >= MaxCallDepth then return None
+            if depth >= MaxCallDepth then return Buffered
 
-            Some((c.body, c.scope))
+            InPlace(c.body, c.scope)
+        Native(f) -> Builtin(f)
         // **A CONSTRUCTOR CALL IS THE SAME CALL WITH THE CALLEE LOOKED UP FIRST.** `Counter(3)` is an
         // object with a `new`, and `invoke` answers it by calling that hook with the arguments exactly
         // as they were written -- a `new` takes no receiver, the object it will make not existing yet.
@@ -551,10 +575,10 @@ in_place_call(u: *Unit, callee: Value, depth: usize) -> Option[(usize, *EnvObj)]
         //
         // **It cannot recur past one step**, `hook_of` answering only a `Fn` or a `Native`.
         Object(_) -> hook_of(callee, "new") match
-            Some(maker) -> in_place_call(u, maker, depth)
-            None -> None
-        _ -> None
-end in_place_call
+            Some(maker) -> placed_call(u, maker, names, depth)
+            None -> Buffered
+        _ -> Buffered
+end placed_call
 
 // Finish the frame of a call whose arguments are already standing at its `base`, and answer which
 // parameters arrived.
@@ -588,6 +612,43 @@ lay_standing(u: *Unit, chunk_ix: usize, argc: usize) -> usize
 
     given
 end lay_standing
+
+// Run a builtin whose arguments are standing on the operand stack, and take them off once it has
+// answered.
+//
+// **THIS IS `in_place_call` FOR BUILTINS, AND THE GEOMETRY IS THE SAME.** The value being called sits
+// directly under the arguments -- the callee of `f(a, b)`, the receiver of `o.m(a, b)` -- so the
+// window is `argc` cells at the top, or one more where that cell is parameter zero of a delegated
+// method. Everything from there down to and including it comes off, and the answer goes where it was.
+//
+// **The stack is a root, so nothing is held**: for the length of the call the arguments are reachable
+// exactly as any other operand is, which is what a builtin running a slate callback needs and what a
+// `Buf` could never give it.
+//
+// **The cut is skipped after a park**, as `run_chunk`'s is: a suspended call swapped the running
+// machine for a fresh one and this height belongs to the other stack.
+//
+// Not `private`: `run_frames.sysl`'s call instructions are the callers.
+standing_native(f: NativeFn, argc: usize, with_receiver: bool, at: Span) -> Step
+    val vm = machine()
+    val top = vm.stack.len()
+
+    // Where the cell under the written arguments is, which is what the whole call comes off back to.
+    val under = top - argc - 1
+
+    for i in 0..<argc
+        keepable(vm.stack.at(top - argc + i), at, "passed to a function")?
+
+    val base = if with_receiver then under else under + 1
+    val count = if with_receiver then argc + 1 else argc
+    val answer = call_native(f, Args(base, count), at)
+
+    answer match
+        Err(Wait) -> ()
+        _ -> vm.stack.truncate(under)
+
+    answer
+end standing_native
 
 // How many calls copied their arguments into a buffer before entering, for the whole run.
 //

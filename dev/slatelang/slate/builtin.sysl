@@ -61,28 +61,24 @@ no_live_sink(line: string) = ()
 // which keeps the sentence and loses which variant it was -- so the fact has to be written down where
 // `skip` was called. `run_one_test` clears both before every test.
 
-// **EVERY ARGUMENT IS ROOTED ACROSS THE CALL, AND THIS IS THE ONE PLACE THAT SAYS SO.** `args` is a
-// sysl `Buf`, which the collector does not walk -- and a call has already popped the callee and its
-// arguments off the operand stack by the time it gets here, so for the length of a native call the
-// only thing holding them is this buffer. That is invisible for every builtin that answers without
-// running slate code, and fatal for the ten or so that call back into it: `map` walks a receiver and
-// calls a function, and a callback that allocates hard enough to collect frees BOTH of them.
+// **EVERY ARGUMENT IS ROOTED FOR THE LENGTH OF THE CALL BY STANDING ON THE OPERAND STACK, WHICH IS
+// WHAT MAKES THIS FUNCTION EMPTY OF ROOTING.** The arguments used to be popped into a sysl `Buf`,
+// which the collector does not walk, so the dispatch held every one of them on the shadow stack and
+// released them afterwards. They are left where the instruction put them instead: the stack is a root
+// the tracer already walks, so a builtin that calls back into slate -- `map` walks a receiver and
+// calls a function -- cannot have its receiver or its callback collected under it.
 //
-// **What it looks like is never a memory failure.** `["a", "b", "c"].map(r -> burn(500))` failed with
-// *"this array was changed while `map` was walking it"* about a literal nothing can reach; binding the
-// array to a `val` moved the failure onto the callback -- *"this function takes from 1 to 0
-// arguments"* -- because the freed slot had been taken by something else and read back as a function
-// of a different arity. Binding both made it pass, and the JavaScript back end passed throughout.
+// **What the old hole looked like was never a memory failure.** `["a", "b", "c"].map(r -> burn(500))`
+// failed with *"this array was changed while `map` was walking it"* about a literal nothing can
+// reach; binding the array to a `val` moved the failure onto the callback -- *"this function takes
+// from 1 to 0 arguments"* -- because the freed slot had been taken by something else and read back as
+// a function of a different arity.
 //
-// **Rooting here rather than in each `do_*` is the point.** The hole was in `map`, and it was in
-// `filter`, `reduce`, `sort`, `find` and every other builtin that calls back -- one rule at the
-// dispatch cannot be half-applied, where a rule written out per builtin already had been.
-call_native(f: NativeFn, args: Buf[Value], at: Span) -> Step
-    val mark = root_mark()
-
-    for i in 0..<args.len()
-        hold(args.at(i))
-
+// **THE CALLER CUTS THE ARGUMENTS OFF, NOT THIS.** They have to outlive the call and they have to go
+// once it is over, and only the caller knows what else is standing under them -- the callee on the
+// ordinary path, the receiver on a method's, nothing at all where a `Buf` was pushed for the
+// occasion.
+call_native(f: NativeFn, args: Args, at: Span) -> Step
     // **Two clock readings, or none at all where the profiler is off** -- `profile_began` answers
     // zero without reading a clock, and `profile_native` returns on the same flag. A builtin that
     // runs a slate callback is timed inclusively; `profile.sysl` says so.
@@ -90,12 +86,34 @@ call_native(f: NativeFn, args: Buf[Value], at: Span) -> Step
     val answer = run_native(f, args, at)
 
     profile_native(f, began)
-
-    // Nothing allocates between here and the caller pushing the answer, which is the same window
-    // every `do_*` already ends in.
-    release(mark)
     answer
 end call_native
+
+// Call a builtin whose arguments are in a `Buf` rather than standing on the stack.
+//
+// **The values go onto the operand stack and are cut off again**, which is what every caller that has
+// not got them on the stack already owes: `apply` and the callback path, a property read, a spread. It
+// is the same buffer the old dispatch made, moved to the handful of callers that genuinely have one
+// instead of being made on every builtin call in the program.
+//
+// **The cut is skipped after a park**, exactly as `run_chunk`'s is and for its reason: a suspended
+// call swapped the running machine for a fresh one, so the height recorded here belongs to a stack
+// that is no longer the one standing.
+call_native_buf(f: NativeFn, vals: Buf[Value], at: Span) -> Step
+    val vm = machine()
+    val base = vm.stack.len()
+
+    for i in 0..<vals.len()
+        vm.stack.push(vals.at(i))
+
+    val answer = call_native(f, Args(base, vals.len()), at)
+
+    answer match
+        Err(Wait) -> ()
+        _ -> vm.stack.truncate(base)
+
+    answer
+end call_native_buf
 
 // -- what this file registers ---------------------------------------------------------------------
 //
@@ -385,7 +403,7 @@ end install_fs
 // there, where the message already names what it wanted.
 // Not `private`: `text.sysl` registers `contains`, `indexOf` and `lastIndexOf`, the three names that
 // answer about an array or about a string, and this is what tells the two apart.
-first_is_array(args: Buf[Value]) -> bool
+first_is_array(args: Args) -> bool
     if args.is_empty() then return false
 
     args.at(0) match
@@ -396,7 +414,7 @@ end first_is_array
 // Whether these arguments begin with a buffer of bytes, which is the third reading the three shared
 // names have: `indexOf` finds a byte or a run of bytes in one, where the array form compares values
 // and the string form compares characters.
-first_is_bytes(args: Buf[Value]) -> bool
+first_is_bytes(args: Args) -> bool
     if args.is_empty() then return false
 
     args.at(0) match
@@ -413,33 +431,33 @@ private port_of(v: Value, at: Span, name: string) -> Result[long, Signal]
         Int(n) -> Ok(n)
         other -> Err(failure(at, s"`${name}` takes a port number, and this is ${other.type_name()}"))
 
-private do_listen(args: Buf[Value], at: Span) -> Step
+private do_listen(args: Args, at: Span) -> Step
     if args.len() != 2 then return fault(at, s"`listen` takes a port and a function, and was given ${counted(args.len(), "argument")}")
 
     val (port, secure, reuse_port) = listen_target(args.at(0), at)?
 
     listen_socket(port, secure, reuse_port, args.at(1), at)
 
-private do_connect(args: Buf[Value], at: Span) -> Step
+private do_connect(args: Args, at: Span) -> Step
     if args.len() != 2 then return fault(at, s"`connect` takes an address and a port, and was given ${counted(args.len(), "argument")}")
 
     args.at(0) match
         Str(p) -> connect_socket(p.s, port_of(args.at(1), at, "connect")?, at)
         other -> fault(at, s"`connect` takes an address, and this is ${other.type_name()}")
 
-private do_read(args: Buf[Value], at: Span, as_text: bool) -> Step
+private do_read(args: Args, at: Span, as_text: bool) -> Step
     val name = if as_text then "onData" else "onBytes"
 
     if args.len() != 2 then return fault(at, s"`${name}` takes a socket and a function, and was given ${counted(args.len(), "argument")}")
 
     read_socket(args.at(0), args.at(1), as_text, at)
 
-private do_on_error(args: Buf[Value], at: Span) -> Step
+private do_on_error(args: Args, at: Span) -> Step
     if args.len() != 2 then return fault(at, s"`onError` takes a socket and a function, and was given ${counted(args.len(), "argument")}")
 
     error_socket(args.at(0), args.at(1), at)
 
-private do_send(args: Buf[Value], at: Span) -> Step
+private do_send(args: Args, at: Span) -> Step
     if args.len() != 2 then return fault(at, s"`send` takes a socket and what to send, and was given ${counted(args.len(), "argument")}")
 
     args.at(1) match
@@ -460,30 +478,30 @@ private do_send(args: Buf[Value], at: Span) -> Step
         // Rendered as `print` would render it, which is the reading `writeFile` already takes.
         other -> send_socket(args.at(0), printed(other, at)?, at)
 
-private do_close(args: Buf[Value], at: Span) -> Step
+private do_close(args: Args, at: Span) -> Step
     if args.len() != 1 then return fault(at, s"`close` takes a socket and was given ${counted(args.len(), "argument")}")
 
     close_socket(args.at(0), at)
 
 // `alpnProtocol(conn)` -- the name the two ends agreed on, or `null` where there is none.
-private do_alpn_protocol(args: Buf[Value], at: Span) -> Step
+private do_alpn_protocol(args: Args, at: Span) -> Step
     if args.len() != 1 then return fault(at, s"`alpnProtocol` takes a connection and was given ${counted(args.len(), "argument")}")
 
     alpn_protocol(args.at(0), at)
 end do_alpn_protocol
 
-private do_local_port(args: Buf[Value], at: Span) -> Step
+private do_local_port(args: Args, at: Span) -> Step
     if args.len() != 1 then return fault(at, s"`localPort` takes a socket and was given ${counted(args.len(), "argument")}")
 
     local_port(args.at(0), at)
 
 // `remoteAddress(conn)` -- the IP at the other end, or `null` where there is no other end.
-private do_remote_address(args: Buf[Value], at: Span) -> Step
+private do_remote_address(args: Args, at: Span) -> Step
     if args.len() != 1 then return fault(at, s"`remoteAddress` takes a connection and was given ${counted(args.len(), "argument")}")
 
     remote_address(args.at(0), at)
 
-private do_start_tls(args: Buf[Value], at: Span) -> Step
+private do_start_tls(args: Args, at: Span) -> Step
     if args.len() != 2 then return fault(at, s"`startTls` takes a socket and the host to connect as, and was given ${counted(args.len(), "argument")}")
 
     start_tls_target(args.at(1), at)? match
@@ -504,7 +522,7 @@ private path_of(v: Value, at: Span, name: string) -> Result[string, Signal]
 // **A function pointer rather than eight arms**, which is what the shape is worth: each of them
 // differs only in which libuv call it makes, and writing the argument check eight times is how the
 // eighth one ends up saying something the other seven do not.
-private with_path(args: Buf[Value], at: Span, name: string, go: &Fn(string, Span) -> Step) -> Step
+private with_path(args: Args, at: Span, name: string, go: &Fn(string, Span) -> Step) -> Step
     if args.len() != 1 then return fault(at, s"`${name}` takes one path and was given ${counted(args.len(), "argument")}")
 
     go(path_of(args.at(0), at, name)?, at)
@@ -517,7 +535,7 @@ end with_path
 // number is something a reader would want written out, while `writeBytes` is about the bytes
 // themselves and a value that is not bytes is a mistake in the program. Rendering it would put
 // `[72, 105]` on the disk under a name that says otherwise.
-private with_bytes(args: Buf[Value], at: Span, name: string, go: &Fn(string, Buf[u8], Span) -> Step) -> Step
+private with_bytes(args: Args, at: Span, name: string, go: &Fn(string, Buf[u8], Span) -> Step) -> Step
     if args.len() != 2 then return fault(at, s"`${name}` takes a path and its bytes, and was given ${counted(args.len(), "argument")}")
 
     val path = path_of(args.at(0), at, name)?
@@ -536,7 +554,7 @@ private write_twin(name: string) -> string =
         "writeBytesSync" -> "writeFileSync"
         else "appendFileSync"
 
-private do_write_file(args: Buf[Value], at: Span) -> Step
+private do_write_file(args: Args, at: Span) -> Step
     if args.len() != 2 then return fault(at, s"`writeFile` takes a path and its contents, and was given ${counted(args.len(), "argument")}")
 
     val path = path_of(args.at(0), at, "writeFile")?
@@ -560,7 +578,7 @@ end do_write_file
 // **The newline is the caller's**, as node's `process.stderr.write` leaves it: a program writing a
 // JSON object per line and one writing a progress bar want different answers, and only one of them
 // can be the default.
-private do_stderr(args: Buf[Value], at: Span) -> Step
+private do_stderr(args: Args, at: Span) -> Step
     var out = str_builder()
 
     for i in 0..<args.len()
@@ -573,7 +591,7 @@ private do_stderr(args: Buf[Value], at: Span) -> Step
 end do_stderr
 
 // `appendFile(path, text)` -- `writeFile` that adds rather than replaces.
-private do_append_file(args: Buf[Value], at: Span) -> Step
+private do_append_file(args: Args, at: Span) -> Step
     if args.len() != 2 then return fault(at, s"`appendFile` takes a path and what to add, and was given ${counted(args.len(), "argument")}")
 
     val path = path_of(args.at(0), at, "appendFile")?
@@ -583,7 +601,7 @@ private do_append_file(args: Buf[Value], at: Span) -> Step
         other -> append_file_promise(path, printed(other, at)?, at)
 end do_append_file
 
-private do_write_file_sync(args: Buf[Value], at: Span) -> Step
+private do_write_file_sync(args: Args, at: Span) -> Step
     if args.len() != 2 then return fault(at, s"`writeFileSync` takes a path and its contents, and was given ${counted(args.len(), "argument")}")
 
     val path = path_of(args.at(0), at, "writeFileSync")?
@@ -598,7 +616,7 @@ private do_write_file_sync(args: Buf[Value], at: Span) -> Step
 // says every one has a blocking twin, ten of them had, and the eleventh arrived with the promise
 // half alone -- so a sink, which answers nothing and cannot await, had no way to write a line and
 // know it had landed.
-private do_append_file_sync(args: Buf[Value], at: Span) -> Step
+private do_append_file_sync(args: Args, at: Span) -> Step
     if args.len() != 2 then return fault(at, s"`appendFileSync` takes a path and what to add, and was given ${counted(args.len(), "argument")}")
 
     val path = path_of(args.at(0), at, "appendFileSync")?
@@ -607,18 +625,18 @@ private do_append_file_sync(args: Buf[Value], at: Span) -> Step
         Str(p) -> append_file_sync(path, p.s, at)
         other -> append_file_sync(path, printed(other, at)?, at)
 
-private do_rename_sync(args: Buf[Value], at: Span) -> Step
+private do_rename_sync(args: Args, at: Span) -> Step
     if args.len() != 2 then return fault(at, s"`renameSync` takes two paths and was given ${counted(args.len(), "argument")}")
 
     rename_sync(path_of(args.at(0), at, "renameSync")?, path_of(args.at(1), at, "renameSync")?, at)
 
-private do_rename(args: Buf[Value], at: Span) -> Step
+private do_rename(args: Args, at: Span) -> Step
     if args.len() != 2 then return fault(at, s"`rename` takes two paths and was given ${counted(args.len(), "argument")}")
 
     rename_promise(path_of(args.at(0), at, "rename")?, path_of(args.at(1), at, "rename")?, at)
 
 // `sleep(ms)` -- a promise for later.
-private do_sleep(args: Buf[Value], at: Span) -> Step
+private do_sleep(args: Args, at: Span) -> Step
     if args.len() != 1 then return fault(at, s"`sleep` takes a number of milliseconds and was given ${counted(args.len(), "argument")}")
 
     args.at(0) match
@@ -637,7 +655,7 @@ end do_sleep
 // **Worth having even though an `async` function makes both**, because the two are what a program
 // reaches for when it is adapting something that is not async at all: a cache hit that needs to look
 // like a lookup, a validation that fails before any work starts.
-private do_settled(args: Buf[Value], at: Span, failing: bool) -> Step
+private do_settled(args: Args, at: Span, failing: bool) -> Step
     if args.len() != 1
         val what = if failing then "`reject`" else "`resolve`"
 
@@ -666,14 +684,14 @@ end do_settled
 // **A promise settles once, and a second answer is dropped rather than refused.** That is
 // `settle_ok`'s rule rather than a new one, and it is JavaScript's: two callbacks racing to answer
 // one promise is a program deciding late, not a program in error.
-private do_pending(args: Buf[Value], at: Span) -> Step
+private do_pending(args: Args, at: Span) -> Step
     if args.len() != 0
         return fault(at, s"`pending` takes no arguments and was given ${counted(args.len(), "argument")}")
 
     Ok(Promise(new_promise()))
 end do_pending
 
-private do_answer(args: Buf[Value], at: Span, failing: bool) -> Step
+private do_answer(args: Args, at: Span, failing: bool) -> Step
     val name = if failing then "fail" else "settle"
 
     if args.len() != 2
@@ -689,7 +707,7 @@ private do_answer(args: Buf[Value], at: Span, failing: bool) -> Step
 end do_answer
 
 // `setTimeout(fn, ms)`; the delay may be left out, and means the next turn of the loop.
-private do_timer(args: Buf[Value], at: Span, repeating: bool) -> Step
+private do_timer(args: Args, at: Span, repeating: bool) -> Step
     if args.len() == 0 || args.len() > 2
         return fault(at, s"a timer takes a function and a delay, and was given ${counted(args.len(), "argument")}")
 
@@ -705,7 +723,7 @@ private do_timer(args: Buf[Value], at: Span, repeating: bool) -> Step
     set_timer(args.at(0), ms, repeating, at)
 end do_timer
 
-private do_clear(args: Buf[Value], at: Span) -> Step
+private do_clear(args: Args, at: Span) -> Step
     if args.len() != 1 then return fault(at, s"cancelling a timer takes its id, and was given ${counted(args.len(), "argument")}")
 
     clear_timer(args.at(0), at)
@@ -717,7 +735,7 @@ private do_clear(args: Buf[Value], at: Span) -> Step
 // to a file or a supervisor's journal would say nothing until it exited, which a program that never
 // exits says never. `flush()` is one syscall per line, the same price node pays on every
 // `console.log`.
-private do_print(args: Buf[Value], at: Span) -> Step
+private do_print(args: Args, at: Span) -> Step
     var out = str_builder()
 
     for i in 0..<args.len()
@@ -740,7 +758,7 @@ end do_print
 
 // `.length` -- of an array, a string or a range. An object counts its keys through `keys(o).length`
 // instead, `.length` being a property no name on an object may be given.
-private do_len(args: Buf[Value], at: Span) -> Step
+private do_len(args: Args, at: Span) -> Step
     if args.len() != 1 then return fault(at, s"`.length` takes one argument and was given ${args.len()}")
 
     args.at(0) match
@@ -770,7 +788,7 @@ end do_len
 // **It answers nothing, as every mutator here does.** Handing the array back is what JavaScript does
 // and is what makes `xs.push(1).push(2)` read like a pipeline over fresh values when it is two
 // writes to one array; `array.sysl` carries the rule and the rest of the family.
-private do_push(args: Buf[Value], at: Span) -> Step
+private do_push(args: Args, at: Span) -> Step
     if args.len() != 2 then return fault(at, s"`push` takes two arguments and was given ${args.len()}")
 
     args.at(0) match
@@ -807,7 +825,7 @@ private do_push(args: Buf[Value], at: Span) -> Step
 end do_push
 
 // `str(x)` -- what `print` would have shown.
-private do_string(args: Buf[Value], at: Span) -> Step
+private do_string(args: Args, at: Span) -> Step
     if args.len() != 1 then return fault(at, s"`string` takes one argument and was given ${args.len()}")
 
     Ok(str_value(printed(args.at(0), at)?))
@@ -816,13 +834,13 @@ private do_string(args: Buf[Value], at: Span) -> Step
 //
 // **Reached only where the value has no `toString` of its own**, the universal table being the last
 // thing a method lookup tries -- so this never recurses into the hook that would have replaced it.
-private do_to_string(args: Buf[Value], at: Span) -> Step
+private do_to_string(args: Args, at: Span) -> Step
     if args.len() != 1 then return fault(at, s"`toString` takes no arguments and was given ${args.len() - 1}")
 
     Ok(str_value(printed(args.at(0), at)?))
 
 // `a.eq(b)` and `a.ne(b)` -- the same OBJECT, not the same shape.
-private do_eq(args: Buf[Value], at: Span, want: bool) -> Step
+private do_eq(args: Args, at: Span, want: bool) -> Step
     if args.len() != 2 then return fault(at, s"`${if want then "eq" else "ne"}` takes one argument and was given ${args.len() - 1}")
 
     Ok(Bool(identical(args.at(0), args.at(1), at) == want))
@@ -832,13 +850,13 @@ private do_eq(args: Buf[Value], at: Span, want: bool) -> Step
 // **The two may not disagree**, which is why this is `same` rather than a second reading of it: a
 // class that writes an `equals` changes both at once, and a class that writes none gets identity from
 // both because that is what `same` now does for a nominal value.
-private do_equals(args: Buf[Value], at: Span) -> Step
+private do_equals(args: Args, at: Span) -> Step
     if args.len() != 2 then return fault(at, s"`equals` takes one argument and was given ${args.len() - 1}")
 
     Ok(Bool(same(args.at(0), args.at(1), at)?))
 
 // `keys(o)` -- an object's field names, as an array of strings.
-private do_keys(args: Buf[Value], at: Span) -> Step
+private do_keys(args: Args, at: Span) -> Step
     if args.len() != 1 then return fault(at, s"`keys` takes one argument and was given ${args.len()}")
 
     args.at(0) match
@@ -854,7 +872,7 @@ end do_keys
 // where JavaScript has two, so reading answers `null` either way -- and the recovery is to ask the
 // question rather than to read and inspect. Python draws the line in the same place with `in`, and Go
 // with the second result of a map read.
-private do_has(args: Buf[Value], at: Span) -> Step
+private do_has(args: Args, at: Span) -> Step
     if args.len() != 2 then return fault(at, s"`has` takes an object and a key, and was given ${counted(args.len(), "argument")}")
 
     args.at(0) match
@@ -878,7 +896,7 @@ end do_has
 // **A key that is not there is not an error**, so `without` is idempotent and a program removing a
 // key it is unsure of writes one line. **A data value's copy is a data value**, exactly as `with`'s
 // is -- and a hidden key cannot be removed, there being nothing there to a program that asks.
-private do_without(args: Buf[Value], at: Span) -> Step
+private do_without(args: Args, at: Span) -> Step
     if args.len() != 2 then return fault(at, s"`without` takes an object and a key, and was given ${counted(args.len(), "argument")}")
 
     args.at(0) match
