@@ -54,8 +54,8 @@ what the first line is working out; take the version from the
 The tarball **is** a prefix, so `bin/slate` lands wherever you point `-C`.
 
 Those four packages are the whole of what the binary needs at run time — `ldd` on the shipped binary names
-OpenSSL, SQLite, brotli, libwebp and libc and nothing else. Redis, libuv, LMDB, HTTP/2, Zstandard, PCRE2
-and the collector are **linked in**, so nothing has to be installed for them and no version of them has to
+OpenSSL, SQLite, brotli, libwebp and libc and nothing else. Redis, libuv, LMDB, HTTP/2, Zstandard, the
+regular-expression engine and the collector are **linked in**, so nothing has to be installed for them and no version of them has to
 match. On Ubuntu 22.04 the OpenSSL package is spelled `libssl3` rather than `libssl3t64`, that rename
 having come with 24.04's `time_t` transition; everything else is named the same everywhere. A bare
 container image will also want `tzdata`, which any real installation already has and which
@@ -74,9 +74,9 @@ Anywhere else, build it from source — a clone and one command, given [sysl](ht
 
 ### Building without a library
 
-Building from source wants nine libraries installed — `openssl@3`, `libuv`, `pcre2`, `brotli`, `hiredis`,
+Building from source wants eight libraries installed — `openssl@3`, `libuv`, `brotli`, `hiredis`,
 `nghttp2`, `zstd`, `lmdb` and `webp` — and sysl refuses before it compiles anything if one of them is
-missing. Six of the nine are **features**, so a build can leave them out:
+missing. Six of the eight are **features**, so a build can leave them out:
 
 | feature | what goes with it |
 |---|---|
@@ -101,8 +101,9 @@ build with no image codec is:
 sysl build . --no-default-features --features server
 ```
 
-The remaining three are not features and cannot be left out: `openssl@3`, `libuv` and `pcre2` are what
-TLS, the event loop and `slate:regex` are made of. SQLite is the machine's own and costs nothing.
+The remaining two are not features and cannot be left out: `openssl@3` and `libuv` are what TLS and the
+event loop are made of. SQLite is the machine's own and costs nothing, and `slate:regex` carries its own
+engine, so there is nothing to install for it either.
 
 ### The desktop build
 
@@ -376,8 +377,8 @@ servers written over them — `slate:ws` has its **client** there, over the host
 cannot have its server, a browser being unable to listen. Each one is a name that
 says *"not in the JavaScript back end yet"* rather than a name that is not there. `slate:time` is whole
 there now, except for `abbrev` and `isDST`; so is `slate:crypto` — Argon2id included, over node's own
-`crypto.argon2` — except for the RSA and ECDSA half of JWS, and except that a browser has no Argon2 at all; so is `slate:regex`, whose patterns are translated into `RegExp` and which refuses the handful
-of PCRE2 constructs a browser has nothing to mean; so is `slate:gzip`, over the host's own
+`crypto.argon2` — except for the RSA and ECDSA half of JWS, and except that a browser has no Argon2 at all; so is `slate:regex`, whose patterns are ECMAScript's on both back ends and are handed to
+the host's `RegExp` exactly as they were written; so is `slate:gzip`, over the host's own
 `CompressionStream`; and so is `fetch`, over the host's own, except that `trust` refuses and the
 redirect rule is the host's — all of them things a JavaScript host genuinely does or does not have, and
 `docs/reference/javascript.md` measures why. **`slate:brotli` is the clearest of the second kind**: no

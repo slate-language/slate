@@ -406,7 +406,7 @@ entire reason `.tsx` had to be a different parse from `.ts` and `.slx` does not.
 
 There is no `npm install` for the things a server needs. **Twenty `slate:` modules ship inside the
 executable** — the file system, TCP, TLS, an HTTP server and router, HTTP/2 over nghttp2, WebSockets,
-Redis, SQLite, LMDB, PCRE2 regular expressions, digests and Argon2id, JWT, gzip, brotli, Zstandard,
+Redis, SQLite, LMDB, ECMAScript regular expressions, digests and Argon2id, JWT, gzip, brotli, Zstandard,
 images, a temporal library, processes and signals:
 
 ```slate
