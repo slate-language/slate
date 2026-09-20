@@ -551,3 +551,94 @@ A_DEEP_RECURSION_UNWINDS_TO_EXACTLY_WHERE_IT_STARTED()
     assertEq(descend(500), 125250)
     assertEq(descend(1), 1)
     assertEq(descend(500), 125250)
+
+// -- a construction is a call, and its callee is not the thing that runs ---------------------------
+//
+// **`Boxed(3)` is an object carrying a `new`**, so a construction is the one call whose callee is not
+// what runs: the hook is looked up first and then called with the arguments exactly as they were
+// written, being handed no receiver -- the object it is about to make does not exist yet. Every shape
+// a `new` comes in is below, because what a construction MEANS may not depend on how its arguments
+// reached the frame.
+
+class Boxed
+    var w
+    var h = w + 1
+    var label = "box"
+
+class Crate
+    // A hand-written `new` of the plain form: the body's value is the object, and the class becomes
+    // its proto on the way out.
+    new(v, extra = 2) = { v: v, extra: extra }
+
+class Warmth
+    // The other hand-written form, which declares its field in the head and runs its body with `self`
+    // bound to what is being made.
+    new(var degrees) =
+        self.warm = degrees > 20
+
+class Parent
+    var kind = "parent"
+
+class Child from Parent
+    var side = 1
+
+data Tint
+    Solid(r)
+    Duo(a, b)
+    Plain
+
+@test
+A_GENERATED_new_TAKES_EVERY_FIELD_AND_FILLS_THE_REST_FROM_THEIR_INITIALISERS()
+    assertEq([Boxed(3).w, Boxed(3).h, Boxed(3).label], [3, 4, "box"])
+    assertEq([Boxed(3, 9).h, Boxed(3, 9, "hat").label], [9, "hat"])
+
+@test
+A_FIELDS_INITIALISER_IS_A_DEFAULT_AND_READS_THE_FIELDS_TO_ITS_LEFT()
+    // `h = w + 1` is `new`'s default for `h`, so it is worked out at the construction and reads
+    // whatever arrived for `w` -- once per object, and not at all where `h` was given.
+    assertEq([Boxed(1).h, Boxed(10).h, Boxed(10, 0).h], [2, 11, 0])
+
+@test
+A_CONSTRUCTION_DROPS_A_SURPLUS_AND_LEAVES_WHAT_NOBODY_GAVE_ABSENT()
+    // Through a value the checker cannot see into, so both ends of the count reach the machine.
+    assertEq(loosely(Boxed)(3, 9, "hat", 77).label, "hat")
+    assertEq((loosely(Boxed)()) catch e -> e.message, "`+` does not apply to undefined and an integer")
+
+    // And the construction after the refused one still answers, which is what says the stack was cut
+    // back to the right cell.
+    assertEq(Boxed(3).h, 4)
+
+@test
+A_HAND_WRITTEN_new_IS_ENTERED_THE_WAY_THE_GENERATED_ONE_IS()
+    assertEq([Crate(1).v, Crate(1).extra, Crate(1, 5).extra], [1, 2, 5])
+    assertEq(Crate(1) is Crate, true)
+    assertEq([Warmth(30).degrees, Warmth(30).warm, Warmth(3).warm], [30, true, false])
+
+@test
+A_DATA_VARIANTS_MAKER_IS_A_CONSTRUCTION_TOO()
+    assertEq([Solid(2).r, Duo(1, 2).a, Duo(1, 2).b], [2, 1, 2])
+    assertEq([Solid(2) is Tint, Plain is Tint], [true, true])
+
+@test
+A_SUBCLASS_IS_MADE_BY_ITS_OWN_new_AND_IS_STILL_THE_PARENT()
+    val c = Child(4)
+
+    assertEq(c.side, 4)
+    assertEq([c is Child, c is Parent], [true, true])
+
+@test
+NAMED_POSITIONAL_AND_SPREAD_CONSTRUCTIONS_OF_ONE_CLASS_ALL_AGREE()
+    // A name leaves a hole in the MIDDLE, so `h` is filled by its initialiser while `label` is filled
+    // by the call -- which is the case a count of how many arrived could not answer.
+    assertEq([Boxed(1).label, Boxed(1, label = "hat").label], ["box", "hat"])
+    assertEq([Boxed(1).h, Boxed(1, label = "hat").h, Boxed(...[1, 5]).h, Boxed(2, 7).h], [2, 2, 5, 7])
+    assertEq(Boxed(...[1, 5, "hat"]).label, "hat")
+
+@test
+A_CONSTRUCTION_DEEP_IN_A_RECURSION_IS_STILL_A_CONSTRUCTION()
+    // How deep a call has got is read where the frame is made, so a construction has to be counted
+    // exactly as the calls around it are.
+    deep(n) = if n == 0 then Boxed(1).h else deep(n - 1)
+
+    assertEq(deep(1), 2)
+    assertEq(deep(2000), 2)
