@@ -117,6 +117,11 @@ catch e
 recovered
 ```
 
+**A fourth field, `suppressed`, is there only where a resource failed to release while this fault was
+already travelling.** The fault the program was told about is the one it was going to be told about
+either way; the release's own complaint is a field of it rather than a replacement for it. See
+[`using`](statements.md).
+
 ## What `catch` does and does not reach
 
 - **It works across an `await`.** A coroutine carries its handlers with it when it is set aside, so a
@@ -130,3 +135,8 @@ recovered
 
 **There is no `finally`.** A `try` with nothing to handle the fault is refused rather than allowed to
 swallow it silently.
+
+**What a `finally` is usually reached for is a resource, and that is [`using`](statements.md)** — a
+binding whose value is released when the block around it is left, by every route out including a
+fault travelling past. It says the release at the line that acquired the thing, which is the half a
+`finally` never had: the two stand together and a branch added later cannot separate them.

@@ -44,6 +44,7 @@ has — so the two databases a program might reach for do not have to be learned
 | `db.transaction(work)` | everything `work` did, or nothing of it |
 | `db.compiledWith(option)` | whether this SQLite was built with a named option |
 | `db.close()` | the statements go, and then the connection |
+| `db.dispose()` | `close` under the name [`using`](../reference/statements.md) looks for |
 
 ## The path is SQLite's own, and is not always a file
 
