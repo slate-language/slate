@@ -175,6 +175,49 @@ continue_skips_the_rest_of_the_turn() =
 
     assertEq(seen, [1, 3])
 
+// Every loop form is written round a place both its own back edge and a `continue` are aimed at, and
+// the two are not always the same instruction -- a `do` loop repeats from the top and continues at
+// the test. This says all four agree about which turns a `continue` skips.
+@test
+continue_skips_the_rest_of_the_turn_in_every_loop_form() =
+    var whiled = []
+    var i = 0
+
+    while i < 6
+        i = i + 1
+
+        if i == 3 then continue
+
+        push(whiled, i)
+
+    assertEq(whiled, [1, 2, 4, 5, 6])
+
+    var looped = []
+    var j = 0
+
+    loop
+        j = j + 1
+
+        if j > 6 then break
+        if j == 3 then continue
+
+        push(looped, j)
+
+    assertEq(looped, [1, 2, 4, 5, 6])
+
+    var repeated = []
+    var k = 0
+
+    do
+        k = k + 1
+
+        if k == 3 then continue
+
+        push(repeated, k)
+    while k < 6
+
+    assertEq(repeated, [1, 2, 4, 5, 6])
+
 @test
 an_if_is_an_expression() =
     assertEq(if true then 1 else 2, 1)
