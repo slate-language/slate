@@ -453,18 +453,20 @@ and `null == 0` are both false — which is why nothing needs a `===`, and `has(
 test where the difference between a `null` field and a missing one matters.
 
 **An integer is an integer**, not a double pretending — and it has no width. It grows rather than
-wrapping, it does not promote to a real, and `/` between two integers divides towards zero. You get
-JavaScript's `BigInt` behaviour with none of the `n` suffix and none of the `TypeError` for mixing
-the two: this is Python's arrangement rather than JavaScript's.
+wrapping and it does not promote to a real. You get JavaScript's `BigInt` behaviour with none of the
+`n` suffix and none of the `TypeError` for mixing the two: this is Python's arrangement rather than
+JavaScript's — **including its division.** `/` answers a real whatever it was handed, so `7 / 2` is
+three and a half here exactly as it is in JavaScript, and **`\` is the whole-number division**,
+truncating toward zero. It is a backslash rather than Python's `//` because `//` opens a comment.
 
 ```slate
-print(7 / 2, 7.0 / 2, 1 << 40)
+print(7 / 2, 7 \ 2, 7.0 / 2, 1 << 40)
 print(9223372036854775807 + 1)
 print(pow(2, 100))
 ```
 
 ```output
-3 3.5 1099511627776
+3.5 3 3.5 1099511627776
 9223372036854775808
 1267650600228229401496703205376
 ```

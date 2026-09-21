@@ -19,7 +19,7 @@ val Digits = "0123456789abcdef"
 
 // **`toArray` is the door onto the array's names**, a digest being `bytes` and `map` belonging to
 // the kind that holds values.
-hex(bs) = join(map(bs.toArray(), b -> Digits[b / 16] + Digits[b % 16]), "")
+hex(bs) = join(map(bs.toArray(), b -> Digits[b \ 16] + Digits[b % 16]), "")
 
 // The empty message, which is where a padding mistake shows first.
 print(hex(md5("")), hex(sha1("")))

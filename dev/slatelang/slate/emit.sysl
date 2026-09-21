@@ -165,6 +165,26 @@ struct Emit
     // already carries a safe point at its top. See `safe_point` below.
     in_loop: bool
 
+    // The resources this point stands inside, outermost first.
+    //
+    // **The fourth counter, and it is a list rather than a number because a way out has to RUN
+    // something.** `sp`, `scopes` and `handlers` say how much to undo; a disposal says what to call,
+    // and where the value to call it on is sitting. Every exit a block has -- falling off its end, a
+    // `return`, a `break`, a `continue` -- reads this and emits the calls in reverse before it
+    // unwinds anything.
+    disposes: Buf[DisposeSite]
+
+// One live `using`: which handler is its own, and where its resource sits on the operand stack.
+struct DisposeSite
+    // The handler depth this resource's own `PushDispose` established, counted from one. A way out
+    // that unwinds to handler depth `h` releases every site above `h` and leaves the rest alone.
+    handlers: usize
+
+    // The stack index the resource was left at. **A copy of the value, not the name it was bound
+    // to**: a `using` may bind a pattern, and there is no one name to read back -- so the value is
+    // duplicated where it is acquired and the copy is what every disposal reaches for.
+    slot: usize
+
 // Where `break` and `continue` have to get back to, and what they have to tidy on the way.
 struct LoopFrame
     sp: usize
@@ -182,7 +202,7 @@ struct LoopFrame
     continues: Buf[usize]
 
 fresh_emit(u: *Unit, chunk: usize, module_top: bool, is_async: bool, is_gen: bool, slotting: bool, cells: bool, tests_bind: bool, kept: Buf[string]) -> Emit =
-    Emit(buf(), u, chunk, module_top, 0, 0, buf(), 0, is_async, is_gen, slotting, cells, tests_bind, kept, 0, buf(), buf(), buf(), buf(), buf(), buf(), "", None, buf(), false)
+    Emit(buf(), u, chunk, module_top, 0, 0, buf(), 0, is_async, is_gen, slotting, cells, tests_bind, kept, 0, buf(), buf(), buf(), buf(), buf(), buf(), "", None, buf(), false, buf())
 
 // Open a block, in the code and in the compiler's own record of what is bound here.
 //
@@ -388,6 +408,9 @@ private stmt_declares(e: *Emit, s: Stmt) -> bool
         Var(name, _) -> !may_cell(e, name)
         Unpack(pat, _, _) -> pattern_declares(e, pat)
 
+        // A `using` declares what its binding declares; the disposal is not a name.
+        Using(bind, _) -> stmt_declares(e, bind)
+
         // A definition and a type declaration both write their name into the scope by hand --
         // `DefineFn` and a `DeclareVal` after a `PushShape` — and `slot_plan` keeps both names for
         // that reason, so this is the answer those two already gave.
@@ -481,6 +504,12 @@ here(e: *Emit) -> usize = e.code.len()
 // = toBytes("x".repeat(4194304))` in an actor holding a megabyte is two statements and no loop.
 // Such a statement costs one `Tick` per time it is REACHED, which for code outside a loop is once,
 // so the saving would be nothing and the guarantee is real.
+//
+// **AND A CHUNK WHOSE BODY IS ONE EXPRESSION GETS ONE AT ITS HEAD**, written by `compile_chunk`,
+// because such a body never goes through `compile_stmts` and so had none at all -- a recursion
+// through `down(n) = n > 0 && down(n - 1)` or through a lambda could run to any depth without the
+// collector being asked once. So the rule reads: **every chunk passes a safe point before it can
+// recurse.** A block-bodied chunk takes nothing extra, its first statement's being that safe point.
 safe_point(e: *Emit, at: Span) = push_n(e, Tick, at, 0, 0)
 
 // A safe point for a statement, which is owed only where the statement is not already inside a
@@ -529,6 +558,9 @@ patch(e: *Emit, at: usize, to: usize)
         // caught fault re-entered the chunk at its first instruction and the program looped until the
         // heap ran out. The `other -> other` arm below is what made it silent.
         PushHandler(_) -> PushHandler(to)
+
+        // A disposal handler's target is aimed exactly as a `catch`'s is, and for the reason above.
+        PushDispose(_) -> PushDispose(to)
         other -> other
 
     e.code.set(at, Ins(aimed, old.at))

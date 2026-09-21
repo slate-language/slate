@@ -215,28 +215,71 @@ true
 true
 ```
 
-**`toJSON` is the one place a wide integer has no form.** JSON's own grammar bounds a number at
-nothing, but slate's encoder holds one as 64 bits and has no way to write more; rather than round it
-into a real and hand you a document that is quietly wrong, it refuses, on both back ends.
+**A wide integer goes through JSON as its digits**, JSON's own grammar bounding a number at nothing.
+Reading them back grows the number again rather than rounding it to the nearest double, so a
+document carries what it was given; and an exponent is still a real however large it is, which is
+what keeps the two kinds apart across a round trip.
 
 ```slate
-print(toJSON({ n: pow(10, 30) }))
-```
+val doc = { n: pow(10, 30), scale: 1e30 }
+val back = parseJSON(toJSON(doc)).value
 
-```error
-an integer wider than 64 bits has no encoding here
-```
-
-**`/` between two integers divides towards zero** and answers an integer; `%` takes the sign of the
-left operand. Where either operand is a real the answer is a real.
-
-```slate
-print(7 / 2, 7.0 / 2, -7 / 2)
+print(toJSON(doc))
+print(back.n == pow(10, 30))
+print(back.scale is real)
 ```
 
 ```output
-3 3.5 -3
+{"n":1000000000000000000000000000000,"scale":1e+30}
+true
+true
 ```
+
+**`/` ANSWERS A REAL, ALWAYS — even between two integers, and even where the division comes out
+exact.** `7 / 2` is three and a half, and `4 / 2` is a whole *real* rather than the integer 2. The
+kind of the answer does not depend on the kinds of the operands, which is the whole of the rule:
+nothing has to work out whether a division came out evenly before it knows what it is holding. It is
+Python 3's rule and JavaScript's, and a wide integer reaches it the same way, through `toReal` —
+which may be an infinity for a number past what a double can name.
+
+**`\` IS THE WHOLE-NUMBER DIVISION**, and it takes two integers and answers an integer. It is
+spelled with a backslash because `//` already opens a comment in slate; the spelling is Visual
+Basic's. Inside a string literal a backslash is still the escape it always was, the lexer reading a
+string on its own.
+
+**`\` truncates toward zero and `%` takes the sign of the left operand**, and those two facts are one
+fact: `a == (a \ b) * b + a % b` holds for every pair, and it holds *only* for the truncating
+division. A flooring `\` would need a flooring `%` beside it, which is Python's pairing and not
+slate's.
+
+```slate
+print(7 / 2, 7 \ 2, -7 \ 2, -7 % 2)
+print(4 / 2, 4 / 2 is integer)
+print(-7 == (-7 \ 2) * 2 + (-7 % 2))
+```
+
+```output
+3.5 3 -3 -1
+2 false
+true
+```
+
+**By zero the two behave differently, and that follows from the first rule rather than being an
+exception to it.** `/` is a real division wherever it appears, so `1 / 0` is the infinity `1.0 / 0.0`
+has always been; `\` and `%` are whole-number operators and fault, on both back ends.
+
+```slate
+print(1 / 0, -1 / 0, 0 / 0)
+print(1 \ 0 catch e -> e.message)
+```
+
+```output
+Infinity -Infinity NaN
+this divides by zero
+```
+
+**`\` is of integers and refuses a real**, where `/` takes anything numeric. `\=` is its compound
+form, beside `/=`, and it binds at the `*` `/` `%` power.
 
 **A real that is whole prints as an integer does.** `string(1.0)` is `"1"`. Only `%`, indexing, or a
 kind test can tell the two apart, so a function that must answer an integer is worth annotating.

@@ -50,6 +50,45 @@ a_wide_integer_is_written_and_read_as_its_digits() =
     assertEq(1_000_000_000_000_000_000_000_000, 1000000000000000000000000)
 
 @test
+a_wide_integer_goes_through_json_as_its_digits() =
+    // JSON's grammar bounds a number at nothing, so the digits are the encoding: nothing is
+    // rounded on the way out and nothing is lost on the way back.
+    assertEq(toJSON(pow(10, 30)), "1000000000000000000000000000000")
+    assertEq(toJSON(-pow(10, 30)), "-1000000000000000000000000000000")
+    assertEq(parseJSON("1000000000000000000000000000000").value, pow(10, 30))
+    assertEq(parseJSON(toJSON(pow(2, 100))).value, pow(2, 100))
+
+    // 2^63 is the first whole number past a 64-bit integer, and it survives exactly.
+    assertEq(toJSON(9223372036854775808), "9223372036854775808")
+    assertEq(parseJSON("9223372036854775808").value, 9223372036854775808)
+
+@test
+a_number_json_can_hold_in_64_bits_comes_back_as_an_ordinary_integer() =
+    // The reader normalizes, so a value the digits do hold is the value the literal is -- equal to
+    // it, and the same key in a table.
+    val back = parseJSON("9223372036854775807").value
+
+    assertEq(back, 9223372036854775807)
+
+    val m = Map()
+
+    m.set(9223372036854775807, "most")
+    assertEq(m.get(back), "most")
+
+@test
+a_document_keeps_its_wide_integers_and_its_reals_apart() =
+    val doc = { id: pow(10, 30), items: [1, pow(2, 64)], scale: 1e30 }
+    val back = parseJSON(toJSON(doc)).value
+
+    assertEq(back.id, pow(10, 30))
+    assert(back.id is integer)
+    assertEq(back.items[1], pow(2, 64))
+
+    // `1e30` is a real and stays one, an exponent being what says so however large the number is.
+    assert(back.scale is real)
+    assertEq(back.scale, 1e30)
+
+@test
 a_factorial_is_the_number_and_not_a_remainder_of_it() =
     var f = 1
 
@@ -74,10 +113,46 @@ a_wide_literal_in_a_pattern_matches_the_number_it_spells() =
 
 @test
 integer_division_truncates_towards_zero() =
-    assertEq(7 / 2, 3)
-    assertEq(-7 / 2, -3)
+    assertEq(7 \ 2, 3)
+    assertEq(-7 \ 2, -3)
+    assertEq(7 \ -2, -3)
+    assertEq(-7 \ -2, 3)
     assertEq(7 % 3, 1)
     assertEq(-7 % 3, -1)
+    assert(7 \ 2 is integer)
+
+@test
+a_division_answers_a_real_even_where_it_comes_out_whole() =
+    assertEq(7 / 2, 3.5)
+    assertEq(-7 / 2, -3.5)
+    assertEq(4 / 2, 2)
+    assert(!(4 / 2 is integer))
+    assert(4 / 2 is real)
+    assertEq(string(1 / 0), "Infinity")
+    assertEq(string(-1 / 0), "-Infinity")
+
+@test
+the_quotient_and_the_remainder_rebuild_the_dividend() =
+    for a in [-9, -7, -1, 0, 1, 7, 9]
+        for b in [-3, -2, -1, 1, 2, 3]
+            assertEq(a, (a \ b) * b + a % b)
+
+    val big = pow(10, 30) + 7
+
+    for d in [-3, 2, 7]
+        assertEq(big, (big \ d) * d + big % d)
+
+@test
+an_integer_division_takes_a_compound_form_and_leaves_the_string_escape_alone() =
+    var n = 17
+    n \= 5
+    assertEq(n, 3)
+
+    n = -17
+    n \= 5
+    assertEq(n, -3)
+
+    assertEq("a\\b".length, 3)
 
 @test
 a_real_is_a_different_kind_from_an_integer() =
@@ -258,7 +333,7 @@ two_draws_are_not_the_same_number() =
 
 @test
 dividing_an_integer_by_zero_is_a_fault_rather_than_an_answer() =
-    assert((1 / 0) catch e -> true)
+    assert((1 \ 0) catch e -> true)
     assert((1 % 0) catch e -> true)
 
 @test

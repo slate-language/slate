@@ -364,10 +364,10 @@ what an annotated [`var`](types.md) already buys:
 class Temperature
     var celsius = 0
 
-    get f(self) = self.celsius * 9 / 5 + 32
+    get f(self) = self.celsius * 9 \ 5 + 32
 
     set f(self, v: integer)
-        self.celsius = (v - 32) * 5 / 9
+        self.celsius = (v - 32) * 5 \ 9
 
 val t = Temperature()
 

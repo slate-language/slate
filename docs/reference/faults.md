@@ -93,6 +93,83 @@ it went wrong 4 true
 `catch` binds looser than every arithmetic operator, so `a + b catch …` guards the sum, and tighter than
 the lambda arrow, so `x -> risky() catch e -> 0` gives the lambda a body that guards.
 
+## Sorting faults out: a `catch` takes a pattern
+
+**What follows `catch` is a pattern** — any pattern a [`match`](patterns.md) arm may carry, with the
+same optional `if` guard. A bare name is a pattern that matches everything, which is why every
+`catch` written before this still means what it did.
+
+**The block form takes as many clauses as you like and tries them in order:**
+
+```slate
+risky(n)
+    if n == 0 then throw "empty"
+    if n > 99 then throw "too big"
+
+    n
+
+look(n)
+    try
+        print(risky(n))
+    catch { message: "empty" }
+        print("nothing there")
+    catch e if e.message == "too big"
+        print("out of range")
+    catch e
+        print(s"other: ${e.message}")
+
+look(0)
+look(500)
+look(7)
+```
+
+```output
+nothing there
+out of range
+7
+```
+
+**A fault no clause wanted is thrown again**, so a run of clauses is a filter rather than a `try`
+that swallows — the enclosing handler, or the program's own end, gets it:
+
+```slate
+go()
+    throw "not one of them"
+
+try
+    go()
+catch { message: "expected" }
+    print("handled")
+```
+
+```error
+not one of them
+```
+
+It keeps the fault's own words; **the line becomes the `catch`'s**, which is what
+[`throw`](#throw) says everywhere else and is the only reading a flattened fault allows.
+
+**A clause matches the fault OBJECT** — `message`, `line` and `file` and nothing else. A `throw` of
+anything that is not a string is rendered into `message` on the way out, so what a pattern has to
+work with is the sentence and where it was raised.
+
+**The postfix form takes one clause**, there being nowhere to write a second — the arrow's body runs
+to the end of the expression. A fault worth sorting into several clauses is what the block form is
+for.
+
+```slate
+risky()
+    throw "gone"
+
+val n = risky() catch { message: "gone" } -> 0
+
+print(n)
+```
+
+```output
+0
+```
+
 ## The fault object
 
 **A fault is an ordinary object** — `message`, `line` and `file` — for the same reason a module is one:
@@ -117,6 +194,11 @@ catch e
 recovered
 ```
 
+**A fourth field, `suppressed`, is there only where a resource failed to release while this fault was
+already travelling.** The fault the program was told about is the one it was going to be told about
+either way; the release's own complaint is a field of it rather than a replacement for it. See
+[`using`](statements.md).
+
 ## What `catch` does and does not reach
 
 - **It works across an `await`.** A coroutine carries its handlers with it when it is set aside, so a
@@ -130,3 +212,8 @@ recovered
 
 **There is no `finally`.** A `try` with nothing to handle the fault is refused rather than allowed to
 swallow it silently.
+
+**What a `finally` is usually reached for is a resource, and that is [`using`](statements.md)** — a
+binding whose value is released when the block around it is left, by every route out including a
+fault travelling past. It says the release at the line that acquired the thing, which is the half a
+`finally` never had: the two stand together and a branch added later cannot separate them.

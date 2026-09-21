@@ -34,6 +34,166 @@ slate 1
 A [definition](functions.md) is a statement too, and so are `type`, `class` and `data`, each of which
 belongs to the top level of a file.
 
+### `using` — a binding that releases what it held
+
+**`using` is a `val` whose value is released when the block around it is left.** It is what slate has
+instead of a `finally`: the release is written at the line that acquired the thing, where it cannot be
+forgotten in a branch added later.
+
+```slate
+made(name) = { dispose: () -> print("released " + name) }
+
+read() =
+    using file = made("file")
+
+    print("working")
+
+read()
+```
+
+```output
+working
+released file
+```
+
+**The release runs on every way out of the block, and there are five**: falling off the end, a
+`return`, a `break`, a `continue`, and a fault travelling past. An `await` and a `yield` are not ways
+out — the block has not been left, and the resource is still the running program's.
+
+```slate
+made(name) = { dispose: () -> print("released " + name) }
+
+first(xs) =
+    for x in xs
+        using turn = made("turn " + string(x))
+
+        if x > 1 then return x
+
+    null
+
+print(first([1, 2, 3]))
+```
+
+```output
+released turn 1
+released turn 2
+2
+```
+
+**Several in one block are released in reverse**, which is the acquisition order run backwards: a
+later resource may have been made out of an earlier one.
+
+```slate
+made(name) = { dispose: () -> print("released " + name) }
+
+run() =
+    using a = made("a")
+    using b = made("b")
+
+    print("body")
+
+run()
+```
+
+```output
+body
+released b
+released a
+```
+
+**The protocol is a method named `dispose`** — the way a source is anything with a `next`. An object
+with the field has one, a class that writes the method has one for every instance, and every built-in
+resource answers to it: a socket, a listening server, a database, a Redis client, a WebSocket
+connection. There is no interface to implement.
+
+**`null` is skipped**, so an optional resource needs no branch around the block:
+
+```slate
+wanted(yes) = if yes then { dispose: () -> print("released") } else null
+
+run(yes) =
+    using maybe = wanted(yes)
+
+    print("body")
+
+run(false)
+run(true)
+```
+
+```output
+body
+body
+released
+```
+
+**A value that is neither `null` nor disposable is refused at the DECLARATION**, before the block has
+run — the mistake is in the line that acquired the thing, and the reader is told before any work is
+done rather than after it.
+
+```slate
+anything(v) = v
+
+run() =
+    using a = anything(42)
+
+    print("never reached")
+
+run()
+```
+
+```error
+`using` needs a value with a `dispose` method to call when the block is left, and this is an integer
+```
+
+**A `using` is a `val`, and the three shapes a `val` has are the three it has.** An annotation is
+checked where the value arrives, a pattern takes the value apart — and a pattern releases the *whole*
+value, the names being a way of reading it rather than a list of separate resources.
+
+```slate
+run() =
+    using { port } = { port: 8080, dispose: () -> print("released") }
+
+    print(port)
+
+run()
+```
+
+```output
+8080
+released
+```
+
+**A release that fails while a fault is travelling does not replace it.** The original fault is what
+the program is told about, and the release's own complaint rides along as its `suppressed` field. A
+release that fails with nothing travelling propagates on its own.
+
+```slate
+fails(why) =
+    throw why
+
+run() =
+    using a = { dispose: () -> fails("could not release") }
+
+    fails("the original")
+
+val e = run() catch caught -> caught
+
+print(e.message)
+print(e.suppressed.message)
+```
+
+```output
+the original
+could not release
+```
+
+**`await using` is not in slate.** A release has to be able to run while a fault is unwinding, and
+nothing can wait there, so a `dispose` that answers a promise is called and its answer is not awaited.
+
+**A `using` written at a file's own top level is released when the file's statements end**, the top
+level being a block like any other. That is before the event loop drains, so a resource a later turn
+still needs belongs in a function rather than at the top of a file.
+
 ### What is in scope where
 
 **A definition is HOISTED to the top of the block it is written in**, which is JavaScript's rule, so
@@ -132,6 +292,43 @@ naming the nearest name it does know; `val` and `var` are the only things that i
 
 The compound forms are `+= -= *= /= %=` and the bitwise `&= |= ^= <<= >>=`. **A compound form
 evaluates its place once**, so `xs[next()] += 1` calls `next` a single time.
+
+Three more write the place only under a condition, and they ask the question the operator they are
+named after asks:
+
+| form | writes when the place is | so it leaves |
+|---|---|---|
+| `x ??= v` | absent — `null`, or a read that found nothing | `0`, `""` and `false` alone |
+| `x \|\|= v` | false by [truthiness](expressions.md) | everything truthy alone |
+| `x &&= v` | true | everything falsy alone |
+
+**The value is not worked out at all where the place is left alone**, which is what these are for
+and what `x = x ?? build()` could not promise:
+
+```slate
+var cache = { one: null, two: 2 }
+var built = 0
+
+build()
+    built += 1
+    "made"
+
+cache.one ??= build()
+cache.two ??= build()
+
+var count = 0
+count ||= 10                    // zero is there, so `??=` would have left it
+
+print(cache, built, count)
+```
+
+```output
+{one: "made", two: 2} 1 10
+```
+
+The place is still worked out exactly once whichever way the test goes, so `xs[next()] ??= 1` calls
+`next` a single time. They write **one** place: `a, b ??= 1, 2` is refused, a multi-assignment
+working out every value before it writes any of them.
 
 `++` and `--` step a name, a field or an element, prefix or postfix.
 

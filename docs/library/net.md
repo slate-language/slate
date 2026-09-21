@@ -40,6 +40,7 @@ main()
 | `onError(sock, fn)` | a sentence, *instead of* that `null` |
 | `send(sock, v)` | a promise of a result; **bytes or an array of numbers go as bytes** |
 | `close(sock)` | |
+| `sock.dispose()` | `close` under the name [`using`](../reference/statements.md) looks for |
 | `localPort(server)` | |
 | `remoteAddress(conn)` | the IP at the other end, or `null` where there is no other end |
 | `startTls(sock, options)` | a promise that settles when the handshake finishes |

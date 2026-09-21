@@ -70,6 +70,7 @@ private power_of(k: Tok) -> Power
         Minus -> left_assoc(50)
         Star -> left_assoc(60)
         Slash -> left_assoc(60)
+        Backslash -> left_assoc(60)
         Percent -> left_assoc(60)
 
         // **A shift binds like a multiplication**, which is sysl's deliberate correction to C -- where
@@ -602,7 +603,7 @@ private if_expression(p: *Parser, t: Spanned[Tok]) -> Expr
     expr(t.span.to(p.just_taken()), IfExpr(cond, a, b))
 end if_expression
 
-// `try` with an indented body and a `catch` under it.
+// `try` with an indented body and one or more `catch` clauses under it.
 //
 // **The block form and the postfix form make the same node**, so nothing downstream learns that
 // there are two. slate already does this for `if`, whose one-line and indented forms are one
@@ -615,27 +616,100 @@ private try_expression(p: *Parser, t: Spanned[Tok]) -> Expr
         return expr(t.span.to(p.just_taken()), Bad)
     end if
 
-    val name = parse_name(p, "a name for the fault")
-    val handler = if p.at(Indent) then parse_block(p) else inline_stmt_body(p)
+    var clauses: Buf[Arm] = buf()
+
+    loop
+        clauses.push(catch_clause(p))
+
+        if !accept_on_next_line(p, Catch) then break
 
     accept_end(p, Try)
-    expr(t.span.to(p.just_taken()), TryCatch(body, name, handler))
+    caught(p, t.span.to(p.just_taken()), body, clauses)
 end try_expression
+
+// One `catch <pattern> [if <guard>]` and the block under it.
+//
+// **The pattern is read by the very function a `match` arm's is**, so the two cannot drift about
+// what a pattern means -- and a bare name binds, which is what every `catch` written before this
+// existed says.
+private catch_clause(p: *Parser) -> Arm
+    val pat = parse_pattern(p)
+
+    // **A guard is read after the pattern**, so it can name what the pattern just bound. It is the
+    // same ordering an arm's guard has and it is what makes a guard worth having over an `if` in
+    // the handler: a refused clause lets the NEXT one try, and an `if` inside the body cannot.
+    val guard = if p.accept(If) then Some(parse_expr(p)) else None
+    val handler = if p.at(Indent) then parse_block(p) else inline_stmt_body(p)
+
+    Arm(pat, guard, handler)
+end catch_clause
 
 // `x catch e -> y` -- the same thing written where a value is wanted.
 //
 // The body after the arrow is read exactly as a lambda's is, which is what lets it be a block: `->`
 // opens one where it ends the line, so a handler may run to several statements without the `try`
 // form being reached for.
+//
+// **The postfix form takes ONE clause**, there being nowhere to write a second: the arrow's body
+// runs to the end of the expression. A fault worth sorting into several clauses is what the block
+// form is for.
 private catch_tail(p: *Parser, lhs: Expr) -> Expr
-    val name = parse_name(p, "a name for the fault")
+    val pat = parse_pattern(p)
+    val guard = if p.accept(If) then Some(parse_expr_before_arrow(p)) else None
 
     p.expect(Arrow, "`->` and what to do about the fault")
 
     val handler = if p.at(Indent) then parse_block(p) else parse_expr_bp(p, power_of(Arrow).right)
 
-    expr(lhs.span.to(handler.span), TryCatch(lhs, name, handler))
+    var clauses: Buf[Arm] = buf()
+
+    clauses.push(Arm(pat, guard, handler))
+    caught(p, lhs.span.to(handler.span), lhs, clauses)
 end catch_tail
+
+// The name the fault is bound to where the clauses are sorted through -- unspellable on purpose, as
+// `(old 0)` and `(0)` are, so that nothing a person wrote can shadow it or be shadowed by it.
+private val CaughtName: string = "(fault)"
+
+// What a run of `catch` clauses becomes.
+//
+// **THE DESUGAR IS WRITTEN HERE AND NOWHERE ELSE.** A `catch` still binds ONE name and carries ONE
+// handler by the time anything downstream sees it, so the checker, the slots pass, the machine and
+// the JavaScript back end all learn nothing: several clauses are a `match` on the fault, and a
+// fault no clause wanted is thrown again from the arm underneath them all.
+//
+// **One clause that is a plain binding is the node slate always made**, unchanged down to the
+// emitted JavaScript. `pattern_binds` is what says so and it is the question `is` already asks --
+// so `catch NotFound`, naming a class, is a TEST like the arm it becomes, and `catch e` is the
+// binding it has always been.
+private caught(p: *Parser, whole: Span, body: Expr, clauses: Buf[Arm]) -> Expr
+    if clauses.len() == 1
+        val only = clauses.at(0)
+
+        if only.guard.is_none() && pattern_binds(only.pattern)
+            *only.pattern.kind match
+                Bind(name) -> return expr(whole, TryCatch(body, name, only.body))
+                _ -> ()
+    end if
+
+    var arms: Buf[Arm] = buf()
+
+    for i in 0..<clauses.len()
+        arms.push(clauses.at(i))
+
+    // **The fault that matched nothing is thrown again**, which is what makes a run of clauses a
+    // filter rather than a `try` that swallows. It keeps the fault's own words; the line becomes
+    // this one, which is what `throw` says everywhere else and is the only honest reading -- a
+    // caught fault is a line number and a file name by then, and no span can be rebuilt from it.
+    var again: Buf[Stmt] = buf()
+
+    again.push(stmt(whole, Throw(expr(whole, Name(CaughtName)))))
+    arms.push(Arm(pattern(whole, Wild), None, expr(whole, Block(again))))
+
+    val sorted = expr(whole, MatchExpr(expr(whole, Name(CaughtName)), arms))
+
+    expr(whole, TryCatch(body, CaughtName, sorted))
+end caught
 
 // The `elif` chain and the `else`, if either is there.
 //
@@ -685,7 +759,7 @@ private led(lhs: Expr, t: Spanned[Tok], p: *Parser) -> Expr
         LParen -> call(p, lhs)
         LBracket -> index(p, lhs)
         Dot -> field(p, lhs, false)
-        QDot -> field(p, lhs, true)
+        QDot -> optional_link(p, lhs)
         Arrow -> arrow(p, lhs, t)
         PlusPlus -> expr(lhs.span.to(t.span), IncDec(lhs, true, false))
         MinusMinus -> expr(lhs.span.to(t.span), IncDec(lhs, false, false))
@@ -818,7 +892,10 @@ private pre_inc_dec(p: *Parser, t: Spanned[Tok], up: bool) -> Expr
 // in every way but what it means: the argument is an ordinary expression, so the one thing that has
 // to happen at this level is that the tree comes back as the slot holding the entry value rather
 // than as a call of a name nothing bound.
-private call(p: *Parser, callee: Expr) -> Expr
+private call(p: *Parser, callee: Expr) -> Expr = call_args(p, callee, false)
+
+// `f(a, b)`, and `f?.(a, b)` where the `(` has already been taken.
+private call_args(p: *Parser, callee: Expr, optional: bool) -> Expr
     val snapping = at_old_snapshot(p, callee)
     val nested = p.in_old
 
@@ -879,17 +956,33 @@ private call(p: *Parser, callee: Expr) -> Expr
 
     if snapping then return old_snapshot(p, nested, args, whole)
 
-    expr(whole, Call(callee, args))
-end call
+    expr(whole, Call(callee, args, optional))
+end call_args
 
 // `xs[i]`.
-private index(p: *Parser, target: Expr) -> Expr
+private index(p: *Parser, target: Expr) -> Expr = index_key(p, target, false)
+
+// `xs[i]`, and `xs?.[i]` where the `[` has already been taken.
+private index_key(p: *Parser, target: Expr, optional: bool) -> Expr
     val key = parse_expr(p)
 
     p.expect(RBracket, "`]`")
 
-    expr(target.span.to(p.just_taken()), Index(target, key))
-end index
+    expr(target.span.to(p.just_taken()), Index(target, key, optional))
+end index_key
+
+// What follows a `?.` decides which of the three guarded links it is: `?.(` a call, `?.[` an index,
+// and anything else a field.
+//
+// **The `?.` is one token, so the `(` and the `[` are read here rather than by the binding-power
+// loop** -- which is what keeps `f ?. (x)` from parsing as a guarded field read of a bracketed
+// group. Each of the three guards its OWN link and no more, exactly as `o?.f` does.
+private optional_link(p: *Parser, lhs: Expr) -> Expr
+    if p.accept(LParen) then return call_args(p, lhs, true)
+    if p.accept(LBracket) then return index_key(p, lhs, true)
+
+    field(p, lhs, true)
+end optional_link
 
 // `o.name`.
 private field(p: *Parser, target: Expr, optional: bool) -> Expr
