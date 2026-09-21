@@ -1975,7 +1975,7 @@ if it removed **all** of the named cost, which none will.
 | 3 | **A register machine instead of a stack machine** | 15.3% (`Buf.push<Value>` + `pop` + `peek`), plus its share of `Buf.at<Ins>` | 10-15%, and it subsumes 4 | **STRUCTURAL — not piecemeal** | `emit.sysl`, `run_frames.sysl`, `slots.sysl` |
 | 4 | **Superinstructions** | up to 12.3% (`Buf.at<Ins>`), pro rata with dispatches removed | 4-6%. **WHICH PAIRS**: `LoadSlot`+`Add`/`Less` and `PushInt`+`Add` (the `arith`/`reals`/`branches` loops), `LoadSlot`+`LoadSlot`, `Dup`+`StoreSlot`, `LoadSlot`+`Ret`. A pair costs one arm and removes one whole `Buf.at<Ins>` call | INCREMENTAL | `code.sysl`, `emit.sysl`, `run_frames.sysl` |
 | 5 | **Cheaper frames — stop re-reading the `Chunk` per call** | 4.0%, and **13.0% on `fib`**, 10.5% `closures`, 8.2% `nested`, 7.3% `calls` | 2-3%, and it is the cheapest thing on this table: hold the chunk beside `pc` and `base` the way `code` already is | INCREMENTAL | `run_frames.sysl`, `execute.sysl` |
-| 6 | **`-O2` as the default** | not measured | unknown, possibly large given 1 and the 17,493-instruction loop. `sysl -O` defaults to **1**. **Measure it before anything else on this list — it is one flag** | INCREMENTAL | `package.hocon` / the build command |
+| 6 | **`-O2` as the default** | **-2.3% geometric mean, no program >3% slower (dev `4820c05`, see the 2026-09-21 write-up below)** | clears the bar to become default, but **BLOCKED: `package.hocon` has no optimization key** — a sysl gap, reported rather than worked around | INCREMENTAL, BLOCKED ON SYSL | `package.hocon` / the build command |
 | 7 | **Module-level `var` cells, `StoreDef`** | 2.6% over the set, **23% of `globals`** (`Map.find` 7.6 + `hash_str` 5.4 + `Map.get` 4.5 + `Map.put` 3.8) | 0.5% of the mean, 15%+ of one program — the reach column's usual reading | INCREMENTAL | `defs.sysl`, `emit.sysl`, `compile.sysl` |
 | 8 | **Inline caches for a field or a method** | 4.5% (`Buf.at<Entry>` 2.5 + `scan_named` 1.3 + `obj_get_name` 0.7); 22% of `fields`, 21% of `methods` | 2-3% | INCREMENTAL, and the largest incremental item that is wholly slate's | `index.sysl`, `table.sysl`, `run_frames.sysl` |
 | — | ~~**`methods_of` looking a method up by name at every call**~~ | **0.18%** | **STRUCK.** It was the named remainder of item 11 and it is not a cost: 7.2% on `mapset` and invisible on all nineteen others | — | — |
@@ -2000,3 +2000,73 @@ if it removed **all** of the named cost, which none will.
   geometric mean today. Nearly half of the wall clock is the cost of reaching into a `Buf`, and that
   is one decision — `Buf.at` taking `self` by value — repeated a few hundred million times a second.
   Everything else on the list above is worth single-digit percentages.
+
+## 2026-09-21 — `-O2` against `-O1` (dev `4820c05`)
+
+Shortlist item 6, measured rather than argued. Two builds of the **same source**, dev `4820c05`, one
+at `-O1` (`sysl build .`, the default) and one at `-O2` (`sysl build . -O2`) — no code changed between
+them, so every row below is the flag alone.
+
+Alternating best-of-9 on `bench/timeit.pl`, O1 and O2 back to back, nine times, lowest of each kept.
+Box 92.3% idle, `pgrep -x java` empty, under `caffeinate`.
+
+| program | O1 (ms) | O2 (ms) | change |
+|---|---|---|---|
+| alloc | 1123.969 | 1101.724 | -2.0% |
+| arith | 1110.522 | 1088.427 | -2.0% |
+| arrays | 1130.005 | 1085.234 | -4.0% |
+| branches | 1206.724 | 1134.880 | **-6.0%** |
+| calls | 1117.391 | 1107.944 | -0.8% |
+| closures | 782.776 | 780.358 | -0.3% |
+| csv | 488.893 | 482.241 | -1.4% |
+| dispatch | 1416.047 | 1372.039 | -3.1% |
+| fib | 1553.598 | 1509.235 | -2.9% |
+| fields | 1147.907 | 1094.958 | **-4.6%** |
+| funcs | 874.263 | 851.365 | -2.6% |
+| globals | 1800.358 | 1718.106 | **-4.6%** |
+| loops | 873.918 | 835.096 | -4.4% |
+| mapset | 549.283 | 534.664 | -2.7% |
+| methods | 1792.613 | 1768.880 | -1.3% |
+| nested | 1341.108 | 1307.803 | -2.5% |
+| options | 1331.218 | 1317.002 | -1.1% |
+| reals | 1191.691 | 1158.556 | -2.8% |
+| sorting | 801.711 | 799.522 | -0.3% |
+| startup | 4.418 | 4.471 | +1.2% |
+| strindex | 10.647 | 10.657 | +0.1% |
+| strings | 776.333 | 743.890 | -4.2% |
+| strwalk | 12.396 | 12.214 | -1.5% |
+| **geometric mean** | | | **-2.3%** |
+
+**Twenty of the twenty-three moved the same way**, and the only two that went the other way —
+`startup` at +1.2% and `strindex` at +0.1% — are both a few milliseconds, where noise is the whole of
+the signal. Nothing is more than 3% slower under `-O2`; `branches`, `fields` and `globals` are the
+three biggest wins, each -4.6% or steeper, and every one is a program with several operators inlined
+in a hot loop — consistent with `-O2` doing more with the inlining `-O1` leaves on the table.
+
+**Binary size and build time, both from `sysl build .`:**
+
+| | O1 | O2 | change |
+|---|---|---|---|
+| binary size | 9,730,744 bytes (9.28 MiB) | 9,746,840 bytes (9.29 MiB) | +0.2% |
+| build wall time | 93.55 s | 97.64 s | +4.4% |
+
+**DECISION: -O2 clears the bar (≥2% geometric-mean improvement, nothing more than 3% slower) and
+should be slate's default build — but IT CANNOT BE MADE ONE, because `package.hocon` has no
+optimization-level key.** `sysl build --help`'s `-O`/`--optimize` is a command-line flag only;
+`sh.sysl.PackageConfig` (`~/dev/sysl-lang/sysl-bootstrap/shared/src/main/scala/sh/sysl/PackageConfig.scala`,
+the case class at line 99) carries `name`, `version`, `targets`, `capabilities`, `requires`, `headers`,
+`pkgConfig`, `dependencies`, `devDependencies`, `features`, `allocator`, `defines` and `sysl` — no
+`optimize` field, and `grep -n -i optim package.hocon` in this repo finds nothing but a comment. A
+project has no way to say "build me at `-O2`" from its manifest, so there is nothing in
+`package.hocon`, the release workflow or the Homebrew formula's build step for this item to make
+consistent — every one of them already just runs `sysl build .` with no `-O` at all, which is
+consistent with itself.
+
+**THIS IS A SYSL GAP, PER THE PROJECT'S RULE, AND IS NOT WORKED AROUND.** Per this file's "Where a
+finding goes" table, a compiler gap that does not block slate is reported rather than routed around —
+a wrapper script that always passes `-O2` would be exactly the kind of workaround the rule exists to
+avoid, and it would also be wrong for `sysl test`, `sysl run` and any other command that does not want
+optimized codegen. **Nothing was changed here but this file.** The fix, when the user wants it, is a
+`package.hocon` optimization key (or a project-default flag) in `sysl-bootstrap`; once that exists,
+slate's own `package.hocon` should set it to `2` and the release/CI/formula build steps need no change,
+since all three already just invoke `sysl build .`.
