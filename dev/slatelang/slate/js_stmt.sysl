@@ -17,9 +17,29 @@ emit_stmts(j: *Js, stmts: Buf[Stmt])
     val outer = open_block(j, stmts)
 
     for i in 0..<stmts.len()
-        emit_stmt(j, stmts.at(i))
+        *stmts.at(i).kind match
+            // **A `using` takes the rest of the run with it**, which is what makes the tail the
+            // body of a `try` rather than the next statement of this block.
+            Using(bind, _) ->
+                mark(j, stmts.at(i).span)
+                emit_using(j, bind, after(stmts, i + 1), stmts.at(i).span, false, "")
+                close_block(j, outer)
+
+                return
+            _ -> emit_stmt(j, stmts.at(i))
 
     close_block(j, outer)
+end emit_stmts
+
+// The statements after position `from`, which is what a `using` guards.
+private after(stmts: Buf[Stmt], from: usize) -> Buf[Stmt]
+    var rest: Buf[Stmt] = buf()
+
+    for k in from..<stmts.len()
+        rest.push(stmts.at(k))
+
+    rest
+end after
 
 // Begin a JavaScript block, working out what the run of statements in it declares twice.
 //
@@ -41,6 +61,17 @@ private close_block(j: *Js, outer: JsBlock)
     j.bound = outer.bound
     j.pending = buf()
 
+// The names the declaration inside a `using` brings in.
+//
+// **The annotated form arrives as a `Group`**, whose first statement is the binding and whose rest
+// is the check the annotation became.
+private using_declares(s: Stmt, here: *Buf[string])
+    *s.kind match
+        Val(name, _) -> here.push(name)
+        Unpack(pat, _, _) -> pattern_names(resolve_pattern(pat, 0), here)
+        Group(stmts) -> if !stmts.is_empty() then using_declares(stmts.at(0), here)
+        _ -> ()
+
 // The names this run declares more than once, which are the ones a `const` cannot hold.
 private declared_twice(stmts: Buf[Stmt], already: Buf[string]) -> Buf[string]
     var seen = already
@@ -54,6 +85,11 @@ private declared_twice(stmts: Buf[Stmt], already: Buf[string]) -> Buf[string]
             Var(name, _) -> here.push(name)
             Def(name, _, _, _, _) -> here.push(name)
             Unpack(pat, _, _) -> pattern_names(resolve_pattern(pat, 0), &here)
+
+            // **A `using` declares into the block it stands in and not into the `try` it opens**,
+            // the release having to reach the resource from the `finally` — so its name is one of
+            // this block's for the purpose of asking whether a `const` can hold it.
+            Using(bind, _) -> using_declares(bind, &here)
 
             // A group binds every name its statements do, and the ones one `data` line writes are
             // all `val`s. Missing this would leave a variant undeclared in the emitted module.
@@ -132,7 +168,14 @@ emit_stmts_into(j: *Js, stmts: Buf[Stmt], into: string)
     val outer = open_block(j, stmts)
 
     for i in 0..<stmts.len() - 1
-        emit_stmt(j, stmts.at(i))
+        *stmts.at(i).kind match
+            Using(bind, _) ->
+                mark(j, stmts.at(i).span)
+                emit_using(j, bind, after(stmts, i + 1), stmts.at(i).span, true, into)
+                close_block(j, outer)
+
+                return
+            _ -> emit_stmt(j, stmts.at(i))
 
     val last = stmts.at(stmts.len() - 1)
 
@@ -180,6 +223,76 @@ private mark(j: *Js, at: Span)
     line(j, s"$$.at(${here});")
 end mark
 
+// `using x = e` and the run of statements it guards, as a `try` with a `finally` on it.
+//
+// **JavaScript's `finally` covers all five ways out at once**, where the interpreter has to place
+// the release in front of four jumps and reach the fifth through a handler -- so the shape here is
+// shorter and says the same thing. What it does NOT give for nothing is the suppression rule: a
+// `finally` that throws replaces the exception travelling through it, and slate keeps the original.
+// `raised` is what tells the two apart, written by a `catch` that puts the signal straight back.
+//
+// **The resource is held in a temporary rather than read back by name**, for the interpreter's
+// reason: a `using` may bind a pattern, so there is no one name the release could reach for.
+//
+// **Several in one block nest**, each taking the rest of its own block, so the inner `finally` runs
+// first and the releases come out in reverse.
+private emit_using(j: *Js, bind: Stmt, rest: Buf[Stmt], at: Span, valued: bool, into: string)
+    val init = using_init(bind) match
+        Some(x) -> x
+        None -> return
+
+    val held = fresh(j)
+    val raised = fresh(j)
+    val err = fresh(j)
+    val v = emit_expr(j, init)
+
+    line(j, s"const ${held} = ${v};")
+    line(j, s"$$.wantDisposable(${held});")
+
+    emit_using_bind(j, bind, held, at)
+
+    line(j, s"let ${raised} = null;")
+    line(j, "try {")
+    open(j)
+
+    if valued then emit_stmts_into(j, rest, into) else emit_stmts(j, rest)
+
+    close(j)
+    line(j, s"} catch (${err}) {")
+    open(j)
+
+    // **The signal is put straight back**, so nothing about it changes: the `catch` is here to
+    // record that one is travelling and for no other reason.
+    line(j, s"${raised} = ${err};")
+    line(j, s"throw ${err};")
+    close(j)
+    line(j, "} finally {")
+    open(j)
+    line(j, s"$$.disposeUsing(${held}, ${raised});")
+    close(j)
+    line(j, "}")
+end emit_using
+
+// What a `using` binds, off the temporary holding the resource.
+//
+// **The binding is `val`'s and not a second one**, which is the rule the whole feature rests on:
+// the word adds a release and changes nothing about what the names are or what they hold.
+private emit_using_bind(j: *Js, bind: Stmt, held: string, at: Span)
+    *bind.kind match
+        Val(name, _) -> line(j, s"${declaring(j, name, true)}${js_name(name)} = ${held};")
+        Unpack(pat, _, immutable) -> emit_binding(j, pat, held, immutable, at)
+        Group(stmts) ->
+            if stmts.is_empty() then return
+
+            emit_using_bind(j, stmts.at(0), held, at)
+
+            // The annotation's own check, and anything else one line of source wrote beside the
+            // binding.
+            for i in 1..<stmts.len()
+                emit_stmt(j, stmts.at(i))
+        _ -> ()
+end emit_using_bind
+
 // One statement, for effect.
 emit_stmt(j: *Js, s: Stmt)
     val at = s.span
@@ -187,6 +300,9 @@ emit_stmt(j: *Js, s: Stmt)
     mark(j, at)
 
     *s.kind match
+        // **A `using` reached here guards nothing**, standing as the whole of a body rather than at
+        // the head of a run -- so the resource is acquired and released with nothing in between.
+        Using(bind, _) -> emit_using(j, bind, buf(), at, false, "")
         // Each is emitted where the group stands, for the reason the machine compiles it there: the
         // names belong to the scope around it and not to one of its own.
         Group(stmts) -> for i in 0..<stmts.len() do emit_stmt(j, stmts.at(i))
@@ -330,12 +446,16 @@ end module_of
 
 // `x = e`, `x += e` and their neighbours, over a name, an index or a field.
 private emit_assign(j: *Js, op: Tok, target: Expr, value: Expr, at: Span)
+    if short_circuit_assign(op)
+        emit_short_assign(j, op, target, value, at)
+        return
+
     *target.kind match
         Name(name) ->
             val v = emit_operand(j, op, target, value, at)
 
             line(j, s"${js_name(name)} = ${v};")
-        Index(t, k) ->
+        Index(t, k, _) ->
             val obj = emit_expr(j, t)
             val key = emit_expr(j, k)
             val a = fresh(j)
@@ -368,6 +488,73 @@ private emit_assign(j: *Js, op: Tok, target: Expr, value: Expr, at: Span)
             line(j, s"$$.setField(${a}, ${quoted_js(name)}, ${v});")
         _ -> complain(j, at, "this cannot be assigned to")
 end emit_assign
+
+// `x ??= v`, `x ||= v` and `x &&= v`.
+//
+// **JavaScript has all three operators and none of them is emitted**, because the value belongs
+// INSIDE the test: an expression slate reads as one thing may need statements written in front of
+// it here, and `x ??= f() ?? g()` would run those statements whatever the place held. The block is
+// what keeps the promise that the value is not worked out at all where the place is left alone.
+//
+// The place's parts are held first, so an index or a field is worked out once either way.
+private emit_short_assign(j: *Js, op: Tok, target: Expr, value: Expr, at: Span)
+    *target.kind match
+        Name(name) ->
+            line(j, s"if (${writes_when(op, js_name(name))}) {")
+            open(j)
+
+            val v = emit_expr(j, value)
+
+            line(j, s"${js_name(name)} = ${v};")
+            close(j)
+            line(j, "}")
+        Index(t, k, _) ->
+            val obj = emit_expr(j, t)
+            val key = emit_expr(j, k)
+            val a = fresh(j)
+            val b = fresh(j)
+            val held = fresh(j)
+
+            line(j, s"const ${a} = ${obj};")
+            line(j, s"const ${b} = ${key};")
+            line(j, s"const ${held} = $$.index(${a}, ${b});")
+            line(j, s"if (${writes_when(op, held)}) {")
+            open(j)
+
+            val v = emit_expr(j, value)
+
+            line(j, s"$$.setIndex(${a}, ${b}, ${v});")
+            close(j)
+            line(j, "}")
+        Field(t, name, _) ->
+            val obj = emit_expr(j, t)
+            val a = fresh(j)
+            val held = fresh(j)
+
+            line(j, s"const ${a} = ${obj};")
+            line(j, s"const ${held} = $$.field(${a}, ${quoted_js(name)});")
+            line(j, s"if (${writes_when(op, held)}) {")
+            open(j)
+
+            val v = emit_expr(j, value)
+
+            line(j, s"$$.setField(${a}, ${quoted_js(name)}, ${v});")
+            close(j)
+            line(j, "}")
+        _ -> complain(j, at, "this cannot be assigned to")
+end emit_short_assign
+
+// When a short-circuiting assignment writes: `??=` where the place is absent, `||=` where it is
+// false, `&&=` where it is true.
+//
+// **`$.present` and not a comparison with null**, for the reason `??` itself has one: absence is a
+// question slate asks of a value rather than a pair of host constants.
+private writes_when(op: Tok, held: string) -> string
+    if op == QQ then return s"!$$.present(${held})"
+    if op == OrOr then return s"!(${held})"
+
+    held
+end writes_when
 
 // The right-hand side of an assignment, which for `+=` is the operator applied to what is there.
 private emit_operand(j: *Js, op: Tok, target: Expr, value: Expr, at: Span) -> string
@@ -402,7 +589,7 @@ private emit_assign_to(j: *Js, op: Tok, target: Expr, value: string, at: Span)
             val v = if op == Assign then value else emit_arith(j, op, js_name(name), value)
 
             line(j, s"${js_name(name)} = ${v};")
-        Index(t, k) ->
+        Index(t, k, _) ->
             val obj = emit_expr(j, t)
             val key = emit_expr(j, k)
 

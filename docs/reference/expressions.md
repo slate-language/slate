@@ -25,7 +25,7 @@ Loosest at the top. Everything is left-associative except the lambda arrow.
 | 44 | `&` | |
 | 50 | `+` `-` | |
 | 60 | `*` `/` `\` `%` `<<` `>>` | **a shift binds like a multiplication** |
-| 80 | `++` `--` (postfix), call, `[…]`, `.`, `?.`, `with` | |
+| 80 | `++` `--` (postfix), call, `[…]`, `.`, `?.`, `?.[`, `?.(`, `with` | |
 
 Three placements are worth knowing because they decide what a line means:
 
@@ -227,9 +227,54 @@ null
 about absence: **it stops at the boundary it arose at**, and one character quietly excusing every link
 after it is the opposite of that.
 
+There are **three** guarded links and all three read the same way — the left is worked out, and
+where it is null or absent the link answers `null` without working out anything to its right:
+
+| written | guards | where the left is there |
+|---|---|---|
+| `o?.f` | `o` | reads `f` off it |
+| `xs?.[i]` | `xs` | reads `i` out of it — the key is not worked out otherwise |
+| `f?.(a)` | `f` | calls it — the arguments are not worked out otherwise |
+
+```slate
+val holder = { xs: [10, 20], go: n -> n * 2 }
+val empty = { }
+val deep = { rows: [{ pick: () -> "here" }] }
+
+print(holder.xs?.[1])
+print(holder.go?.(21))
+print(empty.xs?.[1] ?? "none")
+print(empty.go?.(21) ?? "none")
+print(deep?.rows?.[0]?.pick?.())
+```
+
+```output
+20
+42
+none
+none
+here
+```
+
+- **A guard answers for an ABSENCE and never for a wrong kind.** `f?.()` where `f` holds a `3`
+  faults exactly as `f()` would; the character says *this may not be here*, not *this may be
+  anything*.
+- `o.m?.()` reads `o.m` as the value it is and calls that, which is what `o.m` means everywhere
+  else in the language. **`o?.m()` is the spelling that guards the object** and calls `m` as its
+  method.
 - `o?.m(a)` **does not evaluate its arguments** where there is nothing to call the method on.
-- There is no `a?.[i]`.
-- `o?.f = v` is refused: there is no answer to what writing into absence should do.
+- `o?.f = v` and `xs?.[i] = v` are refused: there is no answer to what writing into absence should
+  do.
+
+```slate
+val xs = null
+
+xs?.[0] = 1
+```
+
+```error
+cannot be assigned to
+```
 
 ## `with`
 

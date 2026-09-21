@@ -1,0 +1,219 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// `using` -- a binding whose value is released when the block around it is left.
+//
+// **slate has no `finally`, and this is what a resource wanted it for.** A `try` with nothing to
+// handle the fault is refused here rather than allowed to swallow one silently, so the shape
+// `finally` is written for -- acquire, work, release whatever happens -- had no way to be said. A
+// `using` says it in one line and says it at the point the resource is acquired, which is the half
+// `finally` never had: the release stands beside the thing it releases and cannot be forgotten in a
+// branch added later.
+//
+// **THE RELEASE IS ON EVERY WAY OUT, AND THERE ARE FIVE.** Falling off the end of the block, a
+// `return`, a `break`, a `continue`, and a fault on its way past. The first four are jumps the
+// compiler emits and therefore places the call in front of; the fifth is the machine's unwind, and
+// it reaches the call through a handler of its own -- `PushDispose`, which releases and then lets
+// the fault carry on rather than stopping it the way a `catch` does. An `await` and a `yield` are
+// NOT ways out: the block has not been left, and the resource is still the running program's.
+//
+// **The value is kept on the OPERAND STACK rather than read back by name.** A `using` may bind a
+// pattern, in which case there is no single name holding the resource -- so the value is duplicated
+// where it is acquired and every release reaches for that copy. It costs one stack slot for the
+// life of the block and makes all five exits one shape.
+
+// The initialiser a `using` acquired, which is the initialiser of the binding it wraps.
+//
+// **A `Group` is the annotated form** -- `using x: T = e` is the binding and the check the parser
+// turns the annotation into -- so the binding is its first statement.
+//
+// Not `private`: the JavaScript back end reads the same initialiser out of the same node.
+using_init(bind: Stmt) -> Option[Expr] = *bind.kind match
+    Val(_, init) -> Some(init)
+    Unpack(_, init, _) -> Some(init)
+    Group(stmts) -> if stmts.is_empty() then None else using_init(stmts.at(0))
+    _ -> None
+
+// Bind what a `using` acquired, the value being on top of the stack already.
+//
+// **The binding is `val`'s and not a second one.** Whatever `val x = e`, `val [a, b] = e` and
+// `val x: T = e` mean, `using` means -- the word adds a release and changes nothing about what the
+// names are or what they hold.
+private bind_using(u: *Unit, e: *Emit, bind: Stmt, at: Span) = *bind.kind match
+    Val(name, _) -> declare_name(u, e, name, at, false)
+    Unpack(pat, _, immutable) ->
+        refuse_optionals(pat, "and this one binds")
+        bind_pattern(u, e, pat, at, !immutable)
+    Group(stmts) ->
+        bind_using(u, e, stmts.at(0), at)
+
+        // The annotation's own check, and anything else one line of source wrote beside the
+        // binding, compiled where it stands.
+        for i in 1..<stmts.len()
+            compile_stmt_after_binding(u, e, stmts.at(i))
+    _ -> ()
+
+// One statement that a binding's own `Group` carried along with it.
+private compile_stmt_after_binding(u: *Unit, e: *Emit, s: Stmt)
+    compile_one_stmt(u, e, s, Dropped)
+
+// The instructions that release ONE resource, given where its copy sits on the stack.
+//
+// **`null` is skipped, which is TypeScript's rule and is what makes an optional resource read
+// cleanly**: `using conn = wanted then open() else null` needs no branch around the block. Nothing
+// else can reach this test -- `WantDisposable` has already refused every value that is neither
+// `null` nor disposable, and no disposable value is false.
+emit_dispose(u: *Unit, e: *Emit, slot: usize, at: Span)
+    push_n(e, DupAt(e.sp - 1 - slot), at, 0, 1)
+
+    val skip = put(e, JumpIfFalseKeep(0), at)
+
+    push_n(e, CallMethod(intern_str(u, "dispose"), 0, 0), at, 1, 1)
+    push_n(e, Pop, at, 1, 0)
+
+    val over = put(e, Jump(0), at)
+
+    patch(e, skip, here(e))
+
+    // Control arrives here with the copy still on the stack, `JumpIfFalseKeep` having kept it, so
+    // the counter is told what the machine has rather than what fell through above.
+    e.sp += 1
+
+    push_n(e, Pop, at, 1, 0)
+    patch(e, over, here(e))
+end emit_dispose
+
+// Release every resource this point stands inside down to a handler depth, innermost first.
+//
+// **Reverse order is the acquisition order run backwards**, which is what every language with this
+// feature does and is the only order that can be right: a later resource may have been made out of
+// an earlier one.
+emit_disposes_above(u: *Unit, e: *Emit, handlers: usize, at: Span)
+    var i = e.disposes.len()
+
+    while i > 0
+        i -= 1
+
+        val site = e.disposes.at(i)
+
+        if site.handlers <= handlers then return
+
+        emit_dispose(u, e, site.slot, at)
+end emit_disposes_above
+
+// `using x = e` and the run of statements it guards.
+//
+// The shape, with `H` the stack height the statement began at:
+//
+//     <init>                 the resource
+//     WantDisposable         refused here if it cannot be released
+//     Dup                    the copy every release reaches for, left at H
+//     <bind>                 takes the top copy off
+//     PushDispose(release)   a fault from here on runs `release` and carries on
+//     <the rest of the block>
+//     PopHandler             nothing faulted, so nothing is owed
+//     <release>
+//     Pop                    the copy, from under the block's value where there is one
+//     Jump(end)
+//   release:                 the machine has cut back to H + 1; no fault object was built
+//     <release>
+//     DisposeDone
+//   end:
+//
+// Not `private`: `compile_stmt.sysl` reaches it with the statements that follow the declaration.
+compile_using(u: *Unit, e: *Emit, bind: Stmt, rest: Buf[Stmt], at: Span, awaited: bool, wants: StmtValue)
+    // **`await using` IS REFUSED, AND THE LIMIT IS THE UNWIND RATHER THAN THE SYNTAX.** Four of the
+    // five ways out of a block are jumps, where an `await` would be ordinary; the fifth is a fault
+    // travelling, and its release runs inside `guarded` -- in the middle of an unwind, on a machine
+    // that is already being taken apart. A machine cannot park there, so waiting on a release would
+    // work on four paths and hang on the one the feature exists for.
+    if awaited
+        complain_here(at, "`await using` is not in slate -- a release has to run while a fault is unwinding, where nothing can wait, so `dispose` is called and its answer is not awaited")
+
+    val init = using_init(bind) match
+        Some(x) -> x
+        None -> return
+
+    compile_expr(u, e, init)
+    push_n(e, WantDisposable, at, 0, 0)
+    push_n(e, Dup, at, 0, 1)
+
+    val slot = e.sp - 2
+
+    bind_using(u, e, bind, at)
+
+    val guard = push_n(e, PushDispose(0), at, 0, 0)
+    val scopes = e.scopes
+
+    e.handlers += 1
+    e.disposes.push(DisposeSite(e.handlers, slot))
+
+    compile_run(u, e, rest, at, wants)
+
+    e.disposes.truncate(e.disposes.len() - 1)
+    push_n(e, PopHandler, at, 0, 0)
+    e.handlers -= 1
+
+    emit_dispose(u, e, slot, at)
+
+    // **The copy is taken out from UNDER the block's value where there is one.** A block is an
+    // expression and its last statement may have left something; the resource was acquired before
+    // that value existed, so it is the lower of the two.
+    if wants == Kept then push_n(e, RotUp(1), at, 0, 0)
+
+    push_n(e, Pop, at, 1, 0)
+
+    val over = put(e, Jump(0), at)
+
+    patch(e, guard, here(e))
+
+    // **The counters are set to what the MACHINE will have at the release, not to what fell through
+    // here.** `guarded` arrives having cut the stack back to where `PushDispose` stood, which is the
+    // copy and nothing above it, and having put the scope chain back to the same point.
+    val fell_through = e.sp
+
+    e.sp = slot + 1
+    e.scopes = scopes
+
+    emit_dispose(u, e, slot, at)
+    push_n(e, DisposeDone, at, 0, 0)
+
+    e.sp = fell_through
+    e.scopes = scopes
+    patch(e, over, here(e))
+end compile_using
+
+// -- what the machine checks ------------------------------------------------------------------------
+
+// Whether a value has a `dispose` to call.
+//
+// **The protocol is a method named `dispose`, the way a source is anything with a `next`.** There is
+// no interface to implement and nothing to register: an object with the field has one, a class that
+// writes the method has one for every instance, and a builtin kind has one where the runtime put it
+// there. That is the same answer slate gives everywhere else it asks a value to take part in a
+// language feature.
+private has_dispose(v: Value, at: Span) -> Result[bool, Signal] = v match
+    Object(o) -> Ok(!is_absent(field_from(o, "dispose", at)?.0))
+
+    // A host value's methods are the host's, and slate may not say what it can do.
+    External(_) -> Ok(false)
+    other -> Ok(builtin_method(other, "dispose").is_some())
+
+// The refusal a `using` makes at the DECLARATION, where the resource arrives.
+//
+// **Not at the release, which is the whole point of checking at all.** A block that has done its
+// work and then finds it cannot let go has already done the work; told at the declaration, the
+// reader is told before anything happened and at the line that is wrong.
+//
+// Not `private`: `run_frames.sysl` is the one caller.
+want_disposable(v: Value, at: Span) -> Result[unit, Signal]
+    v match
+        Null -> return Ok(())
+        _ -> ()
+
+    if has_dispose(v, at)? then return Ok(())
+
+    Err(failure(at, s"`using` needs a value with a `dispose` method to call when the block is left, and this is ${v.type_name()}"))
+end want_disposable

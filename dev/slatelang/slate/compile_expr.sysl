@@ -76,10 +76,19 @@ compile_expr(u: *Unit, e: *Emit, x: Expr)
             compile_expr(u, e, subject)
             push_n(e, IsPat(intern_resolved(u, pat), negated), at, 1, 1)
         IncDec(target, up, before) -> compile_inc_dec(u, e, target, up, before, at)
-        Call(callee, args) ->
+        Call(callee, args, guarded) ->
             // **`o.m(a)` is compiled as one thing, because that is the only form a receiver is
             // passed for.** Everything else -- a name, a call answering a function, an element of an
             // array -- is an ordinary call of whatever it evaluated to.
+            //
+            // **A `?.()` is read as a guard on the CALLEE, so the method fusion is given up for
+            // it**: `o.m?.()` reads `o.m` as the value it is and calls that, which is what `o.m`
+            // means anywhere else in the language.
+            if guarded
+                compile_guarded_call(u, e, callee, args, at)
+                return
+            end if
+
             *callee.kind match
                 Field(target, name, optional) ->
                     compile_expr(u, e, target)
@@ -119,10 +128,27 @@ compile_expr(u: *Unit, e: *Emit, x: Expr)
                             compile_expr(u, e, arg_value(args.at(i)))
 
                         push_n(e, CallFn(args.len(), arg_names_of(u, args, at)), at, args.len() + 1, 1)
-        Index(t, key) ->
+        Index(t, key, optional) ->
             compile_expr(u, e, t)
-            compile_expr(u, e, key)
-            push_n(e, GetIndex, at, 2, 1)
+
+            if !optional
+                compile_expr(u, e, key)
+                push_n(e, GetIndex, at, 2, 1)
+            else
+                // **The key is not worked out where there is nothing to read from**, which is the
+                // rule `o?.m(a)` already has about its arguments and is what makes the guard worth
+                // having over a test written after the read.
+                val short = push_n(e, JumpIfAbsentKeep(0), at, 0, 0)
+
+                compile_expr(u, e, key)
+                push_n(e, GetIndex, at, 2, 1)
+
+                val done = put(e, Jump(0), at)
+
+                patch(e, short, here(e))
+                push_n(e, Pop, at, 1, 0)
+                push_n(e, PushNull, at, 0, 1)
+                patch(e, done, here(e))
         Field(t, name, optional) ->
             compile_expr(u, e, t)
 
@@ -395,6 +421,38 @@ private refuse_named_spread(args: Buf[Expr], at: Span)
             _ -> ()
 end refuse_named_spread
 
+// `f?.(a, b)` -- the callee is worked out, and where it is nullish the whole call answers `null`
+// with the arguments left unevaluated.
+//
+// **The guard is on the callee and nowhere else.** A callee that IS there and is not a function
+// faults exactly as a plain call does, which is the line every guarded link in slate draws: `?.`
+// answers for an absence and never for a wrong kind.
+private compile_guarded_call(u: *Unit, e: *Emit, callee: Expr, args: Buf[Expr], at: Span)
+    compile_expr(u, e, callee)
+
+    // **One value stands where one stood on either path**, so the stack counter needs no
+    // correction -- `CallFn` takes the callee and its arguments and gives one back, and the other
+    // arm drops the nullish callee and pushes `null` in its place.
+    val short = push_n(e, JumpIfAbsentKeep(0), at, 0, 0)
+
+    if has_spread(args)
+        refuse_named_spread(args, at)
+        compile_spread_args(u, e, args, at)
+        push_n(e, CallSpread, at, 2, 1)
+    else
+        for i in 0..<args.len()
+            compile_expr(u, e, arg_value(args.at(i)))
+
+        push_n(e, CallFn(args.len(), arg_names_of(u, args, at)), at, args.len() + 1, 1)
+
+    val done = put(e, Jump(0), at)
+
+    patch(e, short, here(e))
+    push_n(e, Pop, at, 1, 0)
+    push_n(e, PushNull, at, 0, 1)
+    patch(e, done, here(e))
+end compile_guarded_call
+
 // A list of values that is not known until it runs, left on the stack as one array.
 //
 // **A run of written values becomes an array and each spread is already one**, and `JoinArrays`
@@ -471,7 +529,7 @@ private compile_inc_dec(u: *Unit, e: *Emit, target: Expr, up: bool, before: bool
                 push_n(e, BinaryOp(op), at, 2, 1)
 
             push_n(e, SetField(k), target.span, 2, 0)
-        Index(t, key) ->
+        Index(t, key, _) ->
             compile_expr(u, e, t)
             compile_expr(u, e, key)
             push_n(e, DupAt(1), target.span, 0, 1)

@@ -18,6 +18,7 @@ val server = serve(8080, req -> "hello")
 | `serve(port, handler, onUpgrade = null)` | the whole request, body included |
 | `serveStream(port, handler, onUpgrade = null)` | the head, then the body in pieces |
 | `close(server)` | stop serving, and end the connections |
+| `server.dispose()` | `close` under the name [`using`](../reference/statements.md) looks for |
 | `router()` | |
 | `files(root, options = {})` | a handler serving a directory |
 | `setCookie(name, value, options = {})` | a header value |
@@ -76,9 +77,11 @@ channel().onMessage((m, conn) ->
     if conn != null then app.handle(conn))
 ```
 
-- **`adopt(handler)` and `adopt(handler, onUpgrade)` answer `{ handle, close }`.** `handle(conn)` takes
-  one connection, which is node's `server.emit("connection", socket)`; `close()` ends the connections
-  this server accepted, which is what `close(server)` does to the half an adopting server has.
+- **`adopt(handler)` and `adopt(handler, onUpgrade)` answer `{ handle, close, dispose }`.**
+  `handle(conn)` takes one connection, which is node's `server.emit("connection", socket)`; `close()`
+  ends the connections this server accepted, which is what `close(server)` does to the half an
+  adopting server has, and `dispose` is that same function under the name
+  [`using`](../reference/statements.md) looks for.
 - **Everything below the accept is the code that answers an ordinary request** — the parser,
   keep-alive, the idle clock, the upgrade, `h2` over ALPN, the response writer. `serve` is this plus a
   listening socket.

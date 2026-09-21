@@ -215,16 +215,24 @@ true
 true
 ```
 
-**`toJSON` is the one place a wide integer has no form.** JSON's own grammar bounds a number at
-nothing, but slate's encoder holds one as 64 bits and has no way to write more; rather than round it
-into a real and hand you a document that is quietly wrong, it refuses, on both back ends.
+**A wide integer goes through JSON as its digits**, JSON's own grammar bounding a number at nothing.
+Reading them back grows the number again rather than rounding it to the nearest double, so a
+document carries what it was given; and an exponent is still a real however large it is, which is
+what keeps the two kinds apart across a round trip.
 
 ```slate
-print(toJSON({ n: pow(10, 30) }))
+val doc = { n: pow(10, 30), scale: 1e30 }
+val back = parseJSON(toJSON(doc)).value
+
+print(toJSON(doc))
+print(back.n == pow(10, 30))
+print(back.scale is real)
 ```
 
-```error
-an integer wider than 64 bits has no encoding here
+```output
+{"n":1000000000000000000000000000000,"scale":1e+30}
+true
+true
 ```
 
 **`/` ANSWERS A REAL, ALWAYS — even between two integers, and even where the division comes out
