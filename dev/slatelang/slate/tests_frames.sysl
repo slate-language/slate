@@ -1,0 +1,131 @@
+module dev.slatelang.slate
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{read_bytes}
+import sysl.text.Search
+
+// What a frame carries, and what a return puts back.
+//
+// **A `Frame` says which chunk it is AND holds that chunk's code and the file its spans belong to**,
+// so `Ret` restores the instruction loop out of the frame rather than reading the chunk table. That
+// makes the frame the only statement of where a call goes back to -- and a stale or mismatched one
+// is silent in two different ways, which is why every test here asserts both halves:
+//
+// - **a stale CODE buffer** is caught by the ANSWER. The loop would carry on stepping through the
+//   callee's instructions at the caller's `pc`, so the program either computes something else or
+//   walks off the end of a buffer.
+// - **a stale FILE** is caught by a DIAGNOSTIC raised after the call has come back. A fault is
+//   stamped with the file the machine believes it is running, so a wrong one quotes the OTHER file
+//   at this file's offsets -- at a line that usually exists, and with nothing in the message saying
+//   it is pointing somewhere else.
+//
+// **A program has to be several files for any of this to be observable**, the file being source zero
+// and always right while it is one. The fixtures are under `tests/mods/`, read by relative path.
+//
+// **The last line of every fixture is a RUN-TIME fault and not an unbound name**, which is the one
+// shape that does not work here: a name nothing binds is refused before the program runs, so the
+// diagnostic would be the compiler's and the program would never reach the call under test.
+//
+// **AND THE LAST CALL BEFORE THAT FAULT HAS TO BE ONE THAT CROSSES**, which a control build proved
+// rather than argued: with the file deliberately left stale on a return, a fixture whose outermost
+// call was its own reads exactly as a correct one does, because the value left standing is then the
+// right file anyway. `after_catch` and `after_shapes` name the wrong file under that build.
+
+// What a fixture printed and what it then complained about, together: `ran_out` and `ran_fault` each
+// answer one of the two, and every test here wants both.
+private said_and_printed(path: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    read_bytes(path) match
+        Err(e) ->
+            out.push("")
+            out.push(s"cannot read ${path}: ${e} -- run `sysl test .` from the project root")
+        Ok(bytes) ->
+            val r = run(source(path, bytes))
+
+            out.push(r.printed())
+            out.push(if r.ok() then "" else r.render())
+
+    out
+end said_and_printed
+
+@test
+A_HUNDRED_RETURNS_ACROSS_TWO_FILES_PUT_BACK_BOTH_THE_CODE_AND_THE_FILE()
+    // `down` is in the entry and `ladder` is in the module, and they call each other all the way
+    // down -- so every one of the two hundred returns changes the chunk AND the file.
+    val ran = said_and_printed("tests/mods/after_across.sl")
+
+    assert_eq(ran.at(0), "100")
+
+    // The fault is written on the entry's own last line, after the whole ladder has unwound.
+    assert(ran.at(1).contains("this divides by zero"))
+    assert(ran.at(1).contains("tests/mods/after_across.sl"))
+    assert(!ran.at(1).contains("tests/mods/frames_lib.sl"))
+
+@test
+A_CATCH_CARRIES_ON_IN_THE_FILE_THE_try_WAS_WRITTEN_IN()
+    // The fault is raised in the module, fifty frames below the `try`, and the machine is put back
+    // to the handler's own frame rather than returned into. So this is the unwinding path rather
+    // than `Ret`, and it has to leave the loop standing in the entry.
+    val ran = said_and_printed("tests/mods/after_catch.sl")
+
+    assert(ran.at(0).contains("caught this divides by zero"))
+    assert(ran.at(0).contains("carried on"))
+
+    assert(ran.at(1).contains("this divides by zero"))
+    assert(ran.at(1).contains("tests/mods/after_catch.sl"))
+    assert(!ran.at(1).contains("tests/mods/frames_lib.sl"))
+
+@test
+A_CONSTRUCTOR_A_BUILTIN_CALLBACK_AND_A_GENERATOR_ALL_RETURN_INTO_THE_CALLING_FILE()
+    // Three entries into another file's chunks that are not the ordinary call: a `new` reached
+    // through a class value, a callback `map` runs on a machine of its own, and a generator parked
+    // between one value and the next.
+    val ran = said_and_printed("tests/mods/after_shapes.sl")
+
+    assert_eq(ran.at(0), "42\n2,4,6\n0\n10")
+
+    assert(ran.at(1).contains("this divides by zero"))
+    assert(ran.at(1).contains("tests/mods/after_shapes.sl"))
+    assert(!ran.at(1).contains("tests/mods/frames_lib.sl"))
+
+@test
+AN_await_AND_A_REJECTION_BOTH_PUT_THE_AWAITING_FILE_BACK()
+    // The scheduler is the other thing that puts a machine back, and it reads the frame an `Await`
+    // wrote: `resume_chunk` for a promise that kept its word and `resume_failed` for one that did
+    // not. Both carry on in the file the `await` was written in.
+    val ran = said_and_printed("tests/mods/after_await.sl")
+
+    assert_eq(ran.at(0), "42\ncaught this divides by zero\ncarried on")
+
+    assert(ran.at(1).contains("this divides by zero"))
+    assert(ran.at(1).contains("tests/mods/after_await.sl"))
+    assert(!ran.at(1).contains("tests/mods/frames_lib.sl"))
+
+@test
+A_DEEP_RECURSION_RETURNS_THROUGH_EVERY_FRAME_IT_MADE()
+    // One file, so nothing here is about the file a fault belongs to -- this is the code buffer
+    // alone, through the depth at which a frame stack has certainly grown its storage more than
+    // once. A `Buf` that grows moves its elements, so a frame read back after the growth has to be
+    // read out of the buffer as it stands now.
+    assert_eq(out("count(n) = if n <= 0 then 0 else 1 + count(n - 1)\nprint(count(2000))"), "2000")
+
+    // Two chunks taking it in turns, so consecutive returns land in different code buffers.
+    assert_eq(out("even(n) = if n <= 0 then 0 else odd(n - 1)\nodd(n) = if n <= 0 then 1 else even(n - 1)\nprint(even(999))"), "1")
+
+@test
+A_METHOD_CALL_AND_A_NAMED_CALL_RETURN_THE_SAME_WAY_AN_ORDINARY_ONE_DOES()
+    // The in-place path and the buffered path write the frame back at two different instructions, so
+    // both are asked here: a method is `CallMethod`'s in-place arm and a named argument is the one
+    // thing that always takes the buffer.
+    assert_eq(out("class Adder\n    new(by) = { by: by }\n\n    add(self, n) = n + self.by\n\nval a = Adder(5)\nprint(a.add(a.add(1)))"), "11")
+    assert_eq(out("f(a, b = 2) = a * b\nprint(f(3, b = 4) + f(3))"), "18")
+
+@test
+A_GENERATOR_RESUMED_AFTER_A_CALL_PICKS_UP_ITS_OWN_CODE()
+    // A generator's machine is parked with a frame standing on it and put back by whoever asks for
+    // the next value, so the frame is the only record of where it was. Calling something else
+    // between two steps is what makes a shared record show.
+    assert_eq(out("g()\n    yield 1\n    other()\n    yield 2\n\nother() = 0\n\nval it = g()\nprint(it.next().value)\nprint(other())\nprint(it.next().value)\nprint(it.next().done)"), "1\n0\n2\ntrue")

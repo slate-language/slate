@@ -160,7 +160,9 @@ resume_failed(u: *Unit, sig: Signal) -> Step
 
     vm.frames.truncate(vm.frames.len() - 1)
     vm.scope = back.scope
-    current().current_source = u.chunks.at(back.chunk).source
+    // The frame says which file the chunk it belongs to was compiled from, so the chunk table is not
+    // asked for it again.
+    current().current_source = back.source
 
     // Everything this machine has is its own, so every handler in it is allowed the fault.
     val answer = guarded(u, Err(sig), 0, null, 0)
@@ -191,7 +193,10 @@ enum Called
     // arm that receives one lays them onto the operand stack before it does anything else. Nothing
     // between the two allocates on the collected heap today, and putting them down first is what
     // makes that not need to stay true.
-    Enter(chunk: usize, scope: *EnvObj, args: Buf[Value])
+    // **`code` AND `source` BELONG TO `chunk` AND ARE CARRIED FOR THE REASON THE PLAN CARRIES THEM**:
+    // working out that a chunk is entered reads it out of the table, and the loop would otherwise
+    // read it twice more to get the two fields it goes on with.
+    Enter(chunk: usize, scope: *EnvObj, args: Buf[Value], code: Buf[Ins], source: usize)
 
 // A call's arguments in the order the callee's PARAMETERS are written.
 //
@@ -369,7 +374,7 @@ invoke(u: *Unit, callee: Value, args: Buf[Value], at: Span, depth: usize) -> Res
             if chunk.slotted
                 release(mark)
 
-                return Ok(Enter(c.body, c.scope, given))
+                return Ok(Enter(c.body, c.scope, given, chunk.code, chunk.source))
 
             val called = new_env(c.scope)
 
@@ -379,7 +384,7 @@ invoke(u: *Unit, callee: Value, args: Buf[Value], at: Span, depth: usize) -> Res
             // parameters to its left.
             bind_arguments(called, c, given, chunk.variadic)
             release(mark)
-            Ok(Enter(c.body, called, buf()))
+            Ok(Enter(c.body, called, buf(), chunk.code, chunk.source))
         // **An object with a `new` is callable, and the call IS that `new`.** `Circle(3)` and
         // `Circle.new(3)` are one thing said two ways, so the lookup is the one `.` does -- through
         // the proto chain, the same field the written form would have found. What it buys is that a
@@ -551,7 +556,13 @@ end fault_value
 // Not `private`: `run_frames.sysl` matches on one.
 enum CallPlan
     // A slate chunk entered with its arguments left exactly where they are.
-    InPlace(body: usize, scope: *EnvObj)
+    //
+    // **IT CARRIES EVERYTHING ENTERING THAT CHUNK NEEDS, WHICH IS WHY IT IS SIX FIELDS AND NOT TWO.**
+    // Deciding the plan reads the `Chunk` already; `params` and `slots` are what the window is laid
+    // from and `code` and `source` are what the loop carries on with, so handing them back here is
+    // what lets the ordinary call read the chunk table exactly once. A `Buf` copies with a retain,
+    // which is a fraction of what copying the whole `Chunk` out of the table costs.
+    InPlace(body: usize, scope: *EnvObj, params: usize, slots: usize, code: Buf[Ins], source: usize)
 
     // A builtin, which reads its arguments where they stand and answers a value.
     Builtin(f: NativeFn)
@@ -592,7 +603,7 @@ placed_call(u: *Unit, callee: Value, names: usize, depth: usize) -> CallPlan
             // goes back there and is refused with the sentence it has always been refused with.
             if depth >= MaxCallDepth then return Buffered
 
-            InPlace(c.body, c.scope)
+            InPlace(c.body, c.scope, chunk.params.len(), chunk.slots, chunk.code, chunk.source)
         Native(f) -> Builtin(f)
         // **A CONSTRUCTOR CALL IS THE SAME CALL WITH THE CALLEE LOOKED UP FIRST.** `Counter(3)` is an
         // object with a `new`, and `invoke` answers it by calling that hook with the arguments exactly
@@ -624,24 +635,28 @@ end placed_call
 // middle is `arrange_named`'s and a named call never comes here; `keepable` has already refused an
 // `undefined` at the call, so no other value can mean "not given" either.
 //
+// **IT IS TOLD THE TWO COUNTS RATHER THAN LOOKING THE CHUNK UP**, because the plan that chose this
+// path read the chunk to choose it: `params` is how many parameters the callee declared and `slots`
+// how many cells its window is. Reading the table again here would copy the whole `Chunk` for two
+// numbers, once per call.
+//
 // Not `private`: `run_frames.sysl` is the caller.
-lay_standing(u: *Unit, chunk_ix: usize, argc: usize) -> usize
+lay_standing(params: usize, slots: usize, argc: usize) -> usize
     val vm = machine()
-    val chunk = u.chunks.at(chunk_ix)
 
     // **A SURPLUS ARGUMENT IS DROPPED RATHER THAN REFUSED**, which is `fit_arguments`' rule and
     // JavaScript's -- and here it is a truncate, there being nothing to copy it out of.
-    val kept = if argc > chunk.params.len() then chunk.params.len() else argc
+    val kept = if argc > params then params else argc
 
     if kept < argc then vm.stack.truncate(vm.stack.len() - (argc - kept))
 
     // **A PARAMETER CELL NOBODY FILLED IS PADDED WITH THE ABSENCE IT MEANS**, and a local's cell with
     // null, which is `lay_frame`'s rule and is written out in both places for the reason the rest rule
     // is: two copies of it is how they come to disagree.
-    for _ in kept..<chunk.params.len()
+    for _ in kept..<params
         vm.stack.push(Undefined)
 
-    for _ in chunk.params.len()..<chunk.slots
+    for _ in params..<slots
         vm.stack.push(Null)
 
     var given: usize = 0
