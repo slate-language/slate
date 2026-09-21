@@ -250,6 +250,42 @@ the_three_guarded_links_chain_when_each_one_says_so() =
     assertEq(gone.b?.[0]?.c ?? "none", "none")
 
 @test
+a_guarded_receiver_makes_the_method_call_or_answers_nothing() =
+    val P = { twice: (self, x) -> x * 2 }
+    val o = { n: 1, proto: P }
+    val gone = { }
+    var args = 0
+
+    one() =
+        args += 1
+        1
+
+    assertEq(o?.twice(3), 6)
+    assertEq(gone.nope?.twice(one()) ?? "none", "none")
+    assertEq(args, 0)
+
+    // The arguments are worked out where the call happens and nowhere else, which is what the guard
+    // buys over a test written after the call.
+    assertEq(o?.twice(one()), 2)
+    assertEq(args, 1)
+
+    // A builtin method is reached the same way, the guard being about the receiver and not about
+    // where the method came from.
+    assertEq([1, 2]?.map(x -> x + 1), [2, 3])
+    assertEq(gone.nope?.map(one()) ?? "none", "none")
+    assertEq(args, 1)
+
+@test
+a_guarded_receiver_that_is_there_and_cannot_do_it_still_faults() =
+    // `?.` guards the LINK and not the call: a receiver that is present is asked for the method, and
+    // a kind that has no such method says so exactly as it does without the guard.
+    opaque(v) = v
+
+    val three = opaque(3)
+
+    assertFaults(() -> three?.nope(), "`nope` is not something an integer can do")
+
+@test
 a_guarded_call_still_faults_on_a_callee_that_is_there_and_is_not_a_function() =
     // **An unannotated function answers `any` by design**, which is how a value whose type the
     // checker cannot see is handed over -- so what this pins is the machine's own refusal.
