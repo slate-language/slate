@@ -615,7 +615,12 @@ compile_module(u: *Unit, prog: Program, src: usize, name: string, is_entry: bool
     // counts the ones written at the file's own top level and a module holding none lets each block
     // be asked whether it declares anything -- which is what stops a module-level loop building an
     // `EnvObj` every turn for a body that binds nothing.
-    var e = fresh_emit(prog.awaits, false, false, false, prog.binders, buf())
+    var e = fresh_emit(u, at, true, prog.awaits, false, false, false, prog.binders, buf())
+
+    // **The file's own definitions are read off the tree before a line of it is emitted**, so that a
+    // call of one compiles to a table index rather than a lookup by name. `defs.sysl` carries the
+    // rule and `settle_module_defs` at the end of this function is the other half of it.
+    open_module_defs(u, prog.stmts)
 
     // **A module's own body answers nothing**, its exports being an object built below rather than
     // its last statement's value, so every statement in it stands unread.
@@ -648,7 +653,7 @@ compile_module(u: *Unit, prog: Program, src: usize, name: string, is_entry: bool
     // statements the chunk above has just compiled, so every diagnostic they can draw has been drawn.
     val was = quiet_compiling()
 
-    var de = fresh_emit(false, false, false, false, prog.binders, buf())
+    var de = fresh_emit(u, at_decls, true, false, false, false, false, prog.binders, buf())
 
     compile_stmts(u, &de, decl_stmts, point(0), Dropped)
     export_object(u, &de, prog.exports, effect_names(body_stmts))
@@ -658,6 +663,11 @@ compile_module(u: *Unit, prog: Program, src: usize, name: string, is_entry: bool
 
     dc.code = de.code
     u.chunks.set(at_decls, dc)
+
+    // **Both chunks are written, so every resolved read is an index into code standing still** --
+    // which is what this waits for. A spelling something in the file turned out to bind goes back to
+    // the lookup it would have had, wherever it was read.
+    settle_module_defs(u)
 
     u.modules.push(at)
     u.module_decls.push(at_decls)
@@ -790,7 +800,7 @@ compile_chunk(u: *Unit, params: Buf[string], defaults: Buf[Expr], body: Expr, na
     // conservative reading of "a block here may gain a name its statements do not name", and a
     // chunk refused cells for any other reason simply keeps the scopes it always kept.
     val plan = slot_plan(plain, defaults, body)
-    var e = fresh_emit(is_async, is_gen, plan.whole, plan.cells, !plan.cells, plan.kept)
+    var e = fresh_emit(u, at, false, is_async, is_gen, plan.whole, plan.cells, !plan.cells, plan.kept)
 
     // **THE PARAMETERS TAKE THE FIRST SLOTS, IN ORDER, BEFORE ANYTHING ELSE CLAIMS ONE.** That is
     // what makes parameter `i` slot `i` by construction, so the machine can lay a call's arguments
@@ -804,6 +814,13 @@ compile_chunk(u: *Unit, params: Buf[string], defaults: Buf[Expr], body: Expr, na
     // here so a lookup stops at one rather than answering about a cell an inner block claimed under
     // the same spelling. Splitting the parameters -- some cells, some not -- would need a table
     // saying where each argument goes, which is exactly what "parameter `i` is slot `i`" bought.
+    // **A parameter of a chunk with no cells at all is bound by the MACHINE and by no instruction**,
+    // so this is where such a chunk says that its parameters shadow a definition of the same
+    // spelling. `claim_slot` and `note_scope_name` say it for every other chunk, and saying it twice
+    // costs a walk of a list that is nearly always empty.
+    for i in 0..<plain.len()
+        shadowed_name(u, plain.at(i))
+
     if e.slotting
         for i in 0..<plain.len()
             claim_slot(&e, plain.at(i), true)
@@ -840,20 +857,25 @@ end compile_chunk
 //
 // **This is `compile_defaults` with the default expression fixed at `undefined`.** A call giving
 // too few arguments no longer refuses -- it binds the same absence a missing field already answers
-// with, `DeclareAbsent`/`StoreAbsentSlot` being the one difference from an ordinary default's
-// binding: they skip the refusal that a WRITTEN `= undefined` would still meet.
+// with, `DeclareAbsent` being the one difference from an ordinary default's binding: it skips the
+// refusal that a WRITTEN `= undefined` would still meet.
+//
+// **A SLOTTED CHUNK OWES NOTHING HERE, AND THAT IS WHERE THE HEAD OF EVERY ORDINARY FUNCTION WENT.**
+// `lay_frame` pads a parameter cell nobody filled with exactly this absence, so the guarded binding
+// could only ever write what was already there -- and the guard itself ran on every call, three
+// instructions a call for a function of three parameters that has no default anywhere in it.
+//
+// **A chunk that keeps its scope still owes them**, because a parameter nobody gave is not bound
+// there at all and a lookup would walk past it to a global of the same spelling.
 private compile_required_absences(u: *Unit, e: *Emit, params: Buf[string], required: usize, at: Span)
+    if e.slotting then return
+
     for i in 0..<required
         val k = intern_str(u, params.at(i))
-        val over = put(e, if e.slotting then JumpIfGiven(i, 0) else JumpIfBound(k, 0), at)
+        val over = put(e, JumpIfBound(k, 0), at)
 
         push_n(e, PushUndefined, at, 0, 1)
-
-        if e.slotting
-            push_n(e, StoreAbsentSlot(i), at, 1, 0)
-        else
-            push_n(e, DeclareAbsent(k), at, 1, 0)
-
+        push_n(e, DeclareAbsent(k), at, 1, 0)
         patch(e, over, here(e))
 end compile_required_absences
 
@@ -868,22 +890,30 @@ end compile_required_absences
 // ordinary `DeclareVar`/`StoreSlot` -- but a default that is literally `UndefinedLit` (written as
 // `= undefined` or desugared from `b?` in `define.sysl`'s `read_default`) is exactly the absence a
 // missing field already answers with, not a program choosing to store one, so it binds through
-// `DeclareAbsent`/`StoreAbsentSlot` instead. Everything else about the mechanism -- the guard, the
-// order, a default reading an earlier parameter -- is identical either way.
+// `DeclareAbsent` instead. Everything else about the mechanism -- the guard, the order, a default
+// reading an earlier parameter -- is identical either way.
+//
+// **AND A SLOTTED CHUNK EMITS NOTHING FOR A DEFAULT THAT IS THE ABSENCE ITSELF.** `b?`, and a
+// default written `= undefined`, bind exactly what `lay_frame` already padded the cell with, so the
+// guard and the binding under it are a branch and a store that between them change nothing. An
+// evaluated default still needs both: its expression may not run where the argument arrived.
 private compile_defaults(u: *Unit, e: *Emit, params: Buf[string], defaults: Buf[Expr], required: usize)
     for i in 0..<defaults.len()
         val value = defaults.at(i)
         val n = required + i
-        val k = intern_str(u, params.at(n))
-        val over = put(e, if e.slotting then JumpIfGiven(n, 0) else JumpIfBound(k, 0), value.span)
         val absent = *value.kind match
             UndefinedLit -> true
             _ -> false
 
+        if absent && e.slotting then continue
+
+        val k = intern_str(u, params.at(n))
+        val over = put(e, if e.slotting then JumpIfGiven(n, 0) else JumpIfBound(k, 0), value.span)
+
         compile_expr(u, e, value)
 
         if e.slotting
-            push_n(e, if absent then StoreAbsentSlot(n) else StoreSlot(n), value.span, 1, 0)
+            push_n(e, StoreSlot(n), value.span, 1, 0)
         else
             push_n(e, if absent then DeclareAbsent(k) else DeclareVar(k), value.span, 1, 0)
 

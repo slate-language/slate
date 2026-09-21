@@ -24,6 +24,13 @@ gathers(a, ...rest) = [a, rest]
 
 twice(cb: (integer, integer) -> integer) = cb(1, 2)
 
+// Hands a callback two arguments whatever it declares, which is how a function of three parameters
+// is called with two without the checker refusing it first.
+twoArgs(cb) = cb(1, 2)
+
+third(a, b, c) = c
+leans(a, b = a * 2) = [a, b]
+
 class Counter
     var n = 0
 
@@ -104,6 +111,28 @@ A_PARAMETER_THE_CALL_LEFT_OUT_READS_AS_AN_ABSENCE() =
     assert(anything(second)(1) == null)
     assertEq(anything(second)(1) ?? "gone", "gone")
     assertEq(if anything(second)(1) then "yes" else "no", "no")
+
+@test
+A_PARAMETER_PAST_THE_LAST_ARGUMENT_READS_AS_ONE_WHEREVER_IT_IS_READ() =
+    // **The head of a function no longer binds these one at a time.** A parameter that can only ever
+    // hold an absence is left to the frame, which is laid with one in every cell a call did not
+    // fill -- so what a function of three called with two finds in its third parameter is what this
+    // asks for, at the seam a program can see.
+    assert(twoArgs(third) == null)
+    assertEq(twoArgs((a, b, c) -> c ?? "none"), "none")
+    assertEq(twoArgs((a, b, c) -> if c then "yes" else "no"), "no")
+
+    // A lambda is the same chunk by another spelling, and a parameter well past the last argument
+    // reads the same way as the one just past it.
+    assertEq(twoArgs((a, b, c, d) -> (c ?? "c") + (d ?? "d")), "cd")
+
+@test
+A_DEFAULT_READING_AN_EARLIER_PARAMETER_STILL_BINDS() =
+    // A default is an expression and is still worked out at the call, which is the half of the head
+    // that has to stay: the guard is what stops it running where the argument arrived.
+    assertEq(leans(3), [3, 6])
+    assertEq(leans(3, 1), [3, 1])
+    assertEq(twoArgs(leans), [1, 2])
 
 @test
 AN_ABSENCE_A_CALL_LEFT_BEHIND_STILL_CANNOT_TRAVEL() =

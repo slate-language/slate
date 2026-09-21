@@ -1,0 +1,150 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// Which of a file's own definitions a read of a name can be resolved to while compiling.
+//
+// **A CALL OF A MODULE-LEVEL FUNCTION USED TO BE A LOOKUP BY NAME, ONCE PER CALL.** `add3(i, 1, 2)`
+// written inside a loop emitted a `LoadName`, which hashes the spelling and walks the scope chain
+// outward until it finds the binding -- four million times in `bench/funcs.sl`, for an answer that
+// cannot change. What is emitted instead is an index into a table the module fills as it hoists its
+// definitions, and the instruction that reads it does one array read.
+//
+// **THE RULE IS THE ONE A READER CAN STATE: a definition written at the file's own top level, whose
+// spelling nothing else in the file binds or writes.** A program that reassigns `add3`, or that has
+// a parameter, a local, a caught name, a pattern binding or an import of that spelling anywhere in
+// the file, keeps the lookup it always had -- so the observable rule is untouched and nothing new is
+// refused.
+//
+// **THE ANSWER IS NOT KNOWN WHEN THE READ IS EMITTED, WHICH IS WHY THERE IS A FIXUP RATHER THAN A
+// PRE-PASS.** Definitions are hoisted, so a body that calls `add3` is compiled before the statement
+// twenty lines further down that turns out to bind the same spelling; the compiler would have to
+// walk the whole file twice to know. So a read is emitted resolved, where it is emitted, and every
+// one is written down -- and a name that something later turns out to bind puts its reads back to
+// `LoadName` before the module is finished. Nothing outside this file has to know either way.
+//
+// **The table is per MODULE and the run-time indices are per UNIT**, which is what lets two files
+// each have an `add3`. `settle_module_defs` closes one file's table; the numbers it handed out are
+// never reused.
+//
+// **A module's declarations are compiled TWICE** -- once into the module's own chunk and once into
+// the declarations chunk `load_declarations` runs -- so a definition is hoisted twice and claims its
+// index once. Both copies write the same table cell, and a VM that has run only the declarations has
+// it filled.
+
+// One definition written at a file's top level.
+struct ModuleDef
+    name: string
+
+    // Which cell of the machine's own table it is kept in, for the life of the unit.
+    at: usize
+
+    // Whether a read of this spelling may still be resolved. **It starts true and only ever goes
+    // false**, because what closes it is the discovery that something else binds the name -- and a
+    // discovery made anywhere in the file is a discovery about the whole of it.
+    open: bool
+end ModuleDef
+
+// A resolved read that has been emitted, and what it would have been.
+struct DefSite
+    chunk: usize
+    pc: usize
+
+    // The interned spelling, which is what the instruction goes back to being.
+    key: usize
+
+    // Which entry of `Unit.defs` it was resolved to.
+    def: usize
+end DefSite
+
+// Begin a file's table, reading its top-level definitions off the tree before any of them is
+// compiled.
+//
+// **A `Group` is walked into**, matching `hoist_defs`: its statements are the file's own and a
+// definition inside one is a definition of the file.
+open_module_defs(u: *Unit, stmts: Buf[Stmt])
+    for i in 0..<stmts.len()
+        *stmts.at(i).kind match
+            Def(name, _, _, _, _) -> claim_def(u, name)
+            Group(inner) -> open_module_defs(u, inner)
+            _ -> ()
+end open_module_defs
+
+// **A SECOND DEFINITION OF ONE SPELLING CLOSES IT RATHER THAN TAKING A SECOND CELL.** `check.sysl`
+// refuses a file that writes two, so this is the belt on top of that brace: two cells under one
+// name would make which one a read meant depend on where the read stood.
+private claim_def(u: *Unit, name: string)
+    for i in 0..<u.defs.len()
+        if u.defs.at(i).name == name
+            shut_def(u, i)
+            return
+
+    u.defs.push(ModuleDef(name, u.def_total, true))
+    u.def_total = u.def_total + 1
+end claim_def
+
+private shut_def(u: *Unit, i: usize)
+    var d = u.defs.at(i)
+
+    d.open = false
+    u.defs.set(i, d)
+
+// Which entry of the table a name is a definition of, where a read of it may still be resolved.
+def_named(u: *Unit, name: string) -> Option[usize]
+    for i in 0..<u.defs.len()
+        if u.defs.at(i).name == name then return if u.defs.at(i).open then Some(i) else None
+
+    None
+end def_named
+
+// Where a definition's value is kept at run time.
+def_cell(u: *Unit, d: usize) -> usize = u.defs.at(d).at
+
+// Something other than the definition itself binds or writes this spelling, so it is a lookup again.
+//
+// **Asked of every name the compiler binds and every name it writes to**, wherever in the file --
+// `emit.sysl`'s `put` for the instructions that bind one, and the three places that claim a cell or
+// note a scope name for the bindings that have no instruction of their own.
+shadowed_name(u: *Unit, name: string)
+    for i in 0..<u.defs.len()
+        if u.defs.at(i).name == name
+            shut_def(u, i)
+            return
+end shadowed_name
+
+// The same, of every name a pattern binds. **A pattern's bindings are the ones with no instruction
+// naming them**: the matcher puts them down at run time, so nothing `put` sees says the spelling.
+shadowed_pattern(u: *Unit, pat: Pattern)
+    var names: Buf[string] = buf()
+
+    pattern_binders(pat, &names)
+
+    for i in 0..<names.len()
+        shadowed_name(u, names.at(i))
+end shadowed_pattern
+
+// Record a resolved read, so that a name shadowed further down the file can be put back.
+note_def_site(u: *Unit, chunk: usize, pc: usize, key: usize, def: usize)
+    u.def_sites.push(DefSite(chunk, pc, key, def))
+
+// Finish a file: put back every read of a name that turned out to be bound by something else, and
+// leave the table empty for the next file.
+//
+// **Every chunk of the file is complete by now**, `compile_module` having written both of its own,
+// so a site is an index into code that is standing still.
+settle_module_defs(u: *Unit)
+    for i in 0..<u.def_sites.len()
+        val site = u.def_sites.at(i)
+
+        if u.defs.at(site.def).open then continue
+
+        var c = u.chunks.at(site.chunk)
+        val old = c.code.at(site.pc)
+
+        c.code.set(site.pc, Ins(LoadName(site.key), old.at))
+        u.chunks.set(site.chunk, c)
+
+    u.def_sites.clear()
+    u.defs.clear()
+end settle_module_defs

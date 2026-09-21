@@ -1,0 +1,103 @@
+// What a name written at a file's own top level means, wherever in the file it is read.
+//
+// **A CALL OF ONE OF THESE IS RESOLVED WHILE COMPILING**, so the rule it follows is worth asking of
+// the machine rather than reading off the emitter: a definition is in scope from the first line of
+// the file, a nearer binding of the same spelling wins wherever there is one, and neither answer
+// depends on where in the file the read stands.
+
+add3(a, b, c) = a + b + c
+
+// **Reached from a function written ABOVE it**, which is what hoisting a definition means and is the
+// case a read resolved while compiling has to get right: the value is not there when the reading
+// function is compiled, and it is there before the reading function is ever called.
+early() = later(2)
+later(n) = n * 3
+
+// Each reaches the other, so neither can be resolved by having been seen already.
+isEven(n) = if n == 0 then true else isOdd(n - 1)
+isOdd(n) = if n == 0 then false else isEven(n - 1)
+
+// A definition the file ALSO uses as the spelling of a local. The read below it is compiled before
+// the local is reached, so a read resolved eagerly has to be put back to a lookup after the fact.
+picked() = "the definition"
+readsPicked() = picked()
+
+shadowsPicked() =
+    val picked = () -> "the local"
+
+    picked()
+
+// The same through a parameter, which is a binding the machine makes and no instruction names.
+named() = "the definition"
+readsNamed() = named()
+takesNamed(named) = named()
+
+// And through a pattern, whose names the matcher puts down at run time.
+grabbed() = "the definition"
+readsGrabbed() = grabbed()
+
+destructures(fns) =
+    var answer = ""
+
+    for grabbed in fns
+        answer = grabbed()
+
+    answer
+
+// A definition inside a FUNCTION is that function's and is bound where it stands.
+wraps() =
+    helper() = 7
+
+    helper() + 1
+
+// A closure reads the file's definitions through the scope it captured, which is a second way to the
+// same value and has to answer the same thing.
+doubles(n) = n * 2
+
+inLambda() =
+    val f = () -> doubles(21)
+
+    f()
+
+@test
+A_DEFINITION_IS_REACHED_FROM_A_FUNCTION_ABOVE_IT() =
+    assertEq(early(), 6)
+    assertEq(add3(1, 2, 3), 6)
+
+@test
+MUTUALLY_RECURSIVE_DEFINITIONS_REACH_EACH_OTHER() =
+    assertEq(isEven(10), true)
+    assertEq(isOdd(7), true)
+    assertEq(isEven(7), false)
+
+@test
+A_LOCAL_OF_THE_SAME_SPELLING_IS_THE_ONE_THAT_ANSWERS() =
+    assertEq(readsPicked(), "the definition")
+    assertEq(shadowsPicked(), "the local")
+
+@test
+A_PARAMETER_OF_THE_SAME_SPELLING_IS_THE_ONE_THAT_ANSWERS() =
+    assertEq(readsNamed(), "the definition")
+    assertEq(takesNamed(() -> "the argument"), "the argument")
+
+@test
+A_NAME_A_PATTERN_BOUND_IS_THE_ONE_THAT_ANSWERS() =
+    assertEq(readsGrabbed(), "the definition")
+    assertEq(destructures([() -> "the element"]), "the element")
+
+@test
+A_DEFINITION_INSIDE_A_FUNCTION_IS_THAT_FUNCTIONS_OWN() =
+    assertEq(wraps(), 8)
+
+@test
+A_CLOSURE_READS_THE_FILES_DEFINITIONS_TOO() =
+    assertEq(inLambda(), 42)
+
+@test
+A_DEFINITION_IS_A_VALUE_AND_MAY_BE_PASSED_ON() =
+    // Reading one without calling it is the same read, so it has to answer the closure rather than
+    // anything the resolution happens to be carrying.
+    val f = add3
+
+    assertEq(f(1, 2, 3), 6)
+    assertEq(map([1, 2], doubles), [2, 4])
