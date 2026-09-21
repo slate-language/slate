@@ -13,7 +13,7 @@ slate is dynamically typed. Every value is one of a fixed set of kinds, and a pr
 |---|---|---|
 | `null` | `null` | the only absence there is |
 | `boolean` | `true`, `false` | |
-| `integer` | `42`, `0xff` | 64 bits, signed, wraps |
+| `integer` | `42`, `0xff` | signed, no width — it grows rather than wrapping |
 | `real` | `3.14`, `2e10` | a double |
 | `string` | `"text"` | a sequence of **characters**, never of bytes |
 | `array` | `[1, 2]` | reference type, compares by contents |
@@ -109,16 +109,122 @@ all four at once as `<=>` — see [Objects](objects.md).
 
 ## Numbers
 
-**An integer is 64 bits and wraps**; it does not promote to a real and does not become a big integer.
+**An integer never wraps: it grows.** There is no largest integer and no smallest one, and no
+arithmetic on two integers ever answers a number other than the one it means. Python's rule, and the
+64-bit machine word is a fast path with nothing about it a program can see.
 
 ```slate
 print(9223372036854775807 + 1)
-print(1 << 40)
+print(1 << 100)
+print(pow(2, 100))
 ```
 
 ```output
--9223372036854775808
-1099511627776
+9223372036854775808
+1267650600228229401496703205376
+1267650600228229401496703205376
+```
+
+A factorial is the number rather than a remainder of it:
+
+```slate
+factorial(n)
+    var f = 1
+
+    for i in 1..n
+        f = f * i
+
+    f
+
+print(factorial(30))
+```
+
+```output
+265252859812191058636308480000000
+```
+
+**A wide integer is an integer and nothing else.** `is integer` is true of one, `==` compares the
+numbers, `string` gives the digits and a literal is read at whatever width it was written at — in
+any base, with separators if you like.
+
+```slate
+print(123456789012345678901234567890 is integer)
+print(0xffffffffffffffffffff)
+print(1_000_000_000_000_000_000_000_000)
+print((1 << 100) - (1 << 100) + 5)
+```
+
+```output
+true
+1208925819614629174706175
+1000000000000000000000000
+5
+```
+
+That last line is worth reading twice: a number that grew and came back is **the same value** as one
+that never left, so it compares equal to `5`, hashes as `5` does, and finds an entry a table holds
+under `5`. Nothing in the language distinguishes the two.
+
+**The bit operations read a value as an endless run of bits** — a non-negative number padded upward
+with zeros and a negative one with ones — which is the only reading that needs no width to
+complement within. So `~x` is `-x - 1`, `<<` grows rather than discarding, and `>>` floors toward
+negative infinity: past the top of a number it answers `-1` for a negative and `0` for anything
+else.
+
+```slate
+print(~5, -6 & 3, -6 | 3, -6 ^ 3)
+print(1 << 100 >> 99, -1 >> 200, 7 >> 200)
+```
+
+```output
+-6 2 -5 -7
+2 -1 0
+```
+
+**A shift is bounded at 16,777,216 places and `pow` at an answer of that many bits.** Neither is a
+width; they are the point at which slate says so rather than letting the allocator give up.
+
+**Where a call genuinely needs a machine integer — an array index, a `repeat` count, a byte — a
+number too wide for one is refused, and the refusal says so.**
+
+```slate
+print([1, 2, 3][pow(10, 30)])
+```
+
+```error
+an array is indexed by an integer, and this is an integer too large to fit 64 bits
+```
+
+**An integer and a real are compared exactly and their arithmetic promotes**, which is Python's rule
+and is two answers to two different questions. `big + 0.5` has no answer in the integers, so it is a
+real; `big < 0.5` has an exact answer always, and rounding the integer to a double first would make
+numbers a million apart compare equal. `1e30` is not the number `10 ^ 30` — it is the nearest double
+to it — and this says so:
+
+```slate
+print(pow(10, 30) == 1e30)
+print(pow(10, 30) < 1e30)
+print(integer(1e30))
+print(pow(10, 30) + 0.5 is real)
+```
+
+```output
+false
+true
+1000000000000000019884624838656
+true
+```
+
+**`toJSON` is the one place a wide integer has no form.** JSON's own grammar bounds a number at
+nothing, but slate's encoder holds one as 64 bits and has no way to write more; rather than round it
+into a real and hand you a document that is quietly wrong, it refuses, on both back ends.
+
+```slate
+print(toJSON({ n: pow(10, 30) }))
+```
+
+```error
+an integer wider than 64 bits has no encoding here
 ```
 
 **`/` between two integers divides towards zero** and answers an integer; `%` takes the sign of the

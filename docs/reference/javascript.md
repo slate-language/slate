@@ -28,9 +28,15 @@ than it sounds, since a test driving the interpreter says nothing whatever about
 ## The value model
 
 **An integer is a `BigInt` and a real is a `number`, and every operator goes through the runtime.** This is
-the decision everything else follows from, and it is not caution: slate's integer is 64 bits, wraps,
-divides towards zero and shifts to 63 places, and a double does none of those — nor could it be told from
+the decision everything else follows from, and it is not caution: slate's integer has no width — it grows
+rather than wrapping — and it divides towards zero, and a double does neither, nor could it be told from
 a real afterwards, so `2.5 is integer` would answer whatever the value happened to look like.
+
+**There is no wrap on this side and there used to be one.** While a slate integer was 64 bits every
+arithmetic answer here was put back through `BigInt.asIntN(64, …)`; an integer grows now, so the host's
+own `BigInt` arithmetic *is* the rule and the wrap came off. A shift and a `pow` are bounded at the same
+place the interpreter bounds them, so both hosts refuse the same call rather than one of them dying in
+its allocator.
 
 The operators follow because the two languages disagree too often for the exceptions to be worth tracking:
 

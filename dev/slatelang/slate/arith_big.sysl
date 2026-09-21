@@ -1,0 +1,418 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.math.{Float, checked_add, checked_mul, checked_sub}
+import sysl.math.bigint.{BigInt, abs as big_abs, add as big_add, and as big_and, bit_length,
+    cmp as big_cmp, div_rem, from_int as big_from_int, from_real as big_from_real, mul as big_mul,
+    negate as big_negate, not as big_not, or as big_or, pow as big_pow, shl as big_shl,
+    shr as big_shr, sub as big_sub, to_real as big_to_real, to_string as big_to_string,
+    parse as big_parse, parse_radix as big_parse_radix, xor as big_xor}
+import sysl.text.str_builder
+
+// The arms of the arithmetic where a number outgrew 64 bits.
+//
+// **A slate integer never wraps: it grows**, which is Python's rule and the user's decision. What
+// that means in the interpreter is that `+`, `-`, `*`, `<<`, `pow` and unary `-` on two `Int`s are
+// *checked* rather than plain, and where the check says the answer does not fit the operands are
+// read again as `BigInt`s and the answer comes back through `big_value` -- which normalizes, so a
+// result that fits is an `Int` again and nothing downstream sees two spellings of one number.
+//
+// **A file of its own so that `arith.sysl` stays under a thousand lines.** The seam is the width:
+// everything here is about a number that did not fit, and nothing here knows about strings, sets,
+// times or operator hooks. `int_arith` and `whole_arith` are the two names `arith.sysl` reaches.
+
+// How far a shift may move a number, in places.
+//
+// **A bound rather than Python's unbounded shift, and it is about the DIAGNOSTIC.** `1 << (10 ^ 10)`
+// asks for a gigabyte and a quarter of limbs; unbounded, what a program gets is the allocator
+// giving up somewhere far from the line that asked. Sixteen million places is two megabytes of
+// answer, which is past anything a program means and short of anything that hurts.
+const MaxShift: long = 16777216
+
+// `+`, `-`, `*`, `/`, `%`, the comparisons and the bitwise operators on two machine integers.
+//
+// **The three that can overflow are CHECKED and the overflow is not an error**: it is the signal to
+// compute the same thing again in arbitrary precision. `sysl.math`'s `checked_*` answer an `Option`
+// for exactly this caller -- its own page names "an interpreter whose own integers promote to
+// arbitrary precision when they stop fitting".
+//
+// Not `private`: `arith.sysl` dispatches to it.
+int_arith(op: Tok, x: long, y: long, at: Span) -> Step
+    op match
+        Plus -> checked_add(x, y) match
+            Some(n) -> Ok(Int(n))
+            None -> Ok(big_value(big_add(big_from_int(x), big_from_int(y))))
+        Minus -> checked_sub(x, y) match
+            Some(n) -> Ok(Int(n))
+            None -> Ok(big_value(big_sub(big_from_int(x), big_from_int(y))))
+        Star -> checked_mul(x, y) match
+            Some(n) -> Ok(Int(n))
+            None -> Ok(big_value(big_mul(big_from_int(x), big_from_int(y))))
+
+        // **A division of two machine integers overflows at exactly one pair.** The most negative
+        // `long` over `-1` is one past the largest positive, and on the hardware it traps rather
+        // than wrapping -- so it is answered before anything divides, and the answer grows.
+        Slash ->
+            if y == 0 then return fault(at, "this divides by zero")
+            if x == LeastLong && y == -1 then return Ok(big_value(big_negate(big_from_int(x))))
+
+            Ok(Int(x / y))
+
+        // The same pair, and the remainder of it is zero -- which is worth answering here rather
+        // than letting the hardware trap working out a quotient nobody asked for.
+        Percent ->
+            if y == 0 then return fault(at, "this takes a remainder by zero")
+            if x == LeastLong && y == -1 then return Ok(Int(0))
+
+            Ok(Int(x % y))
+        Lt -> Ok(Bool(x < y))
+        LtEq -> Ok(Bool(x <= y))
+        Gt -> Ok(Bool(x > y))
+        GtEq -> Ok(Bool(x >= y))
+
+        // **The bitwise operators are integers only**, which needs no rule of its own: they are here
+        // and nowhere else, so a real reaching one falls through to the sentence naming both sides.
+        Amp -> Ok(Int(x & y))
+        Pipe -> Ok(Int(x | y))
+        Caret -> Ok(Int(x ^ y))
+
+        // **`<<` GROWS, WHICH IS THE WHOLE POINT OF THE TYPE.** `1 << 100` is `2 ^ 100` exactly,
+        // where it used to be a refusal about a shift being "by 0 to 63 places". The fast path is
+        // the standard overflow test -- shift it back and see whether the number is still there --
+        // and everything else is arbitrary precision.
+        Shl -> shift_left(x, y, at)
+
+        // **`>>` FLOORS TOWARD NEGATIVE INFINITY AND HAS NO UPPER BOUND.** A shift past the width
+        // is not a mistake now that there is no width: it drags the sign down, so a negative
+        // answers `-1` and everything else `0`. That agrees with the big-integer arm beside it and
+        // with `div_floor`.
+        Shr ->
+            if y < 0 then return fault(at, s"a shift is by a number of places that is not negative, and this is by ${y}")
+
+            Ok(Int(if y > 63 then x >> 63 else x >> y))
+        _ -> fault(at, "this is not an arithmetic operator")
+end int_arith
+
+// The most negative `long`, written as a subtraction because the literal itself does not fit a
+// positive one. Not `private`: `number.sysl` answers `abs` and `integer` about it.
+const LeastLong: long = -9223372036854775807 - 1
+
+private shift_left(x: long, y: long, at: Span) -> Step
+    if y < 0 then return fault(at, s"a shift is by a number of places that is not negative, and this is by ${y}")
+    if x == 0 then return Ok(Int(0))
+
+    if y < 63
+        val moved = x << y
+
+        if moved >> y == x then return Ok(Int(moved))
+
+    grown_shift(big_from_int(x), y, at)
+end shift_left
+
+private grown_shift(x: BigInt, y: long, at: Span) -> Step
+    if y > MaxShift
+        return fault(at, s"a shift by ${y} places would build a number of ${y} bits, and slate stops at ${MaxShift}")
+
+    Ok(big_value(big_shl(x, usize(y))))
+end grown_shift
+
+// `+`, `-`, `*`, `/`, `%`, the comparisons and the bitwise operators where at least one side is a
+// big integer.
+//
+// **The bit operations read a value as infinitely wide two's complement**, which is Python's
+// reading and `sysl.math.bigint`'s: a non-negative number is padded upward with zeros and a
+// negative one with ones. So `~5` is `-6` and `(-6) & 3` is `2`, at every width and at none.
+//
+// Not `private`: `arith.sysl` dispatches to it.
+big_arith(op: Tok, a: Value, b: Value, at: Span) -> Step
+    val x = as_big(a)
+
+    // **The shift count is read as a MACHINE integer and not as a big one**, which needs no arm of
+    // its own: `MaxShift` refuses anything that would not fit one long before the question arises,
+    // and a big count falls through to the sentence `type_name` writes about a number too wide.
+    if op == Shl || op == Shr
+        val y = b match
+            Int(n) -> n
+            _ -> return fault(at, s"a shift is by a whole number of places, and this is ${b.type_name()}")
+
+        if y < 0 then return fault(at, s"a shift is by a number of places that is not negative, and this is by ${y}")
+        if op == Shl then return grown_shift(x, y, at)
+        if y > MaxShift then return Ok(big_value(big_shr(x, usize(MaxShift))))
+
+        return Ok(big_value(big_shr(x, usize(y))))
+
+    val y = as_big(b)
+
+    op match
+        Plus -> Ok(big_value(big_add(x, y)))
+        Minus -> Ok(big_value(big_sub(x, y)))
+        Star -> Ok(big_value(big_mul(x, y)))
+
+        // **Division truncates toward zero and the remainder takes the dividend's sign**, which is
+        // what `/` and `%` already mean on two machine integers here. `div_rem` is that rounding;
+        // `div_rem_floor` beside it is Python's and is deliberately not what these two operators
+        // are.
+        Slash ->
+            if y.is_zero() then return fault(at, "this divides by zero")
+
+            Ok(big_value(div_rem(x, y).0))
+        Percent ->
+            if y.is_zero() then return fault(at, "this takes a remainder by zero")
+
+            Ok(big_value(div_rem(x, y).1))
+        Lt -> Ok(Bool(big_cmp(x, y) < 0))
+        LtEq -> Ok(Bool(big_cmp(x, y) <= 0))
+        Gt -> Ok(Bool(big_cmp(x, y) > 0))
+        GtEq -> Ok(Bool(big_cmp(x, y) >= 0))
+        Amp -> Ok(big_value(big_and(x, y)))
+        Pipe -> Ok(big_value(big_or(x, y)))
+        Caret -> Ok(big_value(big_xor(x, y)))
+        _ -> fault(at, "this is not an arithmetic operator")
+end big_arith
+
+// A big integer and a real, which is arithmetic through the real and comparison through neither.
+//
+// **THE ARITHMETIC PROMOTES AND THE COMPARISON DOES NOT, WHICH IS PYTHON'S RULE AND IS NOT AN
+// INCONSISTENCY.** `big + 0.5` has no answer in the integers, so the only thing it can be is a
+// real; `big < 0.5` has an exact answer always, and rounding the integer to a double first would
+// make two numbers a million apart compare equal. Python draws the line in exactly this place.
+//
+// Not `private`: `arith.sysl` dispatches to it.
+big_real_arith(op: Tok, a: Value, b: Value, at: Span) -> Step
+    if orders_or_equals(op)
+        val flipped = a match
+            Real(_) -> true
+            _ -> false
+
+        val big = if flipped then as_big(b) else as_big(a)
+
+        val r = if flipped then
+            a match
+                Real(v) -> v
+                _ -> 0.0
+        else
+            b match
+                Real(v) -> v
+                _ -> 0.0
+
+        big_cmp_real(big, r) match
+            // **A NaN is unordered and every comparison against one is false**, which is what a real
+            // against a real already answers and is IEEE's rule.
+            None -> return Ok(Bool(false))
+            Some(c) ->
+                val d = if flipped then -c else c
+
+                return Ok(Bool(op match
+                    Lt -> d < 0
+                    LtEq -> d <= 0
+                    Gt -> d > 0
+                    _ -> d >= 0))
+
+    val x = real_of_value(a)
+    val y = real_of_value(b)
+
+    real_arith(op, x, y, at)
+end big_real_arith
+
+private orders_or_equals(op: Tok) -> bool = op == Lt || op == LtEq || op == Gt || op == GtEq
+
+private real_of_value(v: Value) -> real = v match
+    Real(x) -> x
+    Int(n) -> real(n)
+    Big(p) -> big_to_real(p.n)
+    _ -> 0.0
+
+// Whether a big integer is below, at or above a real -- exactly, and `None` for a NaN.
+//
+// **Three cases and the third is the only interesting one.** An infinity is above or below
+// everything finite. A finite real converts exactly with `from_real`, which TRUNCATES toward zero
+// -- so where the integer equals that truncation the fraction that was thrown away is what decides,
+// and its sign is the answer.
+//
+// Not `private`: `arith.sysl` compares a big integer with a real in `==` too.
+big_cmp_real(x: BigInt, r: real) -> Option[int]
+    if r != r then return None
+    if r.is_infinite() then return Some(if r > 0.0 then -1 else 1)
+
+    val whole = big_from_real(r) match
+        Some(n) -> n
+        None -> return None
+
+    val c = big_cmp(x, whole)
+
+    if c != 0 then return Some(c)
+
+    val frac = r - r.trunc()
+
+    Some(if frac > 0.0 then -1 elif frac < 0.0 then 1 else 0)
+end big_cmp_real
+
+// Whether two big integers are the same number.
+//
+// **A comparison and not a pointer test**, two cells holding one number being two cells: nothing
+// interns a big integer, and `4 * big` computed twice is two objects.
+//
+// Not `private`: `arith.sysl`'s `==` and its literal patterns both ask it.
+big_same(a: BigInt, b: BigInt) -> bool = big_cmp(a, b) == 0
+
+// Whether a big integer and a real are the same number.
+//
+// Not `private`: `arith.sysl`'s `==` and `same_literal` both ask it.
+big_eq_real(x: BigInt, r: real) -> bool = big_cmp_real(x, r) match
+    Some(c) -> c == 0
+    None -> false
+
+// -- literals -----------------------------------------------------------------------------------
+
+// The digits of a whole literal, with its separators taken out and its base written as a pair.
+//
+// **The parser reads a number twice and this is the second read.** `read_number` in
+// `sh.sysl.parsing` accumulates into a `u64` and says `Overflow` where the run does not fit -- and
+// a value that DOES fit a `u64` but not a `long` is the same case wearing a different hat, since a
+// slate literal is unsigned and the `-` in front of one is an operator. Both land here, which is
+// why this takes the literal's own text rather than anything the first read produced.
+//
+// **`parse_radix` takes an optional sign and digits and nothing else**, which its own page says is
+// deliberate: what a document permits is the document's business, and stripping is one call before
+// it. This is that call.
+//
+// Not `private`: `expr.sysl` and `pattern.sysl` each read a literal.
+big_literal(text: string) -> Option[BigInt]
+    val bytes = text.bytes
+    var base = 10
+    var from: usize = 0
+
+    if bytes.len >= 2 && bytes[0] == u8('0')
+        val mark = bytes[1]
+
+        if mark == u8('x') || mark == u8('X')
+            base = 16
+            from = 2
+        elif mark == u8('o') || mark == u8('O')
+            base = 8
+            from = 2
+        elif mark == u8('b') || mark == u8('B')
+            base = 2
+            from = 2
+
+    var digits = str_builder()
+
+    // Every byte of a whole literal is ASCII -- a digit, a letter of a radix, a sign or a
+    // separator -- so one byte is one character and `char` of it is that character.
+    for i in from..<bytes.len
+        if bytes[i] != u8('_') then digits.push_char(char(bytes[i]))
+
+    big_parse_radix(digits.finish(), base)
+end big_literal
+
+// Whether a value equals the number a `BigPat`'s digits spell.
+//
+// **It covers the normalized case too**, which is what makes `-9223372036854775808` a pattern that
+// matches: those digits name a number that fits a `long`, so the value it matches is an `Int`.
+//
+// Not `private`: `match.sysl` is where a pattern meets a value.
+big_pat_matches(v: Value, digits: string) -> bool
+    val n = big_parse(digits) match
+        Some(x) -> x
+        None -> return false
+
+    n.to_long() match
+        Some(small) -> return same_literal(v, Int(small))
+        None -> ()
+
+    v match
+        Big(p) -> big_same(p.n, n)
+        Real(x) -> big_eq_real(n, x)
+        _ -> false
+end big_pat_matches
+
+// The digits a `BigLit` carries, which is what the unit is asked to intern.
+//
+// **A big literal that came back as something inside 64 bits is a mistake upstream and not a case
+// to handle**, the two node kinds being decided by the very read that produced this.
+//
+// Not `private`: `expr.sysl` and `pattern.sysl` both build one.
+big_literal_digits(text: string) -> string = big_literal(text) match
+    Some(n) -> big_to_string(n)
+    None -> "0"
+
+// -- the named arithmetic ---------------------------------------------------------------------------
+
+// `-x`, which grows at exactly one value: the most negative `long` has no positive twin.
+//
+// Not `private`: `runtime.sysl` reads the prefix operators.
+negated_value(v: Value, at: Span) -> Option[Step] = v match
+    Int(n) -> Some(if n == LeastLong then Ok(big_value(big_negate(big_from_int(n)))) else Ok(Int(-n)))
+    Big(p) -> Some(Ok(big_value(big_negate(p.n))))
+    Real(x) -> Some(Ok(Real(-x)))
+    _ -> None
+
+// `~x`, which cannot grow: inverting an endless run of bits is `-x - 1`, and that is one smaller in
+// magnitude for a positive and one larger for a negative -- never past the width it started at.
+//
+// Not `private`: `runtime.sysl` reads the prefix operators.
+complemented_value(v: Value) -> Option[Value] = v match
+    Int(n) -> Some(Int(~n))
+    Big(p) -> Some(big_value(big_not(p.n)))
+    _ -> None
+
+// `abs(x)`, which grows at the same one value `-x` does.
+//
+// Not `private`: `number.sysl` is where `abs` is registered.
+absolute_value(v: Value) -> Option[Value] = v match
+    Int(n) -> Some(if n == LeastLong then big_value(big_negate(big_from_int(n))) else Int(if n < 0 then -n else n))
+    Big(p) -> Some(big_value(big_abs(p.n)))
+    Real(x) -> Some(Real(x.abs()))
+    _ -> None
+
+// `pow(base, e)` where both are whole and the exponent is not negative.
+//
+// **It grows rather than wrapping, which is what makes `pow(2, 100)` the number and not a remainder
+// of it.** The machine path squares with `checked_mul` and gives up to the big path at the first
+// product that does not fit, so an answer inside 64 bits costs no allocation at all.
+//
+// Not `private`: `number.sysl` is where `pow` is registered.
+whole_pow_value(base: Value, e: long, at: Span) -> Step
+    base match
+        Int(b) -> checked_whole_pow(b, e) match
+            Some(n) -> return Ok(Int(n))
+            None -> ()
+        _ -> ()
+
+    val x = as_big(base)
+
+    // **The size is bounded before anything is multiplied**, for `MaxShift`'s reason: `pow(10, 10 ^ 9)`
+    // is a number with a billion digits, and the allocator giving up is not a diagnostic.
+    val bits = bit_length(x)
+
+    if bits > 1 && long(bits) * e > MaxShift
+        return fault(at, s"`pow` would build a number of about ${long(bits) * e} bits, and slate stops at ${MaxShift}")
+
+    Ok(big_value(big_pow(x, usize(e))))
+end whole_pow_value
+
+// `base ^ e` in machine integers, or nothing where it does not fit one.
+//
+// **Squaring rather than `a.pow(b)` through a real**, which is the rule this had before big
+// integers landed and is still right: a double's 53 bits of mantissa round `pow(3, 40)` silently.
+private checked_whole_pow(base: long, e: long) -> Option[long]
+    var result: long = 1
+    var b = base
+    var n = e
+
+    loop
+        if n == 0 then return Some(result)
+
+        if n % 2 == 1
+            result = checked_mul(result, b) match
+                Some(v) -> v
+                None -> return None
+
+        n = n / 2
+
+        if n == 0 then return Some(result)
+
+        b = checked_mul(b, b) match
+            Some(v) -> v
+            None -> return None
+end checked_whole_pow

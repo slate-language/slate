@@ -3,6 +3,8 @@ module dev.slatelang.slate
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.math.{Float, min, max, pi, e as euler}
+import sysl.math.bigint.{from_real as big_from_real, parse as big_parse, to_real as big_to_real,
+    to_string as big_to_string}
 // **`random()`'s generator and its one seed.** `sysl.rand` is PCG32 and says of itself that it is
 // not a source of unpredictability, which is exactly what `random()` promises a program; the seed
 // comes from the kernel through `sysl.posix.rand`, the same `getentropy(2)` that `slate:crypto`'s
@@ -32,6 +34,7 @@ do_number(args: Args, at: Span) -> Step
 
     args.at(0) match
         Int(n) -> return Ok(Int(n))
+        Big(p) -> return Ok(Big(p))
         Real(x) -> return Ok(Real(x))
         _ -> ()
 
@@ -45,6 +48,14 @@ do_number(args: Args, at: Span) -> Step
             return Ok(if n == 0 && s.starts_with("-") then Real(-0.0) else Int(n))
         Err(_) -> ()
 
+    // **A run of digits too wide for a `long` is a whole number and not a real**, which is the same
+    // rule the line above keeps: `number("3")` is an integer because it was written as one, and
+    // thirty digits are written as one too. It is asked before `parse_real`, which would read them
+    // and round.
+    big_parse(s) match
+        Some(n) -> return Ok(big_value(n))
+        None -> ()
+
     parse_real(s) match
         Ok(x) -> Ok(Real(x))
         Err(_) -> Ok(Null)
@@ -56,7 +67,18 @@ do_integer(args: Args, at: Span) -> Step
 
     args.at(0) match
         Int(n) -> Ok(Int(n))
-        Real(x) -> Ok(Int(long(x.trunc())))
+        Big(p) -> Ok(Big(p))
+
+        // **A real too large for a `long` grows rather than saturating**, so `integer(1e30)` is the
+        // number that double actually holds -- which is `1000000000000000019884624838656` and not
+        // `10 ^ 30`, `from_real` being exact about where it is not exact. Python's `int(1e30)` says
+        // the same digits. An infinity and a NaN have no integer at all and say so.
+        Real(x) ->
+            if real(long(x.trunc())) == x.trunc() then return Ok(Int(long(x.trunc())))
+
+            big_from_real(x) match
+                Some(n) -> Ok(big_value(n))
+                None -> fault(at, s"`integer` takes a number with an integer in it, and this is ${real_text(x)}")
         other -> fault(at, s"`integer` takes a number, and this is ${other.type_name()} -- `number` is what reads one out of a string")
 
 // `real(x)` -- a number as a real, whatever it was written as.
@@ -65,6 +87,11 @@ do_real(args: Args, at: Span) -> Step
 
     args.at(0) match
         Int(n) -> Ok(Real(real(n)))
+
+        // **Correctly rounded, to nearest with ties to even** -- `sysl.math.bigint`'s `to_real`,
+        // which is the same rule the hardware applies to every arithmetic result. A number past
+        // what a double can hold becomes an infinity, as it does in Python.
+        Big(p) -> Ok(Real(big_to_real(p.n)))
         Real(x) -> Ok(Real(x))
         other -> fault(at, s"`real` takes a number, and this is ${other.type_name()}")
 
@@ -76,6 +103,9 @@ do_round(args: Args, at: Span, which: usize) -> Step
 
     args.at(0) match
         Int(n) -> Ok(Int(n))
+
+        // A big integer is already whole, exactly as a machine one is.
+        Big(p) -> Ok(Big(p))
         Real(x) ->
             val r = if which == 0 then x.floor() elif which == 1 then x.ceil() elif which == 2 then x.round() else x.trunc()
 
@@ -86,10 +116,12 @@ end do_round
 do_abs(args: Args, at: Span) -> Step
     wants(args, 1, at, "abs", "one number")?
 
-    args.at(0) match
-        Int(n) -> Ok(Int(if n < 0 then -n else n))
-        Real(x) -> Ok(Real(x.abs()))
-        other -> fault(at, s"`abs` takes a number, and this is ${other.type_name()}")
+    // **`abs` grows at exactly one value**: the most negative `long` has no positive twin, so
+    // `abs(-9223372036854775808)` is a big integer. `arith_big.sysl` owns that answer, negation
+    // being the same arithmetic.
+    absolute_value(args.at(0)) match
+        Some(v) -> Ok(v)
+        None -> fault(at, s"`abs` takes a number, and this is ${args.at(0).type_name()}")
 
 do_sqrt(args: Args, at: Span) -> Step
     wants(args, 1, at, "sqrt", "one number")?
@@ -154,13 +186,14 @@ do_pow(args: Args, at: Span) -> Step
     val a = number_of(args.at(0), at, "pow")?
     val b = number_of(args.at(1), at, "pow")?
 
-    args.at(0) match
-        Int(base) ->
-            args.at(1) match
-                Int(e) ->
-                    if e >= 0 then return Ok(Int(whole_pow(base, e)))
-                other -> ()
-        other -> ()
+    // **A whole base to a whole exponent GROWS**, so `pow(2, 100)` is the number and not a
+    // remainder of it. The exponent is the one side that cannot stay whole -- `pow(2, -1)` is a
+    // half -- so a negative one falls through to the reals.
+    if whole_value(args.at(0))
+        args.at(1) match
+            Int(e) ->
+                if e >= 0 then return whole_pow_value(args.at(0), e, at)
+            _ -> ()
 
     Ok(Real(a.pow(b)))
 end do_pow
@@ -310,20 +343,8 @@ do_hypot(args: Args, at: Span) -> Step
     Ok(Real(a.hypot(b)))
 end do_hypot
 
-// `base` multiplied by itself `e` times, by squaring, for an exponent that is not negative.
-private whole_pow(base: long, e: long) -> long
-    var result: long = 1
-    var factor = base
-    var n = e
-
-    while n > 0
-        if n % 2 == 1 then result = result * factor
-
-        factor = factor * factor
-        n = n / 2
-
-    result
-end whole_pow
+// **`whole_pow` IS `arith_big.sysl`'s NOW**, squaring with `checked_mul` and growing where a product
+// does not fit, since an integer that wraps is exactly what this release took out of the language.
 
 // `min(a, b, ...)` and `max(a, b, ...)`, over as many as are given.
 //
@@ -335,12 +356,29 @@ do_extreme(args: Args, at: Span, smallest: bool) -> Step
     if args.len() == 0 then return fault(at, s"`${name}` takes at least one number and was given none")
 
     var whole = true
+    var any_big = false
 
     for i in 0..<args.len()
         args.at(i) match
             Int(_) -> ()
+            Big(_) -> any_big = true
             Real(_) -> whole = false
             other -> return fault(at, s"`${name}` takes numbers, and one of these is ${other.type_name()}")
+
+    // **WHERE ONE SIDE HAS OUTGROWN 64 BITS THE WINNER IS CHOSEN BY COMPARING THE VALUES**, not by
+    // folding them through a double: `min(pow(10, 30), pow(10, 30) + 1)` are one number as reals,
+    // and answering either would be answering a coin toss. `arith` is the one comparison in the
+    // language and it is exact in every mixture.
+    //
+    // **The answer is always one of the arguments, which is what keeps it rooted**: every one of
+    // them is standing on the operand stack for the length of the call.
+    if any_big
+        var best = args.at(0)
+
+        for i in 1..<args.len()
+            if arith(if smallest then Lt else Gt, args.at(i), best, at)?.truthy() then best = args.at(i)
+
+        return Ok(best)
 
     var best = number_of(args.at(0), at, name)?
 
@@ -356,6 +394,12 @@ end do_extreme
 private number_of(v: Value, at: Span, name: string) -> Result[real, Signal]
     v match
         Int(n) -> Ok(real(n))
+
+        // **A big integer converts and does not refuse**, `sqrt` and `log` of one being ordinary
+        // questions whose answer was never going to be exact. `to_real` is correctly rounded, and
+        // a number past what a double holds becomes an infinity rather than a fault -- which is
+        // what every one of these functions already answers for an overflowing real.
+        Big(p) -> Ok(big_to_real(p.n))
         Real(x) -> Ok(x)
         other -> Err(failure(at, s"`${name}` takes a number, and this is ${other.type_name()}"))
 
@@ -418,6 +462,21 @@ do_to_fixed(args: Args, at: Span) -> Step
             var b = str_builder()
 
             b.push_int(n)
+
+            if places > 0
+                b.push_char('.')
+                b.push(repeat("0", places))
+
+            Ok(str_value(b.finish()))
+
+        // **The same arm, and for the reason the integer one exists**: a whole number is written
+        // out rather than measured, so the digits are the answer and the places are zeros after
+        // them. `FixedLimit` is a fact about a `real` and does not bind here -- a big integer has
+        // every one of its digits and there is no exponent to fall back to.
+        Big(p) ->
+            var b = str_builder()
+
+            b.push(big_to_string(p.n))
 
             if places > 0
                 b.push_char('.')
@@ -509,6 +568,9 @@ do_format_number(args: Args, at: Span) -> Step
 
             b.push_int(n)
             b.finish()
+
+        // A whole number of any width has one written form, which is what this takes.
+        Big(p) -> big_to_string(p.n)
         Real(_) -> return fault(at, "`formatNumber` groups a whole number or the text `toFixed` answered -- a real has no one written form, `string` giving the shortest text that reads back, so say how many places you want with `toFixed(x, 2)`")
         Str(p) -> p.s
         other -> return fault(at, s"`formatNumber` takes a number, and this is ${other.type_name()}")

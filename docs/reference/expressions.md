@@ -50,7 +50,9 @@ binding power: `map(xs, _ * 2)` is `map(xs, n -> n * 2)`. See
 `+ - * / %` over integers and reals; see [Values](values.md) for what `/` does between two integers.
 `+` on two strings concatenates.
 
-`| ^ & ~` and the shifts `<< >>` work on 64-bit integers.
+`| ^ & ~` and the shifts `<< >>` work on integers, of any width — they read a value as an endless
+run of two's-complement bits, so `~x` is `-x - 1`, `<<` grows and `>>` floors. See
+[Values](values.md).
 
 ## Comparison
 

@@ -198,8 +198,11 @@ text interpolated it
 An integer may be written in hexadecimal, binary or octal, and `_` may be written between digits of
 any of them.
 
-**Integers and reals are separate values**, not one numeric type. An integer is 64 bits, wraps, and
-divides towards zero.
+**An integer literal has no width**, so a run of digits is read as the number it spells however many
+of them there are — in any of those bases, separators and all.
+
+**Integers and reals are separate values**, not one numeric type. An integer never wraps: it grows.
+It divides towards zero, and `%` takes the sign of the left operand.
 
 Every comma list takes a **trailing comma**: an array, an object, an argument list, a parameter list.
 
