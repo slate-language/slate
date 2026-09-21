@@ -198,6 +198,221 @@ private call_one(f: Value, v: Value, at: Span, name: string) -> Step
     one.push(v)
     apply_callback(f, one, at, name)
 
+// -- set algebra ----------------------------------------------------------------------------------
+
+// **Every member of a set, materialised before anything is written**, which is `walked_values`' rule
+// and is here for a second reason on top of its one: asking a table whether it holds a key runs a
+// class's own `hash` and `==` where it wrote them, so slate runs while this walk is standing in the
+// entries -- and a walk holding an index into a buffer another thing may grow is a walk reading the
+// wrong entry. The values are reachable from the set the caller is holding, so the list roots
+// nothing itself.
+private members(t: *ObjectObj) -> Buf[Value]
+    var out: Buf[Value] = buf()
+
+    for i in 0..<t.entries.len()
+        val e = t.entries.at(i)
+
+        if !e.dead then out.push(e.key)
+
+    out
+end members
+
+// Which of the four a call is building. Named for the set operation rather than for the operator, a
+// spelling being what `union` and `|` have in common and not what either one is.
+private enum Combine
+    SetUnion
+    SetIntersection
+    SetDifference
+    SetSymmetric
+
+// A new set holding what the two make together, with neither side touched.
+//
+// **`hold` between a mark and its release**, which is `do_set_new`'s arrangement and is needed for
+// its reason: the answer is a `Value` in a sysl local, which is not a root, and a key comparison may
+// run a class's own `hash` -- so the collector gets its chance while this is only half filled.
+private combined(x: *ObjectObj, y: *ObjectObj, how: Combine, at: Span) -> Step
+    val mark = root_mark()
+    val t = new_object()
+    val made = SetVal(t)
+
+    hold(made)
+
+    val out = fill_combined(t, x, y, how, at)
+
+    release(mark)
+
+    out match
+        Ok(_) -> Ok(made)
+        Err(e) -> Err(e)
+end combined
+
+// **The receiver's members first and the argument's after them**, which is the order JavaScript's
+// own `union` answers in and the only one a reader can predict: a set walks in the order things went
+// into it, so an answer built from two of them walks the left one first.
+//
+// **An intersection walks the RECEIVER too**, where JavaScript walks whichever of the two is smaller
+// and lets that decide the order. What it buys there is a comparison count and what it costs is an
+// answer whose order depends on a size nobody wrote down.
+private fill_combined(t: *ObjectObj, x: *ObjectObj, y: *ObjectObj, how: Combine, at: Span) -> Result[unit, Signal]
+    val xs = members(x)
+
+    how match
+        SetUnion ->
+            val ys = members(y)
+
+            for i in 0..<xs.len()
+                obj_put(t, xs.at(i), Null, at)?
+
+            for i in 0..<ys.len()
+                obj_put(t, ys.at(i), Null, at)?
+        SetIntersection ->
+            for i in 0..<xs.len()
+                if obj_has(y, xs.at(i), at)? then obj_put(t, xs.at(i), Null, at)?
+        SetDifference ->
+            for i in 0..<xs.len()
+                if !obj_has(y, xs.at(i), at)? then obj_put(t, xs.at(i), Null, at)?
+        SetSymmetric ->
+            val ys = members(y)
+
+            for i in 0..<xs.len()
+                if !obj_has(y, xs.at(i), at)? then obj_put(t, xs.at(i), Null, at)?
+
+            for i in 0..<ys.len()
+                if !obj_has(x, ys.at(i), at)? then obj_put(t, ys.at(i), Null, at)?
+
+    Ok(())
+end fill_combined
+
+// Whether every member of `x` is a member of `y`.
+private contained(x: *ObjectObj, y: *ObjectObj, at: Span) -> Result[bool, Signal]
+    val xs = members(x)
+
+    for i in 0..<xs.len()
+        if !obj_has(y, xs.at(i), at)? then return Ok(false)
+
+    Ok(true)
+end contained
+
+// Whether the two share nothing at all.
+private apart(x: *ObjectObj, y: *ObjectObj, at: Span) -> Result[bool, Signal]
+    val xs = members(x)
+
+    for i in 0..<xs.len()
+        if obj_has(y, xs.at(i), at)? then return Ok(false)
+
+    Ok(true)
+end apart
+
+// The two sets a call works over, or the complaint naming whichever side is not one.
+private both_sets(args: Args, at: Span, name: string) -> Result[unit, Signal]
+    takes_n(args, 2, at, name, "two sets")?
+    set_of(args.at(0), at, name)?
+    set_of(args.at(1), at, name)?
+    Ok(())
+
+// `union(a, b)`, `intersection(a, b)`, `difference(a, b)` and `symmetricDifference(a, b)` -- each a
+// NEW set, leaving both of the sets it was given exactly as they were.
+//
+// **ECMAScript's names**, which slate takes wherever the choice is arbitrary: a reader who has met
+// `Set.prototype.union` in JavaScript has met this one, and the alternative spellings (`plus`, `or`,
+// `intersect`) would each be a word to learn for nothing.
+do_set_union(args: Args, at: Span) -> Step
+    both_sets(args, at, "union")?
+
+    combined(set_of(args.at(0), at, "union")?, set_of(args.at(1), at, "union")?, SetUnion, at)
+
+do_set_intersection(args: Args, at: Span) -> Step
+    both_sets(args, at, "intersection")?
+
+    combined(set_of(args.at(0), at, "intersection")?, set_of(args.at(1), at, "intersection")?, SetIntersection, at)
+
+do_set_difference(args: Args, at: Span) -> Step
+    both_sets(args, at, "difference")?
+
+    combined(set_of(args.at(0), at, "difference")?, set_of(args.at(1), at, "difference")?, SetDifference, at)
+
+do_set_symmetric_difference(args: Args, at: Span) -> Step
+    both_sets(args, at, "symmetricDifference")?
+
+    combined(set_of(args.at(0), at, "symmetricDifference")?, set_of(args.at(1), at, "symmetricDifference")?,
+        SetSymmetric, at)
+
+// `isSubsetOf(a, b)`, `isSupersetOf(a, b)` and `isDisjointFrom(a, b)` -- the three questions two sets
+// answer with a boolean.
+//
+// **A set is a subset of itself**, which is what the mathematics says and what `⊆` means; `a < b`
+// below is the strict reading for a program that wants the other one.
+do_set_is_subset_of(args: Args, at: Span) -> Step
+    both_sets(args, at, "isSubsetOf")?
+
+    Ok(Bool(contained(set_of(args.at(0), at, "isSubsetOf")?, set_of(args.at(1), at, "isSubsetOf")?, at)?))
+
+do_set_is_superset_of(args: Args, at: Span) -> Step
+    both_sets(args, at, "isSupersetOf")?
+
+    Ok(Bool(contained(set_of(args.at(1), at, "isSupersetOf")?, set_of(args.at(0), at, "isSupersetOf")?, at)?))
+
+do_set_is_disjoint_from(args: Args, at: Span) -> Step
+    both_sets(args, at, "isDisjointFrom")?
+
+    Ok(Bool(apart(set_of(args.at(0), at, "isDisjointFrom")?, set_of(args.at(1), at, "isDisjointFrom")?, at)?))
+
+// What an operator means where both of its operands are sets.
+//
+// **Python's spelling, and each one is a method above under another name** -- `|` a union, `&` an
+// intersection, `-` a difference, `^` a symmetric difference, `<=` a subset and `<` a strict one. The
+// operators are worth having beside the words because set algebra is the one place a program writes
+// several of them in a line, where `a.union(b).difference(c)` is a sentence to unpick.
+//
+// **Both operands are HELD, the machine having popped them off the stack before an operator runs** --
+// so nothing else names them while a key comparison runs a class's own `hash` and the collector takes
+// its chance.
+//
+// Not `private`: `arith.sysl` tries this where neither the numbers nor the strings nor the calendar
+// answered.
+set_arith(op: Tok, a: Value, b: Value, at: Span) -> Option[Step]
+    val x = a match
+        SetVal(t) -> t
+        _ -> return None
+
+    val y = b match
+        SetVal(t) -> t
+        _ -> return None
+
+    val mark = root_mark()
+
+    hold(a)
+    hold(b)
+
+    val out = set_operator(op, x, y, at)
+
+    release(mark)
+    out
+end set_arith
+
+private set_operator(op: Tok, x: *ObjectObj, y: *ObjectObj, at: Span) -> Option[Step]
+    op match
+        Pipe -> Some(combined(x, y, SetUnion, at))
+        Amp -> Some(combined(x, y, SetIntersection, at))
+        Minus -> Some(combined(x, y, SetDifference, at))
+        Caret -> Some(combined(x, y, SetSymmetric, at))
+        LtEq -> Some(within(x, y, false, at))
+        GtEq -> Some(within(y, x, false, at))
+        Lt -> Some(within(x, y, true, at))
+        Gt -> Some(within(y, x, true, at))
+        _ -> None
+end set_operator
+
+// Whether `x` is contained in `y`, strictly where a program wrote `<` or `>`.
+//
+// **A strict containment is the plain one plus a smaller size**, which is exact rather than a
+// shortcut: a set holds each member once, so a subset the same size as its superset is that
+// superset.
+private within(x: *ObjectObj, y: *ObjectObj, strict: bool, at: Span) -> Step
+    if strict && live_count(x) >= live_count(y) then return Ok(Bool(false))
+
+    Ok(Bool(contained(x, y, at)?))
+
 // -- maps -----------------------------------------------------------------------------------------
 
 // `Map()` and `Map(pairs)`.
@@ -356,6 +571,13 @@ var n_set_clear: NativeFn = 0
 var n_set_size: NativeFn = 0
 var n_set_values: NativeFn = 0
 var n_set_for_each: NativeFn = 0
+var n_set_union: NativeFn = 0
+var n_set_intersection: NativeFn = 0
+var n_set_difference: NativeFn = 0
+var n_set_symmetric_difference: NativeFn = 0
+var n_set_is_subset_of: NativeFn = 0
+var n_set_is_superset_of: NativeFn = 0
+var n_set_is_disjoint_from: NativeFn = 0
 
 var n_map_new: NativeFn = 0
 var n_map_set: NativeFn = 0
@@ -378,6 +600,13 @@ install_setmap(env: *EnvObj)
     n_set_size = register("Set.size", do_set_size)
     n_set_values = register("Set.values", do_set_values)
     n_set_for_each = register("Set.forEach", do_set_for_each)
+    n_set_union = register("Set.union", do_set_union)
+    n_set_intersection = register("Set.intersection", do_set_intersection)
+    n_set_difference = register("Set.difference", do_set_difference)
+    n_set_symmetric_difference = register("Set.symmetricDifference", do_set_symmetric_difference)
+    n_set_is_subset_of = register("Set.isSubsetOf", do_set_is_subset_of)
+    n_set_is_superset_of = register("Set.isSupersetOf", do_set_is_superset_of)
+    n_set_is_disjoint_from = register("Set.isDisjointFrom", do_set_is_disjoint_from)
 
     n_map_new = register("Map", do_map_new)
     n_map_set = register("Map.set", do_map_set)

@@ -97,6 +97,13 @@ Writing `==` and leaving `hash` out is not refused — it is the rule
 | `s.clear()` | removes everything |
 | `s.values()` | the members, as an array |
 | `s.forEach(f)` | calls `f` on each member |
+| `s.union(o)` | a new set holding what is in either |
+| `s.intersection(o)` | a new set holding what is in both |
+| `s.difference(o)` | a new set holding what is in `s` and not in `o` |
+| `s.symmetricDifference(o)` | a new set holding what is in one of them and not the other |
+| `s.isSubsetOf(o)` | whether every member of `s` is in `o` |
+| `s.isSupersetOf(o)` | whether every member of `o` is in `s` |
+| `s.isDisjointFrom(o)` | whether the two share nothing |
 
 `add` answers the set so a chain reads as building one, and `delete` answers whether there was
 something to delete so a program need not ask `has` first.
@@ -109,6 +116,117 @@ print(s.delete(2), s.delete(2), s)
 
 ```output
 true false [1, 3]
+```
+
+## Set algebra
+
+The four that combine answer a **new set** and leave both of the sets they were given exactly as
+they were. Each one takes a set, and the answer walks in the order the receiver's members were
+added, then the argument's.
+
+```slate
+val a = Set([1, 2, 3])
+val b = Set([3, 4])
+
+print(a.union(b))
+print(a.intersection(b))
+print(a.difference(b))
+print(a.symmetricDifference(b))
+print(a, b)
+```
+
+```output
+[1, 2, 3, 4]
+[3]
+[1, 2]
+[1, 2, 4]
+[1, 2, 3] [3, 4]
+```
+
+The three that ask a question answer a boolean. **A set is a subset and a superset of itself**,
+which is what `⊆` means, and the empty set is a subset of everything.
+
+```slate
+val a = Set([1, 2])
+val b = Set([1, 2, 3])
+
+print(a.isSubsetOf(b), b.isSubsetOf(a), a.isSubsetOf(a))
+print(b.isSupersetOf(a), a.isSupersetOf(b))
+print(a.isDisjointFrom(Set([7, 8])), a.isDisjointFrom(b))
+```
+
+```output
+true false true
+true false
+true false
+```
+
+Anything that is not a set is refused, naming what it was given.
+
+```slate
+print(Set([1]).union([2]))
+```
+
+```error
+`union` takes a set, and this is an array
+```
+
+## The operators two sets answer
+
+The same seven operations are written as operators, which is Python's spelling of them and is worth
+having beside the words: set algebra is the one place a program writes several in a line, where
+`a.union(b).difference(c)` is a sentence to unpick.
+
+| | |
+|---|---|
+| `a \| b` | union |
+| `a & b` | intersection |
+| `a - b` | difference |
+| `a ^ b` | symmetric difference |
+| `a <= b` | `a` is a subset of `b` |
+| `a >= b` | `a` is a superset of `b` |
+| `a < b` | a **strict** subset — a subset, and not the same set |
+| `a > b` | a **strict** superset |
+
+```slate
+val a = Set([1, 2, 3])
+val b = Set([3, 4])
+
+print(a | b, a & b, a - b, a ^ b)
+print(Set([1, 2]) <= a, a <= a, Set([1, 2]) < a, a < a)
+```
+
+```output
+[1, 2, 3, 4] [3] [1, 2] [1, 2, 4]
+true true true false
+```
+
+**Two sets that each hold something the other does not order no way at all**, so all four
+comparisons are false of them. That is what containment is, rather than a gap in the comparison.
+
+```slate
+val a = Set([1, 2])
+val b = Set([2, 3])
+
+print(a < b, a <= b, a > b, a >= b)
+```
+
+```output
+false false false false
+```
+
+**`==` is still identity**, as it is for every container whose contents can change — so two sets
+holding the same members are not equal, and `a <= b && b <= a` is the question a program means.
+
+```slate
+val a = Set([1, 2])
+val b = Set([1, 2])
+
+print(a == b, a <= b && b <= a)
+```
+
+```output
+false true
 ```
 
 ## What a map can do

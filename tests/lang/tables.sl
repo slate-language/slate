@@ -245,3 +245,127 @@ a_class_that_decides_its_own_equality_still_decides_which_keys_are_one() =
     assertEq(m.size, 32)
     assertEq(m.get(Money.new(5)), "five again")
     assertEq(m.get(Money.new(115)), 15)
+
+// -- set algebra ---------------------------------------------------------------------------------
+//
+// The seven operations two sets answer, written both ways. Every one of these is a statement about
+// the LANGUAGE rather than about either implementation of it, which is why they are here: the four
+// that combine answer a new set, the three that ask answer a boolean, and the operators mean exactly
+// what the words mean.
+
+@test
+the_four_combining_operations_answer_a_new_set_and_leave_both_sides_alone() =
+    val a = Set([1, 2, 3])
+    val b = Set([3, 4])
+
+    assertEq(a.union(b).values(), [1, 2, 3, 4])
+    assertEq(a.intersection(b).values(), [3])
+    assertEq(a.difference(b).values(), [1, 2])
+    assertEq(a.symmetricDifference(b).values(), [1, 2, 4])
+
+    assertEq(a.values(), [1, 2, 3])
+    assertEq(b.values(), [3, 4])
+
+// The answer walks the receiver's members and then the argument's, which is the only order a reader
+// can predict -- a set walking in the order things went into it.
+@test
+a_combined_set_walks_the_receiver_first_and_the_argument_after_it() =
+    assertEq(Set([3, 1]).union(Set([2, 1])).values(), [3, 1, 2])
+    assertEq(Set([9, 5, 7]).intersection(Set([7, 9])).values(), [9, 7])
+    assertEq(Set([3, 1]).symmetricDifference(Set([4, 1, 2])).values(), [3, 4, 2])
+
+@test
+an_empty_set_and_a_set_with_itself_are_the_two_edges_of_the_algebra() =
+    val e = Set()
+    val a = Set([1, 2])
+
+    assertEq(e.union(a).values(), [1, 2])
+    assertEq(a.union(e).values(), [1, 2])
+    assertEq(e.intersection(a).size, 0)
+    assertEq(a.difference(a).size, 0)
+    assertEq(a.symmetricDifference(a).size, 0)
+    assertEq(a.intersection(a).values(), [1, 2])
+
+// A set is a subset and a superset of itself, which is what those words mean, and the empty set is
+// a subset of everything.
+@test
+the_three_predicates_answer_a_boolean_and_a_set_contains_itself() =
+    val a = Set([1, 2])
+    val b = Set([1, 2, 3])
+
+    assertEq(a.isSubsetOf(b), true)
+    assertEq(b.isSubsetOf(a), false)
+    assertEq(a.isSubsetOf(a), true)
+
+    assertEq(b.isSupersetOf(a), true)
+    assertEq(a.isSupersetOf(b), false)
+
+    assertEq(a.isDisjointFrom(Set([7, 8])), true)
+    assertEq(a.isDisjointFrom(b), false)
+
+    assertEq(Set().isSubsetOf(a), true)
+    assertEq(a.isSubsetOf(Set()), false)
+    assertEq(Set().isDisjointFrom(Set()), true)
+
+// The operators are the same seven operations under Python's spelling, so a program written either
+// way has to mean one thing.
+@test
+the_operators_between_two_sets_are_the_same_seven_operations() =
+    val a = Set([1, 2, 3])
+    val b = Set([3, 4])
+
+    assertEq((a | b).values(), a.union(b).values())
+    assertEq((a & b).values(), a.intersection(b).values())
+    assertEq((a - b).values(), a.difference(b).values())
+    assertEq((a ^ b).values(), a.symmetricDifference(b).values())
+
+    assertEq(Set([1, 2]) <= a, true)
+    assertEq(a <= a, true)
+    assertEq(a >= Set([1, 2]), true)
+    assertEq(a >= a, true)
+
+// A strict containment is the plain one and not the same set, so `<` is false of a set and itself.
+@test
+a_strict_containment_is_false_of_a_set_and_itself() =
+    val a = Set([1, 2, 3])
+
+    assertEq(Set([1, 2]) < a, true)
+    assertEq(a < a, false)
+    assertEq(a > Set([1, 2]), true)
+    assertEq(a > a, false)
+
+// Two sets that each hold something the other does not order no way at all, so all four comparisons
+// are false of them.
+@test
+two_sets_neither_of_which_contains_the_other_order_no_way_at_all() =
+    val a = Set([1, 2])
+    val b = Set([2, 3])
+
+    assertEq(a < b, false)
+    assertEq(a <= b, false)
+    assertEq(a > b, false)
+    assertEq(a >= b, false)
+
+// `==` is identity for a set, as it is for every container whose contents can change -- so two sets
+// holding the same members are not equal, and containment both ways is the question a program means.
+@test
+two_sets_holding_the_same_members_are_not_equal_and_contain_each_other() =
+    val a = Set([1, 2])
+    val b = Set([2, 1])
+
+    assertEq(a == b, false)
+    assertEq(a <= b && b <= a, true)
+    assertEq(a < b, false)
+
+// A class deciding its own equality decides what two sets share, the members being compared by the
+// very `==` and `hash` the class wrote.
+@test
+a_class_that_decides_its_own_equality_decides_what_two_sets_share() =
+    val a = Set([Money.new(5), Money.new(7)])
+    val b = Set([Money.new(7), Money.new(9)])
+
+    assertEq(a.intersection(b).size, 1)
+    assertEq(a.difference(b).size, 1)
+    assertEq(a.union(b).size, 3)
+    assertEq(b.isSupersetOf(Set([Money.new(7)])), true)
+    assertEq(a.isDisjointFrom(Set([Money.new(1)])), true)
