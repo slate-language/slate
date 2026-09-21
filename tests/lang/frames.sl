@@ -642,3 +642,19 @@ A_CONSTRUCTION_DEEP_IN_A_RECURSION_IS_STILL_A_CONSTRUCTION()
 
     assertEq(deep(1), 2)
     assertEq(deep(2000), 2)
+
+@test
+A_DEEP_RECURSION_THROUGH_EXPRESSION_BODIES_RUNS_TO_THE_END()
+    // The whole cycle is expression bodies, so no statement stands anywhere in it. In the
+    // interpreter that is the chunk shape that used to reach no safe point at all -- and a safe
+    // point is where the collector is asked -- so allocating a value per frame is what makes the
+    // answer depend on one being reached.
+    sum(n, total) = if n == 0 then total else sum(n - 1, total + [n, n][0])
+
+    assertEq(sum(2000, 0), 2001000)
+
+    // A lambda that calls itself is the same chunk written another way, and this one is not a tail
+    // call, so every frame is still standing when the deepest one allocates.
+    val down = (n) -> if n == 0 then 0 else [n][0] + down(n - 1)
+
+    assertEq(down(2000), 2001000)
