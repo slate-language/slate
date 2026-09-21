@@ -186,8 +186,11 @@ enum Op
 
     GetIndex
     SetIndex
-    GetField(k: usize)
-    SetField(k: usize)
+    // `o.name` and `o.name = v`. **The second number is the site's own cache slot**, which is where
+    // this instruction remembers the position a name was found at last time; `site_cache.sysl` says
+    // what that buys and why remembering a position can never answer wrongly.
+    GetField(k: usize, c: usize)
+    SetField(k: usize, c: usize)
 
     // -- control --
     Jump(to: usize)
@@ -294,7 +297,10 @@ enum Op
     // decides whether an object is passed. `o.m` on its own still compiles to a plain `GetField`,
     // which hands back the bare function: taking a method off an object and calling it later is
     // allowed, and what you get is what you took.
-    CallMethod(k: usize, argc: usize, names: usize)
+    //
+    // **`c` is this site's cache slot**, exactly as a `GetField`'s is: the lookup half of a method
+    // call is the same walk a field read makes, so it remembers the same two positions.
+    CallMethod(k: usize, argc: usize, names: usize, c: usize)
 
     // `f(...xs)` and `o.m(...xs)` -- a call whose arguments were worked out while running.
     //
@@ -636,6 +642,14 @@ struct Unit
     // walk the same text on every turn of a loop. The table is compiled once and read for ever.
     string_chars: Buf[usize]
 
+    // The hash of each of those strings, in step with it.
+    //
+    // **A FIELD NAME IS HASHED ONCE, WHEN IT IS INTERNED, FOR THE REASON THE COUNT IS.** Hashing
+    // walks the text, and a name written inside a loop would be walked on every turn -- so the three
+    // instructions that look a name up in an object carry the answer with them instead.
+    // `site_cache.sysl` is what reads it.
+    string_hashes: Buf[u64]
+
     // Every whole literal in the program too wide for 64 bits, already built.
     //
     // **`PushBig` COPIES A VIEW WHERE `PushStr` READS TEXT**, which is the whole reason this holds
@@ -693,16 +707,46 @@ struct Unit
     // number is never reused**, so two files' definitions of one spelling are two cells.
     def_total: usize
 
+    // One cell per field-reading instruction in the program, holding where that instruction found
+    // its name last time.
+    //
+    // **IT LIVES ON THE UNIT AND THE UNIT LIVES INSIDE THE `Vm`** (`vm_state.sysl`'s
+    // `current_unit`), which is what makes a cache safe beside actors with nothing having to be
+    // said about threads: an actor compiles its own declarations into its own unit on its own
+    // thread, so no two lines of execution ever write one of these cells.
+    site_caches: Buf[SiteCache]
+
+// Where one instruction found a name last time.
+//
+// **A POSITION, NOT A VALUE, AND NOT AN OBJECT** -- which is the whole of why this needs no
+// invalidation at all. A cell is a guess that is CHECKED before it is believed, by comparing the key
+// standing at that position against the name being looked up, so an answer built from one is right
+// by construction whatever has happened to the object, to its class, or to any other object the site
+// has seen. A guess that has gone stale costs the search it was trying to save and nothing else.
+struct SiteCache
+    // Where the name sat in the receiver's own table.
+    own: usize
+
+    // Where `proto` sat in the receiver's table, and where the name sat in that proto's.
+    hop: usize
+    up: usize
+
 // An empty unit.
 //
 // **There is no chunk zero.** Every module gets a chunk of its own and the program the user named is
 // simply the last of them, so nothing is special about the first -- which is what stopped the entry
 // from having to be both the first chunk and the last thing to run.
 new_unit() -> Unit
-    var u = Unit(buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), Packages(buf(), "", buf()), buf(), buf(), 0)
+    var u = Unit(buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), Packages(buf(), "", buf()), buf(), buf(), 0, buf())
 
     // Entry zero of `arg_names` is the empty list, which is what a `names` of zero means.
     u.arg_names.push(buf())
+
+    // **Cell zero belongs to every caller that has no instruction of its own**, the machine reaching
+    // a field read from a native or from an actor's delivery as well as from a `GetField`. It is a
+    // guess like any other and is checked like any other, so sharing it costs those callers a stale
+    // hit now and then and can never cost an answer.
+    u.site_caches.push(SiteCache(0, 0, 0))
     u
 end new_unit
 
@@ -724,8 +768,17 @@ intern_str(u: *Unit, s: string) -> usize
 
     u.strings.push(s)
     u.string_chars.push(char_count(s))
+    u.string_hashes.push(s.hash())
     u.strings.len() - 1
 end intern_str
+
+// A fresh cell for one instruction to remember where a name was found.
+//
+// **One per SITE and not one per name**, because what a site sees is one shape of object over and
+// over where a name is shared by everything that ever writes it.
+fresh_site(u: *Unit) -> usize
+    u.site_caches.push(SiteCache(0, 0, 0))
+    u.site_caches.len() - 1
 
 // A whole literal too wide for 64 bits, built once and kept.
 //

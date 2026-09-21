@@ -1,0 +1,198 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// Where the three field-reading instructions found their name last time, and what a site does with
+// that memory.
+//
+// **A CACHE HERE REMEMBERS A POSITION AND NEVER A VALUE, AND THAT SINGLE DECISION IS WHY NOTHING IN
+// THIS FILE NEEDS INVALIDATING.** The usual difficulty with an inline cache is knowing when the
+// answer it holds has stopped being the answer -- a field added, a method reassigned, a class
+// redefined, a proto changed under it, a module reloaded, another thread writing the object -- and
+// each of those is a rule that has to be found and kept. A remembered POSITION needs none of them,
+// because the position is not believed: `key_here` reads the key standing there and compares it with
+// the name being looked up, so a hit is a hit on *this* object's *current* table and a stale guess
+// is a miss that costs the search it was trying to save.
+//
+// **So the fast path is sound for reasons that do not mention time at all.** A table's entries are
+// appended and a removed one is a tombstone in place, which is what makes a position worth
+// remembering; a rehash compacts them and moves everything, which is what makes checking the key
+// mandatory rather than an optimisation of the check.
+//
+// **AND IT IS WHY THIS HELPS EVERY INSTANCE OF A CLASS RATHER THAN ONE.** Two objects a constructor
+// made take their fields in the same order, so `x` is at the same position in both -- the site's
+// guess is right for every one of them, and right again for the class object every instance of that
+// class delegates to. A site that genuinely sees two shapes alternately pays one key comparison
+// before falling back, which is what "never wrong, only slow" buys.
+//
+// **THE NAME AND ITS HASH ARE READ IN HERE AND NOT IN THE INSTRUCTION'S ARM, and that is measured
+// rather than tidy.** The loop is one function, so every value an arm holds is live across the whole
+// of it; two more held in the `GetField` and `SetField` arms cost about 2% on programs that read no
+// field at all. The arm hands over the unit, the name's place in its table and the cache slot.
+//
+// **WHERE THE CELLS LIVE IS WHAT ANSWERS THE ACTOR QUESTION.** They are a `Buf` on the `Unit`, and a
+// `Unit` is a field of the `Vm` (`vm_state.sysl`'s `current_unit`) -- an actor compiles the program's
+// declarations into a unit of its own on its own thread, so two lines of execution never write one
+// cell and there is nothing here to make atomic.
+
+// Whether the entry at this position is a live one whose key is this name.
+//
+// **The whole of the check, and it has to read the key rather than anything cheaper.** A position
+// alone says nothing: the table may have been rehashed, the entry may have been removed, the object
+// may be a different one of another shape entirely.
+private key_here(o: *ObjectObj, at: usize, name: string) -> bool
+    if at >= o.entries.len() then return false
+
+    val e = o.entries.at(at)
+
+    if e.dead then return false
+
+    e.key match
+        Str(p) -> p.s == name
+        _ -> false
+end key_here
+
+// A field and whether it came from a PROTO, with one site's memory in front of the search.
+//
+// **`field_from`'s answer exactly**, which is the contract: this is that function with the two
+// searches it makes given a place to start, and every path through it ends in the same pair.
+field_from_site(o: *ObjectObj, name: string, h: u64, at: Span, u: *Unit, c: usize) -> Result[(Value, bool), Signal]
+    val site = u.site_caches.at(c)
+
+    // The object's own field, where this site found it last time.
+    if key_here(o, site.own, name) then return Ok((obj_value_at(o, site.own), false))
+
+    // The object's own table for real. **This is also the witness a delegated answer needs**: a
+    // method reached through a proto may only stand where the object itself has no field of that
+    // name, and no remembered position can say that an object LACKS something. `obj_index_hashed`
+    // is what makes asking cheap -- the summary of the keys refuses the commonest case, which is a
+    // method call, without touching the table at all.
+    obj_index_hashed(o, name, h) match
+        Some(ix) ->
+            u.site_caches.set(c, SiteCache(ix, site.hop, site.up))
+            return Ok((obj_value_at(o, ix), false))
+        None -> ()
+
+    // One hop up, where this site found both halves last time.
+    if key_here(o, site.hop, "proto")
+        obj_value_at(o, site.hop) match
+            Object(p) -> if key_here(p, site.up, name) then return Ok((obj_value_at(p, site.up), name != "new"))
+            _ -> ()
+
+    walked_protos(o, name, h, at, u, c)
+end field_from_site
+
+// The chain walked for real, remembering the first hop where the answer came from it.
+//
+// **`name != "new"` is `field_from`'s rule and is not restated here**: a constructor is called
+// before there is an object to hand it, so it is the one name the receiver rule does not reach.
+private walked_protos(o: *ObjectObj, name: string, h: u64, at: Span, u: *Unit, c: usize) -> Result[(Value, bool), Signal]
+    var up = o
+    var depth: usize = 0
+
+    loop
+        var hop_at: usize = 0
+
+        val next = obj_index_named(up, "proto") match
+            Some(i) ->
+                hop_at = i
+
+                obj_value_at(up, i) match
+                    Object(p) -> p
+                    _ -> return Ok((Undefined, false))
+            None -> return Ok((Undefined, false))
+
+        obj_index_hashed(next, name, h) match
+            Some(ix) ->
+                if depth == 0
+                    val site = u.site_caches.at(c)
+
+                    u.site_caches.set(c, SiteCache(site.own, hop_at, ix))
+
+                return Ok((obj_value_at(next, ix), name != "new"))
+            None -> ()
+
+        depth += 1
+
+        if depth >= MaxProtoDepth
+            return Err(failure(at, s"this object's `proto` chain is more than ${MaxProtoDepth} deep, which means it is a circle -- looking up `${name}` would never finish"))
+
+        up = next
+end walked_protos
+
+// `o.name` at a `GetField`, which is `read_field` with the site's memory in front of it.
+//
+// **Only an object has a site to remember anything about.** A builtin kind answers by table, which
+// is an array read already, so the other arm is `read_field`'s own unchanged.
+read_field_site(target: Value, u: *Unit, k: usize, c: usize, at: Span) -> Step = target match
+    Object(fields) ->
+        val name = u.strings.at(k)
+        val found = field_from_site(fields, name, u.string_hashes.at(k), at, u, c)?
+
+        if is_absent(found.0) then return read_field_absent(target, fields, name, at)
+
+        Ok(found.0)
+    other -> read_field_of_kind(other, u.strings.at(k), at)
+
+// `o.name = v` at a `SetField`, which is `write_named` with the site's memory in front of it.
+//
+// **A field the object ALREADY HAS takes no property lookup**, and the remembered position is the
+// proof that it has one: `write_property` opens by asking exactly that question and answering `false`
+// where the object holds the name itself, so a checked position answers it first and the ordinary
+// write to an ordinary field costs one key comparison and one store.
+//
+// **The frozen check is NOT skipped with it.** A data value refuses a write to a field it has, so
+// that refusal stands in front of the fast path rather than behind it.
+write_named_site(vm: *Machine, here: *Vm, u: *Unit, k: usize, c: usize, at: Span) -> Result[unit, Signal] =
+    write_named_at(vm, here, u.strings.at(k), u.string_hashes.at(k), at, u, c)
+
+// The write itself, for a caller holding the name rather than its place in the unit's table.
+private write_named_at(vm: *Machine, here: *Vm, name: string, h: u64, at: Span, u: *Unit, c: usize) -> Result[unit, Signal]
+    val v = peek_on(vm, 0)
+
+    // **The sentence is built only where it is going to be said.** An interpolation allocates, and
+    // this one was being built on every field write in every program to describe a refusal that
+    // almost never happens.
+    if is_absent(v) then keepable_on(here, v, at, s"stored in `${name}`")?
+
+    peek_on(vm, 1) match
+        Object(o) ->
+            val site = u.site_caches.at(c)
+
+            // **A `set` property is consulted before the object is written to**, and only where the
+            // object has no field of that name itself -- which is the rule a read follows, read
+            // backwards. A checked position answers that question, so an ordinary write to an
+            // ordinary field asks nothing else.
+            if !o.frozen && key_here(o, site.own, name)
+                obj_set_value_at(o, site.own, v)
+            elif !write_property(peek_on(vm, 1), o, name, v, at)?
+                // **Asked here because `obj_put_named` has nowhere to report from**, where the
+                // indexed form goes through `obj_put` and refuses it there. The two answer the same
+                // sentence.
+                if o.frozen then return Err(failure(at, frozen_complaint(s"`${name}`")))
+
+                u.site_caches.set(c, SiteCache(obj_put_named(o, name, h, v), site.hop, site.up))
+        // **The dotted write and the bracketed one are one thing said two ways**, so they answer one
+        // sentence: `globalThis.marker = 1` is a program reaching the host, not a program mistaking
+        // an external for an object. `store_at` says it for the bracketed form and this is the same
+        // refusal, naming the field the way the read side does.
+        External(_) -> return Err(failure(at, js_host_only(s"writing `${name}` on an external")))
+        other ->
+            // **A PROPERTY OF A BUILTIN KIND IS READ-ONLY, AND THE COMPLAINT NAMES IT.**
+            // `s.length = 3` is a mistake about what `length` is; told only that a string has no
+            // fields, the reader is left thinking the name was never there. `method.sysl` writes the
+            // sentence, a class's read-only property saying the same thing in the same shape.
+            if builtin_property(other, name).is_some()
+                return Err(failure(at, read_only_property(other, name)))
+
+            return Err(failure(at, s"a field belongs to an object, and this is ${other.type_name()}"))
+
+    vm.stack.truncate(vm.stack.len() - 2)
+    Ok(())
+end write_named_at
+
+// `o.name = v` for a caller with no instruction of its own, which is the same write through the
+// shared cell.
+write_named(vm: *Machine, name: string, at: Span) -> Result[unit, Signal] =
+    write_named_at(vm, current(), name, name.hash(), at, running_unit(), 0)

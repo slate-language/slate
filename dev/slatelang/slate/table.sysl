@@ -679,37 +679,77 @@ field_through(o: *ObjectObj, name: string) -> Option[Value]
 end field_through
 
 obj_get_name(o: *ObjectObj, name: string) -> Option[Value]
+    // **The two-way switch is written out here rather than read off `obj_index_named` below**, and
+    // that is measured rather than tidy: a pattern match walking an object asks this twelve million
+    // times in `bench/options`, and routing it through one more call read +2.3% there.
     val found = if o.index.len() == 0 then scan_named(o, name) else find_named(o, name, name.hash())
 
     found match
         None -> None
         Some(at) -> Some(o.entries.at(at).value)
 
+// WHERE a named field sits in this object's own table, rather than what it holds.
+//
+// Not `private`: an inline cache remembers the position so that the next lookup at the same
+// instruction is one key comparison. `site_cache.sysl` is the reader.
+obj_index_named(o: *ObjectObj, name: string) -> Option[usize] =
+    if o.index.len() == 0 then scan_named(o, name) else find_named(o, name, name.hash())
+
+// The same, for a caller that already has the name's hash -- which the machine does, a field name
+// being hashed once when it is interned.
+//
+// **The summary is asked FIRST and is the whole point of this form**: a name whose bit is clear is
+// not in the table, so a miss costs one `and` rather than a walk.
+obj_index_hashed(o: *ObjectObj, name: string, h: u64) -> Option[usize]
+    if obj_lacks(o, h) then return None
+
+    if o.index.len() == 0 then scan_named(o, name) else find_named(o, name, h)
+end obj_index_hashed
+
+// Whether this table is CERTAIN to have no key of this hash. False means only that it may.
+obj_lacks(o: *ObjectObj, h: u64) -> bool = (o.keys_bloom >> (h & 63)) & 1 == 0
+
+// What the entry at a position holds, which a caller that already has the position asks.
+//
+// Not `private`: `site_cache.sysl` reads and writes a position it checked for itself.
+obj_value_at(o: *ObjectObj, at: usize) -> Value = o.entries.at(at).value
+
+// Write over the value at a position, leaving the key and the hash where they are.
+obj_set_value_at(o: *ObjectObj, at: usize, v: Value)
+    var e = o.entries.at(at)
+
+    e.value = v
+    o.entries.set(at, e)
+
 // Write a named field. **Only an insert boxes the name**, because only then is a key stored -- and
 // only an insert hashes it, a small table finding an existing field by comparing the name.
 obj_put_name(o: *ObjectObj, name: string, v: Value)
+    obj_put_named(o, name, name.hash(), v) match
+        _ -> ()
+
+// The same write for a caller that already holds the name's hash, answering WHERE the field ended
+// up so that an instruction can remember the position.
+obj_put_named(o: *ObjectObj, name: string, h: u64, v: Value) -> usize
     val small = o.index.len() == 0
-    val found = if small then scan_named(o, name) else find_named(o, name, name.hash())
+    val found = if obj_lacks(o, h) then None elif small then scan_named(o, name) else find_named(o, name, h)
 
     found match
         Some(at) ->
-            var e = o.entries.at(at)
+            obj_set_value_at(o, at, v)
+            return at
+        None -> ()
 
-            e.value = v
-            o.entries.set(at, e)
-        None ->
-            val h = name.hash()
+    if small
+        if o.entries.len() + 1 > SmallTable then grow(o)
+    elif (o.entries.len() + 1) * 3 >= o.index.len() * 2
+        grow(o)
 
-            if small
-                if o.entries.len() + 1 > SmallTable then grow(o)
-            elif (o.entries.len() + 1) * 3 >= o.index.len() * 2
-                grow(o)
+    val at = o.entries.len()
 
-            val at = o.entries.len()
+    entry_push(o, Entry(h, str_value(name), v, false))
 
-            entry_push(o, Entry(h, str_value(name), v, false))
+    if o.index.len() != 0 then place(&o.index, h, at)
 
-            if o.index.len() != 0 then place(&o.index, h, at)
-
-            o.live += 1
-end obj_put_name
+    o.live += 1
+    at
+end obj_put_named
