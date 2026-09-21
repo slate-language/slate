@@ -353,6 +353,10 @@ end compile_stmt
 // `x = x + e`: `xs[next()] += 1` calls `next` a single time. The place's parts are computed, copied
 // with `DupAt` for the read, and the copies underneath are what the write consumes.
 private compile_assign(u: *Unit, e: *Emit, op: Tok, target: Expr, value: Expr, at: Span, wants: StmtValue)
+    if short_circuit_assign(op)
+        compile_short_assign(u, e, op, target, value, at, wants)
+        return
+
     val plain = op == Assign
 
     *target.kind match
@@ -380,7 +384,7 @@ private compile_assign(u: *Unit, e: *Emit, op: Tok, target: Expr, value: Expr, a
             if !plain then push_n(e, BinaryOp(op), at, 2, 1)
 
             push_n(e, SetField(k), target.span, 2, 0)
-        Index(t, key) ->
+        Index(t, key, _) ->
             compile_expr(u, e, t)
             compile_expr(u, e, key)
 
@@ -398,6 +402,108 @@ private compile_assign(u: *Unit, e: *Emit, op: Tok, target: Expr, value: Expr, a
 
     nothing_left(e, at, wants)
 end compile_assign
+
+// `x ??= v`, `x ||= v` and `x &&= v`.
+//
+// **THE VALUE IS NOT EVALUATED AT ALL WHERE THE PLACE KEEPS WHAT IT HAD**, which is the whole of
+// what these are for: `cache[k] ??= build(k)` builds nothing for a key that is already there. The
+// place's parts are still worked out exactly once, so `xs[next()] ??= 1` steps `next` one time
+// whichever way the test goes.
+//
+//     <place parts>        the object, or the target and the key, or nothing at all for a name
+//     <read the place>     leaves what is there
+//     JumpIf...Keep(skip)  the question that says the place keeps it
+//     Pop                  drop the reading copy
+//     <value>
+//     <write the place>    which consumes the parts underneath
+//     Jump(done)
+//   skip:                  the reading copy and the parts are still here
+//     Pop ...              dropped, and nothing written
+//   done:
+//
+// Both ways out leave the stack where the statement found it, which is what `nothing_left` is told.
+private compile_short_assign(u: *Unit, e: *Emit, op: Tok, target: Expr, value: Expr, at: Span, wants: StmtValue)
+    val entry = e.sp
+
+    *target.kind match
+        Name(n) ->
+            load_name(u, e, n, target.span)
+
+            val skip = keep_jump(e, op, at)
+
+            push_n(e, Pop, at, 1, 0)
+            compile_expr(u, e, value)
+            store_name(u, e, n, target.span)
+
+            val done = put(e, Jump(0), at)
+
+            patch(e, skip, here(e))
+
+            // The counter is set to what the MACHINE has here, not to what fell out of the branch
+            // above: control arrives by the jump, with the reading copy still on the stack.
+            e.sp = entry + 1
+
+            push_n(e, Pop, at, 1, 0)
+            patch(e, done, here(e))
+        Field(obj, name, _) ->
+            val k = intern_str(u, name)
+
+            compile_expr(u, e, obj)
+            push_n(e, Dup, target.span, 0, 1)
+            push_n(e, GetField(k), target.span, 1, 1)
+
+            val skip = keep_jump(e, op, at)
+
+            push_n(e, Pop, at, 1, 0)
+            compile_expr(u, e, value)
+            push_n(e, SetField(k), target.span, 2, 0)
+
+            val done = put(e, Jump(0), at)
+
+            patch(e, skip, here(e))
+            e.sp = entry + 2
+
+            push_n(e, Pop, at, 1, 0)
+            push_n(e, Pop, at, 1, 0)
+            patch(e, done, here(e))
+        Index(t, key, _) ->
+            compile_expr(u, e, t)
+            compile_expr(u, e, key)
+            push_n(e, DupAt(1), target.span, 0, 1)
+            push_n(e, DupAt(1), target.span, 0, 1)
+            push_n(e, GetIndex, target.span, 2, 1)
+
+            val skip = keep_jump(e, op, at)
+
+            push_n(e, Pop, at, 1, 0)
+            compile_expr(u, e, value)
+            push_n(e, SetIndex, target.span, 3, 0)
+
+            val done = put(e, Jump(0), at)
+
+            patch(e, skip, here(e))
+            e.sp = entry + 3
+
+            push_n(e, Pop, at, 1, 0)
+            push_n(e, Pop, at, 1, 0)
+            push_n(e, Pop, at, 1, 0)
+            patch(e, done, here(e))
+        _ -> push_n(e, FailWith(intern_str(u, "this cannot be assigned to")), at, 0, 0)
+
+    nothing_left(e, at, wants)
+end compile_short_assign
+
+// The jump that leaves the place alone, which asks the opposite of what the operator writes on.
+//
+// `??=` writes where the place is absent, so it keeps what is PRESENT -- and that is a different
+// question from `||=`'s, which keeps what is true: `count ??= 1` leaves a zero alone and
+// `count ||= 1` does not.
+private keep_jump(e: *Emit, op: Tok, at: Span) -> usize
+    if op == QQ then return push_n(e, JumpIfPresentKeep(0), at, 0, 0)
+    if op == OrOr then return push_n(e, JumpIfTrueKeep(0), at, 0, 0)
+
+    push_n(e, JumpIfFalseKeep(0), at, 0, 0)
+end keep_jump
 
 // `a, b = b, a`.
 //
@@ -443,7 +549,7 @@ private compile_multi_assign(u: *Unit, e: *Emit, op: Tok, targets: Buf[Expr], va
                     push_n(e, DupAt(deep + 1), target.span, 0, 1)
 
                 push_n(e, SetField(k), target.span, 2, 0)
-            Index(t, key) ->
+            Index(t, key, _) ->
                 compile_expr(u, e, t)
                 compile_expr(u, e, key)
 

@@ -133,6 +133,43 @@ naming the nearest name it does know; `val` and `var` are the only things that i
 The compound forms are `+= -= *= /= %=` and the bitwise `&= |= ^= <<= >>=`. **A compound form
 evaluates its place once**, so `xs[next()] += 1` calls `next` a single time.
 
+Three more write the place only under a condition, and they ask the question the operator they are
+named after asks:
+
+| form | writes when the place is | so it leaves |
+|---|---|---|
+| `x ??= v` | absent — `null`, or a read that found nothing | `0`, `""` and `false` alone |
+| `x \|\|= v` | false by [truthiness](expressions.md) | everything truthy alone |
+| `x &&= v` | true | everything falsy alone |
+
+**The value is not worked out at all where the place is left alone**, which is what these are for
+and what `x = x ?? build()` could not promise:
+
+```slate
+var cache = { one: null, two: 2 }
+var built = 0
+
+build()
+    built += 1
+    "made"
+
+cache.one ??= build()
+cache.two ??= build()
+
+var count = 0
+count ||= 10                    // zero is there, so `??=` would have left it
+
+print(cache, built, count)
+```
+
+```output
+{one: "made", two: 2} 1 10
+```
+
+The place is still worked out exactly once whichever way the test goes, so `xs[next()] ??= 1` calls
+`next` a single time. They write **one** place: `a, b ??= 1, 2` is refused, a multi-assignment
+working out every value before it writes any of them.
+
 `++` and `--` step a name, a field or an element, prefix or postfix.
 
 ## `if`
