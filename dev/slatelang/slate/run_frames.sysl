@@ -98,9 +98,13 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
     // instruction.
     val vm = machine()
 
-    // **The VM itself, taken once for the same reason.** The witness a call charges when it has to
-    // buffer its arguments is a field of it, and a call is the hottest thing this loop does -- so
-    // the accessor is paid once per `run_frames` rather than once per call.
+    // **The VM itself, taken once for the same reason, and it is handed DOWN rather than asked for
+    // again.** `current()` compiles to a thread-local lookup -- a `_tlv_get_addr` call on this
+    // platform, which nothing optimises away -- so every helper this loop reaches that asks for the
+    // VM itself pays one per instruction. The ones that are hot take it as a parameter instead:
+    // `pop_on`/`peek_on` (the machine), `keepable_on` and `maybe_collect_on` (the VM), and the fused
+    // arms. Each keeps a `current()`-asking form beside it for the cold callers that have nothing to
+    // hand down.
     val here = current()
 
     // **Whether to count instructions, decided once for the whole of this loop.**
@@ -174,7 +178,7 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
         ins.op match
             // The object was built by the instructions above this one and nothing else has seen it
             // yet, so there is no window in which a data value is writable and reachable.
-            SealData -> peek(0) match
+            SealData -> peek_on(vm, 0) match
                 Object(o) -> o.frozen = true
                 _ -> ()
             PushNull -> vm.stack.push(Null)
@@ -187,7 +191,7 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
             // **The magnitude is shared with the unit's copy rather than rebuilt**, a `BigInt`
             // copying with a retain and never being written through.
             PushBig(k) -> vm.stack.push(big_value(u.bigs.at(k)))
-            PushModule(m) -> vm.stack.push(current().module_values.at(m))
+            PushModule(m) -> vm.stack.push(here.module_values.at(m))
             PushShape(pk, k) -> vm.stack.push(shape_value(u.patterns.at(pk), u.strings.at(k), vm.scope))
             PushExternal(k) -> vm.stack.push(External(k))
 
@@ -201,14 +205,14 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
 
             CheckResult(t, pk) -> compose_check_result(u, vm, t, pk, at)?
 
-            DefineTest(k) -> here.registered_tests.push(TestCase(u.strings.at(k), here.current_source, pop()))
-            DefineHook(kind, k) -> set_hook(kind, u.strings.at(k), pop())
+            DefineTest(k) -> here.registered_tests.push(TestCase(u.strings.at(k), here.current_source, pop_on(vm)))
+            DefineHook(kind, k) -> set_hook(kind, u.strings.at(k), pop_on(vm))
 
             PushHandler(to) -> vm.handlers.push(Handler(chunk_ix, to, vm.stack.len(), vm.frames.len(), vm.scope, base, given, false))
             PopHandler -> vm.handlers.truncate(vm.handlers.len() - 1)
-            Raise -> return fault(at, thrown_message(pop()))
+            Raise -> return fault(at, thrown_message(pop_on(vm)))
 
-            WantDisposable -> want_disposable(peek(0), at)?
+            WantDisposable -> want_disposable(peek_on(vm, 0), at)?
             PushDispose(to) -> vm.handlers.push(Handler(chunk_ix, to, vm.stack.len(), vm.frames.len(), vm.scope, base, given, true))
 
             // **`Ok` of nothing, because the answer is thrown away.** `guarded` runs a disposal
@@ -225,20 +229,20 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
             // The same question asked of a BINDING SITE's own mask, which stands on the stack rather
             // than in the frame -- so a binding inside a binding carries its own and nothing has to
             // be saved or put back.
-            JumpIfSet(n, to) -> peek(0) match
+            JumpIfSet(n, to) -> peek_on(vm, 0) match
                 Int(m) -> if (usize(m) >> n) & 1 == 1 then pc = to
                 _ -> ()
 
             LoadSlot(i) -> vm.stack.push(vm.stack.at(base + i))
             DeclareSlot(i) ->
-                val v = pop()
+                val v = pop_on(vm)
 
-                keepable(v, at, "bound to a local")?
+                keepable_on(here, v, at, "bound to a local")?
                 vm.stack.set(base + i, v)
             StoreSlot(i) ->
-                val v = pop()
+                val v = pop_on(vm)
 
-                keepable(v, at, "written to a local")?
+                keepable_on(here, v, at, "written to a local")?
                 vm.stack.set(base + i, v)
             // The checker refuses this before the machine runs. It is here so that the one path where
             // it does not says what it has always said.
@@ -247,7 +251,7 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
             // A read the compiler resolved to one of its file's own definitions, which is an array
             // read where `LoadName` hashes a spelling and walks the chain outward. The hoisted
             // definition filled the cell before any statement of the file ran, so it is there.
-            LoadDef(d) -> vm.stack.push(current().defs.at(d))
+            LoadDef(d) -> vm.stack.push(here.defs.at(d))
 
             LoadName(k) ->
                 val name = u.strings.at(k)
@@ -256,26 +260,26 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
                     Some(v) -> vm.stack.push(v)
                     None -> return fault(at, unbound_here(name))
             DeclareVal(k) ->
-                val v = pop()
+                val v = pop_on(vm)
 
-                keepable(v, at, s"bound to `${u.strings.at(k)}`")?
+                keepable_on(here, v, at, s"bound to `${u.strings.at(k)}`")?
                 declare(vm.scope, u.strings.at(k), v, false)
             DeclareVar(k) ->
-                val v = pop()
+                val v = pop_on(vm)
 
-                keepable(v, at, s"bound to `${u.strings.at(k)}`")?
+                keepable_on(here, v, at, s"bound to `${u.strings.at(k)}`")?
                 declare(vm.scope, u.strings.at(k), v, true)
             // No `keepable` here on purpose -- see `code.sysl`.
             DeclareAbsent(k) ->
-                val v = pop()
+                val v = pop_on(vm)
 
                 declare(vm.scope, u.strings.at(k), v, true)
             StoreName(k) ->
                 val name = u.strings.at(k)
 
-                val stored = pop()
+                val stored = pop_on(vm)
 
-                keepable(stored, at, s"written to `${name}`")?
+                keepable_on(here, stored, at, s"written to `${name}`")?
 
                 assign_name(vm.scope, name, stored) match
                     Written -> ()
@@ -287,100 +291,100 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
             // the emitter picks the arm now and `run_arith.sysl` holds the twenty bodies, each a
             // pair of machine integers in front of the general arithmetic.
             Negate ->
-                val v = pop()
+                val v = pop_on(vm)
 
                 vm.stack.push(negated(v, at)?)
             Not ->
-                val v = pop()
+                val v = pop_on(vm)
 
                 vm.stack.push(notted(v)?)
             Complement ->
-                val v = pop()
+                val v = pop_on(vm)
 
                 vm.stack.push(complemented(v, at)?)
             Add ->
-                val b = pop()
-                val a = pop()
+                val b = pop_on(vm)
+                val a = pop_on(vm)
 
                 vm.stack.push(added(a, b, at)?)
             Sub ->
-                val b = pop()
-                val a = pop()
+                val b = pop_on(vm)
+                val a = pop_on(vm)
 
                 vm.stack.push(subtracted(a, b, at)?)
             Mul ->
-                val b = pop()
-                val a = pop()
+                val b = pop_on(vm)
+                val a = pop_on(vm)
 
                 vm.stack.push(multiplied(a, b, at)?)
             Div ->
-                val b = pop()
-                val a = pop()
+                val b = pop_on(vm)
+                val a = pop_on(vm)
 
                 vm.stack.push(divided(a, b, at)?)
             IntDiv ->
-                val b = pop()
-                val a = pop()
+                val b = pop_on(vm)
+                val a = pop_on(vm)
 
                 vm.stack.push(quotient_of(a, b, at)?)
             Rem ->
-                val b = pop()
-                val a = pop()
+                val b = pop_on(vm)
+                val a = pop_on(vm)
 
                 vm.stack.push(remainder_of(a, b, at)?)
             Less ->
-                val b = pop()
-                val a = pop()
+                val b = pop_on(vm)
+                val a = pop_on(vm)
 
                 vm.stack.push(is_less(a, b, at)?)
             LessEq ->
-                val b = pop()
-                val a = pop()
+                val b = pop_on(vm)
+                val a = pop_on(vm)
 
                 vm.stack.push(is_less_eq(a, b, at)?)
             Greater ->
-                val b = pop()
-                val a = pop()
+                val b = pop_on(vm)
+                val a = pop_on(vm)
 
                 vm.stack.push(is_greater(a, b, at)?)
             GreaterEq ->
-                val b = pop()
-                val a = pop()
+                val b = pop_on(vm)
+                val a = pop_on(vm)
 
                 vm.stack.push(is_greater_eq(a, b, at)?)
             Equal ->
-                val b = pop()
-                val a = pop()
+                val b = pop_on(vm)
+                val a = pop_on(vm)
 
                 vm.stack.push(is_equal(a, b, at)?)
             NotEqual ->
-                val b = pop()
-                val a = pop()
+                val b = pop_on(vm)
+                val a = pop_on(vm)
 
                 vm.stack.push(is_unequal(a, b, at)?)
             BitAnd ->
-                val b = pop()
-                val a = pop()
+                val b = pop_on(vm)
+                val a = pop_on(vm)
 
                 vm.stack.push(bit_anded(a, b, at)?)
             BitOr ->
-                val b = pop()
-                val a = pop()
+                val b = pop_on(vm)
+                val a = pop_on(vm)
 
                 vm.stack.push(bit_ored(a, b, at)?)
             BitXor ->
-                val b = pop()
-                val a = pop()
+                val b = pop_on(vm)
+                val a = pop_on(vm)
 
                 vm.stack.push(bit_xored(a, b, at)?)
             ShiftLeft ->
-                val b = pop()
-                val a = pop()
+                val b = pop_on(vm)
+                val a = pop_on(vm)
 
                 vm.stack.push(shifted_left(a, b, at)?)
             ShiftRight ->
-                val b = pop()
-                val a = pop()
+                val b = pop_on(vm)
+                val a = pop_on(vm)
 
                 vm.stack.push(shifted_right(a, b, at)?)
             NoOperator -> return fault(at, "this is not an arithmetic operator")
@@ -389,8 +393,8 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
             MakeObject(n) -> compose_object(vm, n, at)?
 
             GetIndex ->
-                val k = pop()
-                val target = pop()
+                val k = pop_on(vm)
+                val target = pop_on(vm)
 
                 vm.stack.push(read_at(target, k, at)?)
             SetIndex -> write_indexed(vm, at)?
@@ -399,30 +403,30 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
             // a getter that allocates is exactly the shape `A `Value` IN A SYSL LOCAL IS NOT A ROOT`
             // describes, and the cost of not doing it is one truncate.
             GetField(k) ->
-                val got = read_field(peek(0), u.strings.at(k), at)?
+                val got = read_field(peek_on(vm, 0), u.strings.at(k), at)?
 
                 vm.stack.truncate(vm.stack.len() - 1)
                 vm.stack.push(got)
             SetField(k) -> write_named(vm, u.strings.at(k), at)?
 
             Jump(to) -> pc = to
-            JumpIfFalse(to) -> if !pop().truthy() then pc = to
-            JumpIfTrueKeep(to) -> if peek(0).truthy() then pc = to
-            JumpIfPresentKeep(to) -> if !is_nullish(peek(0)) then pc = to
-            JumpIfAbsentKeep(to) -> if is_nullish(peek(0)) then pc = to
-            JumpIfFalseKeep(to) -> if !peek(0).truthy() then pc = to
+            JumpIfFalse(to) -> if !pop_on(vm).truthy() then pc = to
+            JumpIfTrueKeep(to) -> if peek_on(vm, 0).truthy() then pc = to
+            JumpIfPresentKeep(to) -> if !is_nullish(peek_on(vm, 0)) then pc = to
+            JumpIfAbsentKeep(to) -> if is_nullish(peek_on(vm, 0)) then pc = to
+            JumpIfFalseKeep(to) -> if !peek_on(vm, 0).truthy() then pc = to
 
             Pop -> vm.stack.truncate(vm.stack.len() - 1)
             Discard ->
-                peek(0) match
+                peek_on(vm, 0) match
                     Promise(pr) ->
                         pr.orphaned = true
                         orphan_failed(pr)
                     _ -> ()
 
                 vm.stack.truncate(vm.stack.len() - 1)
-            Dup -> vm.stack.push(peek(0))
-            DupAt(n) -> vm.stack.push(peek(n))
+            Dup -> vm.stack.push(peek_on(vm, 0))
+            DupAt(n) -> vm.stack.push(peek_on(vm, n))
             RotUp(n) -> compose_rot_up(vm, n)
 
             Join(n) -> compose_join(vm, n, at)?
@@ -439,8 +443,8 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
             UnpackSlots(k, first, masked) ->
                 val mark = vm.stack.len()
 
-                if !match_walk(u.patterns.at(k), peek(0), vm.scope, false, true)
-                    val subject = peek(0)
+                if !match_walk(u.patterns.at(k), peek_on(vm, 0), vm.scope, false, true)
+                    val subject = peek_on(vm, 0)
 
                     vm.stack.truncate(mark)
                     return fault(at, unpack_complaint(u.patterns.at(k), subject))
@@ -477,7 +481,7 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
             // missed has left nothing behind to be read by mistake.
             TestSlots(k, first) ->
                 val mark = vm.stack.len()
-                val took = match_walk(u.patterns.at(k), peek(0), vm.scope, false, true)
+                val took = match_walk(u.patterns.at(k), peek_on(vm, 0), vm.scope, false, true)
 
                 // **The mask is dropped here and that is not an oversight**: a `match` arm carries
                 // no default and no `?` -- `refuse_defaults` refuses the first and
@@ -490,7 +494,7 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
 
             IterInit -> compose_iter_init(vm, at)?
             IterNext(to) ->
-                val i = peek(0) match
+                val i = peek_on(vm, 0) match
                     Int(n) -> usize(n)
                     _ -> 0
 
@@ -499,7 +503,7 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
                 // a walk over a set or a map skips it and lands past it.
                 var ahead = i + 1
 
-                val step = peek(1) match
+                val step = peek_on(vm, 1) match
                     Array(p) ->
                         if i >= p.items.len() then None else Some(p.items.at(i))
                     Bytes(p) ->
@@ -557,8 +561,8 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
             IterAwaitCheck -> compose_iter_await_check(at)?
 
             FailWith(k) -> return fault(at, u.strings.at(k))
-            FailShowing(k) -> return fault(at, u.strings.at(k) + show_value(peek(0)))
-            FailNoArm -> return fault(at, s"no arm of this match applies to ${value_text(peek(0))}")
+            FailShowing(k) -> return fault(at, u.strings.at(k) + show_value(peek_on(vm, 0)))
+            FailNoArm -> return fault(at, s"no arm of this match applies to ${value_text(peek_on(vm, 0))}")
 
             // **THE SAFE POINT.** It stands in front of every statement outside a loop and once at
             // the top of every loop, where it used to stand in front of every statement full stop:
@@ -566,11 +570,11 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
             // statement runs more than once for having been written once. `safe_point` in
             // `emit.sysl` is where that is decided.
             Tick ->
-                maybe_collect()
+                maybe_collect_on(here)
 
                 // A full heap is reported where there is a line to point at; the allocator has no
                 // idea which statement it was serving.
-                if current().heap_exhausted then return fault(at, "this program has run out of memory")
+                if here.heap_exhausted then return fault(at, "this program has run out of memory")
 
             // **THE FUSED PAIRS, AND THE `pc += 1` IN EACH IS WHAT STEPS OVER THE SLOT `fuse` LEFT
             // STANDING.** The emitter overwrites only the first instruction of a pair, so the second
@@ -592,10 +596,10 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
                     Some(v) -> stored_in_slot(vm, base, i, v, code.at(pc).at)?
 
                 pc += 1
-            LessJumpIfFalse(to) -> if fused_less_jump_if_false(at)? then pc = to else pc += 1
+            LessJumpIfFalse(to) -> if fused_less_jump_if_false(vm, at)? then pc = to else pc += 1
 
             CallFn(argc, names) ->
-                val callee = peek(argc)
+                val callee = peek_on(vm, argc)
 
                 // **THE ORDINARY CALL LEAVES ITS ARGUMENTS WHERE THEY STAND.** They are already at
                 // the position the callee's slots want them in, so the only thing between here and
@@ -606,7 +610,7 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
                 placed_call(u, callee, names, vm.frames.len()) match
                     InPlace(body, scope, params, slots, entering_code, entering_source) ->
                         for i in 0..<argc
-                            keepable(peek(argc - 1 - i), at, "passed to a function")?
+                            keepable_on(here, peek_on(vm, argc - 1 - i), at, "passed to a function")?
 
                         // **The callee comes out from under its own arguments**, which is the whole
                         // of the move: one shift down of `argc` cells against a malloc, a free and
@@ -640,8 +644,8 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
                         var written: Buf[Value] = buf()
 
                         for i in 0..<argc
-                            keepable(peek(argc - 1 - i), at, "passed to a function")?
-                            written.push(peek(argc - 1 - i))
+                            keepable_on(here, peek_on(vm, argc - 1 - i), at, "passed to a function")?
+                            written.push(peek_on(vm, argc - 1 - i))
 
                         vm.stack.truncate(vm.stack.len() - argc - 1)
 
@@ -675,15 +679,15 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
             CallSpread ->
                 here.args_buffered += 1
 
-                val spread = pop()
-                val callee = pop()
+                val spread = pop_on(vm)
+                val callee = pop_on(vm)
 
                 var args: Buf[Value] = buf()
 
                 spread match
                     Array(a) ->
                         for i in 0..<a.items.len()
-                            keepable(a.items.at(i), at, "passed to a function")?
+                            keepable_on(here, a.items.at(i), at, "passed to a function")?
                             args.push(a.items.at(i))
                     _ -> return fault(at, "unreachable")
 
@@ -718,7 +722,7 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
             // proto -- has been thrown away.
             CallMethod(k, argc, names) ->
                 val name = u.strings.at(k)
-                val target = peek(argc)
+                val target = peek_on(vm, argc)
 
                 // **A builtin type answers a method by TABLE and an object answers by field.** An
                 // object is not in the table at all -- its names are the program's, and `proto` is
@@ -753,7 +757,7 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
                 placed_call(u, found.0, names, vm.frames.len()) match
                     InPlace(body, scope, params, slots, entering_code, entering_source) ->
                         for i in 0..<argc
-                            keepable(peek(argc - 1 - i), at, "passed to a function")?
+                            keepable_on(here, peek_on(vm, argc - 1 - i), at, "passed to a function")?
 
                         val top = vm.stack.len()
                         val start = top - argc - 1
@@ -791,8 +795,8 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
                         if found.1 then args.push(target)
 
                         for i in 0..<argc
-                            keepable(peek(argc - 1 - i), at, "passed to a function")?
-                            args.push(peek(argc - 1 - i))
+                            keepable_on(here, peek_on(vm, argc - 1 - i), at, "passed to a function")?
+                            args.push(peek_on(vm, argc - 1 - i))
 
                         vm.stack.truncate(vm.stack.len() - argc - 1)
 
@@ -839,8 +843,8 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
             // the method was delegated to.
             CallMethodSpread(k) ->
                 val name = u.strings.at(k)
-                val spread = pop()
-                val target = peek(0)
+                val spread = pop_on(vm)
+                val target = peek_on(vm, 0)
 
                 val looked = target match
                     Object(fields) -> field_from(fields, name, at)?
@@ -868,7 +872,7 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
                 spread match
                     Array(a) ->
                         for i in 0..<a.items.len()
-                            keepable(a.items.at(i), at, "passed to a function")?
+                            keepable_on(here, a.items.at(i), at, "passed to a function")?
                             args.push(a.items.at(i))
                     _ -> return fault(at, "unreachable")
 
@@ -934,7 +938,7 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
                 // keeps a pending promise reachable: the shadow stack cannot hold it across the park,
                 // and the machine's own operand stack is a root the tracer already walks. The answer
                 // is written over it when the machine comes back.
-                val awaited = peek(0)
+                val awaited = peek_on(vm, 0)
 
                 // What `resume_chunk` will pick the loop up from.
                 vm.frames.push(Frame(chunk_ix, pc, vm.scope, base, vm.handlers.len(), given, code, here.current_source))
@@ -962,7 +966,7 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
                 return Err(Wait)
 
             Ret ->
-                val v = pop()
+                val v = pop_on(vm)
 
                 vm.stack.truncate(base)
 

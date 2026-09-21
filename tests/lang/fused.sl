@@ -201,3 +201,56 @@ A_GUARD_THAT_SKIPS_A_LOAD_LEAVES_THE_STACK_WHERE_THE_UNFUSED_CODE_LEFT_IT()
 
     assertEq(pick({ a: 1 }, 10), 11)
     assertEq(pick({ missing: 4 }, 10), 5)
+
+// -- a second line of execution, stepped from inside a folded loop ---------------------------------
+
+// **A GENERATOR IS A SECOND OPERAND STACK, AND THE DRIVER'S FOLDED LOOP RUNS ON THE FIRST.** Stepping
+// one sets the generator's line of execution running and then puts the driver's back, so every turn
+// of the loop below crosses that boundary twice with fused instructions on both sides of it. A value
+// taken off the wrong stack is a wrong answer rather than a fault, which is why these assert sums and
+// orders rather than merely that nothing went wrong.
+
+countingUp(limit) =
+    var i = 0
+
+    while i < limit
+        yield i * 2
+        i = i + 1
+
+@test
+A_GENERATOR_STEPPED_FROM_A_FOLDED_LOOP_ANSWERS_EVERY_VALUE_IN_ORDER()
+    val g = countingUp(8)
+
+    var total = 0
+    var k = 0
+
+    val seen = []
+
+    while k < 8
+        val step = g.next()
+
+        total = total + step.value
+        seen.push(step.value)
+        k = k + 1
+
+    assertEq(total, 56)
+    assertEq(seen, [0, 2, 4, 6, 8, 10, 12, 14])
+    assertEq(g.next().done, true)
+
+@test
+TWO_GENERATORS_INTERLEAVED_IN_ONE_FOLDED_LOOP_KEEP_THEIR_OWN_COUNTERS()
+    // Three lines of execution, two of them parked at any moment. A driver that read a value off
+    // whichever stack happened to be installed would answer the same number twice here.
+    val a = countingUp(5)
+    val b = countingUp(5)
+
+    var k = 0
+
+    val mixed = []
+
+    while k < 5
+        mixed.push(a.next().value)
+        mixed.push(b.next().value + 1)
+        k = k + 1
+
+    assertEq(mixed, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9])

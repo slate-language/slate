@@ -526,3 +526,38 @@ spawn_refuses_an_option_it_does_not_have() =
     assertFaults(() -> spawn(Squarer, { hepa: 1 }),
         "`spawn` has no option called `hepa` -- it takes `heap`, `mailbox` and `name`")
     assertFaults(() -> spawn(Squarer, { mailbox: 0 }), "`mailbox` is a positive whole number, and this is 0")
+
+// -- two lines of execution running the same loop -------------------------------------------------
+
+// **AN ACTOR IS A SECOND RUNTIME AND THE PROGRAM IS RUNNING ITS OWN LOOP WHILE IT WORKS.** Under the
+// interpreter that is two VMs, each reached through a pointer its own thread holds; under `slate js`
+// it is a worker. Either way a counter that came out of the wrong one is a wrong number rather than a
+// fault, so both sides run the same arithmetic and the answers are asserted apart.
+
+actor Summing
+    on upTo(self, n)
+        var t = 0
+        var i = 0
+
+        while i < n
+            t = t + i * 2
+            i = i + 1
+
+        t
+
+@test
+async an_actor_and_the_program_run_the_same_loop_and_each_keeps_its_own_count() =
+    val w = spawn(Summing)
+    val answered = ask(w.upTo, 400)
+
+    var mine = 0
+    var i = 0
+
+    while i < 400
+        mine = mine + i * 3
+        i = i + 1
+
+    assertEq(mine, 239400)
+    assertEq(await answered, 159600)
+
+    stop(w)

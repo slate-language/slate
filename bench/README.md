@@ -146,7 +146,7 @@ end of the second profile.** In one line each:
 |---|---|---|---|
 | 1 | inline `Buf.push` the way 0.0.122 inlined `Buf.at` (**sysl's `buf.sysl`, not slate's**) | 18.5% | 10–15% |
 | 2 | a register machine instead of a stack machine | 15.5% | 10–15% |
-| 3 | stop re-asking `current()` in the hot helpers (`_tlv_get_addr`) — **new** | 4.3% | 3–4% |
+| 3 | ~~stop re-asking `current()` in the hot helpers (`_tlv_get_addr`)~~ — **DONE 2026-09-21, [`vm-param`](results/2026-09-21-vm-param.md): -4.06% geometric mean**, `dispatch` -12.3%, `arith` -11.8%, `fib` -8.0%; `_tlv_get_addr` on `fib` 4.4% → **0.4%** | was 4.3% | 3–4%, and it took 4.1% |
 | 4 | inline caches for a field or a method | 6.5% | 3–4% |
 | 5 | module-level `var` cells, `StoreDef` | 3.7%, ~30% of `globals` | 0.5% of the mean |
 | 6 | `match_walk` — `for` heads, `match` arms, destructuring — **new** | 3.8% | 2–3% |
@@ -201,6 +201,7 @@ engineering and can be had one release at a time.
 
 | date | write-up | headline |
 |---|---|---|
+| 2026-09-21 | [2026-09-21 — THE VM IS HANDED DOWN INSTEAD OF BEING ASKED FOR AGAIN — shortlist item 3](results/2026-09-21-vm-param.md) | shortlist item 3: -4.06% geometric mean, `_tlv_get_addr` on `fib` 4.4% → 0.4% |
 | 2026-09-21 | [A second sampled profile, after 0.0.122 and the superinstructions (dev `76128bf`)](results/2026-09-21-sampled-profile-2.md) | **the live ranking**: `Buf.at` 32.4% → 0.6% (closed), `Buf.push<Value>` now 15.3%, `run_frames` 21.9%, `current()` through `_tlv_get_addr` 4.3% |
 | 2026-09-21 | [2026-09-21 — sysl 0.0.122: the borrowed-read fix, and `-O2` becomes the default](results/2026-09-21-sysl-0-0-122.md) | sysl 0.0.122 borrowed-read fix + -O2 default: -35.5% then -6.52%; new position 4.34x/3.35x/2.29x |
 | 2026-09-21 | [2026-09-21 — SUPERINSTRUCTIONS: TWO INSTRUCTIONS RUN AS ONE, AND THE LARGEST WIN ON THIS PAGE](results/2026-09-21-superinstructions.md) | superinstructions: -9.17% geometric mean, the largest single win on the page |
