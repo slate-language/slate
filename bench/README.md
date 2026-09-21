@@ -1963,6 +1963,14 @@ or slate holding its operand stack, its code array and its chunk table in raw me
 itself. **Neither is a thing to start without the user, and the first belongs to `sysl-bootstrap` and
 its own release.**
 
+**CLOSED, PARTIALLY, IN sysl 0.0.122.** The first fix landed: a by-value `Buf` parameter is borrowed
+— no retain, no release — when the function writes no memory and every call in it is `-> never`,
+which is `Buf.at`'s shape once its index panic was moved out of line. `Buf.at`/`len`/`cap`/… now
+inline at `-O1` with no frame of their own. **What remains is the SECOND of the two bounds checks
+inside `Buf.at`** — the length check is gone with the retain/release, the capacity check is not — an
+open sysl design question rather than a slate one. See the 2026-09-21 write-up below for what this
+was worth measured on slate's own source.
+
 ### The re-ranked shortlist
 
 Share is the weighted aggregate above. A ceiling is what the item could take off the geometric mean
@@ -1970,12 +1978,12 @@ if it removed **all** of the named cost, which none will.
 
 | rank | candidate | measured share | ceiling | kind | files |
 |---|---|---|---|---|---|
-| 1 | **Borrowed reads: stop `Buf.at`/`push`/`set` retaining, and get them inlined** | **46.5%** of wall | 20-30% — the frame, the retain, the release and one of the two bounds checks go; the element copy stays | **STRUCTURAL, and mostly NOT slate's**: a `sysl.buf` change, or slate indexing raw memory itself | `sysl-bootstrap`'s `buf.sysl`, or `vm.sysl` + `run_frames.sysl` + `execute.sysl` |
+| — | ~~**Borrowed reads: stop `Buf.at`/`push`/`set` retaining, and get them inlined**~~ | **46.5%** of wall | **LANDED in sysl 0.0.122** (not here): a by-value `Buf` parameter is borrowed when the function writes no memory and every call in it is `-> never`, so `Buf.at`/`len`/`cap`/… inline at `-O1` with no frame and no retain/release. See the 2026-09-21 sysl-0.0.122 write-up below | STRUCTURAL, landed in `sysl-bootstrap` | `sysl-bootstrap`'s `buf.sysl` |
 | 2 | **A narrower `Value`, or NaN-boxing** | 24.8% (`Buf.at/push/set/len<Value>`) | 10-15% — 40 bytes to 16 cuts the copy at every read, push, set and frame lay | **STRUCTURAL — not piecemeal** | `value.sysl` and every native |
 | 3 | **A register machine instead of a stack machine** | 15.3% (`Buf.push<Value>` + `pop` + `peek`), plus its share of `Buf.at<Ins>` | 10-15%, and it subsumes 4 | **STRUCTURAL — not piecemeal** | `emit.sysl`, `run_frames.sysl`, `slots.sysl` |
 | — | ~~**Superinstructions**~~ | 12.3% (`Buf.at<Ins>`), pro rata with dispatches removed | **LANDED (`superinstructions`, 2026-09-21): -9.17% geometric mean, `branches` -24.1%, `arith` -19.3%, `reals` -18.8%, `arrays` -18.1%, twenty-two of twenty-three faster** — the largest single win on this page, and the estimate of 4-6% was less than half of it. **The four pairs were MEASURED and three of the five guessed here were wrong**: `LoadSlot`+`PushInt`, `LoadSlot`+`LoadSlot`, `Add`+`StoreSlot`, `Less`+`JumpIfFalse`; `Dup`+`StoreSlot` and `LoadSlot`+`Ret` are not in the top eighteen at all. The write-up is at the foot of this page | INCREMENTAL | `code.sysl`, `emit.sysl`, `run_frames.sysl`, `run_fused.sysl` |
 | — | ~~**Cheaper frames — stop re-reading the `Chunk` per call**~~ | 4.0%, and **13.0% on `fib`**, 10.5% `closures`, 8.2% `nested`, 7.3% `calls` | **LANDED (`chunk-per-call`, 2026-09-21): -3.02% geometric mean, `fib` -16.9%, `funcs` -13.3%, `closures` -8.4%, `nested` -8.3%** — the write-up is at the bottom of this page | INCREMENTAL | `run_frames.sysl`, `execute.sysl`, `vm.sysl`, `generator.sysl` |
-| 6 | **`-O2` as the default** | **-2.3% geometric mean, no program >3% slower (dev `4820c05`, see the 2026-09-21 write-up below)** | clears the bar to become default, but **BLOCKED: `package.hocon` has no optimization key** — a sysl gap, reported rather than worked around | INCREMENTAL, BLOCKED ON SYSL | `package.hocon` / the build command |
+| — | ~~**`-O2` as the default**~~ | **-2.3% geometric mean, no program >3% slower (dev `4820c05`, see the 2026-09-21 write-up below)** | **LANDED (sysl 0.0.122, `optimization = "2"` in `package.hocon`): -6.52% geometric mean over the two builds alternated, on top of the 0.0.122 compiler gain itself.** See the 2026-09-21 sysl-0.0.122 write-up below | INCREMENTAL | `package.hocon` |
 | 7 | **Module-level `var` cells, `StoreDef`** | 2.6% over the set, **23% of `globals`** (`Map.find` 7.6 + `hash_str` 5.4 + `Map.get` 4.5 + `Map.put` 3.8) | 0.5% of the mean, 15%+ of one program — the reach column's usual reading | INCREMENTAL | `defs.sysl`, `emit.sysl`, `compile.sysl` |
 | 8 | **Inline caches for a field or a method** | 4.5% (`Buf.at<Entry>` 2.5 + `scan_named` 1.3 + `obj_get_name` 0.7); 22% of `fields`, 21% of `methods` | 2-3% | INCREMENTAL, and the largest incremental item that is wholly slate's | `index.sysl`, `table.sysl`, `run_frames.sysl` |
 | — | ~~**`methods_of` looking a method up by name at every call**~~ | **0.18%** | **STRUCK.** It was the named remainder of item 11 and it is not a cost: 7.2% on `mapset` and invisible on all nineteen others | — | — |
@@ -2326,3 +2334,154 @@ four went in: `CheckType`, `CheckResult`, `Unpack`, `IsPat`, `TestPat`, `RotUp` 
 functions in `run_compose.sysl` now — each one reads the operand stack and `vm.scope` and none of them
 touches `pc`, `base`, `code` or `given`, which is that file's own rule — and the fused arms' bodies
 are `run_fused.sysl`. It ends at 988.
+
+## 2026-09-21 — sysl 0.0.122: the borrowed-read fix, and `-O2` becomes the default
+
+Two shortlist items land together because they arrived in one sysl release: item 1, ~~**Borrowed
+reads**~~, and item 6, ~~**`-O2` as the default**~~. Neither is a change here — `package.hocon`'s
+floor moved to `sysl = "0.0.122"` and `optimization = "2"` was added at its top level, and nothing
+under `dev/` was touched.
+
+**What 0.0.122 does:** a by-value parameter is BORROWED — no retain, no release — when the function
+writes no memory and every call in it is `-> never`. `sysl.buf`'s index panic moved out of line to
+make `Buf.at`/`len`/`cap`/… exactly that shape, so they inline at `-O1` with no frame of their own —
+the first half of the "THIS IS A FINDING ABOUT `sysl.buf`" section above, closed. The second bounds
+check inside `Buf.at` is still there and is a separate, open sysl question. And `optimization = "2"`
+in a manifest now beats the compiler's own `-O1` default, which is what unblocks shortlist item 6:
+that key did not exist when this page's `-O2 against -O1` section (2026-09-21, above) measured `-O2`
+by hand and reported the gap as a sysl gap rather than a thing to work around.
+
+### The compiler alone: sysl 0.0.121 → 0.0.122, both at `-O1`, same source (dev `ebf08c5`)
+
+**There is no 0.0.121 compiler left on this machine to alternate against**, so this is the README's
+own recorded numbers for dev `ebf08c5` — the "superinstructions" write-up above, wall-time table,
+"superinstructions" column, an alternating-best-of-9 low taken on this machine on 2026-09-21 with
+sysl 0.0.121 — against a fresh `sysl build . -O1` of the SAME commit under sysl 0.0.122, its own
+alternating-best-of-9 low (`bench/alternate.pl`, `perl ./alternate.pl 9 <control> <branch>` — `$0`
+needs a `/` in it for its own directory-finding to work; bare `alternate.pl` finds no programs and
+dies `Illegal division by zero`, a bug in the script rather than in what it measures, left as found).
+Different day, same machine, same method; not a direct alternation, because there is nothing to
+alternate the 0.0.121 side against any more.
+
+| program | 0.0.121 (`superinstructions` ms) | 0.0.122 -O1 (ms) | change |
+|---|---|---|---|
+| arith | 921.638 | 454.999 | **-50.6%** |
+| branches | 944.927 | 483.109 | **-48.9%** |
+| methods | 1613.871 | 846.622 | **-47.5%** |
+| loops | 808.023 | 429.850 | **-46.8%** |
+| reals | 997.283 | 532.730 | **-46.6%** |
+| funcs | 677.487 | 365.549 | **-46.0%** |
+| fields | 1067.148 | 580.564 | **-45.6%** |
+| closures | 607.239 | 341.716 | **-43.7%** |
+| arrays | 945.959 | 550.971 | -41.8% |
+| dispatch | 1169.257 | 680.818 | -41.8% |
+| nested | 1195.015 | 699.410 | -41.5% |
+| options | 1220.840 | 750.972 | -38.5% |
+| fib | 1235.853 | 761.767 | -38.4% |
+| mapset | 515.427 | 319.784 | -38.0% |
+| calls | 1028.214 | 689.433 | -33.0% |
+| alloc | 1048.474 | 720.101 | -31.3% |
+| sorting | 826.011 | 584.341 | -29.3% |
+| globals | 1766.983 | 1287.891 | -27.1% |
+| csv | 493.086 | 402.190 | -18.4% |
+| strindex | 10.844 | 9.338 | -13.9% |
+| strings | 817.316 | 747.460 | -8.5% |
+| strwalk | 12.211 | 11.221 | -8.1% |
+| startup | 4.695 | 4.763 | +1.4% |
+| **geometric mean** | | | **-35.5%** |
+
+**The order agrees with the pre-release measurement on a scratch copy quoted for this release**
+(fib -41%, arith -47%, sorting -28%, methods -50%): arith -50.6% here against -47% there, methods
+-47.5% against -50%, sorting -29.3% against -28%, fib -38.4% against -41% — the same four programs,
+the same rank, numbers within a few points on a different day. **The winners are the same shape as
+`superinstructions`' own winners**: an inner loop reading locals through `Buf.at` at every turn.
+`startup` moving the other way by 1.4% on 4.7 ms is noise, not a regression — nothing in it calls
+`Buf.at` inside a loop.
+
+### `-O2` over `-O1`, both at sysl 0.0.122, same binary source
+
+**Verified the default really is `-O2`** — `sysl build . --verbose`'s link line, unedited:
+
+```
+sysl: link: clang --target=arm64-apple-macosx -Wno-override-module -O2 -Wl,-dead_strip … -o ./slate
+```
+
+Two builds of `dev/` at `ebf08c5`: `sysl build . -O1` (copied aside as the control) and plain
+`sysl build .` (the branch, now `-O2` by the manifest alone, no flag on the command line). Alternating
+best-of-9 on `bench/timeit.pl` over all 23 programs (`bench/alternate.pl`), control and branch back to
+back, nine times, lowest of each kept. Box 85.8% idle at the start under `caffeinate`, `pgrep -x java`
+showing only an idle Gradle daemon (0% CPU, unrelated).
+
+| program | control (-O1, ms) | branch (-O2, ms) | change |
+|---|---|---|---|
+| alloc | 720.101 | 690.194 | -4.2% |
+| arith | 454.999 | 404.338 | **-11.1%** |
+| arrays | 550.971 | 507.730 | -7.8% |
+| branches | 483.109 | 442.469 | -8.4% |
+| calls | 689.433 | 670.638 | -2.7% |
+| closures | 341.716 | 312.631 | -8.5% |
+| csv | 402.190 | 394.284 | -2.0% |
+| dispatch | 680.818 | 614.161 | -9.8% |
+| fib | 761.767 | 710.252 | -6.8% |
+| fields | 580.564 | 568.389 | -2.1% |
+| funcs | 365.549 | 329.131 | **-10.0%** |
+| globals | 1287.891 | 1250.937 | -2.9% |
+| loops | 429.850 | 378.167 | **-12.0%** |
+| mapset | 319.784 | 301.372 | -5.8% |
+| methods | 846.622 | 765.605 | -9.6% |
+| nested | 699.410 | 624.437 | **-10.7%** |
+| options | 750.972 | 696.776 | -7.2% |
+| reals | 532.730 | 489.783 | -8.1% |
+| sorting | 584.341 | 537.160 | -8.1% |
+| startup | 4.763 | 4.482 | -5.9% |
+| strindex | 9.338 | 9.200 | -1.5% |
+| strings | 747.460 | 744.069 | -0.5% |
+| strwalk | 11.221 | 10.884 | -3.0% |
+| **geometric mean** | | | **-6.52%** |
+
+**Every program moved the same way** — twenty-three of twenty-three faster or flat, none slower. This
+is `-O2` alone, ON TOP OF the 0.0.121→0.0.122 compiler gain measured above, not instead of it: the
+control here is already the 0.0.122 `-O1` build. `loops` -12.0%, `arith` -11.1% and `nested` -10.7%
+are the biggest movers, which is a different shape from the borrowed-read table above (that one's
+winners were `Buf.at`-bound; this is ordinary LLVM inlining doing more at `-O2`, as the earlier
+`-O2 against -O1` section on this page already found by hand).
+
+### The new measured position: `bench/run.sh -n 5` on the default (`-O2`) build
+
+| program | slate (ms) | vs Lua | vs node --jitless | vs CPython |
+|---|---|---|---|---|
+| startup | 4.6 | 2.57 | 0.31 | 0.34 |
+| arith | 414.6 | 8.68 | 3.69 | 1.35 |
+| reals | 488.4 | 8.25 | 3.68 | 1.97 |
+| globals | 1256.8 | 12.25 | 16.98 | **3.36** |
+| funcs | 333.0 | 6.87 | 3.55 | 2.20 |
+| fib | 710.9 | 8.93 | 4.26 | **3.53** |
+| calls | 679.6 | 4.37 | 8.86 | **4.99** |
+| methods | 765.9 | 5.56 | 4.79 | **4.09** |
+| closures | 312.1 | 6.76 | 3.95 | 2.29 |
+| nested | 632.5 | 4.84 | 1.40 | 3.25 |
+| loops | 380.9 | 3.20 | 0.75 | 2.54 |
+| options | 705.7 | 8.56 | 6.53 | 3.19 |
+| fields | 574.2 | 9.36 | 7.13 | 2.74 |
+| alloc | 704.9 | 4.36 | 8.61 | 3.18 |
+| arrays | 522.3 | 5.54 | 3.30 | 2.67 |
+| mapset | 304.0 | 17.99 | 3.56 | 2.92 |
+| dispatch | 621.4 | 6.99 | 4.18 | 2.91 |
+| strings | 745.4 | 2.05 | 30.59 | 1.20 |
+| strindex | 9.4 | 3.95 | 0.55 | 0.69 |
+| strwalk | 10.8 | 0.07 | 0.60 | 0.77 |
+| sorting | 527.7 | 0.91 | 0.66 | 1.40 |
+| csv | 400.4 | 1.32 | 3.03 | **4.75** |
+| branches | 447.9 | 4.36 | 1.45 | 1.15 |
+| **geomean** | | **4.34x** | **3.35x** | **2.29x** |
+
+**Down from 7.2x Lua / 5.5x node --jitless / 3.8x CPython**, the numbers this page's superinstructions
+write-up recorded for this same dev tip (`ebf08c5`) built with sysl 0.0.121 at `-O1` — the default at
+the time. **The five worst against CPython** (highest `slate/python` ratio): `calls` 4.99x, `csv`
+4.75x, `methods` 4.09x, `fib` 3.53x, `globals` 3.36x — all builtin- or call-heavy, the shape the
+`sysl.buf` finding above says is still 46.5% of the wall clock even after the borrowed-read fix,
+because a positional call's `InPlace` path and a method dispatch both still read a `Chunk`/entry
+through `Buf.at` on the hot path.
+
+**Nothing in `dev/` changed for either of these tables.** The whole of this section is `package.hocon`
+plus a newer compiler.
