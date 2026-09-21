@@ -6,6 +6,7 @@
 
 import { triple, greet, version, Greeting } from "./lib/greet.sl"
 import * as kit from "./lib/greet.sl"
+import { breaks, breaksAfterParking } from "./lib/faulty.sl"
 
 @test
 an_imported_definition_is_called_like_any_other() =
@@ -30,3 +31,20 @@ a_star_import_is_the_module_object() =
 @test
 what_a_module_did_not_export_is_not_reachable_through_it() =
     assert(!has(kit, "factor"))
+
+@test
+a_fault_raised_in_an_imported_file_says_that_file_and_its_line() =
+    val e = breaks(1) catch e -> e
+
+    assert(contains(e.file, "lib/faulty.sl"))
+    assertEq(e.line, 3)
+
+@test
+async a_fault_raised_after_an_await_in_an_imported_file_says_that_file_too() =
+    // The coroutine parked in the other file and came back there, so the place is still that
+    // file's — which is the half that is easy to lose, the machine being somewhere else by the
+    // time anybody asks.
+    val e = (await breaksAfterParking(1)) catch e -> e
+
+    assert(contains(e.file, "lib/faulty.sl"))
+    assertEq(e.line, 8)
