@@ -134,9 +134,26 @@ plus a newer compiler.
 Every line points at a number above. **Nine have landed since** — 1, 2, 3, 4, 5, 6, 7, 8 and 11, each
 struck through with what it measured; the ranking of what is left is unchanged.
 
-**THE RANKING BELOW HAS BEEN SUPERSEDED BY A SAMPLED PROFILE — read "What the sampled profile shows
-(dev `c26567e`)" at the foot of this page before proposing any of it.** The table here was read off
-instruction COUNTS, and the sampler says the time is not where the counts are.
+**THE RANKING BELOW HAS BEEN SUPERSEDED TWICE, AND THE SECOND SAMPLED PROFILE IS THE LIVE ONE — read
+[the second sampled profile (dev `76128bf`)](results/2026-09-21-sampled-profile-2.md) before proposing
+any of it.** The table here was read off instruction COUNTS, and the sampler says the time is not
+where the counts are; the first sampled profile
+([dev `c26567e`](results/2026-09-21-sampled-profile.md)) then had its own headline closed by sysl
+0.0.122, so its ranking is history as well. **The current ranking, with ceilings, is the table at the
+end of the second profile.** In one line each:
+
+| | candidate | weighted share | ceiling |
+|---|---|---|---|
+| 1 | inline `Buf.push` the way 0.0.122 inlined `Buf.at` (**sysl's `buf.sysl`, not slate's**) | 18.5% | 10–15% |
+| 2 | a register machine instead of a stack machine | 15.5% | 10–15% |
+| 3 | stop re-asking `current()` in the hot helpers (`_tlv_get_addr`) — **new** | 4.3% | 3–4% |
+| 4 | inline caches for a field or a method | 6.5% | 3–4% |
+| 5 | module-level `var` cells, `StoreDef` | 3.7%, ~30% of `globals` | 0.5% of the mean |
+| 6 | `match_walk` — `for` heads, `match` arms, destructuring — **new** | 3.8% | 2–3% |
+| 7 | what `calls` and `csv` allocate per call — **an open question, not yet an item** | 8.9% | unknown |
+| 8 | a narrower `Value`, or NaN-boxing | 15.5% | 5–8% |
+| — | ~~borrowed reads / `Buf.at` retaining~~ | was 46.5%, now **0.6%** | **DONE in sysl 0.0.122** |
+| — | ~~the second bounds check inside `Buf.at`~~ | 2 instructions of a 20-instruction dispatch head | **STRUCK, under 1% of wall** |
 
 **AND ONE THAT WAS ON NO LINE AT ALL TURNED OUT TO BE THE LARGEST OF THEM: one instruction per
 operator** (2026-09-21, **-5.69%** of the geometric mean, `arith` -12.7%, twenty-two of twenty-three
@@ -144,21 +161,21 @@ programs faster; landed as dev `c26567e`). It is not here because the profile ab
 none — `BinaryOp` was 15.2% of every instruction executed and each of them re-asked, three times, an
 operator the compiler had already picked. **The lesson generalises, and is the reason to say so
 here: a shortlist read off an instruction count cannot see what an instruction DOES.** The remainder
-of item 11 — `methods_of` looking a method up by name at every call — is the same shape, and is the
-next place to look for one.
+of item 11 — `methods_of` looking a method up by name at every call — reads as the same shape and is
+**not**: both sampled profiles put it under 0.5% of wall, visible on `mapset` alone.
 
 | # | change | reach | kind |
 |---|---|---|---|
 | 1 | ~~**Stop emitting `PushNull`/`Discard` for a statement whose value nothing reads**~~ — **DONE, `fa327b6`**: 20.6% of all instructions gone, `arith` -24.0%, geometric mean against Lua 17.6x -> **16.4x**. **Its remainder — `if`, `match` and `try` written as STATEMENTS — landed 2026-09-20 and `bench/` cannot see it**: nineteen of the twenty-two programs here hold no conditional at all, so the whole set moved 0.005% while a loop written around an unread `if` moved -12.4% | measured above | INCREMENTAL, and the set is what is missing |
 | 2 | ~~**Fix the module-level loop's per-turn scope**~~ — **DONE, `de4e7c4`**: it WAS a defect. A module has no cells, and the `scoped_*` questions read `!e.cells` as "do not ask" rather than as "this chunk binds by name"; a module's blocks are asked `block_declares` now, guarded by the one binding form an expression can hide (`Emit.tests_bind`). `globals` 6,000,000 `PushScope`/`PopScope` pairs, 5,998,602 allocator steps and 4,288 collections all to **zero**, -14.8% wall, 21.8x -> **18.1x** Lua. **The three geometric means do not move** — one benchmark of twenty-two — and the win is in every top-level script instead | measured above | INCREMENTAL, and it was a defect |
-| 3 | ~~**Make `Tick` cheaper or rarer**~~ — **DONE, 2026-09-20**: a loop body's statements give their safe points up to ONE at the top of the loop, which is the only place a statement runs more than once for having been written once; everything outside a loop keeps its own, because `heap_limit` is read at a safe point and nowhere else. **4.45% of all instructions gone and `Tick` itself down 46.5%**, geometric mean against Lua **8.63x -> 8.55x (-0.97%)**, confirmed to two decimals on two instruments. `branches` -5.2%, `mapset` -4.7%, `arith` -3.6%; `dispatch` +4.2% on FEWER instructions and no collector at all, which is code layout. A `Tick` costs about a third of an average instruction. **The hole it left — a chunk whose body is one EXPRESSION carried no safe point at all, so a recursion through one could be neither collected nor interrupted — was closed 2026-09-21**, for +2.07% of all instructions and **+0.49%** of the geometric mean; the section at the foot of this page has the numbers | measured above | INCREMENTAL |
+| 3 | ~~**Make `Tick` cheaper or rarer**~~ — **DONE, 2026-09-20**: a loop body's statements give their safe points up to ONE at the top of the loop, which is the only place a statement runs more than once for having been written once; everything outside a loop keeps its own, because `heap_limit` is read at a safe point and nowhere else. **4.45% of all instructions gone and `Tick` itself down 46.5%**, geometric mean against Lua **8.63x -> 8.55x (-0.97%)**, confirmed to two decimals on two instruments. `branches` -5.2%, `mapset` -4.7%, `arith` -3.6%; `dispatch` +4.2% on FEWER instructions and no collector at all, which is code layout. A `Tick` costs about a third of an average instruction. **The hole it left — a chunk whose body is one EXPRESSION carried no safe point at all, so a recursion through one could be neither collected nor interrupted — was closed 2026-09-21**, for +2.07% of all instructions and **+0.49%** of the geometric mean; [its write-up](results/2026-09-21-expression-bodied-chunk-safepoint.md) has the numbers | measured above | INCREMENTAL |
 | 4 | ~~**Cache a string's character count on the `StrObj`, and index from a cached cursor**~~ — **DONE, `7478d4b`**: the count is CARRIED rather than cached, so `.length` is O(1) always; `strindex` 980x -> **5.5x** Lua (190x faster), the new `strwalk` 30.3x -> **0.1x** (322x faster), geometric mean against Lua over the original twenty **17.4x -> 13.4x** by this item alone | measured above | INCREMENTAL |
 | 5 | ~~**Resolve a module-level definition's call target at compile time** so `add3(...)` is not a `LoadName`~~ — **DONE, 2026-09-20, with 6**: a definition at a file's own top level whose spelling nothing else in the file binds or writes is a `LoadDef` into a table, and a read of a spelling something turns out to bind is put back before the file is finished. `funcs` 4,000,002 `LoadName` → **1**, `fib` 11,405,774 → **1**. **The reach claimed here for `globals` was WRONG** — its names are module-level `var`s, which are assigned and so cannot be resolved to a value at all; it moved 0.0% | measured above | INCREMENTAL |
 | 6 | ~~**Emit `JumpIfGiven` only for a parameter that can be absent**~~ — **DONE, 2026-09-20, with 5**: the frame is laid with an absence in every parameter cell a call did not fill, so a required parameter and a `b?` are guarded by nothing and an ordinary function has no head at all. **`JumpIfGiven` to ZERO on every benchmark that had one** — `funcs` 12,000,000, `fib` 11,405,773, `calls` 6,000,001, `closures` 4,000,000. Together with 5: `funcs` **-10.7%** of its instructions and **-8.9%** of its wall, `fib` **-7.4%** and **-12.7%**, geometric mean against Lua 8.8x → **8.5x** | measured above | INCREMENTAL |
 | 7 | ~~**Raise `Headroom` with the payload, or schedule payload separately from cells**~~ — **DONE, 2026-09-19**: payload is a schedule of its own, with a floor of its own, because a collection costs the OBJECT GRAPH and not the bytes. `strings` 123,925 collections -> **45,627** and 233 ms of collector -> 92 ms, **-12.8%** wall; `alloc` 18,292 -> 3,685. Peak RSS 14.3 MB -> 30.9 MB on `strings` and unchanged on a buffer-dropping program; a 4 MiB floor was measured (-16%, 83 MB) and refused. **The three geometric means do not move** — one benchmark of twenty-two | measured above | INCREMENTAL |
 | 8 | ~~**Make `Map`/`Set` cheaper for scalar keys**~~ — **DONE, `06b2b6c`**: the hook lookup was two mallocs a call and is gone; a table under nine entries has no index. `mapset` 53.9x -> **49.1x**, `alloc` -6.8%, `fields` -2.4% | measured above | INCREMENTAL |
-| 9 | **A register machine instead of a stack machine** -- `LoadSlot` is 18.0% and `PushInt` 8.6%, and most of both exist only to feed the next instruction | 26.6% of all instructions, and it would take most of 1, 3 and 5 with it | **STRUCTURAL -- not piecemeal** |
-| 10 | **A narrower `Value`, or NaN-boxing** | every instruction; nothing here measures it directly | **STRUCTURAL -- not piecemeal** |
+| 9 | **A register machine instead of a stack machine** -- `LoadSlot` is 18.0% and `PushInt` 8.6%, and most of both exist only to feed the next instruction. **Sampled: 15.5% of wall**, nearly all of it `Buf.push<Value>` | 26.6% of all instructions, and it would take most of 1, 3 and 5 with it | **STRUCTURAL -- not piecemeal** |
+| 10 | **A narrower `Value`, or NaN-boxing**. **Sampled: 5–8%**, down from the first profile's 10–15% now that the read side is inlined | every instruction; nothing here measures it directly | **STRUCTURAL -- not piecemeal** |
 | 11 | ~~**Make the CALL PATH cheaper** -- the argument `Buf` is a malloc per call, `Buf.at` retains and releases it on every read~~ — **DONE in two halves**. `call-args` + `ctor-calls`: an ordinary positional call allocates nothing (69 ns off every one of `fib`'s eleven million) and neither does a positional construction (59 ns off every one of `calls`'s two million). `native-args`, 2026-09-20: a BUILTIN reads its arguments through a window onto the stack they are standing on, so the malloc, the free, the copies and the per-argument hold are gone from the call slate makes most of — `mapset` **-25.6%** (47.4x -> **34.1x** Lua), `csv` **-13.5%**, geometric mean against Lua 8.9x -> **8.65x**, and twenty of the twenty-two read zero. **`methods_of` looking a method up by name every time is what is LEFT of this item** | measured above | INCREMENTAL, and both halves have landed |
 
 **THE RANKING BELOW ITEM 1 IS UNCHANGED, AND THE PROFILE THAT WOULD HAVE CHANGED IT DID NOT.** Item
@@ -184,6 +201,7 @@ engineering and can be had one release at a time.
 
 | date | write-up | headline |
 |---|---|---|
+| 2026-09-21 | [A second sampled profile, after 0.0.122 and the superinstructions (dev `76128bf`)](results/2026-09-21-sampled-profile-2.md) | **the live ranking**: `Buf.at` 32.4% → 0.6% (closed), `Buf.push<Value>` now 15.3%, `run_frames` 21.9%, `current()` through `_tlv_get_addr` 4.3% |
 | 2026-09-21 | [2026-09-21 — sysl 0.0.122: the borrowed-read fix, and `-O2` becomes the default](results/2026-09-21-sysl-0-0-122.md) | sysl 0.0.122 borrowed-read fix + -O2 default: -35.5% then -6.52%; new position 4.34x/3.35x/2.29x |
 | 2026-09-21 | [2026-09-21 — SUPERINSTRUCTIONS: TWO INSTRUCTIONS RUN AS ONE, AND THE LARGEST WIN ON THIS PAGE](results/2026-09-21-superinstructions.md) | superinstructions: -9.17% geometric mean, the largest single win on the page |
 | 2026-09-21 | [2026-09-21 — cheaper frames: the chunk is read once per call and never on a return (`chunk-per-call`)](results/2026-09-21-chunk-per-call.md) | cheaper frames, chunk read once per call: -3.02% geometric mean |
