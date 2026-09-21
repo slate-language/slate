@@ -346,3 +346,91 @@ A_HUNDRED_THOUSAND_TURNS_OVER_AN_UNREAD_if_AND_AN_UNREAD_match_DO_NOT_MOVE_THE_S
     assertEq(i, 100000)
     assertEq(total, 83334)
     assertEq(hits, 5275000)
+
+@test
+A_catch_TAKES_A_PATTERN_AND_A_BARE_NAME_STILL_BINDS_EVERYTHING() =
+    boom(m)
+        throw m
+
+    val plain = try
+        boom("no")
+    catch e
+        e.message
+
+    val picked = try
+        boom("no")
+    catch { message: "yes" }
+        "wrong one"
+    catch { message: "no" }
+        "right one"
+
+    assertEq(plain, "no")
+    assertEq(picked, "right one")
+
+@test
+THE_catch_CLAUSES_ARE_TRIED_IN_THE_ORDER_THEY_ARE_WRITTEN() =
+    boom(m)
+        throw m
+
+    look(m)
+        try
+            boom(m)
+        catch { message: "a" }
+            "first"
+        catch { message: "b" }
+            "second"
+        catch e
+            "last " + e.message
+
+    assertEq(look("a"), "first")
+    assertEq(look("b"), "second")
+    assertEq(look("c"), "last c")
+
+@test
+A_catch_CLAUSE_TAKES_A_GUARD_AND_A_REFUSED_GUARD_LETS_THE_NEXT_ONE_TRY() =
+    boom(m)
+        throw m
+
+    look(m)
+        try
+            boom(m)
+        catch e if e.message == "big"
+            "guarded"
+        catch e
+            "plain " + e.message
+
+    assertEq(look("big"), "guarded")
+    assertEq(look("small"), "plain small")
+
+@test
+A_FAULT_NO_catch_CLAUSE_WANTED_IS_THROWN_AGAIN_AND_AN_ENCLOSING_ONE_GETS_IT() =
+    boom()
+        throw "inner"
+
+    val said = try
+        try
+            boom()
+        catch { message: "other" }
+            "swallowed"
+    catch e
+        "outer saw " + e.message
+
+    assertEq(said, "outer saw inner")
+
+    // And with nothing around it, it is the program's fault again -- the words kept.
+    unwanted()
+        try
+            boom()
+        catch { message: "other" }
+            "swallowed"
+
+    assertFaults(unwanted)
+
+@test
+THE_POSTFIX_catch_TAKES_A_PATTERN_AND_ONE_CLAUSE() =
+    boom()
+        throw "gone"
+
+    assertEq(boom() catch { message: "gone" } -> 0, 0)
+    assertEq(boom() catch e if e.message == "gone" -> 1, 1)
+    assertFaults(() -> boom() catch { message: "other" } -> 0)
