@@ -6,12 +6,12 @@
 # usage: alternate.pl <rounds> <control-slate> <branch-slate>
 use strict;
 use warnings;
+use FindBin qw($RealBin);
 
 my ($rounds, $control, $branch) = @ARGV;
 die "usage: alternate.pl <rounds> <control> <branch>\n" unless defined $branch;
 
-my $here = $0;
-$here =~ s{/[^/]+$}{};
+my $here = $RealBin;
 
 my @progs = sort map { m{/([^/]+)\.sl$}; $1 } glob("$here/*.sl");
 my (%a, %b);
