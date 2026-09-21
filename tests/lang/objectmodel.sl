@@ -77,6 +77,32 @@ equals_is_the_same_function_as_the_operator() =
     assert((1).equals(1))
 
 @test
+a_universal_method_taken_off_a_value_is_the_bare_function_and_wants_that_value() =
+    // `o.m` on its own hands back the bare function, so the receiver is its first argument and a
+    // call is free to leave it out. Leaving it out is a mistake and is told so by name — the count
+    // is worked out past the receiver, and with no receiver there is no count to print.
+    val n = 10
+    val shown = n.toString
+
+    assertEq(shown(n), "10")
+    assertFaults(() -> shown(), "is a method, so the value it is about is its first argument")
+
+    val same = n.eq
+
+    assert(same(n, 10))
+    assertFaults(() -> same(), "`eq` is a method")
+    assertFaults(() -> same(n, 1, 2), "`eq` takes one argument and was given 2 arguments")
+
+    // The count a sentence prints is the one past the receiver, and a call written as a method
+    // always has one — so these two are the surplus and the shortfall, never the underflow.
+    assertFaults(() -> (42).toString(1), "`toString` takes no arguments and was given 1 argument")
+    assertFaults(() -> (10).equals(), "`equals` takes one argument and was given 0 arguments")
+
+    val other = n.ne
+
+    assertFaults(() -> other(), "`ne` is a method")
+
+@test
 a_class_that_writes_the_equality_operator_decides_both_of_them() =
     val m = Money.new(150)
 
