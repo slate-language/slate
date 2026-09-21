@@ -93,6 +93,83 @@ it went wrong 4 true
 `catch` binds looser than every arithmetic operator, so `a + b catch …` guards the sum, and tighter than
 the lambda arrow, so `x -> risky() catch e -> 0` gives the lambda a body that guards.
 
+## Sorting faults out: a `catch` takes a pattern
+
+**What follows `catch` is a pattern** — any pattern a [`match`](patterns.md) arm may carry, with the
+same optional `if` guard. A bare name is a pattern that matches everything, which is why every
+`catch` written before this still means what it did.
+
+**The block form takes as many clauses as you like and tries them in order:**
+
+```slate
+risky(n)
+    if n == 0 then throw "empty"
+    if n > 99 then throw "too big"
+
+    n
+
+look(n)
+    try
+        print(risky(n))
+    catch { message: "empty" }
+        print("nothing there")
+    catch e if e.message == "too big"
+        print("out of range")
+    catch e
+        print(s"other: ${e.message}")
+
+look(0)
+look(500)
+look(7)
+```
+
+```output
+nothing there
+out of range
+7
+```
+
+**A fault no clause wanted is thrown again**, so a run of clauses is a filter rather than a `try`
+that swallows — the enclosing handler, or the program's own end, gets it:
+
+```slate
+go()
+    throw "not one of them"
+
+try
+    go()
+catch { message: "expected" }
+    print("handled")
+```
+
+```error
+not one of them
+```
+
+It keeps the fault's own words; **the line becomes the `catch`'s**, which is what
+[`throw`](#throw) says everywhere else and is the only reading a flattened fault allows.
+
+**A clause matches the fault OBJECT** — `message`, `line` and `file` and nothing else. A `throw` of
+anything that is not a string is rendered into `message` on the way out, so what a pattern has to
+work with is the sentence and where it was raised.
+
+**The postfix form takes one clause**, there being nowhere to write a second — the arrow's body runs
+to the end of the expression. A fault worth sorting into several clauses is what the block form is
+for.
+
+```slate
+risky()
+    throw "gone"
+
+val n = risky() catch { message: "gone" } -> 0
+
+print(n)
+```
+
+```output
+0
+```
+
 ## The fault object
 
 **A fault is an ordinary object** — `message`, `line` and `file` — for the same reason a module is one:
