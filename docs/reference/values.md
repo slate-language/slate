@@ -267,6 +267,26 @@ print(indexOf("héllo", "llo"))      // by character; it is 3 by byte
 There is no character type: a single character is a string of one. That is what lets indexing, `chars`
 and `split` all hand back the same kind of thing.
 
+**`s.at(i)` reads one character and counts back from the end where the position is negative**, which
+is what `xs.at(-1)` is for an array and is the whole reason JavaScript grew `at` beside `s[i]`. It
+counts characters like everything else here, and a position past either end is a **fault** rather
+than an absence, slate storing no `undefined` for such a read to hand back.
+
+**A `for` walks a string's characters**, which is `chars(s)` without the array in the middle:
+
+```slate
+print("a👋b".at(-1), "a👋b".at(1))
+
+for c in "a👋"
+    print(c)
+```
+
+```output
+b 👋
+a
+👋
+```
+
 **`.length` is that count read as a property** — a name a `.` answers with a value and no brackets
 after it, exactly as a class's `get` is read. `s.length` counts characters and not UTF-16 units, so
 a string of one emoji is 1 here where JavaScript says 2. An array carries one too, and so does a

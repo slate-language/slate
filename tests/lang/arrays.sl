@@ -243,3 +243,86 @@ findLast_walks_from_the_other_end() =
 @test
 the_new_eight_chain_with_the_ones_that_were_already_there() =
     assertEq([4, 1, 3, 2].sorted().slice(1, 3).flatMap(n -> [n, n]).at(-1), 3)
+
+@test
+an_array_answers_the_three_walks_an_object_answers_and_its_key_is_the_position() =
+    val xs = ["a", "b", "c"]
+
+    assertEq(xs.keys(), [0, 1, 2])
+    assertEq(xs.values(), ["a", "b", "c"])
+    assertEq(xs.entries(), [[0, "a"], [1, "b"], [2, "c"]])
+
+    // The whole reason they are here: the indexed walk, which had no spelling.
+    var said = []
+
+    for [i, x] in xs.entries()
+        push(said, s"${i}${x}")
+
+    assertEq(said, ["0a", "1b", "2c"])
+
+    // `values` copies, so changing the answer leaves the array alone.
+    val copy = xs.values()
+
+    push(copy, "d")
+    assertEq(xs, ["a", "b", "c"])
+
+@test
+toReversed_is_reversed_under_javascripts_spelling() =
+    val xs = [1, 2, 3]
+
+    assertEq(xs.toReversed(), [3, 2, 1])
+    assertEq(xs, [1, 2, 3])
+    assertEq(toReversed(xs), reversed(xs))
+
+@test
+array_walks_everything_a_for_walks() =
+    counting()
+        yield 1
+        yield 2
+
+    assertEq(array(0..<4), [0, 1, 2, 3])
+    assertEq(array(1..3), [1, 2, 3])
+    assertEq(array(counting()), [1, 2])
+    assertEq(array(Set([1, 2, 2])), [1, 2])
+    assertEq(array(Map([["a", 1]])), [["a", 1]])
+    assertEq(array(toBytes("hi")), [104, 105])
+
+    // An array is COPIED, which is what a conversion means everywhere else.
+    val xs = [1, 2]
+    val copy = array(xs)
+
+    push(copy, 3)
+    assertEq(xs, [1, 2])
+
+@test
+a_spread_spreads_everything_array_takes() =
+    counting()
+        yield 1
+        yield 2
+
+    add(a, b) = a + b
+
+    assertEq([...0..<3], [0, 1, 2])
+    assertEq([...counting()], [1, 2])
+    assertEq([...toBytes("hi")], [104, 105])
+    assertEq(add(...counting()), 3)
+
+@test
+a_position_out_of_range_is_reported_as_the_program_wrote_it() =
+    // A negative position is folded before it is checked, so the sentence has to name the number
+    // that was written rather than the folded one -- and both back ends have to name the same.
+    val said = (anything([1, 2, 3]).at(-9)) catch e -> e.message
+
+    assert(said.contains("the position -9"))
+    assert(said.contains("this array has 3 of them"))
+
+@test
+zip_lines_up_anything_walkable_and_the_shortest_side_decides() =
+    counting()
+        yield 10
+        yield 20
+        yield 30
+
+    assertEq(zip(0..<3, ["a", "b", "c"]), [[0, "a"], [1, "b"], [2, "c"]])
+    assertEq(zip([1, 2], [3, 4, 5]), [[1, 3], [2, 4]])
+    assertEq(zip(counting(), ["a", "b"]), [[10, "a"], [20, "b"]])

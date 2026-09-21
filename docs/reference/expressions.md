@@ -249,29 +249,50 @@ print(base with { c: 3 })
 
 It binds as tightly as a field selection, so `a + b with { … }` changes `b` rather than the sum.
 
-**There is no spread in a literal.** `{ ...o, b: 2 }` is `o with { b: 2 }` and `[...xs, y]` is
-`concat(xs, [y])`, both of which slate has, so a second spelling would buy nothing.
+## Spread
 
-## Spread in a call
-
-`f(...xs)` is the one spread slate has, and it exists because a computed argument list had no spelling
-at all:
+`f(...xs)` exists because a computed argument list had no spelling at all, and an array literal and
+an object literal take one too — `[...xs, y]` is `concat(xs, [y])` written the way a reader expects,
+and `{ ...o, b: 2 }` is `o with { b: 2 }`:
 
 ```slate
 show(...parts) = join(parts, "-")
 val xs = ["b", "c"]
+val o = { a: 1 }
 
 print(show(...xs))
 print(show("a", ...xs, "d"))        // in any order, any number of times
+print([...xs, "d"], { ...o, b: 2 })
 ```
 
 ```output
 b-c
 a-b-c-d
+["b", "c", "d"] {a: 1, b: 2}
 ```
 
-Spreading something that is not an array is a fault naming the spread rather than the call. **The
-[checker](types.md) says nothing about a call that spreads**, the argument count being a run-time fact.
+**What may be spread is exactly what a [`for`](statements.md#loops) walks and what `array(x)` takes:
+an array, bytes, a range, a generator, a set or a map.** A map spreads its pairs and a buffer the
+number at each position; a generator is run out, which is the only way there is to know what it
+holds. A **string** is deliberately not on that list — `chars(s)` is how slate spells one as its
+characters, and a spread that flattened text would be a surprise in every program that meant to pass
+one string.
+
+```slate
+counting()
+    yield 1
+    yield 2
+
+print([...0..<3], [...counting()], [...Set(["a"])])
+```
+
+```output
+[0, 1, 2] [1, 2] ["a"]
+```
+
+Spreading anything else is a fault naming the spread rather than the call, because that is where the
+reader has to look. **The [checker](types.md) says nothing about a call that spreads**, the argument
+count being a run-time fact.
 
 ## `match`
 

@@ -179,6 +179,44 @@ bytes_go_out_and_come_back_as_a_result() =
 asking_a_string_for_something_only_an_array_can_do_is_a_fault() =
     assert((anything("abc").push(1)) catch e -> true)
 
+@test
+at_reads_one_character_and_counts_back_from_the_end() =
+    assertEq("abc".at(0), "a")
+    assertEq("abc".at(-1), "c")
+
+    // Characters and not UTF-16 units, which is what every other name on a string counts in.
+    assertEq("a👋".at(-1), "👋")
+    assertEq("a👋b".at(1), "👋")
+
+    // Past either end is a fault and not an absence, which is the array's rule.
+    assert((anything("abc").at(3)) catch e -> true)
+    assert((anything("abc").at(-4)) catch e -> true)
+
+@test
+toUpperCase_and_toLowerCase_are_upper_and_lower_under_javascripts_spelling() =
+    assertEq("straße".toUpperCase(), upper("straße"))
+    assertEq("ΟΔΟΣ".toLowerCase(), lower("ΟΔΟΣ"))
+    assertEq(toUpperCase("abc"), "ABC")
+    assertEq(toLowerCase("ABC"), "abc")
+
+@test
+a_for_walks_a_strings_characters() =
+    var seen = []
+
+    for c in "a👋b"
+        push(seen, c)
+
+    assertEq(seen, ["a", "👋", "b"])
+    assertEq(seen, chars("a👋b"))
+
+    // Every character is one element however many bytes it takes.
+    var count = 0
+
+    for c in "héllo"
+        count = count + 1
+
+    assertEq(count, 5)
+
 // A value the checker cannot see the type of, so the refusal is the machine's rather than the
 // compiler's.
 anything(v) = v

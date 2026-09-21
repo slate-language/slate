@@ -46,8 +46,8 @@ false
 ## Text
 
 `chars  split  join  contains  includes  indexOf  lastIndexOf  startsWith  endsWith`
-`trim  trimStart  trimEnd  upper  lower  normalize  casefold  replace  replaceAll  repeat`
-`padStart  padEnd`
+`trim  trimStart  trimEnd  upper  lower  toUpperCase  toLowerCase  normalize  casefold`
+`replace  replaceAll  repeat  padStart  padEnd  at`
 
 Every position is **in characters**, never in bytes.
 
@@ -70,6 +70,24 @@ Every position is **in characters**, never in bytes.
 - **`padStart` and `padEnd` bring a string up to a width, in characters.** The filler REPEATS and is
   cut to fit, so `padStart("7", 5, "ab")` is `"abab7"`; a string already at or past the width is
   answered unchanged.
+- **`toUpperCase` and `toLowerCase` are `upper` and `lower` under JavaScript's spelling**, and they
+  are the same natives rather than a second implementation. Neither pair is deprecated: the short
+  names read better in slate's own prose, and these are what a reader arriving from JavaScript
+  writes first.
+- **`at(s, i)` reads one character, counting back from the end where the position is negative** —
+  which is what `xs.at(-1)` is for an array, and is why JavaScript grew `at` beside `s[i]`. It counts
+  in characters like everything else, so `"a👋".at(-1)` is the wave and not half of it, and a
+  position past either end is a **fault** rather than an absence.
+
+```slate
+print("abc".at(-1), "a👋".at(-1))
+print("straße".toUpperCase(), "ΟΔΟΣ".toLowerCase())
+```
+
+```output
+c 👋
+STRASSE οδος
+```
 
 ```slate
 print(upper("Straße"), lower("ΟΔΟΣ"))
@@ -91,12 +109,26 @@ a-b-c true
 `"a👋".length` is 2. Writing to it is refused.
 
 As methods, a string answers: `chars split contains includes indexOf lastIndexOf startsWith
-endsWith trim trimStart trimEnd upper lower normalize casefold replace replaceAll repeat padStart
-padEnd number integer real boolean string`.
+endsWith trim trimStart trimEnd upper lower toUpperCase toLowerCase normalize casefold replace
+replaceAll repeat padStart padEnd at number integer real boolean string`.
+
+**A `for` walks a string's characters**, which is what every other name on a string counts in and is
+what JavaScript's `for...of` yields — so `chars(s)` is only wanted where the array itself is:
+
+```slate
+for c in "a👋b"
+    print(c)
+```
+
+```output
+a
+👋
+b
+```
 
 ## Numbers
 
-`abs  floor  ceil  round  trunc  sqrt  pow  min  max  random`
+`abs  floor  ceil  round  trunc  sqrt  pow  min  max  random  isNaN  isFinite`
 `toFixed  toExponential  toPrecision  formatNumber`
 `sin  cos  tan  asin  acos  atan  atan2  sinh  cosh  tanh  log  log2  log10  exp  cbrt  hypot`
 `PI  E`
@@ -106,6 +138,13 @@ padEnd number integer real boolean string`.
   them was — a `min` that answered a real for two integers would make every use of it in an index a
   conversion.
 - `pow` of two integers with a non-negative exponent answers an **integer**.
+- **`isNaN(v)` and `isFinite(v)` are `Number.isNaN` and `Number.isFinite`, not JavaScript's bare
+  globals.** Nothing is converted, so a value that is not a number is simply **not NaN and not
+  finite either** — `isNaN("x")` is `false` here where JavaScript's global says `true`. A program
+  asking about text writes `isNaN(number(s))`, which says what it is doing. A whole number is finite
+  and is never NaN, however big it has grown. **`isNaN` is the one way to ask**, since a program may
+  not rest on `x == x` answering false: slate's `==` is `same`, which a class may decide for itself.
+  Both are calls rather than methods, a method being found by the kind of its receiver.
 - **`random()` answers a real in `[0, 1)`** and takes no arguments, which is JavaScript's
   `Math.random()` under its own name — 53 bits, and never `1.0`. It is **not a source of secrets**:
   a handful of draws gives away every draw that follows, so a key, a token, a nonce or a password
@@ -160,6 +199,16 @@ print(log(0), log(-1))
 ```
 
 ```slate
+print(isNaN(0.0 / 0.0), isNaN(1.5), isNaN("x"))
+print(isFinite(1), isFinite(1.5), isFinite(1.0 / 0.0), isFinite("x"))
+```
+
+```output
+true false false
+true true false false
+```
+
+```slate
 print(toFixed(1234.5, 2), toFixed(2.5, 0))
 print(formatNumber(1234567), formatNumber(toFixed(1234.5, 2)))
 print(formatNumber(toFixed(1234.5, 2), { separator: " ", decimal: "," }))
@@ -208,7 +257,8 @@ formatNumber`. `atan2`, `hypot`,
 
 `push  pop  shift  unshift  insert  removeAt  clear`
 `map  filter  flatMap  forEach  reduce  find  findIndex  findLast  findLastIndex  every  some`
-`sort  sorted  reverse  reversed  slice  at  concat  flat  sum  join  contains  indexOf  lastIndexOf`
+`sort  sorted  reverse  reversed  toReversed  slice  at  concat  flat  sum  join  contains`
+`indexOf  lastIndexOf  keys  values  entries  zip  array`
 
 ```slate
 print([4, 1, 3, 2].sorted().slice(1, 3).flatMap(n -> [n, n]).at(-1))
@@ -222,6 +272,61 @@ print([1, 2, 3].at(-1), [1, 2, 3].reversed())
 6 [1, 2, [3]]
 null 2
 3 [3, 2, 1]
+```
+
+**An array answers the same three walks an object answers, and its key is the POSITION.**
+`xs.entries()` is `[[0, x0], [1, x1], …]`, which is what makes `for [i, x] in xs.entries()` the
+indexed walk — the one loop slate had no spelling for, `for i, x in xs` being refused by the syntax
+rule and a map already walking as pairs. `keys` answers the positions and `values` a copy of the
+elements, which is JavaScript's `Array.prototype.keys`/`values`/`entries` with an array in place of
+the iterator.
+
+**`toReversed` is `reversed` under JavaScript's spelling** and is the same native: the bare verb
+changes the array and the participle answers a new one, which is the pair JavaScript reached too.
+
+```slate
+val xs = ["a", "b", "c"]
+
+print(xs.keys(), xs.values(), xs.entries())
+
+for [i, x] in xs.entries()
+    print(i, x)
+
+print([1, 2, 3].toReversed())
+```
+
+```output
+[0, 1, 2] ["a", "b", "c"] [[0, "a"], [1, "b"], [2, "c"]]
+0 a
+1 b
+2 c
+[3, 2, 1]
+```
+
+**`array(x)` answers everything `x` yields, in an array** — the type word is the conversion, which is
+the rule `string`, `integer`, `real` and `boolean` already follow. What it takes is exactly what a
+`for` walks and what `...` spreads: **an array, bytes, a range, a generator, a set or a map**, a map
+yielding its pairs. An array given to it is **copied**, which is what a conversion means everywhere
+else. A string is deliberately not on that list — `chars(s)` is how slate spells one as its
+characters.
+
+**`zip` walks every side rather than indexing it**, so the same list goes in there: `zip(0..<3, names)`
+is the numbered walk a program writes it for, and the **shortest** side decides the length.
+
+```slate
+squares()
+    yield 1
+    yield 4
+
+print(array(0..<4), array(Set([1, 2, 2])), array(toBytes("hi")))
+print(array(squares()), [...squares()])
+print(zip(0..<3, ["a", "b", "c"]))
+```
+
+```output
+[0, 1, 2, 3] [1, 2] [104, 105]
+[1, 4] [1, 4]
+[[0, "a"], [1, "b"], [2, "c"]]
 ```
 
 **`length` is a property and not a method**, so it is read with no brackets after it — `xs.length` is
@@ -304,6 +409,9 @@ Where slate parts from JavaScript it is **to remove a case rather than add one**
 ## Objects
 
 `keys  values  entries  has  without`
+
+**`keys`, `values` and `entries` answer for an ARRAY too**, with the position for a key — see
+[Arrays](#arrays) above. Everything else here is an object's alone.
 
 ```slate
 val o = { a: 1, b: 2 }

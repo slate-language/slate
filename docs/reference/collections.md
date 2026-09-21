@@ -303,9 +303,23 @@ print(Set([1, 2]).length)
 
 ## Building one from anything walkable
 
-`Set(x)` takes an array, a range, a generator, another set, or a map; `Map(x)` reads a list of
+`Set(x)` takes an array, bytes, a range, a generator, another set, or a map; `Map(x)` reads a list of
 pairs, which is the shape `entries()` answers with — so `Map(m.entries())` copies a map, and so does
 `Map(m)`.
+
+**That list is the one `for`, `...` and `array(x)` all read**, so a value cannot mean one thing in a
+`Set` and another in a spread. `array(x)` is the same question asked the other way — everything `x`
+yields, as an array — which is how a set or a map is turned back into one:
+
+```slate
+print(array(Set([3, 1, 2])), array(Map([["a", 1]])))
+print(array(0..<3))
+```
+
+```output
+[3, 1, 2] [["a", 1]]
+[0, 1, 2]
+```
 
 ```slate
 print(Set([3, 1, 2, 3]))

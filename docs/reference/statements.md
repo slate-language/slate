@@ -208,6 +208,21 @@ A `for` over a range walks every number it covers, and [`by`](expressions.md#by-
 is how that range takes a step: `for i in 0..<10 by 2` counts the evens, and `for i in 10..0 by -1`
 counts down.
 
+**What a `for` walks is an array, bytes, a string, a range, a generator, a set or a map**, and
+anything else is refused naming all seven. A **string** walks its characters, which is what every
+other name on a string counts in and what JavaScript's `for...of` yields; a **map** walks its pairs;
+a **buffer** walks the number at each position.
+
+```slate
+for c in "a👋"
+    print(c)
+```
+
+```output
+a
+👋
+```
+
 **`for await x in source`** is the fourth, and it walks something that answers `next()` a value at a
 time — see [Asynchrony](asynchrony.md).
 
@@ -221,6 +236,19 @@ for [k, v] in entries({ a: 1, b: 2 })
 ```output
 a 1
 b 2
+```
+
+**An array answers `entries()` too, with the position for a key**, which is how the indexed walk is
+written — there is no `for i, x in xs`, a head binding one element:
+
+```slate
+for [i, x] in ["a", "b"].entries()
+    print(i, x)
+```
+
+```output
+0 a
+1 b
 ```
 
 ### What a loop answers

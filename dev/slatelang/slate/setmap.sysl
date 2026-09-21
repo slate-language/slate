@@ -51,18 +51,56 @@ private live_count(t: *ObjectObj) -> usize = t.live
 // into a table that may grow, and a growth is where the collector runs. A `Buf[Value]` is not a
 // root, so the caller holds the collection it is filling and this holds nothing longer than it
 // takes to build.
-walked_values(v: Value, at: Span, what: string) -> Result[Buf[Value], Signal]
-    var out: Buf[Value] = buf()
+//
+// **The VERB is the caller's**, because the one sentence this answers with has to read as the
+// construct that wanted the walk: `...` *spreads* what `Set` *takes*, and a refusal phrased in the
+// other's words sends the reader to look at the wrong thing.
+walked_values(v: Value, at: Span, what: string, verb: string) -> Result[Buf[Value], Signal]
+    val mark = root_mark()
+    val holder = new_array(buf())
 
+    hold(Array(holder))
+
+    val outcome = walked_into(holder, v, at, what, verb)
+
+    outcome match
+        Err(e) ->
+            release(mark)
+            Err(e)
+        Ok(_) ->
+            // Copied out while the array still holds every value. A `Buf` is sysl memory and its
+            // `push` allocates nothing the collector manages, so nothing can be freed between the
+            // first copy and the last.
+            var out: Buf[Value] = buf()
+
+            for i in 0..<holder.items.len()
+                out.push(holder.items.at(i))
+
+            release(mark)
+            Ok(out)
+end walked_values
+
+// The same walk, straight into an array the CALLER is holding.
+//
+// **This is the primary form and `walked_values` is the wrapper, which is the other way round from
+// how it reads.** A generator's arm runs slate code -- a program, which allocates -- between one
+// value and the next, and a map's arm builds a fresh pair per entry; a `Buf[Value]` is not a root,
+// so values already gathered into one are invisible to a collection that lands mid-walk. Pushing
+// into a held `ArrayObj` roots each value the instant it is produced, which is the rule in
+// `CLAUDE.md`'s *A `Value` in a sysl local is not a root* read at the one place that walks a
+// program while gathering.
+walked_into(out: *ArrayObj, v: Value, at: Span, what: string, verb: string) -> Result[unit, Signal]
     v match
         Array(a) ->
+            // The length is read afresh each turn: nothing on this arm calls back into slate, so it
+            // cannot change, and a `for` over the live length costs no more than a saved bound.
             for i in 0..<a.items.len()
-                out.push(a.items.at(i))
+                array_push(out, a.items.at(i))
         SetVal(t) ->
             for i in 0..<t.entries.len()
                 val e = t.entries.at(i)
 
-                if !e.dead then out.push(e.key)
+                if !e.dead then array_push(out, e.key)
 
         // **A map yields its pairs**, which is what `for (k, v) in m` unpacks and what `Map(m)`
         // reads back -- so a map spread into a `Map` is a copy of it, as an array spread into an
@@ -76,22 +114,29 @@ walked_values(v: Value, at: Span, what: string) -> Result[Buf[Value], Signal]
 
                     pair.push(e.key)
                     pair.push(e.value)
-                    out.push(Array(new_array(pair)))
+                    array_push(out, Array(new_array(pair)))
         RangeVal(lo, hi, inclusive, has_lo, has_hi, step) ->
             if !has_lo || !has_hi
                 return Err(failure(at, s"${what} needs a range with both ends, since one left out would never finish"))
 
             for i in 0..<range_count(lo, hi, inclusive, step)
-                out.push(Int(range_at(lo, step, i)))
+                array_push(out, Int(range_at(lo, step, i)))
         Gen(id, gen) ->
             loop
                 gen_iter_next(id, gen, at)? match
                     None -> break
-                    Some(one) -> out.push(one)
-        other -> return Err(failure(at, s"${what} takes an array, a range, a generator, a set or a map, and this is ${other.type_name()}"))
+                    Some(one) -> array_push(out, one)
 
-    Ok(out)
-end walked_values
+        // **A buffer yields the NUMBER at each position**, which is what `for` over one already
+        // yields and what `toArray` already answers -- so `array(bs)` and `bs.toArray()` are one
+        // answer reached two ways rather than two readings of a buffer.
+        Bytes(p) ->
+            for i in 0..<p.data.len()
+                array_push(out, Int(long(p.data.at(i))))
+        other -> return Err(failure(at, s"${what} ${verb} an array, bytes, a range, a generator, a set or a map, and this is ${other.type_name()}"))
+
+    Ok(())
+end walked_into
 
 // -- sets -----------------------------------------------------------------------------------------
 
@@ -113,7 +158,7 @@ end do_set_new
 
 private fill_set(made: Value, args: Args, at: Span) -> Step
     if args.len() == 1
-        val each = walked_values(args.at(0), at, "`Set`")?
+        val each = walked_values(args.at(0), at, "`Set`", "takes")?
         val t = set_of(made, at, "Set")?
 
         for i in 0..<each.len()
@@ -179,12 +224,12 @@ do_set_size(args: Args, at: Span) -> Step
 do_set_values(args: Args, at: Span) -> Step
     takes_n(args, 1, at, "values", "a set")?
 
-    Ok(Array(new_array(walked_values(args.at(0), at, "`values`")?)))
+    Ok(Array(new_array(walked_values(args.at(0), at, "`values`", "takes")?)))
 
 do_set_for_each(args: Args, at: Span) -> Step
     takes_n(args, 2, at, "forEach", "a set and a function")?
 
-    val each = walked_values(args.at(0), at, "`forEach`")?
+    val each = walked_values(args.at(0), at, "`forEach`", "takes")?
 
     for i in 0..<each.len()
         call_one(args.at(1), each.at(i), at, "forEach")?
@@ -433,7 +478,7 @@ end do_map_new
 
 private fill_map(made: Value, args: Args, at: Span) -> Step
     if args.len() == 1
-        val each = walked_values(args.at(0), at, "`Map`")?
+        val each = walked_values(args.at(0), at, "`Map`", "takes")?
         val t = map_of(made, at, "Map")?
 
         for i in 0..<each.len()
@@ -534,13 +579,13 @@ end do_map_values
 do_map_entries(args: Args, at: Span) -> Step
     takes_n(args, 1, at, "entries", "a map")?
 
-    Ok(Array(new_array(walked_values(args.at(0), at, "`entries`")?)))
+    Ok(Array(new_array(walked_values(args.at(0), at, "`entries`", "takes")?)))
 
 // `forEach(m, f)` -- the function on every pair, as `for (k, v) in m` unpacks one.
 do_map_for_each(args: Args, at: Span) -> Step
     takes_n(args, 2, at, "forEach", "a map and a function")?
 
-    val each = walked_values(args.at(0), at, "`forEach`")?
+    val each = walked_values(args.at(0), at, "`forEach`", "takes")?
 
     for i in 0..<each.len()
         call_one(args.at(1), each.at(i), at, "forEach")?

@@ -394,3 +394,35 @@ a_binary_operator_left_dangling_at_the_end_of_a_line_continues_the_statement() =
         3 < 4
 
     assert(cmp)
+
+@test
+isNaN_and_isFinite_convert_nothing_and_so_answer_false_for_anything_else() =
+    val nan = 0.0 / 0.0
+    val huge = 1.0 / 0.0
+
+    assert(isNaN(nan))
+    assert(!isNaN(1.5))
+    assert(!isFinite(nan))
+    assert(!isFinite(huge))
+    assert(!isFinite(-huge))
+    assert(isFinite(1.5))
+
+    // A whole number is finite and is never NaN, however big it has grown.
+    assert(isFinite(1))
+    assert(!isNaN(1))
+    assert(isFinite(pow(2, 200)))
+
+    // These are `Number.isNaN` and `Number.isFinite`, not JavaScript's converting globals: text is
+    // simply not a number, so it is neither NaN nor finite.
+    assert(!isNaN("nonsense"))
+    assert(!isFinite("nonsense"))
+    assert(!isNaN(null))
+    assert(!isFinite(null))
+
+    // **Both are CALLS and neither is a method**, which is JavaScript's arrangement: they ask about
+    // any value at all, and a method is found by the kind of its receiver -- so `"x".isNaN()` would
+    // have to answer about a string, where the call answers `false` and says nothing.
+    assert((unseen(nan).isNaN()) catch e -> true)
+
+// A value the checker cannot see the type of, so the refusal above is the machine's.
+unseen(v) = v
