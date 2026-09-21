@@ -63,7 +63,9 @@ private thrown_message(v: Value) -> string = v match
 // **The JavaScript back end says the same words**, in `$.caught` in `js_rt_pat.sysl`: a program that
 // prints `e.message` from a `catch` must read alike on both.
 //
-private unbound_here(name: string) -> string
+// Not `private`: `run_compose.sysl`'s `compose_check_named` says the same sentence about an
+// annotated binding whose name is gone.
+unbound_here(name: string) -> string
     val known = current().entry_effects
 
     for i in 0..<known.len()
@@ -137,6 +139,15 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
     // would copy a frame per step.
     var given = if entering then lay_frame(u, chunk_ix, args) else given0
 
+    // **Where the last counted instruction stood**, which is what tells the profiler that this one
+    // ran directly after it rather than being arrived at by a call, a return, a jump or a resumed
+    // coroutine. A position alone is not enough -- a return lands one past its call -- so the frame's
+    // own `base` is carried with it, and a callee's base is never its caller's. These are read and
+    // written only under `profiling_here`, so a default build folds every use away with the branch.
+    var counted_pc = pc
+    var counted_base = base
+    var counted_any = false
+
     loop
         if pc >= code.len()
             // A chunk that ran off its end answers null, which only happens for an empty body.
@@ -145,13 +156,18 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
 
         val ins = code.at(pc)
         val at = ins.at
+        val here_pc = pc
 
         pc += 1
 
         // **One branch on a local, and that is the whole cost of the profiler when it is off.**
         // `profile.sysl` says why the instrument is shaped this way and `bench/README.md` carries
         // the measurement that says this costs nothing a benchmark can see.
-        if profiling_here then profile_step(ins.op)
+        if profiling_here
+            profile_step(ins.op, counted_any && here_pc == counted_pc + 1 && base == counted_base)
+            counted_pc = here_pc
+            counted_base = base
+            counted_any = true
 
         ins.op match
             // The object was built by the instructions above this one and nothing else has seen it
@@ -173,15 +189,7 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
             PushShape(pk, k) -> vm.stack.push(shape_value(u.patterns.at(pk), u.strings.at(k), vm.scope))
             PushExternal(k) -> vm.stack.push(External(k))
 
-            CheckType(k, t, pk) ->
-                val name = u.strings.at(k)
-
-                val v = lookup(vm.scope, name) match
-                    Some(found) -> found
-                    None -> return fault(at, unbound_here(name))
-
-                if !match_pattern(u.patterns.at(pk), v, vm.scope, false)
-                    return fault(at, s"`${name}` was declared ${u.strings.at(t)}, and was given ${show_value(v)}")
+            CheckType(k, t, pk) -> compose_check_named(u, vm, k, t, pk, at)?
 
             CheckSlot(i, k, t, pk) ->
                 val v = vm.stack.at(base + i)
@@ -189,9 +197,7 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
                 if !match_pattern(u.patterns.at(pk), v, vm.scope, false)
                     return fault(at, s"`${u.strings.at(k)}` was declared ${u.strings.at(t)}, and was given ${show_value(v)}")
 
-            CheckResult(t, pk) ->
-                if !match_pattern(u.patterns.at(pk), peek(0), vm.scope, false)
-                    return fault(at, s"this answers ${u.strings.at(t)}, and gave back ${show_value(peek(0))}")
+            CheckResult(t, pk) -> compose_check_result(u, vm, t, pk, at)?
 
             DefineTest(k) -> here.registered_tests.push(TestCase(u.strings.at(k), here.current_source, pop()))
             DefineHook(kind, k) -> set_hook(kind, u.strings.at(k), pop())
@@ -415,18 +421,7 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
                 vm.stack.truncate(vm.stack.len() - 1)
             Dup -> vm.stack.push(peek(0))
             DupAt(n) -> vm.stack.push(peek(n))
-            RotUp(n) ->
-                // `[a, b, c]` with an `n` of two becomes `[c, a, b]`: the top slides down and
-                // everything it passed shifts up one.
-                val top = vm.stack.len() - 1
-                val v = vm.stack.at(top)
-                var i = top
-
-                while i > top - n
-                    vm.stack.set(i, vm.stack.at(i - 1))
-                    i -= 1
-
-                vm.stack.set(top - n, v)
+            RotUp(n) -> compose_rot_up(vm, n)
 
             Join(n) -> compose_join(vm, n, at)?
             Repeat -> compose_repeat(vm, at)?
@@ -434,15 +429,7 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
             WithMerge(spread) -> compose_with_merge(vm, spread, at)?
             MakeRange(inclusive, has_lo, has_hi, has_step) ->
                 compose_range(vm, inclusive, has_lo, has_hi, has_step, at)?
-            Unpack(k, immutable) ->
-                val subject = pop()
-
-                // **A binding has no next arm, so a shape that does not fit is a fault**, where a
-                // `match` would simply let the next pattern try. The message says the pattern back
-                // and says what arrived, both being things the reader needs and neither being on
-                // the line by itself.
-                if !match_pattern(u.patterns.at(k), subject, vm.scope, !immutable)
-                    return fault(at, unpack_complaint(u.patterns.at(k), subject))
+            Unpack(k, immutable) -> compose_unpack(u, vm, k, immutable, at)?
 
             // The same, in a chunk whose names are numbered cells. **The subject is left standing
             // while the walk runs**, so what a `rest` pattern builds is reachable from the stack --
@@ -462,10 +449,7 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
 
                 if masked then vm.stack.push(Int(long(mask)))
 
-            IsPat(k, negated) ->
-                val took = match_pattern(u.patterns.at(k), pop(), vm.scope, false)
-
-                vm.stack.push(Bool(if negated then !took else took))
+            IsPat(k, negated) -> compose_is_pat(u, vm, k, negated)
 
             PushScope -> vm.scope = new_env(vm.scope)
             PopScope -> vm.scope = vm.scope.parent
@@ -482,26 +466,9 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
             // The same, and the closure also goes into the table a `LoadDef` reads. **The table grows
             // to reach the cell rather than being sized in advance**: a unit's definitions are
             // numbered across every file it holds, and a machine may run only some of them.
-            DefineDef(k, c, d) ->
-                val name = u.strings.at(k)
+            DefineDef(k, c, d) -> compose_define_def(u, vm, k, c, d)
 
-                declare(vm.scope, name, Null, false)
-
-                val made = Fn(new_closure(u.chunks.at(c).params, c, vm.scope))
-
-                declare(vm.scope, name, made, false)
-
-                val v = current()
-
-                while v.defs.len() <= d
-                    v.defs.push(Null)
-
-                v.defs.set(d, made)
-
-            TestPat(k) ->
-                val took = match_pattern(u.patterns.at(k), peek(0), vm.scope, false)
-
-                vm.stack.push(Bool(took))
+            TestPat(k) -> compose_test_pat(u, vm, k)
 
             // **Only an arm that TAKES writes its cells**, which is what its own scope used to do
             // for it: the arm after this one finds its own names wherever it put them, and one that
@@ -602,6 +569,28 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
                 // A full heap is reported where there is a line to point at; the allocator has no
                 // idea which statement it was serving.
                 if current().heap_exhausted then return fault(at, "this program has run out of memory")
+
+            // **THE FUSED PAIRS, AND THE `pc += 1` IN EACH IS WHAT STEPS OVER THE SLOT `fuse` LEFT
+            // STANDING.** The emitter overwrites only the first instruction of a pair, so the second
+            // is still in the code buffer for anything that jumps at it -- and an arm that forgot to
+            // skip it would run the tail twice. `run_fused.sysl` holds what each one does and
+            // `code.sysl` says why these four.
+            LoadSlot2(i, j) ->
+                fused_load_slot2(vm, base, i, j)
+                pc += 1
+            LoadSlotInt(i, v) ->
+                fused_load_slot_int(vm, base, i, v)
+                pc += 1
+            AddStoreSlot(i) ->
+                // `code.at(pc)` is the `StoreSlot` that was stepped over, read for its span alone
+                // and only where the sum is not a whole number -- which is the one path whose
+                // sentence belongs to the store rather than to the addition.
+                fused_add_store_slot(vm, base, i, at)? match
+                    None -> ()
+                    Some(v) -> stored_in_slot(vm, base, i, v, code.at(pc).at)?
+
+                pc += 1
+            LessJumpIfFalse(to) -> if fused_less_jump_if_false(at)? then pc = to else pc += 1
 
             CallFn(argc, names) ->
                 val callee = peek(argc)

@@ -1,0 +1,205 @@
+module dev.slatelang.slate
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// What `fuse` in `emit.sysl` writes into a chunk, and what the fused arms in `run_fused.sysl` do
+// with it.
+//
+// **`tests/lang/fused.sl` asks whether the ANSWERS are right and this asks whether the FUSION
+// HAPPENED**, and neither question stands in for the other: an emitter that quietly stopped fusing
+// would print exactly the right thing for ever and leave the item measuring nothing, while one that
+// fused the wrong pair would be caught by the answers alone. That is `tests_operators.sysl`'s own
+// division and it is here for its reason.
+//
+// **THE INVARIANT THAT MAKES A FUSION SAFE IS A SHAPE THIS FILE CAN SEE.** `fuse` overwrites the
+// first slot of a pair and leaves the second standing, so anything that jumps at the second runs
+// the instruction the emitter wrote. That means a `LoadSlot2` is always followed in the buffer by a
+// `LoadSlot`, a `LessJumpIfFalse` by a `JumpIfFalse`, and so on -- and a pass that started deleting
+// what it folded would fail the tests below rather than failing a program one release later.
+
+// The instruction names of the chunk of that name, longest first.
+//
+// **The largest match is the real one**: `compile_module` compiles a file twice, so a top-level
+// definition has two chunks of one name and the declarations-only copy holds a subset. This is
+// `tests_operators.sysl`'s helper, which is `private` there as it is here -- `private` in sysl is
+// per file, and a second copy is cheaper than making a test helper part of the module's surface.
+private fused_names(program: string, name: string) -> Buf[string]
+    out(program)
+
+    var best: Buf[string] = buf()
+    var found = false
+
+    for i in 0..<running_unit().chunks.len()
+        if running_unit().chunks.at(i).name != name then continue
+
+        found = true
+
+        val code = running_unit().chunks.at(i).code
+        var names: Buf[string] = buf()
+
+        for k in 0..<code.len()
+            names.push(op_label(code.at(k).op))
+
+        if names.len() > best.len() then best = names
+
+    assert(found, s"no chunk is called `${name}`")
+    best
+end fused_names
+
+// How many of that instruction the chunk carries.
+private how_many(names: Buf[string], want: string) -> usize
+    var n: usize = 0
+
+    for i in 0..<names.len()
+        if names.at(i) == want then n += 1
+
+    n
+
+// Whether every `want` in the chunk is directly followed by `tail` -- which is the whole of what
+// makes a fusion legal, the tail being what a jump into the middle of the group runs.
+private always_followed_by(names: Buf[string], want: string, tail: string) -> bool
+    for i in 0..<names.len()
+        if names.at(i) != want then continue
+        if i + 1 >= names.len() then return false
+        if names.at(i + 1) != tail then return false
+
+    true
+end always_followed_by
+
+// -- the emitter folds the pairs it says it folds --------------------------------------------------
+
+@test
+TWO_LOADS_AND_A_LOAD_WITH_A_LITERAL_ARE_EACH_ONE_INSTRUCTION()
+    val names = fused_names("f(a, b) =\n    val x = a + b\n    val y = a + 1\n\n    x + y\n\nprint(f(1, 2))", "f")
+
+    assert(how_many(names, "LoadSlot2") > 0, "`a + b` did not fold its two loads")
+    assert(how_many(names, "LoadSlotInt") > 0, "`a + 1` did not fold its load and its literal")
+
+    // **The folded instruction is still there**, which is what a jump into the middle of the group
+    // runs. A pass that deleted it would have to renumber every jump target in the chunk.
+    assert(always_followed_by(names, "LoadSlot2", "LoadSlot"), "a `LoadSlot2` is not followed by the load it folded")
+    assert(always_followed_by(names, "LoadSlotInt", "PushInt"), "a `LoadSlotInt` is not followed by the literal it folded")
+end TWO_LOADS_AND_A_LOAD_WITH_A_LITERAL_ARE_EACH_ONE_INSTRUCTION
+
+@test
+A_SUM_INTO_A_LOCAL_AND_A_COMPARISON_BEFORE_A_JUMP_ARE_EACH_ONE_INSTRUCTION()
+    val names = fused_names("f(n) =\n    var t = 0\n    var i = 0\n\n    while i < n\n        t = t + i\n        i = i + 1\n\n    t\n\nprint(f(3))", "f")
+
+    assert(how_many(names, "AddStoreSlot") > 0, "`t = t + i` did not fold its store")
+    assert(how_many(names, "LessJumpIfFalse") > 0, "`while i < n` did not fold its jump")
+    assert(always_followed_by(names, "AddStoreSlot", "StoreSlot"), "an `AddStoreSlot` is not followed by the store it folded")
+    assert(always_followed_by(names, "LessJumpIfFalse", "JumpIfFalse"), "a `LessJumpIfFalse` is not followed by the jump it folded")
+end A_SUM_INTO_A_LOCAL_AND_A_COMPARISON_BEFORE_A_JUMP_ARE_EACH_ONE_INSTRUCTION
+
+@test
+A_FOLDED_PAIR_IS_NEVER_OVERLAPPED_SO_THREE_LOADS_LEAVE_ONE_STANDING()
+    // `[a, b, c]` is three loads in a row. The scan advances by two over a pair, so the first two
+    // fold and the third is an ordinary `LoadSlot` -- rather than two groups sharing an instruction,
+    // where the second group's head would be a slot the first had already overwritten.
+    val names = fused_names("f(a, b, c) = [a, b, c]\n\nprint(f(1, 2, 3))", "f")
+
+    assert_eq(how_many(names, "LoadSlot2"), 1, "three loads did not fold into exactly one pair")
+end A_FOLDED_PAIR_IS_NEVER_OVERLAPPED_SO_THREE_LOADS_LEAVE_ONE_STANDING
+
+@test
+NO_FOLDED_PAIR_NAMES_A_RESOLVED_MODULE_DEFINITION()
+    // **`settle_module_defs` puts a `LoadName` back over a `LoadDef` AT A REMEMBERED POSITION**, so
+    // a fusion whose head were a `LoadDef` would have its slot overwritten by that put-back and a
+    // fusion whose tail were one would step over a read the compiler had just corrected. Neither is
+    // possible while no pattern names `LoadDef`, and this is what says so about the code that is
+    // actually emitted: a file whose top-level definition is read beside a local and a literal.
+    val names = fused_names("add3(n) = n + 3\n\nf(a) =\n    val g = add3\n\n    g(a) + a + 1\n\nprint(f(1))", "f")
+
+    assert(how_many(names, "LoadDef") + how_many(names, "LoadName") > 0, "the program resolved no definition at all")
+    assert(always_followed_by(names, "LoadSlot2", "LoadSlot"), "a `LoadSlot2` folded something that is not a load")
+    assert(always_followed_by(names, "LoadSlotInt", "PushInt"), "a `LoadSlotInt` folded something that is not a literal")
+end NO_FOLDED_PAIR_NAMES_A_RESOLVED_MODULE_DEFINITION
+
+// -- a jump really does land inside a group ---------------------------------------------------------
+
+// Where every jump in the chunk of that name is aimed.
+private jump_targets(program: string, name: string) -> Buf[usize]
+    out(program)
+
+    var best: Buf[usize] = buf()
+    var longest: usize = 0
+
+    for i in 0..<running_unit().chunks.len()
+        if running_unit().chunks.at(i).name != name then continue
+
+        val code = running_unit().chunks.at(i).code
+
+        if code.len() < longest then continue
+
+        longest = code.len()
+
+        var aims: Buf[usize] = buf()
+
+        for k in 0..<code.len()
+            code.at(k).op match
+                Jump(to) -> aims.push(to)
+                JumpIfFalse(to) -> aims.push(to)
+                JumpIfTrueKeep(to) -> aims.push(to)
+                JumpIfFalseKeep(to) -> aims.push(to)
+                JumpIfPresentKeep(to) -> aims.push(to)
+                JumpIfAbsentKeep(to) -> aims.push(to)
+                LessJumpIfFalse(to) -> aims.push(to)
+                _ -> ()
+
+        best = aims
+
+    best
+end jump_targets
+
+@test
+A_JUMP_AIMED_INSIDE_A_FOLDED_GROUP_IS_WHAT_THE_SHORT_CIRCUIT_TESTS_EXERCISE()
+    // **A test that could not have failed is not evidence**, so this is the witness that
+    // `tests/lang/fused.sl`'s short-circuit programs really do aim a jump at the SECOND instruction
+    // of a fused pair rather than merely looking as though they might. `a || c` leaves `a` where it
+    // is truthy and jumps over `c` to what follows -- and what follows is a load the emitter has
+    // already folded onto the load of `c`, so the target sits one past a `LoadSlot2`.
+    val program = "f(a, c, d) = (a || c) + d\n\nprint(f(1, 99, 5))"
+    val names = fused_names(program, "f")
+    val aims = jump_targets(program, "f")
+
+    var inside = false
+
+    for i in 0..<aims.len()
+        val to = aims.at(i)
+
+        if to > 0 && to < names.len() && names.at(to - 1).starts_with("LoadSlot2")
+            inside = true
+
+    assert(inside, "no jump in this chunk lands on the second instruction of a folded pair")
+end A_JUMP_AIMED_INSIDE_A_FOLDED_GROUP_IS_WHAT_THE_SHORT_CIRCUIT_TESTS_EXERCISE
+
+// -- a fault inside a fused instruction points where it always pointed ------------------------------
+
+@test
+A_FAULT_IN_A_FOLDED_SUM_QUOTES_THE_LINE_THE_ADDITION_WAS_WRITTEN_ON()
+    // The addition is what is wrong, and the caret has to stand under it rather than under the
+    // store the fusion swallowed or the statement that contains both.
+    val said = fails("f() =\n    var t = 1\n\n    t = t + {}\n    t\n\nprint(f())")
+
+    assert(said.contains("t = t + {}"), said)
+    assert(said.contains("4"), said)
+end A_FAULT_IN_A_FOLDED_SUM_QUOTES_THE_LINE_THE_ADDITION_WAS_WRITTEN_ON
+
+@test
+AN_ABSENCE_WRITTEN_TO_A_LOCAL_BY_A_FOLDED_SUM_IS_STILL_REFUSED()
+    // **This is the one path whose sentence belongs to the STORE and not to the addition**, which is
+    // why `fused_add_store_slot` hands the value back rather than writing it: the fused arm has to
+    // read the span out of the instruction it stepped over.
+    val said = fails("class Holder\n    var box\n\n    +(self, o) = self.box.missing\n\nf() =\n    var t = Holder({})\n\n    t = t + t\n    t\n\nprint(f())")
+
+    assert(said.contains("undefined"), said)
+end AN_ABSENCE_WRITTEN_TO_A_LOCAL_BY_A_FOLDED_SUM_IS_STILL_REFUSED
+
+@test
+A_FAULT_IN_A_FOLDED_COMPARISON_QUOTES_THE_COMPARISON()
+    val said = fails("f(a) =\n    if a < 1\n        \"less\"\n    else\n        \"more\"\n\nprint(f({}))")
+
+    assert(said.contains("a < 1"), said)
+end A_FAULT_IN_A_FOLDED_COMPARISON_QUOTES_THE_COMPARISON

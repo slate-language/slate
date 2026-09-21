@@ -46,6 +46,23 @@ private struct Profile
     // Executions per instruction kind, keyed by the name of the `Op` variant.
     ops: Map[string, u64]
 
+    // Executions per adjacent PAIR and TRIPLE of instructions, keyed by the names joined with a
+    // space. **Only a run that stayed inside one chunk activation is counted** -- `profile_step`
+    // takes that answer from the loop, which is the only place that knows it -- so a pair here is
+    // one a peephole pass could actually fuse and never an instruction beside a callee's first.
+    //
+    // **This is what says which superinstruction is worth building**, a table of single kinds being
+    // unable to distinguish `LoadSlot; LoadSlot` from two loads a jump lands between.
+    pairs: Map[string, u64]
+    triples: Map[string, u64]
+
+    // The last two instruction names counted, and whether the last one ran directly after the one
+    // before it. They are the pair walk's whole state: a triple is counted only where BOTH steps
+    // were adjacent, so a jump landing between two of them breaks the run rather than shortening it.
+    prev1: string
+    prev2: string
+    ran_on1: bool
+
     // Calls per builtin, and microseconds in them, keyed by the name the builtin was registered
     // under. Two tables rather than one of pairs, because a `Map` of a struct would copy the struct
     // on every read-modify-write and this is the hot path when the instrument is on.
@@ -96,7 +113,7 @@ var profile_on: bool = false
 // `Map`s and takes no lock, which is sound for one reason and one only: nothing touches it unless
 // `profile_on` is true, and `profile_on` is thread-local.** A second writer here would be exactly
 // the defect a missing lock is; `tests_vm_state.sysl` says so where it counts the types.
-private var profile_tally: Profile = Profile(0u64, map(), map(), map(), 0, 0)
+private var profile_tally: Profile = Profile(0u64, map(), map(), map(), "", "", false, map(), map(), 0, 0)
 
 // The tally, as a pointer, so a caller writes to the one table rather than to a copy of it. This is
 // `machine()`'s arrangement in `execute.sysl` and is here for its reason.
@@ -107,7 +124,7 @@ private tallied() -> *Profile = &profile_tally
 // Not `private`: `main.sysl` calls it where `SLATE_PROFILE` says to, and `tests_profile.sysl` calls
 // it to ask what a known program executes.
 profile_start()
-    profile_tally = Profile(0u64, map(), map(), map(), 0, monotonic().us)
+    profile_tally = Profile(0u64, map(), map(), map(), "", "", false, map(), map(), 0, monotonic().us)
     profile_on = true
 
 // Stop counting, leaving the tally to be read.
@@ -137,13 +154,33 @@ asked_to_profile() -> bool = env.get("SLATE_PROFILE") match
 // Count one instruction. **Called only from behind `if profile_on`**, which is the whole of what
 // makes this free when it is off.
 //
+// **`ran_on` IS THE LOOP'S ANSWER AND CANNOT BE WORKED OUT HERE**: it says that this instruction is
+// the one directly after the last counted one, in the same chunk activation. A call, a return, a
+// jump and a coroutine swap all break the run, and only `run_frames` can see that it happened.
+// Given it, the pair and triple tables are what a peephole pass reads to choose a fusion.
+//
 // Not `private`: `run_frames.sysl` is the caller.
-profile_step(op: Op)
+profile_step(op: Op, ran_on: bool)
     val p = tallied()
     val label = op_label(op)
 
     p.steps += 1u64
     p.ops.put(label, p.ops.get_or(label, 0u64) + 1u64)
+
+    if ran_on
+        val pair = s"${p.prev1} ${label}"
+
+        p.pairs.put(pair, p.pairs.get_or(pair, 0u64) + 1u64)
+
+        if p.ran_on1
+            val triple = s"${p.prev2} ${pair}"
+
+            p.triples.put(triple, p.triples.get_or(triple, 0u64) + 1u64)
+
+    p.prev2 = p.prev1
+    p.prev1 = label
+    p.ran_on1 = ran_on
+end profile_step
 
 // The clock reading a builtin's call should be measured from, or nothing where the instrument is off.
 //
@@ -178,6 +215,11 @@ profile_steps() -> u64 = tallied().steps
 // How many of that instruction kind have been counted.
 profile_op_count(label: string) -> u64 = tallied().ops.get_or(label, 0u64)
 
+// How many times those two, or those three, instruction kinds ran back to back inside one chunk
+// activation. The key is the names with one space between them.
+profile_pair_count(labels: string) -> u64 = tallied().pairs.get_or(labels, 0u64)
+profile_triple_count(labels: string) -> u64 = tallied().triples.get_or(labels, 0u64)
+
 // How many calls to that builtin have been counted.
 profile_call_count(name: string) -> u64 = tallied().calls.get_or(name, 0u64)
 
@@ -193,6 +235,22 @@ profile_op_labels() -> Buf[string]
 
     out
 end profile_op_labels
+
+// Every adjacent pair, and every adjacent triple, that has been counted at least once.
+profile_pair_labels() -> Buf[string] = keys_of(tallied().pairs)
+profile_triple_labels() -> Buf[string] = keys_of(tallied().triples)
+
+private keys_of(counts: Map[string, u64]) -> Buf[string]
+    var out: Buf[string] = buf()
+    var walk = counts.walk()
+
+    loop
+        walk.next() match
+            None -> break
+            Some(pair) -> out.push(pair.0)
+
+    out
+end keys_of
 
 // -- the report -------------------------------------------------------------------------------------
 
@@ -229,6 +287,27 @@ private ranked_by_count(counts: Map[string, u64]) -> Buf[Row]
     sort_by(out.view(), (a, b) -> a.count > b.count)
     out
 end ranked_by_count
+
+// How many sequences a table shows before it is cut off. A run that executed once tells a peephole
+// pass nothing and there are thousands of those.
+private const SequencesShown: usize = 20
+
+// One of the two sequence tables, heaviest first and cut at `SequencesShown`.
+//
+// **The share is read against the TOTAL instruction count**, not against the number of pairs, so a
+// figure here is directly comparable with an instruction kind's own share above it: a pair at 6% is
+// a fusion that would take 6% of the dispatches away.
+private sequence_table(title: string, rows: Buf[Row], steps: u64) -> string
+    var out = str_builder()
+    val shown = if rows.len() < SequencesShown then rows.len() else SequencesShown
+
+    out.push(s"\n  ${title}, heaviest first (${shown} of ${rows.len()})\n")
+
+    for i in 0..<shown
+        out.push(s"    ${rows.at(i).name} ${rows.at(i).count} ${share(rows.at(i).count, steps)}%\n")
+
+    out.finish()
+end sequence_table
 
 // A count as a percentage of the total, in tenths of a percent, where the total is not zero.
 //
@@ -279,6 +358,11 @@ profile_report() -> string
 
         for i in 0..<ops.len()
             out.push(s"    ${ops.at(i).name} ${ops.at(i).count} ${share(ops.at(i).count, p.steps)}%\n")
+
+        // **The two tables a superinstruction is chosen from**, cut at the twenty heaviest because a
+        // long tail of sequences that ran once is noise no fusion would pay for.
+        out.push(sequence_table("adjacent pairs", ranked_by_count(p.pairs), p.steps))
+        out.push(sequence_table("adjacent triples", ranked_by_count(p.triples), p.steps))
 
     val calls = ranked(p.calls, p.spent)
 
@@ -403,4 +487,12 @@ op_label(op: Op) -> string = op match
     Raise -> "Raise"
     PushModule(_) -> "PushModule"
     Tick -> "Tick"
+
+    // The fused pairs. **They are named for the pair they replace and counted as ONE**, which is the
+    // reading a fusion is supposed to have: the point of the change is that one dispatch happened
+    // where two used to, so a table that split them again would hide exactly what it is measuring.
+    LoadSlot2(_, _) -> "LoadSlot2"
+    LoadSlotInt(_, _) -> "LoadSlotInt"
+    AddStoreSlot(_) -> "AddStoreSlot"
+    LessJumpIfFalse(_) -> "LessJumpIfFalse"
 end op_label
