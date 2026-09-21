@@ -1,1 +1,1 @@
-export val boom = 1 / 0
+export val boom = 1 \ 0

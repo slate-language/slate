@@ -147,7 +147,7 @@ class Money
     unary_-(self) = Money(-self.cents)
     <=>(self, o) = self.cents - o.cents      // `<`, `<=`, `>` and `>=` read its sign
 
-    toString(self) = "$" + string(self.cents / 100)
+    toString(self) = "$" + string(self.cents \ 100)
 
 val a = Money(150)
 val b = Money(50)
@@ -167,6 +167,7 @@ false true
 | `-` | `-` |
 | `*` | `*` |
 | `/` | `/` |
+| `\` | `\` |
 | `%` | `%` |
 | `unary_-` | prefix `-` |
 | `<`, `<=`, `>`, `>=` | those four, each on its own |
@@ -250,8 +251,8 @@ leaking the fields it is made of:
 class Money
     var cents
 
-    toString(self) = "$" + string(self.cents / 100)
-    toJSON(self)   = string(self.cents / 100)
+    toString(self) = "$" + string(self.cents \ 100)
+    toJSON(self)   = string(self.cents \ 100)
 
 print(Money(150))
 print(toJSON({ paid: Money(150) }))

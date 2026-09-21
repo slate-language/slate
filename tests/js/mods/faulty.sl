@@ -5,4 +5,4 @@
 // somewhere else, and a `catch` reading the caller's file would be reading a file the fault has
 // nothing to do with.
 
-export boom(x) = x / 0
+export boom(x) = x \ 0

@@ -32,7 +32,7 @@ class WriteOnly
     var n
 
     set half(self, v)
-        self.n = v / 2
+        self.n = v \ 2
 
 class Shape
     get label(self) = s"area ${self.area}"

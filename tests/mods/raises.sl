@@ -1,1 +1,1 @@
-export boom() = 1 / 0
+export boom() = 1 \ 0
