@@ -59,6 +59,22 @@ compile_stmts(u: *Unit, e: *Emit, stmts: Buf[Stmt], at: Span, wants: StmtValue)
         return
 
     hoist_defs(u, e, stmts)
+    compile_run(u, e, stmts, at, wants)
+end compile_stmts
+
+// The run itself, with the hoisting already done.
+//
+// **A `using` takes the rest of the run with it**, which is the whole reason this is a function of
+// its own: what a `using` guards is the statements that FOLLOW it, so the tail becomes the body of
+// something rather than the next turn of this loop. Hoisting has already run over the whole block,
+// the tail included, so it must not run again -- a chunk compiled twice reports every complaint in
+// it twice.
+//
+// Not `private`: `using.sysl` compiles the tail it was handed through this.
+compile_run(u: *Unit, e: *Emit, stmts: Buf[Stmt], at: Span, wants: StmtValue)
+    if stmts.len() == 0
+        nothing_left(e, at, wants)
+        return
 
     val last = stmts.len() - 1
 
@@ -66,8 +82,18 @@ compile_stmts(u: *Unit, e: *Emit, stmts: Buf[Stmt], at: Span, wants: StmtValue)
         val leaves: StmtValue = if i == last then wants else Dropped
 
         statement_safe_point(e, stmts.at(i).span)
-        compile_stmt(u, e, stmts.at(i), true, leaves)
-end compile_stmts
+
+        *stmts.at(i).kind match
+            Using(bind, awaited) ->
+                var rest: Buf[Stmt] = buf()
+
+                for j in (i + 1)..<stmts.len()
+                    rest.push(stmts.at(j))
+
+                compile_using(u, e, bind, rest, stmts.at(i).span, awaited, wants)
+                return
+            _ -> compile_stmt(u, e, stmts.at(i), true, leaves)
+end compile_run
 
 // A statement that computed nothing, which is most of them: the null it used to leave is pushed only
 // where somebody is going to read it.
@@ -163,10 +189,22 @@ private check_answer(u: *Unit, e: *Emit, at: Span)
             push_n(e, CheckResult(intern_str(u, e.result_declared), intern_pattern(u, resolve_pattern(pat, 0))), at, 0, 0)
         None -> ()
 
+// One statement, compiled where it stands.
+//
+// Not `private`: `using.sysl` compiles the annotation check a binding's own `Group` carried along
+// with it, which is an ordinary statement standing on its own.
+compile_one_stmt(u: *Unit, e: *Emit, s: Stmt, wants: StmtValue)
+    compile_stmt(u, e, s, false, wants)
+
 private compile_stmt(u: *Unit, e: *Emit, s: Stmt, hoisted: bool, wants: StmtValue)
     val at = s.span
 
     *s.kind match
+        // **A `using` reached here guards nothing**, being the whole of a one-line body rather than
+        // the head of a run -- so the resource is acquired and released with no statement in
+        // between. `compile_run` is where the ordinary case is, the tail it guards being statements
+        // this arm cannot see.
+        Using(bind, awaited) -> compile_using(u, e, bind, buf(), at, awaited, wants)
         Val(name, init) ->
             compile_expr(u, e, init)
             declare_name(u, e, name, at, false)
@@ -232,6 +270,12 @@ private compile_stmt(u: *Unit, e: *Emit, s: Stmt, hoisted: bool, wants: StmtValu
             // wrap and a `return` is a jump nothing can be wrapped around.
             compile_exits(u, e, at)
             check_answer(u, e, result_span)
+
+            // **Every resource this chunk still holds is released in front of the jump, and the
+            // answer is already on the stack when they run.** A `return` leaves every block at
+            // once, so there is no depth to stop at; `Ret` puts the handler stack back to the
+            // caller's, which is what takes the disposal handlers off with it.
+            emit_disposes_above(u, e, 0, at)
             put(e, Ret, at)
 
             // Nothing after a `return` runs, but the block it sits in still has to count as leaving
@@ -607,6 +651,11 @@ private jump_out(u: *Unit, e: *Emit, at: Span, breaking: bool, label: string, va
             Some(x) -> compile_expr(u, e, x)
             None -> push_n(e, PushNull, at, 0, 1)
 
+        // **The resources are released BEFORE the stack is cut back**, for the reason the value was
+        // compiled first: a release reaches its resource where it stands, and the cut is about to
+        // take that copy away with everything else the loop had.
+        emit_disposes_above(u, e, frame.handlers, at)
+
         val extra = sp - frame.sp
 
         if extra > 0
@@ -633,6 +682,7 @@ private jump_out(u: *Unit, e: *Emit, at: Span, breaking: bool, label: string, va
 
         e.handlers = frame.handlers
     else
+        emit_disposes_above(u, e, frame.handlers, at)
         unwind_to(e, frame.sp, frame.scopes, frame.handlers, at)
 
     val j = put(e, Jump(0), at)

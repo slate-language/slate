@@ -52,7 +52,8 @@ class Money
     +(self, o) = Money(self.cents + o.cents)
     -(self, o) = Money(self.cents - o.cents)
     *(self, n) = Money(self.cents * n)
-    /(self, n) = Money(self.cents / n)
+    /(self, n) = Money(self.cents \ n)
+    \(self, n) = Money(self.cents \ n)
     %(self, n) = Money(self.cents % n)
     unary_-(self) = Money(-self.cents)
     <=>(self, o) = self.cents - o.cents
@@ -60,7 +61,7 @@ class Money
 val a = Money(500)
 val b = Money(125)
 
-print((a + b).cents, (a - b).cents, (a * 3).cents, (a / 2).cents, (a % 300).cents)
+print((a + b).cents, (a - b).cents, (a * 3).cents, (a / 2).cents, (a \ 3).cents, (a % 300).cents)
 print((-a).cents)
 print(a < b, a > b, a <= a, a >= a)
 // `==` is structural here, the class having written none.

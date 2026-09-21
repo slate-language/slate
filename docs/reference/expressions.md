@@ -24,7 +24,7 @@ Loosest at the top. Everything is left-associative except the lambda arrow.
 | 42 | `^` | |
 | 44 | `&` | |
 | 50 | `+` `-` | |
-| 60 | `*` `/` `%` `<<` `>>` | **a shift binds like a multiplication** |
+| 60 | `*` `/` `\` `%` `<<` `>>` | **a shift binds like a multiplication** |
 | 80 | `++` `--` (postfix), call, `[…]`, `.`, `?.`, `?.[`, `?.(`, `with` | |
 
 Three placements are worth knowing because they decide what a line means:
@@ -47,8 +47,9 @@ binding power: `map(xs, _ * 2)` is `map(xs, n -> n * 2)`. See
 
 ## Arithmetic and bitwise
 
-`+ - * / %` over integers and reals; see [Values](values.md) for what `/` does between two integers.
-`+` on two strings concatenates.
+`+ - * / %` over integers and reals, and `\` over integers alone. **`/` answers a real whatever it
+was handed and `\` is the whole-number division**; see [Values](values.md) for the pair and for what
+each does by zero. `+` on two strings concatenates.
 
 `| ^ & ~` and the shifts `<< >>` work on integers, of any width — they read a value as an endless
 run of two's-complement bits, so `~x` is `-x - 1`, `<<` grows and `>>` floors. See

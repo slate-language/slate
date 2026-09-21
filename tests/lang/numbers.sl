@@ -113,10 +113,46 @@ a_wide_literal_in_a_pattern_matches_the_number_it_spells() =
 
 @test
 integer_division_truncates_towards_zero() =
-    assertEq(7 / 2, 3)
-    assertEq(-7 / 2, -3)
+    assertEq(7 \ 2, 3)
+    assertEq(-7 \ 2, -3)
+    assertEq(7 \ -2, -3)
+    assertEq(-7 \ -2, 3)
     assertEq(7 % 3, 1)
     assertEq(-7 % 3, -1)
+    assert(7 \ 2 is integer)
+
+@test
+a_division_answers_a_real_even_where_it_comes_out_whole() =
+    assertEq(7 / 2, 3.5)
+    assertEq(-7 / 2, -3.5)
+    assertEq(4 / 2, 2)
+    assert(!(4 / 2 is integer))
+    assert(4 / 2 is real)
+    assertEq(string(1 / 0), "Infinity")
+    assertEq(string(-1 / 0), "-Infinity")
+
+@test
+the_quotient_and_the_remainder_rebuild_the_dividend() =
+    for a in [-9, -7, -1, 0, 1, 7, 9]
+        for b in [-3, -2, -1, 1, 2, 3]
+            assertEq(a, (a \ b) * b + a % b)
+
+    val big = pow(10, 30) + 7
+
+    for d in [-3, 2, 7]
+        assertEq(big, (big \ d) * d + big % d)
+
+@test
+an_integer_division_takes_a_compound_form_and_leaves_the_string_escape_alone() =
+    var n = 17
+    n \= 5
+    assertEq(n, 3)
+
+    n = -17
+    n \= 5
+    assertEq(n, -3)
+
+    assertEq("a\\b".length, 3)
 
 @test
 a_real_is_a_different_kind_from_an_integer() =
@@ -297,7 +333,7 @@ two_draws_are_not_the_same_number() =
 
 @test
 dividing_an_integer_by_zero_is_a_fault_rather_than_an_answer() =
-    assert((1 / 0) catch e -> true)
+    assert((1 \ 0) catch e -> true)
     assert((1 % 0) catch e -> true)
 
 @test

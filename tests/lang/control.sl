@@ -95,7 +95,7 @@ A_LINE_UNDER_A_BLOCK_LAMBDA_IS_A_STATEMENT_OF_ITS_OWN() =
 A_LINE_UNDER_A_try_AND_ITS_catch_IS_A_STATEMENT_OF_ITS_OWN() =
     recovered()
         val v = try
-            1 / 0
+            1 \ 0
         catch e
             10
         -v
@@ -252,7 +252,7 @@ a_closure_keeps_the_scope_that_made_it() =
 
 @test
 a_fault_is_caught_and_carries_a_message_and_a_line() =
-    val e = (1 / 0) catch e -> e
+    val e = (1 \ 0) catch e -> e
 
     assert(contains(e.message, "zero"))
     assert(e.line is integer)
@@ -275,7 +275,7 @@ a_caught_fault_put_back_keeps_its_own_words() =
 
 again() =
     try
-        1 / 0
+        1 \ 0
     catch e
         throw e
 

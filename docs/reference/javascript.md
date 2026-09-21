@@ -29,8 +29,8 @@ than it sounds, since a test driving the interpreter says nothing whatever about
 
 **An integer is a `BigInt` and a real is a `number`, and every operator goes through the runtime.** This is
 the decision everything else follows from, and it is not caution: slate's integer has no width — it grows
-rather than wrapping — and it divides towards zero, and a double does neither, nor could it be told from
-a real afterwards, so `2.5 is integer` would answer whatever the value happened to look like.
+rather than wrapping — and `\` divides it towards zero, and a double does neither, nor could it be told
+from a real afterwards, so `2.5 is integer` would answer whatever the value happened to look like.
 
 **There is no wrap on this side and there used to be one.** While a slate integer was 64 bits every
 arithmetic answer here was put back through `BigInt.asIntN(64, …)`; an integer grows now, so the host's
@@ -42,10 +42,18 @@ The operators follow because the two languages disagree too often for the except
 
 | | slate | JavaScript |
 |---|---|---|
-| `7 / 2` | `3` | `3.5` |
+| `7 / 2` | `3.5` | `3.5` |
+| `7 \ 2` | `3` | no such operator |
+| `1 / 0` | `Infinity` | `Infinity` |
 | `0` in a condition | true | false |
 | `[1] == [1]` | true | false |
 | `1 << 40` | 2^40 | 256 |
+
+**`/` is the host's own division and `\` is `BigInt`'s.** Both sides of a `/` leave `BigInt` for a
+`number` before the host divides, which is where `1 / 0` being an infinity comes from and why an
+integer past what a double can name becomes one on the way in — the interpreter's `toReal` answers
+the same. `\` is the host's `BigInt` division, which truncates toward zero exactly as the
+interpreter does.
 
 **One thing `print` says differently, and it is not closable cheaply.** A promise prints as
 `<promise pending>`, `<promise 5>` or `<promise failed: …>` in the interpreter and as `<promise>`
@@ -202,7 +210,7 @@ import { md5, sha1, sha256, sha512, hmac, pbkdf2, randomBytes, timingSafeEqual }
 
 val digits = "0123456789abcdef"
 
-hex(bs) = join(map(bs.toArray(), b -> digits[b / 16] + digits[b % 16]), "")
+hex(bs) = join(map(bs.toArray(), b -> digits[b \ 16] + digits[b % 16]), "")
 
 print(hex(sha256("abc")))
 print(hex(md5("abc")), hex(sha1("abc")))

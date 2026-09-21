@@ -10,7 +10,7 @@ print(e.line)
 
 // And the file goes back to this one afterwards, which is the half a marker in the caller is for.
 val f = try
-    1 / 0
+    1 \ 0
 catch f
     f
 

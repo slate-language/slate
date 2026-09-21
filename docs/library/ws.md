@@ -56,7 +56,9 @@ with. `ws://` and `wss://` are the only two schemes, and a url that is not one i
 sentence wherever the program runs.
 
 **The connection is the same object `accept` answers** — `onMessage`, `onBinary`, `onClose`, `send`,
-`sendBytes`, `ping`, `close` — so a program that speaks WebSocket does not know which end it is.
+`sendBytes`, `ping`, `close` — so a program that speaks WebSocket does not know which end it is. It
+answers `dispose` as well, which is `close` under the name [`using`](../reference/statements.md)
+looks for.
 
 **A client masks every frame it sends and a server masks none**, which is RFC 6455's rule and not an
 implementation detail: masking exists so that a hostile page cannot steer an intermediary into reading

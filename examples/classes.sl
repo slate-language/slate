@@ -220,7 +220,7 @@ class Money
     // this or the four comparisons, never both.
     <=>(self, o) = self.cents - o.cents
 
-    string(self) = "$" + string(self.cents / 100)
+    string(self) = "$" + string(self.cents \ 100)
 
 val rent = Money(90000)
 val bill = Money(4500)

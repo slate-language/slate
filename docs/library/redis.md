@@ -24,6 +24,9 @@ r.onPush(m -> print("pushed:", m))
 r.close()
 ```
 
+**A client answers `dispose` beside `close`**, which is the name [`using`](../reference/statements.md)
+looks for — so a block may hold a connection and be sure of letting it go.
+
 **One export, because a connection is one object** and everything else is a method on it. That is
 [`slate:regex`](regex.md)'s shape. `redis` is also what `connect` had to become, [`slate:net`](net.md)
 exporting that name and a program with a Redis client in it having sockets in it.

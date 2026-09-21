@@ -202,7 +202,12 @@ any of them.
 of them there are — in any of those bases, separators and all.
 
 **Integers and reals are separate values**, not one numeric type. An integer never wraps: it grows.
-It divides towards zero, and `%` takes the sign of the left operand.
+`/` between two of them answers a **real**; `\` is the whole-number division, and it divides towards
+zero, with `%` taking the sign of the left operand.
+
+**`\` is an operator only outside a string literal.** The string lexer reads its own escapes, so
+`"a\\b"` and `"\t"` mean exactly what they always meant, and a backslash begins nothing else
+anywhere in the grammar. `\=` is the compound form.
 
 Every comma list takes a **trailing comma**: an array, an object, an argument list, a parameter list.
 
