@@ -1,9 +1,76 @@
 // Numbers: two kinds, and the arithmetic that keeps them apart.
 
 @test
-an_integer_is_sixty_four_bits_wide_and_wraps() =
-    assertEq(9223372036854775807 + 1, -9223372036854775808)
-    assertEq(-9223372036854775808 - 1, 9223372036854775807)
+an_integer_never_wraps_it_grows() =
+    assertEq(9223372036854775807 + 1, 9223372036854775808)
+    assertEq(-9223372036854775808 - 1, -9223372036854775809)
+    assertEq(4611686018427387904 * 2, 9223372036854775808)
+    assertEq(string(9223372036854775807 + 1), "9223372036854775808")
+
+@test
+the_one_division_that_grows_is_the_most_negative_over_minus_one() =
+    val least = -9223372036854775808
+
+    assertEq(least / -1, 9223372036854775808)
+    assertEq(least % -1, 0)
+    assertEq(-least, 9223372036854775808)
+    assertEq(abs(least), 9223372036854775808)
+
+@test
+a_number_that_grew_and_came_back_is_the_number_it_came_back_as() =
+    // The normalization rule, which is what keeps `==` and hashing free of a width case.
+    assertEq((1 << 100) - (1 << 100) + 5, 5)
+    assert((1 << 100) - (1 << 100) + 5 is integer)
+
+    val m = Map()
+
+    m.set(5, "five")
+    assertEq(m.get((1 << 100) - (1 << 100) + 5), "five")
+
+@test
+a_wide_integer_is_still_an_integer() =
+    assert(pow(2, 100) is integer)
+    assert(pow(2, 100) is number)
+    assert(!(pow(2, 100) is real))
+
+@test
+a_wide_integer_and_a_real_compare_exactly_and_arithmetic_promotes() =
+    // `1e30` is not the number `10 ^ 30`; it is `1000000000000000019884624838656`.
+    assert(!(pow(10, 30) == 1e30))
+    assert(pow(10, 30) < 1e30)
+    assert(pow(10, 30) + 1 < 1e30)
+    assertEq(integer(1e30), 1000000000000000019884624838656)
+    assert(pow(10, 30) + 0.5 is real)
+
+@test
+a_wide_integer_is_written_and_read_as_its_digits() =
+    assertEq(string(pow(2, 100)), "1267650600228229401496703205376")
+    assertEq(number("1267650600228229401496703205376"), pow(2, 100))
+    assertEq(0xffffffffffffffffffff, 1208925819614629174706175)
+    assertEq(1_000_000_000_000_000_000_000_000, 1000000000000000000000000)
+
+@test
+a_factorial_is_the_number_and_not_a_remainder_of_it() =
+    var f = 1
+
+    for i in 1..30
+        f = f * i
+
+    assertEq(string(f), "265252859812191058636308480000000")
+
+@test
+a_wide_literal_in_a_pattern_matches_the_number_it_spells() =
+    val said = pow(10, 30) match
+        1000000000000000000000000000000 -> "yes"
+        _ -> "no"
+
+    assertEq(said, "yes")
+
+    val least = -9223372036854775808 match
+        -9223372036854775808 -> "yes"
+        _ -> "no"
+
+    assertEq(least, "yes")
 
 @test
 integer_division_truncates_towards_zero() =
@@ -36,17 +103,31 @@ a_real_literal_rounds_to_the_nearest_double_however_many_digits_it_has() =
     assertEq(99999999999999999999.5, 100000000000000000000.0)
 
 @test
-shifting_is_to_sixty_three_places() =
+shifting_left_grows_and_shifting_right_drags_the_sign_down() =
     assertEq(1 << 3, 8)
     assertEq(-8 >> 1, -4)
-    assertEq(1 << 63, -9223372036854775808)
+    assertEq(1 << 63, 9223372036854775808)
+    assertEq(1 << 100, 1267650600228229401496703205376)
+    assertEq((1 << 100) >> 99, 2)
+
+    // No width, so a shift past one is not a mistake: it floors toward negative infinity.
+    assertEq(7 >> 200, 0)
+    assertEq(-1 >> 200, -1)
 
 @test
-the_bitwise_operators() =
+the_bitwise_operators_read_an_endless_twos_complement() =
     assertEq(6 & 3, 2)
     assertEq(6 | 3, 7)
     assertEq(6 ^ 3, 5)
     assertEq(~0, -1)
+
+    // Python's reading, which is the only one that is total: `~x` is `-x - 1` at every width.
+    assertEq(~5, -6)
+    assertEq(-6 & 3, 2)
+    assertEq(-6 | 3, -5)
+    assertEq(-6 ^ 3, -7)
+    assertEq((1 << 100) | 1, 1267650600228229401496703205377)
+    assertEq(~(1 << 100), -1267650600228229401496703205377)
 
 @test
 conversions_between_the_kinds() =

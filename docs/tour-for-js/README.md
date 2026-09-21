@@ -452,17 +452,21 @@ idiom you already write means "absent, either way" here too. Everything else sta
 and `null == 0` are both false — which is why nothing needs a `===`, and `has(o, k)` is the presence
 test where the difference between a `null` field and a missing one matters.
 
-**An integer is a 64-bit integer**, not a double pretending. It wraps, it does not promote, and `/`
-between two integers divides towards zero:
+**An integer is an integer**, not a double pretending — and it has no width. It grows rather than
+wrapping, it does not promote to a real, and `/` between two integers divides towards zero. You get
+JavaScript's `BigInt` behaviour with none of the `n` suffix and none of the `TypeError` for mixing
+the two: this is Python's arrangement rather than JavaScript's.
 
 ```slate
 print(7 / 2, 7.0 / 2, 1 << 40)
 print(9223372036854775807 + 1)
+print(pow(2, 100))
 ```
 
 ```output
 3 3.5 1099511627776
--9223372036854775808
+9223372036854775808
+1267650600228229401496703205376
 ```
 
 **There is no `undefined` to store anywhere.** `null` is a value like any other and is the only one;

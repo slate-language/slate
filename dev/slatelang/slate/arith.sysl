@@ -2,6 +2,7 @@ module dev.slatelang.slate
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
+import sysl.math.bigint.to_real as big_as_real
 
 // What an operator means over two values, and what makes two values equal.
 //
@@ -26,11 +27,34 @@ arith(op: Tok, a: Value, b: Value, at: Span) -> Step
             _ -> ()
     end if
 
-    if is_number(a) && is_number(b)
-        if is_int(a) && is_int(b) then return int_arith(op, as_int(a), as_int(b), at)
-
-        return real_arith(op, as_real(a), as_real(b), at)
-    end if
+    // **NINE NUMERIC PAIRS, TWO MATCHES, AND THE NESTING IS WHAT MAKES IT CHEAP.** This is the
+    // hottest function in the interpreter after the instruction loop, so the three kinds are told
+    // apart by matching each operand exactly once -- which also unpacks the value, so nothing below
+    // asks a second time. Written as a run of `is_number`/`is_int`/`is_big` tests with an `as_int`
+    // under them it was six matches for two integers and eight for a pair carrying a real, and the
+    // benchmarks read it: `arith` and `reals` both moved several percent.
+    //
+    // **Which path a pair takes is `arith_big.sysl`'s subject.** Two machine integers take the
+    // checked arithmetic and grow only where a result does not fit; a pair where either side has
+    // already grown takes the big arithmetic; and anything with a real in it promotes -- except a
+    // comparison against a big integer, which is exact.
+    a match
+        Int(x) -> b match
+            Int(y) -> return int_arith(op, x, y, at)
+            Real(y) -> return real_arith(op, real(x), y, at)
+            Big(_) -> return big_arith(op, a, b, at)
+            _ -> ()
+        Real(x) -> b match
+            Real(y) -> return real_arith(op, x, y, at)
+            Int(y) -> return real_arith(op, x, real(y), at)
+            Big(_) -> return big_real_arith(op, a, b, at)
+            _ -> ()
+        Big(_) -> b match
+            Int(_) -> return big_arith(op, a, b, at)
+            Big(_) -> return big_arith(op, a, b, at)
+            Real(_) -> return big_real_arith(op, a, b, at)
+            _ -> ()
+        _ -> ()
 
     // Ordering strings is worth having and is not arithmetic, so it is tested after the numbers.
     a match
@@ -192,33 +216,12 @@ private call_hook_with(a: Value, name: string, b: Value, at: Span) -> Option[Ste
     extra.push(b)
     call_hook(a, name, extra, at)
 
-private int_arith(op: Tok, x: long, y: long, at: Span) -> Step
-    op match
-        Plus -> Ok(Int(x + y))
-        Minus -> Ok(Int(x - y))
-        Star -> Ok(Int(x * y))
-        Slash ->
-            if y == 0 then fault(at, "this divides by zero") else Ok(Int(x / y))
-        Percent ->
-            if y == 0 then fault(at, "this takes a remainder by zero") else Ok(Int(x % y))
-        Lt -> Ok(Bool(x < y))
-        LtEq -> Ok(Bool(x <= y))
-        Gt -> Ok(Bool(x > y))
-        GtEq -> Ok(Bool(x >= y))
+// **`int_arith`, `big_arith` and `big_real_arith` are `arith_big.sysl`'s**, cut out when the checked
+// arithmetic and the big arms took this file past a thousand lines. What crosses is those three
+// names and `real_arith` below, which the big-and-real path reaches once it has promoted.
 
-        // **The bitwise operators are integers only**, which needs no rule of its own: they are here
-        // and nowhere else, so a real reaching one falls through to the sentence naming both sides.
-        Amp -> Ok(Int(x & y))
-        Pipe -> Ok(Int(x | y))
-        Caret -> Ok(Int(x ^ y))
-        Shl ->
-            if y < 0 || y > 63 then fault(at, s"a shift is by 0 to 63 places, and this is by ${y}") else Ok(Int(x << y))
-        Shr ->
-            if y < 0 || y > 63 then fault(at, s"a shift is by 0 to 63 places, and this is by ${y}") else Ok(Int(x >> y))
-        _ -> fault(at, "this is not an arithmetic operator")
-end int_arith
-
-private real_arith(op: Tok, x: real, y: real, at: Span) -> Step
+// Not `private`: `arith_big.sysl` promotes a big integer and a real and then asks this.
+real_arith(op: Tok, x: real, y: real, at: Span) -> Step
     op match
         Plus -> Ok(Real(x + y))
         Minus -> Ok(Real(x - y))
@@ -255,19 +258,16 @@ end compare_str
 
 private is_number(v: Value) -> bool = v match
     Int(_) -> true
+    Big(_) -> true
     Real(_) -> true
     _ -> false
 
-private is_int(v: Value) -> bool = v match
-    Int(_) -> true
-    _ -> false
-
-private as_int(v: Value) -> long = v match
-    Int(n) -> n
-    _ -> 0
-
+// **Only `<=>`'s answer reaches this**, the arithmetic above having unpacked its operands where it
+// matched them. A big integer converts rather than being refused: what the sign of the answer says
+// is all four comparisons read, and a class that answered one is saying "far above zero".
 private as_real(v: Value) -> real = v match
     Int(n) -> real(n)
+    Big(p) -> big_as_real(p.n)
     Real(n) -> n
     _ -> 0.0
 
@@ -303,8 +303,16 @@ same_literal(v: Value, lit: Value) -> bool = v match
         Int(y) -> x == y
         Real(y) -> real(x) == y
         _ -> false
+
+    // **No `Int` arm, and the invariant is why**: a big integer that fits a `long` never exists, so
+    // one can never equal an `Int`.
+    Big(x) -> lit match
+        Big(y) -> big_same(x.n, y.n)
+        Real(y) -> big_eq_real(x.n, y)
+        _ -> false
     Real(x) -> lit match
         Int(y) -> x == real(y)
+        Big(y) -> big_eq_real(y.n, x)
         Real(y) -> x == y
         _ -> false
     _ -> false
@@ -455,8 +463,19 @@ private same_plain(a: Value, b: Value, seen: *Buf[SeenPair], at: Span) -> Result
             Int(y) -> Ok(x == y)
             Real(y) -> Ok(real(x) == y)
             _ -> Ok(false)
+
+        // **A big integer equals another big integer of the same number and a real of the same
+        // number, and nothing else.** There is no `Int` arm because there cannot be one: a big
+        // integer that fits a `long` never exists, so the two variants partition the integers.
+        // **The comparison against a real is EXACT**, which is Python's rule -- see
+        // `big_cmp_real` in `arith_big.sysl` for why rounding the integer would be wrong.
+        Big(x) -> b match
+            Big(y) -> Ok(big_same(x.n, y.n))
+            Real(y) -> Ok(big_eq_real(x.n, y))
+            _ -> Ok(false)
         Real(x) -> b match
             Int(y) -> Ok(x == real(y))
+            Big(y) -> Ok(big_eq_real(y.n, x))
             Real(y) -> Ok(x == y)
             _ -> Ok(false)
         Array(xs) -> b match

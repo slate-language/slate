@@ -84,7 +84,7 @@ this program does not speak, which it can act on; a socket nothing will ever ans
 ## What is in the module
 
 **The framing, the masking, the fragment reassembly and base64 are all slate.** `&`, `|`, `^`, `<<` and
-`>>` are slate's own on 64-bit integers, and `toBytes`/`fromBytes` are the byte surface.
+`>>` are slate's own on integers, and `toBytes`/`fromBytes` are the byte surface.
 
 **SHA-1 is the one thing reached for**, from [`slate:crypto`](crypto.md). This is not a use of SHA-1 that
 its weakness touches: nothing is signed, and the protocol wants a value only the other end could have

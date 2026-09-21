@@ -4,6 +4,7 @@ import sh.sysl.gc
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map}
+import sysl.math.bigint.{BigInt, zero as big_zero}
 
 // The collected heap, and the objects in it.
 //
@@ -165,6 +166,20 @@ struct StrObj
     cursor_char: usize
     cursor_byte: usize
 
+// A slate integer that has outgrown 64 bits.
+//
+// **A heap object for `StrObj`'s reason and on exactly its terms.** A `BigInt` is a sign and a view
+// of limbs, and a view is reference counted -- so it may not sit in a `Value`, which holds no
+// counted member at all. The cell owns it, `finalize_big` gives it back, and what a `Value` carries
+// is the pointer.
+//
+// **A `Big` THAT FITS A `long` NEVER EXISTS.** Every producer goes through `big_value` in
+// `value.sysl`, which asks `to_long()` first and answers an `Int` where it fits. That single
+// invariant is what keeps `==`, `<` and hashing free of a cross-kind case: two values of the same
+// number are the same variant, so `Int(5)` and a big five can never both be in a table.
+struct BigObj
+    n: BigInt
+
 // A slate array. Its elements are `Value`s, which is what `trace` walks.
 struct ArrayObj
     items: Buf[Value]
@@ -305,6 +320,7 @@ struct EnvObj
 mark_value(h: *gc.Heap, v: Value)
     v match
         Str(p) -> gc.mark(h, ptr_cast(p))
+        Big(p) -> gc.mark(h, ptr_cast(p))
         Array(p) -> gc.mark(h, ptr_cast(p))
         Bytes(p) -> gc.mark(h, ptr_cast(p))
         Object(p) -> gc.mark(h, ptr_cast(p))
@@ -334,6 +350,7 @@ end mark_value
 // keyed by one is an ordinary identity-keyed map whose entries live as long as the map does.
 private object_of(v: Value) -> *u8 = v match
     Str(p) -> ptr_cast(p)
+    Big(p) -> ptr_cast(p)
     Array(p) -> ptr_cast(p)
     Bytes(p) -> ptr_cast(p)
     Object(p) -> ptr_cast(p)
@@ -371,6 +388,9 @@ end mark_map
 
 // A string is its bytes. The `string` box itself is a word or two and is not worth counting.
 str_payload(o: *StrObj) -> usize = o.s.bytes.len
+
+// A big integer is its limbs, which are 32 bits each. The sign is a byte in the cell.
+big_payload(o: *BigObj) -> usize = o.n.limbs() * 4
 
 array_payload(o: *ArrayObj) -> usize = o.items.cap() * sizeof(Value)
 
@@ -414,6 +434,20 @@ finalize_str(p: *u8)
     // Writing an empty string here releases the one that was there, which is the whole of what a
     // finalizer owes: give back what the object held outside the collected heap.
     o.s = ""
+
+// A big integer owns its limbs and points at nothing, so it needs a finalizer and no tracer --
+// which is `trace_str`'s arrangement exactly.
+trace_big(p: *u8, h: *gc.Heap)
+    val o: *BigObj = ptr_cast(p)
+
+    mark_payload(big_payload(o))
+
+finalize_big(p: *u8)
+    val o: *BigObj = ptr_cast(p)
+
+    // Writing zero here releases the magnitude that was there, which is the whole of what a
+    // finalizer owes.
+    o.n = big_zero()
 
 trace_array(p: *u8, h: *gc.Heap)
     val o: *ArrayObj = ptr_cast(p)
@@ -564,9 +598,11 @@ weaken_weak_ref(p: *u8, h: *gc.Heap)
 // A `Kind` must outlive every object naming it and its address must not move, so these are module
 // storage. Module storage states its type, which is why each is written out.
 //
-// process-wide: nine tables of function addresses, built at startup and never written again. A VM
-// of its own would hold the same nine, so each is one table and not one per VM.
+// process-wide: ten tables of function addresses, built at startup and never written again. A VM
+// of its own would hold the same ten, so each is one table and not one per VM.
 var str_kind: gc.Kind = gc.Kind(&trace_str, &finalize_str, null, null)
+// process-wide: see `str_kind`.
+var big_kind: gc.Kind = gc.Kind(&trace_big, &finalize_big, null, null)
 // process-wide: see `str_kind`.
 var array_kind: gc.Kind = gc.Kind(&trace_array, &finalize_array, null, null)
 // process-wide: see `str_kind`.
@@ -858,13 +894,14 @@ reset_heap()
 // A reserve is a real object in the heap with a real header, so it can be written to, traced and
 // marked like any other. Handing the same one out twice makes two slate values share it, which is
 // wrong and does not matter: the program stops at the end of the statement that got it.
-// They are the nine `current().spare_*` fields -- see `vm_state.sysl`.
+// They are the ten `current().spare_*` fields -- see `vm_state.sysl`.
 
 // Take the reserves. Called with an empty heap, where the allocation cannot fail.
 private reserve_spares()
     val v = current()
 
     v.spare_str = ptr_cast(gc.alloc(slate_heap(), sizeof(StrObj), &str_kind))
+    v.spare_big = ptr_cast(gc.alloc(slate_heap(), sizeof(BigObj), &big_kind))
     v.spare_array = ptr_cast(gc.alloc(slate_heap(), sizeof(ArrayObj), &array_kind))
     v.spare_bytes = ptr_cast(gc.alloc(slate_heap(), sizeof(BytesObj), &bytes_kind))
     v.spare_object = ptr_cast(gc.alloc(slate_heap(), sizeof(ObjectObj), &object_kind))
@@ -879,7 +916,7 @@ private reserve_spares()
     v.spare_weak_ref = ptr_cast(gc.alloc(slate_heap(), sizeof(WeakRefObj), &weak_ref_kind))
 
     // A zeroed payload is a valid object of each of these kinds except the ones holding a `Buf` or a
-    // `Map`, which a tracer walks -- and a zero `Buf` is an empty one, so all nine are safe to trace
+    // `Map`, which a tracer walks -- and a zero `Buf` is an empty one, so all ten are safe to trace
     // from the moment they exist.
     v.heap_exhausted = false
 end reserve_spares
@@ -890,6 +927,7 @@ private mark_spares(h: *gc.Heap)
     val v = current()
 
     gc.mark(h, ptr_cast(v.spare_str))
+    gc.mark(h, ptr_cast(v.spare_big))
     gc.mark(h, ptr_cast(v.spare_array))
     gc.mark(h, ptr_cast(v.spare_bytes))
     gc.mark(h, ptr_cast(v.spare_object))
@@ -939,6 +977,20 @@ new_str_counted(s: string, chars: usize) -> *StrObj
     o.cursor_char = 0
     o.cursor_byte = 0
     charge(str_payload(o))
+    o
+
+// A cell for an integer that has outgrown 64 bits.
+//
+// **The `BigInt` is taken by value and this object becomes its owner**, which is `new_str`'s bargain
+// -- the caller's copy dies with the caller's frame and the finalizer is what releases the limbs.
+//
+// **Nothing calls this directly but `big_value`**, which is what keeps the normalization invariant:
+// a cell holding a number that fits a `long` would be a second spelling of an `Int`.
+new_big(n: BigInt) -> *BigObj
+    var o: *BigObj = ptr_cast(alloc_or_collect(sizeof(BigObj), &big_kind, ptr_cast(current().spare_big)))
+
+    o.n = n
+    charge(big_payload(o))
     o
 
 // A string whose count nobody knows, which is one walk of the bytes.
