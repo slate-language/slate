@@ -253,6 +253,7 @@ engineering and can be had one release at a time.
 
 | date | write-up | headline |
 |---|---|---|
+| 2026-09-21 | [A third sampled profile, after sysl 0.0.123, the VM parameter and the inline caches (dev `a642e9f`)](results/2026-09-21-sampled-profile-3.md) | **the live ranking**: `Buf.push<Value>` 15.3% → 0.9% (closed), `_tlv_get_addr` 4.3% → 1.3% (closed), `run_frames` 29.1% and it is the DISPATCH — fitted at a flat 1.30 ns/instruction with 0.00 ns of arm dependence; the four `fused_*` superinstruction arms are **out-of-line calls** at 7.4% and are the new item 1 |
 | 2026-09-21 | [2026-09-21 — a fifth runtime: QuickJS-ng, and slate's geomean against it](results/2026-09-21-quickjs.md) | `qjs` added as a fifth comparison runtime (bench tooling only); geomean vs QuickJS-ng 0.16.2 is 2.2x, between `node --jitless` (2.7x) and CPython (1.8x) |
 | 2026-09-21 | [2026-09-21 — sysl 0.0.123: `Buf.push`'s grow path moves out of line — shortlist item 1](results/2026-09-21-sysl-0-0-123.md) | shortlist item 1: -16.6% geometric mean, `Buf.push<Value>` on `methods` 16.2% → 1.9%; new position 3.5x/2.7x/1.8x |
 | 2026-09-21 | [2026-09-21 — A FIELD READ REMEMBERS WHERE IT LOOKED — shortlist item 4](results/2026-09-21-inline-caches.md) | shortlist item 4: -2.33% geometric mean, `fields` -40.2%, `methods` -10.5%, the lookup on `methods` 29.5% → 20.3% |
