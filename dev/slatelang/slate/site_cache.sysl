@@ -36,22 +36,55 @@ import sysl.buf.{Buf, buf}
 // declarations into a unit of its own on its own thread, so two lines of execution never write one
 // cell and there is nothing here to make atomic.
 
-// Whether the entry at this position is a live one whose key is this name.
+// What stands at this position, where the entry there is a live one whose key is this name.
 //
-// **The whole of the check, and it has to read the key rather than anything cheaper.** A position
-// alone says nothing: the table may have been rehashed, the entry may have been removed, the object
-// may be a different one of another shape entirely.
-private key_here(o: *ObjectObj, at: usize, name: string) -> bool
-    if at >= o.entries.len() then return false
+// **The check and the read are ONE look at the entry**, and that is what this function is for. An
+// entry is a key, a hash, a value and a flag -- some fifty bytes -- so asking whether the position
+// is still right and then asking what it holds read the same bytes twice, on the commonest path any
+// program has. Everything else about the check is unchanged: a position alone says nothing, because
+// the table may have been rehashed, the entry may have been removed, and the object may be a
+// different one of another shape entirely.
+//
+// **THE HASH IS COMPARED BEFORE THE KEY AND IT IS NOT AN OPTIMISATION OF THE KEY COMPARISON.** An
+// entry carries the hash it was filed under and the caller already holds the name's, so a position
+// holding some other name is refused by one integer comparison -- which is the case a method call
+// is in every single time, the name it wants living on the class and the receiver's own table
+// holding its fields. **The key is still compared where the hashes agree**, two names that hash
+// alike being a thing a program can construct rather than a thing that cannot happen.
+private field_here(o: *ObjectObj, at: usize, name: string, h: u64) -> Option[Value]
+    if at >= o.entries.len() then return None
 
     val e = o.entries.at(at)
 
-    if e.dead then return false
+    if e.dead || e.hash != h then return None
 
     e.key match
+        Str(p) -> if p.s == name then Some(e.value) else None
+        _ -> None
+end field_here
+
+// Write over the value at this position, where the entry there is a live one whose key is this
+// name, and say whether it was.
+//
+// **`field_here` for a write**, and it is a separate function for the reason that one exists: asking
+// the question and then writing the answer read the entry twice.
+private set_here(o: *ObjectObj, at: usize, name: string, h: u64, v: Value) -> bool
+    if at >= o.entries.len() then return false
+
+    var e = o.entries.at(at)
+
+    if e.dead || e.hash != h then return false
+
+    val named = e.key match
         Str(p) -> p.s == name
         _ -> false
-end key_here
+
+    if !named then return false
+
+    e.value = v
+    o.entries.set(at, e)
+    true
+end set_here
 
 // A field and whether it came from a PROTO, with one site's memory in front of the search.
 //
@@ -61,7 +94,9 @@ field_from_site(o: *ObjectObj, name: string, h: u64, at: Span, u: *Unit, c: usiz
     val site = u.site_caches.at(c)
 
     // The object's own field, where this site found it last time.
-    if key_here(o, site.own, name) then return Ok((obj_value_at(o, site.own), false))
+    field_here(o, site.own, name, h) match
+        Some(v) -> return Ok((v, false))
+        None -> ()
 
     // The object's own table for real. **This is also the witness a delegated answer needs**: a
     // method reached through a proto may only stand where the object itself has no field of that
@@ -75,10 +110,12 @@ field_from_site(o: *ObjectObj, name: string, h: u64, at: Span, u: *Unit, c: usiz
         None -> ()
 
     // One hop up, where this site found both halves last time.
-    if key_here(o, site.hop, "proto")
-        obj_value_at(o, site.hop) match
-            Object(p) -> if key_here(p, site.up, name) then return Ok((obj_value_at(p, site.up), name != "new"))
-            _ -> ()
+    field_here(o, site.hop, "proto", u.proto_hash) match
+        Some(Object(p)) ->
+            field_here(p, site.up, name, h) match
+                Some(v) -> return Ok((v, name != "new"))
+                None -> ()
+        _ -> ()
 
     walked_protos(o, name, h, at, u, c)
 end field_from_site
@@ -94,7 +131,7 @@ private walked_protos(o: *ObjectObj, name: string, h: u64, at: Span, u: *Unit, c
     loop
         var hop_at: usize = 0
 
-        val next = obj_index_named(up, "proto") match
+        val next = obj_index_hashed(up, "proto", u.proto_hash) match
             Some(i) ->
                 hop_at = i
 
@@ -128,7 +165,25 @@ end walked_protos
 read_field_site(target: Value, u: *Unit, k: usize, c: usize, at: Span) -> Step = target match
     Object(fields) ->
         val name = u.strings.at(k)
-        val found = field_from_site(fields, name, u.string_hashes.at(k), at, u, c)?
+        val h = u.string_hashes.at(k)
+
+        // **THE COMMONEST READ ANY PROGRAM MAKES IS A FIELD THE OBJECT ITSELF HAS, standing where
+        // this site found it last time, and it is answered here without a call.** `field_from_site`
+        // is the same question asked of a whole proto chain as well, and a hit on the object's own
+        // table needs none of that -- neither the receiver rule, which answers `false` for an own
+        // field, nor the absence check, a field being one thing that can never hold an absence.
+        // The miss pays for it by asking the same position twice, which is a bounds check and an
+        // integer comparison in front of a table search.
+        //
+        // **The absence is still tested, and it is one comparison rather than a belief.** Nothing can
+        // store an absence in a field, so the branch is never taken -- which is exactly the kind of
+        // claim that stops being true quietly, and this path would then answer `undefined` where the
+        // slow one answers a `get` property or a complaint.
+        field_here(fields, u.site_caches.at(c).own, name, h) match
+            Some(v) -> if !is_absent(v) then return Ok(v)
+            None -> ()
+
+        val found = field_from_site(fields, name, h, at, u, c)?
 
         if is_absent(found.0) then return read_field_absent(target, fields, name, at)
 
@@ -164,9 +219,9 @@ private write_named_at(vm: *Machine, here: *Vm, name: string, h: u64, at: Span, 
             // object has no field of that name itself -- which is the rule a read follows, read
             // backwards. A checked position answers that question, so an ordinary write to an
             // ordinary field asks nothing else.
-            if !o.frozen && key_here(o, site.own, name)
-                obj_set_value_at(o, site.own, v)
-            elif !write_property(peek_on(vm, 1), o, name, v, at)?
+            val wrote = !o.frozen && set_here(o, site.own, name, h, v)
+
+            if !wrote && !write_property(peek_on(vm, 1), o, name, v, at)?
                 // **Asked here because `obj_put_named` has nowhere to report from**, where the
                 // indexed form goes through `obj_put` and refuses it there. The two answer the same
                 // sentence.

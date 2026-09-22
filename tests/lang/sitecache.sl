@@ -31,6 +31,24 @@ class Box
         self.n = v / 2
 end Box
 
+// Two classes whose instances lay their fields out differently, so `proto` stands at one position in
+// a `Tick` and at another in a `Tock`, and `kind` at one position in each class object.
+class Tick
+    var a
+
+    kind(self) = "tick"
+end Tick
+
+class Tock
+    var x
+    var y
+    var a
+
+    kind(self) = "tock"
+end Tock
+
+callKind(v) = v.kind()
+
 @test
 ONE_PLACE_READS_TWO_SHAPES_AND_ANSWERS_FOR_EACH()
     // The same instruction, three objects, the field at a different position in each.
@@ -111,6 +129,32 @@ A_FIELD_WRITTEN_ON_THE_OBJECT_WINS_OVER_THE_ONE_ITS_CLASS_SHARES()
     b.tell = () -> "own"
 
     assertEq(b.tell(), "own")
+
+@test
+ONE_PLACE_CALLS_A_METHOD_ON_TWO_CLASSES_WHOSE_TABLES_DISAGREE()
+    // A delegated call remembers TWO positions -- where `proto` sat on the receiver and where the
+    // name sat on the class it reached -- and neither is right for the other class. One place
+    // alternating between them is the only shape that says both are checked rather than believed.
+    val a = Tick(1)
+    val b = Tock(2, 3, 4)
+
+    assertEq(callKind(a), "tick")
+    assertEq(callKind(b), "tock")
+    assertEq(callKind(a), "tick")
+    assertEq(callKind(b), "tock")
+
+@test
+ONE_PLACE_READS_A_FIELD_THE_OBJECT_HAS_AND_THEN_ONE_IT_INHERITS()
+    // A field the object holds itself is answered from the receiver's own table and a name it
+    // inherits is answered by the walk, so these are two different paths through one place in the
+    // program. Alternating is what says the first can never answer for the second.
+    val own = { a: "own" }
+    val inherited = { proto: { a: "shared" } }
+
+    assertEq(readA(own), "own")
+    assertEq(readA(inherited), "shared")
+    assertEq(readA(own), "own")
+    assertEq(readA(inherited), "shared")
 
 @test
 A_PROTO_CHANGED_UNDER_A_PLACE_IS_THE_ONE_THE_NEXT_READ_WALKS()
