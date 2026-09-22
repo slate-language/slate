@@ -176,11 +176,7 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
             counted_any = true
 
         ins.op match
-            // The object was built by the instructions above this one and nothing else has seen it
-            // yet, so there is no window in which a data value is writable and reachable.
-            SealData -> peek_on(vm, 0) match
-                Object(o) -> o.frozen = true
-                _ -> ()
+            SealData -> compose_seal_data(vm)
             PushNull -> vm.stack.push(Null)
             PushUndefined -> vm.stack.push(Undefined)
             PushBool(v) -> vm.stack.push(Bool(v))
@@ -197,12 +193,7 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
 
             CheckType(k, t, pk) -> compose_check_named(u, vm, k, t, pk, at)?
 
-            CheckSlot(i, k, t, pk) ->
-                val v = vm.stack.at(base + i)
-
-                if !match_pattern(u.patterns.at(pk), v, vm.scope, false)
-                    return fault(at, s"`${u.strings.at(k)}` was declared ${u.strings.at(t)}, and was given ${show_value(v)}")
-
+            CheckSlot(i, k, t, pk) -> compose_check_slot(u, vm, base, i, k, t, pk, at)?
             CheckResult(t, pk) -> compose_check_result(u, vm, t, pk, at)?
 
             DefineTest(k) -> here.registered_tests.push(TestCase(u.strings.at(k), here.current_source, pop_on(vm)))
@@ -259,32 +250,10 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
                 lookup(vm.scope, name) match
                     Some(v) -> vm.stack.push(v)
                     None -> return fault(at, unbound_here(name))
-            DeclareVal(k) ->
-                val v = pop_on(vm)
-
-                keepable_on(here, v, at, s"bound to `${u.strings.at(k)}`")?
-                declare(vm.scope, u.strings.at(k), v, false)
-            DeclareVar(k) ->
-                val v = pop_on(vm)
-
-                keepable_on(here, v, at, s"bound to `${u.strings.at(k)}`")?
-                declare(vm.scope, u.strings.at(k), v, true)
-            // No `keepable` here on purpose -- see `code.sysl`.
-            DeclareAbsent(k) ->
-                val v = pop_on(vm)
-
-                declare(vm.scope, u.strings.at(k), v, true)
-            StoreName(k) ->
-                val name = u.strings.at(k)
-
-                val stored = pop_on(vm)
-
-                keepable_on(here, stored, at, s"written to `${name}`")?
-
-                assign_name(vm.scope, name, stored) match
-                    Written -> ()
-                    Immutable -> return fault(at, s"`${name}` is a `val`, so it is written once")
-                    Unknown -> return fault(at, s"`${name}` is not defined")
+            DeclareVal(k) -> compose_declare_name(u, vm, here, k, false, at)?
+            DeclareVar(k) -> compose_declare_name(u, vm, here, k, true, at)?
+            DeclareAbsent(k) -> compose_declare_absent(u, vm, k)
+            StoreName(k) -> compose_store_name(u, vm, here, k, at)?
 
             // **ONE ARM PER OPERATOR, AND NOTHING BELOW THEM ASKS WHICH ONE IT WAS.** The token used
             // to ride on the instruction and be matched three more times on the way to the answer;
@@ -437,37 +406,14 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
                 compose_range(vm, inclusive, has_lo, has_hi, has_step, at)?
             Unpack(k, immutable) -> compose_unpack(u, vm, k, immutable, at)?
 
-            // The same, in a chunk whose names are numbered cells. **The subject is left standing
-            // while the walk runs**, so what a `rest` pattern builds is reachable from the stack --
-            // which is a root -- rather than from a sysl local, which is not.
-            UnpackSlots(k, first, masked) ->
-                val mark = vm.stack.len()
-
-                if !match_walk(u.patterns.at(k), peek_on(vm, 0), vm.scope, false, true)
-                    val subject = peek_on(vm, 0)
-
-                    vm.stack.truncate(mark)
-                    return fault(at, unpack_complaint(u.patterns.at(k), subject))
-
-                val mask = lay_bindings(mark, base + first)
-
-                vm.stack.truncate(mark - 1)
-
-                if masked then vm.stack.push(Int(long(mask)))
-
+            UnpackSlots(k, first, masked) -> compose_unpack_slots(u, vm, base, k, first, masked, at)?
             IsPat(k, negated) -> compose_is_pat(u, vm, k, negated)
 
             PushScope -> vm.scope = new_env(vm.scope)
             PopScope -> vm.scope = vm.scope.parent
 
             MakeClosure(c) -> vm.stack.push(Fn(new_closure(u.chunks.at(c).params, c, vm.scope)))
-            DefineFn(k, c) ->
-                val name = u.strings.at(k)
-
-                // Bound before the closure is built, so the body can see its own name -- which is the
-                // whole of what makes a named function recursive.
-                declare(vm.scope, name, Null, false)
-                declare(vm.scope, name, Fn(new_closure(u.chunks.at(c).params, c, vm.scope)), false)
+            DefineFn(k, c) -> compose_define_fn(u, vm, k, c)
 
             // The same, and the closure also goes into the table a `LoadDef` reads. **The table grows
             // to reach the cell rather than being sized in advance**: a unit's definitions are
@@ -579,24 +525,55 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
             // **THE FUSED PAIRS, AND THE `pc += 1` IN EACH IS WHAT STEPS OVER THE SLOT `fuse` LEFT
             // STANDING.** The emitter overwrites only the first instruction of a pair, so the second
             // is still in the code buffer for anything that jumps at it -- and an arm that forgot to
-            // skip it would run the tail twice. `run_fused.sysl` holds what each one does and
-            // `code.sysl` says why these four.
+            // skip it would run the tail twice. **Each fast path is WRITTEN OUT here and only the
+            // tails are calls**, which `run_fused.sysl` argues; `code.sysl` says why these four.
             LoadSlot2(i, j) ->
-                fused_load_slot2(vm, base, i, j)
+                val a = vm.stack.at(base + i)
+                val b = vm.stack.at(base + j)
+
+                vm.stack.push(a)
+                vm.stack.push(b)
                 pc += 1
             LoadSlotInt(i, v) ->
-                fused_load_slot_int(vm, base, i, v)
+                val a = vm.stack.at(base + i)
+
+                vm.stack.push(a)
+                vm.stack.push(Int(v))
                 pc += 1
             AddStoreSlot(i) ->
+                val b = pop_on(vm)
+                val a = pop_on(vm)
+                val sum = a match
+                    Int(x) -> b match
+                        Int(y) ->
+                            val s = x + y
+
+                            if (x ^ s) & (y ^ s) >= 0 then Some(s) else None
+                        _ -> None
+                    _ -> None
+
                 // `code.at(pc)` is the `StoreSlot` that was stepped over, read for its span alone
                 // and only where the sum is not a whole number -- which is the one path whose
                 // sentence belongs to the store rather than to the addition.
-                fused_add_store_slot(vm, base, i, at)? match
-                    None -> ()
-                    Some(v) -> stored_in_slot(vm, base, i, v, code.at(pc).at)?
+                sum match
+                    Some(s) -> vm.stack.set(base + i, Int(s))
+                    None -> stored_in_slot(vm, base, i, added(a, b, at)?, code.at(pc).at)?
 
                 pc += 1
-            LessJumpIfFalse(to) -> if fused_less_jump_if_false(vm, at)? then pc = to else pc += 1
+            LessJumpIfFalse(to) ->
+                val b = pop_on(vm)
+                val a = pop_on(vm)
+                val whole = a match
+                    Int(x) -> b match
+                        Int(y) -> Some(!(x < y))
+                        _ -> None
+                    _ -> None
+
+                val no = whole match
+                    Some(v) -> v
+                    None -> !is_less(a, b, at)?.truthy()
+
+                if no then pc = to else pc += 1
 
             CallFn(argc, names) ->
                 val callee = peek_on(vm, argc)
