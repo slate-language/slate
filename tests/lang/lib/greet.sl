@@ -10,3 +10,13 @@ export type Greeting = { to: string }
 export greet(name) = "hello " + name
 
 export val version = 2
+
+// A variable the importer binds and the module goes on writing, so that a test can ask which of the
+// two an import is.
+export var tally = 0
+
+export bump(n)
+    tally = tally + n
+    tally
+
+export currentTally() = tally

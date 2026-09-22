@@ -4,7 +4,7 @@
 // something reads it — `$exports.fields.set` emptied EVERY built-in module for a release and
 // surfaced three layers away.
 
-import { triple, greet, version, Greeting } from "./lib/greet.sl"
+import { triple, greet, version, tally, bump, currentTally, Greeting } from "./lib/greet.sl"
 import * as kit from "./lib/greet.sl"
 import { breaks, breaksAfterParking } from "./lib/faulty.sl"
 
@@ -16,6 +16,17 @@ an_imported_definition_is_called_like_any_other() =
 @test
 an_imported_value_is_the_snapshot_the_module_finished_with() =
     assertEq(version, 2)
+
+@test
+an_imported_variable_is_the_snapshot_too_and_the_module_goes_on_writing_its_own() =
+    // The module's own functions read the binding as it is now; what the importer bound is what the
+    // file finished with, and a write afterwards does not reach either of the two names here.
+    val had = currentTally()
+
+    assertEq(bump(4), had + 4)
+    assertEq(currentTally(), had + 4)
+    assertEq(tally, 0)
+    assertEq(kit.tally, 0)
 
 @test
 an_imported_type_is_a_pattern_and_a_value() =

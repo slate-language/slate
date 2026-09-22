@@ -51,3 +51,24 @@ A_BINDING_is_IN_A_LOOP_BODY_AT_THE_TOP_OF_A_FILE_IS_READ_BACK_ON_THAT_TURN()
 
     // And the scopes balance: a level counted and never pushed would pop the file's own.
     assertEq(afterTheLoop, "still here")
+
+// -- a binding `is` over the spelling of a DEFINITION ------------------------------------------------
+
+// **A definition is the one top-level binding a read may be resolved to while compiling**, so a
+// binding `is` that reuses its spelling has to put that read back -- and the names an `is` binds are
+// the names no instruction says. The two tests above ask this of a `val`; this asks it of the form
+// the resolution was built for.
+
+labelled() = "the definition"
+
+var seen = []
+var turn = 0
+
+while turn < 2
+    if turn is labelled then push(seen, string(labelled))
+    turn = turn + 1
+
+@test
+A_BINDING_is_OVER_A_DEFINITIONS_SPELLING_IS_THE_ONE_THAT_ANSWERS() =
+    assertEq(seen, ["0", "1"])
+    assertEq(labelled(), "the definition")

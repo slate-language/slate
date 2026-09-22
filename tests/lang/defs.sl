@@ -101,3 +101,76 @@ A_DEFINITION_IS_A_VALUE_AND_MAY_BE_PASSED_ON() =
 
     assertEq(f(1, 2, 3), 6)
     assertEq(map([1, 2], doubles), [2, 4])
+
+// -- a `val` and a `var` at the file's own top level -------------------------------------------------
+
+// **These are read and written through the same table a definition is**, so what they mean is worth
+// asking of a running program for the reason the definitions above are: a variable's cell is empty
+// until its own statement is reached, a nearer binding of the spelling wins, and a write has to be
+// seen by every other way to the same binding.
+
+var counted = 0
+val fixedAt = 5
+
+countUp(n)
+    var k = 0
+
+    while k < n
+        counted = counted + 1
+        k = k + 1
+
+    counted
+
+readsFixed() = fixedAt
+
+// Written ABOVE the variable it reads, which is the case the cell has to get right: nothing is in
+// the cell when this is compiled and something is by the time it is called.
+readsLate() = lateOne
+
+var lateOne = 11
+
+// A lambda that writes the file's own variable, which is a second way to one binding.
+bumper() = () ->
+    counted = counted + 10
+    counted
+
+var pickedVar = "the file's"
+
+shadowsPickedVar()
+    var pickedVar = "the local"
+
+    pickedVar = pickedVar + "!"
+    pickedVar
+
+@test
+A_MODULE_VARIABLE_IS_READ_AND_WRITTEN_FROM_A_LOOP() =
+    val before = counted
+
+    assertEq(countUp(3), before + 3)
+    assertEq(countUp(2), before + 5)
+    assertEq(counted, before + 5)
+
+@test
+A_MODULE_VALUE_IS_READ_FROM_A_FUNCTION() =
+    assertEq(readsFixed(), 5)
+    assertEq(fixedAt, 5)
+
+@test
+A_FUNCTION_WRITTEN_ABOVE_A_MODULE_VARIABLE_STILL_READS_IT() =
+    assertEq(readsLate(), 11)
+
+@test
+A_CLOSURE_WRITES_THE_FILES_OWN_VARIABLE() =
+    val before = counted
+    val f = bumper()
+
+    assertEq(f(), before + 10)
+    assertEq(counted, before + 10)
+    assertEq(f(), before + 20)
+
+@test
+A_LOCAL_OF_A_MODULE_VARIABLES_SPELLING_IS_THE_ONE_WRITTEN() =
+    val before = pickedVar
+
+    assertEq(shadowsPickedVar(), "the local!")
+    assertEq(pickedVar, before)

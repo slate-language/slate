@@ -3,7 +3,8 @@ module dev.slatelang.slate
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 
-// Which of a file's own definitions a read of a name can be resolved to while compiling.
+// Which of a file's own top-level bindings a read or a write of a name can be resolved to while
+// compiling.
 //
 // **A CALL OF A MODULE-LEVEL FUNCTION USED TO BE A LOOKUP BY NAME, ONCE PER CALL.** `add3(i, 1, 2)`
 // written inside a loop emitted a `LoadName`, which hashes the spelling and walks the scope chain
@@ -11,11 +12,18 @@ import sysl.buf.{Buf, buf}
 // cannot change. What is emitted instead is an index into a table the module fills as it hoists its
 // definitions, and the instruction that reads it does one array read.
 //
-// **THE RULE IS THE ONE A READER CAN STATE: a definition written at the file's own top level, whose
-// spelling nothing else in the file binds or writes.** A program that reassigns `add3`, or that has
-// a parameter, a local, a caught name, a pattern binding or an import of that spelling anywhere in
-// the file, keeps the lookup it always had -- so the observable rule is untouched and nothing new is
-// refused.
+// **A MODULE'S OWN `val` AND `var` ARE HERE TOO, AND THEY ARE THE SAME QUESTION.** A module never
+// slots -- its names are what an import reads -- so `total = total + i * 2 - 1` at a file's top level
+// hashed the spelling ten times a turn: four lookups and two assignments, and an assignment asks
+// whether the scope has the name, whether it may be written, and then puts. All three answers are
+// the compiler's. What differs from a definition is that a variable's cell is EMPTY until its own
+// statement runs, which `DefShape` records and an empty cell says for itself.
+//
+// **THE RULE IS THE ONE A READER CAN STATE: a binding written at the file's own top level, whose
+// spelling nothing else in the file binds or writes.** A program that has a parameter, a local, a
+// caught name, a pattern binding or an import of that spelling anywhere in the file keeps the lookup
+// it always had -- so the observable rule is untouched and nothing new is refused. A write is not a
+// shadowing where the spelling is the file's own `var`, and is one everywhere else.
 //
 // **THE ANSWER IS NOT KNOWN WHEN THE READ IS EMITTED, WHICH IS WHY THERE IS A FIXUP RATHER THAN A
 // PRE-PASS.** Definitions are hoisted, so a body that calls `add3` is compiled before the statement
@@ -33,7 +41,19 @@ import sysl.buf.{Buf, buf}
 // index once. Both copies write the same table cell, and a VM that has run only the declarations has
 // it filled.
 
-// One definition written at a file's top level.
+// What a file's top level wrote, which decides what a read of it may be turned into.
+enum DefShape
+    // A definition, hoisted: its cell holds a closure before the first statement of the file runs,
+    // so a read of it needs no question about whether anything is there.
+    Hoisted
+
+    // A `val`: the cell is filled when the statement is reached, and nothing may write it after.
+    Fixed
+
+    // A `var`: the cell is filled when the statement is reached, and a write goes through it.
+    Written
+
+// One binding written at a file's top level.
 struct ModuleDef
     name: string
 
@@ -44,6 +64,9 @@ struct ModuleDef
     // false**, because what closes it is the discovery that something else binds the name -- and a
     // discovery made anywhere in the file is a discovery about the whole of it.
     open: bool
+
+    // Which of the three the file wrote.
+    shape: DefShape
 end ModuleDef
 
 // A resolved read that has been emitted, and what it would have been.
@@ -63,24 +86,32 @@ end DefSite
 //
 // **A `Group` is walked into**, matching `hoist_defs`: its statements are the file's own and a
 // definition inside one is a definition of the file.
+// **A `val` AND A `var` ARE CLAIMED HERE TOO**, which is the whole of what a module-level variable
+// needed: its reads and its writes then index the same table a call of a definition does, instead of
+// hashing the spelling and walking outward on every turn of a loop. What keeps them apart from a
+// definition is `DefShape`, because a variable's cell is empty until its own statement runs.
 open_module_defs(u: *Unit, stmts: Buf[Stmt])
     for i in 0..<stmts.len()
         *stmts.at(i).kind match
-            Def(name, _, _, _, _) -> claim_def(u, name)
+            Def(name, _, _, _, _) -> claim_def(u, name, Hoisted)
+            Val(name, _) -> claim_def(u, name, Fixed)
+            Var(name, _) -> claim_def(u, name, Written)
             Group(inner) -> open_module_defs(u, inner)
             _ -> ()
 end open_module_defs
 
-// **A SECOND DEFINITION OF ONE SPELLING CLOSES IT RATHER THAN TAKING A SECOND CELL.** `check.sysl`
-// refuses a file that writes two, so this is the belt on top of that brace: two cells under one
-// name would make which one a read meant depend on where the read stood.
-private claim_def(u: *Unit, name: string)
+// **A SECOND CLAIM OF ONE SPELLING CLOSES IT RATHER THAN TAKING A SECOND CELL**, because two cells
+// under one name would make which one a read meant depend on where the read stood. `check.sysl`
+// refuses a file that writes two DEFINITIONS, so for those this is the belt on top of that brace --
+// but a file may perfectly well declare a variable twice, the second declaration being a second
+// binding, and for that this is the whole of the answer.
+private claim_def(u: *Unit, name: string, shape: DefShape)
     for i in 0..<u.defs.len()
         if u.defs.at(i).name == name
             shut_def(u, i)
             return
 
-    u.defs.push(ModuleDef(name, u.def_total, true))
+    u.defs.push(ModuleDef(name, u.def_total, true, shape))
     u.def_total = u.def_total + 1
 end claim_def
 
@@ -100,6 +131,15 @@ end def_named
 
 // Where a definition's value is kept at run time.
 def_cell(u: *Unit, d: usize) -> usize = u.defs.at(d).at
+
+// What the file wrote at this entry.
+def_shape(u: *Unit, d: usize) -> DefShape = u.defs.at(d).shape
+
+// The same as `def_named`, for the one caller that may only have a hoisted definition: a `val` or a
+// `var` of the spelling has claimed the cell and `DefineDef` would fill it with a closure.
+def_hoisted(u: *Unit, name: string) -> Option[usize] = def_named(u, name) match
+    Some(d) -> if u.defs.at(d).shape == Hoisted then Some(d) else None
+    None -> None
 
 // Something other than the definition itself binds or writes this spelling, so it is a lookup again.
 //
@@ -128,6 +168,62 @@ end shadowed_pattern
 note_def_site(u: *Unit, chunk: usize, pc: usize, key: usize, def: usize)
     u.def_sites.push(DefSite(chunk, pc, key, def))
 
+// -- what a name the chunk does not slot is emitted as -----------------------------------------------
+
+// **THESE THREE ARE THE ONLY PLACES A CELL IS EMITTED, AND EACH WRITES ITS SITE DOWN AS IT DOES.**
+// `slots.sysl` decides between a slot and the chain and hands the chain here; what is decided here is
+// the narrower question of whether the chain's answer is already known.
+
+// A read the chunk does not slot: a cell where it is one of the file's own top-level bindings, and
+// the lookup by spelling everywhere else.
+read_module_name(u: *Unit, e: *Emit, name: string, at: Span)
+    val k = intern_str(u, name)
+
+    def_named(u, name) match
+        Some(d) ->
+            val c = def_cell(u, d)
+            val op = if def_shape(u, d) == Hoisted then LoadDef(c) else LoadCell(c, k)
+
+            note_def_site(u, e.chunk, push_n(e, op, at, 0, 1), k, d)
+        None -> push_n(e, LoadName(k), at, 0, 1)
+end read_module_name
+
+// A write the chunk does not slot. **Only a `var` of the file's own top level takes a cell**: a write
+// to any other spelling is the `StoreName` it always was, and `put` shuts the entry on it, so every
+// read of that spelling goes back to a lookup as well.
+write_module_name(u: *Unit, e: *Emit, name: string, at: Span)
+    val k = intern_str(u, name)
+
+    def_named(u, name) match
+        Some(d) ->
+            if def_shape(u, d) == Written
+                note_def_site(u, e.chunk, push_n(e, StoreCell(def_cell(u, d), k), at, 1, 0), k, d)
+            else
+                push_n(e, StoreName(k), at, 1, 0)
+        None -> push_n(e, StoreName(k), at, 1, 0)
+end write_module_name
+
+// `val name = v` and `var name = v`, which fill a cell only where they are the file's own top level.
+//
+// **It is asked here rather than in `declare_name` because only these two statements may fill one.**
+// A class, a `type`, an `external`, an import and a caught name all bind at a file's top level too,
+// and a spelling one of them shares with a top-level variable has to go back to a lookup -- which is
+// what `declare_name` does for them, by saying that the name is bound.
+declare_module_name(u: *Unit, e: *Emit, name: string, at: Span, assignable: bool)
+    val resolved = if e.module_top && e.blocks.is_empty() then def_named(u, name) else None
+
+    resolved match
+        Some(d) ->
+            if def_shape(u, d) == Hoisted
+                declare_name(u, e, name, at, assignable)
+                return
+
+            val k = intern_str(u, name)
+
+            note_def_site(u, e.chunk, push_n(e, DeclareCell(def_cell(u, d), k, assignable), at, 1, 0), k, d)
+        None -> declare_name(u, e, name, at, assignable)
+end declare_module_name
+
 // Finish a file: put back every read of a name that turned out to be bound by something else, and
 // leave the table empty for the next file.
 //
@@ -142,7 +238,17 @@ settle_module_defs(u: *Unit)
         var c = u.chunks.at(site.chunk)
         val old = c.code.at(site.pc)
 
-        c.code.set(site.pc, Ins(LoadName(site.key), old.at))
+        // **What was written there says what it goes back to**, rather than a fourth field on the
+        // site saying it again: there are four instructions a resolved name can be, each has exactly
+        // one unresolved form, and reading the code cannot disagree with the code.
+        val back = old.op match
+            LoadDef(_) -> LoadName(site.key)
+            LoadCell(_, _) -> LoadName(site.key)
+            StoreCell(_, _) -> StoreName(site.key)
+            DeclareCell(_, _, mutable) -> if mutable then DeclareVar(site.key) else DeclareVal(site.key)
+            other -> other
+
+        c.code.set(site.pc, Ins(back, old.at))
         u.chunks.set(site.chunk, c)
 
     u.def_sites.clear()
