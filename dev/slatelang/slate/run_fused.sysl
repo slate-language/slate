@@ -2,8 +2,8 @@ module dev.slatelang.slate
 
 import sh.sysl.parsing.*
 
-// What a FUSED PAIR does: the two arms the emitter wrote run back to back with the value between
-// them left in a register instead of on the stack.
+// What a FUSED PAIR does: one function per superinstruction, each of them the two arms the emitter
+// wrote run back to back with the value between them left in a register instead of on the stack.
 //
 // **WHAT IS BOUGHT IS THE INSTRUCTION FETCH, AND THE FETCH IS NOT CHEAP HERE.** `Buf.at<Ins>` is an
 // out-of-line call that retains the code buffer, bounds-checks it twice and copies 56 bytes, and
@@ -14,44 +14,38 @@ import sh.sysl.parsing.*
 // that existed only to move a number four bytes.
 //
 // **WHICH PAIRS WAS MEASURED AND NOT GUESSED.** `profile.sysl` counts adjacent pairs and triples
-// under `--features profile`, and the four are the heaviest sequences over `arith`, `loops`,
+// under `--features profile`, and the four here are the heaviest sequences over `arith`, `loops`,
 // `fib`, `nested`, `calls`, `methods` and `dispatch` that are also broad: `LoadSlot`+`PushInt`
 // 82.8M, `LoadSlot`+`LoadSlot` 55.0M, `Add`+`StoreSlot` 40.0M, `Less`+`JumpIfFalse` 31.4M. Re-run
 // that table before proposing a fifth; a pair costs an arm in the hottest `match` in the project and
 // `code.sysl` carries the numbers.
 //
-// **EACH ONE IS WRITTEN OUT IN `run_frames.sysl`'s OWN ARM, AND A FUNCTION PER PAIR COST 7.4% OF
-// WALL.** The four lived here as functions until `bench/results/2026-09-21-inline-fused.md`, which
-// is where the number comes from: `private` in sysl is private to the FILE, so a body called from
-// `run_frames.sysl` and written in this one cannot be `private` -- and a name the whole module can
-// reach lowers to an LLVM `define` with EXTERNAL linkage, whose body has to be kept whatever the
-// inliner does. So `-O2` never gets the single-caller bonus that would bring it under the threshold,
-// and every fused pair paid a `bl` and a frame around ten instructions -- the very shape 0.0.122 and
-// 0.0.123 removed from `Buf.at` and `Buf.push`. **A fast path that has to be inline therefore goes
-// in the file its caller is in, and nowhere else**; what stays here is the cold tail below, which is
-// a call on purpose.
-//
 // **EVERY ONE KEEPS THE INT-INT FAST PATH INLINE AND HANDS EVERYTHING ELSE TO `run_arith.sysl`.**
 // There is no second copy of an overflow promotion, a string join, an operator method or a
-// diagnostic anywhere near the fused arms: a pair of machine integers is answered in the arm and
-// every other pair goes to the very function the unfused instruction called -- `added` for
-// `AddStoreSlot` and `is_less` for `LessJumpIfFalse`. That is what makes a fused pair
+// diagnostic anywhere in this file: a pair of machine integers is answered here and every other pair
+// goes to the very function the unfused instruction called. That is what makes a fused pair
 // answer-for-answer identical to the two it replaces, which `tests_fused.sysl` asserts rather than
 // assumes.
 //
-// **`LoadSlot2` READS BOTH CELLS BEFORE PUSHING EITHER**, because a push may grow the stack and
-// replace its storage -- and `vm.stack.at` would then be reading the old block. The unfused pair
-// could not have this problem, each of its instructions doing one thing.
+// **A FUSED BODY IS A CALL ON PURPOSE, AND WRITING THE FOUR OUT INSIDE THE DISPATCH WAS MEASURED AND
+// UNDONE.** They were written out in `run_frames.sysl`'s own arms for one release, which measured
+// -1.96% of the geometric mean against a compiler whose `Buf.push` was still an out-of-line call --
+// and +1.19% against sysl 0.0.125, which inlines that push into the very same function. The two
+// cannot both have the registers: `run_frames` already used every callee-saved register the ABI has
+// and already opened a 1,504-byte frame, so the allocator answers more live values by spilling three
+// of the loop's own nine parameters at entry rather than by growing the frame -- `u`, which every
+// instruction fetch reads, among them, reloaded forty-two times across the body.
+// `bench/results/2026-09-22-unfuse.md` has the three-way measurement and
+// `bench/results/2026-09-22-sampled-profile-4.md` the disassembly. **So a fast path whose caller is
+// register-saturated is cheaper as a call, and the cost of the `bl` is the smaller of the two.**
 //
-// **`AddStoreSlot` PUTS A WHOLE SUM STRAIGHT INTO THE CELL AND NEVER PUSHES IT**, which is the whole
-// of what that pair is worth beyond the fetch: the unfused form pushed the answer, fetched a
-// `StoreSlot`, popped it back off and asked `keepable` about it. **An `Int` can never be
-// `undefined`**, so the absence rule has nothing to say about the fast path and the check is not
-// skipped so much as answered. **Where the sum is not whole it goes through `stored_in_slot` below,
-// AND THAT IS ABOUT A SPAN**: the absence refusal belongs to the `StoreSlot` and has to point where
-// the unfused one pointed -- a different character from the `Add` the fused instruction carries --
-// so reading that span means fetching the instruction the fusion stepped over, which is the very
-// cost the fusion exists to remove. The arm pays for it only on the path that genuinely needs it.
+// **NOTHING HERE SAYS `@noinline` AND NOTHING NEEDS TO.** `private` in sysl is private to the FILE,
+// so a body called from `run_frames.sysl` and written in this one cannot be `private` -- and a
+// module-visible name lowers to an LLVM `define` with EXTERNAL linkage, whose body must be kept
+// whatever the inliner decides, so the single-caller bonus that would bring one under the `-O2`
+// threshold never applies. `nm` finds all four symbols in the binary and `otool` exactly one `bl` to
+// each. **The file split is what keeps them out of line**, which is the same finding read backwards:
+// moving one into the caller's file is what inlines it, and that is the change this page undid.
 //
 // **THE SECOND INSTRUCTION IS STILL IN THE CODE BUFFER AND MUST STAY THERE.** `fuse` in `emit.sysl`
 // overwrites the first slot of a pair and leaves the second exactly as the emitter wrote it, so a
@@ -59,11 +53,85 @@ import sh.sysl.parsing.*
 // fusion here needs anything proved about jump targets. The loop steps over that slot with an extra
 // `pc += 1`; forget it and the tail runs twice.
 //
-// Nothing here is `private`: it is reached from `run_frames.sysl`, which is its only caller.
+// Nothing here is `private`: every name is reached from `run_frames.sysl`, which is the only caller
+// of any of them.
+
+// `LoadSlot(i)` then `LoadSlot(j)`.
+//
+// **Read both cells BEFORE pushing either**, because a push may grow the stack and replace its
+// storage -- and `vm.stack.at` would then be reading the old block. The unfused pair could not have
+// this problem, each of its instructions doing one thing.
+fused_load_slot2(vm: *Machine, base: usize, i: usize, j: usize)
+    val a = vm.stack.at(base + i)
+    val b = vm.stack.at(base + j)
+
+    vm.stack.push(a)
+    vm.stack.push(b)
+
+// `LoadSlot(i)` then `PushInt(v)`.
+fused_load_slot_int(vm: *Machine, base: usize, i: usize, v: long)
+    val a = vm.stack.at(base + i)
+
+    vm.stack.push(a)
+    vm.stack.push(Int(v))
+
+// `Add` then `StoreSlot(i)`.
+//
+// **A whole-number sum goes straight into the cell and is never pushed**, which is the whole of what
+// this pair is worth beyond the fetch: the unfused form pushed the answer, fetched a `StoreSlot`,
+// popped it back off and asked `keepable` about it. **An `Int` can never be `undefined`**, so the
+// absence rule has nothing to say about the fast path and the check is not skipped so much as
+// answered.
+//
+// **IT HANDS THE VALUE BACK RATHER THAN STORING IT WHERE THE SUM IS NOT WHOLE, AND THAT IS ABOUT A
+// SPAN.** The absence refusal belongs to the `StoreSlot` and has to point where the unfused one
+// pointed -- a different character from the `Add` this instruction carries -- and reading that span
+// means fetching the instruction the fusion stepped over, which is the very cost the fusion exists
+// to remove. So the fast path, where the answer is an `Int` and can need no such sentence, stores
+// and answers `None`; everything else answers the value and lets the loop pay for the span it now
+// genuinely needs. `stored_in_slot` below is the other half.
+fused_add_store_slot(vm: *Machine, base: usize, i: usize, at: Span) -> Result[Option[Value], Signal]
+    val b = pop_on(vm)
+    val a = pop_on(vm)
+
+    a match
+        Int(x) -> b match
+            Int(y) ->
+                val sum = x + y
+
+                if (x ^ sum) & (y ^ sum) >= 0
+                    vm.stack.set(base + i, Int(sum))
+                    return Ok(None)
+            _ -> ()
+        _ -> ()
+
+    Ok(Some(added(a, b, at)?))
+end fused_add_store_slot
 
 // What an unfused `StoreSlot` does with a value that is already in hand, which is the tail
-// `AddStoreSlot` takes where its sum is not a whole number.
+// `fused_add_store_slot` hands back.
 stored_in_slot(vm: *Machine, base: usize, i: usize, v: Value, at: Span) -> Result[unit, Signal]
     keepable(v, at, "written to a local")?
     vm.stack.set(base + i, v)
     Ok(())
+
+// `Less` then `JumpIfFalse(to)`, answering whether the jump is taken.
+//
+// **`pc` stays the loop's**, which is what lets this be a function at all: every other thing the
+// pair does is the operand stack's, and the one thing that is not is handed back as a boolean.
+//
+// **The machine is a parameter for `pop_on`'s reason** -- the two operands come off the stack the
+// loop is already holding, so asking `current()` for it again is a thread-local lookup on the arm
+// that carries every loop condition in the suite.
+fused_less_jump_if_false(vm: *Machine, at: Span) -> Result[bool, Signal]
+    val b = pop_on(vm)
+    val a = pop_on(vm)
+
+    a match
+        Int(x) -> b match
+            Int(y) -> return Ok(!(x < y))
+            _ -> ()
+        _ -> ()
+
+    Ok(!is_less(a, b, at)?.truthy())
+end fused_less_jump_if_false
