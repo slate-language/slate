@@ -28,6 +28,11 @@ rather than as a benchmark that quietly measures something else.
 `run.sh` reports the **best of N** wall times (N = 5; `-n` changes it), the ratio against each
 yardstick, and the geometric mean of those ratios. `--tsv` writes the same thing tab-separated.
 
+**A fifth runtime, `qjs` (QuickJS-ng), is a yardstick alongside `lua`, `node --jitless` and
+`python3`** — `brew install quickjs-ng` (`sudo -n -u work -H /opt/homebrew/bin/brew install
+quickjs-ng` on this machine; the binary lands on `PATH` as `qjs`). It runs the same `.js` files
+already used for `node`/`node --jitless`, no shim needed.
+
 - **The clock is `CLOCK_MONOTONIC` through `perl -MTime::HiRes`** (`timeit.pl`). `/usr/bin/time -p`
   reports hundredths of a second, which is all of a start-up measurement; `gdate` is GNU coreutils
   and is not on this machine. Perl is on every macOS.
@@ -141,32 +146,37 @@ plus a newer compiler.
 moved this same commit **-16.6%** on the alternating best-of-9. Full detail, and the alternating
 before/after table against 0.0.122, is in that write-up.
 
-| program | slate (ms) | vs Lua | vs node --jitless | vs CPython |
-|---|---|---|---|---|
-| startup | 4.5 | 1.7 | 14.3 | 13.0 |
-| arith | 284.5 | 47.8 | 111.7 | 306.0 |
-| reals | 358.9 | 58.7 | 133.1 | 247.3 |
-| globals | 1103.9 | 95.6 | 74.2 | 369.6 |
-| funcs | 243.4 | 49.0 | 93.8 | 153.2 |
-| fib | 540.9 | 79.2 | 167.1 | 202.4 |
-| calls | 551.8 | 152.3 | 76.8 | 136.5 |
-| methods | 550.2 | 142.0 | 160.3 | 186.1 |
-| closures | 245.8 | 47.2 | 78.1 | 133.3 |
-| nested | 505.2 | 131.4 | 464.6 | 194.5 |
-| loops | 300.9 | 119.7 | 507.5 | 148.9 |
-| options | 585.2 | 83.1 | 108.5 | 217.0 |
-| fields | 267.6 | 63.0 | 79.8 | 209.1 |
-| alloc | 604.1 | 159.1 | 82.1 | 216.3 |
-| arrays | 435.1 | 93.0 | 156.7 | 194.5 |
-| mapset | 249.5 | 17.6 | 83.4 | 103.4 |
-| dispatch | 484.0 | 90.3 | 148.5 | 214.3 |
-| strings | 714.3 | 365.1 | 24.6 | 621.9 |
-| strindex | 8.7 | 2.2 | 16.9 | 13.7 |
-| strwalk | 10.2 | 147.0 | 17.3 | 13.6 |
-| sorting | 518.8 | 566.0 | 801.8 | 378.1 |
-| csv | 365.2 | 304.8 | 130.4 | 84.5 |
-| branches | 334.6 | 102.3 | 313.8 | 386.1 |
-| **geomean** | | **3.5x** | **2.7x** | **1.8x** |
+| program | slate (ms) | vs Lua | vs node --jitless | vs CPython | vs QuickJS-ng |
+|---|---|---|---|---|---|
+| startup | 4.5 | 1.7 | 14.3 | 13.0 | 2.2 |
+| arith | 284.5 | 47.8 | 111.7 | 306.0 | 124.6 |
+| reals | 358.9 | 58.7 | 133.1 | 247.3 | 128.2 |
+| globals | 1103.9 | 95.6 | 74.2 | 369.6 | 58.3 |
+| funcs | 243.4 | 49.0 | 93.8 | 153.2 | 106.2 |
+| fib | 540.9 | 79.2 | 167.1 | 202.4 | 165.7 |
+| calls | 551.8 | 152.3 | 76.8 | 136.5 | 168.7 |
+| methods | 550.2 | 142.0 | 160.3 | 186.1 | 208.6 |
+| closures | 245.8 | 47.2 | 78.1 | 133.3 | 87.3 |
+| nested | 505.2 | 131.4 | 464.6 | 194.5 | 550.3 |
+| loops | 300.9 | 119.7 | 507.5 | 148.9 | 638.4 |
+| options | 585.2 | 83.1 | 108.5 | 217.0 | 186.4 |
+| fields | 267.6 | 63.0 | 79.8 | 209.1 | 85.3 |
+| alloc | 604.1 | 159.1 | 82.1 | 216.3 | 206.5 |
+| arrays | 435.1 | 93.0 | 156.7 | 194.5 | 156.3 |
+| mapset | 249.5 | 17.6 | 83.4 | 103.4 | 3370.8 |
+| dispatch | 484.0 | 90.3 | 148.5 | 214.3 | 277.7 |
+| strings | 714.3 | 365.1 | 24.6 | 621.9 | 16.8 |
+| strindex | 8.7 | 2.2 | 16.9 | 13.7 | 3.0 |
+| strwalk | 10.2 | 147.0 | 17.3 | 13.6 | 2.8 |
+| sorting | 518.8 | 566.0 | 801.8 | 378.1 | 1169.1 |
+| csv | 365.2 | 304.8 | 130.4 | 84.5 | 169.0 |
+| branches | 334.6 | 102.3 | 313.8 | 386.1 | 447.9 |
+| **geomean** | | **3.5x** | **2.7x** | **1.8x** | **2.2x** |
+
+**The QuickJS-ng column was added 2026-09-21** ([write-up](results/2026-09-21-quickjs.md)) from a
+fresh `bench/run.sh -n 5` at dev `b3f22f1` (`0669746` plus only doc/bench commits — nothing under
+`dev/` moved in between), so it sits beside the Lua/node/CPython columns above without a separate
+`slate (ms)` re-measurement.
 
 (Read this table's Lua/node/CPython columns as their own wall-clock milliseconds — `bench/run.sh`'s
 raw output — not as ratios; the geomean row is the ratio.)
@@ -243,6 +253,7 @@ engineering and can be had one release at a time.
 
 | date | write-up | headline |
 |---|---|---|
+| 2026-09-21 | [2026-09-21 — a fifth runtime: QuickJS-ng, and slate's geomean against it](results/2026-09-21-quickjs.md) | `qjs` added as a fifth comparison runtime (bench tooling only); geomean vs QuickJS-ng 0.16.2 is 2.2x, between `node --jitless` (2.7x) and CPython (1.8x) |
 | 2026-09-21 | [2026-09-21 — sysl 0.0.123: `Buf.push`'s grow path moves out of line — shortlist item 1](results/2026-09-21-sysl-0-0-123.md) | shortlist item 1: -16.6% geometric mean, `Buf.push<Value>` on `methods` 16.2% → 1.9%; new position 3.5x/2.7x/1.8x |
 | 2026-09-21 | [2026-09-21 — A FIELD READ REMEMBERS WHERE IT LOOKED — shortlist item 4](results/2026-09-21-inline-caches.md) | shortlist item 4: -2.33% geometric mean, `fields` -40.2%, `methods` -10.5%, the lookup on `methods` 29.5% → 20.3% |
 | 2026-09-21 | [2026-09-21 — THE VM IS HANDED DOWN INSTEAD OF BEING ASKED FOR AGAIN — shortlist item 3](results/2026-09-21-vm-param.md) | shortlist item 3: -4.06% geometric mean, `_tlv_get_addr` on `fib` 4.4% → 0.4% |

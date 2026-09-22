@@ -12,10 +12,13 @@
 # measurement of a program that does nothing, so a reader can see how much of a short run was never
 # the program; it is reported and never subtracted.
 #
-# **The three yardsticks are `lua`, `node --jitless` and `python3`.** Lua is the goal. `node
+# **The four yardsticks are `lua`, `node --jitless`, `python3` and `qjs`.** Lua is the goal. `node
 # --jitless` runs V8's Ignition bytecode interpreter with no Sparkplug, Maglev or TurboFan behind it,
 # which is the nearest thing to slate's own design that is not a toy. CPython is a stack machine with
-# a much larger object model, which is the other direction.
+# a much larger object model, which is the other direction. **`qjs` (QuickJS-ng) is a JIT-less
+# bytecode interpreter for a dynamically typed JS-family language** -- the same design category as
+# slate, closer than CPython, Lua or `node --jitless`, none of which interpret JavaScript's own
+# object model without a tiering JIT sitting on top somewhere.
 #
 # **`node` WITH its compilers is reported too and is NOT a yardstick.** It is here because slate's
 # own JavaScript back end runs under exactly that, so the column says what `slate js` is aiming at --
@@ -83,17 +86,18 @@ best() {
 }
 
 for name in startup $names; do
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$name" \
         "$(best "$slate" "$dir/$name.sl")" \
         "$(best lua "$dir/$name.lua")" \
         "$(best node --jitless "$dir/$name.js")" \
         "$(best python3 "$dir/$name.py")" \
+        "$(best qjs "$dir/$name.js")" \
         "$(best node "$dir/$name.js")" >> "$rows"
 done
 
 if [ "$tsv" = 1 ]; then
-    printf 'benchmark\tslate_ms\tlua_ms\tnode_jitless_ms\tpython_ms\tnode_jit_ms\tvs_lua\tvs_node_jitless\tvs_python\n'
+    printf 'benchmark\tslate_ms\tlua_ms\tnode_jitless_ms\tpython_ms\tqjs_ms\tnode_jit_ms\tvs_lua\tvs_node_jitless\tvs_python\tvs_qjs\n'
 fi
 
 awk -v tsv="$tsv" -F '\t' '
@@ -101,33 +105,35 @@ awk -v tsv="$tsv" -F '\t' '
 
     BEGIN {
         if (tsv == 0) {
-            printf "%-10s %8s %8s %8s %8s %8s   %7s %7s %7s\n",
-                "", "slate", "lua", "node-jl", "python", "node+jit", "/lua", "/node", "/py"
+            printf "%-10s %8s %8s %8s %8s %8s %8s   %7s %7s %7s %7s\n",
+                "", "slate", "lua", "node-jl", "python", "qjs", "node+jit", "/lua", "/node", "/py", "/qjs"
         }
     }
 
     {
-        name = $1; s = $2 + 0; l = $3 + 0; n = $4 + 0; p = $5 + 0; j = $6 + 0
-        rl = ratio(s, l); rn = ratio(s, n); rp = ratio(s, p)
+        name = $1; s = $2 + 0; l = $3 + 0; n = $4 + 0; p = $5 + 0; q = $6 + 0; j = $7 + 0
+        rl = ratio(s, l); rn = ratio(s, n); rp = ratio(s, p); rq = ratio(s, q)
 
-        if (name != "startup" && rl > 0) { suml += log(rl); sumn += log(rn); sump += log(rp); count++ }
+        if (name != "startup" && rl > 0) {
+            suml += log(rl); sumn += log(rn); sump += log(rp); sumq += log(rq); count++
+        }
 
         if (tsv == 1) {
-            printf "%s\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.2f\t%.2f\t%.2f\n", name, s, l, n, p, j, rl, rn, rp
+            printf "%s\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.2f\t%.2f\t%.2f\t%.2f\n", name, s, l, n, p, q, j, rl, rn, rp, rq
         } else {
-            printf "%-10s %8.1f %8.1f %8.1f %8.1f %8.1f   %6.1fx %6.1fx %6.1fx\n", name, s, l, n, p, j, rl, rn, rp
+            printf "%-10s %8.1f %8.1f %8.1f %8.1f %8.1f %8.1f   %6.1fx %6.1fx %6.1fx %6.1fx\n", name, s, l, n, p, q, j, rl, rn, rp, rq
         }
     }
 
     END {
         if (count == 0) exit
 
-        gl = exp(suml / count); gn = exp(sumn / count); gp = exp(sump / count)
+        gl = exp(suml / count); gn = exp(sumn / count); gp = exp(sump / count); gq = exp(sumq / count)
 
         if (tsv == 1) {
-            printf "geomean\t\t\t\t\t\t%.2f\t%.2f\t%.2f\n", gl, gn, gp
+            printf "geomean\t\t\t\t\t\t\t%.2f\t%.2f\t%.2f\t%.2f\n", gl, gn, gp, gq
         } else {
-            printf "%-10s %8s %8s %8s %8s %8s   %6.1fx %6.1fx %6.1fx\n", "geomean", "", "", "", "", "", gl, gn, gp
+            printf "%-10s %8s %8s %8s %8s %8s %8s   %6.1fx %6.1fx %6.1fx %6.1fx\n", "geomean", "", "", "", "", "", "", gl, gn, gp, gq
         }
     }
 ' "$rows"
