@@ -203,7 +203,9 @@ false
 ```
 
 `{ name: n }` binds `n`, `{ name }` is shorthand for `{ name: name }`, and `{ pinned? }` is a field
-the subject need not have.
+the subject need not have. An [object literal](objects.md) reads `{ name }` the other way round, as
+`{ name: name }` built rather than taken apart; `{ pinned? }` is a pattern's alone, a literal writing
+a field or not writing it.
 
 **A field a proto supplies counts**, a pattern asking whether the value *has* the field — which is the
 question `.` answers.

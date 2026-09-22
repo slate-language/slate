@@ -331,3 +331,52 @@ a_key_that_is_not_a_plain_name_is_quoted_where_a_name_is_bare() =
     t["ok"] = 2
 
     assertEq(string(t), "{\"a b\": 1, ok: 2}")
+
+@test
+a_shorthand_field_names_its_key_and_reads_the_name() =
+    val x = 1
+    val y = 2
+
+    assertEq({ x }, { x: 1 })
+    assertEq({ x, y }, { x: 1, y: 2 })
+
+    // The key is the name as written, and the order is the order the fields were written in --
+    // a shorthand being an ordinary field with its value left to be read off the name.
+    assertEq(keys({ x, y }), ["x", "y"])
+    assertEq(string({ x, y }), "{x: 1, y: 2}")
+
+@test
+a_shorthand_MIXES_WITH_EVERY_OTHER_KIND_OF_FIELD() =
+    val x = 1
+    val o = { z: 9 }
+
+    assertEq({ x, y: 2 }, { x: 1, y: 2 })
+    assertEq({ y: 2, x }, { y: 2, x: 1 })
+    assertEq({ "a b": 3, x }, { "a b": 3, x: 1 })
+
+    // **A spread and a shorthand meet in the same literal**, and the later entry still wins --
+    // the shorthand is desugared before `object_so_far` sees it, so the merge rule is untouched.
+    assertEq(string({ ...o, x }), "{z: 9, x: 1}")
+    assertEq(string({ x, ...o }), "{x: 1, z: 9}")
+
+    val z = 5
+
+    assertEq(string({ ...o, z }), "{z: 5}")
+    assertEq(string({ z, ...o }), "{z: 9}")
+
+@test
+a_shorthand_READS_THE_NAME_WHERE_IT_IS_WRITTEN() =
+    val x = "outer"
+
+    // A nested literal reads the name in scope at that point, the shorthand being an ordinary
+    // read of a name rather than anything the literal does.
+    assertEq(string({ p: { x } }), "{p: {x: \"outer\"}}")
+
+    f(x) = { x }
+
+    assertEq(f(7), { x: 7 })
+
+    // **And it is the same spelling an object pattern uses, read the other way round.**
+    val { x: got } = { x }
+
+    assertEq(got, "outer")

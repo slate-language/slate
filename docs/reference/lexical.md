@@ -158,11 +158,19 @@ print(n)
 2
 ```
 
-**A keyword still may not name a BINDING**, so the `{ name }` shorthand has nothing to introduce
-where the key is one, and says so:
+**A keyword still may not name a BINDING**, so the `{ name }` shorthand has nothing to introduce in a
+pattern and nothing to read in a literal, and both say so:
 
 ```slate
 val { with } = { with: 1 }
+```
+
+```error
+is a word the grammar has taken
+```
+
+```slate
+print({ with })
 ```
 
 ```error
