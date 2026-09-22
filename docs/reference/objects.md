@@ -19,9 +19,34 @@ print({})
 {}
 ```
 
-**Every field is written `key: value`.** There is no `{ name }` shorthand in a literal — that spelling
-belongs to an [object pattern](patterns.md), where it means *bind the field `name` to the name `name`*,
-and a literal reading it the other way round would make one notation mean two things.
+**A field is written `key: value`, and `{ name }` is shorthand for `{ name: name }`.** It is the same
+spelling an [object pattern](patterns.md) has, read the other way round: on the left of an `=` it takes
+a field apart, and on the right it puts one together.
+
+```slate
+val name = "ada"
+val born = 1815
+
+print({ name, born })
+print({ name, born, alive: false })
+```
+
+```output
+{name: "ada", born: 1815}
+{name: "ada", born: 1815, alive: false}
+```
+
+**A shorthand needs a name a program could bind**, so a [keyword](lexical.md) and a quoted key each have
+to say what their value is; and `{ name? }`, which marks a field a *pattern* need not find, is a pattern's
+spelling and means nothing in a literal.
+
+```slate
+print({ if })
+```
+
+```error
+is a word the grammar has taken
+```
 
 **A key in a literal is a name or a string**, and nothing else — a number there is a parse error. A key
 written through an index may be **any value**, and stays that value:
