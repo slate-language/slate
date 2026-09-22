@@ -164,3 +164,33 @@ A_WILDCARD_BESIDE_A_BINDING_BINDS_NOTHING_AND_SHIFTS_NOTHING() =
         _ -> 0
 
     assertEq(said, 2)
+
+@test
+A_LITERAL_MEANS_THE_SAME_AS_A_WHOLE_ARM_AND_INSIDE_A_SHAPE() =
+    // A string, an integer, a boolean and a null are each written as a whole arm and again one
+    // level down, where an array or an object pattern is what reaches them.
+    kind(w) = w match
+        "add" -> 1
+        7 -> 2
+        true -> 3
+        null -> 4
+        _ -> 0
+
+    assertEq([kind("add"), kind(7), kind(true), kind(null)], [1, 2, 3, 4])
+    assertEq([kind("sub"), kind(8), kind(false)], [0, 0, 0])
+
+    said(v) = v match
+        ["add", n] -> n
+        [1, n] -> n * 10
+        { tag: null, n } -> n * 100
+        _ -> 0
+
+    assertEq([said(["add", 5]), said([1, 5]), said({ tag: null, n: 5 })], [5, 50, 500])
+    assertEq(said([2, 5]), 0)
+
+    // A literal element that does not fit lets the next arm try, and a name beside it still binds.
+    val moved = [2, 9] match
+        [1, n] -> n
+        [k, n] -> k + n
+
+    assertEq(moved, 11)
