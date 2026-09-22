@@ -112,7 +112,14 @@ set_heap_limit(bytes: usize)
 
 // Take note of payload just allocated.
 charge(n: usize)
-    current().payload += n
+    charge_on(current(), n)
+
+// The same, for a caller that already holds the VM. **Every constructor below takes this form**, so
+// that one allocation asks for the VM once rather than once for its reserve, once for its heap and
+// once for this: `current()` reads a thread-local, which on this platform is a call into the dynamic
+// loader and not a load.
+charge_on(v: *Vm, n: usize)
+    v.payload += n
 
 // Take note of payload just given back. **Clamped at zero**: the figure is an estimate between
 // collections, and a credit larger than the running count must not wrap a `usize`.
@@ -957,18 +964,21 @@ private mark_spares(h: *gc.Heap)
 //
 // **The caller is going to write through whatever comes back**, so this may not answer null. What it
 // does instead is say so in `heap_exhausted`, which the statement boundary reports against a line.
-private alloc_or_collect(size: usize, kind: *gc.Kind, spare: *u8) -> *u8
-    var p = gc.alloc(slate_heap(), size, kind)
+// **The VM is a parameter and not asked for here**, for `charge_on`'s reason: the caller has already
+// read it to find the reserve it passes, so asking again would be a second thread-local lookup on
+// every allocation the interpreter makes.
+private alloc_or_collect(v: *Vm, size: usize, kind: *gc.Kind, spare: *u8) -> *u8
+    var p = gc.alloc(&v.heap, size, kind)
 
     if p != null then return p
 
     collect_now()
 
-    p = gc.alloc(slate_heap(), size, kind)
+    p = gc.alloc(&v.heap, size, kind)
 
     if p != null then return p
 
-    current().heap_exhausted = true
+    v.heap_exhausted = true
     spare
 end alloc_or_collect
 // **Each of these charges what it was handed**, the object becoming the owner of storage that was a
@@ -986,13 +996,14 @@ end alloc_or_collect
 //
 // **The cursor starts at the front**, which is where a zeroed cell already is.
 new_str_counted(s: string, chars: usize) -> *StrObj
-    var o: *StrObj = ptr_cast(alloc_or_collect(sizeof(StrObj), &str_kind, ptr_cast(current().spare_str)))
+    val v = current()
+    var o: *StrObj = ptr_cast(alloc_or_collect(v, sizeof(StrObj), &str_kind, ptr_cast(v.spare_str)))
 
     o.s = s
     o.chars = chars
     o.cursor_char = 0
     o.cursor_byte = 0
-    charge(str_payload(o))
+    charge_on(v, str_payload(o))
     o
 
 // A cell for an integer that has outgrown 64 bits.
@@ -1003,10 +1014,11 @@ new_str_counted(s: string, chars: usize) -> *StrObj
 // **Nothing calls this directly but `big_value`**, which is what keeps the normalization invariant:
 // a cell holding a number that fits a `long` would be a second spelling of an `Int`.
 new_big(n: BigInt) -> *BigObj
-    var o: *BigObj = ptr_cast(alloc_or_collect(sizeof(BigObj), &big_kind, ptr_cast(current().spare_big)))
+    val v = current()
+    var o: *BigObj = ptr_cast(alloc_or_collect(v, sizeof(BigObj), &big_kind, ptr_cast(v.spare_big)))
 
     o.n = n
-    charge(big_payload(o))
+    charge_on(v, big_payload(o))
     o
 
 // A string whose count nobody knows, which is one walk of the bytes.
@@ -1017,23 +1029,26 @@ new_big(n: BigInt) -> *BigObj
 new_str_scanned(s: string) -> *StrObj = new_str_counted(s, char_count(s))
 
 new_array(items: Buf[Value]) -> *ArrayObj
-    var o: *ArrayObj = ptr_cast(alloc_or_collect(sizeof(ArrayObj), &array_kind, ptr_cast(current().spare_array)))
+    val v = current()
+    var o: *ArrayObj = ptr_cast(alloc_or_collect(v, sizeof(ArrayObj), &array_kind, ptr_cast(v.spare_array)))
 
     o.items = items
-    charge(array_payload(o))
+    charge_on(v, array_payload(o))
     o
 
 // **The `Buf` is taken by value and this object becomes its owner**, which is `new_str`'s bargain: the
 // caller's copy dies with the caller's frame and the finalizer is what takes the count to zero.
 new_bytes(data: Buf[u8]) -> *BytesObj
-    var o: *BytesObj = ptr_cast(alloc_or_collect(sizeof(BytesObj), &bytes_kind, ptr_cast(current().spare_bytes)))
+    val v = current()
+    var o: *BytesObj = ptr_cast(alloc_or_collect(v, sizeof(BytesObj), &bytes_kind, ptr_cast(v.spare_bytes)))
 
     o.data = data
-    charge(bytes_payload(o))
+    charge_on(v, bytes_payload(o))
     o
 
 new_object() -> *ObjectObj
-    var o: *ObjectObj = ptr_cast(alloc_or_collect(sizeof(ObjectObj), &object_kind, ptr_cast(current().spare_object)))
+    val v = current()
+    var o: *ObjectObj = ptr_cast(alloc_or_collect(v, sizeof(ObjectObj), &object_kind, ptr_cast(v.spare_object)))
 
     o.entries = buf()
 
@@ -1045,13 +1060,14 @@ new_object() -> *ObjectObj
     o.frozen = false
     o.by_identity = false
     o.keys_bloom = 0
-    charge(object_payload(o))
+    charge_on(v, object_payload(o))
     o
 
 // **A weak map is `new_object`'s twin under another kind**, and the two must be built alike --
 // including the index it does not have.
 new_weak_map() -> *ObjectObj
-    var o: *ObjectObj = ptr_cast(alloc_or_collect(sizeof(ObjectObj), &weak_map_kind, ptr_cast(current().spare_weak_map)))
+    val v = current()
+    var o: *ObjectObj = ptr_cast(alloc_or_collect(v, sizeof(ObjectObj), &weak_map_kind, ptr_cast(v.spare_weak_map)))
 
     o.entries = buf()
     o.index = buf()
@@ -1059,26 +1075,29 @@ new_weak_map() -> *ObjectObj
     o.frozen = false
     o.by_identity = true
     o.keys_bloom = 0
-    charge(object_payload(o))
+    charge_on(v, object_payload(o))
     o
 
 new_weak_ref(target: Value) -> *WeakRefObj
-    var o: *WeakRefObj = ptr_cast(alloc_or_collect(sizeof(WeakRefObj), &weak_ref_kind, ptr_cast(current().spare_weak_ref)))
+    val v = current()
+    var o: *WeakRefObj = ptr_cast(alloc_or_collect(v, sizeof(WeakRefObj), &weak_ref_kind, ptr_cast(v.spare_weak_ref)))
 
     o.target = target
     o
 
 new_closure(params: Buf[string], body: usize, scope: *EnvObj) -> *ClosureObj
-    var o: *ClosureObj = ptr_cast(alloc_or_collect(sizeof(ClosureObj), &closure_kind, ptr_cast(current().spare_closure)))
+    val v = current()
+    var o: *ClosureObj = ptr_cast(alloc_or_collect(v, sizeof(ClosureObj), &closure_kind, ptr_cast(v.spare_closure)))
 
     o.params = params
     o.body = body
     o.scope = scope
-    charge(closure_payload(o))
+    charge_on(v, closure_payload(o))
     o
 
 new_promise() -> *PromiseObj
-    var o: *PromiseObj = ptr_cast(alloc_or_collect(sizeof(PromiseObj), &promise_kind, ptr_cast(current().spare_promise)))
+    val v = current()
+    var o: *PromiseObj = ptr_cast(alloc_or_collect(v, sizeof(PromiseObj), &promise_kind, ptr_cast(v.spare_promise)))
 
     o.value = Null
     o.settled = false
@@ -1094,7 +1113,8 @@ new_promise() -> *PromiseObj
     o
 
 new_env(parent: *EnvObj) -> *EnvObj
-    var o: *EnvObj = ptr_cast(alloc_or_collect(sizeof(EnvObj), &env_kind, ptr_cast(current().spare_env)))
+    val v = current()
+    var o: *EnvObj = ptr_cast(alloc_or_collect(v, sizeof(EnvObj), &env_kind, ptr_cast(v.spare_env)))
 
     o.names = map()
     o.mutable = map()
