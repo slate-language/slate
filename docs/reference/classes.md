@@ -144,6 +144,69 @@ print(c.kind, c.side)
 coin 5
 ```
 
+## Annotating a field
+
+**A field is a binding like any `var`, so it takes the same annotation**: every [type](types.md) a
+binding may say — a word, a union, a function type, `array of T`, `Map[K, V]`, a tuple, a shape, or
+the class's own name. A `val` on the class takes one too:
+
+```slate
+class Counter
+    var count: integer = 0
+    var step: integer = 1
+    var label: string | null = null
+    var onChange: (integer) -> string = n -> s"now ${n}"
+    val most: integer = 10
+
+    bump(self)
+        self.count += self.step
+        self.onChange(self.count)
+
+val c = Counter()
+
+print(c.bump(), Counter.most)
+```
+
+```output
+now 1 10
+```
+
+**It is checked where the object is made**, because that is where the value arrives: the generated
+`new` checks each annotated field exactly as `new(count: integer)` would check its parameter, and an
+initialiser is checked as the default it is.
+
+```slate
+class Counter
+    var count: integer = 0
+
+readCount(text) = Counter(text).count
+
+print(readCount("seven"))
+```
+
+```error
+`count` was declared integer, and was given "seven"
+```
+
+**An assignment is held to it as well — the annotated `var` rule.** Where the object's class is beyond
+doubt, a `val` bound to `Counter()`, a write of another kind is refused before the program runs:
+
+```slate
+class Counter
+    var count: integer = 0
+
+val c = Counter()
+
+c.count = "lots"
+```
+
+```error
+`count` on `Counter` was declared integer, and this is string
+```
+
+A written `new` checks what its own parameters declare, and a field it fills from an initialiser is
+checked there.
+
 ## No member may be called `proto`
 
 **`proto` is the link itself, not a name a class can spend.** A class is an object with a `proto`, and
