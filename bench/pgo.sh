@@ -35,6 +35,8 @@ echo "pgo: building the instrumented binary" >&2
 sysl build . --lto thin --profile-generate "$out/raw" -o "$out/slate-instrumented"
 
 for program in bench/*.sl; do
+    # profile.sl is the sampling tool, not a benchmark; alternate.pl skips it too.
+    case "$program" in bench/profile.sl) continue ;; esac
     echo "pgo: training on $program" >&2
     "$out/slate-instrumented" "$program" > /dev/null
 done
