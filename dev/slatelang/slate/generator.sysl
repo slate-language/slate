@@ -20,6 +20,12 @@ import sysl.buf.{Buf, buf}
 // and there, on the caller's own turn, so a generator works in a program that has no loop running at
 // all -- and a `for` over one is an ordinary loop rather than something that has to be awaited.
 //
+// **UNLESS ITS BODY IS ALSO `async`, WHICH IS THE ONE THING THAT CHANGES.** A body carrying both
+// `async` and a `yield` is still a generator -- calling it runs nothing and answers a generator --
+// and its `async` half decides only what a STEP of it hands back: `next()` answers a promise of
+// `{ value, done }`, which is the shape `for await` was already written against. The asynchronous
+// half of this file is at `gen_step_async` and says why it needed almost nothing.
+//
 // **What a program gets from `next` is `{ value, done }`**, which is JavaScript's shape and is the
 // honest one: `null` is a value a generator may yield, so a bare answer could not say whether the
 // generator was finished. The value on the last step is what the body `return`ed.
@@ -27,11 +33,19 @@ import sysl.buf.{Buf, buf}
 // `for x in g` drives the same machinery without the object -- `IterNext` asks this file for the next
 // value exactly as it asks an array for its next element.
 
+// What every walk that wants its values NOW says about one that has only promises to give.
+//
+// **One sentence, and `js_rt_dispatch.sysl` writes the same words**, because which back end a
+// program is on must not decide what it is told.
+const AsyncGenWalk: string = "an `async` generator's values arrive one promise at a time -- `for await` is the only way to walk one"
+
 // One generator: where its machine went, and what it has done so far.
 struct GenSlot
     live: bool
 
-    // Which entry of `parked` holds the suspended body. Meaningless once `done`.
+    // Which entry of `parked` holds the suspended body. Meaningless once `done`, and **meaningless
+    // while an asynchronous one is `pending`**: a body that parks at an `await` goes into `parked`
+    // wherever the scheduler's own park put it, and this is written again at the next `yield`.
     machine: usize
 
     // Whether the body has been entered at all. **The first step must not write a sent value over
@@ -42,6 +56,14 @@ struct GenSlot
     // Which occupant of this slot this is. See `Value.Gen`: a finished generator gives its slot back,
     // so an id on its own would come to name whatever took it next.
     gen: usize
+
+    // Whether the body is `async` as well as a generator, which decides what a step of it HANDS
+    // BACK and nothing else: a promise of `{ value, done }` rather than the pair itself.
+    asynchronous: bool
+
+    // Whether a `next` is in flight -- true only for an asynchronous one, and only across an
+    // `await` inside the body. **One at a time**: see `gen_step_async`.
+    pending: bool
 
 // Every generator a program is holding, and every one it has abandoned half-finished, is
 // `current().generators` -- see `vm_state.sysl`. The stamp for the next claim is `current().gen_stamp`.
@@ -62,21 +84,34 @@ gen_holds(id: usize, gen: usize) -> bool
 
     g.live && g.gen == gen
 
-// Take a slot for a machine that has been parked.
-private claim_gen(machine: usize) -> Value
+// Take a slot, before the machine that is going to fill it has been parked.
+//
+// **The index is wanted FIRST, because the machine carries it.** `Machine.gen` is what tells
+// `finish` which generator a line of execution is the body of, and it has to be written while that
+// machine is the running one -- which is before the park that would say where it went.
+private reserve_gen(asynchronous: bool) -> usize
     val v = current()
 
     v.gen_stamp += 1
 
-    val slot = GenSlot(true, machine, false, false, v.gen_stamp)
+    val slot = GenSlot(true, 0, false, false, v.gen_stamp, asynchronous, false)
 
     for i in 0..<v.generators.len()
         if !v.generators.at(i).live
             v.generators.set(i, slot)
-            return Gen(i, v.gen_stamp)
+            return i
 
     v.generators.push(slot)
-    Gen(v.generators.len() - 1, v.gen_stamp)
+    v.generators.len() - 1
+
+// Whether stepping this one hands back a promise. **Asked of a slot that may be finished**, a
+// program holding a spent generator still being owed an answer of the shape it has always had.
+gen_is_async(id: usize) -> bool
+    val generators = current().generators
+
+    if id >= generators.len() then return false
+
+    generators.at(id).asynchronous
 
 // Calling a generator function: a machine set up at the top of the body, and nothing run.
 //
@@ -105,10 +140,14 @@ start_generator(c: *ClosureObj, args: Buf[Value], at: Span) -> Step
 
     if !slotted then bind_arguments(scope, c, args, chunk.variadic)
 
+    // Reserved before the park, the machine being what carries it -- see `reserve_gen`.
+    val id = reserve_gen(chunk.is_async)
+
     // From here the caller is set aside and `vm` is the generator's own.
     val here = park()
 
     machine().scope = scope
+    machine().gen = Some(id)
 
     // **THE ONE PLACE A FRAME'S SLOTS ARE LAID BEFORE ANYTHING RUNS**, and it has to be here: this
     // machine is parked without executing an instruction, so arguments left in a sysl local would
@@ -125,8 +164,12 @@ start_generator(c: *ClosureObj, args: Buf[Value], at: Span) -> Step
     // so that nothing putting the loop back has to look the chunk up again.
     machine().frames.push(Frame(c.body, 0, scope, 0, 0, mask, chunk.code, chunk.source))
 
-    val gen_machine = park()
-    val g = claim_gen(gen_machine)
+    var slot = current().generators.at(id)
+
+    slot.machine = park()
+    current().generators.set(id, slot)
+
+    val g = Gen(id, slot.gen)
 
     unpark(here)
     release_env(emark)
@@ -199,6 +242,140 @@ gen_step(id: usize, gen: usize, sent: Value, at: Span) -> Result[Step2, Signal]
     answer
 end gen_step
 
+// -- the asynchronous half -------------------------------------------------------------------------
+//
+// **An `async` generator is the same body with the same two instructions in it, and what changed is
+// only WHO IS OWED THE ANSWER.** A plain generator's driver is the `next` that called it, standing
+// on the caller's own turn; an asynchronous one's is a PROMISE, so a step that has to wait for
+// something can hand the machine to the scheduler half way through and settle that promise later,
+// when the body finally reaches a `yield`.
+//
+// Nothing below is new machinery. `Op.Await` already parks a machine and asks for `vm.promise`, the
+// scheduler already puts one back, and `finish` is already the one place a resumed machine's outcome
+// is written into a promise. The whole of the feature is that the generator's machine carries a
+// promise like a coroutine's and `Machine.gen` says whose values it is producing.
+
+// One step of an `async` generator: the machine is put back, run, and whatever it comes to is
+// written into the promise this hands back.
+//
+// **The promise is the machine's OWN**, which is what makes an `await` inside the body work with no
+// code of its own: `Op.Await` reads `vm.promise` and parks, the scheduler resumes the machine when
+// what it waited for settles, and `finish` -- reading the `Machine.gen` `start_generator` wrote --
+// settles this promise at the `yield` the body eventually reaches.
+private gen_step_async(id: usize, gen: usize, sent: Value, at: Span) -> Step
+    var slot = current().generators.at(id)
+
+    // **ONE `next` AT A TIME, AND IT IS REFUSED RATHER THAN QUEUED.** A second asked while the first
+    // is still waiting would leave two promises entitled to the generator's next value and no rule
+    // for which gets it. JavaScript queues them; refusing says so where queueing would answer
+    // quietly, and a program that wants the values in order already has `for await`.
+    if slot.pending
+        return fault(at, "this `async` generator is already working on a `next` -- await that promise before asking it for another value")
+
+    val mark = root_mark()
+
+    hold(sent)
+
+    val pr = new_promise()
+
+    hold(Promise(pr))
+
+    slot.pending = true
+    current().generators.set(id, slot)
+
+    val here = park()
+
+    unpark(slot.machine)
+
+    // **Taken after the `unpark`**, which is where the generator's own machine comes back.
+    val vm = machine()
+
+    if slot.started
+        vm.stack.set(vm.stack.len() - 1, sent)
+
+    vm.promise = pr
+
+    // **`finish` does the parking and the settling**, exactly as it does for the resumption the
+    // scheduler drives -- so a step that ends at a `yield` and a step that ends at a `yield` three
+    // `await`s later are one piece of code.
+    finish(resume_chunk(running_unit()))
+    unpark(here)
+    release(mark)
+    Ok(Promise(pr))
+end gen_step_async
+
+// What an `async` generator's step came to, written into the promise the `next` that drove it
+// handed back.
+//
+// **Reached from BOTH drivers, which is the point of it being here rather than in either.**
+// `gen_step_async` resumes a machine standing still at a `yield`; `resume_one` resumes one that was
+// waiting on a promise. Both go through `finish`, and nothing about the value a body yields is
+// different for having waited first.
+//
+// Not `private`: `finish` in `async.sysl` is what dispatches to it.
+finish_generator(id: usize, pr: *PromiseObj, outcome: Step)
+    val mark = root_mark()
+
+    hold(Promise(pr))
+
+    outcome match
+        // **A `yield` leaves the machine STANDING HERE**, exactly as it does for a plain generator:
+        // `Op.Yield` does not park, so parking is the driver's move and this is the driver. An
+        // `await` is the other `Err(Wait)` and never reaches this -- it parks first, so the machine
+        // `finish` read was the fresh one park left behind and its null promise sent it home.
+        Err(Wait) ->
+            val vm = machine()
+            val v = vm.stack.at(vm.stack.len() - 1)
+            val step = step_value(v, false)
+
+            hold(step)
+
+            var slot = current().generators.at(id)
+
+            slot.machine = park()
+            slot.started = true
+            slot.pending = false
+            current().generators.set(id, slot)
+            settle_ok(pr, step)
+        Ok(v) ->
+            hold(v)
+
+            val step = step_value(v, true)
+
+            hold(step)
+            retire(id)
+            settle_ok(pr, step)
+
+        // **A fault ends the generator and REJECTS the pending `next`.** It has already been offered
+        // to the body's own `catch` blocks, which went into `parked` with the machine, so anything
+        // still travelling belongs to whoever awaited this step.
+        Err(Fail(fat, src, m)) ->
+            retire(id)
+            settle_err(pr, m, fat, src)
+        Err(Quit(fat, src, n)) ->
+            retire(id)
+            settle_quit(pr, fat, src, n)
+        Err(s) ->
+            retire(id)
+            settle_err(pr, signal_message(s), signal_span(s), signal_source(s))
+
+    release(mark)
+end finish_generator
+
+// A promise that has already settled with `v`, which is what a finished `async` generator's `next`
+// answers: the shape a program reads is the same on every step, including the last.
+private settled_step(v: Value) -> Step
+    val mark = root_mark()
+
+    hold(v)
+
+    val pr = new_promise()
+
+    hold(Promise(pr))
+    settle_ok(pr, v)
+    release(mark)
+    Ok(Promise(pr))
+
 // Give a spent generator's slot back. The machine is in `vm` at this point and goes when the caller
 // is put back over it.
 private retire(id: usize)
@@ -207,6 +384,7 @@ private retire(id: usize)
     slot.live = false
     slot.done = true
     slot.started = true
+    slot.pending = false
     current().generators.set(id, slot)
 
 // The next value a `for` gets, or nothing where the generator is finished.
@@ -216,6 +394,12 @@ private retire(id: usize)
 // drives it with `next` instead.
 gen_iter_next(id: usize, gen: usize, at: Span) -> Result[Option[Value], Signal]
     if !gen_holds(id, gen) then return Ok(None)
+
+    // **The one refusal for every walk that materialises**, which is why it is here rather than at
+    // `IterInit`: `for`, `...`, `array(g)`, `zip` and `Set(g)` all come through this, and each of
+    // them wants a value now where an `async` generator has only a promise to give.
+    if current().generators.at(id).asynchronous
+        return Err(failure(at, AsyncGenWalk))
 
     gen_step(id, gen, Value.Null, at)? match
         Yielded(v) -> Ok(Some(v))
@@ -233,11 +417,18 @@ do_gen_next(args: Args, at: Span) -> Step
 
     args.at(0) match
         Gen(id, gen) ->
+            val asynchronous = gen_is_async(id)
+
             // **A finished generator answers rather than faulting.** Asking one for another value is
             // what every loop written over a generator does on its last turn, so it is an ordinary
             // state and not a mistake -- where asking one that has been *reused* would be a stale
             // value, which `gen_holds` is what catches.
-            if !gen_holds(id, gen) then return Ok(step_value(Value.Null, true))
+            if !gen_holds(id, gen)
+                val ended = step_value(Value.Null, true)
+
+                return if asynchronous then settled_step(ended) else Ok(ended)
+
+            if asynchronous then return gen_step_async(id, gen, sent, at)
 
             gen_step(id, gen, sent, at)? match
                 Yielded(v) -> Ok(step_value(v, false))
