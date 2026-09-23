@@ -551,8 +551,34 @@ trace_object(p: *u8, h: *gc.Heap)
             mark_value(h, e.key)
             mark_value(h, e.value)
 
+// The capacity a `Buf` takes at its first push, which is therefore the table every object of fewer
+// than eight fields has.
+private const FirstTable: usize = 8
+
+// How many emptied tables a VM keeps for reuse.
+private const SpareEntries: usize = 1024
+
+// **A SWEEP KEEPS A SMALL OBJECT'S ENTRY TABLE FOR THE NEXT OBJECT, AND THAT IS THE ALLOCATION A
+// CONSTRUCTOR CALL USED TO MAKE.** An object's fields live in a `Buf` outside the heap, so every
+// `Counter(n)` asked `malloc` for a table of `SmallTable` entries, wrote every one of them, and the
+// sweep that freed the object handed the table back to `free` -- a malloc, a fill and a free per
+// object, which a loop making one object a turn pays every turn. A table of exactly the size the
+// first push gives is emptied and kept instead, up to `SpareEntries` of them, and `new_object` takes
+// one before it asks for memory.
+//
+// **Only during a SWEEP, which `sweeping` says.** A heap being disposed is going away with its VM,
+// and keeping its tables would only move the free to later.
+//
+// **Bounded, so the tables kept are never more than a sweep's worth of small objects**: a program
+// that made a million and dropped them keeps `SpareEntries` tables -- half a megabyte -- and gives the
+// rest back as it always did.
 finalize_object(p: *u8)
     val o: *ObjectObj = ptr_cast(p)
+    val v = current()
+
+    if v.sweeping && o.entries.cap() == FirstTable && v.spare_entries.len() < SpareEntries
+        o.entries.clear()
+        v.spare_entries.push(o.entries)
 
     o.entries = buf()
     o.index = buf()
@@ -804,7 +830,9 @@ collect_now()
     v.collections += 1
     v.payload_marked = 0
 
+    v.sweeping = true
     gc.collect(slate_heap(), &roots)
+    v.sweeping = false
 
     v.payload = v.payload_marked
     profile_collected(began)
@@ -928,6 +956,7 @@ reset_heap()
     val v = current()
 
     v.heap = gc.heap(v.region, v.heap_limit)
+    v.spare_entries = buf()
     v.root_values.clear()
     v.root_envs.clear()
     forget_carried()
@@ -1144,7 +1173,12 @@ new_object() -> *ObjectObj
     val v = current()
     var o: *ObjectObj = ptr_cast(alloc_or_collect(v, sizeof(ObjectObj), &object_kind, ptr_cast(v.spare_object)))
 
-    o.entries = buf()
+    // **A table a sweep kept, where there is one** -- `finalize_object` says why. It is empty and
+    // already the size a first field would have grown it to, and the charge below is what that
+    // growth would have charged.
+    o.entries = v.spare_entries.pop() match
+        Some(kept) -> kept
+        None -> buf()
 
     // **A new table has no index and allocates none**, which `table.sysl`'s `SmallTable` is the
     // whole of: a lookup walks the entries until the table outgrows the small case, and an object
