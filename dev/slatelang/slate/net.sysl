@@ -192,7 +192,7 @@ listen_socket(port: long, secure: Option[Secure], reuse_port: bool, cb: Value, a
 
     if port < 0 || port > 65535 then return fault(at, s"a port is between 0 and 65535, and this is ${port}")
 
-    val server = libuv.tcp(event_loop()) match
+    var server = libuv.tcp(event_loop()) match
         Err(e) -> return fault(at, s"this socket could not be made: ${e}")
         Ok(t) -> t
 
@@ -206,9 +206,27 @@ listen_socket(port: long, secure: Option[Secure], reuse_port: bool, cb: Value, a
     //
     // **A host with no IPv6 at all falls back**, since the bind is what says so and there is nothing
     // to be gained by refusing to serve.
-    val bound = libuv.ip6("::", int(port)) match
-        Err(_) -> false
-        Ok(a) -> server.bind(a, flags).is_ok()
+    var bound = bind_any6(server, port, flags)
+
+    // **A port of `0` is a promise of a FREE port, and on macOS the dual-stack bind does not keep
+    // it.** The kernel's choice for `::` does not avoid a port some other process holds on
+    // `127.0.0.1` alone, and the bind succeeds -- after which a client dialling `127.0.0.1` (or
+    // `localhost`, which `connect` resolves to IPv4 first) reaches THAT listener and not this one.
+    // It answers a stranger's bytes or a failed handshake, once in a few hundred runs on a machine
+    // with other servers on it, and nothing in the sentence names a port. So a kernel choice that
+    // someone else holds on the IPv4 loopback is handed back and another is asked for. A port the
+    // PROGRAM named is its own business, and is left exactly as it was.
+    var tries = 0
+
+    while bound && port == 0 && tries < PortTries && !loopback_free(server)
+        tries += 1
+        server.close()
+
+        server = libuv.tcp(event_loop()) match
+            Err(e) -> return fault(at, s"this socket could not be made: ${e}")
+            Ok(t) -> t
+
+        bound = bind_any6(server, port, flags)
 
     if !bound
         val addr = libuv.ip4("0.0.0.0", int(port)) match
@@ -237,6 +255,43 @@ listen_socket(port: long, secure: Option[Secure], reuse_port: bool, cb: Value, a
             fault(at, s"cannot listen on port ${port}: ${e}")
         Ok(_) -> Ok(held)
 end listen_socket
+
+// How many kernel choices `listen(0)` hands back before settling for one. Another process holding the
+// chosen port on the IPv4 loopback is rare, so a second choice is nearly always the last.
+private const PortTries: int = 16
+
+// Bind a server to every address, both families, at this port; whether it took.
+private bind_any6(server: &libuv.Tcp, port: long, flags: u32) -> bool = libuv.ip6("::", int(port)) match
+    Err(_) -> false
+    Ok(a) -> server.bind(a, flags).is_ok()
+
+// Whether nothing else is listening on `127.0.0.1` at the port this server was given.
+//
+// **The probe is a bind AND a listen**, because libuv defers `EADDRINUSE` from the bind to whichever
+// of `listen` or `connect` comes next. libuv sets `SO_REUSEADDR` on every socket, which is what lets
+// the probe take the specific address beside this server's wildcard while still being refused by a
+// listener that holds that exact address -- measured on macOS both ways before this was written.
+//
+// Not `private`: `tests_io.sysl` asks it with a squatter standing on the port, the kernel's own
+// choice of port being something no test can arrange.
+loopback_free(server: &libuv.Tcp) -> bool
+    val port = server.sockname() match
+        Err(_) -> return true
+        Ok(a) -> a.port()
+
+    val addr = libuv.ip4("127.0.0.1", port) match
+        Err(_) -> return true
+        Ok(a) -> a
+
+    val probe = libuv.tcp(event_loop()) match
+        Err(_) -> return true
+        Ok(t) -> t
+
+    val free = probe.bind(addr).is_ok() && probe.listen(1, () -> ()).is_ok()
+
+    probe.close()
+    free
+end loopback_free
 
 // The slot and generation inside a socket value, for the two places here that made one and know it
 // is a socket.

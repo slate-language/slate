@@ -352,6 +352,36 @@ print(e.next(5))
 {value: 50, done: false}
 ```
 
+**A bare `next()` sends `undefined`**, which is JavaScript's answer: nothing was passed, and absence
+is `undefined`. A `for` sends nothing in either. Since `undefined` [may not be kept](values.md#absence),
+a `yield` that could be resumed with nothing says what nothing means with `??`:
+
+```slate
+asker()
+    val got = (yield "ready") ?? "nothing"
+
+    yield got
+
+val a = asker()
+
+a.next()
+print(a.next())
+
+val b = asker()
+
+b.next()
+print(b.next("sent"))
+```
+
+```output
+{value: "nothing", done: false}
+{value: "sent", done: false}
+```
+
+Bound as it stands, `val got = yield 1` resumed by a bare `next()` is refused where it binds:
+*this generator was resumed with nothing, and `undefined` cannot be kept -- give the `yield` a value
+with `??`, or call `next(v)`*.
+
 **`yield` takes the whole expression where `await` takes one operand.** `await f() + 1` waits for the
 call and adds to the answer; `yield x * x` yields the product. A yield used inside a larger expression is
 bracketed. JavaScript and Python both put `yield` at the bottom of the ladder.

@@ -477,10 +477,16 @@ end match_leaf
 // Which unpacking instruction a binding site gets, and the operands it carries.
 //
 // **An array or an object of BARE NAMES is taken apart by the instruction itself** -- `for [a, b] in
-// pairs`, `val { k, v } = o`, a parameter that unpacks -- because such a pattern cannot half-match:
-// every part is a name and a name takes whatever stands in its place. So there is nothing for the
-// matcher to decide, nothing to push onto the operand stack and nothing to copy down afterwards.
-// Everything else -- a default, a `?`, a rest, a literal, anything nested -- still walks.
+// pairs`, `val { k, v } = o`, `val { width = 10, height } = opts`, a parameter that unpacks --
+// because such a pattern cannot half-match: every part is a name and a name takes whatever stands in
+// its place. So there is nothing for the matcher to decide, nothing to push onto the operand stack
+// and nothing to copy down afterwards. Everything else -- a rest, a literal, anything nested -- still
+// walks. (A `?` never reaches a binding site; `refuse_optionals` sees to that.)
+//
+// **A DEFAULT IS NOT A HALF-MATCH, it is a name the subject may leave out**, and what a binding site
+// does about one is already decided downstream: the mask says which names arrived and the guarded
+// assignments after the unpack work the defaults out. So the instruction takes a defaulted row
+// exactly as it takes a plain one and leaves the mask `UnpackSlots` would have left.
 //
 // **The two halves are written together on purpose.** Which patterns may skip the matcher and how
 // they are then taken apart are one rule, and they share `unpack_complaint` for the sentence a
@@ -488,15 +494,14 @@ end match_leaf
 //
 // Not `private`: `slots.sysl` is the one site that emits either of them.
 unpack_op(u: *Unit, pat: Pattern, k: usize, first: usize, masked: bool) -> Op
-    if !masked
-        *pat.kind match
-            ArrayPat(items, open, rest, _) ->
-                if !open && rest.is_none() && all_bare(items)
-                    return UnpackFixed(intern_wide(u, k, first, items.len()), false)
-            ObjectPat(keys, values, _, optional) ->
-                if !any_optional(optional) && all_bare(values)
-                    return UnpackFixed(intern_wide(u, k, first, keys.len()), true)
-            _ -> ()
+    *pat.kind match
+        ArrayPat(items, open, rest, _) ->
+            if !open && rest.is_none() && all_bare(items)
+                return UnpackFixed(intern_wide(u, k, first, items.len()), false, masked)
+        ObjectPat(keys, values, _, optional) ->
+            if !any_optional(optional) && all_bare(values)
+                return UnpackFixed(intern_wide(u, k, first, keys.len()), true, masked)
+        _ -> ()
 
     UnpackSlots(intern_wide(u, k, first, 0), masked)
 end unpack_op
@@ -506,32 +511,60 @@ end unpack_op
 // **A `false` means nothing was bound and the caller owes the sentence**, which is
 // `unpack_complaint`'s -- so the two paths a binding can fail on say exactly the same thing. An
 // object is filled in key order, which is `pattern_names`' order for one and therefore the order
-// the cells were claimed in. The subject is left standing; the caller takes it off.
+// the cells were claimed in.
+//
+// **On a `true` the subject is gone**, replaced by the mask where the pattern carries defaults and
+// taken off where it does not -- `compose_unpack_slots`' stack effect, so the two instructions are
+// interchangeable at the site. A name the subject did not supply is a cell left alone and a bit left
+// zero, which is `lay_bindings`' placeholder rule with no placeholder to push.
 //
 // Not `private`: `run_frames.sysl` is where the instruction lands.
-unpacked_fixed(vm: *Machine, pat: Pattern, object: bool, first: usize, n: usize) -> bool
+unpacked_fixed(vm: *Machine, pat: Pattern, object: bool, masked: bool, first: usize, n: usize) -> bool
     val subject = peek_on(vm, 0)
+
+    var mask: usize = 0
 
     if !object
         subject match
             Array(xs) ->
-                if xs.items.len() != n then return false
+                val arrived = xs.items.len()
 
-                for i in 0..<n
+                if arrived > n then return false
+
+                // **Short is a fault unless every element it leaves out has a default**, and those
+                // are all at the end, which the parser has already seen to.
+                if arrived < n
+                    if !masked then return false
+
+                    *pat.kind match
+                        ArrayPat(_, _, _, defaults) -> if arrived < n - trailing_defaults(defaults) then return false
+                        _ -> return false
+
+                // The mask is only built where one is wanted: a row with no default may be wider
+                // than the mask has bits.
+                for i in 0..<arrived
                     vm.stack.set(first + i, xs.items.at(i))
+
+                    if masked then mask = mask | (1usize << i)
+            _ -> return false
+    else
+        subject match
+            Object(fields) -> *pat.kind match
+                ObjectPat(keys, _, defaults, _) ->
+                    for i in 0..<keys.len()
+                        field_through(fields, keys.at(i)) match
+                            Some(field) ->
+                                vm.stack.set(first + i, field)
+
+                                if masked then mask = mask | (1usize << i)
+                            None -> if !masked || defaults.at(i).is_none() then return false
+                _ -> return false
             _ -> return false
 
-        return true
-
-    subject match
-        Object(fields) -> *pat.kind match
-            ObjectPat(keys, _, _, _) ->
-                for i in 0..<keys.len()
-                    field_through(fields, keys.at(i)) match
-                        Some(field) -> vm.stack.set(first + i, field)
-                        None -> return false
-            _ -> return false
-        _ -> return false
+    if masked
+        vm.stack.set(vm.stack.len() - 1, Int(long(mask)))
+    else
+        vm.stack.truncate(vm.stack.len() - 1)
 
     true
 end unpacked_fixed

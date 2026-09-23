@@ -428,7 +428,7 @@ mutating it. `concat(xs, ys)` is the array counterpart.
 
 **`null` is the only absence a program can keep**, it is an ordinary value, and slate refuses to store
 anything else in its place — `undefined` exists only as the immediate answer to a read that found
-nothing, and [compares equal to `null`](#equality). That single rule explains a run of behaviour that
+nothing, or to a `yield` a bare [`next()`](asynchrony.md#generators) resumed, and [compares equal to `null`](#equality). That single rule explains a run of behaviour that
 otherwise looks unrelated:
 
 - `pop`, `shift` and `at` **fault** where there is nothing there, rather than answering nothing.
