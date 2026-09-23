@@ -236,3 +236,28 @@ async AN_ACTOR_READS_ITS_OWN_FIELDS_AND_ITS_OWN_CLASSES() =
     send(t.bump, 4)
 
     assertEq(await ask(t.sum), 14)
+
+// **A method call on a builtin kind remembers the builtin it found, keyed on the KIND**, so one place
+// in the program that meets a string and then an array has to answer each with its own.
+firstOf(x) = x.at(0)
+
+@test
+A_METHOD_CALL_PLACE_THAT_MEETS_TWO_KINDS_ANSWERS_EACH_WITH_ITS_OWN() =
+    assertEq([firstOf("abc"), firstOf([7, 8]), firstOf("xyz"), firstOf([1])], ["a", 7, "x", 1])
+
+cutAt(x) = x.split(",")
+
+@test
+A_PLACE_THAT_FOUND_A_METHOD_ON_ONE_KIND_STILL_REFUSES_IT_ON_ANOTHER() =
+    // The string's `split` is remembered first, so what is under test is that an array arriving at
+    // the same place is asked the tables again rather than handed the string's answer.
+    assertEq(cutAt("a,b"), ["a", "b"])
+    assertFaults(() -> cutAt([1, 2]), "`split` is not something an array can do")
+    assertEq(cutAt("c"), ["c"])
+
+@test
+A_NUMBER_OF_EITHER_KIND_TAKES_THE_SAME_REMEMBERED_METHOD() =
+    // An integer and a real are one kind to the method tables, so one remembered answer serves both.
+    val shown = [1, 2.5, 3].map((n) -> n.toString())
+
+    assertEq(shown, ["1", "2.5", "3"])

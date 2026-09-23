@@ -551,8 +551,34 @@ trace_object(p: *u8, h: *gc.Heap)
             mark_value(h, e.key)
             mark_value(h, e.value)
 
+// The capacity a `Buf` takes at its first push, which is therefore the table every object of fewer
+// than eight fields has.
+private const FirstTable: usize = 8
+
+// How many emptied tables a VM keeps for reuse.
+private const SpareEntries: usize = 1024
+
+// **A SWEEP KEEPS A SMALL OBJECT'S ENTRY TABLE FOR THE NEXT OBJECT, AND THAT IS THE ALLOCATION A
+// CONSTRUCTOR CALL USED TO MAKE.** An object's fields live in a `Buf` outside the heap, so every
+// `Counter(n)` asked `malloc` for a table of `SmallTable` entries, wrote every one of them, and the
+// sweep that freed the object handed the table back to `free` -- a malloc, a fill and a free per
+// object, which a loop making one object a turn pays every turn. A table of exactly the size the
+// first push gives is emptied and kept instead, up to `SpareEntries` of them, and `new_object` takes
+// one before it asks for memory.
+//
+// **Only during a SWEEP, which `sweeping` says.** A heap being disposed is going away with its VM,
+// and keeping its tables would only move the free to later.
+//
+// **Bounded, so the tables kept are never more than a sweep's worth of small objects**: a program
+// that made a million and dropped them keeps `SpareEntries` tables -- half a megabyte -- and gives the
+// rest back as it always did.
 finalize_object(p: *u8)
     val o: *ObjectObj = ptr_cast(p)
+    val v = current()
+
+    if v.sweeping && o.entries.cap() == FirstTable && v.spare_entries.len() < SpareEntries
+        o.entries.clear()
+        v.spare_entries.push(o.entries)
 
     o.entries = buf()
     o.index = buf()
@@ -804,7 +830,9 @@ collect_now()
     v.collections += 1
     v.payload_marked = 0
 
+    v.sweeping = true
     gc.collect(slate_heap(), &roots)
+    v.sweeping = false
 
     v.payload = v.payload_marked
     profile_collected(began)
@@ -928,6 +956,7 @@ reset_heap()
     val v = current()
 
     v.heap = gc.heap(v.region, v.heap_limit)
+    v.spare_entries = buf()
     v.root_values.clear()
     v.root_envs.clear()
     forget_carried()
@@ -941,7 +970,7 @@ reset_heap()
     v.high_water = 0
 
     v.heap_exhausted = false
-    reserve_spares()
+    reserve_spares(v)
 
 // -- allocation ---------------------------------------------------------------------------------
 
@@ -972,23 +1001,30 @@ reset_heap()
 // They are the ten `current().spare_*` fields -- see `vm_state.sysl`.
 
 // Take the reserves. Called with an empty heap, where the allocation cannot fail.
-private reserve_spares()
-    val v = current()
+//
+// **The VM is a parameter because `new_vm` calls this on a VM nobody has entered yet.** A VM whose
+// reserves were never taken holds ten nulls, and handing one of those out is the wild write the
+// reserves exist to prevent: a second VM that filled its heap before anything had rebuilt it died
+// with a bare SIGSEGV where the program's own VM said it had run out of memory.
+//
+// Not `private`: `new_vm` in `vm_state.sysl` takes a fresh VM's reserves here.
+reserve_spares(v: *Vm)
+    val h = &v.heap
 
-    v.spare_str = ptr_cast(gc.alloc(slate_heap(), sizeof(StrObj), &str_kind))
-    v.spare_big = ptr_cast(gc.alloc(slate_heap(), sizeof(BigObj), &big_kind))
-    v.spare_array = ptr_cast(gc.alloc(slate_heap(), sizeof(ArrayObj), &array_kind))
-    v.spare_bytes = ptr_cast(gc.alloc(slate_heap(), sizeof(BytesObj), &bytes_kind))
-    v.spare_object = ptr_cast(gc.alloc(slate_heap(), sizeof(ObjectObj), &object_kind))
-    v.spare_closure = ptr_cast(gc.alloc(slate_heap(), sizeof(ClosureObj), &closure_kind))
-    v.spare_env = ptr_cast(gc.alloc(slate_heap(), sizeof(EnvObj), &env_kind))
-    v.spare_promise = ptr_cast(gc.alloc(slate_heap(), sizeof(PromiseObj), &promise_kind))
+    v.spare_str = ptr_cast(gc.alloc(h, sizeof(StrObj), &str_kind))
+    v.spare_big = ptr_cast(gc.alloc(h, sizeof(BigObj), &big_kind))
+    v.spare_array = ptr_cast(gc.alloc(h, sizeof(ArrayObj), &array_kind))
+    v.spare_bytes = ptr_cast(gc.alloc(h, sizeof(BytesObj), &bytes_kind))
+    v.spare_object = ptr_cast(gc.alloc(h, sizeof(ObjectObj), &object_kind))
+    v.spare_closure = ptr_cast(gc.alloc(h, sizeof(ClosureObj), &closure_kind))
+    v.spare_env = ptr_cast(gc.alloc(h, sizeof(EnvObj), &env_kind))
+    v.spare_promise = ptr_cast(gc.alloc(h, sizeof(PromiseObj), &promise_kind))
 
     // **The weak pair gets a reserve of its own rather than borrowing the object's**, because the
     // kind is written into the header at the allocation: a reserve taken under `object_kind` handed
     // out as a weak map would be traced strongly and weakened by nothing.
-    v.spare_weak_map = ptr_cast(gc.alloc(slate_heap(), sizeof(ObjectObj), &weak_map_kind))
-    v.spare_weak_ref = ptr_cast(gc.alloc(slate_heap(), sizeof(WeakRefObj), &weak_ref_kind))
+    v.spare_weak_map = ptr_cast(gc.alloc(h, sizeof(ObjectObj), &weak_map_kind))
+    v.spare_weak_ref = ptr_cast(gc.alloc(h, sizeof(WeakRefObj), &weak_ref_kind))
 
     // A zeroed payload is a valid object of each of these kinds except the ones holding a `Buf` or a
     // `Map`, which a tracer walks -- and a zero `Buf` is an empty one, so all ten are safe to trace
@@ -1137,7 +1173,12 @@ new_object() -> *ObjectObj
     val v = current()
     var o: *ObjectObj = ptr_cast(alloc_or_collect(v, sizeof(ObjectObj), &object_kind, ptr_cast(v.spare_object)))
 
-    o.entries = buf()
+    // **A table a sweep kept, where there is one** -- `finalize_object` says why. It is empty and
+    // already the size a first field would have grown it to, and the charge below is what that
+    // growth would have charged.
+    o.entries = v.spare_entries.pop() match
+        Some(kept) -> kept
+        None -> buf()
 
     // **A new table has no index and allocates none**, which `table.sysl`'s `SmallTable` is the
     // whole of: a lookup walks the entries until the table outgrows the small case, and an object

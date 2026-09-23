@@ -185,6 +185,43 @@ enum Step2
     // It finished, and this is what its body answered.
     Ended(v: Value)
 
+// Run the generator's machine on from its `yield`, once `sent` has been written into the slot.
+//
+// **A bare `next()` sends `undefined`, and `undefined` may not be kept** -- so `val got = yield 1`
+// resumed with nothing faults exactly as `val got = o.nope` does. What differs is the sentence:
+// the binding would say "this field is not there", which is true of a read and false of a `yield`.
+// So where the instruction the `yield` is about to hand its answer to is one that keeps it, the
+// fault is raised here instead, at that instruction and inside the body -- where its own `catch`
+// can have it -- in words that name what happened.
+private resume_sent(vm: *Machine, started: bool, sent: Value) -> Step
+    val nothing = sent match
+        Undefined -> true
+        _ -> false
+
+    if started && nothing
+        val back = vm.frames.at(vm.frames.len() - 1)
+        val ins = back.code.at(back.pc)
+
+        if keeps_outright(ins.op)
+            val msg = "this generator was resumed with nothing, and `undefined` cannot be kept -- give the `yield` a value with `??`, or call `next(v)`"
+
+            return resume_failed(running_unit(), failure_in(ins.at, back.source, msg, None))
+
+    resume_chunk(running_unit())
+end resume_sent
+
+// Whether an instruction keeps the value on top of the stack as it stands: a binding or a write.
+private keeps_outright(op: Op) -> bool
+    op match
+        DeclareSlot(_) -> true
+        StoreSlot(_) -> true
+        DeclareVal(_) -> true
+        DeclareVar(_) -> true
+        DeclareCell(_, _) -> true
+        StoreCell(_, _) -> true
+        StoreName(_) -> true
+        _ -> false
+
 // Run a generator to its next `yield`, or to the end.
 //
 // **The machine is put back, run, and set aside again, all on the caller's turn.** That is the same
@@ -213,7 +250,7 @@ gen_step(id: usize, gen: usize, sent: Value, at: Span) -> Result[Step2, Signal]
     if slot.started
         vm.stack.set(vm.stack.len() - 1, sent)
 
-    val outcome = resume_chunk(running_unit())
+    val outcome = resume_sent(vm, slot.started, sent)
 
     // **A yield leaves the machine in `vm` rather than parking it**, unlike an `await`: the driver is
     // right here, so parking is this function's move and doing it in the instruction would have been
@@ -298,7 +335,7 @@ private gen_step_async(id: usize, gen: usize, sent: Value, at: Span) -> Step
     // **`finish` does the parking and the settling**, exactly as it does for the resumption the
     // scheduler drives -- so a step that ends at a `yield` and a step that ends at a `yield` three
     // `await`s later are one piece of code.
-    finish(resume_chunk(running_unit()))
+    finish(resume_sent(vm, slot.started, sent))
     unpark(here)
     release(mark)
     Ok(Promise(pr))
@@ -390,7 +427,7 @@ private retire(id: usize)
 // The next value a `for` gets, or nothing where the generator is finished.
 //
 // **A `for` sends nothing in**, there being nowhere in `for x in g` to write what would be sent -- so
-// `yield` answers `null` inside a loop-driven generator, and a program that wants two-way traffic
+// `yield` answers `undefined` inside a loop-driven generator, as a bare `next()` makes it, and a program that wants two-way traffic
 // drives it with `next` instead.
 gen_iter_next(id: usize, gen: usize, at: Span) -> Result[Option[Value], Signal]
     if !gen_holds(id, gen) then return Ok(None)
@@ -401,7 +438,7 @@ gen_iter_next(id: usize, gen: usize, at: Span) -> Result[Option[Value], Signal]
     if current().generators.at(id).asynchronous
         return Err(failure(at, AsyncGenWalk))
 
-    gen_step(id, gen, Value.Null, at)? match
+    gen_step(id, gen, Value.Undefined, at)? match
         Yielded(v) -> Ok(Some(v))
 
         // **What the body returned is not an element.** `for x in g` walks what a generator yields;
@@ -413,7 +450,9 @@ do_gen_next(args: Args, at: Span) -> Step
     if args.len() != 1 && args.len() != 2
         return fault(at, s"`next` takes a generator and optionally a value to send it, and was given ${counted(args.len(), "argument")}")
 
-    val sent = if args.len() == 2 then args.at(1) else Value.Null
+    // **A bare `next()` sends `undefined`**: nothing was passed, and absence is `undefined` -- which
+    // is also what JavaScript's own `g.next()` makes the paused `yield` answer.
+    val sent = if args.len() == 2 then args.at(1) else Value.Undefined
 
     args.at(0) match
         Gen(id, gen) ->

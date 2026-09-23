@@ -445,6 +445,81 @@ a_generator_may_be_stepped_by_hand() =
     assertEq(next(g).value, "b")
     assert(next(g).done)
 
+    // A finished one goes on answering, and its value is `null`.
+    val after = next(g)
+
+    assertEq(after.value, null)
+    assert(after.done)
+
+@test
+A_BARE_next_SENDS_undefined_AND_next_v_SENDS_v() =
+    // **Nothing passed is absence, which slate spells `undefined`** -- JavaScript's own answer -- so
+    // the `yield` says what it means by nothing with `??`.
+    echoer() =
+        val got = (yield 1) ?? "nothing"
+
+        yield got
+
+    val bare = echoer()
+
+    bare.next()
+    assertEq(bare.next().value, "nothing")
+
+    val sent = echoer()
+
+    sent.next()
+    assertEq(sent.next("v").value, "v")
+
+    // A `for` sends nothing in, exactly as a bare `next()` does.
+    var seen = []
+
+    for x in echoer()
+        seen.push(x)
+
+    assertEq(seen, [1, "nothing"])
+
+@test
+A_BARE_next_INTO_A_KEPT_yield_FAULTS_IN_WORDS_ABOUT_THE_GENERATOR() =
+    // `undefined` may not be kept, but "this field is not there" would be false of a `yield`, so
+    // the sentence names the generator -- the same words on both back ends.
+    val said = "this generator was resumed with nothing, and `undefined` cannot be kept -- give the `yield` a value with `??`, or call `next(v)`"
+
+    bound() =
+        val got = yield 1
+
+        yield got
+
+    val b = bound()
+
+    b.next()
+    assertEq(b.next() catch e -> e.message, said)
+    assert(b.next().done)
+
+    // A write to a `var` is refused the same way.
+    written() =
+        var got = 0
+
+        got = yield 1
+        yield got
+
+    val w = written()
+
+    w.next()
+    assertEq(w.next() catch e -> e.message, said)
+
+    // And so is a write to a local a closure holds.
+    captured() =
+        var got = 0
+        val f = () -> got
+
+        got = yield 1
+        yield f()
+
+    val c = captured()
+
+    c.next()
+    assertEq(c.next() catch e -> e.message, said)
+
 @test
 async an_async_function_answers_a_promise() =
     later() =
@@ -693,6 +768,33 @@ async A_VALUE_SENT_INTO_AN_ASYNC_GENERATOR_IS_WHAT_ITS_yield_ANSWERS() =
 
     assertEq((await e.next()).value, 1)
     assertEq((await e.next(5)).value, 50)
+
+@test
+async A_BARE_next_SENDS_undefined_INTO_AN_ASYNC_GENERATOR_TOO() =
+    async echoer()
+        val got = (yield 1) ?? "nothing"
+
+        await sleep(1)
+
+        yield got
+
+    val bare = echoer()
+
+    await bare.next()
+    assertEq((await bare.next()).value, "nothing")
+
+    val sent = echoer()
+
+    await sent.next()
+    assertEq((await sent.next("v")).value, "v")
+
+    // `for await` sends nothing in either.
+    var seen = []
+
+    for await x in echoer()
+        seen.push(x)
+
+    assertEq(seen, [1, "nothing"])
 
 @test
 async A_FAULT_INSIDE_AN_ASYNC_GENERATOR_REJECTS_THE_next_THAT_IS_WAITING() =
