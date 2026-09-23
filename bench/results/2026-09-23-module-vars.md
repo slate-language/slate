@@ -42,10 +42,16 @@ A `sample` of a 60,000,000-turn `globals` on the control, top of stack: `run_fra
   written again). The name is still bound, so the scope still says the file has it; a copy of the
   first value would have been stale and would have kept it alive for the life of the run.
   `Vm.defs` is a collector root, and for a `var` it is now the only holder of the latest value.
+- **An annotation's check reads the cell too.** `var n: number = 0` is a `DeclareCell` followed by a
+  `CheckType` that looked the name up by spelling — and found the scope's `null`, so the first gate
+  refused every annotated module variable (nine tests, and two documentation pages). `CheckType`
+  carries the cell now, `CheckType(w, cell)` with `cell` one more than the index and 0 for none, the
+  payload still eight bytes; `check_module_name` in `defs.sysl` notes it as a site, so a spelling
+  that is put back takes its check back to the lookup with it.
 - `Vm.def_scopes` is gone.
 
-`run_frames.sysl` is untouched (the arms were already `LoadCell`/`StoreCell`), so no `Op`, no `Step`
-width and no jump-table order moved.
+The hot arms were already `LoadCell`/`StoreCell` and are untouched; the one `run_frames.sysl` line
+that changed is the cold `CheckType` arm, so no `Step` width and no jump-table order moved.
 
 ## Wall time
 
@@ -103,12 +109,13 @@ outlier it was.
 
 ## Tests
 
-`tests_module_vars.sysl` (5): the export object reads an exported `var` from its cell and a put-back
+`tests_module_vars.sysl` (7): an annotated module variable's check reads its cell (and a put-back
+spelling's check reads by name); the export object reads an exported `var` from its cell and a put-back
 spelling by name; a loop, a function and an early closure all read the last write; all four refusals
 of absence still name the variable (cell write, cell binding, by-name write, by-name binding); a
 value written to a module `var` survives collections in a one-megabyte heap with the cell as its only
-holder. `tests/lang/modulevars.sl` (7, both back ends) with `tests/lang/lib/tallied.sl`: a top-level
+holder. `tests/lang/modulevars.sl` (8, both back ends) with `tests/lang/lib/tallied.sl`: a top-level
 loop, a function writing the file's variable, a closure reading the latest value, an import of a
 variable the module wrote after declaring it (`settled` 1 → 24, `shape` rebound to another kind), an
-import of a put-back spelling, a refused absent write, and a closure another module hands out writing
+import of a put-back spelling, an annotated variable bound and written, a refused absent write, and a closure another module hands out writing
 its own variable while the importer's snapshot stays.

@@ -57,6 +57,15 @@ AN_IMPORTED_VARIABLE_WHOSE_SPELLING_A_FUNCTION_REBINDS_IS_WHAT_THE_MODULE_FINISH
     assertEq(shadowed, 5)
     assertEq(ownShadowed(), 9)
 
+// An annotated variable is checked where it is bound, against what it was bound to.
+var typed: number = 1.5
+
+typed = typed * 2
+
+@test
+AN_ANNOTATED_MODULE_VARIABLE_IS_BOUND_AND_WRITTEN()
+    assertEq(typed, 3)
+
 spoil() =
     total = {}.missing
     0
