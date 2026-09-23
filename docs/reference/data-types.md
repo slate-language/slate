@@ -33,6 +33,37 @@ Empty 0
 machinery `class` already had. `Circle(3)` is the generated constructor, reached by the rule that
 calling an object calls its `new`.
 
+**A variant's field may say its type**, the annotation a parameter takes, and it is checked where the
+variant is made — a field is a parameter of the variant's constructor:
+
+```slate
+data Shape
+    Circle(r: real)
+    Rect(w: number, h: number)
+    Traced(outline: { x: integer, y: integer }, draw: (integer) -> string = n -> "")
+
+print(Circle(1.5).r, Rect(2, 3.5).h, Traced({ x: 0, y: 1 }).outline.y)
+```
+
+```output
+1.5 3.5 1
+```
+
+An integer is not a `real` — `number` is the word for either — so:
+
+```slate
+data Shape
+    Circle(r: real)
+
+doubled(n) = Circle(n).r * 2.0
+
+print(doubled(2))
+```
+
+```error
+`r` was declared real, and was given 2
+```
+
 **A variant that declares no fields is a value rather than a maker.** `Empty` is the value, not
 `Empty()`, and the test for it is identity.
 

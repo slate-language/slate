@@ -138,6 +138,21 @@ splitting_and_joining() =
     assertEq(repeat("ab", 3), "ababab")
 
 @test
+SPLIT_KEEPS_EVERY_EMPTY_PIECE_AND_CUTS_ON_THE_WHOLE_SEPARATOR() =
+    assertEq(split(",a,,b,", ","), ["", "a", "", "b", ""])
+    assertEq(split("a--b--", "--"), ["a", "b", ""])
+    assertEq(split("a-b", "--"), ["a-b"])
+    assertEq(split("", ","), [""])
+    assertEq("x,y".split(","), ["x", "y"])
+
+@test
+A_PIECE_OF_A_STRING_THAT_IS_NOT_ALL_ONE_BYTE_COUNTS_ITS_OWN_CHARACTERS() =
+    val pieces = split("é,ü,ab", ",")
+
+    assertEq(pieces.map((p) -> p.length), [1, 1, 2])
+    assertEq(pieces[0][0], "é")
+
+@test
 interpolation_renders_a_value_the_way_print_does() =
     val n = 3
     val xs = [1, 2]

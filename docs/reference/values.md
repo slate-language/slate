@@ -434,7 +434,24 @@ otherwise looks unrelated:
 - `pop`, `shift` and `at` **fault** where there is nothing there, rather than answering nothing.
 - `find` and `indexOf` answer **`null`** — a search that found nothing is an answer, where reaching
   past the end is a mistake.
-- A parameter nobody gave is **not bound at all**, so there is no sentinel to test for and
-  `f(1, null)` is not the same as `f(1)`.
+- A parameter nobody gave reads as the absence a missing field does, so `f(1, null)` is not the same
+  as `f(1)` — and like a missing field it can be read but not kept.
 - An object field a value need not have is a question about its [shape](types.md) (`pinned?`), not a
   value that might be absent.
+
+Keeping one is refused where it is attempted — binding it to a `val`, a `var` or a `for` head,
+writing it over a local, storing it in a field, an array or an object, or passing it to a function —
+and in the same words under `slate js`:
+
+```slate
+val settings = { port: 8080 }
+val host = settings.host
+
+print(host)
+```
+
+```error
+this field is not there, and `undefined` cannot be bound to `host` -- give it a value with `??`, or ask `has` first
+```
+
+`settings.host ?? "localhost"` is the program that runs.
