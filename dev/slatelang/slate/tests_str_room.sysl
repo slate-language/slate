@@ -1,0 +1,228 @@
+module dev.slatelang.slate
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.str_builder
+
+// A string built by appending, and the room its pieces share (`str_room.sysl`).
+//
+// **What has to stay true is that a string never changes**, however its storage is shared: an
+// append writes only bytes no string can see yet, so a string held under another name, a prefix
+// kept in an array and a string appended to after something else was appended to it all keep the
+// text they had. The rest is accounting -- a room is charged once, at its capacity -- and the
+// collector, which has to keep a room alive for as long as any of its strings is.
+
+// A heap small enough that building a few thousand strings in it collects many times, and the one
+// the rest of the suite runs against.
+private const Crowded: usize = 1048576
+private const Roomy: usize = 268435456
+
+private repeated(piece: string, n: usize) -> string
+    var out = str_builder()
+
+    for i in 0..<n
+        out.push(piece)
+
+    out.finish()
+end repeated
+
+private st(text: string) -> *StrObj = new_str_scanned(text)
+
+private cell(v: Value) -> *StrObj
+    v match
+        Str(p) -> return p
+        _ -> ()
+
+    assert(false, "a join answers a string")
+    null
+end cell
+
+private join(x: *StrObj, y: *StrObj) -> *StrObj = cell(joined(x, y))
+
+@test
+AN_APPEND_TO_THE_TIP_WRITES_INTO_THE_ROOM_AND_CHANGES_NO_STRING_ANYBODY_HOLDS()
+    reset_vm()
+    reset_heap()
+
+    val left = repeated("a", 64)
+    val s = join(st(left), st("b"))
+
+    assert(s.room != null, "a join of 65 bytes with the long side first is given a room")
+    assert(s.room.store.len > 65usize, "with spare capacity after it")
+
+    // `val a = s; s += "ccc"`: `a` is the very cell `s` was, and the append leaves it alone.
+    val a = s
+    val t = join(s, st("ccc"))
+
+    assert(t.room == s.room, "appending to the tip extends the same room rather than copying")
+    assert_eq(a.s, left + "b", "the string held under the other name is unchanged")
+    assert_eq(t.s, left + "bccc", "and the appended one reads the whole")
+    assert_eq(a.chars, 65usize)
+    assert_eq(t.chars, 68usize)
+
+    // `a` is no longer the tip, so appending to it must COPY: writing "ddd" at its end would
+    // overwrite the "ccc" that `t` can see.
+    val u = join(a, st("ddd"))
+
+    assert(u.room != s.room, "an append to a string that is not the tip goes to a room of its own")
+    assert_eq(u.s, left + "bddd")
+    assert_eq(t.s, left + "bccc", "and the string that WAS extended still reads what it did")
+    assert_eq(a.s, left + "b")
+end AN_APPEND_TO_THE_TIP_WRITES_INTO_THE_ROOM_AND_CHANGES_NO_STRING_ANYBODY_HOLDS
+
+@test
+A_SHORT_JOIN_AND_A_PREPEND_ARE_GIVEN_NO_ROOM()
+    reset_vm()
+    reset_heap()
+
+    // Below the threshold a room could never pay for itself, and a long right side is a prepend,
+    // which spare room after the text does nothing for.
+    val short = join(st("abc"), st("def"))
+    val prepend = join(st("x"), st(repeated("y", 100)))
+
+    assert(short.room == null, "a short join is an ordinary string")
+    assert_eq(short.s, "abcdef")
+    assert(prepend.room == null, "and so is a short prefix joined to a long text")
+    assert_eq(prepend.chars, 101usize)
+end A_SHORT_JOIN_AND_A_PREPEND_ARE_GIVEN_NO_ROOM
+
+@test
+A_STRING_JOINED_TO_ITSELF_IN_ITS_OWN_ROOM_READS_TWICE_OVER()
+    reset_vm()
+    reset_heap()
+
+    val s = join(st(repeated("ab", 40)), st("c"))
+    val twice = join(s, s)
+
+    // The right side is the room's own bytes. A room is half as much again as the join that made
+    // it, so a tip never has room for itself and this moves -- which the text must not show.
+    assert_eq(twice.s, repeated("ab", 40) + "c" + repeated("ab", 40) + "c")
+    assert_eq(twice.chars, 162usize)
+    assert_eq(s.s, repeated("ab", 40) + "c")
+
+    // And an empty append to the tip makes a second tip of the same length; appending to either
+    // writes past both, so neither can see what the other gains.
+    val same = join(s, st(""))
+    val one = join(s, st("1"))
+    val two = join(same, st("2"))
+
+    assert_eq(one.s, repeated("ab", 40) + "c1")
+    assert_eq(two.s, repeated("ab", 40) + "c2")
+    assert_eq(same.s, repeated("ab", 40) + "c")
+end A_STRING_JOINED_TO_ITSELF_IN_ITS_OWN_ROOM_READS_TWICE_OVER
+
+@test
+GROWING_ONE_STRING_A_PIECE_AT_A_TIME_MOVES_IT_A_LOGARITHMIC_NUMBER_OF_TIMES()
+    reset_vm()
+    reset_heap()
+
+    val mark = root_mark()
+    var s = join(st(repeated("x", 64)), st("y"))
+    var moves = 0
+    var room = s.room
+
+    hold(Str(s))
+
+    for i in 0..<20000
+        s = join(s, st("yz"))
+        hold(Str(s))
+
+        if s.room != room
+            moves += 1
+            room = s.room
+
+    // 65 bytes grown to 40,065 at half as much again each time is fifteen or sixteen moves; a
+    // room that was not reused would be twenty thousand.
+    assert(moves > 5 && moves < 40, s"forty thousand bytes appended two at a time moved ${str(moves)} times")
+    assert_eq(s.s.bytes.len, 40065usize)
+    assert_eq(s.chars, 40065usize)
+    assert_eq(s.s, repeated("x", 64) + "y" + repeated("yz", 20000))
+
+    release(mark)
+end GROWING_ONE_STRING_A_PIECE_AT_A_TIME_MOVES_IT_A_LOGARITHMIC_NUMBER_OF_TIMES
+
+@test
+A_ROOM_IS_CHARGED_ONCE_AT_ITS_CAPACITY_AND_THE_RECOUNT_SAYS_THE_SAME()
+    reset_vm()
+    reset_heap()
+    collect_now()
+
+    val start = current().payload
+    val mark = root_mark()
+
+    // Ten prefixes of one room, all held. Charged as ten strings they would be about ten times the
+    // longest; charged as one room they are its capacity.
+    var s = join(st(repeated("q", 64)), st("r"))
+    val room = s.room
+
+    hold(Str(s))
+
+    for i in 0..<9
+        s = join(s, st("r"))
+        hold(Str(s))
+
+    assert(s.room == room, "all ten fitted in the first room")
+    collect_now()
+    assert_eq(current().payload, start + room.store.len, "the live payload is the room's capacity, once")
+
+    // And the recount is a measurement: a second collection over the same live set moves nothing.
+    collect_now()
+    assert_eq(current().payload, start + room.store.len, "and a second collection agrees")
+
+    release(mark)
+    collect_now()
+    assert_eq(current().payload, start, "dropping every string of the room gives all of it back")
+end A_ROOM_IS_CHARGED_ONCE_AT_ITS_CAPACITY_AND_THE_RECOUNT_SAYS_THE_SAME
+
+@test
+A_ROOM_HELD_ONLY_BY_ITS_SHORTER_PREFIXES_SURVIVES_A_COLLECTION_WITH_EVERY_ONE_INTACT()
+    reset_vm()
+    reset_heap()
+    collect_now()
+
+    val start = current().payload
+    val mark = root_mark()
+    val base = repeated("p", 64)
+    var s = join(st(base), st("0"))
+    var expect = base + "0"
+    var kept: Buf[*StrObj] = buf()
+    var wanted: Buf[string] = buf()
+
+    for i in 1..<50
+        val digit = str(i % 10)
+
+        s = join(s, st(digit))
+        expect = expect + digit
+
+        // Every seventh prefix is held; the tip itself, and everything between, is garbage.
+        if i % 7 == 0
+            hold(Str(s))
+            kept.push(s)
+            wanted.push(expect)
+
+    val room = kept.at(0).room
+
+    collect_now()
+
+    // The prefixes are all in one room -- the growth stayed inside its first capacity or moved,
+    // and either way every one of them still reads its own text after the rest were swept.
+    for i in 0..<kept.len()
+        assert_eq(kept.at(i).s, wanted.at(i), s"prefix ${str(i)} survives the collection intact")
+
+    assert(current().payload > start, "the rooms the prefixes stand in are still charged")
+    assert(room.store.len > 0usize, "and the first of them was not finalized under its strings")
+
+    release(mark)
+end A_ROOM_HELD_ONLY_BY_ITS_SHORTER_PREFIXES_SURVIVES_A_COLLECTION_WITH_EVERY_ONE_INTACT
+
+@test
+A_PROGRAM_KEEPING_PREFIXES_OF_A_GROWING_STRING_IN_A_SMALL_HEAP_READS_EVERY_ONE_BACK()
+    // The same question asked of a running program, in a megabyte, so the collector runs many times
+    // while the room's strings are held only by an array and a `var`.
+    set_heap_limit(Crowded)
+
+    val said = out("var s = \"p\".repeat(64)\nval kept = []\nfor i in 0..<3000\n    s += string(i % 10)\n    val junk = [i, i + 1, { a: i }]\n    if i % 250 == 0\n        kept.push(s)\nvar ok = true\nfor k in 0..<kept.length\n    val p = kept[k]\n    if p.length != 65 + k * 250 || p[p.length - 1] != \"0\"\n        ok = false\nprint([ok, kept.length, s.length])")
+
+    set_heap_limit(Roomy)
+    assert_eq(said, "[true, 12, 3064]")
+end A_PROGRAM_KEEPING_PREFIXES_OF_A_GROWING_STRING_IN_A_SMALL_HEAP_READS_EVERY_ONE_BACK
