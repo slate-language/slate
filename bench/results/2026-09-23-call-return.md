@@ -82,6 +82,35 @@ Alternating best-of-9 (`bench/alternate.pl 9`), control `a59aeee` against the br
 
 Nothing is slower than +0.8% (`strings`), which is this instrument's floor.
 
+**And again after dev moved under it** — `superinstructions-2`, `proto-hit` and sysl 0.0.128's thin
+LTO landed while this was being gated, so the branch was merged forward (`8c3cbaa`: the new fused
+arms read their stepped-over slots through the view too) and measured against a control at dev
+`7b8c4fb`, box 90.0% idle. **The item is worth MORE on the newer tree — geometric mean −10.44%**,
+every program faster:
+
+| program | control ms | branch ms | change |
+|---|---|---|---|
+| **fib** | 398.4 | 290.5 | **−27.1%** |
+| **closures** | 156.1 | 122.9 | **−21.2%** |
+| **methods** | 384.3 | 311.3 | **−19.0%** |
+| **funcs** | 182.3 | 149.8 | **−17.9%** |
+| **nested** | 318.3 | 262.7 | **−17.5%** |
+| branches | 314.2 | 261.3 | −16.8% |
+| dispatch | 355.3 | 300.5 | −15.4% |
+| **calls** | 322.1 | 278.1 | **−13.7%** |
+| arith | 170.7 | 151.1 | −11.5% |
+| fields | 170.6 | 154.1 | −9.7% |
+| options | 278.2 | 253.5 | −8.9% |
+| arrays | 235.1 | 216.6 | −7.8% |
+| mapset | 206.7 | 190.9 | −7.6% |
+| loops | 162.9 | 151.3 | −7.1% |
+| strindex, csv, reals, globals, startup, strwalk, alloc, strings, sorting | | | −5.7% to −1.0% |
+| **geometric mean, all twenty-three** | | | **−10.44%** |
+
+A loop body is fewer, wider instructions after round two of the superinstructions, so the head's
+per-instruction saving is a larger share of what is left; and with thin LTO the head's bounds check
+and the counted local were two of very few things still in the way.
+
 **By step**, each an alternating best-of-9 against the one before it:
 
 | step | against | geometric mean | the call rows |
