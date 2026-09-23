@@ -104,6 +104,39 @@ A_GENERATOR_STEP_IS_A_BUILTIN_WITH_STANDING_ARGUMENTS() =
     assertEq(g.next(99).done, true)
 
 @test
+A_PROPERTY_IS_A_BUILTIN_CALL_ON_THE_VALUE_IT_IS_READ_FROM() =
+    // `length` and `size` are builtins whose only argument is the receiver, and a property read hands
+    // one the value the field read is being made on. Every kind that answers either is read here,
+    // inside a loop that allocates under them, so a receiver that went missing between the read and
+    // the call would come back as a wrong number rather than as nothing at all.
+    var total = 0
+    var i = 0
+
+    while i < 200
+        val xs = [allocating(50).a, 2, 3]
+        val text = "abc"
+        val raw = toBytes("abcd")
+        val span = 0..<5
+        val members = Set([1, 2])
+        val table = Map([[1, 1], [2, 2], [3, 3]])
+
+        total = total + xs.length + text.length + raw.length + span.length + members.size + table.size
+        i = i + 1
+
+    assertEq(total, 4000)
+
+    // A read on an expression rather than on a name, where the receiver is a value nothing else holds
+    // and the answer goes back where it stood.
+    assertEq([allocating(50).a, 2, 3].length + "ab".length, 5)
+
+@test
+A_PROPERTY_CALLED_AS_A_METHOD_IS_STILL_TOLD_WHICH_IT_IS() =
+    // The sentence beside the read, which does not go through it: a property reached as a method is
+    // named as a property rather than as something the kind cannot do.
+    assertFaults(() -> anything("abc").length(), "is a property")
+    assertFaults(() -> anything([1, 2]).length(), "is a property")
+
+@test
 async A_TIMER_IS_A_BUILTIN_THAT_ANSWERS_A_PROMISE() =
     // A native that arms something and hands back a handle still reads its arguments where they
     // stand, and a surplus is dropped there as anywhere else.
