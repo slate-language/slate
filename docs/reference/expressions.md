@@ -208,27 +208,26 @@ top, so `0..by` is a range up to what `by` holds.
 
 `.` reads a field, `[…]` indexes an array, a string or an object.
 
-**`?.` guards its own link and not the rest of the chain**, which is Kotlin's rule:
+**`?.` guards the whole chain after it**, which is JavaScript's rule:
 
 ```slate
-val a = { b: { c: 1 } }
+val a = { b: { c: { d: 1 } } }
+val gone = { }
 
-print(a?.b?.c)
-print(a.missing?.c)         // `?.` on the link that may be absent
+print(a?.b.c.d)
+print(gone.missing?.b.c.d ?? "none")
 ```
 
 ```output
 1
-null
+none
 ```
 
-`a?.b.c` reads `b` off `a` or answers `null`, and then asks `.c` of whatever that was — so a nullish
-`a` faults at `.c`, and `a?.b?.c` is what the reader means. The rule is the one slate states everywhere
-about absence: **it stops at the boundary it arose at**, and one character quietly excusing every link
-after it is the opposite of that.
+The **run of links** is what the character guards, not the one link it was written on. Where the
+left is null or absent, every `.`, `[…]` and `(…)` after it is skipped — nothing along the rest of
+the chain is worked out at all — and the expression answers `null`.
 
-There are **three** guarded links and all three read the same way — the left is worked out, and
-where it is null or absent the link answers `null` without working out anything to its right:
+There are **three** guarded links, and each one opens a chain that reaches to the end of the run:
 
 | written | guards | where the left is there |
 |---|---|---|
@@ -245,7 +244,7 @@ print(holder.xs?.[1])
 print(holder.go?.(21))
 print(empty.xs?.[1] ?? "none")
 print(empty.go?.(21) ?? "none")
-print(deep?.rows?.[0]?.pick?.())
+print(deep?.rows[0].pick())
 ```
 
 ```output
@@ -256,13 +255,65 @@ none
 here
 ```
 
+### What a chain does NOT guard
+
+**A guard answers for the absence it was written about and for no other.** A link *after* it that
+finds a nullish value of its own faults there, exactly as it would with no `?.` in the line:
+
+```slate
+val a = { b: null }
+
+print(a?.b.c)
+```
+
+```error
+there is nothing here to read `c` from
+```
+
+`a?.b?.c` is what says both may be missing. So a chain is read link by link: each `?.` marks one
+place a value may not be there, and marks it once.
+
+**Brackets end a chain.** `(a?.b)` is a chain that is over, so what follows the brackets asks the
+answer it gave:
+
+```slate
+val a = null
+
+print((a?.b).c)
+```
+
+```error
+there is nothing here to read `c` from
+```
+
+### The rest of the rules
+
 - **A guard answers for an ABSENCE and never for a wrong kind.** `f?.()` where `f` holds a `3`
   faults exactly as `f()` would; the character says *this may not be here*, not *this may be
   anything*.
 - `o.m?.()` reads `o.m` as the value it is and calls that, which is what `o.m` means everywhere
   else in the language. **`o?.m()` is the spelling that guards the object** and calls `m` as its
   method.
-- `o?.m(a)` **does not evaluate its arguments** where there is nothing to call the method on.
+- **Nothing in the skipped part runs** — not a key, not an argument, not a call:
+
+```slate
+var calls = 0
+
+side() =
+    calls += 1
+    0
+
+val gone = null
+
+print(gone?.rows[side()].pick(side()) ?? "none")
+print(calls)
+```
+
+```output
+none
+0
+```
+
 - `o?.f = v` and `xs?.[i] = v` are refused: there is no answer to what writing into absence should
   do.
 

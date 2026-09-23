@@ -85,6 +85,10 @@ end real_literal
 emit_expr(j: *Js, e: Expr) -> string
     val at = e.span
 
+    // The outermost link of a `?.` chain is where the chain is written, for the interpreter's
+    // reason: what a guard skips is the rest of the run, so the run has to be emitted as one thing.
+    if chain_guarded(e) then return emit_chain(j, e)
+
     *e.kind match
         IntLit(v) -> s"${v}n"
 
@@ -109,17 +113,16 @@ emit_expr(j: *Js, e: Expr) -> string
         Unary(op, rhs) -> emit_unary(j, op, rhs, at)
         Binary(op, lhs, rhs) -> emit_binary(j, op, lhs, rhs, at)
         Compare(operands, ops) -> emit_compare(j, operands, ops, at)
-        Call(callee, args, guarded) -> emit_call(j, callee, args, guarded)
-        Index(target, key, optional) ->
-            if optional then return emit_guarded_index(j, target, key)
-
+        Call(callee, args, _) -> emit_call(j, callee, args)
+        Index(target, key, _) ->
             val two = emit_pair(j, target, key)
 
             s"$$.index(${two.0}, ${two.1})"
-        Field(target, name, optional) ->
-            val t = emit_expr(j, target)
+        Field(target, name, _) -> s"$$.field(${emit_expr(j, target)}, ${quoted_js(name)})"
 
-            if optional then s"$$.fieldOpt(${t}, ${quoted_js(name)})" else s"$$.field(${t}, ${quoted_js(name)})"
+        // A chain the brackets around it ended, which is what makes it an expression of its own
+        // and everything after those brackets a link on a chain of its own.
+        Chain(inner) -> emit_chain(j, inner)
         ArrayLit(items) -> s"$$.arr([${emit_list(j, items)}])"
         ArrayRepeat(value, count) ->
             val two = emit_pair(j, value, count)
@@ -222,7 +225,7 @@ end emit_expr
 emit_inline(j: *Js, e: Expr) -> string
     if !hoists(e) then return emit_expr(j, e)
 
-    var inner = Js(str_builder(), j.src, j.file, j.stamp, j.last_line, j.depth + 1, j.tmp, report(), buf(), j.in_async, j.in_gen, buf(), buf(), buf(), buf(), buf(), buf(), "", None)
+    var inner = Js(str_builder(), j.src, j.file, j.stamp, j.last_line, j.depth + 1, j.tmp, 0, report(), buf(), j.in_async, j.in_gen, buf(), buf(), buf(), buf(), buf(), buf(), "", None)
     val answer = fresh(&inner)
 
     line(&inner, s"let ${answer};")
@@ -402,17 +405,13 @@ end emit_inc_dec
 
 // `f(a)` and `o.m(a)`, which are different calls: a method takes its receiver where it was
 // delegated to, and only the runtime knows whether it was.
-private emit_call(j: *Js, callee: Expr, args: Buf[Expr], guarded: bool) -> string
+private emit_call(j: *Js, callee: Expr, args: Buf[Expr]) -> string
     // **The names are a third argument and are absent from nearly every call**, which is what keeps
     // an ordinary one exactly the text it was before.
     val names = named_list(args)
 
-    if guarded then return emit_guarded_call(j, callee, names, args)
-
     *callee.kind match
-        Field(target, name, optional) ->
-            if optional then return emit_guarded_method(j, target, name, names, args)
-
+        Field(target, name, _) ->
             val recv = emit_held(j, target, args)
 
             s"$$.method(${recv}, ${quoted_js(name)}, [${emit_list(j, args)}]${names})"
@@ -422,78 +421,99 @@ private emit_call(j: *Js, callee: Expr, args: Buf[Expr], guarded: bool) -> strin
             s"$$.call(${f}, [${emit_list(j, args)}]${names})"
 end emit_call
 
-// `o?.m(a)` -- the receiver is worked out, and where it is nullish neither the method nor the
-// arguments are.
+// -- `?.` chains ---------------------------------------------------------------------------------
+
+// A whole `?.` chain, as nested guards: every link after a guard is written INSIDE it, so a guard
+// that fires skips the rest of the run and the answer is `null`.
 //
-// **The method fusion is KEPT here, where `f?.()` gives it up**, and the two are different
-// questions: a `?.` guards its own link and nothing else, so `o?.m(a)` guards the read of `o` and
-// then makes the ordinary method call, receiver rule and all. `$$.method` is what the unguarded form
-// emits and it is what the guard holds.
+// **JAVASCRIPT HAS `a?.b.c` NATIVELY AND IT STILL CANNOT BE USED**, for the reason every operator
+// here goes through the runtime: a field read is `$$.field(o, "b")` rather than `o.b`, so there is
+// no `.` for the host's own `?.` to guard. What the nesting buys is what the interpreter's single
+// landing buys -- a key, an argument, a call written further along the chain is never worked out.
 //
-// **JavaScript has `o?.m(a)` natively and it is deliberately not used**: its own `?.` covers the
-// whole chain after it, and slate's covers one link (Kotlin's rule, `ast.sysl`'s `Field`). The
-// explicit `if` is also what keeps the arguments out of a call that does not happen, which the
-// interpreter's `JumpIfAbsentKeep` does by jumping over them.
-private emit_guarded_method(j: *Js, target: Expr, name: string, names: string, args: Buf[Expr]) -> string
-    val t = emit_expr(j, target)
+// **A real `if` and not a conditional expression**, because those things may leave statements of
+// their own behind and every one of them belongs inside the guard.
+private emit_chain(j: *Js, x: Expr) -> string
     val held = fresh(j)
-    val recv = fresh(j)
+    val floor = j.guards
 
-    line(j, s"const ${recv} = ${t};")
     line(j, s"let ${held} = null;")
-    line(j, s"if ($$.present(${recv})) {")
-    open(j)
 
-    val written = emit_list(j, args)
+    val text = chain_text(j, x)
 
-    line(j, s"${held} = $$.method(${recv}, ${quoted_js(name)}, [${written}]${names});")
-    close(j)
-    line(j, "}")
+    line(j, s"${held} = ${text};")
+
+    while j.guards > floor
+        close(j)
+        line(j, "}")
+
+        j.guards -= 1
+
     held
-end emit_guarded_method
+end emit_chain
 
-// `xs?.[i]` -- the key is worked out only where there is something to read from, which is what a
-// real `if` around the emitted statements buys that a conditional expression could not: the key may
-// leave statements of its own behind, and they belong inside the guard.
-private emit_guarded_index(j: *Js, target: Expr, key: Expr) -> string
-    val t = emit_expr(j, target)
-    val held = fresh(j)
-    val subject = fresh(j)
+// One link of a chain, written where its target's guards are already open.
+private chain_text(j: *Js, x: Expr) -> string
+    *x.kind match
+        Field(target, name, optional) ->
+            s"$$.field(${chain_link(j, target, optional)}, ${quoted_js(name)})"
+        Index(target, key, optional) ->
+            val t = chain_link(j, target, optional)
 
-    line(j, s"const ${subject} = ${t};")
-    line(j, s"let ${held} = null;")
+            // A guarded target is already a name, so only the plain one can be overtaken by a key
+            // that leaves statements behind it.
+            val base = if !optional && hoists(key) then bound(j, t) else t
+
+            s"$$.index(${base}, ${emit_expr(j, key)})"
+        Call(callee, args, optional) ->
+            val names = named_list(args)
+
+            // **The method fusion is given up for `f?.()`**: `o.m?.()` reads `o.m` as the value it
+            // is and calls that, which is what `o.m` means everywhere else in the language.
+            if optional
+                return s"$$.call(${chain_link(j, callee, true)}, [${emit_list(j, args)}]${names})"
+
+            // **And it is KEPT for `o?.m(a)`**, which guards the read of `o` and then makes the
+            // ordinary method call, receiver rule and all.
+            *callee.kind match
+                Field(target, name, guarded) ->
+                    val t = chain_link(j, target, guarded)
+                    val recv = if !guarded && any_hoists(args) then bound(j, t) else t
+
+                    s"$$.method(${recv}, ${quoted_js(name)}, [${emit_list(j, args)}]${names})"
+                _ ->
+                    val f = chain_link(j, callee, false)
+
+                    s"$$.call(${if any_hoists(args) then bound(j, f) else f}, [${emit_list(j, args)}]${names})"
+
+        // The value the chain reads from, which is an expression of its own -- and where it is a
+        // `Chain`, one whose brackets already ended it.
+        _ -> emit_expr(j, x)
+end chain_text
+
+// The target of one link, guarded where a `?.` was written on that link. A guard leaves a block
+// open for everything after it; `emit_chain` closes them all once the run has been written.
+private chain_link(j: *Js, target: Expr, guarded: bool) -> string
+    val t = chain_text(j, target)
+
+    if !guarded then return t
+
+    val subject = bound(j, t)
+
     line(j, s"if ($$.present(${subject})) {")
     open(j)
 
-    val k = emit_expr(j, key)
+    j.guards += 1
+    subject
+end chain_link
 
-    line(j, s"${held} = $$.index(${subject}, ${k});")
-    close(j)
-    line(j, "}")
-    held
-end emit_guarded_index
+// A value given a name, so that nothing written after it can run before it.
+private bound(j: *Js, text: string) -> string
+    val name = fresh(j)
 
-// `f?.(a)` -- the callee is worked out, and where it is nullish the arguments are not.
-//
-// **The method fusion is given up, exactly as it is in the interpreter**: `o.m?.()` reads `o.m` as
-// the value it is and calls that, so both back ends answer the same thing for the same program.
-private emit_guarded_call(j: *Js, callee: Expr, names: string, args: Buf[Expr]) -> string
-    val f = emit_expr(j, callee)
-    val held = fresh(j)
-    val fn = fresh(j)
-
-    line(j, s"const ${fn} = ${f};")
-    line(j, s"let ${held} = null;")
-    line(j, s"if ($$.present(${fn})) {")
-    open(j)
-
-    val written = emit_list(j, args)
-
-    line(j, s"${held} = $$.call(${fn}, [${written}]${names});")
-    close(j)
-    line(j, "}")
-    held
-end emit_guarded_call
+    line(j, s"const ${name} = ${text};")
+    name
+end bound
 
 // The names one call site wrote, as a trailing argument, or nothing where it named none.
 //
@@ -670,14 +690,16 @@ hoists(e: Expr) -> bool = *e.kind match
     Lambda(_, _, _, _) -> true
     Binary(op, lhs, rhs) -> op == AndAnd || op == OrOr || op == QQ || hoists(lhs) || hoists(rhs)
     Unary(_, rhs) -> hoists(rhs)
-    // **A guarded link hoists whatever it holds**, both of them emitting a real `if` around the
-    // half that must not run. **A guarded RECEIVER counts too and the callee alone cannot say so**:
-    // `o?.m` read on its own is one expression, and `o?.m(a)` is the `if` `emit_guarded_method`
-    // writes -- so asking `hoists(callee)` about the `Field` would answer for the wrong form.
-    Call(callee, args, guarded) -> guarded || guards_receiver(callee) || hoists(callee) ||
+    // **A `?.` ANYWHERE ON THE SPINE HOISTS THE WHOLE RUN**, the chain being emitted as a `let` and
+    // a nest of real `if`s -- so the question is about the chain and not about the one link, which
+    // is what `chain_guarded` answers.
+    Call(callee, args, optional) -> optional || chain_guarded(callee) || hoists(callee) ||
         any_hoists(args)
     Index(target, key, optional) -> optional || hoists(target) || hoists(key)
-    Field(target, _, _) -> hoists(target)
+    Field(target, _, optional) -> optional || hoists(target)
+
+    // A chain brackets ended is still a chain, and still a `let` and a nest of `if`s.
+    Chain(_) -> true
     ArrayLit(items) -> any_hoists(items)
     ArrayRepeat(value, count) -> hoists(value) || hoists(count)
     Interp(pieces) -> any_hoists(pieces)
@@ -691,11 +713,6 @@ hoists(e: Expr) -> bool = *e.kind match
     Spread(inner) -> hoists(inner)
     Named(_, value) -> hoists(value)
     Range(lo, hi, _, step) -> option_hoists(lo) || option_hoists(hi) || option_hoists(step)
-    _ -> false
-
-// Whether this callee makes the call a guarded METHOD call -- `o?.m(a)` rather than `o.m(a)`.
-private guards_receiver(callee: Expr) -> bool = *callee.kind match
-    Field(_, _, optional) -> optional
     _ -> false
 
 private option_hoists(e: Option[Expr]) -> bool = e match

@@ -15,6 +15,20 @@ import sysl.buf.{Buf, buf}
 compile_expr(u: *Unit, e: *Emit, x: Expr)
     val at = x.span
 
+    // **Every expression is off the spine unless the link above it just said otherwise**, which is
+    // what makes `in_spine` safe to read here and nowhere else: a key, an argument and a receiver in
+    // brackets all arrive through this line with the flag already down.
+    val spine = e.in_spine
+
+    e.in_spine = false
+
+    // The outermost link of a `?.` chain is where the chain is opened, and it is the only place
+    // that can be: the guard has to know where the run of links ENDS to jump past it.
+    if !spine && chain_guarded(x)
+        compile_chain(u, e, x)
+        return
+    end if
+
     *x.kind match
         IntLit(v) -> push_n(e, PushInt(v), at, 0, 1)
         BigLit(digits) -> push_n(e, PushBig(intern_big(u, digits)), at, 0, 1)
@@ -97,11 +111,14 @@ compile_expr(u: *Unit, e: *Emit, x: Expr)
 
             *callee.kind match
                 Field(target, name, optional) ->
+                    e.in_spine = true
+
                     compile_expr(u, e, target)
 
                     // `o?.m(a)` does not evaluate its arguments where there is nothing to call the
-                    // method on, which is what makes the guard worth having over a test afterwards.
-                    val short = if optional then Some(push_n(e, JumpIfAbsentKeep(0), at, 0, 0)) else None
+                    // method on -- nor anything further along the chain, the guard's jump landing
+                    // past the last link of it.
+                    if optional then e.chain.push(push_n(e, JumpIfAbsentKeep(0), at, 0, 0))
 
                     if has_spread(args)
                         refuse_named_spread(args, at)
@@ -112,17 +129,9 @@ compile_expr(u: *Unit, e: *Emit, x: Expr)
                             compile_expr(u, e, arg_value(args.at(i)))
 
                         push_n(e, CallMethod(intern_str(u, name), args.len(), arg_names_of(u, args, at), fresh_site(u)), at, args.len() + 1, 1)
-
-                    short match
-                        Some(where) ->
-                            val done = put(e, Jump(0), at)
-
-                            patch(e, where, here(e))
-                            push_n(e, Pop, at, 1, 0)
-                            push_n(e, PushNull, at, 0, 1)
-                            patch(e, done, here(e))
-                        None -> ()
                 _ ->
+                    e.in_spine = true
+
                     compile_expr(u, e, callee)
 
                     if has_spread(args)
@@ -135,45 +144,29 @@ compile_expr(u: *Unit, e: *Emit, x: Expr)
 
                         push_n(e, CallFn(args.len(), arg_names_of(u, args, at)), at, args.len() + 1, 1)
         Index(t, key, optional) ->
+            e.in_spine = true
+
             compile_expr(u, e, t)
 
-            if !optional
-                compile_expr(u, e, key)
-                push_n(e, GetIndex, at, 2, 1)
-            else
-                // **The key is not worked out where there is nothing to read from**, which is the
-                // rule `o?.m(a)` already has about its arguments and is what makes the guard worth
-                // having over a test written after the read.
-                val short = push_n(e, JumpIfAbsentKeep(0), at, 0, 0)
+            // **The key is not worked out where there is nothing to read from**, which is the rule
+            // `o?.m(a)` already has about its arguments: the guard jumps past the whole rest of the
+            // chain, and the key is inside it.
+            if optional then e.chain.push(push_n(e, JumpIfAbsentKeep(0), at, 0, 0))
 
-                compile_expr(u, e, key)
-                push_n(e, GetIndex, at, 2, 1)
-
-                val done = put(e, Jump(0), at)
-
-                patch(e, short, here(e))
-                push_n(e, Pop, at, 1, 0)
-                push_n(e, PushNull, at, 0, 1)
-                patch(e, done, here(e))
+            compile_expr(u, e, key)
+            push_n(e, GetIndex, at, 2, 1)
         Field(t, name, optional) ->
+            e.in_spine = true
+
             compile_expr(u, e, t)
 
-            if !optional
-                push_n(e, GetField(intern_str(u, name), fresh_site(u)), at, 1, 1)
-            else
-                // **The two paths leave one value where one stood**, so the counter needs no
-                // correction: `GetField` takes one and gives one, and the other arm drops the
-                // nullish subject and pushes `null` in its place.
-                val short = push_n(e, JumpIfAbsentKeep(0), at, 0, 0)
+            if optional then e.chain.push(push_n(e, JumpIfAbsentKeep(0), at, 0, 0))
 
-                push_n(e, GetField(intern_str(u, name), fresh_site(u)), at, 1, 1)
+            push_n(e, GetField(intern_str(u, name), fresh_site(u)), at, 1, 1)
 
-                val done = put(e, Jump(0), at)
-
-                patch(e, short, here(e))
-                push_n(e, Pop, at, 1, 0)
-                push_n(e, PushNull, at, 0, 1)
-                patch(e, done, here(e))
+        // A chain the brackets around it ended. Everything after those brackets is a link on a
+        // chain of its own, which is exactly what compiling this one here says.
+        Chain(inner) -> compile_chain(u, e, inner)
         Interp(pieces) ->
             for i in 0..<pieces.len()
                 compile_expr(u, e, pieces.at(i))
@@ -432,12 +425,10 @@ end refuse_named_spread
 // faults exactly as a plain call does, which is the line every guarded link in slate draws: `?.`
 // answers for an absence and never for a wrong kind.
 private compile_guarded_call(u: *Unit, e: *Emit, callee: Expr, args: Buf[Expr], at: Span)
-    compile_expr(u, e, callee)
+    e.in_spine = true
 
-    // **One value stands where one stood on either path**, so the stack counter needs no
-    // correction -- `CallFn` takes the callee and its arguments and gives one back, and the other
-    // arm drops the nullish callee and pushes `null` in its place.
-    val short = push_n(e, JumpIfAbsentKeep(0), at, 0, 0)
+    compile_expr(u, e, callee)
+    e.chain.push(push_n(e, JumpIfAbsentKeep(0), at, 0, 0))
 
     if has_spread(args)
         refuse_named_spread(args, at)
@@ -448,14 +439,38 @@ private compile_guarded_call(u: *Unit, e: *Emit, callee: Expr, args: Buf[Expr], 
             compile_expr(u, e, arg_value(args.at(i)))
 
         push_n(e, CallFn(args.len(), arg_names_of(u, args, at)), at, args.len() + 1, 1)
+end compile_guarded_call
+
+// A whole `?.` chain: the run of links, and the one place they all land where a guard fires.
+//
+// **Every guard leaves the nullish value it tested standing**, `JumpIfAbsentKeep` being what its
+// name says, so the landing sees exactly one value however many links were skipped and however far
+// along the run the guard that fired was written. That is why there is one `Pop` and one `PushNull`
+// for the chain rather than a pair per link: one value stood before the chain's first instruction
+// and one stands after its last, on both paths.
+private compile_chain(u: *Unit, e: *Emit, x: Expr)
+    val at = x.span
+    val floor = e.chain.len()
+
+    e.in_spine = true
+
+    compile_expr(u, e, x)
+
+    // A chain with no guard in it is an ordinary run of links, which is what `Chain` around a
+    // bracketed expression that turned out not to hold one leaves.
+    if e.chain.len() == floor then return
 
     val done = put(e, Jump(0), at)
+    val landing = here(e)
 
-    patch(e, short, here(e))
+    for i in floor..<e.chain.len()
+        patch(e, e.chain.at(i), landing)
+
+    e.chain.truncate(floor)
     push_n(e, Pop, at, 1, 0)
     push_n(e, PushNull, at, 0, 1)
     patch(e, done, here(e))
-end compile_guarded_call
+end compile_chain
 
 // A list of values that is not known until it runs, left on the stack as one array.
 //
