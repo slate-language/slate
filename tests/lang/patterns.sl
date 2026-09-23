@@ -91,6 +91,68 @@ a_pattern_may_carry_a_default_and_it_fires_on_absence_alone() =
     assertEq(fresh(), [1])
 
 @test
+a_row_of_names_with_defaults_binds_the_same_at_every_site() =
+    // **The interpreter takes a row of bare names apart without the matcher, defaults and all**, so
+    // each shape a default can take is asked here: a `val`, a parameter, a `for` head, a default that
+    // reads a name to its left, one that runs only where the name is missing, and a loop whose second
+    // turn leaves out what its first supplied -- the cell must take the default, not the last value.
+    sized(opts) =
+        val { width = 10, height, scale = 2 } = opts
+
+        width * height * scale
+
+    assertEq([sized({ width: 3, height: 4, scale: 5 }), sized({ height: 4 })], [60, 80])
+
+    boxed({ w = 1, h = w * 2 }) = [w, h]
+
+    assertEq([boxed({}), boxed({ w: 3 }), boxed({ h: 9 }), boxed({ w: 3, h: 4 })], [[1, 2], [3, 6], [1, 9], [3, 4]])
+
+    var ran = 0
+
+    counted() =
+        ran = ran + 1
+        ran * 100
+
+    picked(o) =
+        val { a, b = counted() } = o
+
+        a + b
+
+    assertEq([picked({ a: 1, b: 2 }), picked({ a: 1 }), picked({ a: 1, b: 3 })], [3, 101, 4])
+    assertEq(ran, 1)
+
+    turns(rows) =
+        var seen = []
+
+        for { k, v = "none" } in rows
+            push(seen, k + ":" + v)
+
+        seen
+
+    assertEq(turns([{ k: "a", v: "x" }, { k: "b" }, { k: "c", v: "y" }]), ["a:x", "b:none", "c:y"])
+
+    pairs(rows) =
+        var seen = []
+
+        for [a, b = 0] in rows
+            push(seen, a + b)
+
+        seen
+
+    assertEq(pairs([[1, 2], [5], [3, 4]]), [3, 5, 7])
+
+    // A field a proto supplies counts, and a `var` row can be written afterwards.
+    reread(o) =
+        var { x, y = 7 } = o
+
+        y = y + x
+
+        [x, y]
+
+    assertEq(reread({ proto: { x: 1 } }), [1, 8])
+    assertEq(reread({ x: 2, y: 3 }), [2, 5])
+
+@test
 a_parameter_may_take_its_argument_apart_and_may_carry_a_default() =
     doubled({ n }) = n * 2
     greet(who, greeting = "hello") = greeting + " " + who
