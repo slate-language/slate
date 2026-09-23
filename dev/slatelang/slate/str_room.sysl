@@ -1,0 +1,134 @@
+module dev.slatelang.slate
+
+import sh.sysl.gc
+import sysl.slices.copy
+import sysl.text.{from_utf8_unchecked, str_view}
+
+// Joining two strings, and why a string built a piece at a time costs what its pieces cost.
+//
+// **`out = out + piece` in a loop used to copy everything `out` held on every turn**, so building a
+// string of n characters one at a time cost n²/2 bytes of copying -- 43 times QuickJS on
+// `bench/strings.sl`. QuickJS and CPython both append in place when the left operand's storage has
+// room and nothing else can see past its end; this is that trick for a heap whose cells carry no
+// reference count.
+//
+// **A ROOM IS STORAGE WITH SPARE CAPACITY, SHARED BY EVERY STRING THAT IS A PREFIX OF IT.** Each such
+// string is a sysl `string` viewing `store[0..<its length]` -- a view shares the owner, so none of
+// them copies -- and `used` says how far the longest of them reaches. A string whose length IS `used`
+// is the room's tip: nothing anybody holds reaches past its end, so appending to it writes into the
+// spare bytes, raises `used`, and makes a new cell viewing the longer prefix. Every other string of
+// the room keeps its length and so keeps its text: **no byte any string can see is ever written**,
+// which is what keeps a string immutable to the program. `val a = s; s += t` leaves `a` the tip,
+// the append moves `used`, and the next append to `a` finds `used` past its end and copies instead.
+//
+// **The room is a heap object and not a count kept in the bytes**, so that its lifetime is the
+// collector's question like everything else's: every string of the room marks it, and the room holds
+// the storage. It is also where the storage is charged -- once, at its capacity -- so a room's strings
+// charge nothing of their own (`str_payload`), and a thousand prefixes of one buffer are not counted
+// as a thousand buffers.
+//
+// **A room is made only where it can pay for itself**: the result is at least `RoomFrom` bytes and
+// the left side is at least as long as the right. That is appending, where copying the left side is
+// the whole cost; prepending or joining a short prefix to a long text gains nothing from spare room
+// after it, and a short string was never where the copying went.
+
+// A room is struct enough to name its storage and its high-water mark.
+struct RoomObj
+    store: []u8
+    used: usize
+
+// The smallest joined string that is given room to grow.
+const RoomFrom: usize = 64
+
+// process-wide: see `str_kind`.
+var room_kind: gc.Kind = gc.Kind(&trace_room, &finalize_room, null, null)
+
+// A room's storage is its capacity, used or not.
+room_payload(o: *RoomObj) -> usize = o.store.len
+
+// A room points at nothing in the heap, so its tracer only counts what it holds.
+trace_room(p: *u8, h: *gc.Heap)
+    val o: *RoomObj = ptr_cast(p)
+
+    mark_payload(room_payload(o))
+
+// Writing an empty slice releases the storage, which the room's strings may still share only if
+// they are dying in the same sweep: every one of them marks the room.
+finalize_room(p: *u8)
+    val o: *RoomObj = ptr_cast(p)
+
+    o.store = []
+
+// `x + y` for two strings, appending in place where `x` is the tip of a room with space for `y`.
+//
+// **Everything read from `x` and `y` is read before anything is allocated.** Both were popped off
+// the stack and nothing else need hold them, so the collection an allocation may run can free either
+// -- which is why the new room is filled first, and why the room a new cell will name is rooted in
+// `pending_room` across that cell's allocation.
+joined(x: *StrObj, y: *StrObj) -> Value
+    val n = x.s.bytes.len
+    val m = y.s.bytes.len
+    val need = n + m
+    val chars = x.chars + y.chars
+    val room = x.room
+
+    if room != null && room.used == n && need <= room.store.len
+        copy(room.store[n..<need], y.s.bytes)
+        room.used = need
+
+        return Str(in_room(room, chars))
+
+    if need < RoomFrom || n < m then return str_counted(x.s + y.s, chars)
+
+    // Half as much again: geometric, so a run of appends copies each byte a bounded number of times,
+    // without doubling the storage of a string that was joined once and never again.
+    var store: []u8 = [0u8; need + need / 2]
+
+    copy(store[0..<n], x.s.bytes)
+    copy(store[n..<need], y.s.bytes)
+
+    val made = new_room(store, need)
+
+    // A heap too full for the room is still one a plain string can be made in, and the bytes are
+    // already joined; `copy` gives the string storage of its own size rather than the room's.
+    if made == null then return str_counted(from_utf8_unchecked(store[0..<need]).copy(), chars)
+
+    Str(in_room(made, chars))
+end joined
+
+// A room over storage already holding `used` bytes, charged at its capacity. Null when even a
+// collection leaves no space for the cell.
+private new_room(store: []u8, used: usize) -> *RoomObj
+    val v = current()
+    var p = gc.alloc(&v.heap, sizeof(RoomObj), &room_kind)
+
+    if p == null
+        collect_now()
+        p = gc.alloc(&v.heap, sizeof(RoomObj), &room_kind)
+
+    if p == null then return null
+
+    var o: *RoomObj = ptr_cast(p)
+
+    o.store = store
+    o.used = used
+    charge_on(v, room_payload(o))
+    o
+end new_room
+
+// A string cell viewing the room's bytes up to its mark. It charges nothing: the room did.
+private in_room(room: *RoomObj, chars: usize) -> *StrObj
+    val v = current()
+
+    v.pending_room = room
+
+    var o: *StrObj = ptr_cast(alloc_or_collect(v, sizeof(StrObj), &str_kind, ptr_cast(v.spare_str)))
+
+    v.pending_room = null
+    o.s = str_view(room.store[0..<room.used])
+    o.chars = chars
+    o.cursor_char = 0
+    o.cursor_byte = 0
+    o.room = room
+    o
+end in_room
