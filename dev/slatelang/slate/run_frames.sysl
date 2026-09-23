@@ -32,7 +32,8 @@ import sysl.text.str_builder
 // fast paths out in the arms is what a reader would want and takes this file two hundred lines past
 // a thousand, which is the rule that decided it.
 
-// The sentence a thrown value carries.
+// The sentence a thrown value carries -- what an uncaught fault SAYS, where the value itself is what
+// a `catch` is handed.
 //
 // **A caught fault re-thrown keeps its own words**, which is what `throw e` inside a `catch` is for:
 // a library that decides not to handle something puts it back rather than replacing it with a
@@ -40,17 +41,25 @@ import sysl.text.str_builder
 // rendered -- rendering would turn the fault into `{message: "...", line: 3, file: "..."}`, which is
 // a description of a fault rather than the fault.
 //
-// **The LOCATION becomes the `throw`'s own**, and does not travel. A `Fail` carries a span into a
-// source, and a caught fault has been flattened to a line number and a file name by the time a
-// program can see it -- so a re-thrown fault says the words of the original and points at the line
-// that put it back. That is the honest reading of what the value still holds.
-private thrown_message(v: Value) -> string = v match
-    Str(p) -> p.s
-    Object(o) ->
-        obj_get_name(o, "message") match
-            Some(Str(p)) -> p.s
-            _ -> value_text(v)
-    other -> value_text(other)
+// `thrown_message` and `thrown_payload` -- the two halves of what a thrown value means -- are
+// `runtime.sysl`'s, beside the `Fail` they fill: `reject` and `fail` raise a fault the same way from
+// a promise, and a second copy of this rule would be a second answer to `is a string a sentence`.
+
+// `throw v` as the error channel wants it.
+//
+// **A STRING IS A MESSAGE FAULT AND EVERYTHING ELSE CARRIES ITS VALUE**, which is the whole of the
+// rule and is what keeps every `catch e -> e.message` written before this true: a thrown string has
+// nothing in it a handler could sort on, so it is flattened to a sentence exactly as it always was,
+// and the `catch` is handed the `{message, line, file}` object `fault_value` builds. Anything else --
+// a data variant, a class instance, a number -- travels whole, so `catch NotFound(id)` can ask what
+// went wrong rather than reading a sentence.
+//
+// **The LOCATION the fault is REPORTED at becomes the `throw`'s own** and does not travel, a `Fail`
+// carrying a span into a source that a caught fault no longer holds. The value's own fields are
+// untouched, so a fault object put back with `throw e` still remembers where it was raised.
+private raised(at: Span, v: Value) -> Step = v match
+    Str(p) -> fault(at, p.s)
+    other -> Err(value_failure(at, thrown_message(at, other), other))
 
 // What a name nothing has bound is reported as.
 //
@@ -175,54 +184,24 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
             counted_base = base
             counted_any = true
 
+        // **THE ORDER THE ARMS ARE WRITTEN IN IS LOAD-BEARING: ONLY THE FIRST FORTY-TWO OF THEM GET
+        // THE SINGLE-LEVEL JUMP TABLE.** The back end folds this arm list into two switches and puts
+        // exactly forty-two arms in the first, whichever ones they are; the other sixty-eight share a
+        // SECOND table reached through the first's default, which is nine more instructions and a
+        // second unpredictable indirect branch on every one of them. So the list is in two blocks --
+        // the instructions programs actually execute, then everything else -- and the boundary is the
+        // comment below rather than a convention anybody has to remember.
+        //
+        // **`Op`'s DECLARATION ORDER IS THE OTHER HALF OF IT.** A table is built only where the tags
+        // it spans are dense enough, so the hot instructions have to hold near-neighbouring tags as
+        // well as near-neighbouring arms -- which is why `Tick` and the four fused instructions are
+        // declared among the early variants in `code.sysl` rather than at the end where they were
+        // added. `bench/results/2026-09-22-one-jump-table.md` reads both tables out of the binary and
+        // has the measurement.
         ins.op match
-            SealData -> compose_seal_data(vm)
-            PushNull -> vm.stack.push(Null)
-            PushUndefined -> vm.stack.push(Undefined)
-            PushBool(v) -> vm.stack.push(Bool(v))
             PushInt(v) -> vm.stack.push(Int(v))
             PushReal(v) -> vm.stack.push(Real(v))
             PushStr(k) -> vm.stack.push(str_counted(u.strings.at(k), u.string_chars.at(k)))
-
-            // **The magnitude is shared with the unit's copy rather than rebuilt**, a `BigInt`
-            // copying with a retain and never being written through.
-            PushBig(k) -> vm.stack.push(big_value(u.bigs.at(k)))
-            PushModule(m) -> vm.stack.push(here.module_values.at(m))
-            PushShape(pk, k) -> vm.stack.push(shape_value(u.patterns.at(pk), u.strings.at(k), vm.scope))
-            PushExternal(k) -> vm.stack.push(External(k))
-
-            CheckType(k, t, pk) -> compose_check_named(u, vm, k, t, pk, at)?
-
-            CheckSlot(i, k, t, pk) -> compose_check_slot(u, vm, base, i, k, t, pk, at)?
-            CheckResult(t, pk) -> compose_check_result(u, vm, t, pk, at)?
-
-            DefineTest(k) -> here.registered_tests.push(TestCase(u.strings.at(k), here.current_source, pop_on(vm)))
-            DefineHook(kind, k) -> set_hook(kind, u.strings.at(k), pop_on(vm))
-
-            PushHandler(to) -> vm.handlers.push(Handler(chunk_ix, to, vm.stack.len(), vm.frames.len(), vm.scope, base, given, false))
-            PopHandler -> vm.handlers.truncate(vm.handlers.len() - 1)
-            Raise -> return fault(at, thrown_message(pop_on(vm)))
-
-            WantDisposable -> want_disposable(peek_on(vm, 0), at)?
-            PushDispose(to) -> vm.handlers.push(Handler(chunk_ix, to, vm.stack.len(), vm.frames.len(), vm.scope, base, given, true))
-
-            // **`Ok` of nothing, because the answer is thrown away.** `guarded` runs a disposal
-            // handler for its effect and then raises the signal it was already carrying.
-            DisposeDone -> return Ok(Null)
-
-            // The head of a chunk with default parameters, and nowhere else.
-            JumpIfBound(k, to) -> if bound_here(vm.scope, u.strings.at(k)) then pc = to
-
-            // The same, where that chunk's parameters are slots. One bit rather than a lookup, which
-            // is what the whole of this arrangement is.
-            JumpIfGiven(n, to) -> if (given >> n) & 1 == 1 then pc = to
-
-            // The same question asked of a BINDING SITE's own mask, which stands on the stack rather
-            // than in the frame -- so a binding inside a binding carries its own and nothing has to
-            // be saved or put back.
-            JumpIfSet(n, to) -> peek_on(vm, 0) match
-                Int(m) -> if (usize(m) >> n) & 1 == 1 then pc = to
-                _ -> ()
 
             LoadSlot(i) -> vm.stack.push(vm.stack.at(base + i))
             DeclareSlot(i) ->
@@ -235,9 +214,6 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
 
                 keepable_on(here, v, at, "written to a local")?
                 vm.stack.set(base + i, v)
-            // The checker refuses this before the machine runs. It is here so that the one path where
-            // it does not says what it has always said.
-            ImmutableSlot(k) -> return fault(at, s"`${u.strings.at(k)}` is a `val`, so it is written once")
 
             // A read the compiler resolved to one of its file's own definitions, which is an array
             // read where `LoadName` hashes a spelling and walks the chain outward. The hoisted
@@ -253,7 +229,6 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
                 cell match
                     Undefined -> compose_load_cell(u, vm, k, at)?
                     v -> vm.stack.push(v)
-            DeclareCell(d, k, mutable) -> compose_declare_cell(u, vm, here, d, k, mutable, at)?
             StoreCell(d, k) -> compose_store_cell(u, vm, here, d, k, at)?
 
             LoadName(k) ->
@@ -262,27 +237,11 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
                 lookup(vm.scope, name) match
                     Some(v) -> vm.stack.push(v)
                     None -> return fault(at, unbound_here(name))
-            DeclareVal(k) -> compose_declare_name(u, vm, here, k, false, at)?
-            DeclareVar(k) -> compose_declare_name(u, vm, here, k, true, at)?
-            DeclareAbsent(k) -> compose_declare_absent(u, vm, k)
-            StoreName(k) -> compose_store_name(u, vm, here, k, at)?
 
             // **ONE ARM PER OPERATOR, AND NOTHING BELOW THEM ASKS WHICH ONE IT WAS.** The token used
             // to ride on the instruction and be matched three more times on the way to the answer;
             // the emitter picks the arm now and `run_arith.sysl` holds the twenty bodies, each a
             // pair of machine integers in front of the general arithmetic.
-            Negate ->
-                val v = pop_on(vm)
-
-                vm.stack.push(negated(v, at)?)
-            Not ->
-                val v = pop_on(vm)
-
-                vm.stack.push(notted(v)?)
-            Complement ->
-                val v = pop_on(vm)
-
-                vm.stack.push(complemented(v, at)?)
             Add ->
                 val b = pop_on(vm)
                 val a = pop_on(vm)
@@ -343,34 +302,7 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
                 val a = pop_on(vm)
 
                 vm.stack.push(is_unequal(a, b, at)?)
-            BitAnd ->
-                val b = pop_on(vm)
-                val a = pop_on(vm)
 
-                vm.stack.push(bit_anded(a, b, at)?)
-            BitOr ->
-                val b = pop_on(vm)
-                val a = pop_on(vm)
-
-                vm.stack.push(bit_ored(a, b, at)?)
-            BitXor ->
-                val b = pop_on(vm)
-                val a = pop_on(vm)
-
-                vm.stack.push(bit_xored(a, b, at)?)
-            ShiftLeft ->
-                val b = pop_on(vm)
-                val a = pop_on(vm)
-
-                vm.stack.push(shifted_left(a, b, at)?)
-            ShiftRight ->
-                val b = pop_on(vm)
-                val a = pop_on(vm)
-
-                vm.stack.push(shifted_right(a, b, at)?)
-            NoOperator -> return fault(at, "this is not an arithmetic operator")
-
-            MakeArray(n) -> compose_array(vm, n, at)?
             MakeObject(n) -> compose_object(vm, n, at)?
 
             GetIndex ->
@@ -378,7 +310,6 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
                 val target = pop_on(vm)
 
                 vm.stack.push(read_at(target, k, at)?)
-            SetIndex -> write_indexed(vm, at)?
             // **THE SUBJECT STAYS ON THE STACK ACROSS THE READ**, because a `get` property runs
             // slate code and a `Value` in a sysl local is not a root. Popping first and then calling
             // a getter that allocates is exactly the shape `A `Value` IN A SYSL LOCAL IS NOT A ROOT`
@@ -392,10 +323,13 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
 
             Jump(to) -> pc = to
             JumpIfFalse(to) -> if !pop_on(vm).truthy() then pc = to
-            JumpIfTrueKeep(to) -> if peek_on(vm, 0).truthy() then pc = to
-            JumpIfPresentKeep(to) -> if !is_nullish(peek_on(vm, 0)) then pc = to
-            JumpIfAbsentKeep(to) -> if is_nullish(peek_on(vm, 0)) then pc = to
-            JumpIfFalseKeep(to) -> if !peek_on(vm, 0).truthy() then pc = to
+
+            // The same question asked of a BINDING SITE's own mask, which stands on the stack rather
+            // than in the frame -- so a binding inside a binding carries its own and nothing has to
+            // be saved or put back.
+            JumpIfSet(n, to) -> peek_on(vm, 0) match
+                Int(m) -> if (usize(m) >> n) & 1 == 1 then pc = to
+                _ -> ()
 
             Pop -> vm.stack.truncate(vm.stack.len() - 1)
             Discard ->
@@ -406,33 +340,8 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
                     _ -> ()
 
                 vm.stack.truncate(vm.stack.len() - 1)
-            Dup -> vm.stack.push(peek_on(vm, 0))
-            DupAt(n) -> vm.stack.push(peek_on(vm, n))
-            RotUp(n) -> compose_rot_up(vm, n)
-
-            Join(n) -> compose_join(vm, n, at)?
-            Repeat -> compose_repeat(vm, at)?
-            WithObject(n) -> compose_with_object(vm, n, at)?
-            WithMerge(spread) -> compose_with_merge(vm, spread, at)?
-            MakeRange(inclusive, has_lo, has_hi, has_step) ->
-                compose_range(vm, inclusive, has_lo, has_hi, has_step, at)?
-            Unpack(k, immutable) -> compose_unpack(u, vm, k, immutable, at)?
 
             UnpackSlots(k, first, masked) -> compose_unpack_slots(u, vm, base, k, first, masked, at)?
-            IsPat(k, negated) -> compose_is_pat(u, vm, k, negated)
-
-            PushScope -> vm.scope = new_env(vm.scope)
-            PopScope -> vm.scope = vm.scope.parent
-
-            MakeClosure(c) -> vm.stack.push(Fn(new_closure(u.chunks.at(c).params, c, vm.scope)))
-            DefineFn(k, c) -> compose_define_fn(u, vm, k, c)
-
-            // The same, and the closure also goes into the table a `LoadDef` reads. **The table grows
-            // to reach the cell rather than being sized in advance**: a unit's definitions are
-            // numbered across every file it holds, and a machine may run only some of them.
-            DefineDef(k, c, d) -> compose_define_def(u, vm, k, c, d)
-
-            TestPat(k) -> compose_test_pat(u, vm, k)
 
             // **Only an arm that TAKES writes its cells**, which is what its own scope used to do
             // for it: the arm after this one finds its own names wherever it put them, and one that
@@ -450,7 +359,6 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
                 vm.stack.truncate(mark)
                 vm.stack.push(Bool(took))
 
-            IterInit -> compose_iter_init(vm, at)?
             IterNext(to) ->
                 val i = peek_on(vm, 0) match
                     Int(n) -> usize(n)
@@ -515,12 +423,6 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
                     Some(v) ->
                         vm.stack.set(vm.stack.len() - 1, Int(long(ahead)))
                         vm.stack.push(v)
-
-            IterAwaitCheck -> compose_iter_await_check(at)?
-
-            FailWith(k) -> return fault(at, u.strings.at(k))
-            FailShowing(k) -> return fault(at, u.strings.at(k) + show_value(peek_on(vm, 0)))
-            FailNoArm -> return fault(at, s"no arm of this match applies to ${value_text(peek_on(vm, 0))}")
 
             // **THE SAFE POINT.** It stands in front of every statement outside a loop and once at
             // the top of every loop, where it used to stand in front of every statement full stop:
@@ -629,49 +531,6 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
                                 vm.scope = called
                                 base = laid_base
                                 given = mask
-
-            // `f(...xs)` -- the arguments are an array the instruction above it built.
-            //
-            // **The only difference from `CallFn` is where the count comes from**, which is the
-            // whole point: everything after that -- the keepable check, the truncate, `invoke` and
-            // the two ways a call can go -- is the same code doing the same thing.
-            CallSpread ->
-                here.args_buffered += 1
-
-                val spread = pop_on(vm)
-                val callee = pop_on(vm)
-
-                var args: Buf[Value] = buf()
-
-                spread match
-                    Array(a) ->
-                        for i in 0..<a.items.len()
-                            keepable_on(here, a.items.at(i), at, "passed to a function")?
-                            args.push(a.items.at(i))
-                    _ -> return fault(at, "unreachable")
-
-                invoke(u, callee, args, at, vm.frames.len())? match
-                    Answered(v) -> vm.stack.push(v)
-                    Enter(body, called, laid, entering_code, entering_source) ->
-                        // **The arguments go down FIRST, before anything else in this arm.** They
-                        // are a sysl local until they are on the stack, and the mark phase cannot
-                        // see one -- so the fewer instructions between `invoke` releasing its hold
-                        // and this, the less there is to go wrong when one of them later learns to
-                        // allocate.
-                        val laid_base = vm.stack.len()
-                        val mask = lay_frame(u, body, laid)
-
-                        vm.frames.push(Frame(chunk_ix, pc, vm.scope, base, vm.handlers.len(), given, code, here.current_source))
-                        chunk_ix = body
-                        code = entering_code
-                        here.current_source = entering_source
-                        pc = 0
-                        vm.scope = called
-                        base = laid_base
-                        given = mask
-
-            // The top `n` arrays, made into one. What builds a spread argument list.
-            JoinArrays(n) -> compose_joined_arrays(vm, n, at)?
 
             // `o.m(a)`, which is where the receiver rule lives.
             //
@@ -797,6 +656,33 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
                                 base = laid_base
                                 given = mask
 
+            Ret ->
+                val v = pop_on(vm)
+
+                vm.stack.truncate(base)
+
+                if vm.frames.len() == floor
+                    vm.scope = outer_scope
+                    return Ok(v)
+
+                val back = vm.frames.at(vm.frames.len() - 1)
+
+                vm.frames.truncate(vm.frames.len() - 1)
+
+                // **Anything the returning call was inside goes with it.** A `return` written in a
+                // `try` body skips its `PopHandler`, and a handler outliving the frame it was
+                // established in names an instruction nobody is standing at.
+                // **A RETURN READS NO CHUNK AT ALL** -- the frame carries its own code and file.
+                vm.handlers.truncate(back.handlers)
+                chunk_ix = back.chunk
+                code = back.code
+                here.current_source = back.source
+                pc = back.pc
+                vm.scope = back.scope
+                base = back.base
+                given = back.given
+                vm.stack.push(v)
+
             // `o.m(...xs)`. The receiver rule is `CallMethod`'s and is not restated: what differs is
             // that the arguments arrive as an array, and the receiver goes in front of them where
             // the method was delegated to.
@@ -914,40 +800,190 @@ run_frames(u: *Unit, start: usize, from: usize, base0: usize, floor: usize, oute
                         // runtime that took the shortcut has had to undo. JavaScript resolves this
                         // case through a microtask for the same reason.
                         if pr.settled
-                            current().ready.push(Resumption(id, pr.value, pr.failed, pr.message, pr.at, pr.src, pr.quit, pr.quit_status))
+                            current().ready.push(Resumption(id, pr.value, pr.failed, pr.thrown, pr.message, pr.at, pr.src, pr.quit, pr.quit_status))
                         else
                             waiter_push(pr, id)
                     other ->
                         // `await 5` is 5, as in JavaScript -- and it still yields, so that a program
                         // cannot tell which of the two it was given by watching what runs next.
-                        current().ready.push(Resumption(id, other, false, "", at, current().current_source, false, 0))
+                        current().ready.push(Resumption(id, other, false, false, "", at, current().current_source, false, 0))
 
                 return Err(Wait)
 
-            Ret ->
+            // ---- THE COLD BLOCK. Everything above this line is in the first jump table; everything
+            // below it pays the second. An instruction moved across this line changes which table it
+            // is in, and an instruction added above it pushes the last one over. ----
+
+            SealData -> compose_seal_data(vm)
+            PushModule(m) -> vm.stack.push(here.module_values.at(m))
+
+            CheckType(k, t, pk) -> compose_check_named(u, vm, k, t, pk, at)?
+            CheckResult(t, pk) -> compose_check_result(u, vm, t, pk, at)?
+
+            DefineTest(k) -> here.registered_tests.push(TestCase(u.strings.at(k), here.current_source, pop_on(vm)))
+            DefineHook(kind, k) -> set_hook(kind, u.strings.at(k), pop_on(vm))
+
+            PushHandler(to) -> vm.handlers.push(Handler(chunk_ix, to, vm.stack.len(), vm.frames.len(), vm.scope, base, given, false))
+            PopHandler -> vm.handlers.truncate(vm.handlers.len() - 1)
+            Raise -> return raised(at, pop_on(vm))
+
+            WantDisposable -> want_disposable(peek_on(vm, 0), at)?
+            PushDispose(to) -> vm.handlers.push(Handler(chunk_ix, to, vm.stack.len(), vm.frames.len(), vm.scope, base, given, true))
+
+            // **`Ok` of nothing, because the answer is thrown away.** `guarded` runs a disposal
+            // handler for its effect and then raises the signal it was already carrying.
+            DisposeDone -> return Ok(Null)
+
+            // The head of a chunk with default parameters, and nowhere else.
+            JumpIfBound(k, to) -> if bound_here(vm.scope, u.strings.at(k)) then pc = to
+
+            // The same, where that chunk's parameters are slots. One bit rather than a lookup, which
+            // is what the whole of this arrangement is.
+            JumpIfGiven(n, to) -> if (given >> n) & 1 == 1 then pc = to
+
+            PushNull -> vm.stack.push(Null)
+            PushUndefined -> vm.stack.push(Undefined)
+            PushBool(v) -> vm.stack.push(Bool(v))
+
+            // **The magnitude is shared with the unit's copy rather than rebuilt**, a `BigInt`
+            // copying with a retain and never being written through.
+            PushBig(k) -> vm.stack.push(big_value(u.bigs.at(k)))
+            PushShape(pk, k) -> vm.stack.push(shape_value(u.patterns.at(pk), u.strings.at(k), vm.scope))
+            PushExternal(k) -> vm.stack.push(External(k))
+
+            CheckSlot(i, k, t, pk) -> compose_check_slot(u, vm, base, i, k, t, pk, at)?
+
+            // The checker refuses this before the machine runs. It is here so that the one path where
+            // it does not says what it has always said.
+            ImmutableSlot(k) -> return fault(at, s"`${u.strings.at(k)}` is a `val`, so it is written once")
+
+            DeclareCell(d, k, mutable) -> compose_declare_cell(u, vm, here, d, k, mutable, at)?
+            DeclareVal(k) -> compose_declare_name(u, vm, here, k, false, at)?
+            DeclareVar(k) -> compose_declare_name(u, vm, here, k, true, at)?
+            DeclareAbsent(k) -> compose_declare_absent(u, vm, k)
+            StoreName(k) -> compose_store_name(u, vm, here, k, at)?
+
+            // The three prefix operators, and the bitwise ones no benchmark reaches.
+            Negate ->
                 val v = pop_on(vm)
 
-                vm.stack.truncate(base)
+                vm.stack.push(negated(v, at)?)
+            Not ->
+                val v = pop_on(vm)
 
-                if vm.frames.len() == floor
-                    vm.scope = outer_scope
-                    return Ok(v)
+                vm.stack.push(notted(v)?)
+            Complement ->
+                val v = pop_on(vm)
 
-                val back = vm.frames.at(vm.frames.len() - 1)
+                vm.stack.push(complemented(v, at)?)
+            BitAnd ->
+                val b = pop_on(vm)
+                val a = pop_on(vm)
 
-                vm.frames.truncate(vm.frames.len() - 1)
+                vm.stack.push(bit_anded(a, b, at)?)
+            BitOr ->
+                val b = pop_on(vm)
+                val a = pop_on(vm)
 
-                // **Anything the returning call was inside goes with it.** A `return` written in a
-                // `try` body skips its `PopHandler`, and a handler outliving the frame it was
-                // established in names an instruction nobody is standing at.
-                // **A RETURN READS NO CHUNK AT ALL** -- the frame carries its own code and file.
-                vm.handlers.truncate(back.handlers)
-                chunk_ix = back.chunk
-                code = back.code
-                here.current_source = back.source
-                pc = back.pc
-                vm.scope = back.scope
-                base = back.base
-                given = back.given
-                vm.stack.push(v)
+                vm.stack.push(bit_ored(a, b, at)?)
+            BitXor ->
+                val b = pop_on(vm)
+                val a = pop_on(vm)
+
+                vm.stack.push(bit_xored(a, b, at)?)
+            ShiftLeft ->
+                val b = pop_on(vm)
+                val a = pop_on(vm)
+
+                vm.stack.push(shifted_left(a, b, at)?)
+            ShiftRight ->
+                val b = pop_on(vm)
+                val a = pop_on(vm)
+
+                vm.stack.push(shifted_right(a, b, at)?)
+            NoOperator -> return fault(at, "this is not an arithmetic operator")
+
+            MakeArray(n) -> compose_array(vm, n, at)?
+            SetIndex -> write_indexed(vm, at)?
+
+            JumpIfTrueKeep(to) -> if peek_on(vm, 0).truthy() then pc = to
+            JumpIfPresentKeep(to) -> if !is_nullish(peek_on(vm, 0)) then pc = to
+            JumpIfAbsentKeep(to) -> if is_nullish(peek_on(vm, 0)) then pc = to
+            JumpIfFalseKeep(to) -> if !peek_on(vm, 0).truthy() then pc = to
+
+            Dup -> vm.stack.push(peek_on(vm, 0))
+            DupAt(n) -> vm.stack.push(peek_on(vm, n))
+            RotUp(n) -> compose_rot_up(vm, n)
+
+            Join(n) -> compose_join(vm, n, at)?
+            Repeat -> compose_repeat(vm, at)?
+            WithObject(n) -> compose_with_object(vm, n, at)?
+            WithMerge(spread) -> compose_with_merge(vm, spread, at)?
+            MakeRange(inclusive, has_lo, has_hi, has_step) ->
+                compose_range(vm, inclusive, has_lo, has_hi, has_step, at)?
+            Unpack(k, immutable) -> compose_unpack(u, vm, k, immutable, at)?
+            IsPat(k, negated) -> compose_is_pat(u, vm, k, negated)
+
+            PushScope -> vm.scope = new_env(vm.scope)
+            PopScope -> vm.scope = vm.scope.parent
+
+            MakeClosure(c) -> vm.stack.push(Fn(new_closure(u.chunks.at(c).params, c, vm.scope)))
+            DefineFn(k, c) -> compose_define_fn(u, vm, k, c)
+
+            // The same, and the closure also goes into the table a `LoadDef` reads. **The table grows
+            // to reach the cell rather than being sized in advance**: a unit's definitions are
+            // numbered across every file it holds, and a machine may run only some of them.
+            DefineDef(k, c, d) -> compose_define_def(u, vm, k, c, d)
+
+            TestPat(k) -> compose_test_pat(u, vm, k)
+
+            IterInit -> compose_iter_init(vm, at)?
+            IterAwaitCheck -> compose_iter_await_check(at)?
+
+            FailWith(k) -> return fault(at, u.strings.at(k))
+            FailShowing(k) -> return fault(at, u.strings.at(k) + show_value(peek_on(vm, 0)))
+            FailNoArm -> return fault(at, s"no arm of this match applies to ${value_text(peek_on(vm, 0))}")
+
+            // `f(...xs)` -- the arguments are an array the instruction above it built.
+            //
+            // **The only difference from `CallFn` is where the count comes from**, which is the
+            // whole point: everything after that -- the keepable check, the truncate, `invoke` and
+            // the two ways a call can go -- is the same code doing the same thing.
+            CallSpread ->
+                here.args_buffered += 1
+
+                val spread = pop_on(vm)
+                val callee = pop_on(vm)
+
+                var args: Buf[Value] = buf()
+
+                spread match
+                    Array(a) ->
+                        for i in 0..<a.items.len()
+                            keepable_on(here, a.items.at(i), at, "passed to a function")?
+                            args.push(a.items.at(i))
+                    _ -> return fault(at, "unreachable")
+
+                invoke(u, callee, args, at, vm.frames.len())? match
+                    Answered(v) -> vm.stack.push(v)
+                    Enter(body, called, laid, entering_code, entering_source) ->
+                        // **The arguments go down FIRST, before anything else in this arm.** They
+                        // are a sysl local until they are on the stack, and the mark phase cannot
+                        // see one -- so the fewer instructions between `invoke` releasing its hold
+                        // and this, the less there is to go wrong when one of them later learns to
+                        // allocate.
+                        val laid_base = vm.stack.len()
+                        val mask = lay_frame(u, body, laid)
+
+                        vm.frames.push(Frame(chunk_ix, pc, vm.scope, base, vm.handlers.len(), given, code, here.current_source))
+                        chunk_ix = body
+                        code = entering_code
+                        here.current_source = entering_source
+                        pc = 0
+                        vm.scope = called
+                        base = laid_base
+                        given = mask
+
+            // The top `n` arrays, made into one. What builds a spread argument list.
+            JoinArrays(n) -> compose_joined_arrays(vm, n, at)?
 end run_frames

@@ -35,7 +35,13 @@ enum Signal
     // being looked up when the fault is reported. A `Signal` outlives the statement that raised it —
     // an unhandled rejection is reported after the loop has drained, by which time the machine is
     // somewhere else entirely — so the file has to be captured where the span was.
-    Fail(at: Span, src: usize, message: string)
+    // **`value` is what a `catch` BINDS, where the fault carries one.** `throw v` of anything that is
+    // not a string carries `v` itself, so a handler can sort faults by what went wrong rather than by
+    // reading a sentence -- `catch NotFound(id)` is the pattern a `match` arm would be. `None` is the
+    // other kind of fault: one the machine raised, and a `throw` of a string, both of which a `catch`
+    // is handed as the object `fault_value` builds. `message` is filled either way, being what a
+    // diagnostic says when nothing catches this.
+    Fail(at: Span, src: usize, message: string, value: Option[Value])
 
     // `exit(n)` on its way out of everything.
     //
@@ -81,9 +87,55 @@ type Step = Result[Value, Signal]
 //
 // **This is the ONE place a `Fail` is built**, which is what lets it learn the current file without
 // 116 call sites saying so. `Fail` is otherwise only ever matched on.
-failure(at: Span, message: string) -> Signal = Fail(at, current().current_source, message)
+failure(at: Span, message: string) -> Signal = Fail(at, current().current_source, message, None)
 
 fault(at: Span, message: string) -> Step = Err(failure(at, message))
+
+// A fault CARRYING a value, which is what `throw v` raises for a `v` that is not a string.
+//
+// **`message` is the sentence the value renders to** and is what an uncaught fault says; the value is
+// what a `catch` binds. Both are filled here so that nothing downstream has to decide which of them a
+// fault has.
+value_failure(at: Span, message: string, v: Value) -> Signal = Fail(at, current().current_source, message, Some(v))
+
+// **WHAT A THROWN VALUE MEANS IS DECIDED HERE AND NOWHERE ELSE**, because `throw` is not the only way
+// a program raises one: `reject(v)` and `fail(p, v)` put the very same fault into a promise, and two
+// answers to *is a string a sentence* would be two languages.
+//
+// **A STRING IS A SENTENCE AND EVERYTHING ELSE IS ITSELF.** A thrown string has nothing in it a
+// handler could sort on, so it is flattened and the `catch` is handed the `{message, line, file}`
+// object it has always been handed; anything else travels whole, so `catch NotFound(id)` can ask what
+// went wrong rather than reading a sentence.
+thrown_payload(v: Value) -> Option[Value] = v match
+    Str(_) -> None
+    other -> Some(other)
+
+// The sentence that fault SAYS, which is what an uncaught one is reported as.
+//
+// **An object with a `message` is READ for that field rather than rendered**, which is what lets a
+// library put a fault back with `throw e` without replacing it with a description of itself.
+//
+// **A VALUE IS WRITTEN THE WAY `print` WRITES IT, so a class that wrote a `toString` decides what its
+// own fault says** -- the one diagnostic in slate that runs a program's own code. The rule the rest of
+// them keep is kept here by the FALLBACK: where that hook faults in turn, the ordinary rendering is
+// what is left, so the reader is told about the fault the program threw rather than about the one its
+// `toString` raised on the way out.
+//
+// **It is worked out where the fault is RAISED and not where it is reported**, because that is the one
+// place the value is certainly still the machine's: a `Signal` travels in a sysl local, which is no
+// root, and a report happens after everything the unwind ran.
+thrown_message(at: Span, v: Value) -> string = v match
+    Str(p) -> p.s
+    Object(o) ->
+        obj_get_name(o, "message") match
+            Some(Str(p)) -> p.s
+            _ -> program_text(at, v)
+    other -> program_text(at, other)
+
+// The rendering `print` gives, with the diagnostic one where the program's own hook faulted.
+private program_text(at: Span, v: Value) -> string = printed(v, at) match
+    Ok(said) -> said
+    Err(_) -> value_text(v)
 
 // `exit(n)` as the error channel wants it, carrying the place it was asked for.
 //
@@ -186,7 +238,7 @@ is_nullish(v: Value) -> bool = v match
 // the question. `keepable` below is the same check for a caller with no VM in hand.
 keepable_on(vm: *Vm, v: Value, at: Span, what: string) -> Result[unit, Signal]
     if is_absent(v)
-        return Err(Fail(at, vm.current_source, s"this field is not there, and `undefined` cannot be ${what} -- give it a value with `??`, or ask `has` first"))
+        return Err(Fail(at, vm.current_source, s"this field is not there, and `undefined` cannot be ${what} -- give it a value with `??`, or ask `has` first", None))
 
     Ok(())
 end keepable_on
@@ -292,7 +344,7 @@ private const ReportLimit: usize = 5
 
 // Where to point at a signal that escaped to the top.
 signal_span(s: Signal) -> Span = s match
-    Fail(at, _, _) -> at
+    Fail(at, _, _, _) -> at
     Quit(at, _, _) -> at
     Skip(at, _, _) -> at
     _ -> point(0)
@@ -302,7 +354,7 @@ signal_span(s: Signal) -> Span = s match
 // **Zero for the ones that carry no place**, which is the entry: a `break` outside a loop is a
 // complaint about the program the user named, and there is nowhere better to point.
 signal_source(s: Signal) -> usize = s match
-    Fail(_, src, _) -> src
+    Fail(_, src, _, _) -> src
     Quit(_, src, _) -> src
     Skip(_, src, _) -> src
     _ -> 0
@@ -340,7 +392,7 @@ local_source_of(file: string) -> usize
 end local_source_of
 
 signal_message(s: Signal) -> string = s match
-    Fail(_, _, m) -> m
+    Fail(_, _, m, _) -> m
     Ret(_) -> "`return` outside a function"
     Brk -> "`break` outside a loop"
     Cont -> "`continue` outside a loop"
@@ -362,6 +414,10 @@ store_at(container: Value, k: Value, v: Value, at: Span) -> Step
         Array(items) ->
             k match
                 Int(i) ->
+                    // **Asked before the bounds are**, so a frozen array answers what is actually
+                    // wrong rather than complaining about a position that was perfectly good.
+                    if items.frozen then return fault(at, frozen_array_complaint("xs[i] = v"))
+
                     if i < 0 || usize(i) >= items.items.len()
                         return fault(at, s"the index ${i} is outside an array of ${items.items.len()}")
 
@@ -375,6 +431,8 @@ store_at(container: Value, k: Value, v: Value, at: Span) -> Step
         Bytes(bs) ->
             k match
                 Int(i) ->
+                    if bs.frozen then return fault(at, frozen_bytes_complaint("b[i] = v"))
+
                     if i < 0 || usize(i) >= bs.data.len()
                         return fault(at, s"the index ${i} is outside ${bs.data.len()} bytes")
 

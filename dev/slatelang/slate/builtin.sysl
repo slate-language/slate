@@ -151,6 +151,12 @@ var n_has: NativeFn = 0
 // object.
 var n_without: NativeFn = 0
 
+// **`freeze` and `isFrozen` are JavaScript's names and the SHALLOW rule is JavaScript's too.** They
+// sit beside `without` because they are the same tier: an operation on a container a program built,
+// wanted by the same programs and reached without importing anything.
+var n_freeze: NativeFn = 0
+var n_is_frozen: NativeFn = 0
+
 install_basics(env: *EnvObj)
     n_print = register("print", do_print)
     n_length = register("length", do_len)
@@ -163,6 +169,8 @@ install_basics(env: *EnvObj)
     n_keys = register("keys", do_keys)
     n_has = register("has", do_has)
     n_without = register("without", do_without)
+    n_freeze = register("freeze", do_freeze)
+    n_is_frozen = register("isFrozen", do_is_frozen)
 
     declare(env, "print", Native(n_print), false)
     declare(env, "push", Native(n_push), false)
@@ -177,6 +185,9 @@ install_basics(env: *EnvObj)
     // read, and `with` writes -- so a table that had to forget something had to be rebuilt by hand
     // out of everything else, which is what `slate-language/sluice`'s session store does.
     declare(env, "without", Native(n_without), false)
+
+    declare(env, "freeze", Native(n_freeze), false)
+    declare(env, "isFrozen", Native(n_is_frozen), false)
 end install_basics
 
 // The event loop's, which are node's names because a program that knows node should not have to
@@ -666,7 +677,10 @@ private do_settled(args: Args, at: Span, failing: bool) -> Step
 
     hold(Promise(pr))
 
-    if failing then settle_err(pr, printed(args.at(0), at)?, at, current().current_source) else settle_ok(pr, args.at(0))
+    // **A rejection raises the same fault `throw` raises**, which is `thrown_payload`'s rule read one
+    // level out: `reject("gone")` is a sentence and `reject(NotFound(3))` is a value a `catch` can
+    // sort on, or the two ways of raising a fault would answer differently after an `await`.
+    if failing then settle_thrown(pr, thrown_message(at, args.at(0)), at, current().current_source, thrown_payload(args.at(0))) else settle_ok(pr, args.at(0))
 
     release(mark)
     Ok(Promise(pr))
@@ -701,7 +715,7 @@ private do_answer(args: Args, at: Span, failing: bool) -> Step
         Promise(p) -> p
         other -> return fault(at, s"`${name}` answers a promise, and this is ${other.type_name()}")
 
-    if failing then settle_err(pr, printed(args.at(1), at)?, at, current().current_source) else settle_ok(pr, args.at(1))
+    if failing then settle_thrown(pr, thrown_message(at, args.at(1)), at, current().current_source, thrown_payload(args.at(1))) else settle_ok(pr, args.at(1))
 
     Ok(Null)
 end do_answer
@@ -793,6 +807,8 @@ private do_push(args: Args, at: Span) -> Step
 
     args.at(0) match
         Array(a) ->
+            if a.frozen then return fault(at, frozen_array_complaint("push"))
+
             keepable(args.at(1), at, "stored")?
             array_push(a, args.at(1))
             Ok(Null)
@@ -801,7 +817,7 @@ private do_push(args: Args, at: Span) -> Step
         // one buffer to another used to be a loop in the program, one `Value` per byte; here it is
         // an `extend`, which is a copy of a run of memory. A number is a byte and must be one --
         // `push(b, 256)` is a mistake in the program, not a truncation.
-        Bytes(b) -> args.at(1) match
+        Bytes(b) -> if b.frozen then fault(at, frozen_bytes_complaint("push")) else args.at(1) match
             Int(_) ->
                 bytes_push(b, byte_of_value(args.at(1), at)?)
                 Ok(Null)
@@ -931,13 +947,77 @@ private do_without(args: Args, at: Span) -> Step
                     obj_put(o, e.key, e.value, at)?
 
             // Set last, the writes above being how the copy was filled -- `WithObject`'s own
-            // ordering and for its reason.
-            o.frozen = fields.frozen
+            // ordering and for its reason, including that a copy of a value `freeze` closed is an
+            // ordinary object.
+            o.data_value = fields.data_value
+            o.frozen = fields.data_value
 
             release(mark)
             Ok(Object(o))
         other -> fault(at, s"`without` needs an object, and this is ${other.type_name()}")
 end do_without
+
+// `freeze(v)` -- close a container to writing, and answer the very value it was given.
+//
+// **IT IS SHALLOW, WHICH IS JavaScript's RULE AND IS THE ONE WORTH STATING.** Freezing an object
+// says nothing about the objects its fields hold; a program wanting the whole graph walks it
+// itself. A deep freeze cannot be the default here for the reason it is not there either -- the
+// graph may be cyclic, may be large, and may hold values the program does not own.
+//
+// **A value that is not a container ANSWERS ITSELF**, again JavaScript's rule: a number cannot be
+// written through, so there is nothing for `freeze` to do and nothing to refuse. That makes
+// `freeze` safe to write over a value whose kind the program does not know.
+//
+// **Freezing twice is not an error.** The flag is already true and the call is a no-op, which is
+// what lets a constructor freeze what it was handed without asking whether somebody else did.
+private do_freeze(args: Args, at: Span) -> Step
+    if args.len() != 1 then return fault(at, s"`freeze` takes one value, and was given ${counted(args.len(), "argument")}")
+
+    val v = args.at(0)
+
+    v match
+        Object(o) -> o.frozen = true
+        Array(a) -> a.frozen = true
+        Bytes(b) -> b.frozen = true
+
+        // **A set, a map and a weak map ARE the object's table**, so one flag closes all four kinds
+        // and each mutator asks it where the call's own name is still in hand.
+        //
+        // **A weak map is on the list although nothing about it is copyable**, and leaving it off
+        // was the tempting mistake: `isFrozen` would then have to answer `true` for it -- the answer
+        // a value with nothing to write through gets -- about a value `set` writes into happily.
+        SetVal(o) -> o.frozen = true
+        MapVal(o) -> o.frozen = true
+        WeakMapVal(o) -> o.frozen = true
+        _ -> ()
+
+    Ok(v)
+end do_freeze
+
+// `isFrozen(v)` -- whether writing through this value is refused.
+//
+// **A value with nothing to write through answers TRUE**, which is `Object.isFrozen`'s answer for a
+// primitive and is the honest one: the question is whether the value can change, and a number
+// cannot. So `isFrozen(freeze(x))` is true for every `x`, which is the property a program reading
+// this would want.
+//
+// **A DATA VALUE IS FROZEN AND ALWAYS WAS**, so `isFrozen(Circle(2))` is true without anybody having
+// called `freeze` -- the flag is one answer whatever set it.
+private do_is_frozen(args: Args, at: Span) -> Step
+    if args.len() != 1 then return fault(at, s"`isFrozen` takes one value, and was given ${counted(args.len(), "argument")}")
+
+    Ok(Bool(args.at(0) match
+        Object(o) -> o.frozen
+        Array(a) -> a.frozen
+        Bytes(b) -> b.frozen
+        SetVal(o) -> o.frozen
+        MapVal(o) -> o.frozen
+        WeakMapVal(o) -> o.frozen
+
+        // A closure, a promise, a generator, a socket: each holds state a program cannot write a
+        // field of, so none of them is writable and none is refused.
+        _ -> true))
+end do_is_frozen
 
 
 // The sentence a program gets for reaching the JavaScript host through an external where there is

@@ -107,6 +107,43 @@ one array every instance pushes into. **A mutable literal under `val` is therefo
 message names `var` as the fix. Only a *literal* is refused: an object bound outside the class and named
 here is sharing somebody asked for, and still compiles.
 
+**A `val` does not change, so assigning to one is refused** — through an object of the class and
+through the class itself alike:
+
+```slate
+class Coin
+    val kind = "coin"
+    var side = 1
+
+val c = Coin()
+
+c.kind = "token"
+```
+
+```error
+is a `val` of `Coin`
+```
+
+Without the refusal the write would be taken and would put a field on `c` that *hides* the class's
+value: `c.kind` would answer `"token"` while `Coin.kind` still answered `"coin"`, and nothing would
+have said so. A `var` is the field each object gets and is written freely:
+
+```slate
+class Coin
+    val kind = "coin"
+    var side = 1
+
+val c = Coin(2)
+
+c.side = 5
+
+print(c.kind, c.side)
+```
+
+```output
+coin 5
+```
+
 ## No member may be called `proto`
 
 **`proto` is the link itself, not a name a class can spend.** A class is an object with a `proto`, and

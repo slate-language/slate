@@ -202,6 +202,7 @@ private encode_bytes(out: *Buf[u8], seen: *Buf[usize], p: *BytesObj, at: Span)
         None ->
             seen.push(usize(p))
             out.push(TagBytes)
+            out.push(if p.frozen then 1u8 else 0u8)
             put_usize(out, p.data.len())
             out.extend(p.data.view())
 end encode_bytes
@@ -215,6 +216,7 @@ private encode_array(out: *Buf[u8], seen: *Buf[usize], p: *ArrayObj, path: strin
         None -> seen.push(usize(p))
 
     out.push(TagArray)
+    out.push(if p.frozen then 1u8 else 0u8)
     put_usize(out, p.items.len())
 
     for i in 0..<p.items.len()
@@ -233,6 +235,7 @@ private encode_members(out: *Buf[u8], seen: *Buf[usize], o: *ObjectObj, tag: u8,
         None -> seen.push(usize(o))
 
     out.push(tag)
+    out.push(if o.frozen then 1u8 else 0u8)
     put_usize(out, o.live)
 
     var n: usize = 0
@@ -257,6 +260,7 @@ private encode_pairs(out: *Buf[u8], seen: *Buf[usize], o: *ObjectObj, tag: u8, p
         None -> seen.push(usize(o))
 
     out.push(tag)
+    out.push(if o.frozen then 1u8 else 0u8)
     put_usize(out, o.live)
 
     var n: usize = 0
@@ -315,12 +319,17 @@ private encode_object(out: *Buf[u8], seen: *Buf[usize], o: *ObjectObj, path: str
             Some(n) -> n
             None -> ""
 
+    // **BOTH FLAGS CROSS, AND A PLAIN OBJECT CARRIES THEM TOO.** A byte was written only for an
+    // instance while the only thing that could be closed was a data variant; `freeze` closes an
+    // ordinary object, so one that did not carry its answer would arrive on the other thread
+    // writable — a value the program had deliberately shut, silently open again.
     if named == ""
         out.push(TagObject)
+        out.push(sealing_byte(o))
     else
         out.push(TagInstance)
         put_text(out, named)
-        out.push(if o.frozen then 1u8 else 0u8)
+        out.push(sealing_byte(o))
 
     // **`walked_key` is what says which keys are the program's**, so a tag and an instance's `proto`
     // are left out and a `proto` a program wrote on a plain object is carried like any other field.
@@ -464,22 +473,28 @@ decode_value(w: *Wire, at: Span) -> Step
         return Ok(w.seen.at(i))
 
     if tag == TagBytes
+        val shut = w.byte() == 1u8
         val n = w.count()
         val v = bytes_value(w.take(n))
 
         hold(v)
         w.seen.push(v)
+
+        v match
+            Bytes(b) -> b.frozen = shut
+            _ -> ()
+
         return Ok(v)
 
     if tag == TagArray then return decode_array(w, at)
     if tag == TagSet then return decode_set(w, at)
     if tag == TagMap then return decode_map(w, at)
-    if tag == TagObject then return decode_object(w, "", false, at)
+    if tag == TagObject then return decode_object(w, "", w.byte(), at)
 
     if tag == TagInstance
         val name = w.text()
 
-        return decode_object(w, name, w.byte() == 1u8, at)
+        return decode_object(w, name, w.byte(), at)
 
     Err(failure(at, "a message carried something this actor does not know how to read"))
 end decode_value
@@ -494,6 +509,9 @@ private decode_array(w: *Wire, at: Span) -> Step
     hold(v)
     w.seen.push(v)
 
+    // **Read before the elements and written after them.** The flag closes the array to writing, so
+    // setting it first would refuse the very `array_push`es that fill the copy.
+    val shut = w.byte() == 1u8
     val n = w.count()
 
     for _ in 0..<n
@@ -502,6 +520,7 @@ private decode_array(w: *Wire, at: Span) -> Step
         hold(e)
         array_push(p, e)
 
+    p.frozen = shut
     Ok(v)
 end decode_array
 
@@ -512,6 +531,9 @@ private decode_set(w: *Wire, at: Span) -> Step
     hold(v)
     w.seen.push(v)
 
+    // Read before the members and written after them, which is `decode_array`'s rule and for its
+    // reason: the flag refuses the very writes that fill the copy.
+    val shut = w.byte() == 1u8
     val n = w.count()
 
     for _ in 0..<n
@@ -520,6 +542,7 @@ private decode_set(w: *Wire, at: Span) -> Step
         hold(e)
         obj_put(p, e, Null, at)?
 
+    p.frozen = shut
     Ok(v)
 end decode_set
 
@@ -530,6 +553,7 @@ private decode_map(w: *Wire, at: Span) -> Step
     hold(v)
     w.seen.push(v)
 
+    val shut = w.byte() == 1u8
     val n = w.count()
 
     for _ in 0..<n
@@ -542,11 +566,17 @@ private decode_map(w: *Wire, at: Span) -> Step
         hold(e)
         obj_put(p, k, e, at)?
 
+    p.frozen = shut
     Ok(v)
 end decode_map
 
 // A plain object, or an instance of the class or variant the sender named.
-private decode_object(w: *Wire, named: string, frozen: bool, at: Span) -> Step
+// The two flags that say whether a value is closed and why, as one byte: bit 0 is `frozen` and bit 1
+// is `data_value`. One byte rather than two because they are one answer read two ways.
+private sealing_byte(o: *ObjectObj) -> u8 =
+    (if o.frozen then 1u8 else 0u8) | (if o.data_value then 2u8 else 0u8)
+
+private decode_object(w: *Wire, named: string, sealing: u8, at: Span) -> Step
     val p = new_object()
     val v = Object(p)
 
@@ -579,7 +609,8 @@ private decode_object(w: *Wire, named: string, frozen: bool, at: Span) -> Step
         hold(e)
         obj_put(p, k, e, at)?
 
-    p.frozen = frozen
+    p.frozen = (sealing & 1u8) != 0u8
+    p.data_value = (sealing & 2u8) != 0u8
     Ok(v)
 end decode_object
 
