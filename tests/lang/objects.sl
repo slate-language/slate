@@ -150,6 +150,27 @@ with_takes_a_value_on_the_right_as_well_as_a_literal() =
     assertEq(a with more, { x: 1, y: 2 })
 
 @test
+A_with_TAKES_THE_SHORTHAND_AN_OBJECT_LITERAL_TAKES() =
+    val x = 1
+    val y = 2
+    val base = { a: 9, x: 0 }
+
+    assertEq(base with { x }, { a: 9, x: 1 })
+    assertEq(base with { x, y }, { a: 9, x: 1, y: 2 })
+    assertEq(base with { x, y: 7 }, { a: 9, x: 1, y: 7 })
+
+    // The original is untouched, a shorthand being an ordinary way of saying what a field's value is.
+    assertEq(base, { a: 9, x: 0 })
+
+@test
+a_shorthand_in_a_with_reads_the_name_at_whatever_depth_it_is_written() =
+    val y = 2
+    val base = { a: 9 }
+
+    assertEq({ p: base with { y } }, { p: { a: 9, y: 2 } })
+    assertEq(base with { q: base with { y } }, { a: 9, q: { a: 9, y: 2 } })
+
+@test
 a_method_reached_through_a_proto_is_handed_the_object() =
     val Base = { twice: (self) -> self.n * 2 }
     val o = { n: 21, proto: Base }
