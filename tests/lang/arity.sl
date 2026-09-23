@@ -159,7 +159,7 @@ AN_ABSENCE_IS_REFUSED_WHEREVER_IT_STANDS_AMONG_THE_ARGUMENTS() =
 three(a, b, c) = a + b + c
 
 class Tripled
-    n: integer
+    var n
     plus(self, y) = self.n * 3 + y
 
 @test
