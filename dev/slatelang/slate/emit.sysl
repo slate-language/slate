@@ -620,6 +620,13 @@ fuse(code: Buf[Ins]) -> Buf[Ins]
     while p + 1 < out.len()
         val first = out.at(p)
 
+        // **A run is tried before a pair**, a run's first two slots being a pair's too.
+        val run = fused_run(&out, p)
+
+        if run > 0
+            p += run
+            continue
+
         val joined: Option[Op] = first.op match
             LoadSlot(i) -> out.at(p + 1).op match
                 LoadSlot(j) -> Some(LoadSlot2(u32(i), u32(j)))
@@ -633,6 +640,9 @@ fuse(code: Buf[Ins]) -> Buf[Ins]
                 _ -> None
             Add -> out.at(p + 1).op match
                 StoreSlot(i) -> Some(AddStoreSlot(i))
+                _ -> None
+            Sub -> out.at(p + 1).op match
+                StoreSlot(i) -> Some(SubStoreSlot(i))
                 _ -> None
             Less -> out.at(p + 1).op match
                 JumpIfFalse(to) -> Some(LessJumpIfFalse(to))
@@ -651,6 +661,88 @@ fuse(code: Buf[Ins]) -> Buf[Ins]
 
     out
 end fuse
+
+// A fused RUN beginning at `p` -- a loop's head or a loop's tail -- written over its first slot,
+// answering how many slots it covers, or zero where none begins here.
+//
+// **The run's inner pair is folded where it stands as well**, so a jump that lands inside the run
+// finds the pair form rather than the two unfused instructions -- and a pair steps over only what
+// it covers, so what runs from there is what the unfused slots would have run. No `LoadDef` is
+// named here either, for `fuse`'s reason.
+fused_run(out: *Buf[Ins], p: usize) -> usize
+    if p + 4 >= out.len() then return 0
+
+    out.at(p).op match
+        Tick -> fused_loop_head(out, p)
+        LoadSlot(i) -> fused_loop_tail(out, p, i)
+        _ -> 0
+
+// `Tick; LoadSlot(i); PushInt(v); Less; JumpIfFalse(to)`. Its inner pairs are the `LoadSlotInt` at
+// `p + 1` and the `LessJumpIfFalse` at `p + 3`.
+fused_loop_head(out: *Buf[Ins], p: usize) -> usize
+    val i = fusing_slot_read(out.at(p + 1).op)
+    val v = fusing_int(out.at(p + 2).op)
+    val to = fusing_false_jump(out.at(p + 4).op)
+    val less = out.at(p + 3).op match
+        Less -> true
+        _ -> false
+
+    if !less || i.is_none() || v.is_none() || to.is_none() then return 0
+    if i.unwrap() > 4294967295 || v.unwrap() < -2147483648 || v.unwrap() > 2147483647 then return 0
+
+    val slot = u32(i.unwrap())
+    val lit = int(v.unwrap())
+
+    out.set(p, Ins(TickSlotIntLess(slot, lit), out.at(p).at))
+    out.set(p + 1, Ins(LoadSlotInt(slot, lit), out.at(p + 1).at))
+    out.set(p + 3, Ins(LessJumpIfFalse(to.unwrap()), out.at(p + 3).at))
+    5
+end fused_loop_head
+
+// `LoadSlot(i); PushInt(v); Add; StoreSlot(i); Jump(to)`, the one slot read and written. Its inner
+// pair is the `AddStoreSlot` at `p + 2`.
+//
+// **A sum into a local followed by the back edge is NOT a run of its own**, though it was the
+// heaviest pair left: `Add; StoreSlot; Jump` folded alone measured -0.35% of the geometric mean over
+// the four programs that run it -- `loops` -6.6%, and `arrays` +3.0%, `csv` +1.5%, `nested` +1.2% --
+// which is no answer, and an arm in the dispatch is not free.
+// `bench/results/2026-09-23-superinstructions-2.md` has the run.
+fused_loop_tail(out: *Buf[Ins], p: usize, i: usize) -> usize
+    val v = fusing_int(out.at(p + 1).op)
+    val stored = fusing_slot_written(out.at(p + 3).op)
+    val to = fusing_jump(out.at(p + 4).op)
+    val add = out.at(p + 2).op match
+        Add -> true
+        _ -> false
+
+    if !add || v.is_none() || to.is_none() || stored.is_none() || stored.unwrap() != i then return 0
+    if i > 65535 || v.unwrap() < -32768 || v.unwrap() > 32767 || to.unwrap() > 4294967295 then return 0
+
+    out.set(p, Ins(SlotIntAddStoreJump(u16(i), i16(v.unwrap()), u32(to.unwrap())), out.at(p).at))
+    out.set(p + 2, Ins(AddStoreSlot(i), out.at(p + 2).at))
+    5
+end fused_loop_tail
+
+// What one instruction carries, where it is the kind a run wants and `None` where it is not.
+fusing_slot_read(op: Op) -> Option[usize] = op match
+    LoadSlot(i) -> Some(i)
+    _ -> None
+
+fusing_slot_written(op: Op) -> Option[usize] = op match
+    StoreSlot(i) -> Some(i)
+    _ -> None
+
+fusing_int(op: Op) -> Option[long] = op match
+    PushInt(v) -> Some(v)
+    _ -> None
+
+fusing_jump(op: Op) -> Option[usize] = op match
+    Jump(to) -> Some(to)
+    _ -> None
+
+fusing_false_jump(op: Op) -> Option[usize] = op match
+    JumpIfFalse(to) -> Some(to)
+    _ -> None
 
 // Drop back to a stack height, a scope depth and a handler depth, which is what leaving a block
 // means.

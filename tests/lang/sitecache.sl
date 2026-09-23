@@ -261,3 +261,90 @@ A_NUMBER_OF_EITHER_KIND_TAKES_THE_SAME_REMEMBERED_METHOD() =
     val shown = [1, 2.5, 3].map((n) -> n.toString())
 
     assertEq(shown, ["1", "2.5", "3"])
+
+// **A method found through a proto is answered from where the call found it last time, with nothing
+// asked of the receiver's own table but whether it could hold the name at all.** Each test below
+// changes what that answer should be between two calls at one place: the receiver gains the name,
+// loses it again in a copy, is handed another proto, or is one of two instances only one of which
+// holds the name itself.
+callTell(b) = b.tell()
+
+@test
+A_METHOD_CALL_PLACE_THAT_HIT_THE_CLASS_FINDS_A_FIELD_THE_INSTANCE_GAINS_SINCE()
+    val b = Box(1)
+
+    assertEq(callTell(b), "class")
+    assertEq(callTell(b), "class")
+
+    b.tell = () -> "own"
+
+    assertEq(callTell(b), "own")
+
+@test
+ONE_METHOD_CALL_PLACE_ALTERNATES_BETWEEN_AN_INSTANCE_THAT_SHADOWS_AND_ONE_THAT_DOES_NOT()
+    val plain = Box(1)
+    val shadowed = Box(2)
+
+    shadowed.tell = () -> "own"
+
+    assertEq([callTell(plain), callTell(shadowed), callTell(plain), callTell(shadowed)], ["class", "own", "class", "own"])
+
+@test
+A_COPY_WITHOUT_THE_SHADOWING_FIELD_REACHES_THE_PROTO_AGAIN()
+    val shared = { tell: self -> "shared" }
+    val o = { proto: shared, tell: () -> "own" }
+
+    assertEq(callTell(o), "own")
+
+    val bare = without(o, "tell")
+
+    assertEq(callTell(bare), "shared")
+    assertEq(callTell(bare), "shared")
+    assertEq(callTell(o), "own")
+
+greetOf(o) = o.greet()
+
+@test
+A_PROTO_REPLACED_UNDER_A_METHOD_CALL_PLACE_IS_THE_ONE_THE_NEXT_CALL_REACHES()
+    val one = { greet: self -> "one" }
+    val two = { greet: self -> "two" }
+    val o = { proto: one }
+
+    assertEq(greetOf(o), "one")
+    assertEq(greetOf(o), "one")
+
+    o.proto = two
+
+    assertEq(greetOf(o), "two")
+
+    // A method replaced on the proto it already reaches is the next one run as well.
+    two.greet = self -> "two again"
+
+    assertEq(greetOf(o), "two again")
+
+@test
+A_NEARER_PROTO_THAT_GAINS_THE_NAME_WINS_OVER_THE_ONE_A_PLACE_REACHED_BEFORE()
+    val far = { greet: self -> "far" }
+    val near = { proto: far }
+    val o = { proto: near }
+
+    assertEq(greetOf(o), "far")
+
+    near.greet = self -> "near"
+
+    assertEq(greetOf(o), "near")
+
+    o.greet = () -> "own"
+
+    assertEq(greetOf(o), "own")
+
+remade(b, n) = b.new(n)
+
+@test
+A_CONSTRUCTOR_REACHED_THROUGH_AN_INSTANCE_IS_HANDED_NO_RECEIVER_AT_A_REMEMBERED_PLACE()
+    // `new` is the one name the receiver rule does not reach -- a constructor runs before there is an
+    // object to hand it -- so a place that has found it through a proto must not start handing one.
+    val b = Box(1)
+
+    assertEq(remade(b, 4).n, 4)
+    assertEq(remade(b, 6).n, 6)

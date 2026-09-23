@@ -14,11 +14,11 @@ import sh.sysl.parsing.*
 // that existed only to move a number four bytes.
 //
 // **WHICH PAIRS WAS MEASURED AND NOT GUESSED.** `profile.sysl` counts adjacent pairs and triples
-// under `--features profile`, and the four here are the heaviest sequences over `arith`, `loops`,
-// `fib`, `nested`, `calls`, `methods` and `dispatch` that are also broad: `LoadSlot`+`PushInt`
-// 82.8M, `LoadSlot`+`LoadSlot` 55.0M, `Add`+`StoreSlot` 40.0M, `Less`+`JumpIfFalse` 31.4M. Re-run
-// that table before proposing a fifth; a pair costs an arm in the hottest `match` in the project and
-// `code.sysl` carries the numbers.
+// under `--features profile`, and every sequence here was the heaviest broad one when it was fused:
+// the first four pairs (`LoadSlot`+`PushInt`, `LoadSlot`+`LoadSlot`, `Add`+`StoreSlot`,
+// `Less`+`JumpIfFalse`), then `Sub`+`StoreSlot` and the two five-slot runs a counted loop's head and
+// tail make of those pairs. Re-run that table before proposing another; an arm costs a slot in the
+// hottest `match` in the project, and `code.sysl` carries the numbers.
 //
 // **EVERY ONE KEEPS THE INT-INT FAST PATH INLINE AND HANDS EVERYTHING ELSE TO `run_arith.sysl`.**
 // There is no second copy of an overflow promotion, a string join, an operator method or a
@@ -135,3 +135,79 @@ fused_less_jump_if_false(vm: *Machine, at: Span) -> Result[bool, Signal]
 
     Ok(!is_less(a, b, at)?.truthy())
 end fused_less_jump_if_false
+
+// `Sub` then `StoreSlot(i)`, which is `fused_add_store_slot` with the other operator and answers the
+// same way: `None` where the difference went into the cell, and the value where the store's own
+// span is owed.
+fused_sub_store_slot(vm: *Machine, base: usize, i: usize, at: Span) -> Result[Option[Value], Signal]
+    val b = pop_on(vm)
+    val a = pop_on(vm)
+
+    a match
+        Int(x) -> b match
+            Int(y) ->
+                val diff = x - y
+
+                // A difference overflows exactly where the operands' signs differ and the answer's
+                // sign is not the minuend's.
+                if (x ^ y) & (x ^ diff) >= 0
+                    vm.stack.set(base + i, Int(diff))
+                    return Ok(None)
+            _ -> ()
+        _ -> ()
+
+    Ok(Some(subtracted(a, b, at)?))
+end fused_sub_store_slot
+
+// -- THE FUSED RUNS: a loop's head and its tail -----------------------------------------------------
+//
+// **Each fast path answers without reading a slot it stepped over**, which is the point: the exit
+// target of a loop head and the spans of every instruction after the first are in the code buffer,
+// and the arm in `run_frames.sysl` reads one only on the path that owes it -- the loop ending, or a
+// value that is not a whole number and may have a sentence coming.
+
+// `Tick`, then whether `LoadSlot(i) < v`: `Some` with the answer where the slot holds a whole
+// number, and `None` where it does not and the ordinary comparison has to be asked.
+//
+// **The safe point is the Tick arm's own two lines**, the collection and the full-heap sentence at
+// the Tick's span, which is the first slot's and so the one this instruction carries.
+fused_tick_slot_int_less(here: *Vm, vm: *Machine, base: usize, i: usize, v: long, at: Span) -> Result[Option[bool], Signal]
+    maybe_collect_on(here)
+
+    if here.heap_exhausted then return Err(failure(at, "this program has run out of memory"))
+
+    vm.stack.at(base + i) match
+        Int(x) -> Ok(Some(x < v))
+        _ -> Ok(None)
+end fused_tick_slot_int_less
+
+// `LoadSlot(i) < v` for a slot that is not a whole number, with the `Less`'s own span.
+fused_slot_less(vm: *Machine, base: usize, i: usize, v: long, at: Span) -> Result[bool, Signal]
+    Ok(is_less(vm.stack.at(base + i), Int(v), at)?.truthy())
+
+// Where a loop head's `JumpIfFalse` goes, read out of the slot the run stepped over. `fuse` writes a
+// head only in front of one, so any other instruction here is a defect in `fuse`.
+fused_exit(op: Op) -> usize = op match
+    JumpIfFalse(to) -> to
+    _ -> panic("a fused loop head is not followed by its JumpIfFalse")
+
+// `i = i + v` on a slot that holds a whole number and does not overflow, written straight into the
+// cell; `false` where the ordinary addition has to be asked.
+fused_slot_int_add(vm: *Machine, base: usize, i: usize, v: long) -> bool
+    vm.stack.at(base + i) match
+        Int(x) ->
+            val sum = x + v
+
+            if (x ^ sum) & (v ^ sum) < 0 then return false
+
+            vm.stack.set(base + i, Int(sum))
+            true
+        _ -> false
+end fused_slot_int_add
+
+// `i = i + v` the long way, with the `Add`'s span for the arithmetic and the `StoreSlot`'s for the
+// absence rule -- the two sentences the unfused run would have said.
+fused_slot_int_add_slow(vm: *Machine, base: usize, i: usize, v: long, add_at: Span, store_at: Span) -> Result[unit, Signal]
+    val sum = added(vm.stack.at(base + i), Int(v), add_at)?
+
+    stored_in_slot(vm, base, i, sum, store_at)
