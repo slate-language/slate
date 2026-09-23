@@ -479,6 +479,48 @@ A_BARE_next_SENDS_undefined_AND_next_v_SENDS_v() =
     assertEq(seen, [1, "nothing"])
 
 @test
+A_BARE_next_INTO_A_KEPT_yield_FAULTS_IN_WORDS_ABOUT_THE_GENERATOR() =
+    // `undefined` may not be kept, but "this field is not there" would be false of a `yield`, so
+    // the sentence names the generator -- the same words on both back ends.
+    val said = "this generator was resumed with nothing, and `undefined` cannot be kept -- give the `yield` a value with `??`, or call `next(v)`"
+
+    bound() =
+        val got = yield 1
+
+        yield got
+
+    val b = bound()
+
+    b.next()
+    assertEq(b.next() catch e -> e.message, said)
+    assert(b.next().done)
+
+    // A write to a `var` is refused the same way.
+    written() =
+        var got = 0
+
+        got = yield 1
+        yield got
+
+    val w = written()
+
+    w.next()
+    assertEq(w.next() catch e -> e.message, said)
+
+    // And so is a write to a local a closure holds.
+    captured() =
+        var got = 0
+        val f = () -> got
+
+        got = yield 1
+        yield f()
+
+    val c = captured()
+
+    c.next()
+    assertEq(c.next() catch e -> e.message, said)
+
+@test
 async an_async_function_answers_a_promise() =
     later() =
         41
