@@ -215,10 +215,13 @@ belongs.
 
 ## Array patterns
 
-An array pattern tests the elements it writes and lets the rest through:
+**An array pattern says how many elements the array has**, and a `...` is what opens it. So `[a, b]`
+matches an array of exactly two and `[a, ...rest]` matches any array with at least one:
 
 ```slate
-print(["a", 2] is [string, ...])
+print([1, 2] is [integer, integer])
+print([1, 2, 3] is [integer, integer])
+print([1, 2, 3] is [integer, ...])
 
 val [first, ...rest] = [1, 2, 3]
 
@@ -227,8 +230,16 @@ print(first, rest)
 
 ```output
 true
+false
+true
 1 [2, 3]
 ```
+
+This is the same reading a bracketed [type](types.md) has — the two are read by one grammar, so
+`type Pair = [string, integer]` is a pair wherever its name is written.
+
+**A `...` need not be named.** `[a, ...]` is *at least one element, and the rest are none of this
+pattern's business*; nothing may follow it, there being no end to count back from.
 
 ## Bindings
 

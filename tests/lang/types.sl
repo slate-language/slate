@@ -17,6 +17,8 @@ type Even = 0..<10 by 2
 // A generic type may stand for ANY type expression and not only for an object, so these are the four
 // other shapes a substitution has to reach into.
 type Twin[T] = [T, T]
+type Coord = [string, integer]
+type Opened = [string, ...]
 type Answer[T] = { ok: true, value: T } | { ok: false, error: string }
 type Bag[T] = array of T
 type Wrap[T] = (T) -> T
@@ -190,6 +192,10 @@ a_generic_type_stands_for_any_shape_and_not_only_for_an_object() =
     assert(!(["a", "b"] is Twin[integer]))
     assert(!([1] is Twin[integer]))
 
+    // The count is part of the shape, so a THIRD element misses the same way a wrong one does --
+    // which is what makes `Twin` read as a pair rather than as a floor of two.
+    assert(!([1, 2, 3] is Twin[integer]))
+
     assert({ ok: true, value: "x" } is Answer[string])
     assert(!({ ok: true, value: 1 } is Answer[string]))
     assert({ ok: false, error: "e" } is Answer[string])
@@ -271,3 +277,111 @@ takes_an_optional_field_written_in_the_annotation() =
     assertEq(Aged.mismatch({ name: "a", age: "x" })[0].path, "age")
 
 aged(p: { name: string, age?: integer }) = p.name
+
+@test
+a_bracketed_annotation_is_exactly_as_long_as_it_says() =
+    // A bracketed shape says HOW MANY, so a surplus element misses the same way a wrong one does.
+    // The value goes through `anything` so the check under test is the machine's, at the spot the
+    // value arrives.
+    assertEq(coord(anything(["a", 2])), ["a", 2])
+
+    val tooLong = (coord(anything(["a", 2, 3]))) catch e -> e.message
+
+    assert(tooLong.contains("was declared [string, integer]"))
+    assert(tooLong.contains("[\"a\", 2, 3]"))
+
+    val tooShort = (coord(anything(["a"]))) catch e -> e.message
+
+    assert(tooShort.contains("was declared [string, integer]"))
+
+    // A `...` is what opens it, and the elements written before one are still checked.
+    assertEq(opened(anything(["a", 2, 3, 4])), ["a", 2, 3, 4])
+    assertEq(opened(anything(["a"])), ["a"])
+
+    val notEvenOne = (opened(anything([]))) catch e -> e.message
+
+    assert(notEvenOne.contains("was declared [string, ...]"))
+
+@test
+a_bracketed_shape_counts_the_same_in_every_position() =
+    // An annotation, an `is` test, a `match` arm, a destructuring binding and a `for` head are one
+    // grammar read in two positions, so none of them may disagree about the length.
+    assert(["a", 2] is Coord)
+    assert(!(["a", 2, 3] is Coord))
+
+    // A name a `type` declared carries the count with it, and a bracketed shape written at the spot
+    // says the same thing -- the declaration is the very pattern the brackets are.
+    assert(["a", 2] is [string, integer])
+    assert(!(["a", 2, 3] is [string, integer]))
+
+    named(v) = v match
+        Coord -> "a coord"
+        _     -> "not a coord"
+
+    assertEq(named(["a", 2]), "a coord")
+    assertEq(named(["a", 2, 3]), "not a coord")
+
+    bare(v) = v match
+        [string, integer] -> "a pair"
+        _                 -> "not a pair"
+
+    assertEq(bare(["a", 2]), "a pair")
+    assertEq(bare(["a", 2, 3]), "not a pair")
+
+    // A binding has no next arm to try, so a surplus element is a FAULT rather than a miss. What
+    // each back end says about it is its own sentence, so what is asserted here is that both
+    // refuse; the interpreter's wording is pinned in `tests_pattern.sysl`.
+    val [first, second] = ["a", 2]
+
+    assertEq(first, "a")
+    assertEq(second, 2)
+
+    assertEq(unpackedTwo(anything(["a", 2])), ["a", 2])
+    assertEq((unpackedTwo(anything(["a", 2, 3]))) catch e -> "refused", "refused")
+
+    // A `for` head is a binding once per row, and counts the same way.
+    assertEq(overRows(anything([["a", 1], ["b", 2]])), 2)
+    assertEq((overRows(anything([["a", 1, 9]]))) catch e -> "refused", "refused")
+
+    // And a rest opens every one of them alike.
+    val [head, ...rest] = ["a", 2, 3]
+
+    assertEq(head, "a")
+    assertEq(rest, [2, 3])
+
+@test
+mismatch_on_a_bracketed_type_reports_the_LENGTH_and_not_the_elements() =
+    // The length is reported OR the elements are, never both: an array of the wrong length has
+    // nothing useful to say about element three.
+    assert(Coord.test(["a", 2]))
+    assert(!Coord.test(["a", 2, 3]))
+
+    assertEq(Coord.mismatch(["a", 2]).length, 0)
+    assertEq(Coord.mismatch(["a", 2, 3]).length, 1)
+    assertEq(Coord.mismatch(["a", 2, 3])[0].wanted, "[string, integer]")
+    assertEq(Coord.mismatch(["a", 2, 3])[0].got, "an array of 3")
+
+    // A RIGHT-length array that does not fit is reported per element, which is the other half of
+    // that rule.
+    assertEq(Coord.mismatch(["a", "b"]).length, 1)
+    assertEq(Coord.mismatch(["a", "b"])[0].path, "1")
+
+    // An open shape counts the elements it writes as a floor, so a longer array is no reason at all.
+    assertEq(Opened.mismatch(["a", 2, 3]).length, 0)
+    assertEq(Opened.mismatch([]).length, 1)
+
+coord(p: [string, integer]) = p
+opened(p: [string, ...]) = p
+
+unpackedTwo(xs) =
+    val [a, b] = xs
+
+    [a, b]
+
+overRows(rows) =
+    var n = 0
+
+    for [k, v] in rows
+        n = n + 1
+
+    n
