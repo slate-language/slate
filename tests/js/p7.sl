@@ -71,10 +71,12 @@ async refused()
 async settled()
     print(await resolve(7))
 
+    // **A rejection carries what it was given**, exactly as a `throw` does: a string is a sentence
+    // and anything else is the value a `catch` clause can sort on.
     val said = try
         await reject(42)
     catch e
-        e.message
+        string(e)
 
     print(said)
 

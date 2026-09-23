@@ -206,12 +206,26 @@ proto_is_an_ordinary_field_and_is_not_hidden() =
     assertEq(string(o), "{n: 1, proto: {m: 2}}")
 
 @test
-the_optional_link_guards_its_own_link_and_not_the_rest_of_the_chain() =
-    val o = { a: { b: 1 } }
+an_optional_link_guards_the_whole_chain_after_it() =
+    val o = { a: { b: { c: 1 } } }
     val nothing = { }
 
-    assertEq(o.a?.b, 1)
+    assertEq(o.a?.b.c, 1)
     assertEq(nothing.a?.b ?? "none", "none")
+
+    // The whole run of links after the guard is skipped, however long it is, and the answer is null.
+    assertEq(nothing.a?.b.c.d ?? "none", "none")
+
+@test
+a_chain_guards_the_ABSENCE_IT_WAS_WRITTEN_ABOUT_and_no_other() =
+    // A link AFTER the guard that finds a nullish value of its own faults there, exactly as it would
+    // with no `?.` in the line. `a?.b?.c` is what says both may be missing.
+    opaque(v) = v
+
+    val a = opaque({ b: null })
+
+    assertFaults(() -> a?.b.c, "there is nothing here to read `c` from")
+    assertEq(a?.b?.c ?? "none", "none")
 
 @test
 a_guarded_index_and_a_guarded_call_answer_for_an_absent_left() =
@@ -269,6 +283,78 @@ the_three_guarded_links_chain_when_each_one_says_so() =
     assertEq(a?.b?.[0]?.c, 7)
     assertEq(a?.b?.[0]?.go?.(), 5)
     assertEq(gone.b?.[0]?.c ?? "none", "none")
+
+@test
+ONE_guard_carries_every_kind_of_link_that_follows_it() =
+    val a = { b: [{ c: 7, go: () -> 5 }], f: () -> ({ g: 9 }), m: (self) -> 11 }
+    val gone = null
+
+    // A field, an index, a call and a method call all join the chain the first `?.` opened.
+    assertEq(a?.b[0].c, 7)
+    assertEq(a?.f().g, 9)
+    assertEq(a?.b[0].go(), 5)
+    assertEq(a?.m(), 11)
+
+    assertEq(gone?.b[0].c ?? "none", "none")
+    assertEq(gone?.f().g ?? "none", "none")
+    assertEq(gone?.[0].x ?? "none", "none")
+    assertEq(gone?.().y ?? "none", "none")
+
+@test
+a_chain_that_short_circuits_works_out_NOTHING_further_along_it() =
+    var calls = 0
+
+    bump() =
+        calls += 1
+        0
+
+    val gone = null
+
+    // Neither the key nor the argument nor the call is reached.
+    assertEq(gone?.b[bump()].c(bump()) ?? "none", "none")
+    assertEq(calls, 0)
+
+    val here = { b: [{ c: n -> n + 1 }] }
+
+    assertEq(here?.b[bump()].c(bump()), 1)
+    assertEq(calls, 2)
+
+@test
+BRACKETS_END_A_CHAIN_and_the_link_after_them_asks_the_guarded_answer() =
+    // `(a?.b)` is a chain that is over, so `.c` is asked of the null it answered -- which is
+    // JavaScript's rule, and the reason the brackets have to be written down at all.
+    opaque(v) = v
+
+    val gone = opaque(null)
+
+    assertFaults(() -> (gone?.b).c, "there is nothing here to read `c` from")
+
+    val a = opaque({ b: { c: 3 } })
+
+    assertEq((a?.b).c, 3)
+
+@test
+a_chain_inside_a_chains_KEY_is_a_chain_of_its_own() =
+    val gone = null
+    val keys = { at: 0 }
+    val a = { rows: [10, 20] }
+
+    assertEq(a?.rows[gone?.n ?? 1], 20)
+    assertEq(a?.rows[keys?.at], 10)
+
+@test
+a_chain_may_be_the_receiver_of_a_method_and_the_left_of_an_operator() =
+    val P = { twice: (self, x) -> x * 2 }
+    val a = { o: { n: 1, proto: P } }
+    val gone = null
+
+    assertEq(a?.o.twice(4), 8)
+    assertEq(gone?.o.twice(4) ?? "none", "none")
+
+    // `with` and `is` read what the chain answered.
+    assertEq((a?.o.proto with { }) == { twice: P.twice }, true)
+    assert(a?.o is object)
+    assert(!(gone?.o is object))
 
 @test
 a_guarded_receiver_makes_the_method_call_or_answers_nothing() =
