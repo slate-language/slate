@@ -92,6 +92,37 @@ difference matters, `has` is what draws it.
 
 `o with { f: v }` answers a **copy** with `f` changed. There is no spread in a literal — `with` is it.
 
+**The braces after `with` are read exactly as a literal's are, shorthand and all**, so `o with { x }` is
+`o with { x: x }` and a keyword, a quoted key and a `name?` each say what to write instead there too:
+
+```slate
+val x = 1
+val y = 2
+val base = { a: 9, x: 0 }
+
+print(base with { x })
+print(base with { x, y })
+print(base with { x, y: 7 })
+print(base)
+```
+
+```output
+{a: 9, x: 1}
+{a: 9, x: 1, y: 2}
+{a: 9, x: 1, y: 7}
+{a: 9, x: 0}
+```
+
+```slate
+val o = { a: 1 }
+
+print(o with { if })
+```
+
+```error
+is a word the grammar has taken
+```
+
 ## `freeze` and `isFrozen`
 
 **`freeze(v)` closes a value to writing and answers the very value it was given.** Reads are
