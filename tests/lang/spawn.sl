@@ -303,3 +303,13 @@ async A_MESSAGE_SENT_JUST_BEFORE_EXIT_IS_DELIVERED_BEFORE_exited_SETTLES()
         await worker.exited
 
         assertEq(got, "ping")
+
+@test
+async A_SIGPIPE_DOES_NOT_END_THE_PROGRAM()
+    // **A write to a peer that has gone is an error the write answers**, which is node's rule and
+    // slate's on both hosts. What finds it in the wild is a race -- a supervisor writing to a worker
+    // in the instant after the worker exits -- so the signal is sent here on purpose instead, and a
+    // host that left its default in place dies on this line every time rather than once in sixty.
+    await spawn("/bin/sh", ["-c", "kill -PIPE $PPID"]).value.exited
+
+    assert(true)

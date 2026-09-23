@@ -13,7 +13,7 @@ die "usage: alternate.pl <rounds> <control> <branch>\n" unless defined $branch;
 
 my $here = $RealBin;
 
-my @progs = sort map { m{/([^/]+)\.sl$}; $1 } glob("$here/*.sl");
+my @progs = sort grep { $_ ne 'profile' } map { m{/([^/]+)\.sl$}; $1 } glob("$here/*.sl");
 my (%a, %b);
 
 for my $round (1 .. $rounds) {
