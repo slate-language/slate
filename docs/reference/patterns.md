@@ -372,3 +372,38 @@ false
 
 **Nothing of a type's structure exists at run time**, so a type costs no instruction. A type may not
 bind a name — `type Tagged = { x: n }` is refused — for the reason `|` may not.
+
+**A [generic type](types.md#type-parameters) is written here with the types it is given**, and the
+substitution happens where the arm is written — so the pattern that runs is the ordinary one for the
+shape that came out:
+
+```slate
+type Pair[T] = [T, T]
+
+sort(v) = v match
+    Pair[integer] -> "two integers"
+    Pair[string]  -> "two strings"
+    _             -> "something else"
+
+print(sort([1, 2]), sort(["a", "b"]), sort([1, "a"]))
+```
+
+```output
+two integers two strings something else
+```
+
+**A type PARAMETER is a different thing and cannot be tested against.** It is erased, so `v is T`
+would be a bare name binding the value and matching everything — a test the reader believes and does
+not get — and it is refused where it is written instead:
+
+```slate
+only[T](v) = v match
+    T -> "yes"
+    _ -> "no"
+
+print(only(1))
+```
+
+```error
+`T` is a type parameter, and a type parameter is not there at run time
+```

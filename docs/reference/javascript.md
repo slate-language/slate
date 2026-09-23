@@ -661,6 +661,18 @@ the same on both hosts — a JavaScript function could otherwise read the extras
 the timers all go through that path, so `on(node, "click", () -> …)` is what a page writes and what
 it has always written.
 
+### A second `next` on an `async` generator is refused there and QUEUED here
+
+An [`async` generator](asynchrony.md#async-generators) is emitted as an `async function*`, so its
+steps are the host's own — and JavaScript **queues** a `next` asked while the last one is still
+waiting, serving them in order. The interpreter refuses the second one by name, two promises
+entitled to the generator's next value having no rule for which gets it.
+
+So a program that drives one with `for await`, or that awaits each step before asking for the next,
+behaves identically on both; a program that asks for two at once is the one place they differ. That
+is the shape of difference a host's own construct brings with it, and closing it would mean writing
+out a queue here to make the fast path slower on both.
+
 ### A diagnostic about a function names it, and the emitter says what to call it
 
 `` `Counter` takes 0 arguments and was given 1 `` rather than *"this function"*. The caret is on the

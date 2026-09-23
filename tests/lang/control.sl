@@ -500,6 +500,137 @@ async a_for_await_walks_a_source_whose_next_answers_a_promise() =
     assertEq(seen, [10, 20, 30])
 
 @test
+async AN_ASYNC_BODY_THAT_YIELDS_IS_A_GENERATOR_WHOSE_STEPS_ANSWER_PROMISES() =
+    // A body that is both `async` and holds a `yield` produces a source: calling it runs nothing
+    // and answers a generator, and `next()` on that answers a promise of `{ value, done }` --
+    // which is the shape `for await` was already written against.
+    async ticks(n)
+        var i = 0
+
+        while i < n
+            await sleep(1)
+
+            yield i * 10
+
+            i = i + 1
+
+    var seen = []
+
+    for await v in ticks(3)
+        push(seen, v)
+
+    assertEq(seen, [0, 10, 20])
+
+@test
+async AN_ASYNC_GENERATOR_STEPPED_BY_HAND_HANDS_BACK_A_PROMISE_EACH_TIME() =
+    async two()
+        await sleep(1)
+
+        yield "a"
+
+        yield "b"
+
+        "end"
+
+    val g = two()
+    val first = g.next()
+
+    assert(first is promise)
+
+    assertEq((await first).value, "a")
+    assertEq((await g.next()).value, "b")
+
+    // **What the body answered is the value on the last step**, exactly as a plain generator's is.
+    val last = await g.next()
+
+    assertEq(last.value, "end")
+    assert(last.done)
+
+    // And a finished one goes on answering, in the same shape.
+    val after = await g.next()
+
+    assertEq(after.value, null)
+    assert(after.done)
+
+@test
+async A_VALUE_SENT_INTO_AN_ASYNC_GENERATOR_IS_WHAT_ITS_yield_ANSWERS() =
+    async echoer()
+        val got = yield 1
+
+        await sleep(1)
+
+        yield got * 10
+
+    val e = echoer()
+
+    assertEq((await e.next()).value, 1)
+    assertEq((await e.next(5)).value, 50)
+
+@test
+async A_FAULT_INSIDE_AN_ASYNC_GENERATOR_REJECTS_THE_next_THAT_IS_WAITING() =
+    async breaks()
+        yield 1
+
+        await sleep(1)
+
+        throw "gone wrong"
+
+    val g = breaks()
+
+    assertEq((await g.next()).value, 1)
+    assertEq((await g.next()) catch e -> e.message, "gone wrong")
+
+    // **A faulted generator is finished**, so the step after it says so rather than faulting again.
+    assert((await g.next()).done)
+
+@test
+async AN_ASYNC_GENERATOR_IS_NOT_SOMETHING_A_PLAIN_for_CAN_WALK() =
+    async ticks()
+        await sleep(1)
+
+        yield 1
+
+    val said = try
+        for x in ticks()
+            print(x)
+
+        "walked"
+    catch e
+        e.message
+
+    assertEq(said, "an `async` generator's values arrive one promise at a time -- `for await` is the only way to walk one")
+
+    // The same sentence for a walk that materialises rather than steps.
+    val spread = try
+        [...ticks()]
+    catch e
+        e.message
+
+    assertEq(spread, "an `async` generator's values arrive one promise at a time -- `for await` is the only way to walk one")
+
+@test
+A_PLAIN_GENERATOR_IS_UNTOUCHED_BY_ANY_OF_IT() =
+    // **The control.** Nothing about a generator with no `async` on it changed: it is driven on the
+    // caller's own turn, answers the pair outright rather than a promise, and a `for` walks it.
+    twoOf()
+        yield 1
+        yield 2
+
+    val g = twoOf()
+    val step = g.next()
+
+    assert(!(step is promise))
+    assertEq(step.value, 1)
+    assertEq(array(twoOf()), [1, 2])
+
+    var seen = []
+
+    for x in twoOf()
+        push(seen, x)
+
+    assertEq(seen, [1, 2])
+
+@test
 async a_for_await_breaks_with_a_value_and_takes_an_else() =
     counted(n)
         var i = 0
