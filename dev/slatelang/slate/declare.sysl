@@ -77,6 +77,11 @@ private struct ClassBody
     inits: Buf[Expr]
     has_init: Buf[bool]
 
+    // The `CheckType` a field's annotation turned into, in step with `fields`, and `None` where the
+    // field was written without one. **A field is a binding site like any `var`**, so `var n: integer`
+    // is checked where the value arrives -- at the constructor, which is where the object is made.
+    field_checks: Buf[Option[Stmt]]
+
     // The fields the constructor fills, in the order it takes them -- which is what a pattern takes
     // apart, and `ctor_positional` is whether it may do so by position.
     //
@@ -156,7 +161,7 @@ private class_shaped(p: *Parser, public: bool, actor: bool) -> Stmt
 
     val name = parse_name(p, s"a name for the ${what}")
 
-    var b = ClassBody(buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), false,start, buf(), buf(), buf(), 0, false, buf())
+    var b = ClassBody(buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), false,start, buf(), buf(), buf(), 0, false, buf())
 
     // **`from` takes an EXPRESSION rather than a name**, because the field it becomes takes one: a
     // base may arrive under an import alias, out of a module object, or be chosen at run time. The
@@ -445,6 +450,7 @@ private one_member(p: *Parser, what: string, cls: string, b: *ClassBody, fields_
         val name_at = p.here()
         val fname = parse_name(p, "a name for the field")
         val named = name_at.to(p.just_taken())
+        val check = field_annotation(p, fname)
         val init = if p.accept(Assign) then Some(parse_body(p)) else None
 
         if proto_member(p, what, cls, fname, named) then return
@@ -454,7 +460,7 @@ private one_member(p: *Parser, what: string, cls: string, b: *ClassBody, fields_
             return
         end if
 
-        declare_field(b, fname, named, init)
+        declare_field(b, fname, named, init, check)
         return
     end if
 
@@ -464,10 +470,16 @@ private one_member(p: *Parser, what: string, cls: string, b: *ClassBody, fields_
         val name_at = p.here()
         val vname = parse_name(p, "a name for the member")
         val named = name_at.to(p.just_taken())
+        val check = field_annotation(p, vname)
 
         p.expect(Assign, "`=` and a value")
 
-        val value = parse_body(p)
+        val written = parse_body(p)
+
+        // An annotated `val` is checked where the class is made, which is where its one value is.
+        val value = check match
+            Some(c) -> checked_value(vname, written, c)
+            None -> written
 
         // **`from` and a `val proto` are the same field, so that pairing keeps its own sentence** --
         // the reader wrote the mechanism twice rather than mistaking it for a name they could have.
@@ -483,7 +495,7 @@ private one_member(p: *Parser, what: string, cls: string, b: *ClassBody, fields_
         // into by all of them at once -- which is what a reader coming from TypeScript, where `items =
         // []` is per-instance, will least expect. Refusing only a LITERAL is deliberate: a shared
         // object bound outside the class and named here is sharing somebody asked for.
-        *value.kind match
+        *written.kind match
             ArrayLit(_) -> shared_mutable(p, cls, vname, named)
             ArrayRepeat(_, _) -> shared_mutable(p, cls, vname, named)
             ObjectLit(_, _, _) -> shared_mutable(p, cls, vname, named)
@@ -584,7 +596,7 @@ private one_member(p: *Parser, what: string, cls: string, b: *ClassBody, fields_
                     else if property_taken(b, params.at(i))
                         p.fault(s.span, s"`${params.at(i)}` is given twice in ${what} `${cls}`")
                     else
-                        declare_field(b, params.at(i), s.span, None)
+                        declare_field(b, params.at(i), s.span, None, None)
         _ -> ()
 end one_member
 
@@ -661,9 +673,10 @@ private has_member(b: *ClassBody, name: string) -> bool
     false
 end has_member
 
-private declare_field(b: *ClassBody, name: string, at: Span, init: Option[Expr])
+private declare_field(b: *ClassBody, name: string, at: Span, init: Option[Expr], check: Option[Stmt])
     b.fields.push(name)
     b.field_spans.push(at)
+    b.field_checks.push(check)
 
     init match
         Some(e) ->
@@ -673,6 +686,37 @@ private declare_field(b: *ClassBody, name: string, at: Span, init: Option[Expr])
             b.inits.push(expr(at, NullLit))
             b.has_init.push(false)
 end declare_field
+
+// `: T` after a field's name or a class `val`'s, read into the `CheckType` a local's annotation turns
+// into -- the same grammar, the same node, and so the same check on both back ends.
+private field_annotation(p: *Parser, name: string) -> Option[Stmt]
+    if !p.accept(Colon) then return None
+
+    val tat = p.here()
+    val tpat = parse_type(p)
+    val said = tat.to(p.just_taken())
+
+    Some(stmt(said, CheckType(name, p.text(said), tpat)))
+end field_annotation
+
+// A value bound under `name` in a block of its own, checked there, and answered.
+//
+// **The binding and its check travel as a `Group`, which is exactly what `val x: T = e` is**, so the
+// checker compares a literal against the annotation as it does for any annotated binding, and the
+// machine tests the value one instruction later. The block's scope ends with it, so the name shadows
+// nothing a constructor's body or a method reads.
+private checked_value(name: string, value: Expr, check: Stmt) -> Expr
+    var pair: Buf[Stmt] = buf()
+
+    pair.push(stmt(value.span, Val(name, value)))
+    pair.push(check)
+
+    var stmts: Buf[Stmt] = buf()
+
+    stmts.push(stmt(value.span, Group(pair)))
+    stmts.push(stmt(value.span, Eval(expr(value.span, Name(name)))))
+    expr(value.span, Block(stmts))
+end checked_value
 
 // Whether a member is trying to take `proto`, and the sentence where it is.
 //
@@ -727,7 +771,12 @@ private instance_of(cls: string, b: *ClassBody, assigned: Buf[string], at: Span,
         elif b.has_init.at(i)
             keys.push(f)
             key_spans.push(b.field_spans.at(i))
-            values.push(b.inits.at(i))
+
+            // A field a written `new` does not take is filled from its initialiser, and an annotated
+            // one is checked there -- a taken one is a parameter, which checks its own.
+            values.push(b.field_checks.at(i) match
+                Some(c) -> checked_value(f, b.inits.at(i), c)
+                None -> b.inits.at(i))
 
     keys.push("proto")
     key_spans.push(at)
@@ -777,7 +826,17 @@ private make_constructor(p: *Parser, cls: string, b: *ClassBody, at: Span, seal:
         b.ctor_fields = params
         b.ctor_positional = true
 
-        add_maker(b, at, params, expr(at, Lambda(params, defaults, intern_body(instance_of(cls, b, params, at, seal), false), false)))
+        // **An annotated field is an annotated PARAMETER here**, its check at the top of the body
+        // exactly where `new(n: integer)` would have put it -- so a default is checked too, being
+        // bound before the body runs.
+        var checks: Buf[Stmt] = buf()
+
+        for i in 0..<b.fields.len()
+            b.field_checks.at(i) match
+                Some(c) -> checks.push(c)
+                None -> ()
+
+        add_maker(b, at, params, expr(at, Lambda(params, defaults, intern_body(with_checks(checks, instance_of(cls, b, params, at, seal)), false), false)))
         return
     end if
 
@@ -919,7 +978,7 @@ parse_data_decl(p: *Parser, public: bool) -> Stmt
     if p.at(Ident) && p.text(p.here()) == "from"
         p.fault(p.here(), s"a data type has no `from` -- it IS the base its variants descend from, and each of them has `${name}` as its `proto` already")
 
-    var shared = ClassBody(buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), false,start, buf(), buf(), buf(), 0, false, buf())
+    var shared = ClassBody(buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), false,start, buf(), buf(), buf(), 0, false, buf())
     var d = DataBody(buf(), buf(), buf())
 
     if p.at(Indent) then data_members(p, name, &shared, &d, public)
@@ -1001,7 +1060,7 @@ private one_variant(p: *Parser, data: string, d: *DataBody, public: bool)
         return
     end if
 
-    var vb = ClassBody(buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), false,named, buf(), buf(), buf(), 0, false, buf())
+    var vb = ClassBody(buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), false,named, buf(), buf(), buf(), 0, false, buf())
 
     vb.keys.push("proto")
     vb.key_spans.push(named)
@@ -1036,9 +1095,13 @@ private one_variant(p: *Parser, data: string, d: *DataBody, public: bool)
                     // A field may carry a default, which is the generated constructor's default:
                     // the same expression, worked out at the call, for the same reason a class's
                     // initialiser is.
+                    //
+                    // And a type, `Circle(r: real)`, which is the annotation a parameter takes and
+                    // is checked where one is: at the top of the constructor.
+                    val check = field_annotation(p, fname)
                     val init = if p.accept(Assign) then Some(parse_body(p)) else None
 
-                    declare_field(&vb, fname, fnamed, init)
+                    declare_field(&vb, fname, fnamed, init, check)
 
                 if !p.accept(Comma) then break
 

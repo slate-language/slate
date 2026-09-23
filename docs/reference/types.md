@@ -504,6 +504,48 @@ n = "later"
 An **unannotated** `var` is left as it always was — the union of its initialiser and every value ever
 assigned to it — so a program that deliberately reuses a name for another kind is untouched.
 
+### A field
+
+**A class's `var` and `val` and a data variant's field are bindings too**, and take every annotation a
+binding does. The check is made where the object is: the generated constructor tests each annotated
+field as it would an annotated parameter, and an assignment to one on an object whose class is beyond
+doubt is held to it as an annotated `var`'s is. [Classes](classes.md) and [data types](data-types.md)
+have the rest.
+
+```slate
+class Account
+    var owner: { name: string }
+    var balance: integer = 0
+    var audit: (integer) -> boolean = n -> n >= 0
+
+data Entry
+    Deposit(amount: integer)
+    Note(text: string)
+
+val a = Account({ name: "ada" })
+
+a.balance = 5
+
+print(a.owner.name, a.balance, a.audit(a.balance), Deposit(3).amount)
+```
+
+```output
+ada 5 true 3
+```
+
+```slate
+class Account
+    var balance: integer = 0
+
+val a = Account()
+
+a.balance = 2.5
+```
+
+```error
+`balance` on `Account` was declared integer, and this is real
+```
+
 ### An object literal written where a shape is expected
 
 **A shape asks for *at least* its fields — except of a literal written at the spot, which may carry
