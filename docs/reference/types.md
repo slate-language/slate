@@ -574,6 +574,46 @@ print(widen("abcd"), widen(3))
 4 6
 ```
 
+**A FIELD TESTED AGAINST A LITERAL NARROWS THE NAME IT IS READ OFF.** Where the alternatives of a
+union disagree at one field — and the field is written as a *literal* in each of them — testing that
+field says which alternative the value is. This is the shape every result in slate has, so it is the
+narrowing a program meets most often:
+
+```slate
+type Read = { ok: true, value: string } | { ok: false, error: string }
+
+shout(s: string) = upper(s) + "!"
+
+report(r: Read) = if r.ok then shout(r.value) else "(" + r.error + ")"
+
+print(report({ ok: true, value: "hi" }), report({ ok: false, error: "gone" }))
+```
+
+```output
+HI! (gone)
+```
+
+The discriminating field may be a boolean, a string or a whole number, and the test may be `==`, `!=`,
+a bare read for its truth, or any of those under `&&`, `||` and `!`:
+
+```slate
+type Answer = { kind: "text", body: string } | { kind: "count", n: integer }
+
+says(a: Answer) = if a.kind == "text" then a.body else string(a.n * 2)
+
+print(says({ kind: "text", body: "hi" }), says({ kind: "count", n: 21 }))
+```
+
+```output
+hi 42
+```
+
+**It says nothing wherever it cannot be sure**, which is the rule every other narrowing follows. A
+field whose type is the bare word `boolean` rather than `true` decides nothing; an alternative that
+does not name the field at all is kept on both sides, an object pattern matching on the fields it
+names and ignoring the rest; an optional field is kept for the same reason, the value being free not
+to have it. And a `var` is left alone here exactly as it is everywhere else.
+
 A comparison with `null` narrows the same way, and it is how most of the standard library is guarded —
 `indexOf` answers `integer | null`, so the else branch of the test is where the integer is:
 

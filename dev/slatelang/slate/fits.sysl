@@ -35,6 +35,20 @@ import sysl.buf.{Buf, buf}
 // unknown in the walk becomes `Any`, so this is what keeps the pass from reporting a program it
 // merely failed to understand.
 fits(got: Type, want: Type) -> bool
+    // **A LITERAL TYPE IS ITS BASE TYPE HERE, AND THAT IS NOT A HOLE EITHER.** `{ ok: true }` is an
+    // annotation the machine tests as a pattern where the value arrives and never again, so an
+    // object whose `ok` is some other boolean may be assigned to a name holding one a line later --
+    // and a lattice that refused it would be refusing a program that runs. What the literal is FOR
+    // is deciding which alternative of a union a branch is in, which is `narrow_by`'s question and
+    // is not asked here.
+    *got.kind match
+        Literally(of, _) -> return fits(of, want)
+        _ -> ()
+
+    *want.kind match
+        Literally(of, _) -> return fits(got, of)
+        _ -> ()
+
     *want.kind match
         Any -> return true
         _ -> ()
@@ -283,6 +297,17 @@ struct TypeEnv
     // dies with the scope that made it, exactly as a narrowing always has.
     tracked: Buf[bool]
 
+    // Whether an object SHAPE recorded for this name may be believed.
+    //
+    // **`unshaped` is the default and this is the proof that lifts it.** A shape carried through a
+    // name goes stale the moment a field is written or the object reaches a second holder, and a
+    // stale shape is too narrow -- which refuses a program that runs. `flow.sysl`'s `shape_survives`
+    // answers the question for a whole block at once: a name never mentioned except to read a field
+    // off it cannot have been handed anywhere and has no field written to it. Where it says yes, the
+    // shape an ANNOTATION gives is kept as well as the one a literal gives, which is what lets a
+    // narrowed union alternative say what its fields are.
+    shaped: Buf[bool]
+
     // **It travels BESIDE `types` rather than in a table of its own**, so leaving a scope drops it
     // and an inner binding shadows an outer one — both of which a separate table would have had to be
     // taught, and getting either wrong would refuse a program that runs.
@@ -300,7 +325,7 @@ struct TypeEnv
     test_marks: Buf[usize]
 end TypeEnv
 
-type_env() -> TypeEnv = TypeEnv(buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf())
+type_env() -> TypeEnv = TypeEnv(buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf())
 
 enter_scope(e: *TypeEnv)
     e.marks.push(e.names.len())
@@ -334,6 +359,7 @@ private drop_scope(e: *TypeEnv, carry: bool, widen: bool)
             e.settled.truncate(mark)
             e.flowed.truncate(mark)
             e.tracked.truncate(mark)
+            e.shaped.truncate(mark)
             e.bound.truncate(mark)
 
             for i in 0..<out_names.len()
@@ -396,7 +422,30 @@ note_type(e: *TypeEnv, name: string, t: Type)
 // have been handed anywhere, so nothing outside the block that declared it holds the object -- and
 // no field of it is ever written, so the shape it was built with is the shape it dies with.
 note_shaped(e: *TypeEnv, name: string, t: Type)
-    push_entry(e, name, t, t, true, false, false)
+    push_entry(e, name, t, t, true, false, false, true)
+
+// The same proof, over a name whose type came from somewhere other than an object literal.
+//
+// **Written over the entry the note above just pushed**, which is `note_bound`'s arrangement and is
+// here for its reason: every way of putting a name into the scope goes through one of the notes, and
+// this is the one line that says the shape may be believed. What it buys is the ANNOTATED binding --
+// `val r: Result = fetch(…)` is a union of shapes the walk cannot read off the initialiser, and
+// without this the narrowing below could say which alternative `r` is and not what its fields are.
+keep_shape(e: *TypeEnv)
+    if e.shaped.len() != 0 then e.shaped.set(e.shaped.len() - 1, true)
+
+// Whether an object shape recorded for this name may be believed, walked backwards so the innermost
+// binding answers.
+is_shape_kept(e: *TypeEnv, name: string) -> bool
+    var i = e.names.len()
+
+    loop
+        if i == 0 then return false
+
+        i -= 1
+
+        if e.names.at(i) == name then return e.shaped.at(i)
+end is_shape_kept
 
 // The same, over a name the environment already has: what a DECLARATION says it is.
 //
@@ -408,12 +457,19 @@ note_shaped(e: *TypeEnv, name: string, t: Type)
 // scope before the body is entered and then met a second time as the `CheckType` the parser left at
 // the top of it -- so a re-note that dropped the flag would untrack every parameter the moment its
 // own annotation was walked, and an assignment below a narrowing would leave the narrowing standing.
+//
+// **AND SO DOES THE SHAPE PROOF**, for the same reason read once more: the binding above said
+// whether anything in this block can make an object shape stale, and an annotation is the very type
+// that proof was wanted for. Dropping it here would unshape every annotated `val` the moment its own
+// `CheckType` was walked, which is exactly what used to happen.
 renote_declared(e: *TypeEnv, name: string, t: Type)
-    push_entry(e, name, unshaped(t), unshaped(t), !has_name(e, name) || may_narrow(e, name), false, is_tracked(e, name))
+    val kept = is_shape_kept(e, name)
+
+    push_entry(e, name, shaped_as(t, kept), shaped_as(t, kept), !has_name(e, name) || may_narrow(e, name), false, is_tracked(e, name), kept)
 
 // The same, saying whether the name may later be written to.
 note_binding(e: *TypeEnv, name: string, t: Type, settled: bool)
-    push_entry(e, name, unshaped(t), unshaped(t), settled, false, false)
+    push_entry(e, name, unshaped(t), unshaped(t), settled, false, false, false)
 
 // **AN ANNOTATED `var`, WHICH IS THE ONE NAME WHOSE TWO TYPES DIFFER.** `flow` is what it holds
 // where it was declared and `declared` is what it may ever hold; a read is checked against the
@@ -421,7 +477,7 @@ note_binding(e: *TypeEnv, name: string, t: Type, settled: bool)
 // assignment inside a branch is a flow note of its own, so nothing a branch does can leave a stale
 // claim behind it.
 note_var(e: *TypeEnv, name: string, flow: Type, declared: Type)
-    push_entry(e, name, unshaped(flow), unshaped(declared), true, false, true)
+    push_entry(e, name, unshaped(flow), unshaped(declared), true, false, true, false)
 
 // What a name holds AT THIS POINT: a narrowing, an assignment, or the join of the branches above.
 //
@@ -431,17 +487,23 @@ note_var(e: *TypeEnv, name: string, flow: Type, declared: Type)
 // program that runs.
 note_flow(e: *TypeEnv, name: string, t: Type)
     val b = bound_to(e, name)
+    val kept = is_shape_kept(e, name)
 
-    push_entry(e, name, unshaped(t), declared_of(e, name), may_narrow(e, name), true, is_tracked(e, name))
+    push_entry(e, name, shaped_as(t, kept), declared_of(e, name), may_narrow(e, name), true, is_tracked(e, name), kept)
     note_bound(e, b)
 
-private push_entry(e: *TypeEnv, name: string, t: Type, declared: Type, settled: bool, flowed: bool, tracked: bool)
+// A type as a note is allowed to record it: whole where the shape was proved, and `unshaped`
+// otherwise, which is what every note did before there was anything to prove.
+private shaped_as(t: Type, kept: bool) -> Type = if kept then t else unshaped(t)
+
+private push_entry(e: *TypeEnv, name: string, t: Type, declared: Type, settled: bool, flowed: bool, tracked: bool, shaped: bool)
     e.names.push(name)
     e.types.push(t)
     e.declared.push(declared)
     e.settled.push(settled)
     e.flowed.push(flowed)
     e.tracked.push(tracked)
+    e.shaped.push(shaped)
     e.bound.push(BoundPlain)
 
 // What the name just noted was BOUND to, where that is a class or one of its instances.
@@ -637,6 +699,21 @@ narrow_by(cond: Expr, want_true: bool, env: *TypeEnv)
                                     None -> ()
                         _ -> ()
 
+                // **AND A FIELD COMPARED WITH A LITERAL NARROWS THE NAME THE FIELD IS ON.** Either
+                // order, for the reason the null comparison reads both: only one side of
+                // `r.kind == "err"` is a literal and only one is a field, so asking each way round
+                // decides nothing.
+                val says = (op == EqEq) == want_true
+
+                narrow_field_compare(lhs, rhs, says, env)
+                narrow_field_compare(rhs, lhs, says, env)
+
+        // **A BARE FIELD READ IS A TRUTHINESS TEST**, which is how a result is asked about:
+        // `if r.ok` and `if !r.ok` are what a program writes where the discriminating field is a
+        // boolean, and slate's truthiness is TypeScript's.
+        Field(target, field, optional) ->
+            if !optional then narrow_field_test(target, field, want_true, None, env)
+
         // **`!c` is `c` with its two sides swapped**, so `if !(x is string) then a else b` narrows
         // in `b` exactly as `if x is not string` does. Written without this the two spellings of one
         // test did not mean the same thing.
@@ -644,6 +721,95 @@ narrow_by(cond: Expr, want_true: bool, env: *TypeEnv)
             if op == Bang then narrow_by(rhs, !want_true, env)
         _ -> ()
 end narrow_by
+
+// One side of a comparison read as a field and the other as the literal it is being held against.
+private narrow_field_compare(side: Expr, other: Expr, says: bool, env: *TypeEnv)
+    val text = expr_literal_text(other) match
+        Some(t) -> t
+        None -> return
+
+    *side.kind match
+        Field(target, field, optional) ->
+            if !optional then narrow_field_test(target, field, says, Some(text), env)
+        _ -> ()
+end narrow_field_compare
+
+// **A FIELD TESTED AGAINST A LITERAL NARROWS THE NAME IT IS READ OFF**, which is the discriminated
+// union a reader coming from TypeScript reaches for. Given
+// `{ ok: true, value: string } | { ok: false, error: string }`, `if r.ok` leaves `r` at the first
+// alternative and the else branch at the second -- and `{ ok, value }` results are the shape every
+// `fetch`, `readFile` and `parseJSON` in this language answers with.
+//
+// **IT IS SOUND BECAUSE THE FIELD IS A LITERAL TYPE.** An alternative whose `ok` is the literal
+// `false` cannot be what the value is in a branch that `r.ok` held in: a literal in an annotation is
+// a pattern the machine TESTED where the value arrived, which `{ ok: true, … } = { ok: false, … }`
+// being refused at run time is the proof of. An alternative this cannot judge -- one whose field is
+// an ordinary type, or which does not name the field at all, an object pattern being open -- is
+// KEPT on both sides, that being the direction which says less.
+//
+// `against` is the literal an `==` or `!=` named, or nothing for a bare truthiness test.
+private narrow_field_test(target: Expr, field: string, want: bool, against: Option[string], env: *TypeEnv)
+    val name = *target.kind match
+        Name(n) -> n
+        _ -> return
+
+    if !may_narrow(env, name) then return
+
+    val alts = *known_type(env, name).kind match
+        OneOf(xs) -> xs
+        _ -> return
+
+    var kept: Buf[Type] = buf()
+
+    for i in 0..<alts.len()
+        if field_may_be(alts.at(i), field, want, against) then kept.push(alts.at(i))
+
+    // **Nothing is claimed where nothing was ruled out, and nothing where EVERYTHING was.** The
+    // first is the union the name already had; the second describes a branch no run reaches, where a
+    // claim could only complain about code that never runs.
+    if kept.len() == alts.len() || kept.len() == 0 then return
+
+    note_flow(env, name, if kept.len() == 1 then kept.at(0) else type_of(OneOf(kept)))
+end narrow_field_test
+
+// Whether this alternative could be the value, given what the test said about one of its fields.
+private field_may_be(alt: Type, field: string, want: bool, against: Option[string]) -> bool
+    val lit = field_literal(alt, field) match
+        Some(text) -> text
+        None -> return true
+
+    against match
+        // `r.kind == "err"` keeps the alternatives whose literal IS that text on the true side, and
+        // the ones whose literal is anything else on the false side.
+        Some(text) -> (lit == text) == want
+
+        // A bare `r.ok` is a truthiness test, and slate's rule is TypeScript's: `false`, `0` and
+        // `""` are false, everything else true.
+        None -> literal_is_truthy(lit) == want
+end field_may_be
+
+// The literal a shape says one of its fields is, where it says so at all.
+//
+// **An optional field says nothing**, the value being free not to have it -- and absence is not
+// something this pass may argue from.
+private field_literal(t: Type, field: string) -> Option[string]
+    *t.kind match
+        ObjectWith(keys, values, optional) ->
+            for i in 0..<keys.len()
+                if keys.at(i) == field && !optional.at(i) then return literal_text(values.at(i))
+
+            None
+        _ -> None
+end field_literal
+
+// The canonical spelling of a literal written in the PROGRAM, which is what a field's literal type
+// is compared against. The two spellings are made by one pair of functions in `types.sysl`, so a
+// tested value and an annotated one cannot drift.
+private expr_literal_text(x: Expr) -> Option[string] = *x.kind match
+    BoolLit(v) -> Some(literal_spelling_of_bool(v))
+    IntLit(v) -> Some(literal_spelling_of_int(v))
+    StrLit(v) -> Some(literal_spelling_of_str(v))
+    _ -> None
 
 private is_null_literal(x: Expr) -> bool
     *x.kind match
