@@ -199,6 +199,35 @@ false
 **`=` is for a pattern that binds and `?` is for one that tests**, and each is refused where the other
 belongs.
 
+**The mark is the shape's and not the declaration's**, so it reads the same written straight into an
+annotation — at a parameter, at a binding, or anywhere else a type goes:
+
+```slate
+greet(person: { name: string, age?: integer }) =
+    if has(person, "age") then s"${person.name} (${person.age})" else person.name
+
+print(greet({ name: "ada" }), greet({ name: "grace", age: 36 }))
+```
+
+```output
+ada grace (36)
+```
+
+A field the value need not have is still a field the shape *knows*, which is what makes a misspelling
+of one catchable: an [object literal written at the spot](#an-object-literal-written-where-a-shape-is-expected)
+may carry only the fields the shape names, and an optional one it never had is exactly the case that
+would otherwise pass.
+
+```slate
+greet(person: { name: string, age?: integer }) = person.name
+
+print(greet({ name: "ada", aeg: 36 }))
+```
+
+```error
+`aeg` is not a field of { name: string, age?: integer }
+```
+
 A union may have `null` as an alternative, which is how a parameter says it will take nothing:
 
 ```slate
@@ -291,6 +320,38 @@ handed it expected, so a mismatch there is a complaint no run could make. Where 
 **At run time a function type asks what it can ask: is this callable, and would it take a call of this
 size.** What a function will *do* with what it is given is not a question about the value in front of
 you, which is why the parameters are the checker's business and the count is both.
+
+**A function type may be written over a [type parameter](#type-parameters) like any other type**, in a
+definition's own head or in a `type` of its own:
+
+```slate
+applyTo[T](f: (T) -> T, x: T) -> T = f(x)
+
+type Wrap[T] = (T) -> T
+
+val twice: Wrap[integer] = n -> n * 2
+
+print(applyTo(n -> n + 1, 41), applyTo(s -> upper(s), "hi"), twice(21))
+```
+
+```output
+42 HI 42
+```
+
+A callback declaring more parameters than the type says it is handed is refused where it is written,
+which is the arity half above reading through the substitution:
+
+```slate
+type Handler[T] = (T, integer) -> null
+
+each(xs: array of string, cb: Handler[string]) = cb(xs[0], 0)
+
+each(["a"], (s, i, extra) -> print(s))
+```
+
+```error
+`each` takes (string, integer) -> null here, and this is (any, any, any) -> any
+```
 
 ## Annotating
 
@@ -808,6 +869,31 @@ print({ first: "ada", second: "x" } is Pair[string, integer])
 ```output
 ada is 36
 false
+```
+
+**What it is generic over may stand anywhere in the type, not only at a field.** The declaration is an
+ordinary type expression with a name in it, so an array, a union, `array of T` and a function type are
+all things a generic type may be — and what comes out is substituted where the type is *used*, in an
+annotation, an `is` test or a [`match` arm](patterns.md#types-in-patterns) alike:
+
+```slate
+type Pair[T]   = [T, T]
+type Result[T] = { ok: true, value: T } | { ok: false, error: string }
+type Bag[T]    = array of T
+
+read(r: Result[string]) = r match
+    { ok: true, value }  -> value
+    { ok: false, error } -> s"!${error}"
+
+print([1, 2] is Pair[integer], ["a", "b"] is Pair[integer])
+print([1, 2, 3] is Bag[integer], [1, "a"] is Bag[integer])
+print(read({ ok: true, value: "hi" }), read({ ok: false, error: "no" }))
+```
+
+```output
+true false
+true false
+hi !no
 ```
 
 **A generic type used without its arguments is refused rather than quietly erased**, because a check
