@@ -1,0 +1,147 @@
+module dev.slatelang.slate
+@tests
+
+import sh.sysl.parsing.point
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// What a call and a return no longer pay for, and what that asks of the rest of the machine.
+//
+// **A FRAME HOLDS ITS CHUNK'S INSTRUCTIONS AS A `Code` -- AN ADDRESS AND A COUNT -- AND OWNS
+// NOTHING.** It used to hold a counted `Buf[Ins]`, so every call retained one into the frame it
+// pushed and every return released one out of the frame it popped. What keeps the instructions alive
+// now is the unit, which `vm.sysl` argues outlives every frame; these pin the three things that
+// argument rests on -- that every chunk ends in `Ret`, so the loop's one bound check is enough; that
+// frames standing through collections still run their own code when they are returned to; and that
+// a generator parked across collections comes back to its own.
+//
+// **The call's `undefined` refusal is pinned for each position an argument can be in, on both
+// in-place paths**, it being the check a cheaper call path is most tempted to thin out. **And the
+// mask `lay_standing` sets is one subtraction**, so the widest mask a slotted chunk can have --
+// sixty-four parameters -- is pinned beside the ordinary ones.
+
+// A heap small enough that a deep recursion collects many times while its frames stand, and the one
+// the rest of the suite runs against.
+private const Crowded: usize = 1048576
+private const Roomy: usize = 268435456
+
+// What a program printed, run against a heap that collects under it, the limit put back after.
+private out_crowded(text: string) -> string
+    set_heap_limit(Crowded)
+
+    val said = out(text)
+
+    set_heap_limit(Roomy)
+    said
+end out_crowded
+
+@test
+EVERY_CHUNK_THE_COMPILER_MAKES_ENDS_IN_A_RETURN()
+    // A function, a lambda, an empty body, a generator, an `async` function, a class and the file
+    // itself: the loop's only bound check is `pc` against the count, which is sound only if running
+    // off the end can never be the ordinary way out of a chunk.
+    val said = out("f() = {}\ng = x -> x\nh(n)\n    if n > 0 then return 1\n    2\ngen()\n    yield 1\nasync w() = 3\nclass P\n    x: integer\n    m(self) = self.x\nprint(h(0))")
+
+    assert_eq(said, "2")
+
+    val chunks = running_unit().chunks
+
+    assert(chunks.len() > 6, s"the program made only ${chunks.len()} chunks")
+
+    for i in 0..<chunks.len()
+        val code = chunks.at(i).code
+
+        assert(code.len() > 0, s"chunk `${chunks.at(i).name}` has no instructions")
+
+        code.at(code.len() - 1).op match
+            Ret -> ()
+            _ -> assert(false, s"chunk `${chunks.at(i).name}` does not end in `Ret`")
+
+@test
+A_VIEW_OF_A_CHUNKS_CODE_IS_ITS_STORAGE_AND_ITS_COUNT()
+    var code: Buf[Ins] = buf()
+
+    assert(code_view(code).ins == null, "an empty chunk has no first instruction")
+    assert_eq(code_view(code).len, 0)
+
+    code.push(Ins(Ret, point(0)))
+    code.push(Ins(Ret, point(3)))
+
+    val view = code_view(code)
+
+    assert_eq(view.len, 2)
+    assert(view.ins == &code.elems[0], "the view is the buffer's own storage and not a copy of it")
+    assert_eq(view.ins[1].at.start, 3)
+
+@test
+A_RECURSION_THAT_COLLECTS_ON_THE_WAY_DOWN_RETURNS_THROUGH_EVERY_FRAMES_OWN_CODE()
+    // Three functions calling one another, each allocating at every level, so the collector runs
+    // many times while hundreds of frames stand -- and each return has to resume the caller's
+    // instructions, which is only right if every frame's view of its code is still the code.
+    val before = current().collections
+    val said = out_crowded("a(n) = if n == 0 then 0 else { k: [n, n, n] }.k[0] - n + b(n - 1) + 1\nb(n) = if n == 0 then 0 else [n, n].length - 1 + c(n - 1)\nc(n) = if n == 0 then 0 else { v: n }.v * 0 + a(n - 1) + 2\nvar t = 0\nfor i in 0..<40\n    t = t + a(300)\nprint(t)")
+
+    // a, b and c each add 1 per level, so 300 levels add 400 in total per call.
+    assert_eq(said, "16000")
+    assert(current().collections > before, "the program was meant to collect while its frames stood")
+
+@test
+A_GENERATOR_PARKED_ACROSS_COLLECTIONS_RESUMES_ITS_OWN_CODE()
+    // The generator's frame is pushed by `start_generator` with a view of its chunk's code, and the
+    // machine is parked -- off the running one -- while the program allocates between steps.
+    val said = out_crowded("inner(k) = k * 10\ncount(n)\n    for i in 0..<n\n        yield inner(i) + 1\nburn(n) = if n == 0 then [] else [{ a: n }, burn(n - 1)]\nval g = count(5)\nvar got = []\nfor i in 0..<5\n    burn(200)\n    got.push(g.next().value)\nprint(got)")
+
+    assert_eq(said, "[1, 11, 21, 31, 41]")
+
+@test
+AN_UNDEFINED_ARGUMENT_IS_REFUSED_AT_A_CALL_IN_ANY_POSITION()
+    val first = fails("f(a, b, c) = a\nval o = {}\nprint(f(o.x, 2, 3))")
+    val middle = fails("f(a, b, c) = a\nval o = {}\nprint(f(1, o.x, 3))")
+    val last = fails("f(a, b, c) = a\nval o = {}\nprint(f(1, 2, o.x))")
+
+    for said in [first, middle, last]
+        assert(said.contains("`undefined` cannot be passed to a function"), said)
+
+    // The control: the same calls with every argument there run.
+    assert_eq(out("f(a, b, c) = a + b + c\nprint(f(1, 2, 3))"), "6")
+
+@test
+AN_UNDEFINED_ARGUMENT_IS_REFUSED_AT_A_METHOD_CALL_TOO()
+    // Delegated through a class, so the receiver is parameter zero and stands in the window, and a
+    // method the object holds itself, which takes none.
+    val delegated = fails("class P\n    x: integer\n    m(self, y) = self.x + y\nval o = {}\nprint(P(1).m(o.y))")
+    val own = fails("val o = { m: y -> y }\nval p = {}\nprint(o.m(p.y))")
+
+    assert(delegated.contains("`undefined` cannot be passed to a function"), delegated)
+    assert(own.contains("`undefined` cannot be passed to a function"), own)
+
+    assert_eq(out("class P\n    x: integer\n    m(self, y) = self.x + y\nval o = { m: y -> y }\nprint(P(1).m(2), o.m(3))"), "3 3")
+
+@test
+THE_MASK_OF_AN_IN_PLACE_CALL_SAYS_WHICH_PARAMETERS_ARRIVED()
+    // A default is filled only where its argument was not given; a surplus is dropped.
+    assert_eq(out("f(a, b = 5, c = 7) = [a, b, c]\nprint(f(1), f(1, 2), f(1, 2, 3), f(1, 2, 3, 4))"), "[1, 5, 7] [1, 2, 7] [1, 2, 3] [1, 2, 3]")
+
+@test
+SIXTY_FOUR_PARAMETERS_IS_THE_WIDEST_MASK_AND_IT_IS_EXACT()
+    // The shift that makes the mask cannot say sixty-four bits, so that count is its own branch.
+    var params = ""
+    var args = "0"
+
+    for i in 0..<63
+        params = params + s"p${i}, "
+
+    for i in 1..<63
+        args = args + s", ${i}"
+
+    val def = s"f(${params}last = -1) = last\n"
+
+    assert_eq(out(def + s"print(f(${args}, 63), f(${args}))"), "63 -1")
+
+    // And the chunk is one the in-place path takes, or the branch above was never reached.
+    var slotted = false
+
+    for i in 0..<running_unit().chunks.len()
+        if running_unit().chunks.at(i).name == "f" then slotted = running_unit().chunks.at(i).slotted
+
+    assert(slotted, "a function of sixty-four parameters slots them")

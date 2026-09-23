@@ -145,6 +145,24 @@ AN_ABSENCE_A_CALL_LEFT_BEHIND_STILL_CANNOT_TRAVEL() =
     assertFaults(() -> second(1, undefined), "cannot be passed to a function")
 
 @test
+AN_ABSENCE_IS_REFUSED_WHEREVER_IT_STANDS_AMONG_THE_ARGUMENTS() =
+    // The interpreter asks one question of all the arguments at once and only then says which, so
+    // each position is its own case -- first, middle and last, a delegated method and an own one.
+    assertFaults(() -> three(undefined, 2, 3), "cannot be passed to a function")
+    assertFaults(() -> three(1, undefined, 3), "cannot be passed to a function")
+    assertFaults(() -> three(1, 2, undefined), "cannot be passed to a function")
+    assertFaults(() -> Tripled(1).plus(undefined), "cannot be passed to a function")
+    assertFaults(() -> { plus: y -> y }.plus(undefined), "cannot be passed to a function")
+    assertEq(three(1, 2, 3), 6)
+    assertEq(Tripled(1).plus(2), 5)
+
+three(a, b, c) = a + b + c
+
+class Tripled
+    n: integer
+    plus(self, y) = self.n * 3 + y
+
+@test
 A_QUESTION_MARK_MARKS_A_PARAMETER_OPTIONAL_WITH_NO_VALUE_OF_ITS_OWN() =
     // `b?` is `b = undefined` down to the bytecode: it drops out of the count the way a default
     // does, and what it binds where nobody gave it is the absence every other parameter now reads
