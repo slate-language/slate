@@ -1,172 +1,155 @@
 // Sample every `bench/*.sl` program under macOS `sample` and collect each one's top self-time
-// symbols into one Markdown report -- the shell script every profile agent had been hand-rolling
-// beside `bench/results/`, written once.
+// symbols into one Markdown report.
 //
 // Usage:
 //
 //   slate bench/profile.sl --out=PATH [--binary=./slate] [--duration=10] [--interval=1] [program.sl ...]
 //
-// `--out` is required and names the Markdown file to write. `--binary` is the executable `sample`
-// attaches to (default `./slate`); the remaining bare arguments are the programs to run under it,
-// each one a path handed to `<binary>` as its sole argument -- default is every `*.sl` file directly
-// under `bench/`, this file excluded. `--duration` is the number of seconds `sample` watches for
-// (default 10) and `--interval` the sampling interval in milliseconds (default 1), both passed
-// straight through to `sample`.
+// `--out` is required and names the Markdown file to write. `--binary` is the executable each program
+// is run under (default `./slate`); the bare arguments are the programs, each handed to `<binary>` as
+// its one argument -- every `*.sl` directly under `bench/` where none is named, this file excluded.
+// `--duration` is how many seconds `sample` watches (default 10) and `--interval` its sampling
+// interval in milliseconds (default 1), both handed straight to `sample`.
 //
-// Each program is started, sampled where it stands, and killed once the sample has what it wants --
-// serially, one shell call per program, exactly as `bench/results/2026-09-22-sampled-profile-5.md`
-// describes doing this by hand. A program that exits before the sampler can attach (`startup`,
-// `strindex`, `strwalk`) is reported with no rows rather than failing the whole run.
+// Each program is started, sampled where it stands, and killed once the sample is in hand, one at a
+// time. A program that ends before `sample` can attach gets a section saying so rather than failing
+// the run. The rows are `sample`'s own "Sort by top of stack, same collapsed" section, which is self
+// time and is what every sampled profile under `bench/results/` reads.
 
 import { args, exit, run, spawn } from slate:process
-import { readDirSync, writeFileSync } from slate:fs
+import { readDirSync, readFileSync, removeSync, writeFileSync } from slate:fs
 
 val TableRows = 12
+val Marker = "Sort by top of stack, same collapsed"
 
-// -- command line -----------------------------------------------------------------------------------
+// -- the command line ----------------------------------------------------------------------------
 
-flag(name, fallback) ->
+flag(name, fallback)
     val prefix = "--" + name + "="
 
     for a in args
-        if startsWith(a, prefix)
+        if a.startsWith(prefix)
             return a[prefix.length..<a.length]
 
     fallback
 
-positional() ->
-    var out = []
+given()
+    args.filter(a -> !a.startsWith("--"))
 
-    for a in args
-        if !startsWith(a, "--")
-            out.push(a)
-
-    out
-
-// Every `*.sl` file directly under `bench/`, this tool excluded, in a stable order.
-defaultPrograms() ->
+// Every `*.sl` directly under `bench/`, this program excluded, in name order.
+everyProgram()
     readDirSync("bench") match
         { ok: true, value: names } ->
-            names.filter(n -> endsWith(n, ".sl") && n != "profile.sl")
-                .sorted((a, b) -> if a < b then -1 elif a > b then 1 else 0)
-                .map(n -> "bench/" + n)
+            names.filter(n -> n.endsWith(".sl") && n != "profile.sl").sorted().map(n -> "bench/" + n)
         { error: e } ->
-            print("cannot read bench/: " + string(e))
-            exit(1)
+            print("cannot read bench/:", e)
+            exit(2)
 
-// -- reading `sample`'s own report -------------------------------------------------------------------
+// -- reading `sample`'s report --------------------------------------------------------------------
 
-// The rows of `sample`'s "Sort by top of stack, same collapsed" section: a count and a symbol name,
-// which is self time and is what every figure in `bench/results/` reads. Answers `[]` where the
-// marker never appears, which is what a `sample` that never attached looks like.
-parseCollapsed(text) ->
-    val lines = split(text, "\n")
-    var marker = -1
-    var i = 0
+// One row of the collapsed section, `symbol  (in image)        count`, as `{ symbol, samples }` --
+// or null for a line that is not one.
+row(line)
+    val t = line.trim()
+    val gap = t.lastIndexOf(" ")
 
-    while i < lines.length
-        if indexOf(lines.at(i), "Sort by top of stack, same collapsed") != null
-            marker = i
+    if gap == null
+        return null
 
-        i = i + 1
+    val count = number(t[gap + 1..<t.length])
 
+    if count == null
+        return null
+
+    val head = t[0..<gap].trim()
+    val cut = head.indexOf("  (in ") ?? head.length
+
+    { symbol: head[0..<cut].trim(), samples: count }
+
+// The rows under `Marker`, which run to the first line that is not one. `[]` where the marker never
+// appears, which is what a `sample` that could not attach leaves behind.
+collapsed(text)
+    val lines = text.split("\n")
+    val at = lines.findIndex(l -> l.startsWith(Marker))
     var rows = []
 
-    if marker >= 0
-        var j = marker + 1
-        var going = true
+    if at == null || at < 0
+        return rows
 
-        while going && j < lines.length
-            val t = trim(lines.at(j))
+    for line in lines.slice(at + 1)
+        val r = row(line)
 
-            if t.length == 0
-                if rows.length > 0
-                    going = false
-            elif t.at(0) >= "0" && t.at(0) <= "9"
-                val sp = indexOf(t, " ")
+        if r == null
+            break
 
-                if sp != null
-                    val count = number(t[0..<sp])
-                    val rest = trim(t[sp..<t.length])
-                    val cut = indexOf(rest, "  (in ")
-                    val two = indexOf(rest, "  ")
-                    val symEnd = if cut != null then cut elif two != null then two else rest.length
-
-                    rows.push({ symbol: trim(rest[0..<symEnd]), samples: count })
-            else
-                if rows.length > 0
-                    going = false
-
-            j = j + 1
+        rows.push(r)
 
     rows
 
-// -- the report ---------------------------------------------------------------------------------------
+// -- the report ------------------------------------------------------------------------------------
 
-formatPct(n) -> string(round(n * 10) / 10)
+percent(part, whole) = toFixed(part * 100.0 / whole, 1)
 
-// The table and the one-line summary for a single program's rows, as one Markdown section.
-reportFor(name, rows) ->
-    val total = rows.reduce(0, (acc, r) -> acc + r.samples)
-    val ranked = rows.sorted((a, b) -> b.samples - a.samples)
-    val topRows = ranked.slice(0, min(TableRows, ranked.length))
+section(program, rows)
+    val total = rows.reduce((sum, r) -> sum + r.samples, 0)
 
-    val body = topRows
-        .map(r -> "| " + r.symbol + " | " + string(r.samples) + " | " + formatPct(r.samples / total * 100) + "% |")
-        .join("\n")
+    if total == 0
+        return "## " + program + "\n\nNo samples: the program ended before `sample` could attach.\n"
 
-    val summary = if topRows.length > 0
-        then string(total) + " samples; top: `" + topRows.at(0).symbol + "` at " +
-            formatPct(topRows.at(0).samples / total * 100) + "%."
-        else "no samples -- the program likely exited before `sample` could attach."
+    val top = rows.sorted((a, b) -> a.samples > b.samples).slice(0, TableRows)
+    val table = top.map(r -> "| `" + r.symbol + "` | " + string(r.samples) + " | " + percent(r.samples, total) + " |")
 
-    "### " + name + "\n\n| symbol | samples | % |\n|---|---|---|\n" + body + "\n\n" + summary + "\n"
+    "## " + program + "\n\n" + string(total) + " samples.\n\n| symbol | samples | % |\n|---|---:|---:|\n" +
+        table.join("\n") + "\n"
 
-// -- driving `sample` -----------------------------------------------------------------------------
+// -- driving `sample` ----------------------------------------------------------------------------
 
-// Start `program` under `binary`, sample the child for `duration` seconds at `interval` milliseconds,
-// and answer its Markdown section. The child is killed once the sample is in hand, whether or not it
-// was still running.
-async profileOne(binary, program, duration, interval)
-    print("sampling " + program + " ...")
+// Start `program` under `binary`, sample it, kill it, and answer its section of the report.
+async profiled(binary, program, duration, interval, scratch)
+    print("sampling", program)
 
-    spawn(binary, [program]) match
-        { ok: false, error: e } ->
-            "### " + program + "\n\nfailed to start `" + binary + " " + program + "`: " + string(e) + "\n"
-        { ok: true, value: worker } ->
-            val timeoutMs = (number(duration) + 10) * 1000
-            val sampled = await run("/usr/bin/sample",
-                [string(worker.pid), duration, interval, "-mayDie"], { timeout: timeoutMs })
+    val started = spawn(binary, [program])
 
-            worker.kill()
-            await worker.exited
+    if !started.ok
+        return "## " + program + "\n\n`" + binary + "` could not be started: " + string(started.error) + "\n"
 
-            sampled match
-                { ok: true, value: res } -> reportFor(program, parseCollapsed(res.out))
-                { ok: false, error: e } -> "### " + program + "\n\n`sample` failed: " + string(e) + "\n"
+    val child = started.value
+    val limit = (number(duration) + 30) * 1000
+    val sampled = await run("/usr/bin/sample", [string(child.pid), duration, interval, "-mayDie", "-file", scratch],
+        { timeout: limit })
+
+    child.kill()
+    await child.exited
+
+    val text = readFileSync(scratch) match
+        { ok: true, value: t } -> t
+        _ -> ""
+
+    removeSync(scratch)
+    section(program, collapsed(text))
 
 async main()
-    val outPath = flag("out", "")
+    val out = flag("out", "")
 
-    if outPath == ""
+    if out == ""
         print("usage: slate bench/profile.sl --out=PATH [--binary=./slate] [--duration=10] [--interval=1] [program.sl ...]")
         exit(2)
 
     val binary = flag("binary", "./slate")
     val duration = flag("duration", "10")
     val interval = flag("interval", "1")
-    val given = positional()
-    val programs = if given.length > 0 then given else defaultPrograms()
-
+    val named = given()
+    val programs = if named.length > 0 then named else everyProgram()
+    val scratch = out + ".sample.txt"
     var sections = []
 
     for p in programs
-        sections.push(await profileOne(binary, p, duration, interval))
+        sections.push(await profiled(binary, p, duration, interval, scratch))
 
-    val header = "# slate bench profile\n\nBinary: `" + binary + "`, duration " + duration +
-        "s, interval " + interval + "ms.\n\n"
+    val head = "# slate bench profile\n\nSelf time from macOS `sample`: binary `" + binary + "`, " + duration +
+        " s per program at " + interval + " ms.\n"
 
-    writeFileSync(outPath, header + sections.join("\n"))
-    print("wrote " + outPath)
+    writeFileSync(out, head + "\n" + sections.join("\n"))
+    print("wrote", out)
 
 main()

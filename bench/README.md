@@ -47,29 +47,22 @@ running: `pgrep -x java` must be empty, no `sysl test` or `slate test` may be ru
 `caffeinate -dimsu`** -- this box sleeps for about fourteen seconds a minute otherwise, which lands
 wherever it lands and is indistinguishable from a benchmark being slow.
 
-## Tooling
+## Sampling every program at once
 
-**`bench/profile.sl` is `sample-all.sh`/`prof-all.sh`, written once instead of hand-rolled per
-profile.** Every one of the sampled profiles above (`2026-09-22-sampled-profile-5.md` and its four
-predecessors) was taken by a shell script an agent wrote fresh -- spawn the program, hand its pid to
-macOS `sample`, wait, move on to the next -- and none of those scripts survived past the profile they
-were written for. This one is a slate program that does the same thing for every program at once and
-writes a Markdown table instead of a directory of `.txt` files:
+**`bench/profile.sl` takes a sampled profile of every benchmark and writes one Markdown report** --
+a section per program with its top twelve symbols by self time (symbol, samples, %), read from macOS
+`sample`'s own "Sort by top of stack, same collapsed" section. Each program is started under
+`--binary` (default `./slate`), handed to `sample` for `--duration` seconds at one sample every
+`--interval` milliseconds (defaults 10 and 1), and killed once the sample is in hand, one at a time;
+the programs are the bare arguments, or every `*.sl` directly under `bench/` where none is named. A
+program that ends before `sample` attaches (`startup`) gets a section saying so. The percentages are
+of the samples that section lists, which leaves out any symbol `sample` saw fewer than five times.
+macOS only, and under the same quiet-box rule as a timing.
 
 ```
-slate bench/profile.sl --out=bench/results/profile.md
-slate bench/profile.sl --out=/tmp/one.md --binary=./slate --duration=15 --interval=1 arrays.sl csv.sl
+caffeinate -dimsu ./slate bench/profile.sl --out=bench/results/profile.md
+./slate bench/profile.sl --out=one.md --duration=15 bench/arrays.sl bench/csv.sl
 ```
-
-`--out` names the report and is the only required flag. `--binary` is the executable `sample`
-attaches to (default `./slate`); `--duration` and `--interval` are `sample`'s own arguments, seconds
-and milliseconds (default 10 and 1); anything left over is the list of programs to run, each handed
-to `<binary>` as its one argument -- default is every `*.sl` file directly under `bench/`. Each
-program is started, sampled where it stands, and killed once the sample is in hand, one shell call at
-a time, exactly as the method section above describes doing it by hand. A program that exits before
-the sampler can attach (`startup`, `strindex`, `strwalk`) gets a section that says so rather than an
-empty table. It reads `sample`'s own "Sort by top of stack, same collapsed" section, which is what
-every number in this file's sampled profiles is.
 
 ## What each one stresses
 
