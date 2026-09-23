@@ -254,3 +254,152 @@ TWO_GENERATORS_INTERLEAVED_IN_ONE_FOLDED_LOOP_KEEP_THEIR_OWN_COUNTERS()
         k = k + 1
 
     assertEq(mixed, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+
+// -- a difference stored into a local, and a loop's whole head and tail --------------------------
+//
+// **`Sub`+`StoreSlot` is `Add`+`StoreSlot`'s twin**, and the two RUNS fold a counted loop: its head
+// `Tick; LoadSlot; PushInt; Less; JumpIfFalse`, and its tail `LoadSlot; PushInt; Add; StoreSlot;
+// Jump` where the slot read and written is the same one. Each has a whole-number path and hands
+// everything else to the arithmetic the unfused run used.
+
+countedDown(n)
+    var t = 100
+    var i = 0
+
+    while i < n
+        t = t - i
+        i = i + 1
+
+    t
+
+@test
+A_DIFFERENCE_STORED_INTO_A_LOCAL_COUNTS_WHAT_THE_UNFUSED_PAIR_COUNTED()
+    assertEq(countedDown(0), 100)
+    assertEq(countedDown(5), 90)
+
+    // The minuend is the LEFT operand, which a pair popped the wrong way round would swap.
+    var d = 3
+
+    d = d - 10
+    assertEq(d, -7)
+
+@test
+A_DIFFERENCE_STORED_INTO_A_LOCAL_STILL_PROMOTES_AN_OVERFLOW_AND_SUBTRACTS_REALS()
+    var n = -9223372036854775807
+
+    n = n - 2
+    assertEq(string(n), "-9223372036854775809")
+
+    var r = 1.0
+
+    r = r - 0.25
+    assertEq(r, 0.75)
+
+@test
+A_DIFFERENCE_STORED_INTO_A_LOCAL_STILL_REFUSES_WHAT_IS_NOT_A_NUMBER()
+    var n = 1
+    var said = ""
+
+    try
+        n = n - {}
+    catch e
+        said = e.message
+
+    assert(said != "", "subtracting an object from a number was allowed")
+    assertEq(n, 1)
+
+@test
+A_COUNTED_LOOP_RUNS_EXACTLY_ITS_TURNS_WHATEVER_ITS_STEP()
+    var turns = 0
+    var i = 0
+
+    while i < 10
+        turns = turns + 1
+        i = i + 3
+
+    assertEq(turns, 4)
+    assertEq(i, 12)
+
+    // A loop that never turns leaves its counter where it was.
+    var j = 5
+
+    while j < 5
+        j = j + 1
+
+    assertEq(j, 5)
+
+    // A negative step and a negative bound.
+    var k = 0
+    var down = 0
+
+    while k < -1
+        down = down + 1
+
+    assertEq(down, 0)
+
+@test
+A_LOOP_OVER_A_REAL_COUNTER_TAKES_THE_ORDINARY_ARITHMETIC()
+    // Neither half of the loop holds a whole number here, so both runs take their slow paths.
+    var x = 0.5
+    var turns = 0
+
+    while x < 3
+        turns = turns + 1
+        x = x + 1
+
+    assertEq(turns, 3)
+    assertEq(x, 3.5)
+
+@test
+A_LOOP_WHOSE_COUNTER_OVERFLOWS_PROMOTES_IT()
+    var i = 9223372036854775806
+    var turns = 0
+
+    while turns < 3
+        turns = turns + 1
+        i = i + 1
+
+    assertEq(string(i), "9223372036854775809")
+
+@test
+A_LOOP_HEAD_OVER_SOMETHING_WITH_NO_ORDER_STILL_FAULTS()
+    var i = {}
+    var said = ""
+
+    try
+        while i < 3
+            i = 4
+    catch e
+        said = e.message
+
+    assert(said != "", "comparing an object with a number was allowed")
+
+@test
+A_LOOP_TAIL_OVER_A_STRING_STILL_REFUSES_AN_INTEGER()
+    // The tail's slow path is the ordinary addition, so it says what the ordinary addition says.
+    var s = "a"
+    var said = ""
+
+    try
+        while s != "done"
+            s = s + 1
+    catch e
+        said = e.message
+
+    assertEq(said, "`+` does not apply to a string and an integer")
+    assertEq(s, "a")
+
+@test
+A_BREAK_AND_A_CONTINUE_LEAVE_A_FOLDED_LOOP_WHERE_THE_UNFUSED_ONE_LEFT_IT()
+    var seen = []
+    var i = 0
+
+    while i < 10
+        i = i + 1
+
+        if i % 2 == 0 then continue
+        if i > 7 then break
+
+        seen.push(i)
+
+    assertEq(seen, [1, 3, 5, 7])
