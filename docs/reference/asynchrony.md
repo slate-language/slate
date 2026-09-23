@@ -291,9 +291,9 @@ walk()
 `for await` belongs in an `async` function
 ```
 
-**There is no `async` generator yet.** A source is written by hand as an object with a `next`, which is
-how node's streams implement theirs; the sugar for *producing* one came second in JavaScript and can
-come second here.
+**A source written by hand as an object with a `next` is how node's streams implement theirs**, and it
+is still the right shape where the values come from somewhere that is not a loop of slate's own. Where
+they do, an [`async` generator](#async-generators) writes the same thing as a body with `yield` in it.
 
 ## Generators
 
@@ -356,9 +356,144 @@ print(e.next(5))
 call and adds to the answer; `yield x * x` yields the product. A yield used inside a larger expression is
 bracketed. JavaScript and Python both put `yield` at the bottom of the ladder.
 
-**An `async` function may not `yield`.** Two things would be entitled to put one machine back and there
-is no rule for which, so calling one fails its promise with *"an `async` function may not `yield` -- an
-async generator is not slate"*. It is refused at the call rather than at the compile.
-
 An abandoned generator's state is held for the life of the program — there is no finalizer, so a
 generator never run to the end keeps what it was holding.
+
+## `async` generators
+
+**A body that is both `async` and holds a `yield` produces a source.** Calling it runs nothing and
+answers a generator, exactly as a plain one does; what `async` changes is only what a *step* of it
+hands back — `next()` answers a **promise** of `{ value, done }`, which is the shape
+[`for await`](#for-await) already asks for.
+
+```slate
+async ticks(n)
+    var i = 0
+
+    while i < n
+        await sleep(1)
+
+        yield i * 10
+
+        i = i + 1
+
+async main()
+    for await v in ticks(3)
+        print(v)
+
+main()
+```
+
+```output
+0
+10
+20
+```
+
+**An `await` inside the body suspends the step and not the program.** The promise the `next` handed
+back stays pending until the body reaches its next `yield`; everything else the program had going on
+carries on in the meantime.
+
+Stepping one by hand is `next()` awaited, and the last step carries what the body answered:
+
+```slate
+async two()
+    yield "a"
+
+    await sleep(1)
+
+    yield "b"
+
+    "end"
+
+async main()
+    val g = two()
+
+    print(await g.next())
+    print(await g.next())
+    print(await g.next())
+    print(await g.next())
+
+main()
+```
+
+```output
+{value: "a", done: false}
+{value: "b", done: false}
+{value: "end", done: true}
+{value: null, done: true}
+```
+
+**`val got = yield x` sends a value in exactly as it does in a plain generator**, the difference
+being only that the step is awaited:
+
+```slate
+async echoer()
+    val got = yield 1
+
+    await sleep(1)
+
+    yield got * 10
+
+async main()
+    val e = echoer()
+
+    print((await e.next()).value)
+    print((await e.next(5)).value)
+
+main()
+```
+
+```output
+1
+50
+```
+
+**A fault inside the body rejects the `next` that is waiting**, and ends the generator — the step
+after it says `done` rather than faulting a second time:
+
+```slate
+async breaks()
+    yield 1
+
+    throw "gone wrong"
+
+async main()
+    val g = breaks()
+
+    print((await g.next()).value)
+    print((await g.next()) catch e -> e.message)
+    print((await g.next()).done)
+
+main()
+```
+
+```output
+1
+gone wrong
+true
+```
+
+**One `next` at a time.** Asking for another value while the last one is still waiting is refused,
+rather than queued: two promises entitled to the generator's next value have no rule for which gets
+it, and a program that wants them in order already has `for await`.
+
+**A plain `for` cannot walk one**, and neither can anything else that wants its values now — `...`,
+`array`, `zip`, `Set`:
+
+```slate
+async ticks()
+    await sleep(1)
+
+    yield 1
+
+async main()
+    for x in ticks()
+        print(x)
+
+main()
+```
+
+```error
+an `async` generator's values arrive one promise at a time -- `for await` is the only way to walk one
+```

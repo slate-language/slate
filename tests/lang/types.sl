@@ -14,6 +14,17 @@ type Wrapper = { inner: object }
 // A range with a step is a type the same way a range without one is: the numbers it covers.
 type Even = 0..<10 by 2
 
+// A generic type may stand for ANY type expression and not only for an object, so these are the four
+// other shapes a substitution has to reach into.
+type Twin[T] = [T, T]
+type Answer[T] = { ok: true, value: T } | { ok: false, error: string }
+type Bag[T] = array of T
+type Wrap[T] = (T) -> T
+
+// The `?` mark belongs to the shape rather than to the declaration, so it reads the same written
+// straight into an annotation -- `takes_an_optional_field_written_in_the_annotation` does that.
+type Aged = { name: string, age?: integer }
+
 anything(v) = v
 
 @test
@@ -169,3 +180,94 @@ A_RANGE_TYPE_HONOURS_ITS_STEP() =
     assert(!(5 is Even))
     assert(0 is Even)
     assert(!(10 is Even))
+
+@test
+a_generic_type_stands_for_any_shape_and_not_only_for_an_object() =
+    // The substitution walks the whole type, so what is generic over may sit in an array, in an
+    // alternative of a union, under `array of`, or at a function type's parameter. What comes out at
+    // a use is the ordinary pattern for that shape, which is what is tested here.
+    assert([1, 2] is Twin[integer])
+    assert(!(["a", "b"] is Twin[integer]))
+    assert(!([1] is Twin[integer]))
+
+    assert({ ok: true, value: "x" } is Answer[string])
+    assert(!({ ok: true, value: 1 } is Answer[string]))
+    assert({ ok: false, error: "e" } is Answer[string])
+
+    assert([1, 2, 3] is Bag[integer])
+    assert(!([1, "a"] is Bag[integer]))
+
+    // A function type asks what it can ask, which is callable and the count -- so the `T` in it is
+    // substituted and then says nothing further, exactly as a written one does.
+    assert((n -> n) is Wrap[integer])
+    assert(!(3 is Wrap[integer]))
+
+@test
+a_generic_type_reads_as_a_match_arm_with_the_types_it_was_given() =
+    // A `match` arm is pattern position, and type ARGUMENTS are read there as well as in a type
+    // position -- so the arm that runs is the shape the substitution produced.
+    sort(v) = v match
+        Twin[integer] -> "two integers"
+        Twin[string]  -> "two strings"
+        _             -> "something else"
+
+    assertEq(sort([1, 2]), "two integers")
+    assertEq(sort(["a", "b"]), "two strings")
+    assertEq(sort([1, "a"]), "something else")
+
+    read(r: Answer[string]) = r match
+        { ok: true, value }  -> value
+        { ok: false, error } -> "!" + error
+
+    assertEq(read({ ok: true, value: "hi" }), "hi")
+    assertEq(read({ ok: false, error: "no" }), "!no")
+
+@test
+a_generic_function_type_is_the_written_one_after_the_substitution() =
+    // `(T) -> T` in a definition's own head, and the same thing given a name of its own.
+    applyTo[T](f: (T) -> T, x: T) -> T = f(x)
+
+    assertEq(applyTo(n -> n + 1, 41), 42)
+    assertEq(applyTo(s -> upper(s), "hi"), "HI")
+
+    val twice: Wrap[integer] = n -> n * 2
+
+    assertEq(twice(21), 42)
+
+    // And the machine still asks the one question it can: a value that is not callable at all does
+    // not fit, wherever the type came from.
+    val said = (declaredWrap(anything("no"))) catch e -> e.message
+
+    assert(said.contains("was declared Wrap[integer]"))
+
+declaredWrap(v) =
+    val f: Wrap[integer] = v
+
+    f
+
+@test
+takes_an_optional_field_written_in_the_annotation() =
+    // The `?` is the shape's, so it reads the same inline as it does through a `type`: absent, the
+    // shape still holds; present, it is checked.
+    greet(person: { name: string, age?: integer }) =
+        if has(person, "age") then s"${person.name} (${person.age})" else person.name
+
+    assertEq(greet({ name: "ada" }), "ada")
+    assertEq(greet({ name: "grace", age: 36 }), "grace (36)")
+
+    // Through a declared name the run-time check says the same, and names the annotation as written.
+    assertEq(greet(anything({ name: "ada" })), "ada")
+
+    val said = (aged(anything({ name: "ada", age: "old" }))) catch e -> e.message
+
+    assert(said.contains("was declared { name: string, age?: integer }"))
+
+    // `mismatch` treats the two halves the same way the test does: a missing optional is no reason,
+    // a present one that does not fit is.
+    assert(Aged.test({ name: "a" }))
+    assert(!Aged.test({ name: "a", age: "x" }))
+    assertEq(Aged.mismatch({ name: "a" }).length, 0)
+    assertEq(Aged.mismatch({ name: "a", age: "x" }).length, 1)
+    assertEq(Aged.mismatch({ name: "a", age: "x" })[0].path, "age")
+
+aged(p: { name: string, age?: integer }) = p.name
