@@ -35,6 +35,134 @@ a_for_walks_an_array_a_range_and_an_objects_entries() =
 
     assertEq(seen, [1, 2, 0, 1, "a", 1])
 
+// A head that is a row of bare names is the commonest shape a loop has, and the interpreter takes it
+// apart without the pattern matcher. These ask what every shape ANSWERS, which is what says the two
+// back ends still agree and that the short path binds what the long one did.
+
+@test
+a_head_of_bare_names_binds_each_element_in_order() =
+    two(rows) =
+        var out = []
+
+        for [a, b] in rows
+            push(out, a * 10 + b)
+
+        out
+
+    three(rows) =
+        var out = []
+
+        for [a, b, c] in rows
+            push(out, a + b + c)
+
+        out
+
+    assertEq(two([[1, 2], [3, 4]]), [12, 34])
+    assertEq(three([[1, 2, 3], [4, 5, 6]]), [6, 15])
+
+@test
+an_object_head_binds_the_fields_it_names() =
+    named(rows) =
+        var out = ""
+
+        for { k, v } in rows
+            out = out + k + string(v)
+
+        out
+
+    assertEq(named([{ k: "a", v: 1 }, { k: "b", v: 2 }]), "a1b2")
+
+    // A field the head does not name is ignored, and one it reads through a proto counts.
+    spare(rows) =
+        var out = 0
+
+        for { n } in rows
+            out = out + n
+
+        out
+
+    assertEq(spare([{ n: 1, other: "x" }, { n: 2 }]), 3)
+    assertEq(spare([{ proto: { n: 5 } }]), 5)
+
+@test
+a_head_whose_element_does_not_fit_is_a_fault() =
+    assert(short([[1, 2], [3]]) catch e -> true)
+    assert(short([[1, 2, 3]]) catch e -> true)
+    assert(short([7]) catch e -> true)
+    assert(missing([{ m: 1 }]) catch e -> true)
+    assert(missing([7]) catch e -> true)
+
+short(rows) =
+    var n = 0
+
+    for [a, b] in rows
+        n = n + a + b
+
+    n
+
+missing(rows) =
+    var n = 0
+
+    for { k } in rows
+        n = n + k
+
+    n
+
+@test
+a_head_with_a_default_a_rest_or_a_nested_pattern_binds_as_it_always_did() =
+    defaulted(rows) =
+        var out = []
+
+        for [a, b = 7] in rows
+            push(out, a * 10 + b)
+
+        out
+
+    rested(rows) =
+        var out = []
+
+        for [a, ...more] in rows
+            push(out, a + more.length)
+
+        out
+
+    nested(rows) =
+        var out = []
+
+        for [[a, b], c] in rows
+            push(out, a + b + c)
+
+        out
+
+    assertEq(defaulted([[1], [2, 3]]), [17, 23])
+    assertEq(rested([[1, 2, 3], [4]]), [3, 4])
+    assertEq(nested([[[1, 2], 3], [[4, 5], 6]]), [6, 15])
+
+@test
+a_head_of_two_names_walks_a_maps_pairs() =
+    summed(m) =
+        var total = 0
+
+        for [k, v] in m
+            total = total + v
+
+        total
+
+    assertEq(summed(Map([["a", 1], ["b", 2]])), 3)
+
+@test
+a_head_shadows_and_gives_back_whatever_shape_it_has() =
+    shadowed() =
+        val a = "outer"
+        var last = ""
+
+        for { a, b } in [{ a: "x", b: "y" }]
+            last = a + b
+
+        last + " " + a
+
+    assertEq(shadowed(), "xy outer")
+
 // A block that closes ends the expression holding it, so the line under it is a statement of its own
 // whatever it begins with. Each of these was read as an operator on the block's value: `-1` as a
 // subtraction from the `if`, `[i, 1]` as an index on the loop's last line, `(` as a call.

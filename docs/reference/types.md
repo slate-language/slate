@@ -71,7 +71,8 @@ the compiler resolves and the value the name binds.
 | `any` | anything, and what an unannotated thing is |
 | `number` `integer` `real` `string` `boolean` `array` `object` `function` `null` | a kind |
 | `{ a: T, b?: U }` | an object with at least those fields — except a literal written at the spot, which may carry no others |
-| `[T, U]` | an array whose first elements fit |
+| `[T, U]` | an array of exactly two elements, both of which fit |
+| `[T, U, ...]` | an array of at least two, whose first two fit |
 | `array of T` | an array every element of which fits `T` |
 | `object of T` | an object every value of which fits `T` |
 | `1..100`, `0..<10`, `..0`, `1..` | a number between those ends |
@@ -83,10 +84,72 @@ the compiler resolves and the value the name binds.
 | a `type`, `class` or `data` name | what that declared |
 | `Name[A, B]` | a generic type, given what it is generic over |
 
+### `[T, U]`
+
+**The brackets say how many.** `[string, integer]` is an array of exactly two elements, so a third is
+as much a misfit as a wrong one — which is what makes `type Pair = [string, integer]` read the way it
+looks. A trailing `...` is how a shape says *and whatever else*:
+
+```slate
+type Pair = [string, integer]
+type Tail = [string, ...]
+
+print(["a", 2] is Pair, ["a", 2, 3] is Pair, ["a"] is Pair)
+print(["a", 2, 3] is Tail, [] is Tail)
+```
+
+```output
+true false false
+true false
+```
+
+The count is checked wherever the shape is, so an annotation refuses the longer array where it
+arrives:
+
+```slate
+first(p: [string, integer]) = p[0]
+
+print(first(["a", 2, 3]))
+```
+
+```error
+was declared [string, integer]
+```
+
+**The brackets mean the same thing in every position**, an annotation, an `is` test, a `match` arm, a
+`for` head and a destructuring `val` all reading the shape one way — which is the single grammar
+working, [patterns](patterns.md) and types being read by the same code. So a name a `type` declared
+carries the count with it, and `mismatch` reports the length rather than picking over the elements:
+
+```slate
+type Pair = [string, integer]
+
+val [a, b] = ["x", 1]
+
+val what = ["x", 1, 2] match
+    Pair -> "a pair"
+    _    -> "not a pair"
+
+val why = Pair.mismatch(["x", 1, 2])
+
+print(a, b)
+print(what)
+print(why[0].wanted, why[0].got)
+```
+
+```output
+x 1
+not a pair
+[string, integer] an array of 3
+```
+
+**A rest is how an open-ended shape is written**, and the elements before it are still checked — so
+`[string, ...]` is *begins with a string*.
+
 ### `array of T`
 
-An array pattern tests the elements it writes and lets the rest through — `["a", 2] is [string, ...]`
-is **true** — so a list of unknown length needs this:
+An array of unknown length is not a tuple, and a rest pattern says nothing about the elements past
+the ones it writes, so a list of unknown length needs this:
 
 ```slate
 type Tags   = array of string
