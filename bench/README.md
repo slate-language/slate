@@ -47,6 +47,23 @@ running: `pgrep -x java` must be empty, no `sysl test` or `slate test` may be ru
 `caffeinate -dimsu`** -- this box sleeps for about fourteen seconds a minute otherwise, which lands
 wherever it lands and is indistinguishable from a benchmark being slow.
 
+## Sampling every program at once
+
+**`bench/profile.sl` takes a sampled profile of every benchmark and writes one Markdown report** --
+a section per program with its top twelve symbols by self time (symbol, samples, %), read from macOS
+`sample`'s own "Sort by top of stack, same collapsed" section. Each program is started under
+`--binary` (default `./slate`), handed to `sample` for `--duration` seconds at one sample every
+`--interval` milliseconds (defaults 10 and 1), and killed once the sample is in hand, one at a time;
+the programs are the bare arguments, or every `*.sl` directly under `bench/` where none is named. A
+program that ends before `sample` attaches (`startup`) gets a section saying so. The percentages are
+of the samples that section lists, which leaves out any symbol `sample` saw fewer than five times.
+macOS only, and under the same quiet-box rule as a timing.
+
+```
+caffeinate -dimsu ./slate bench/profile.sl --out=bench/results/profile.md
+./slate bench/profile.sl --out=one.md --duration=15 bench/arrays.sl bench/csv.sl
+```
+
 ## What each one stresses
 
 | file | what it is for |
