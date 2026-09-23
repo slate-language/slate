@@ -133,6 +133,8 @@ end holds
 // **A name is `let` from the start where the block declares it again**, since the second one is an
 // assignment and assigning to a `const` is a fault rather than a refusal to start.
 declaring(j: *Js, name: string, immutable: bool) -> string
+    claim_slot(j, name)
+
     if holds(j.bound, name) then return ""
 
     j.bound.push(name)
@@ -148,11 +150,72 @@ end declaring
 // written before the run of statements that would say so. A `for` over a name whose body binds the
 // same name is the case, and it is an ordinary thing to write.
 declaring_into_block(j: *Js, name: string) -> string
+    claim_slot(j, name)
+
     if holds(j.pending, name) then return ""
 
     j.pending.push(name)
     "let "
 end declaring_into_block
+
+// Whether the interpreter holds this name in a frame slot, noting it where it does -- which is
+// `may_cell`'s question asked of the plan this function made. Every declaration comes through here,
+// so a later write to the name knows which sentence the machine would refuse it with.
+private claim_slot(j: *Js, name: string) -> bool
+    val slotted = j.chunk.cells && !holds(j.chunk.kept, name)
+
+    if slotted && !holds(j.chunk.slotted, name) then j.chunk.slotted.push(name)
+
+    slotted
+end claim_slot
+
+// The value a local is BOUND to, refusing `undefined` as the interpreter's `DeclareSlot` and
+// `DeclareVal` do.
+//
+// **An absence may not be kept, and a local is somewhere it would be kept** -- the rule
+// `docs/reference/values.md` states and every other keeping place in this runtime already enforces.
+// The sentence names the local the way the machine would: "a local" for a slot, the name for a
+// binding in the scope. A literal cannot be `undefined`, so it is written bare.
+//
+// Not `private`: a `for` head in `js_pat.sysl` binds through it.
+kept_binding(j: *Js, name: string, init: Option[Expr], v: string) -> string =
+    kept_value(init, v, if claim_slot(j, name) then "bound to a local" else s"bound to `${name}`")
+
+// The value WRITTEN to a local, which is `StoreSlot`'s refusal where the name is a slot this
+// function claimed and `StoreName`'s everywhere else -- an outer function's local and a file's own
+// name included.
+private kept_write(j: *Js, name: string, value: Option[Expr], v: string) -> string =
+    kept_value(value, v, if holds(j.chunk.slotted, name) then "written to a local" else s"written to `${name}`")
+
+private kept_value(from: Option[Expr], v: string, what: string) -> string
+    from match
+        Some(e) -> if never_absent(e) then return v
+        None -> ()
+
+    s"$$.keep(${v}, ${quoted_js(what)})"
+end kept_value
+
+// Whether an expression is one that cannot answer `undefined`: a literal, and the few forms that
+// build their answer themselves. **An operator is not one** -- `??`, `&&` and `||` hand an operand
+// back, and every other operator may be a class's own method, which answers whatever it returns.
+private never_absent(e: Expr) -> bool = *e.kind match
+    Interp(_) -> true
+    IsPattern(_, _, _) -> true
+    Range(_, _, _, _) -> true
+    WithFields(_, _, _) -> true
+    WithAll(_, _, _) -> true
+    Range(_, _, _, _) -> true
+    IsPattern(_, _, _) -> true
+    IntLit(_) -> true
+    BigLit(_) -> true
+    RealLit(_) -> true
+    StrLit(_) -> true
+    BoolLit(_) -> true
+    NullLit -> true
+    ArrayLit(_) -> true
+    ObjectLit(_, _, _) -> true
+    Lambda(_, _, _, _) -> true
+    _ -> false
 
 // A run of statements whose last value is wanted, assigned into `into`.
 //
@@ -307,11 +370,11 @@ emit_stmt(j: *Js, s: Stmt)
         // names belong to the scope around it and not to one of its own.
         Group(stmts) -> for i in 0..<stmts.len() do emit_stmt(j, stmts.at(i))
         Val(name, init) ->
-            val v = emit_expr(j, init)
+            val v = kept_binding(j, name, Some(init), emit_expr(j, init))
 
             line(j, s"${declaring(j, name, true)}${js_name(name)} = ${v};")
         Var(name, init) ->
-            val v = emit_expr(j, init)
+            val v = kept_binding(j, name, Some(init), emit_expr(j, init))
 
             line(j, s"${declaring(j, name, false)}${js_name(name)} = ${v};")
         Unpack(pat, init, immutable) ->
@@ -454,7 +517,8 @@ private emit_assign(j: *Js, op: Tok, target: Expr, value: Expr, at: Span)
         Name(name) ->
             val v = emit_operand(j, op, target, value, at)
 
-            line(j, s"${js_name(name)} = ${v};")
+            // A compound assignment answers what its operator answers, which is never an absence.
+            line(j, s"${js_name(name)} = ${if op == Assign then kept_write(j, name, Some(value), v) else v};")
         Index(t, k, _) ->
             val obj = emit_expr(j, t)
             val key = emit_expr(j, k)
@@ -503,7 +567,7 @@ private emit_short_assign(j: *Js, op: Tok, target: Expr, value: Expr, at: Span)
             line(j, s"if (${writes_when(op, js_name(name))}) {")
             open(j)
 
-            val v = emit_expr(j, value)
+            val v = kept_write(j, name, Some(value), emit_expr(j, value))
 
             line(j, s"${js_name(name)} = ${v};")
             close(j)
@@ -586,7 +650,7 @@ end emit_multi_assign
 private emit_assign_to(j: *Js, op: Tok, target: Expr, value: string, at: Span)
     *target.kind match
         Name(name) ->
-            val v = if op == Assign then value else emit_arith(j, op, js_name(name), value)
+            val v = if op == Assign then kept_write(j, name, None, value) else emit_arith(j, op, js_name(name), value)
 
             line(j, s"${js_name(name)} = ${v};")
         Index(t, k, _) ->
@@ -726,6 +790,19 @@ emit_function(j: *Js, before: string, name: string, bound: string, shown: string
     for i in 0..<params.len()
         j.pending.push(plain_param(params.at(i)))
 
+    // **The function's own answer to where its names live**, asked of the same parameters, defaults
+    // and body `compile_chunk` asks it of. A chunk that keeps its scope keeps its parameters in it,
+    // so they are slots only where the chunk slots wholly.
+    val outer_chunk = j.chunk
+    val plan = slot_plan(j.pending, defaults, body_at(body))
+    var slotted: Buf[string] = buf()
+
+    if plan.whole
+        for i in 0..<j.pending.len()
+            slotted.push(j.pending.at(i))
+
+    j.chunk = JsChunk(plan.cells, plan.kept, slotted)
+
     j.bound = j.pending
     j.rebound = buf()
     j.last_line = 0
@@ -736,6 +813,7 @@ emit_function(j: *Js, before: string, name: string, bound: string, shown: string
     j.pending = outer_pending
     j.bound = outer_bound
     j.rebound = outer_rebound
+    j.chunk = outer_chunk
     j.last_line = 0
     line(j, s"return ${answer};")
     close(j)
