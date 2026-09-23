@@ -408,10 +408,11 @@ Where slate parts from JavaScript it is **to remove a case rather than add one**
 
 ## Objects
 
-`keys  values  entries  has  without`
+`keys  values  entries  has  without  freeze  isFrozen`
 
 **`keys`, `values` and `entries` answer for an ARRAY too**, with the position for a key — see
-[Arrays](#arrays) above. Everything else here is an object's alone.
+[Arrays](#arrays) above. Everything else here is an object's alone, `freeze` and `isFrozen` excepted:
+they answer for every kind.
 
 ```slate
 val o = { a: 1, b: 2 }
@@ -443,6 +444,30 @@ field and is reported like any other.
 An object answers **no** methods of its own — its names belong to the program, and a builtin `o.keys`
 would give every object a field nothing put there. The [four universal methods](README.md) are the
 exception, and a field the program wrote wins over those.
+
+**`freeze(v)` closes a container to writing and answers the value it was given**; `isFrozen(v)` says
+whether writing through it is refused. Both take an object, an array, a set, a map, a buffer or a weak
+map — and **anything else answers itself and is already frozen**, there being nothing to write through
+a number or a string.
+
+```slate
+val limits = freeze({ retries: 3 })
+val names = freeze(["a", "b"])
+
+print(isFrozen(limits), isFrozen(names), isFrozen(7))
+print(limits.retries, names[0], sorted(names))
+print(isFrozen({ a: 1 }), freeze("hi"))
+```
+
+```output
+true true true
+3 a ["a", "b"]
+false hi
+```
+
+It is **shallow**, freezing twice is a no-op, and `with`, a spread, `Set(s)` and `Map(m)` all answer a
+copy that is free to change. [Objects](../reference/objects.md) is the page that says what a refused
+write reads like.
 
 ## Sets and maps
 

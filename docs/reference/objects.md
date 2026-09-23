@@ -92,6 +92,56 @@ difference matters, `has` is what draws it.
 
 `o with { f: v }` answers a **copy** with `f` changed. There is no spread in a literal — `with` is it.
 
+## `freeze` and `isFrozen`
+
+**`freeze(v)` closes a value to writing and answers the very value it was given.** Reads are
+untouched; every write is refused with a sentence naming what was refused and where the copy is:
+
+```slate
+val settings = freeze({ port: 8080, host: "localhost" })
+
+print(settings.port, isFrozen(settings))
+
+settings.port = 9090
+```
+
+```error
+`port` belongs to a frozen value
+```
+
+It closes an object, an array, a set, a map, a buffer and a weak map. **A value with nothing to write
+through answers itself** — a number, a string, a function — and `isFrozen` says `true` of one, so
+`isFrozen(freeze(x))` holds for every `x`. Freezing twice is a no-op, which is what lets a constructor
+freeze what it was handed without asking whether somebody else did.
+
+**It is shallow, which is JavaScript's rule**, and the rule worth stating: freezing an object says
+nothing about the objects its fields hold. A program that wants the whole graph walks it itself.
+
+**A copy is free to change**, which is what every refusal points at — `with` and a spread for an
+object, `[...xs]` for an array, `Set(s)` and `Map(m)` for the two collections:
+
+```slate
+val base = freeze({ port: 8080 })
+val mine = base with { port: 9090 }
+
+mine.port = 3000
+
+val xs = freeze([1, 2])
+val ys = [...xs]
+
+push(ys, 3)
+
+print(mine.port, isFrozen(mine), ys, isFrozen(xs))
+```
+
+```output
+3000 false [1, 2, 3] true
+```
+
+A [data variant](data-types.md) is frozen without anybody having called `freeze`, and says so
+differently — its refusal names `with` as the line to write *instead*, where a frozen value's names it
+as the way back to something writable.
+
 ## `proto`
 
 **`proto` is an ordinary field, and a lookup that misses carries on into it:**

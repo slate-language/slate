@@ -63,6 +63,19 @@ class Bag
 writesTwice(o)
     o.twice = 9
 
+writesKind(o)
+    o.kind = "round"
+
+class Coin
+    val kind = "square"
+    var side = 1
+
+    // A method writing its own object's `var` is the ordinary case, and it is what says the refusal
+    // above is about the `val` rather than about writing a field at all.
+    flip(self)
+        self.side = self.side + 1
+        return self
+
 @test
 a_getter_is_read_with_no_brackets() =
     assertEq(Rect.new(3, 4).area, 12)
@@ -174,3 +187,31 @@ get_and_set_are_soft_words_and_a_class_may_still_use_them_as_methods() =
 
     assertEq(b.get(0), 9)
     assertEq(b.size, 2)
+
+@test
+A_val_MEMBER_DOES_NOT_CHANGE_AND_A_WRITE_THROUGH_AN_OBJECT_IS_REFUSED() =
+    val c = Coin.new(2)
+
+    assertEq(c.kind, "square")
+    assertFaults(() -> writesKind(c),
+        "`kind` is a `val` of `Coin`, and a `val` does not change -- write `var kind` in the class where each object is to have its own, or hold the new value in a name of your own")
+
+    // **The refusal is what stops the SHADOW**, which is the whole point: taken, the write would put
+    // a field on `c` that hides the class's value, so `c.kind` would answer one thing and `Coin.kind`
+    // another.
+    assertEq(c.kind, "square")
+    assertEq(Coin.kind, "square")
+
+@test
+A_val_IS_REFUSED_THROUGH_THE_CLASS_ITSELF_TOO() =
+    assertFaults(() -> writesKind(Coin), "`kind` is a `val` of `Coin`")
+    assertEq(Coin.kind, "square")
+
+@test
+A_var_FIELD_IS_WRITABLE_FROM_OUTSIDE_AND_FROM_A_METHOD() =
+    val c = Coin.new(2)
+
+    assertEq(c.side, 2)
+    c.side = 5
+    assertEq(c.side, 5)
+    assertEq(c.flip().side, 6)
