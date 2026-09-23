@@ -1,0 +1,169 @@
+module dev.slatelang.slate
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// What a call and a construction no longer ask `malloc` or the method tables for.
+//
+// **An object's fields live in a `Buf` outside the heap**, so every object made used to allocate a
+// table and every sweep that freed one gave it back -- a malloc and a free per `Counter(n)`. A sweep
+// now keeps the emptied table and the next object takes it (`finalize_object` and `new_object` in
+// `obj.sysl`). What these pin is that the kept table is EMPTY when it is handed out, that the kept
+// ones are bounded, that a heap being disposed keeps nothing, and that the payload a collection
+// recounts is still exact.
+
+// The table a `Buf` grows to at its first push, which is the only size a sweep keeps.
+private const FirstTable: usize = 8
+
+// `SpareEntries` in `obj.sysl`, which is private there.
+private const SpareEntries: usize = 1024
+
+// Objects of one field, made and dropped. Nothing roots them, so all of them are garbage at once.
+private small_objects(n: usize)
+    for i in 0..<n
+        val o = new_object()
+
+        obj_put_name(o, "a", Int(long(i)))
+
+@test
+A_SWEEP_KEEPS_A_SMALL_OBJECTS_TABLE_AND_THE_NEXT_OBJECT_TAKES_IT_EMPTY()
+    reset_vm()
+    reset_heap()
+    collect_now()
+
+    val before = current().spare_entries.len()
+
+    small_objects(100)
+    collect_now()
+
+    val kept = current().spare_entries.len()
+
+    assert(kept >= before + 100, s"a sweep over 100 dropped objects kept ${kept - before} tables")
+
+    for i in 0..<kept
+        val t = current().spare_entries.at(i)
+
+        assert_eq(t.len(), 0, "a kept table holds nothing")
+        assert_eq(t.cap(), FirstTable, "and is the size a first field grows it to")
+
+    // **The next object takes one, and what it had held is gone**: the dropped objects all had an
+    // `a`, and this one must not.
+    val o = new_object()
+
+    assert_eq(current().spare_entries.len(), kept - 1, "the next object took a kept table")
+    assert_eq(o.entries.len(), 0, "and it starts with no fields")
+    assert(obj_get_name(o, "a").is_none(), "none of the dropped object's fields came with it")
+
+    obj_put_name(o, "b", Int(2))
+
+    assert_eq(o.entries.len(), 1, "a field written into it is the only one there")
+    assert_eq(o.entries.cap(), FirstTable, "and it did not have to grow")
+end A_SWEEP_KEEPS_A_SMALL_OBJECTS_TABLE_AND_THE_NEXT_OBJECT_TAKES_IT_EMPTY
+
+@test
+THE_TABLES_A_SWEEP_KEEPS_ARE_BOUNDED()
+    reset_vm()
+    reset_heap()
+    collect_now()
+    small_objects(3000)
+    collect_now()
+
+    assert_eq(current().spare_entries.len(), SpareEntries, "three thousand dropped objects keep no more than the bound")
+end THE_TABLES_A_SWEEP_KEEPS_ARE_BOUNDED
+
+@test
+A_TABLE_THAT_GREW_PAST_THE_FIRST_SIZE_IS_GIVEN_BACK_RATHER_THAN_KEPT()
+    reset_vm()
+    reset_heap()
+    collect_now()
+
+    val before = current().spare_entries.len()
+
+    for i in 0..<50
+        val o = new_object()
+
+        for k in 0..<12
+            obj_put_name(o, s"f${k}", Int(long(k)))
+
+    collect_now()
+
+    assert_eq(current().spare_entries.len(), before, "no table of twelve fields was kept")
+end A_TABLE_THAT_GREW_PAST_THE_FIRST_SIZE_IS_GIVEN_BACK_RATHER_THAN_KEPT
+
+@test
+A_KEPT_TABLE_IS_CHARGED_AS_PAYLOAD_EXACTLY_AS_A_GROWN_ONE_WAS()
+    // **The recount at a collection is what makes the schedule honest**, so an object on a kept table
+    // must charge what its first field used to, and dropping it must give all of it back.
+    reset_vm()
+    reset_heap()
+    collect_now()
+    small_objects(200)
+    collect_now()
+
+    val start = current().payload
+
+    small_objects(200)
+
+    assert(current().payload > start, "objects made on kept tables are charged")
+
+    collect_now()
+    assert_eq(current().payload, start, "and a collection gives every byte back")
+end A_KEPT_TABLE_IS_CHARGED_AS_PAYLOAD_EXACTLY_AS_A_GROWN_ONE_WAS
+
+@test
+A_HEAP_BEING_DISPOSED_KEEPS_NOTHING_AND_TOUCHES_NO_OTHER_VM()
+    // **The finalizers of a disposed heap run with THAT VM entered**, so `finalize_object` asks
+    // whether that VM is sweeping -- and a VM being disposed is not. Disposed from outside, the
+    // question would be asked of whichever VM this thread was in, which is the one that must not grow.
+    reset_vm()
+    reset_heap()
+    collect_now()
+
+    val outer = current().spare_entries.len()
+
+    var second = new_vm(1048576)
+    val was = enter(&second)
+
+    small_objects(100)
+    collect_now()
+
+    val kept = current().spare_entries.len()
+
+    small_objects(100)
+    leave(was)
+
+    assert(kept >= 100, "the second VM's own sweep kept its tables")
+
+    // **The VM this thread is left in is made to look mid-sweep**, which is what the MAIN VM is at
+    // any moment on another thread when an actor's thread disposes its own heap. A dispose that
+    // asked `current()` from out here would keep the disposed heap's tables in it.
+    current().sweeping = true
+    dispose_vm(&second)
+    current().sweeping = false
+
+    assert_eq(second.spare_entries.len(), 0, "a disposed VM holds no kept tables")
+    assert_eq(current().spare_entries.len(), outer, "and the VM this thread is in kept none of the disposed heap's")
+end A_HEAP_BEING_DISPOSED_KEEPS_NOTHING_AND_TOUCHES_NO_OTHER_VM
+
+@test
+EVERY_KIND_NUMBER_HAS_A_WORD_OF_ITS_OWN_AND_ZERO_HAS_NONE()
+    // **A call site remembers a kind as a number** (`method_kind_code`), and the method tables are
+    // keyed on the word -- so two numbers sharing a word, or a number with none, would be a site
+    // remembering one kind's builtin for another.
+    var seen: Buf[string] = buf()
+
+    for code in 1u32..<24u32
+        val word = kind_word(code)
+
+        assert(word != "", s"kind ${code} has a word")
+
+        for i in 0..<seen.len()
+            assert(seen.at(i) != word, s"kind ${code} shares the word `${word}`")
+
+        seen.push(word)
+
+    assert_eq(kind_word(0), "", "kind 0 is a value with no methods")
+    assert_eq(kind_word(24), "", "and a number past the last kind is too")
+    assert_eq(method_kind_code(Int(1)), method_kind_code(Real(2.5)), "an integer and a real are one kind")
+    assert_eq(kind_word(method_kind_code(str_counted("x", 1))), "string", "a string is `string`")
+end EVERY_KIND_NUMBER_HAS_A_WORD_OF_ITS_OWN_AND_ZERO_HAS_NONE
