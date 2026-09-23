@@ -35,13 +35,20 @@ enum Signal
     // being looked up when the fault is reported. A `Signal` outlives the statement that raised it —
     // an unhandled rejection is reported after the loop has drained, by which time the machine is
     // somewhere else entirely — so the file has to be captured where the span was.
-    // **`value` is what a `catch` BINDS, where the fault carries one.** `throw v` of anything that is
-    // not a string carries `v` itself, so a handler can sort faults by what went wrong rather than by
-    // reading a sentence -- `catch NotFound(id)` is the pattern a `match` arm would be. `None` is the
-    // other kind of fault: one the machine raised, and a `throw` of a string, both of which a `catch`
-    // is handed as the object `fault_value` builds. `message` is filled either way, being what a
-    // diagnostic says when nothing catches this.
-    Fail(at: Span, src: usize, message: string, value: Option[Value])
+    //
+    // **`carried` names what a `catch` BINDS, where the fault carries a value.** `throw v` of anything
+    // that is not a string carries `v` itself, so a handler can sort faults by what went wrong rather
+    // than by reading a sentence -- `catch NotFound(id)` is the pattern a `match` arm would be. Zero is
+    // the other kind of fault: one the machine raised, and a `throw` of a string, both of which a
+    // `catch` is handed as the object `fault_value` builds. `message` is filled either way, being what
+    // a diagnostic says when nothing catches this.
+    //
+    // **The value is NOT in the variant, and that is a measurement.** A `Value` here made `Fail` the
+    // widest variant by forty-eight bytes, so every `Step` -- which every arm of the instruction loop
+    // answers, fault or no fault -- nearly doubled, and the whole benchmark suite ran 18% slower for a
+    // feature only a `throw` uses. `carried` is an index into the VM's `carried` table (`carry` below),
+    // and it and `src` are 32 bits each so that the pair takes the one word `src` alone used to.
+    Fail(at: Span, src: u32, carried: u32, message: string)
 
     // `exit(n)` on its way out of everything.
     //
@@ -87,7 +94,7 @@ type Step = Result[Value, Signal]
 //
 // **This is the ONE place a `Fail` is built**, which is what lets it learn the current file without
 // 116 call sites saying so. `Fail` is otherwise only ever matched on.
-failure(at: Span, message: string) -> Signal = Fail(at, current().current_source, message, None)
+failure(at: Span, message: string) -> Signal = failure_in(at, current().current_source, message, None)
 
 fault(at: Span, message: string) -> Step = Err(failure(at, message))
 
@@ -96,7 +103,63 @@ fault(at: Span, message: string) -> Step = Err(failure(at, message))
 // **`message` is the sentence the value renders to** and is what an uncaught fault says; the value is
 // what a `catch` binds. Both are filled here so that nothing downstream has to decide which of them a
 // fault has.
-value_failure(at: Span, message: string, v: Value) -> Signal = Fail(at, current().current_source, message, Some(v))
+value_failure(at: Span, message: string, v: Value) -> Signal = failure_in(at, current().current_source, message, Some(v))
+
+// A fault raised in a named file, carrying a value or not -- what a promise's rejection becomes again
+// on the machine that awaited it, and what every other constructor here comes down to.
+failure_in(at: Span, src: usize, message: string, thrown: Option[Value]) -> Signal
+    val carried = thrown match
+        Some(v) -> carry(v)
+        None -> 0
+
+    Fail(at, u32(src), carried, message)
+end failure_in
+
+// Which file a fault was raised in, as the index every other signal's `src` is.
+fail_source(src: u32) -> usize = usize(src)
+
+// Put a thrown value in the VM's `carried` table and answer the number a `Fail` names it by.
+//
+// **Numbered from one, so that zero is "carries nothing"** and a fault the machine raised costs no
+// table at all. A freed entry is reused before the table grows, so a program that throws and catches
+// in a loop holds one entry however long it runs.
+carry(v: Value) -> u32
+    val vm = current()
+
+    if vm.carried_free.len() > 0
+        val i = vm.carried_free.at(vm.carried_free.len() - 1)
+
+        vm.carried_free.truncate(vm.carried_free.len() - 1)
+        vm.carried.set(i, v)
+        return u32(i + 1)
+
+    vm.carried.push(v)
+    u32(vm.carried.len())
+end carry
+
+// The value a fault carries, taken OUT of the table -- which is what the one reader that consumes a
+// fault does: the `catch` that binds it, the promise it rejects, the release that drops it.
+//
+// **Taken exactly once.** A `Signal` is copied freely while it travels, but only its last stop reads
+// the value, so the entry is freed here and the number goes back for reuse. An entry nobody takes --
+// a fault that ends the program -- stays a root until the VM's heap is given back, which is harmless:
+// the program has stopped.
+take_carried(id: u32) -> Option[Value]
+    if id == 0 then return None
+
+    val vm = current()
+    val i = usize(id) - 1
+    val v = vm.carried.at(i)
+
+    vm.carried.set(i, Null)
+    vm.carried_free.push(i)
+    Some(v)
+end take_carried
+
+// Forget every carried value, which is what giving the heap back does to everything else that held one.
+forget_carried()
+    current().carried.clear()
+    current().carried_free.clear()
 
 // **WHAT A THROWN VALUE MEANS IS DECIDED HERE AND NOWHERE ELSE**, because `throw` is not the only way
 // a program raises one: `reject(v)` and `fail(p, v)` put the very same fault into a promise, and two
@@ -238,7 +301,7 @@ is_nullish(v: Value) -> bool = v match
 // the question. `keepable` below is the same check for a caller with no VM in hand.
 keepable_on(vm: *Vm, v: Value, at: Span, what: string) -> Result[unit, Signal]
     if is_absent(v)
-        return Err(Fail(at, vm.current_source, s"this field is not there, and `undefined` cannot be ${what} -- give it a value with `??`, or ask `has` first", None))
+        return Err(failure_in(at, vm.current_source, s"this field is not there, and `undefined` cannot be ${what} -- give it a value with `??`, or ask `has` first", None))
 
     Ok(())
 end keepable_on
@@ -354,7 +417,7 @@ signal_span(s: Signal) -> Span = s match
 // **Zero for the ones that carry no place**, which is the entry: a `break` outside a loop is a
 // complaint about the program the user named, and there is nowhere better to point.
 signal_source(s: Signal) -> usize = s match
-    Fail(_, src, _, _) -> src
+    Fail(_, src, _, _) -> fail_source(src)
     Quit(_, src, _) -> src
     Skip(_, src, _) -> src
     _ -> 0
@@ -392,7 +455,7 @@ local_source_of(file: string) -> usize
 end local_source_of
 
 signal_message(s: Signal) -> string = s match
-    Fail(_, _, m, _) -> m
+    Fail(_, _, _, m) -> m
     Ret(_) -> "`return` outside a function"
     Brk -> "`break` outside a loop"
     Cont -> "`continue` outside a loop"
