@@ -63,6 +63,25 @@ private field_here(o: *ObjectObj, at: usize, name: string, h: u64) -> Option[Val
         _ -> None
 end field_here
 
+// `field_here` for the name at place `k` in the unit's table, compared where it stands.
+//
+// **THE NAME IS NEVER TAKEN OUT OF THE TABLE, AND THAT IS WHAT THIS FORM IS FOR.** `u.strings.at(k)`
+// hands back a sysl `string` by value, which retains it on the way out and releases it at the end of
+// whatever held it -- two counted writes on every field read and every method call, to compare a
+// few bytes. Reading `elems[k]` in the comparison itself touches the bytes and nothing else. The
+// bounds check `at` made is not lost: `k` is an operand the compiler interned, as is `h` beside it.
+private field_named(o: *ObjectObj, at: usize, u: *Unit, k: usize, h: u64) -> Option[Value]
+    if at >= o.entries.len() then return None
+
+    val e = o.entries.at(at)
+
+    if e.dead || e.hash != h then return None
+
+    e.key match
+        Str(p) -> if p.s == u.strings.elems[k] then Some(e.value) else None
+        _ -> None
+end field_named
+
 // Write over the value at this position, where the entry there is a live one whose key is this
 // name, and say whether it was.
 //
@@ -89,27 +108,52 @@ end set_here
 // A field and whether it came from a PROTO, with one site's memory in front of the search.
 //
 // **`field_from`'s answer exactly**, which is the contract: this is that function with the two
-// searches it makes given a place to start, and every path through it ends in the same pair.
-field_from_site(o: *ObjectObj, name: string, h: u64, at: Span, u: *Unit, c: usize) -> Result[(Value, bool), Signal]
+// searches it makes given a place to start, and every path through it ends in the same pair. The
+// name is its place `k` in the unit's table, taken out only where a search has to be made.
+//
+// **A PROTO HIT IS ONE LOOK, AND WHAT MAKES IT ONE IS THE OBJECT'S KEY SUMMARY.** A method reached
+// through a proto may only stand where the object itself has no field of that name, and no
+// remembered position can say that an object LACKS something -- but `keys_bloom` can, in one shift
+// and one `and`, and it answers exactly: every key a table ever took set its bit (`entry_push`), and
+// nothing clears one short of emptying the table. So an object that GAINS a field of this name
+// since the site last hit -- the one change that would make the remembered answer wrong -- has its
+// bit set by that very write, and the next look at this site goes the long way and finds it. A
+// field REMOVED since leaves its bit standing, which costs the search and never an answer. Nothing
+// else needs noticing: the hop and the hit are each checked where they stand, so a proto replaced,
+// a method reassigned or a table rehashed is a remembered position that misses.
+//
+// **The receiver is `true` on this path without asking what the name is**, where the walk asks
+// `name != "new"`: a constructor is the one name the receiver rule does not reach, and a site whose
+// name hashes as `new` does is sent the long way before anything is compared.
+field_from_site(o: *ObjectObj, k: usize, at: Span, u: *Unit, c: usize) -> Result[(Value, bool), Signal]
+    val h = u.string_hashes.at(k)
     val site = u.site_caches.at(c)
 
-    // The object's own field, where this site found it last time.
-    field_here(o, site.own, name, h) match
-        Some(v) -> return Ok((v, false))
-        None -> ()
+    if obj_lacks(o, h)
+        if h != u.new_hash
+            field_here(o, site.hop, "proto", u.proto_hash) match
+                Some(Object(p)) ->
+                    field_named(p, site.up, u, k, h) match
+                        Some(v) -> return Ok((v, true))
+                        None -> ()
+                _ -> ()
+    else
+        // The object's own field, where this site found it last time.
+        field_named(o, site.own, u, k, h) match
+            Some(v) -> return Ok((v, false))
+            None -> ()
 
-    // The object's own table for real. **This is also the witness a delegated answer needs**: a
-    // method reached through a proto may only stand where the object itself has no field of that
-    // name, and no remembered position can say that an object LACKS something. `obj_index_hashed`
-    // is what makes asking cheap -- the summary of the keys refuses the commonest case, which is a
-    // method call, without touching the table at all.
+    val name = u.strings.at(k)
+
+    // The object's own table for real, which the summary could not settle.
     obj_index_hashed(o, name, h) match
         Some(ix) ->
             u.site_caches.set(c, SiteCache(ix, site.hop, site.up, site.kind, site.native))
             return Ok((obj_value_at(o, ix), false))
         None -> ()
 
-    // One hop up, where this site found both halves last time.
+    // One hop up, where this site found both halves last time -- reached here where the summary
+    // could not rule the name out of the object's own table and the search just did.
     field_here(o, site.hop, "proto", u.proto_hash) match
         Some(Object(p)) ->
             field_here(p, site.up, name, h) match
@@ -132,13 +176,16 @@ end field_from_site
 //
 // **Nothing is remembered for kind `0`** -- an external, an actor, a message -- nor for a name the
 // kind does not answer, whose sentence is `builtin_receiver`'s to write every time it is asked.
-builtin_from_site(target: Value, name: string, at: Span, u: *Unit, c: usize) -> Result[(Value, bool), Signal]
+//
+// **The name is its place `k` in the unit's table and is taken out only where the tables are
+// asked**, so a hit reads no string at all.
+builtin_from_site(target: Value, k: usize, at: Span, u: *Unit, c: usize) -> Result[(Value, bool), Signal]
     val kind = method_kind_code(target)
     val site = u.site_caches.at(c)
 
     if kind != 0 && site.kind == kind then return Ok((Native(site.native), true))
 
-    val found = builtin_receiver(target, name, at)?
+    val found = builtin_receiver(target, u.strings.at(k), at)?
 
     if kind != 0
         found.0 match
@@ -196,7 +243,6 @@ end walked_protos
 // is what lets a builtin kind's property be read through a window rather than through a buffer.
 read_field_site(target: Value, u: *Unit, k: usize, c: usize, at: Span) -> Step = target match
     Object(fields) ->
-        val name = u.strings.at(k)
         val h = u.string_hashes.at(k)
 
         // **THE COMMONEST READ ANY PROGRAM MAKES IS A FIELD THE OBJECT ITSELF HAS, standing where
@@ -211,13 +257,13 @@ read_field_site(target: Value, u: *Unit, k: usize, c: usize, at: Span) -> Step =
         // store an absence in a field, so the branch is never taken -- which is exactly the kind of
         // claim that stops being true quietly, and this path would then answer `undefined` where the
         // slow one answers a `get` property or a complaint.
-        field_here(fields, u.site_caches.at(c).own, name, h) match
+        field_named(fields, u.site_caches.at(c).own, u, k, h) match
             Some(v) -> if !is_absent(v) then return Ok(v)
             None -> ()
 
-        val found = field_from_site(fields, name, h, at, u, c)?
+        val found = field_from_site(fields, k, at, u, c)?
 
-        if is_absent(found.0) then return read_field_absent(target, fields, name, at)
+        if is_absent(found.0) then return read_field_absent(target, fields, u.strings.at(k), at)
 
         Ok(found.0)
     other -> read_field_of_kind(other, u.strings.at(k), at, true)
