@@ -62,6 +62,11 @@ same pair of binaries, on a box at 89% idle with `pgrep -x java` empty.
 | sorting | +4.0% | +3.2% |
 | **geometric mean, all twenty-three** | **−4.09%** | **−3.69%** |
 
+**After merging dev `386d133`** (the call-path item, which touched `run_frames.sysl` and `code.sysl`)
+both binaries were rebuilt and measured a third time, control `386d133` against the merged branch,
+92% idle: **`options` 493 → 285 ms, −42.2%; geometric mean −4.16%** (`fib` −5.9%, `dispatch` −4.8%,
+`startup` −4.4%, `strindex` −3.4%; nothing slower than `branches` +1.9%).
+
 **`options` goes 505 → 297 ms, which is all of the matcher share the profile named and then some** —
 the 40% the profile priced was the matcher's frames, and the stack traffic and placeholder pushes
 around them came off with it. The shortlist's ceiling for the mean was ~2%; the rest of the table moves
