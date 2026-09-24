@@ -156,6 +156,29 @@ AN_ABSENCE_IS_REFUSED_WHEREVER_IT_STANDS_AMONG_THE_ARGUMENTS() =
     assertEq(three(1, 2, 3), 6)
     assertEq(Tripled(1).plus(2), 5)
 
+@test
+A_CALL_OF_PROVEN_ARGUMENTS_STILL_REFUSES_THE_ONE_IT_COULD_NOT_PROVE() =
+    // **A call whose every argument is a literal, an operator's answer or a local skips the refusal
+    // on the machine**, which is sound only while any argument that COULD be an absence keeps it --
+    // so each read that can answer one stands beside proven arguments, first and last, on a
+    // function and on a method, with the sentence the unproven call has always said.
+    val o = anything({ a: 1 })
+    val k = 2
+
+    assertFaults(() -> three(o.nope, 2, 3), "cannot be passed to a function")
+    assertFaults(() -> three(1, k + 1, o.nope), "cannot be passed to a function")
+    assertFaults(() -> three(1, k, o?.nope), "cannot be passed to a function")
+    assertFaults(() -> handsOn(), "cannot be passed to a function")
+    assertFaults(() -> Tripled(1).plus(o.nope), "cannot be passed to a function")
+
+    // The controls: the proven calls themselves answer.
+    assertEq(three(1, k, k * 2), 7)
+    assertEq(three(o.a, s"${k}".length, -k), 0)
+    assertEq(Tripled(k).plus(k + 1), 9)
+
+// A parameter nobody gave, passed straight on: a parameter is the one local that may be an absence.
+handsOn(p?) = three(1, 2, p)
+
 three(a, b, c) = a + b + c
 
 class Tripled
