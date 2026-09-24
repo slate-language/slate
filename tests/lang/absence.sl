@@ -140,3 +140,123 @@ WHAT_THE_RULE_ALLOWS_STILL_RUNS() =
         x -> "matched"
 
     assertEq(seen, "matched")
+
+// -- a return is a keeping place ------------------------------------------------------------------
+//
+// An absence handed back would be bound, passed or stored by the caller, one frame away from the read
+// that made it -- so a function may not answer one, by a `return` or by falling out of its body.
+
+@test
+A_return_REFUSES_AN_ABSENCE() =
+    assertFaults(() -> returnsField({}), refused("returned"))
+    assertFaults(() -> returnsBare({}), refused("returned"))
+
+returnsField(o)
+    return o.nope
+
+returnsBare(o) = o.nope
+
+@test
+FALLING_OUT_OF_A_BLOCK_BODY_REFUSES_AN_ABSENCE() =
+    assertFaults(() -> fallsOut({}), refused("returned"))
+
+fallsOut(o)
+    val n = 1
+    o.nope
+
+@test
+A_LAMBDA_AND_A_METHOD_REFUSE_AN_ABSENCE() =
+    val read = o -> o.nope
+
+    assertFaults(() -> read({}), refused("returned"))
+    assertFaults(() -> Holder().missing(), refused("returned"))
+
+class Holder
+    var kept = 1
+    missing(self) = self.nope
+
+@test
+A_PARAMETER_NOBODY_GAVE_MAY_NOT_BE_HANDED_BACK() =
+    assertFaults(() -> echoes(), refused("returned"))
+    assertEq(echoesOrNull(), null)
+
+echoes(b?) = b
+
+echoesOrNull(b?) = b ?? null
+
+@test
+async AN_ASYNC_BODY_REJECTS_WITH_THE_SAME_SENTENCE() =
+    val said = (await answersLater({})) catch e -> e.message
+
+    assertEq(said, refused("returned"))
+
+async answersLater(o) = o.nope
+
+@test
+A_GENERATORS_return_REFUSES_AN_ABSENCE() =
+    val g = endsAbsent({})
+
+    assertEq(g.next().value, 1)
+    assertFaults(() -> g.next(), refused("returned"))
+
+endsAbsent(o) =
+    yield 1
+    return o.nope
+
+@test
+A_return_OF_A_yield_RESUMED_WITH_NOTHING_NAMES_THE_GENERATOR() =
+    val g = handsBack()
+
+    g.next()
+    assertFaults(() -> g.next(), "this generator was resumed with nothing, and `undefined` cannot be kept -- give the `yield` a value with `??`, or call `next(v)`")
+
+handsBack() =
+    return yield 1
+
+@test
+THE_REFUSAL_IS_MADE_INSIDE_THE_FUNCTION_SO_ITS_OWN_catch_SEES_IT() =
+    assertEq(recovers({}), "recovered")
+
+recovers(o)
+    try
+        return o.nope
+    catch e
+        "recovered"
+
+@test
+A_using_IS_RELEASED_ONCE_WHEN_A_return_IS_REFUSED() =
+    val log = []
+
+    assertFaults(() -> returnsInUsing(log, {}), refused("returned"))
+    assertEq(log, ["released"])
+
+returnsInUsing(log, o)
+    using r = { dispose: () -> push(log, "released") }
+    return o.nope
+
+@test
+A_RESULT_ANNOTATION_AND_A_POSTCONDITION_SAY_returned_FIRST() =
+    assertFaults(() -> annotated({}), refused("returned"))
+    assertFaults(() -> promised({}), refused("returned"))
+
+annotated(o) -> integer
+    return o.nope
+
+promised(o)
+    ensure result != null
+    return o.nope
+
+@test
+WHAT_A_FUNCTION_MAY_HAND_BACK_INSTEAD() =
+    // `??` resolves the absence where it is read, and `null` is the value that means nothing.
+    assertEq(orNull({}), null)
+    assertEq(orDefault({}), 0)
+    assertEq(nothing(), null)
+
+orNull(o) = o.nope ?? null
+
+orDefault(o)
+    return o.nope ?? 0
+
+nothing()
+    return

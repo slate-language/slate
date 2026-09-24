@@ -420,11 +420,10 @@ Where a call the checker could not see gives too few, the parameters nobody fill
 
 ```slate
 call1(g) = g(1)
-second(a, b) = b
 
-print(call1(second) == null)
-print(call1(second) ?? "gone")
-print(if call1(second) then "yes" else "no")
+print(call1((a, b) -> b == null))
+print(call1((a, b) -> b ?? "gone"))
+print(call1((a, b) -> if b then "yes" else "no"))
 ```
 
 ```output
@@ -434,8 +433,8 @@ no
 ```
 
 **And it goes no further than the read.** An absence cannot be stored in a container, bound to a
-name or passed on to another function, so a function that puts an unfilled parameter into an array
-faults there rather than carrying the hole along — which is the rule that keeps `undefined` from
+name, passed on to another function or returned, so a function that puts an unfilled parameter into
+an array or hands it back faults there rather than carrying the hole along — which is the rule that keeps `undefined` from
 surfacing far from where it came.
 
 ## Destructuring parameters

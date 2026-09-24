@@ -108,9 +108,16 @@ A_NAMED_ARGUMENT_CALL_DROPS_A_SURPLUS_POSITIONAL_ONE() =
 A_PARAMETER_THE_CALL_LEFT_OUT_READS_AS_AN_ABSENCE() =
     // **It is the very value a missing field reads as**, so everything that resolves one resolves
     // this: it is `null` to `==`, `??` puts a value in its place, and a test reads it as false.
-    assert(anything(second)(1) == null)
-    assertEq(anything(second)(1) ?? "gone", "gone")
-    assertEq(if anything(second)(1) then "yes" else "no", "no")
+    assertEq(anything(secondIsNull)(1), true)
+    assertEq(anything(secondOr)(1), "gone")
+    assertEq(anything(secondTested)(1), "no")
+
+    // And like a missing field it may be read but not handed back.
+    assertFaults(() -> anything(second)(1), "`undefined` cannot be returned")
+
+secondIsNull(a, b) = b == null
+secondOr(a, b) = b ?? "gone"
+secondTested(a, b) = if b then "yes" else "no"
 
 @test
 A_PARAMETER_PAST_THE_LAST_ARGUMENT_READS_AS_ONE_WHEREVER_IT_IS_READ() =
@@ -118,7 +125,8 @@ A_PARAMETER_PAST_THE_LAST_ARGUMENT_READS_AS_ONE_WHEREVER_IT_IS_READ() =
     // hold an absence is left to the frame, which is laid with one in every cell a call did not
     // fill -- so what a function of three called with two finds in its third parameter is what this
     // asks for, at the seam a program can see.
-    assert(twoArgs(third) == null)
+    assertEq(twoArgs((a, b, c) -> c == null), true)
+    assertFaults(() -> twoArgs(third), "`undefined` cannot be returned")
     assertEq(twoArgs((a, b, c) -> c ?? "none"), "none")
     assertEq(twoArgs((a, b, c) -> if c then "yes" else "no"), "no")
 

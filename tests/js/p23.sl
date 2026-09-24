@@ -43,9 +43,12 @@ print(anything(held)(1, 2))
 
 // -- a parameter nobody gave reads as an absence ---------------------------------------------------
 
-print(anything(second)(1) == null)
-print(anything(second)(1) ?? "absent")
-print(if anything(second)(1) then "yes" else "no")
+print(anything((a, b) -> b == null)(1))
+print(anything((a, b) -> b ?? "absent")(1))
+print(anything((a, b) -> if b then "yes" else "no")(1))
+
+// Handing one back is refused at the `return`, in the same words on both.
+print(anything(second)(1) catch e -> e.message)
 
 // **And it goes no further than the read**, which is slate's own rule and is untouched: passing one
 // on or putting one in a container is refused where it is attempted.
