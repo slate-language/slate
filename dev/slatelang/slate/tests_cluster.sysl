@@ -1,8 +1,11 @@
 module dev.slatelang.slate
 @tests
 
+import sh.sysl.libuv
+import sh.sysl.libuv.Handle
+import sh.sysl.libuv.Stream
 import sysl.buf.{Buf, buf}
-import sysl.text.Search
+import sysl.text.{Search, from_utf8}
 
 // `slate:cluster` -- the refusals, and the WORKER half, which no supervisor test can reach.
 //
@@ -277,6 +280,92 @@ A_SUBSCRIBER_THAT_IS_NOT_A_FUNCTION_IS_REFUSED()
     val (printed, _) = over_a_channel(program, supervisor_says(extra))
 
     assert(printed.contains("a subscriber is a function"), printed)
+
+// -- a connection handed over just before the worker is told to go ------------------------------------
+
+// **The supervisor's side of a roll, with a REAL connection crossing the channel**: the handshake, the
+// answer to the worker's `serve`, one accepted connection carried by a `connection` message, and then
+// `shutdown` -- all written before the worker starts, so they arrive in one read, which is the tightest
+// the timing can be. `request` is what the client has already sent on that connection, or "" for one
+// that never speaks. Answers what the worker printed and what the client was sent.
+private handed_then_shutdown(program: string, request: string) -> (string, string)
+    val (ours, theirs) = ipc_end()
+    val (server, client, conn) = connected_tcp()
+
+    var reply: Buf[u8] = buf()
+    val heard = &reply
+    var ended = false
+    val over = &ended
+
+    client.read_start((r) -> r match
+        Data(bytes) ->
+            for b in bytes do heard.push(b)
+        End -> *over = true
+        Failed(_) -> *over = true).expect("the client is read")
+
+    if request.len > 0
+        client.write(request.bytes).expect("the request is sent")
+
+    val mark = "{\"$" + "cluster\": "
+
+    ours.write((mark + "\"id\", \"id\": 7, \"scheduling\": \"roundRobin\"}\n").bytes).expect("queued")
+    ours.write((mark + "\"listening\", \"req\": 1, \"port\": 45123}\n").bytes).expect("queued")
+    ours.write_handle((mark + "\"connection\", \"port\": 45123}\n").bytes, conn, (r) ->
+        r.expect("the handle was sent")
+        conn.close()).expect("the message is queued")
+    ours.write((mark + "\"shutdown\"}\n").bytes).expect("queued")
+    ours.shutdown().expect("this side says it has finished")
+    libuv.set_env(ChannelVariable, s"${theirs}").expect("the descriptor is named")
+
+    val said = out(ClusterImport + program)
+
+    libuv.unset_env(ChannelVariable).expect("the name is taken back")
+    pump_until(() -> *over)
+    ours.close(() -> ())
+    server.close()
+    client.close()
+    libuv.default_loop().run(libuv.RUN_NOWAIT).expect("the closes finish")
+
+    (said, from_utf8(reply.view()).unwrap_or(""))
+end handed_then_shutdown
+
+// An application that does what a real one does in `onShutdown`: marks itself as draining, and from
+// then on answers a request as a server that is going away (a real one says `503`; the words are
+// what the test reads). It prints whether `onShutdown` waited out the ceiling.
+private val Draining: string =
+    "import { monotonic, millis } from slate:time\n" +
+    "cluster({}, async w ->\n" +
+    "    var stopping = false\n" +
+    "    val t0 = monotonic()\n" +
+    "    w.onShutdown(() ->\n" +
+    "        stopping = true\n" +
+    "        print(\"draining\", monotonic() >= t0 + millis(200)))\n" +
+    "    await w.serve(0, req -> if stopping then \"going away\" else \"served\"))\n"
+
+@test
+A_REQUEST_HANDED_OVER_BEFORE_THE_SHUTDOWN_IS_SERVED_BEFORE_onShutdown_RUNS()
+    // **The exact fix for a roll, rather than a wait long enough to usually be enough.** The request
+    // is in the socket before the worker starts and `shutdown` arrives in the same read as the
+    // connection, so an `onShutdown` run at once would set `stopping` before the request is read and
+    // the client would be told `503`. The worker waits for the handed connection to be heard -- and
+    // no longer: `draining` says `false`, well inside the ceiling.
+    set_program_command("", "")
+
+    val (said, reply) = handed_then_shutdown(Draining, "GET / HTTP/1.1\r\nHost: h\r\n\r\n")
+
+    assert_eq(said, "draining false")
+    assert(reply.contains("served"), reply)
+
+@test
+A_HANDED_CONNECTION_THAT_NEVER_SPEAKS_HOLDS_onShutdown_ONLY_AS_LONG_AS_THE_CEILING()
+    // **The other end of the bound**: a connection that says nothing is waited for `HandOffMillis`,
+    // then `onShutdown` runs, and the close lets the connection go -- the worker still ends.
+    set_program_command("", "")
+
+    val (said, reply) = handed_then_shutdown(Draining, "")
+
+    assert_eq(said, "draining true")
+    assert_eq(reply, "")
 
 // -- what the machine says about itself ---------------------------------------------------------------
 

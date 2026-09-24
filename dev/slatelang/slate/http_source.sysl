@@ -312,6 +312,13 @@ http_head_source() -> string = raw"""
     // what `close(server)` does to the half that is left -- it ends the connections this server
     // accepted and is what lets a worker exit.
     //
+    // **`heard()` answers a promise that settles once every connection handed over so far has had its
+    // first request put to the handler, or has ended without one.** It is what a worker being retired
+    // waits on before it runs the program's `onShutdown`: a connection the supervisor handed it a
+    // moment before the retirement has crossed the channel, but its request is still in the socket,
+    // and an application that marks itself as draining in `onShutdown` would otherwise answer that
+    // request as a server that is going away -- a request the client sent in good time, refused.
+    //
     // **A NAME OF ITS OWN RATHER THAN AN OPTION ON `serve`.** `serve(handler, { adopt: true })` would
     // make the first argument sometimes a port and sometimes a function, which is exactly the
     // overload `serveStream` was split out to avoid; and `handle(conn, handler)` as a bare function
@@ -336,6 +343,30 @@ http_head_source() -> string = raw"""
         // connection cannot arrive before `listen` has answered**, so nothing reads it while it is
         // still empty.
         var portKey = ""
+
+        // How many accepted connections have not yet had a request put to the handler nor ended, and
+        // the `heard()` promises waiting for that to reach nought.
+        var unheard = 0
+        var hearing = []
+
+        heard()
+            val p = pending()
+
+            if unheard == 0 then settle(p, null) else hearing.push(p)
+
+            p
+
+        // One connection has been heard from, or has gone without a word.
+        spokeOnce()
+            unheard = unheard - 1
+
+            if unheard == 0
+                val waiting = hearing
+
+                hearing = []
+
+                for p in waiting
+                    settle(p, null)
 
         if !(called is function) then throw "`serve` needs a function to call with each request, or an object with a `handle` that is one"
 
@@ -377,9 +408,22 @@ http_head_source() -> string = raw"""
             // server has not been closed.
             var hushing = null
 
+            // Whether this connection still counts in `unheard`. **Every way it can stop counting
+            // goes through `spoke`**, and each may happen more than once -- a first request that is
+            // also the connection's last reaches both the handler and `retire` -- so it is a latch.
+            var silent = true
+
+            unheard = unheard + 1
+
+            spoke()
+                if silent
+                    silent = false
+                    spokeOnce()
+
             hush()
                 hushing = null
 
+                spoke()
                 shutSocket(conn)
 
             // **A CONNECTION THAT HAS NOT SPOKEN YET IS NOT IDLE, AND CLOSING THE SERVER GIVES IT
@@ -394,7 +438,13 @@ http_head_source() -> string = raw"""
             startHushing()
                 if hushing == null then hushing = setTimeout(hush, DrainMillis)
 
-            val slot = { finish: startHushing, retire: () -> retire(portKey, key) }
+            // `spoke` is what a speaker calls as it puts a request to the handler; `retire` counts
+            // too, since a connection that ends has nothing left to say.
+            leave()
+                spoke()
+                retire(portKey, key)
+
+            val slot = { finish: startHushing, spoke: spoke, retire: leave }
 
             enrol(portKey, key, slot)
 
@@ -632,6 +682,10 @@ http_head_source() -> string = raw"""
                 // connection because it costs a cached read and nothing else, and a connection
                 // holding a stale copy is a thing to keep in step.
                 req.address = remoteAddress(conn)
+
+                // Counted as heard in the same turn the handler is called, so nothing waiting on
+                // `heard()` runs before the handler has seen the request.
+                slot.spoke()
 
                 try
                     reply = await called(req)
@@ -987,7 +1041,7 @@ http_head_source() -> string = raw"""
 
             // `dispose` is `close` under the name a `using` looks for, which every built-in
             // resource answers to now.
-            return { handle: accept, close: () -> shutConns(key), dispose: () -> shutConns(key) }
+            return { handle: accept, heard: heard, close: () -> shutConns(key), dispose: () -> shutConns(key) }
 
         val sock = listen(port, accept)
 
