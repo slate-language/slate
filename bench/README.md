@@ -283,6 +283,17 @@ geomean                                                                         
 | yardstick | lua | node --jitless | CPython | QuickJS-ng | Ruby (no JIT) | PHP (no JIT) | LuaJIT `-joff` |
 |---|---|---|---|---|---|---|---|
 | **geomean, slate / it** | **1.2x** | **0.9x** | **0.6x** | **0.8x** | **0.6x** | **1.0x** | **1.6x** |
+| **0.1.7 release** (PGO `pgo/slate`, tag `v0.1.7`) | **0.8x** | **0.6x** | **0.4x** | **0.5x** | **0.4x** | **0.6x** | **1.1x** |
+
+**The 0.1.7 row is not taken like the row above it, so the two cannot be compared.** It is the
+release's own PGO binary, `bench/run.sh -n 5 pgo/slate` under `caffeinate -dimsu`, started at 91%
+idle with no JVM running, at the `v0.1.7` tag (dev `09ca84a`). The row above is a plain
+`sysl build .` binary of an earlier dev, and a PGO binary runs about 20% faster across the board.
+The 0.1.6 release measured 0.9x lua, 0.7x node-jl, 0.5x py and 0.5x qjs; it had no Ruby, PHP or
+LuaJIT yardsticks. At 0.1.7, slate is still behind LuaJIT's interpreter on 16 rows, behind PHP on 9,
+behind Lua on 15, behind `node --jitless` on 4 (`calls`, `options`, `fields`, `alloc`), behind
+QuickJS on 3 (`startup`, `strindex`, `strwalk`), and behind CPython on 1 (`csv`). It is behind Ruby
+on none. The whole table is in the v0.1.7 release notes.
 
 **What the three new columns say.** Ruby's interpreter is the mainstream peer closest to slate in
 shape and slate is already **faster than it** (0.6x) on all but the call-heavy programs (`funcs`,
