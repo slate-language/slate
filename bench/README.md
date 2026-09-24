@@ -1,7 +1,7 @@
 # The benchmarks, and what the first profile says
 
-Twenty-three programs, each written four times -- in slate, in Lua, in JavaScript and in Python -- and
-a profiler for the interpreter that runs them. **Nothing here makes slate faster.** It exists so that
+Twenty-three programs, each written six times -- in slate, in Lua, in JavaScript, in Python, in Ruby
+and in PHP -- and a profiler for the interpreter that runs them. **Nothing here makes slate faster.** It exists so that
 the next thing that does can be chosen from a number rather than from an opinion, and so that the
 claim afterwards can be checked.
 
@@ -12,6 +12,29 @@ second is a stack machine with a much larger object model, which is the other di
 its compilers on is reported in its own column and is **not** a yardstick; it is there because
 slate's own JavaScript back end runs under exactly that.
 
+**Seven yardsticks, every one an interpreter with no compiler behind it**: `lua`, `node --jitless`,
+`python3`, `qjs`, and since 2026-09-24 `ruby`, `php` and `luajit -joff`.
+
+- **`ruby` is CRuby 4.0 with YJIT and ZJIT off** (`--disable=yjit,zjit`, also the default). Ruby
+  is the mainstream language closest to slate in shape -- dynamically typed, garbage collected,
+  everything an object, closures everywhere -- and it ships its JIT opt-in, so the interpreter is
+  what most Ruby runs on.
+- **`php` is PHP 8.5 with its JIT off** (`-d opcache.jit=0 -d opcache.jit_buffer_size=0`, also the
+  default, and the CLI does not load opcache at all). It is the fastest mainstream hand-tuned C
+  interpreter, and it too ships with its JIT off.
+- **`luajit -joff` is LuaJIT 2.1's interpreter**: a hand-written assembly register machine. It is on
+  the page as the CEILING for an interpreter, not as a peer -- what the design space allows when
+  every instruction is written by hand. It runs the Lua twins unchanged, all but one:
+  `strwalk.luajit.lua` exists because LuaJIT is Lua 5.1 and has no `utf8` library, and both scripts
+  prefer a `<name>.luajit.lua` where there is one. LuaJIT's numbers are all doubles, which every
+  answer here fits in exactly.
+
+**`ruby --yjit` and `luajit` with its trace compiler on are reported beside `node`**, in the
+non-yardstick group, to say what each one's own JIT buys it. `RUBY`, `PHP` and `LUAJIT` name the
+binaries where they are not the defaults (`/opt/homebrew/opt/ruby/bin/ruby`, `php`, `luajit`) --
+macOS's own `/usr/bin/ruby` is years old and is never the one meant. All three came from Homebrew
+(`sudo -n -u work -H /opt/homebrew/bin/brew install ruby php luajit` on this machine).
+
 ## Running them
 
 ```
@@ -20,8 +43,8 @@ bench/run.sh ./slate
 bench/run.sh -n 9 --tsv ./slate arith fib mapset
 ```
 
-`check.sh` runs all four implementations of all twenty-two and diffs every answer against
-`expected.txt`. **A twin that has drifted from its slate program shows up there** -- a loop bound
+`check.sh` runs all six implementations of all twenty-two -- the Lua twins twice, once under `lua`
+and once under `luajit -joff` -- and diffs every answer against `expected.txt`. **A twin that has drifted from its slate program shows up there** -- a loop bound
 edited on one side, a 1-based index off by one, an integer that stopped being exact in a double --
 rather than as a benchmark that quietly measures something else.
 
@@ -83,7 +106,7 @@ caffeinate -dimsu ./slate bench/profile.sl --out=bench/results/profile.md
 
 | file | what it is for |
 |---|---|
-| `startup` | a program that does nothing, in each of the four |
+| `startup` | a program that does nothing, in each of the six |
 | `arith` | a tight integer loop: two locals read and written per turn, nothing else |
 | `reals` | the same loop over reals, which is the other number type slate carries |
 | `globals` | `arith`'s loop at MODULE level, where the names cannot be slots |
@@ -111,14 +134,19 @@ caffeinate -dimsu ./slate bench/profile.sl --out=bench/results/profile.md
 short enough that slate finishes in a couple. **`strindex` and `strwalk` are deliberately outside
 that band, and `strwalk` is the one benchmark here Lua is not a yardstick for** -- Lua has no
 character indexing at all, so its own twin is quadratic in the same way slate's used to be, which the
-twin's header says. `strindex` is the ASCII case: sized
-for Lua it would run for hours under slate, and sized for slate the other three finish before their
+twin's header says. **The same is true of Ruby and PHP**: Ruby's `s[i]` on text that is not ASCII
+and PHP's `mb_substr` both count from the front, so their twins are quadratic too. LuaJIT's twin is
+the exception in the other direction -- with no `utf8` library at all it keeps a byte cursor, which
+is linear, and its header says why. `strindex` is the ASCII case: sized
+for Lua it would run for hours under slate, and sized for slate the others finish before their
 own start-up is over. That gap is the measurement.
 
 **Every twin says in its header where it differs from the slate program** -- Lua has no set, no
 destructuring and no `match`; JavaScript has one number type and sorts by string unless told
 otherwise; Python's integers are arbitrary precision and its `+=` on a string may be linear where
-everybody else's is quadratic. Where a language cannot do the same thing, the twin does the nearest
+everybody else's is quadratic; a PHP array is one type for lists and maps, so `mapset`'s map and set
+are two arrays PHP keeps as plain vectors; Ruby and PHP both compile a `case`/`match` over string
+literals to a hash lookup, which is the dispatch `dispatch.sl` anticipates. Where a language cannot do the same thing, the twin does the nearest
 honest thing and says so rather than the slate program being bent to match.
 
 ## Current measured position
@@ -170,9 +198,9 @@ through `Buf.at` on the hot path.
 **Nothing in `dev/` changed for either of these tables.** The whole of this section is `package.hocon`
 plus a newer compiler.
 
-### The CURRENT measured position: dev `0669746`, sysl 0.0.123 — `bench/run.sh -n 5`
+### The measured position at dev `0669746`, sysl 0.0.123 — `bench/run.sh -n 5`
 
-**This is the table to read.** It is dev `0669746`, which already carries shortlist items 3
+**Superseded by the seven-yardstick table below (2026-09-24).** It is dev `0669746`, which already carries shortlist items 3
 (`vm-param`) and 4 (`inline-caches`) on top of the 0.0.122 table above, plus item 1
 ([`sysl-0-0-123`](results/2026-09-21-sysl-0-0-123.md), struck through above): the compiler alone
 moved this same commit **-16.6%** on the alternating best-of-9. Full detail, and the alternating
@@ -212,6 +240,63 @@ fresh `bench/run.sh -n 5` at dev `b3f22f1` (`0669746` plus only doc/bench commit
 
 (Read this table's Lua/node/CPython columns as their own wall-clock milliseconds — `bench/run.sh`'s
 raw output — not as ratios; the geomean row is the ratio.)
+
+### The CURRENT measured position, 2026-09-24: dev `504cfb2`, seven yardsticks — `bench/run.sh -n 5`
+
+**This is the table to read.** A plain `sysl build .` of dev `504cfb2` (thin LTO, no profile — the
+shipped tarball is PGO and runs faster), `bench/run.sh -n 5 ./slate` under `caffeinate -dimsu`,
+started at 87.5% idle with no JVM running. Another session's sbt started for the last ~37 s of the
+run, so `sorting`, `csv` and `branches` may carry a little of it; a first run that sbt overlapped
+from its 27th second gave the same seven geometric means to the tenth. Ruby 4.0.7 (YJIT and ZJIT
+off), PHP 8.5.10 (JIT off), LuaJIT 2.1 `-joff`; `node+jit`, `ruby+yj` (`--yjit`) and `lj+jit`
+(LuaJIT with its trace compiler) are context, not yardsticks. Every column is milliseconds, best of
+five; the ratios are slate's time over each yardstick's, so below 1.0x slate is faster.
+
+```
+              slate      lua  node-jl   python      qjs     ruby      php luajit-i   node+jit  ruby+yj   lj+jit      /lua   /node     /py    /qjs   /ruby    /php   /lj-i
+startup         4.3      1.8     14.8     13.3      2.1     24.4     31.3      1.7       14.9     24.0      1.7      2.4x    0.3x    0.3x    2.0x    0.2x    0.1x    2.6x
+arith         115.3     49.0    114.1    310.6    126.3    174.2     80.4     93.2       27.6    172.7     17.3      2.4x    1.0x    0.4x    0.9x    0.7x    1.4x    1.2x
+reals         226.8     54.3    135.7    251.1    132.1    323.7     86.6     68.3       29.3    323.6     18.4      4.2x    1.7x    0.9x    1.7x    0.7x    2.6x    3.3x
+globals       148.3    102.3     78.3    394.9     62.3    296.9     68.3    101.3       26.6    310.1      9.6      1.4x    1.9x    0.4x    2.4x    0.5x    2.2x    1.5x
+funcs         135.5     54.1    107.1    170.1    118.2    110.4     87.8     36.5       22.5     93.8      5.0      2.5x    1.3x    0.8x    1.1x    1.2x    1.5x    3.7x
+fib           269.1     85.5    180.8    228.4    205.9    221.4    187.8     76.1       43.7     78.4     17.8      3.1x    1.5x    1.2x    1.3x    1.2x    1.4x    3.5x
+calls         225.1    181.9    110.7    165.8    202.2    138.3    110.2     97.9       28.3    105.5      4.8      1.2x    2.0x    1.4x    1.1x    1.6x    2.0x    2.3x
+methods       278.7    161.2    231.8    215.5    226.8    176.2    130.7     95.4       20.0    100.1      3.7      1.7x    1.2x    1.3x    1.2x    1.6x    2.1x    2.9x
+closures      120.2     49.9     82.8    142.7     92.3    118.1     85.0     33.8       21.0    108.3      6.7      2.4x    1.5x    0.8x    1.3x    1.0x    1.4x    3.6x
+nested        226.8    132.8    483.8    210.6    558.4    245.6    149.6     65.1       27.2    204.5      9.2      1.7x    0.5x    1.1x    0.4x    0.9x    1.5x    3.5x
+loops         128.3    120.7    560.1    163.6    689.7    219.5    133.6     63.5       34.7    240.4     14.5      1.1x    0.2x    0.8x    0.2x    0.6x    1.0x    2.0x
+options       281.9    101.1    148.5    294.7    223.1    274.4    163.8     57.0       29.5    176.8      3.4      2.8x    1.9x    1.0x    1.3x    1.0x    1.7x    4.9x
+fields        142.2     67.6    100.6    254.8    107.9    266.6    110.7     40.8       25.3    222.7      4.7      2.1x    1.4x    0.6x    1.3x    0.5x    1.3x    3.5x
+alloc         192.9    163.7     89.9    233.2    217.6    163.2    101.4    106.0       22.6    164.0     16.8      1.2x    2.1x    0.8x    0.9x    1.2x    1.9x    1.8x
+arrays        184.7     94.5    164.4    201.4    158.4    196.9     81.6    299.1       44.5    160.3     14.2      2.0x    1.1x    0.9x    1.2x    0.9x    2.3x    0.6x
+mapset         71.4     17.4     85.4    106.6   3458.1    103.5     47.2     13.4       33.6    103.7      3.9      4.1x    0.8x    0.7x    0.0x    0.7x    1.5x    5.3x
+dispatch      240.6     90.7    150.5    218.2    279.9    172.5    118.9     59.7       22.5    182.0     12.1      2.7x    1.6x    1.1x    0.9x    1.4x    2.0x    4.0x
+strings        12.9    376.0     25.7    650.9     17.1    974.4    648.6    997.3       22.2    964.0    834.0      0.0x    0.5x    0.0x    0.8x    0.0x    0.0x    0.0x
+strindex        5.1      2.4     18.0     14.2      2.8     26.2     32.0      2.0       16.1     26.3      1.8      2.1x    0.3x    0.4x    1.8x    0.2x    0.2x    2.5x
+strwalk         6.3    149.1     17.7     14.1      2.9     74.0    290.6      3.0       16.3     74.3      2.0      0.0x    0.4x    0.4x    2.2x    0.1x    0.0x    2.1x
+sorting       113.5    599.6    827.5    392.1   1175.2    234.0    261.5    586.1      557.6    233.5    605.2      0.2x    0.1x    0.3x    0.1x    0.5x    0.4x    0.2x
+csv           162.2    309.9    147.1     98.6    181.0    197.0     86.4    237.4      115.2    185.6    239.5      0.5x    1.1x    1.6x    0.9x    0.8x    1.9x    0.7x
+branches      232.9    115.9    326.2    406.2    455.7    213.5    128.9    228.7      219.3    213.4     64.7      2.0x    0.7x    0.6x    0.5x    1.1x    1.8x    1.0x
+geomean                                                                                                              1.2x    0.9x    0.6x    0.8x    0.6x    1.0x    1.6x
+```
+
+| yardstick | lua | node --jitless | CPython | QuickJS-ng | Ruby (no JIT) | PHP (no JIT) | LuaJIT `-joff` |
+|---|---|---|---|---|---|---|---|
+| **geomean, slate / it** | **1.2x** | **0.9x** | **0.6x** | **0.8x** | **0.6x** | **1.0x** | **1.6x** |
+
+**What the three new columns say.** Ruby's interpreter is the mainstream peer closest to slate in
+shape and slate is already **faster than it** (0.6x) on all but the call-heavy programs (`funcs`,
+`fib`, `calls`, `methods`, `alloc` at 1.2–1.6x) — which is also where YJIT buys Ruby the most
+(`fib` 221 → 78 ms, `methods` 176 → 100). PHP with its JIT off is **level** (1.0x): it wins
+arithmetic, arrays, method calls and objects (a packed array; declared properties are slots), and loses
+where slate's builtins do the work (`strings`, `sorting`, `strwalk`). LuaJIT's hand-written
+interpreter is the ceiling at **1.6x** — 3.5–5x on calls, options, dispatch and `mapset`, which is
+the measure of what an assembly register machine buys over a sysl `match`. Several rows are not like
+for like and each twin's header says why: `strwalk`'s LuaJIT twin is linear where Lua's, Ruby's and
+PHP's are quadratic; PHP's `mapset` never hashes (its keys make both arrays plain vectors); Ruby and
+PHP compile `dispatch`'s string `case`/`match` to a hash lookup; and `strings` is the naive
+`out = out + …` form in every language, which costs Ruby, PHP, CPython and both Luas 0.4–1 s and slate
+and the JavaScript engines 13–26 ms.
 
 ## The ranked shortlist for 0.0.58 and after
 
