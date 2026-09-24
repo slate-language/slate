@@ -102,7 +102,7 @@ Against the yardsticks, `bench/run.sh -n 9` on each binary:
 ## The witness
 
 `SLATE_PROFILE` on a `--features profile` build: `mapset` executes 26,011,038 instructions on dev
-and 18,011,038 on the branch — `LoadSlot2` 4,002,000 → 2,000, `PushInt` and `Rem` 4,000,003 → 3,
+and 18,011,037 on the branch — `LoadSlot2` 4,002,000 → 2,000, `PushInt` and `Rem` 4,000,003 → 3,
 `SlotIntRem` 0 → 4,000,000, and the 4,000,000 `Discard`s stepped over rather than dispatched.
 `bench/check.sh pgo/slate`: all four runtimes' answers unchanged. The branch's profile of `mapset`
 has no `obj_put`, no `Buf.at.string` and no atomic in the builtin path; what is left is the
