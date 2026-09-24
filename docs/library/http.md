@@ -77,11 +77,16 @@ channel().onMessage((m, conn) ->
     if conn != null then app.handle(conn))
 ```
 
-- **`adopt(handler)` and `adopt(handler, onUpgrade)` answer `{ handle, close, dispose }`.**
+- **`adopt(handler)` and `adopt(handler, onUpgrade)` answer `{ handle, heard, close, dispose }`.**
   `handle(conn)` takes one connection, which is node's `server.emit("connection", socket)`; `close()`
   ends the connections this server accepted, which is what `close(server)` does to the half an
   adopting server has, and `dispose` is that same function under the name
   [`using`](../reference/statements.md) looks for.
+- **`heard()` answers a promise that settles once every connection handed over so far has had its
+  first request put to the handler, or has ended without one** — at once, if there is none. It is what
+  a [cluster](cluster.md) worker told to leave waits on before it runs `onShutdown`, so a request
+  handed to it a moment earlier is answered by the application and not by one that has started
+  draining.
 - **Everything below the accept is the code that answers an ordinary request** — the parser,
   keep-alive, the idle clock, the upgrade, `h2` over ALPN, the response writer. `serve` is this plus a
   listening socket.
