@@ -3,6 +3,7 @@ module dev.slatelang.slate
 
 import sysl.buf.{Buf, buf}
 import sysl.text.Search
+import sysl.text.replace_all
 
 // What `fuse` in `emit.sysl` writes into a chunk, and what the fused arms in `run_fused.sysl` do
 // with it.
@@ -564,3 +565,119 @@ A_FAULT_IN_A_FOLDED_WALK_QUOTES_THE_FOR()
     assert(said.contains("`for` walks an array"), said)
     assert(said.contains("for x in xs"), said)
 end A_FAULT_IN_A_FOLDED_WALK_QUOTES_THE_FOR
+
+// -- a counted loop at the top of a file, over module-level `var`s -----------------------------------
+
+// `Counting` with its function taken away: the same loop over two cells instead of two slots.
+private const TopCounting: string = "var t = 0\nvar i = 0\n\nwhile i < 10\n    t = t - 2\n    i = i + 1\n\nprint(t)"
+
+@test
+A_COUNTED_LOOP_AT_THE_TOP_OF_A_FILE_FOLDS_AS_A_FUNCTIONS_DOES()
+    val names = every_name(TopCounting)
+
+    assert_eq(out(TopCounting), "-20")
+    assert_eq(how_many(names, "TickCellIntLess"), 1, "`while i < 10` over a cell did not fold its head")
+    assert_eq(how_many(names, "CellIntAddStoreJump"), 1, "`i = i + 1` over a cell did not fold with the back edge")
+    assert_eq(how_many(names, "SubStoreCell"), 1, "`t = t - 2` did not fold its store into the cell")
+
+    // **The same shape `fuse` promises for slots**: every slot of a run stays standing and its inner
+    // pairs are folded where they stand, so a jump into one finds the pair form.
+    assert(always_followed_by(names, "TickCellIntLess", "LoadCellInt"), "a cell loop head does not stand over its read")
+    assert(always_followed_by(names, "LoadCellInt", "PushInt"), "a cell read stands over no literal")
+    assert(always_followed_by(names, "LessJumpIfFalse", "JumpIfFalse"), "a comparison stands over no jump")
+    assert(always_followed_by(names, "CellIntAddStoreJump", "PushInt"), "a cell loop tail does not stand over its literal")
+    assert(always_followed_by(names, "AddStoreCell", "StoreCell"), "a sum stands over no cell write")
+    assert(always_followed_by(names, "SubStoreCell", "StoreCell"), "a difference stands over no cell write")
+end A_COUNTED_LOOP_AT_THE_TOP_OF_A_FILE_FOLDS_AS_A_FUNCTIONS_DOES
+
+@test
+A_SUM_INTO_ANOTHER_MODULE_VARIABLE_IS_ONE_INSTRUCTION_AND_A_PRODUCT_IS_LEFT_TO_IT()
+    // `t = t + i` is not an increment of one cell, so it is the pair and not the tail; and
+    // `t = t + i * 2` leaves its product to the pair, which writes the cell without pushing.
+    val program = "var t = 0\nvar u = 0\nvar i = 0\n\nwhile i < 4\n    i = i + 1\n    t = t + i\n    u = u + i * 2\n\nprint(t)\nprint(u)"
+    val names = every_name(program)
+
+    assert_eq(out(program), "10\n20")
+    assert_eq(how_many(names, "CellIntAddStoreJump"), 0, "a sum into another variable was folded as an increment")
+    assert(how_many(names, "AddStoreCell") >= 3, "the three sums into cells did not all fold their writes")
+    assert_eq(how_many(names, "MulAdd"), 0, "a product summed into a cell was not left to the write")
+end A_SUM_INTO_ANOTHER_MODULE_VARIABLE_IS_ONE_INSTRUCTION_AND_A_PRODUCT_IS_LEFT_TO_IT
+
+@test
+A_MODULE_LOOP_WHOSE_SPELLINGS_A_FUNCTION_REBINDS_GOES_BACK_TO_THE_LOOKUP_WHOLE()
+    // **Every run and pair over a cell covers a site `settle_module_defs` may put back**, and a head's
+    // `Tick` and a pair's `Add`/`Sub` stand in FRONT of the site they cover -- so the put-back has to
+    // undo them too, or the fused head would go on reading a cell nothing writes any more.
+    val program = "var t = 0\nvar i = 0\n\nwhile i < 5\n    t = t - i\n    t = t + 0\n    i = i + 1\n\nown() =\n    var t = 100\n    var i = 9\n    t + i\n\nprint(t + i + own())"
+    val names = every_name(program)
+
+    assert_eq(out(program), "104")
+    assert_eq(how_many(names, "TickCellIntLess"), 0, "a rebound spelling kept its folded loop head")
+    assert_eq(how_many(names, "CellIntAddStoreJump"), 0, "a rebound spelling kept its folded loop tail")
+    assert_eq(how_many(names, "AddStoreCell"), 0, "a rebound spelling kept its folded sum")
+    assert_eq(how_many(names, "SubStoreCell"), 0, "a rebound spelling kept its folded difference")
+    assert_eq(how_many(names, "LoadCellInt"), 0, "a rebound spelling kept its folded read")
+end A_MODULE_LOOP_WHOSE_SPELLINGS_A_FUNCTION_REBINDS_GOES_BACK_TO_THE_LOOKUP_WHOLE
+
+@test
+A_STEP_TOO_WIDE_FOR_SIXTEEN_BITS_IS_LEFT_TO_THE_PAIRS_AT_THE_TOP_OF_A_FILE_TOO()
+    val narrow = "var i = 0\n\nwhile i < 100000\n    i = i + 32767\n\nprint(i)"
+    val wide = "var i = 0\n\nwhile i < 100000\n    i = i + 32768\n\nprint(i)"
+
+    assert_eq(how_many(every_name(narrow), "CellIntAddStoreJump"), 1, "the widest step that fits was not folded")
+    assert_eq(how_many(every_name(wide), "CellIntAddStoreJump"), 0, "a step too wide for the payload was folded")
+    assert_eq(out(narrow), "131068")
+    assert_eq(out(wide), "131072")
+end A_STEP_TOO_WIDE_FOR_SIXTEEN_BITS_IS_LEFT_TO_THE_PAIRS_AT_THE_TOP_OF_A_FILE_TOO
+
+@test
+A_FAULT_IN_A_FOLDED_MODULE_LOOP_QUOTES_THE_INSTRUCTION_IT_BELONGS_TO()
+    // Each run carries its first slot's span, and a slow path reads back the one it owes: the `<`
+    // for a head, the `+` for a tail, the `-` for a difference.
+    val head = fails("anything(v) = v\n\nvar i = anything({})\n\nwhile i < 3\n    i = 4\n\nprint(i)")
+
+    assert(head.contains("while i < 3"), head)
+
+    val tail = fails("anything(v) = v\n\nvar s = anything(\"a\")\n\nwhile s != \"b\"\n    s = s + 1\n\nprint(s)")
+
+    assert(tail.contains("does not apply to a string and an integer"), tail)
+    assert(tail.contains("s = s + 1"), tail)
+
+    val difference = fails("anything(v) = v\n\nvar t = 1\n\nt = t - anything({})\nprint(t)")
+
+    assert(difference.contains("t = t - anything({})"), difference)
+end A_FAULT_IN_A_FOLDED_MODULE_LOOP_QUOTES_THE_INSTRUCTION_IT_BELONGS_TO
+
+@test
+A_FOLDED_MODULE_LOOP_ANSWERS_WHAT_THE_SAME_LOOP_IN_A_FUNCTION_ANSWERS()
+    // **The slow paths are the unfused instructions**, so a string joined by `+`, a real, and a sum
+    // that leaves sixty-four bits all come out as they do from slots.
+    top_and_inside("var s = \"\"\nvar i = 0\nwhile i < 3\n    s = s + \"ab\"\n    i = i + 1\n", "s")
+    top_and_inside("var r = 0.5\nvar i = 0\nwhile i < 3\n    r = r + 1\n    i = i + 1\n", "r")
+    top_and_inside("var i = 9223372036854775806\nvar n = 0\nwhile n < 2\n    n = n + 1\n    i = i + 1\n", "i")
+    top_and_inside("var t = 9223372036854775806\nvar i = 0\nwhile i < 2\n    t = t + 1\n    i = i + 1\n", "t")
+    top_and_inside("var t = -9223372036854775807\nvar i = 0\nwhile i < 2\n    t = t - 1\n    i = i + 1\n", "t")
+end A_FOLDED_MODULE_LOOP_ANSWERS_WHAT_THE_SAME_LOOP_IN_A_FUNCTION_ANSWERS
+
+// The same lines run at the top of a file and again as a function's body, which must print alike.
+// `lines` is written with no blank line in it, so indenting it is one replacement per newline.
+private top_and_inside(lines: string, answer: string)
+    val top = out(lines + "print(" + answer + ")")
+    val inside = out("f() =\n    " + replace_all(lines, "\n", "\n    ") + answer + "\n\nprint(f())")
+
+    assert_eq(top, inside)
+end top_and_inside
+
+@test
+AN_ABSENCE_WRITTEN_TO_A_MODULE_VARIABLE_IS_REFUSED_IN_THE_SAME_WORDS()
+    val said = fails("anything(v) = v\n\nvar n = 0\n\nn = anything({}).missing\nprint(n)")
+
+    assert(said.contains("this field is not there, and `undefined` cannot be written to `n` -- give it a value with `??`, or ask `has` first"), said)
+end AN_ABSENCE_WRITTEN_TO_A_MODULE_VARIABLE_IS_REFUSED_IN_THE_SAME_WORDS
+
+@test
+A_MODULE_LOOP_HEAD_COLLECTS_AND_ANSWERS_WITH_A_SMALL_HEAP()
+    val counted = out_in_small_heap(Allocating + "var t = 0\nvar i = 0\n\nwhile i < 3000\n    deep(60)\n    t = t + i\n    i = i + 1\n\nprint(t)")
+
+    assert_eq(counted, "4498500")
+end A_MODULE_LOOP_HEAD_COLLECTS_AND_ANSWERS_WITH_A_SMALL_HEAP

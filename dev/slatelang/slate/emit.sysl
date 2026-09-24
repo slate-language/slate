@@ -654,13 +654,14 @@ fuse(code: Buf[Ins]) -> Buf[Ins]
                 _ -> None
             Add -> out.at(p + 1).op match
                 StoreSlot(i) -> Some(AddStoreSlot(i))
+                StoreCell(d, k) -> Some(AddStoreCell(d, k))
                 _ -> None
 
-            // **A product summed into a local is left to `AddStoreSlot`**, which writes the cell
-            // without pushing -- so `Mul; Add; StoreSlot` stays two instructions either way, and the
-            // one that skips a push and a pop is the one kept.
+            // **A product summed into a local is left to `AddStoreSlot`** (or into a module-level
+            // `var`, to `AddStoreCell`), which writes without pushing -- so `Mul; Add; StoreSlot`
+            // stays two instructions either way, and the one that skips a push and a pop is kept.
             Mul -> out.at(p + 1).op match
-                Add -> if p + 2 < out.len() && fusing_slot_written(out.at(p + 2).op).is_some() then None else Some(MulAdd)
+                Add -> if p + 2 < out.len() && fusing_store(out.at(p + 2).op) then None else Some(MulAdd)
                 _ -> None
             TestSlots(k, first) -> out.at(p + 1).op match
                 JumpIfFalse(_) -> Some(TestSlotsJumpIfFalse(k, first))
@@ -678,6 +679,7 @@ fuse(code: Buf[Ins]) -> Buf[Ins]
                 _ -> None
             Sub -> out.at(p + 1).op match
                 StoreSlot(i) -> Some(SubStoreSlot(i))
+                StoreCell(d, k) -> Some(SubStoreCell(d, k))
                 _ -> None
             Less -> out.at(p + 1).op match
                 JumpIfFalse(to) -> Some(LessJumpIfFalse(to))
@@ -727,11 +729,17 @@ fused_run(out: *Buf[Ins], p: usize) -> usize
     // `Tick; LoadSlot`, `Tick; LoadSlot; LoadSlot` and a `for`'s `Tick; IterNext` were all built as
     // runs of their own and measured nothing (`bench/results/2026-09-23-superinstructions-3.md`).
     out.at(p).op match
-        Tick -> if five then fused_loop_head(out, p) else 0
+        Tick ->
+            if !five then return 0
+
+            val slot = fused_loop_head(out, p)
+
+            if slot > 0 then slot else fused_cell_loop_head(out, p)
         LoadSlot(i) ->
             val tail = if five then fused_loop_tail(out, p, i) else 0
 
             if tail > 0 then tail else fused_slot_rem(out, p, i)
+        LoadCell(d, _) -> if five then fused_cell_loop_tail(out, p, d) else 0
         _ -> 0
 
 // `LoadSlot(i); PushInt(v); Rem`, three slots, where the literal fits thirty-two bits.
@@ -809,6 +817,54 @@ fused_loop_tail(out: *Buf[Ins], p: usize, i: usize) -> usize
     5
 end fused_loop_tail
 
+// `Tick; LoadCell(d, k); PushInt(v); Less; JumpIfFalse(to)`: `fused_loop_head` over a module-level
+// `var`. Its inner pairs are the `LoadCellInt` at `p + 1`, which is where the arm reads the spelling
+// an empty cell falls back to, and the `LessJumpIfFalse` at `p + 3`.
+fused_cell_loop_head(out: *Buf[Ins], p: usize) -> usize
+    val v = fusing_int(out.at(p + 2).op)
+    val to = fusing_false_jump(out.at(p + 4).op)
+    val less = out.at(p + 3).op match
+        Less -> true
+        _ -> false
+
+    if !less || v.is_none() || to.is_none() then return 0
+
+    val lit = v.unwrap()
+
+    if lit < -2147483648 || lit > 2147483647 then return 0
+
+    out.at(p + 1).op match
+        LoadCell(d, k) ->
+            if d > 65535 || k > 65535 then return 0
+
+            out.set(p, Ins(TickCellIntLess(d, int(lit)), out.at(p).at))
+            out.set(p + 1, Ins(LoadCellInt(u16(d), u16(k), i32(lit)), out.at(p + 1).at))
+            out.set(p + 3, Ins(LessJumpIfFalse(to.unwrap()), out.at(p + 3).at))
+            5
+        _ -> 0
+end fused_cell_loop_head
+
+// `LoadCell(d, k); PushInt(v); Add; StoreCell(d, k); Jump(to)`, one module-level `var` read and
+// written: `fused_loop_tail` over a cell. The arm reads the spelling out of the `StoreCell` at
+// `p + 3`; its inner pair is the `AddStoreCell` at `p + 2`.
+fused_cell_loop_tail(out: *Buf[Ins], p: usize, d: u32) -> usize
+    val v = fusing_int(out.at(p + 1).op)
+    val to = fusing_jump(out.at(p + 4).op)
+    val add = out.at(p + 2).op match
+        Add -> true
+        _ -> false
+    val k = out.at(p + 3).op match
+        StoreCell(e, key) -> if e == d then Some(key) else None
+        _ -> None
+
+    if !add || v.is_none() || to.is_none() || k.is_none() then return 0
+    if d > 65535 || v.unwrap() < -32768 || v.unwrap() > 32767 || to.unwrap() > 4294967295 then return 0
+
+    out.set(p, Ins(CellIntAddStoreJump(u16(d), i16(v.unwrap()), u32(to.unwrap())), out.at(p).at))
+    out.set(p + 2, Ins(AddStoreCell(d, k.unwrap()), out.at(p + 2).at))
+    5
+end fused_cell_loop_tail
+
 // What one instruction carries, where it is the kind a run wants and `None` where it is not.
 fusing_slot_read(op: Op) -> Option[usize] = op match
     LoadSlot(i) -> Some(i)
@@ -817,6 +873,12 @@ fusing_slot_read(op: Op) -> Option[usize] = op match
 fusing_slot_written(op: Op) -> Option[usize] = op match
     StoreSlot(i) -> Some(i)
     _ -> None
+
+// Whether an instruction is a write that `Add` folds into: a local's or a module-level `var`'s.
+fusing_store(op: Op) -> bool = op match
+    StoreSlot(_) -> true
+    StoreCell(_, _) -> true
+    _ -> false
 
 fusing_int(op: Op) -> Option[long] = op match
     PushInt(v) -> Some(v)

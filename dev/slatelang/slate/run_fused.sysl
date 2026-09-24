@@ -274,3 +274,110 @@ fused_load_cell_int(u: *Unit, vm: *Machine, here: *Vm, d: usize, k: usize, v: lo
     vm.stack.push(Int(v))
     Ok(())
 end fused_load_cell_int
+
+// -- THE SAME FOR A MODULE-LEVEL `var`: its cell in `Vm.defs` where a local has its slot -------------
+//
+// **A top-level loop's names cannot be slots** -- an importer reads them by name -- so each read and
+// write is a `LoadCell`/`StoreCell`, and `bench/globals.sl`'s loop was thirteen dispatches a turn
+// where `arith.sl`'s is seven. These four are the slot runs above over a cell, and each keeps the
+// same bargain: a whole number in a FILLED cell is answered here, and everything else -- an empty
+// cell, which is a read that has run too early and takes the lookup, a sum that overflows, a value
+// that is not an integer -- runs exactly what the unfused instructions ran, with each one's own span
+// read out of the slot it stands in.
+//
+// **Each answers the `pc` the loop goes on from**, so its arm in `run_frames.sysl` is one line: that
+// file is at its thousand-line limit, and `pc` is the one piece of the loop's own state these touch.
+// `pc` is handed in as the loop holds it, one past the fused instruction -- the first slot stepped
+// over.
+
+// `Add` then `StoreCell(d, k)`.
+fused_add_store_cell(u: *Unit, here: *Vm, vm: *Machine, d: usize, k: usize, code: Code, pc: usize, at: Span) -> Result[usize, Signal]
+    val b = pop_on(vm)
+    val a = pop_on(vm)
+
+    a match
+        Int(x) -> b match
+            Int(y) ->
+                val sum = x + y
+
+                if (x ^ sum) & (y ^ sum) >= 0 && def_filled(here, d)
+                    here.defs.set(d, Int(sum))
+                    return Ok(pc + 1)
+            _ -> ()
+        _ -> ()
+
+    vm.stack.push(added(a, b, at)?)
+    compose_store_cell(u, vm, here, d, k, code.ins[pc].at)?
+    Ok(pc + 1)
+end fused_add_store_cell
+
+// `Sub` then `StoreCell(d, k)`, the same with the other operator.
+fused_sub_store_cell(u: *Unit, here: *Vm, vm: *Machine, d: usize, k: usize, code: Code, pc: usize, at: Span) -> Result[usize, Signal]
+    val b = pop_on(vm)
+    val a = pop_on(vm)
+
+    a match
+        Int(x) -> b match
+            Int(y) ->
+                val diff = x - y
+
+                if (x ^ y) & (x ^ diff) >= 0 && def_filled(here, d)
+                    here.defs.set(d, Int(diff))
+                    return Ok(pc + 1)
+            _ -> ()
+        _ -> ()
+
+    vm.stack.push(subtracted(a, b, at)?)
+    compose_store_cell(u, vm, here, d, k, code.ins[pc].at)?
+    Ok(pc + 1)
+end fused_sub_store_cell
+
+// `Tick; LoadCell(d, k); PushInt(v); Less; JumpIfFalse(to)`. The safe point is the `Tick` arm's own
+// two lines at the `Tick`'s span; the spelling, the `Less`'s span and the exit are read out of the
+// slots stepped over, and only on the path that owes them.
+fused_tick_cell_int_less(u: *Unit, here: *Vm, vm: *Machine, d: usize, v: long, code: Code, pc: usize, at: Span) -> Result[usize, Signal]
+    maybe_collect_on(here)
+
+    if here.heap_exhausted then return Err(failure(at, "this program has run out of memory"))
+
+    val cell = if d < here.defs.len() then here.defs.at(d) else Undefined
+    val goes = cell match
+        Int(x) -> x < v
+        _ ->
+            val k = code.ins[pc].op match
+                LoadCellInt(_, key, _) -> usize(key)
+                _ -> panic("a fused loop head over a cell is not standing over its LoadCellInt")
+
+            fused_load_cell_int(u, vm, here, d, k, v, code.ins[pc].at)?
+            !fused_less_jump_if_false(vm, code.ins[pc + 2].at)?
+
+    Ok(if goes then pc + 4 else fused_exit(code.ins[pc + 3].op))
+end fused_tick_cell_int_less
+
+// `LoadCell(d, k); PushInt(v); Add; StoreCell(d, k); Jump(to)`, answering `to` either way.
+fused_cell_int_add_store_jump(u: *Unit, here: *Vm, vm: *Machine, d: usize, v: long, to: usize, code: Code, pc: usize, at: Span) -> Result[usize, Signal]
+    val cell = if d < here.defs.len() then here.defs.at(d) else Undefined
+
+    cell match
+        Int(x) ->
+            val sum = x + v
+
+            if (x ^ sum) & (v ^ sum) >= 0
+                here.defs.set(d, Int(sum))
+                return Ok(to)
+        _ -> ()
+
+    val k = code.ins[pc + 2].op match
+        StoreCell(_, key) -> usize(key)
+        _ -> panic("a fused loop tail over a cell is not standing over its StoreCell")
+
+    cell match
+        Undefined -> compose_load_cell(u, vm, k, at)?
+        found -> vm.stack.push(found)
+
+    val a = pop_on(vm)
+
+    vm.stack.push(added(a, Int(v), code.ins[pc + 1].at)?)
+    compose_store_cell(u, vm, here, d, k, code.ins[pc + 2].at)?
+    Ok(to)
+end fused_cell_int_add_store_jump
