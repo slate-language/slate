@@ -326,7 +326,8 @@ dev/slatelang/slate/
     obj.sysl        the collected heap: the objects, their tracers, and the roots
     value.sysl      what a program computes with, and the scope chain
     table.sysl      the hash table an object is, and how a value is hashed
-    code.sysl       the instruction set, and the unit a program compiles to
+    code.sysl       the instruction set
+    unit.sysl       the unit a program compiles to: its chunks and their tables
     compile.sysl    the tree to instructions
     vm.sysl         the machine
     event.sysl      the event loop, over libuv: timers, and what roots a callback
