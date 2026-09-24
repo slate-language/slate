@@ -123,7 +123,9 @@ await cluster({ workers: 3 }, w ->
   `drainMillis` is killed.
 - **`SIGHUP` rolls.** The workers are replaced one at a time, and the replacement is serving before the
   one it replaces is asked to leave, so the port is never unserved — which is what a deployment does to
-  pick up new code without dropping a connection.
+  pick up new code without dropping a connection. A connection handed to a worker just before its
+  retirement is still served: the supervisor stops handing that worker connections, waits a quarter of
+  a second for what is already on its way to be read, and only then tells it to shut down.
 
 ```slate
 import { cluster } from slate:cluster

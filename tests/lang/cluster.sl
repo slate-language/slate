@@ -18,6 +18,7 @@
 
 import { cluster, isPrimary, isWorker, workerId } from slate:cluster
 import { cpus, pid, spawn } from slate:process
+import { monotonic, millis } from slate:time
 
 // A value whose type the checker cannot see, so a refusal is the machine's rather than the pass's.
 anything(v) = v
@@ -279,3 +280,47 @@ async A_SHUTDOWN_ASKED_FOR_TWICE_IS_NOT_AN_ERROR()
     await down
 
     assert(true)
+
+@test
+async A_ROLL_LEAVES_THE_OLD_WORKER_A_MOMENT_BEFORE_TELLING_IT_TO_GO()
+    // **A connection handed to a worker just before a roll is still being read when the roll reaches
+    // it**, and a worker told to drain in that window answers it as a server that is shutting down. So
+    // the supervisor waits a quarter of a second after taking the old worker out of the rotation, and
+    // only then sends `shutdown`. A shell worker exits the moment it is told, so the time from the
+    // `SIGHUP` to its exit is at least that wait; without it, it is the few milliseconds a shell takes
+    // to start and say hello.
+    var heard = []
+    var exits = []
+    var stop = null
+
+    val down = cluster({ workers: 1, exec: "/bin/sh", args: ["-c", shellWorker(publishesOnce)],
+        primary: sup ->
+            stop = sup.shutdown
+
+            sup.subscribe("t", v -> heard.push(v))
+            sup.onWorkerExit(e -> exits.push(e)) },
+        w -> null)
+
+    val first = await until(() -> heard.length == 1, 8000)
+    val began = monotonic()
+
+    await spawn("/bin/sh", ["-c", "kill -HUP $PPID"]).value.exited
+
+    val rolled = await until(() -> exits.length == 1, 8000)
+    val took = monotonic() - began
+    val second = heard.length
+
+    stop()
+
+    await down
+
+    assert(first)
+    assert(rolled)
+
+    // The replacement said hello before the old one was asked to leave.
+    assertEq(second, 2)
+
+    // The old worker was TOLD, not killed, and only after the wait.
+    assertEq(exits[0].id, 1)
+    assertEq(exits[0].signal, null)
+    assert(took >= millis(250))
