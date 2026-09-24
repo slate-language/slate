@@ -1,0 +1,220 @@
+module dev.slatelang.slate
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// Three things a loop used to redo on every turn and now remembers: the string cell a literal is
+// (`literal.sysl`), where a class keeps its `new` (`class_call.sysl`), and what a builtin's spelling
+// holds (`LoadFree`, `defs.sysl`). What these pin is that each memory is right in the case where it
+// WOULD have gone stale -- a table emptied between runs, a collection, a `new` written over or moved,
+// a spelling the file turns out to bind. The same answers as a running program sees them, on both
+// back ends, are `tests/lang/construction.sl`.
+
+// How many times the program's own chunks read `name` by spelling and through a free cell.
+private struct NameReads
+    by_name: usize
+    by_free: usize
+
+private name_reads(program: string, name: string) -> NameReads
+    out(program)
+
+    val u = running_unit()
+    var by_name: usize = 0
+    var by_free: usize = 0
+
+    for c in 0..<u.chunks.len()
+        val code = u.chunks.at(c).code
+
+        for i in 0..<code.len()
+            code.at(i).op match
+                LoadName(k) -> if u.strings.at(usize(k)) == name then by_name += 1
+                LoadFree(_, k) -> if u.strings.at(usize(k)) == name then by_free += 1
+                _ -> ()
+
+    NameReads(by_name, by_free)
+end name_reads
+
+// The cell literal `text` was given in the last run, if it ran.
+private literal_cell(text: string) -> Option[Value]
+    val u = running_unit()
+    val kept = current().literals
+
+    for k in 0..<u.strings.len()
+        if u.strings.at(k) == text && k < kept.len()
+            kept.at(k) match
+                Undefined -> ()
+                v -> return Some(v)
+
+    None
+end literal_cell
+
+// -- a string literal ------------------------------------------------------------------------------------
+
+@test
+A_LITERAL_THAT_RAN_IS_KEPT_AS_ONE_CELL()
+    assert_eq(out("var xs = []\nfor i in 0..<5\n    push(xs, \"zebra\")\nprint(xs.length)"), "5")
+
+    literal_cell("zebra") match
+        Some(Str(p)) ->
+            assert_eq(p.s, "zebra")
+            assert_eq(p.chars, 5, "the cell carries the count the unit interned")
+        _ -> assert(false, "the literal that ran has no cell")
+
+@test
+A_LITERAL_THAT_NEVER_RAN_HAS_NO_CELL()
+    out("f() = \"never\"\nprint(1)")
+
+    assert(literal_cell("never").is_none(), "a literal nobody ran was made anyway")
+
+@test
+A_LITERALS_CELL_OUTLIVES_A_COLLECTION()
+    out("var n = 0\nfor i in 0..<3000\n    val o = { k: \"kept\", i: i }\n    n = n + o.k.length\nprint(n)")
+    collect_now()
+
+    literal_cell("kept") match
+        Some(Str(p)) -> assert_eq(p.s, "kept", "the collection freed a literal's cell")
+        _ -> assert(false, "the literal that ran has no cell")
+
+@test
+A_NEW_RUN_STARTS_WITH_NO_LITERALS()
+    out("print(\"first\")")
+
+    assert(current().literals.len() > 0, "the run kept nothing")
+
+    reset_vm()
+
+    assert_eq(current().literals.len(), 0, "a cell outlived the unit whose numbering it is in")
+
+@test
+A_LITERAL_GROWN_ON_IS_NOT_CHANGED()
+    assert_eq(out("var s = \"\"\nfor i in 0..<40\n    val b = \"base\"\n    s = s + b\nprint(\"base\".length)\nprint(s.length)"), "4\n160")
+
+// -- a class's `new` --------------------------------------------------------------------------------------
+
+// An object whose fields are `names`, in that order, each holding `Int(i)` except `new`, which holds
+// `maker`. It is rooted on the machine's stack for the test's length.
+private table_with(names: []const string, maker: Value) -> *ObjectObj
+    val o = new_object()
+
+    machine().stack.push(Object(o))
+
+    for i in 0..<names.len
+        obj_put_name(o, names[i], if names[i] == "new" then maker else Int(long(i)))
+
+    o
+end table_with
+
+private some_native() -> Value = Native(global_native("string").unwrap())
+
+@test
+A_CONSTRUCTOR_IS_FOUND_WHEREVER_ITS_NEW_STANDS()
+    reset_vm()
+
+    val u = running_unit()
+    val f = some_native()
+    val first = table_with(["new"], f)
+    val later = table_with(["a", "b", "c", "new"], f)
+
+    assert(constructor_of(u, first).is_some())
+    assert_eq(u.new_at, 0, "the position was not remembered")
+    assert(constructor_of(u, later).is_some(), "a new at another position was missed")
+    assert_eq(u.new_at, 3)
+    assert(constructor_of(u, first).is_some(), "the first table's new was lost to the second's position")
+
+@test
+A_NEW_WRITTEN_OVER_IS_THE_ANSWER()
+    reset_vm()
+
+    val u = running_unit()
+    val o = table_with(["new"], some_native())
+
+    constructor_of(u, o)
+
+    val replaced = Native(global_native("number").unwrap())
+
+    obj_put_name(o, "new", replaced)
+
+    constructor_of(u, o) match
+        Some(Native(n)) -> assert(n == global_native("number").unwrap(), "the remembered position answered the old new")
+        _ -> assert(false, "the written-over new was not found")
+
+@test
+A_NEW_THAT_IS_NOT_CALLABLE_IS_NO_CONSTRUCTOR()
+    reset_vm()
+
+    val u = running_unit()
+    val o = table_with(["new"], Int(3))
+
+    assert(constructor_of(u, o).is_none(), "a number in `new` was taken for a constructor")
+
+    // The same through the remembered position, which is now the right one.
+    assert(constructor_of(u, o).is_none())
+
+@test
+A_NEW_REMOVED_IS_LOOKED_FOR_THROUGH_THE_PROTO()
+    reset_vm()
+
+    val u = running_unit()
+    val base = table_with(["new"], some_native())
+    val child = table_with(["new"], Int(0))
+
+    obj_remove(child, str_value("new"), point(0)) match
+        Ok(gone) -> assert(gone)
+        Err(_) -> assert(false, "the table refused the removal")
+
+    obj_put_name(child, "proto", Object(base))
+    u.new_at = 0
+
+    assert(constructor_of(u, child).is_some(), "a new supplied by the proto was not found")
+
+@test
+A_CLASS_CALLED_IN_A_LOOP_CONSTRUCTS_EVERY_TIME()
+    assert_eq(out("class C\n    var n\nvar t = 0\nfor i in 0..<100\n    t = t + C(i).n\nprint(t)"), "4950")
+
+// -- a builtin's spelling ------------------------------------------------------------------------------------
+
+@test
+A_BUILTIN_THE_FILE_NEVER_BINDS_IS_READ_THROUGH_A_CELL()
+    val r = name_reads("f(s) = number(s)\nvar t = 0\nfor i in 0..<3\n    t = t + f(\"2\")\nprint(t)", "number")
+
+    assert_eq(r.by_name, 0, "a builtin read nothing binds still looks the name up")
+    // At least once: a file's declarations are compiled into two chunks, so `f`'s body is in both.
+    assert(r.by_free >= 1, "the builtin was not read through a cell")
+    assert_eq(out("f(s) = number(s)\nvar t = 0\nfor i in 0..<3\n    t = t + f(\"2\")\nprint(t)"), "6")
+
+@test
+A_BUILTIN_SPELLING_BOUND_AFTER_ITS_READ_GOES_BACK_TO_THE_LOOKUP()
+    // The read is compiled first; the local that binds the spelling is reached later in the file.
+    val program = "f(s) = number(s)\ng() =\n    val number = (x) -> 99\n    number(1)\nprint(f(\"5\"))\nprint(g())"
+    val r = name_reads(program, "number")
+
+    assert_eq(r.by_free, 0, "a read of a spelling the file binds kept its cell")
+    assert(r.by_name >= 1)
+    assert_eq(out(program), "5\n99")
+
+@test
+A_BUILTIN_SPELLING_BOUND_BEFORE_ITS_READ_IS_NEVER_CLAIMED()
+    val program = "g(number) = number(1)\nf(s) = number(s)\nprint(g((x) -> 7))\nprint(f(\"8\"))"
+    val r = name_reads(program, "number")
+
+    assert_eq(r.by_free, 0, "a read after a binding of its spelling was claimed as free")
+    assert_eq(out(program), "7\n8")
+
+@test
+A_BUILTIN_SPELLING_WRITTEN_IS_A_LOOKUP()
+    val r = name_reads("f() = floor(2.5)\nprint(f())\nfloor = 3", "floor")
+
+    assert_eq(r.by_free, 0, "a spelling the file writes kept its cell")
+
+@test
+AN_UNBOUND_NAME_IS_REFUSED_AS_IT_ALWAYS_WAS()
+    val said = fails("f() = nosuchthing(1)\nf()")
+
+    assert(said.contains("`nosuchthing` is not defined"), said)
+
+    // Twice, so a refused read is seen to have left its cell empty rather than full of something.
+    val twice = fails("f() = nosuchthing\ng()\n    try\n        f()\n    catch e\n        1\nprint(g() + g())\nf()")
+
+    assert(twice.contains("`nosuchthing` is not defined"), twice)

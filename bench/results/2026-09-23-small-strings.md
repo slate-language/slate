@@ -8,7 +8,7 @@ byte for what is one of 128 texts. Control `8bd0c9d` (dev); branch `small-string
 ## What was built
 
 `small_str.sysl`, one field on the `Vm` (`small_strs`, 128 entries), and one line each in
-`obj.sysl`'s `reserve_spares` (a rebuilt heap empties the table) and `mark_spares` (every interned
+`obj.sysl`'s `reserve_spares` (a rebuilt heap empties the table) and `collector.sysl`'s `mark_spares` (every interned
 cell is rooted).
 
 - **The table is filled lazily**: the first time a character is asked for, its cell is made in the

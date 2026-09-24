@@ -1,0 +1,179 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// The `new` a class or a data variant ends up with, and the object it answers.
+//
+// **Split out of `declare.sysl` at the seam with the fewest crossings.** Everything here is reached
+// through one name, `make_constructor`, called once for a class and once for each variant, and it
+// reads back across for two: the `ClassBody` the members were gathered into, and `checked_value`,
+// which a field's annotation shares with a written assignment. Cutting instead at the `data` half or
+// at the member readers crossed seven names each, most of them the member readers a variant body
+// reuses. What is left in `declare.sysl` is the reading of the declarations; what is here is what
+// they are turned into once read.
+
+// The name a constructor holds the object under while it is being made.
+//
+// **Unspellable on purpose**, for the reason a destructured parameter's is: the names in a body are
+// the program's, and a synthetic one that could be written would shadow something a person wrote.
+private const Made: string = "(new)"
+
+// The object a constructor answers: every declared field it can fill, and the class as its proto.
+//
+// **The initialiser is the EXPRESSION, put here rather than evaluated once**, which is the whole of
+// what `var` buys over `val`: `var tags = []` gives every object its own array, and the same words
+// under `val` would have given them all one.
+//
+// `assigned` names the fields a parameter supplies. Anything else with an initialiser takes it, and a
+// field with neither is simply absent -- which is what a dynamically typed language has instead of
+// TypeScript's definite-assignment check, and it faults at the first read rather than at the make.
+//
+// **A generated constructor names every field, so that middle case is a written `new(var w, var h)`
+// and nothing else**: there, the fields the parameter list did not name are filled from their own
+// declarations. A generated one carries each initialiser as that parameter's default instead, which
+// runs in the head of the chunk and is the same expression evaluated the same number of times.
+// **`seal` makes the object a DATA VALUE**, which is a variant's instance and nothing else. It is a
+// parameter rather than two functions because everything else about building one is the same: the
+// fields a parameter supplies, the initialisers, and the class as the proto.
+private instance_of(cls: string, b: *ClassBody, assigned: Buf[string], at: Span, seal: bool) -> Expr
+    var keys: Buf[string] = buf()
+    var key_spans: Buf[Span] = buf()
+    var values: Buf[Expr] = buf()
+
+    for i in 0..<b.fields.len()
+        val f = b.fields.at(i)
+        var taken = false
+
+        for j in 0..<assigned.len()
+            if assigned.at(j) == f then taken = true
+
+        if taken
+            keys.push(f)
+            key_spans.push(b.field_spans.at(i))
+            values.push(expr(b.field_spans.at(i), Name(f)))
+        elif b.has_init.at(i)
+            keys.push(f)
+            key_spans.push(b.field_spans.at(i))
+
+            // A field a written `new` does not take is filled from its initialiser, and an annotated
+            // one is checked there -- a taken one is a parameter, which checks its own.
+            values.push(b.field_checks.at(i) match
+                Some(c) -> checked_value(f, b.inits.at(i), c)
+                None -> b.inits.at(i))
+
+    keys.push("proto")
+    key_spans.push(at)
+    values.push(expr(at, Name(cls)))
+
+    val made = expr(at, ObjectLit(keys, key_spans, values))
+
+    if seal then expr(at, DataLit(made)) else made
+end instance_of
+
+// The `new` a class ends up with: the one it wrote, or the one its field declarations imply.
+//
+// Not `private`: `declare.sysl` calls it once a class body or a variant body has been read, which is
+// the one way in to this file.
+make_constructor(p: *Parser, cls: string, b: *ClassBody, at: Span, seal: bool)
+    if !b.has_maker
+        // **A class that declares nothing gets no constructor**, rather than one answering an object
+        // with nothing in it. `{ proto: Square }` compiles, runs, and faults later at the first field
+        // nobody set, which moves the complaint away from the mistake -- and `{ side: 4, proto: Square }`
+        // is still how such a class is instantiated, exactly as it was before classes existed.
+        if b.fields.len() == 0 then return
+
+        // **Every declared field is a parameter: the ones with no initialiser first, then the ones
+        // with, each carrying its initialiser as its default.** A field the class gives a value may
+        // therefore be given another one at the call, which is what `Box.new(7, ["a"])` reads as in
+        // every language that has this; and leaving it out means exactly what it meant before, since
+        // a default is worked out at the call and so runs once per object.
+        //
+        // **Where an initialised field was declared first, the parameter order is NOT the declaration
+        // order**, a default having to be trailing: `var kind = "plain"` above `var side` gives
+        // `new(side, kind = "plain")`. The alternative was to refuse that class the way Python
+        // refuses the same shape in a dataclass, which would break classes that compile today to buy
+        // a rule nobody asked for.
+        //
+        // **An initialiser may read a field to its left in that order**, because the defaults are
+        // bound in order like any others -- so `var w` then `var area = w * w` works, and did not
+        // before.
+        var params: Buf[string] = buf()
+        var defaults: Buf[Expr] = buf()
+
+        for i in 0..<b.fields.len()
+            if !b.has_init.at(i) then params.push(b.fields.at(i))
+
+        for i in 0..<b.fields.len()
+            if b.has_init.at(i)
+                params.push(b.fields.at(i))
+                defaults.push(b.inits.at(i))
+
+        // Every parameter here IS a field, so the whole list is what a positional pattern names.
+        b.ctor_fields = params
+        b.ctor_positional = true
+
+        // **An annotated field is an annotated PARAMETER here**, its check at the top of the body
+        // exactly where `new(n: integer)` would have put it -- so a default is checked too, being
+        // bound before the body runs.
+        var checks: Buf[Stmt] = buf()
+
+        for i in 0..<b.fields.len()
+            b.field_checks.at(i) match
+                Some(c) -> checks.push(c)
+                None -> ()
+
+        add_maker(b, at, params, expr(at, Lambda(params, defaults, intern_body(with_checks(checks, instance_of(cls, b, params, at, seal)), false), false)))
+        return
+    end if
+
+    var assigned: Buf[string] = buf()
+
+    for i in 0..<b.maker_declares.len()
+        if b.maker_declares.at(i) then assigned.push(b.maker_params.at(i))
+
+    if assigned.len() != 0
+        // `new(var side)`: the object is made from the declarations, and the body runs for its effect
+        // with `self` bound to what is being made. That is TypeScript's constructor, and it is the
+        // one shape where a body has an object to talk about -- an ordinary `new` is called before
+        // there is one, which is why it is handed no receiver.
+        var stmts: Buf[Stmt] = buf()
+
+        // **The names are known here whatever else the constructor takes, and the POSITIONS are only
+        // known where it takes nothing else.** A positional pattern promises that it binds what the
+        // call sets: `new(var x, scale)` takes two arguments and makes an object with one field, so
+        // `Point(a, b)` could not mean what `Point.new(a, b)` means. Naming `x` is still exact, so
+        // the named form stays available and `resolve_pattern` carries the message for the other.
+        b.ctor_fields = assigned
+        b.ctor_positional = assigned.len() == b.maker_params.len()
+
+        stmts.push(stmt(b.maker_at, Val(Made, instance_of(cls, b, assigned, b.maker_at, seal))))
+        stmts.push(stmt(b.maker_at, Val("self", expr(b.maker_at, Name(Made)))))
+        stmts.push(stmt(b.maker_at, Eval(body_at(b.maker_body))))
+        stmts.push(stmt(b.maker_at, Eval(expr(b.maker_at, Name(Made)))))
+
+        add_maker(b, b.maker_at, b.maker_params, expr(b.maker_at, Lambda(b.maker_params, b.maker_defaults, intern_body(expr(b.maker_at, Block(stmts)), false), false)))
+        return
+    end if
+
+    if b.fields.len() != 0
+        p.fault(b.maker_at, s"class `${cls}` declares fields with `var`, so its `new` has to name the ones it takes -- `new(var ${b.fields.at(0)})` declares and assigns in one place, and the rest are filled from their own declarations. A `new` that builds the object itself leaves nothing to fill them")
+
+    // The plain form, which is what a class with no declared fields has: the body's value is the
+    // object, and it is given the class as its proto on the way out. **It is written to rather than
+    // copied** -- `with` would have said the same thing in one node and allocated a second object for
+    // every instance, on the one path where allocation is measured.
+    var stmts: Buf[Stmt] = buf()
+
+    stmts.push(stmt(b.maker_at, Val(Made, body_at(b.maker_body))))
+    stmts.push(stmt(b.maker_at, Assign(Tok.Assign, expr(b.maker_at, Field(expr(b.maker_at, Name(Made)), "proto", false)), expr(b.maker_at, Name(cls)))))
+    stmts.push(stmt(b.maker_at, Eval(expr(b.maker_at, Name(Made)))))
+
+    add_maker(b, b.maker_at, b.maker_params, expr(b.maker_at, Lambda(b.maker_params, b.maker_defaults, intern_body(expr(b.maker_at, Block(stmts)), false), false)))
+end make_constructor
+
+private add_maker(b: *ClassBody, at: Span, params: Buf[string], value: Expr)
+    b.keys.push("new")
+    b.key_spans.push(at)
+    b.values.push(value)
+end add_maker
