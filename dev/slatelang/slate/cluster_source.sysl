@@ -73,8 +73,8 @@ cluster_source() -> string = raw"""
     // worker runs what it registered with `onShutdown` before ending. A worker still alive after
     // `drainMillis` is killed. **`SIGHUP` rolls**: the workers are replaced one at a time, and the
     // replacement is serving before the one it replaces is asked to leave, so the port is never
-    // unserved -- and the one leaving is asked a quarter of a second after it stops being handed
-    // connections, so one it was handed just before the roll is still served.
+    // unserved -- and the one leaving runs its `onShutdown` only once every connection it was handed
+    // has had its first request put to the handler, so one handed over just before the roll is served.
 
     import { spawn, channel, cpus, exit, onSignal, offSignal } from slate:process
     import { listen, close as closeSocket, localPort } from slate:net
@@ -116,12 +116,13 @@ cluster_source() -> string = raw"""
     val RoundRobin = "roundRobin"
     val ReusePort = "reusePort"
 
-    // How long a worker being retired by a roll is left alone, once it has stopped being handed
-    // connections, before it is told to shut down. **A connection handed over a moment before the roll
-    // is still in flight**: the socket has crossed the channel but its request has not been read, and a
-    // worker told to drain in that window answers it as a server that is shutting down. A quarter of a
-    // second is `slate:http`'s `DrainMillis`, the time it gives a connection that has not spoken yet --
-    // the same question asked one process further out. Only a roll pays it; `SIGTERM` does not wait.
+    // The longest a worker told to shut down holds its `onShutdown` for a connection it was handed that
+    // has not yet said anything. **A connection handed over a moment before the shutdown is still in
+    // flight**: the socket has crossed the channel but its request has not been read, and an
+    // application that marks itself as draining would answer it as a server going away. The wait ends
+    // as soon as every such connection has been heard; this is the bound for one that never speaks. A
+    // quarter of a second is `slate:http`'s `DrainMillis`, the time it gives a connection that has not
+    // spoken yet -- the same question asked one process further out.
     val HandOffMillis = 250
 
     // `cluster(options, worker)` -- the whole of what a program writes.
@@ -434,10 +435,10 @@ cluster_source() -> string = raw"""
 
                     forgetPortsOf(old)
 
-                    // Nothing new reaches it now; what it was handed just before is still being read.
-                    await sleep(HandOffMillis)
-
-                    // A `SIGTERM` during the wait has already told it to go.
+                    // **Nothing new reaches it now, and it is told to go AT ONCE.** What it was
+                    // handed just before is ahead of the `shutdown` on the same ordered channel, and
+                    // the worker holds its `onShutdown` until each of those has been heard -- which is
+                    // exact where a wait here could only be long enough most of the time.
                     if old.child != null && !stopping
                         old.child.send({ "$cluster": "shutdown" })
 
@@ -563,6 +564,8 @@ cluster_source() -> string = raw"""
 
             closing = true
 
+            await heardOrLate()
+
             for f in shutdownFns
                 await f()
 
@@ -574,6 +577,21 @@ cluster_source() -> string = raw"""
             ch.send({ "$cluster": "drained" })
             settle(done, null)
             setTimeout(() -> exit(0), 0)
+
+        // **Every connection the supervisor handed over before `shutdown` has had its request put to
+        // the handler, or `HandOffMillis` has passed.** The channel is one ordered stream, so each
+        // `connection` sent ahead of the `shutdown` has already been handed to its server by the time
+        // this runs; what is not yet done is reading its request, which is still in the socket. An
+        // application's `onShutdown` is where it marks itself as draining, and running it first would
+        // have that request answered as one to a server going away. A connection that says nothing
+        // is waited for no longer than the ceiling, and `close` then gives it `slate:http`'s own
+        // `DrainMillis` to speak.
+        async heardOrLate()
+            val waiting = keys(apps).map(key -> apps[key].heard())
+
+            if waiting.length == 0 then return
+
+            await race([all(waiting), sleep(HandOffMillis)])
 
         told(message, conn)
             if !(message is object) || !has(message, "$cluster") then return

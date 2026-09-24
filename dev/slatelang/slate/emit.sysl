@@ -637,8 +637,12 @@ fuse(code: Buf[Ins]) -> Buf[Ins]
             continue
 
         val joined: Option[Op] = first.op match
+            // **A pair does not take the head of a run that begins in its second slot.**
+            // `m.set(i % 1000, v)` is `LoadSlot(m); LoadSlot(i); PushInt; Rem`, and pairing the two
+            // loads leaves the literal and the remainder two dispatches of their own, where leaving
+            // the first load alone lets `SlotIntRem` take the other three.
             LoadSlot(i) -> out.at(p + 1).op match
-                LoadSlot(j) -> Some(LoadSlot2(u32(i), u32(j)))
+                LoadSlot(j) -> if slot_rem_at(&out, p + 1) then None else Some(LoadSlot2(u32(i), u32(j)))
 
                 // **A LITERAL WIDER THAN THIRTY-TWO BITS IS NOT FUSED, AND THAT IS THE WHOLE OF THE
                 // RESTRICTION.** An instruction's payload is eight bytes, so a slot and a whole
@@ -677,6 +681,16 @@ fuse(code: Buf[Ins]) -> Buf[Ins]
                 _ -> None
             Less -> out.at(p + 1).op match
                 JumpIfFalse(to) -> Some(LessJumpIfFalse(to))
+                _ -> None
+
+            // **A call whose answer is only discarded is MARKED, not replaced** -- `AnswerUnused` in
+            // `code.sysl`. The `Discard` stays where it is: a builtin steps over it and every other
+            // callee returns to it.
+            CallFn(argc, names) -> out.at(p + 1).op match
+                Discard -> Some(CallFn(argc | AnswerUnused, names))
+                _ -> None
+            CallMethod(argc, w) -> out.at(p + 1).op match
+                Discard -> Some(CallMethod(argc | AnswerUnused, w))
                 _ -> None
             _ -> None
 
@@ -722,19 +736,32 @@ fused_run(out: *Buf[Ins], p: usize) -> usize
 
 // `LoadSlot(i); PushInt(v); Rem`, three slots, where the literal fits thirty-two bits.
 fused_slot_rem(out: *Buf[Ins], p: usize, i: usize) -> usize
-    if p + 2 >= out.len() || i > 4294967295 then return 0
+    if !slot_rem_at(out, p) then return 0
+
+    val v = fusing_int(out.at(p + 1).op)
+
+    // **The `Rem`'s span**, the division by zero being the one fault the three can raise.
+    out.set(p, Ins(SlotIntRem(u32(i), int(v.unwrap())), out.at(p + 2).at))
+    3
+end fused_slot_rem
+
+// Whether `fused_slot_rem` would fold the run at `p`, asked without folding it.
+slot_rem_at(out: *Buf[Ins], p: usize) -> bool
+    if p + 2 >= out.len() then return false
+
+    val i = out.at(p).op match
+        LoadSlot(i) -> i
+        _ -> return false
+
+    if i > 4294967295 then return false
 
     val v = fusing_int(out.at(p + 1).op)
     val rem = out.at(p + 2).op match
         Rem -> true
         _ -> false
 
-    if !rem || v.is_none() || v.unwrap() < -2147483648 || v.unwrap() > 2147483647 then return 0
-
-    // **The `Rem`'s span**, the division by zero being the one fault the three can raise.
-    out.set(p, Ins(SlotIntRem(u32(i), int(v.unwrap())), out.at(p + 2).at))
-    3
-end fused_slot_rem
+    rem && v.is_some() && v.unwrap() >= -2147483648 && v.unwrap() <= 2147483647
+end slot_rem_at
 
 // `Tick; LoadSlot(i); PushInt(v); Less; JumpIfFalse(to)`. Its inner pairs are the `LoadSlotInt` at
 // `p + 1` and the `LessJumpIfFalse` at `p + 3`.
