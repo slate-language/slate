@@ -4,6 +4,8 @@ import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
 // `trunc` is `Float`'s, and a trait has to be in scope for its member to be reached.
 import sysl.math.Float
+// `leading_zeros` is `Bits`', for the same reason.
+import sysl.math.Bits
 import sysl.math.bigint.from_real as big_from_real
 
 // What a hash answers with. A user-supplied `hash` can fault, so this carries the fault out.
@@ -57,6 +59,22 @@ private const Bias: usize = 2
 
 // Where an index array starts. A power of two, because the probe masks rather than divides.
 private const InitialSlots: usize = 8
+
+// 2^64 divided by the golden ratio, the multiplier `home` spreads a hash with.
+private const Golden: u64 = 0x9e3779b97f4a7c15u64
+
+// The slot a hash's probe starts at, in an index whose size is `mask + 1`.
+//
+// **THE TOP BITS OF THE HASH TIMES THE GOLDEN RATIO, NOT ITS LOW BITS** -- Knuth's multiplicative
+// hashing. It is what lets an integer hash as ITSELF (`hash_plain`): the multiples of an irrational
+// number spread as evenly as any sequence can, so a run of consecutive integers lands in distinct
+// slots with no collision at all -- which is what a map keyed `0..n` wants, and which a scrambled
+// hash under a low-bit mask can only approach with a collision about one lookup in three, each one
+// a mispredicted branch in the probe loop. A stride of any power of two spreads too, where the low
+// bits of an identity hash would put every key in one slot; so does a class's own `hash`, which is
+// whatever integer the program answered and is often exactly that kind of number.
+@inline
+private home(h: u64, mask: usize) -> usize = usize((h * Golden) >> u64(u64(mask).leading_zeros()))
 
 // How many entries a table holds before it has an index at all.
 //
@@ -147,7 +165,10 @@ private hash_plain(v: Value, depth: usize, at: Span) -> Hashed = v match
     // **An integer and a real that are numerically equal MUST hash alike**, because `==` says they
     // are equal: `1 == 1.0` is true in slate, so `t[1]` and `t[1.0]` have to find each other. A real
     // that holds an exact integer therefore hashes as that integer.
-    Int(n) -> Ok(hash_u64(u64(n)))
+    //
+    // **An integer hashes as ITSELF**, which is sound only because `home` spreads a hash by its top
+    // bits: under a low-bit mask a stride of 1024 would put every key in one slot.
+    Int(n) -> Ok(u64(n))
 
     // **It owes nothing to `Int` and everything to `Real`.** A `Big` that fits a `long` never
     // exists, so no big integer is ever equal to an `Int` and the two are free to hash by different
@@ -242,7 +263,7 @@ private hash_plain(v: Value, depth: usize, at: Span) -> Hashed = v match
 private hash_real(r: real) -> u64
     val whole = long(r)
 
-    if real(whole) == r then return hash_u64(u64(whole))
+    if real(whole) == r then return u64(whole)
 
     // **A WHOLE REAL TOO LARGE FOR A `long` IS EQUAL TO A BIG INTEGER, SO IT HASHES AS ONE.**
     // `1e30 == pow(10, 30)` -- the comparison is exact both ways -- and a table that hashed the two
@@ -318,7 +339,7 @@ private mix(a: u64, b: u64) -> u64 = hash_u64(a ^ (b + 0x9e3779b97f4a7c15u64 + (
 // and `hash_plain`'s is this line.
 @inline
 private key_hash(o: *ObjectObj, k: Value, at: Span) -> Hashed = k match
-    Int(n) -> if o.by_identity then Ok(identity_hash(k)) else Ok(hash_u64(u64(n)))
+    Int(n) -> if o.by_identity then Ok(identity_hash(k)) else Ok(u64(n))
     _ -> if o.by_identity then Ok(identity_hash(k)) else hash_value(k, at)
 
 // The hash that agrees with `identical`, which is what an identity-keyed table compares with.
@@ -362,7 +383,7 @@ private find_entry(o: *ObjectObj, k: Value, h: u64, at: Span) -> Result[Option[u
 
     val slots = o.index.len()
     val mask = slots - 1
-    var probe = usize(h) & mask
+    var probe = home(h, mask)
     var steps: usize = 0
 
     while steps < slots
@@ -401,7 +422,7 @@ end scan_entry
 private place(ix: *Buf[usize], h: u64, at: usize)
     val slots = ix.len()
     val mask = slots - 1
-    var probe = usize(h) & mask
+    var probe = home(h, mask)
 
     loop
         val slot = ix.at(probe)
@@ -469,6 +490,75 @@ obj_get(o: *ObjectObj, k: Value, at: Span) -> Found
 obj_has(o: *ObjectObj, k: Value, at: Span) -> Result[bool, Signal] = find_entry(o, k, key_hash(o, k, at)?, at)? match
     None -> Ok(false)
     Some(_) -> Ok(true)
+
+// Where an integer key already stands in an indexed table, found with no call -- or `None`, which
+// means only "ask the general road", never "absent".
+//
+// **This is `find_entry` for the one case a set or a map method meets nearly every time**, inlined
+// into the natives so that `m.set(k, v)` and `s.has(k)` on an integer key are a hash, a probe and a
+// comparison where they were a call into `obj_put` or `obj_has` and everything that function has to
+// be ready for. Everything it is not sure of it hands back: a table too small for an index (`scan_entry`
+// is the road there), one keyed by identity, a key it did not find (which the general road then
+// inserts or answers `false` for), and -- the one that matters for correctness -- an entry whose hash
+// agrees but whose key is not an integer. That is `1.0` stored and `1` asked, which `same` says is
+// the same key; answering "not found" there would put a second entry beside the first.
+@inline
+obj_int_at(o: *ObjectObj, n: long) -> Option[usize]
+    val slots = o.index.len()
+
+    if slots == 0 || o.by_identity then return None
+
+    val h = u64(n)
+    val mask = slots - 1
+    var probe = home(h, mask)
+    var steps: usize = 0
+
+    while steps < slots
+        val slot = o.index.at(probe)
+
+        if slot == Empty then return None
+
+        if slot != Dead
+            val where = slot - Bias
+            val e = o.entries.at(where)
+
+            if e.hash == h && !e.dead
+                return e.key match
+                    Int(m) -> if m == n then Some(where) else None
+                    _ -> None
+
+        probe = (probe + 1) & mask
+        steps += 1
+
+    None
+end obj_int_at
+
+// The most slots any live key of the table has to look at past its own `home` before it finds
+// itself -- nothing for a table too small to have an index.
+//
+// **The witness for `home`**, which no answer a program prints can show: a table that put every
+// key in one slot answers every lookup correctly, one probe at a time. Not `private`:
+// `tests_mapset_chain.sysl` asserts it stays small for a run of integers and for a strided one.
+longest_probe(o: *ObjectObj) -> usize
+    val slots = o.index.len()
+
+    if slots == 0 then return 0
+
+    val mask = slots - 1
+    var worst: usize = 0
+
+    for probe in 0..<slots
+        val slot = o.index.at(probe)
+
+        if slot == Empty || slot == Dead then continue
+
+        val start = home(o.entries.at(slot - Bias).hash, mask)
+        val far = (probe + slots - start) & mask
+
+        if far > worst then worst = far
+
+    worst
+end longest_probe
 
 // Write a key, keeping the position it already had if it has one.
 //
@@ -654,7 +744,7 @@ obj_drop_at(o: *ObjectObj, where: usize)
 
     val slots = o.index.len()
     val mask = slots - 1
-    var probe = usize(h) & mask
+    var probe = home(h, mask)
 
     loop
         if o.index.at(probe) == where + Bias
@@ -704,7 +794,7 @@ end scan_named
 private find_named(o: *ObjectObj, name: string, h: u64) -> Option[usize]
     val slots = o.index.len()
     val mask = slots - 1
-    var probe = usize(h) & mask
+    var probe = home(h, mask)
     var steps: usize = 0
 
     while steps < slots

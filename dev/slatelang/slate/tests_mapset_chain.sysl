@@ -1,0 +1,236 @@
+module dev.slatelang.slate
+@tests
+
+import sh.sysl.parsing.{Span}
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// A span pointing at nothing, for the calls below that want one.
+private nowhere() -> Span = Span(0, 0)
+
+// The builtin call chain a set or a map method goes through, and the table under it.
+//
+// **Four things are pinned here, one per change that made `bench/mapset.sl` cheaper**, each beside
+// the neighbouring case that still takes the long road:
+//
+// - the dispatch table calls a builtin where it stands, and a slot nobody registered still answers
+//   its sentence;
+// - an integer key is found in a set's or a map's table without a call, and hands everything it is
+//   unsure of -- `1.0` where `1` is asked, a key not there -- back to the general road;
+// - an integer hashes as itself and the probe starts from the top bits of the hash times the golden
+//   ratio, so keys a power of two apart do not pile into one slot;
+// - a call whose answer is only discarded is marked, and a builtin's answer is then never pushed.
+//
+// `tests/lang/mapchain.sl` asks the same questions of both back ends through a program.
+
+// The instructions of the largest chunk of that name -- `tests_fused.sysl`'s helper, answering the
+// instructions rather than their names, since what is asked is a bit of an operand.
+private chunk_ops(program: string, name: string) -> Buf[Op]
+    out(program)
+
+    var best: Buf[Op] = buf()
+    var found = false
+
+    for i in 0..<running_unit().chunks.len()
+        if running_unit().chunks.at(i).name != name then continue
+
+        found = true
+
+        val code = running_unit().chunks.at(i).code
+        var ops: Buf[Op] = buf()
+
+        for k in 0..<code.len()
+            ops.push(code.at(k).op)
+
+        if ops.len() > best.len() then best = ops
+
+    assert(found, s"no chunk is called `${name}`")
+    best
+end chunk_ops
+
+// How many calls in the chunk carry `AnswerUnused`, and whether each such one is followed by the
+// `Discard` it marks -- the slot a frame returns to, which must still be standing.
+private unused_calls(ops: Buf[Op]) -> usize
+    var n: usize = 0
+
+    for i in 0..<ops.len()
+        val marked = ops.at(i) match
+            CallFn(argc, _) -> argc & AnswerUnused != 0u32
+            CallMethod(argc, _) -> argc & AnswerUnused != 0u32
+            _ -> false
+
+        if !marked then continue
+
+        n += 1
+
+        val next_is_discard = if i + 1 < ops.len() then ops.at(i + 1) match
+            Discard -> true
+            _ -> false
+        else false
+
+        assert(next_is_discard, "a call marked as discarded does not stand over its `Discard`")
+
+    n
+end unused_calls
+
+// -- the dispatch table ----------------------------------------------------------------------------
+
+@test
+A_BUILTIN_ID_NOBODY_REGISTERED_STILL_SAYS_SO()
+    // **The table is filled with a function that faults, not with `None`**, so the sentence a slot
+    // with no name has always answered is now that function's -- and an id past the table's end
+    // gives the same one.
+    val window = Args(current(), 0, 0)
+
+    for f in [0u32, 1025u32, 4000u32]
+        run_native(f, window, nowhere()) match
+            Err(Fail(r, _)) -> assert(r.text.contains("never registered"), s"id ${f} said `${r.text}`")
+            _ -> assert(false, s"id ${f} did not fault")
+end A_BUILTIN_ID_NOBODY_REGISTERED_STILL_SAYS_SO
+
+@test
+A_WINDOW_CARRIES_THE_VM_ITS_ARGUMENTS_STAND_IN()
+    // `at` reads through the VM written into the window rather than through a lookup, so a window
+    // made over the running VM reads the running machine's stack.
+    val v = current()
+    val base = v.machine.stack.len()
+
+    v.machine.stack.push(Int(41))
+    v.machine.stack.push(Int(42))
+
+    val window = Args(v, base, 2)
+
+    val second = window.at(1) match
+        Int(n) -> n
+        _ -> 0
+
+    assert_eq(second, 42)
+    assert_eq(window.take(1).len(), 1usize)
+    assert(window.take(1).vm == v, "a narrowed window forgot its VM")
+
+    v.machine.stack.truncate(base)
+end A_WINDOW_CARRIES_THE_VM_ITS_ARGUMENTS_STAND_IN
+
+// -- integer keys ------------------------------------------------------------------------------------
+
+@test
+AN_INTEGER_KEY_FINDS_A_REAL_ONE_OF_THE_SAME_VALUE_IN_A_MAP_AND_A_SET()
+    // **The short road answers only what it is sure of**: a whole real stored and an integer asked
+    // hash alike, and it hands that entry to `same` rather than calling it absent -- which would
+    // put a second key beside the first.
+    val program = "val m = Map()\nvar i = 0\n\nwhile i < 40\n    m.set(i * 1.0, \"r\")\n    i = i + 1\n\nm.set(7, \"i\")\n" +
+                  "val s = Set()\ns.add(3.0)\ns.add(3)\nprint(m.size, m.get(7), m.get(8), m.has(9), s.size, s.has(3))"
+
+    assert_eq(out(program), "40 i r true 1 true")
+end AN_INTEGER_KEY_FINDS_A_REAL_ONE_OF_THE_SAME_VALUE_IN_A_MAP_AND_A_SET
+
+@test
+INTEGER_KEYS_AT_THE_EDGES_OF_A_LONG_AND_BELOW_ZERO_ARE_KEPT_APART()
+    val program = "val m = Map()\nvar i = -20\n\nwhile i < 20\n    m.set(i, i * 2)\n    i = i + 1\n\n" +
+                  "m.set(9223372036854775807, \"top\")\nm.set(-9223372036854775807 - 1, \"bottom\")\n" +
+                  "print(m.size, m.get(-20), m.get(19), m.get(-1), m.get(9223372036854775807), m.get(-9223372036854775807 - 1), m.get(20))"
+
+    assert_eq(out(program), "42 -40 38 -2 top bottom null")
+end INTEGER_KEYS_AT_THE_EDGES_OF_A_LONG_AND_BELOW_ZERO_ARE_KEPT_APART
+
+@test
+KEYS_A_POWER_OF_TWO_APART_DO_NOT_SHARE_A_SLOT()
+    // **An integer hashes as itself**, so a table that took its probe from the low bits would put
+    // every multiple of 4096 in one slot and walk them all on every lookup. Starting from the top
+    // bits of the hash times the golden ratio spreads them; what this asserts is the answers, and
+    // the bound on the count of probes is what the test after this one asserts.
+    val program = "val m = Map()\nval s = Set()\nvar i = 0\n\nwhile i < 3000\n    m.set(i * 4096, i)\n    s.add(i * 65536)\n    i = i + 1\n\n" +
+                  "var ok = 0\nvar k = 0\n\nwhile k < 3000\n    if m.get(k * 4096) == k && s.has(k * 65536) then ok = ok + 1\n    k = k + 1\n\n" +
+                  "print(ok, m.size, s.size, m.has(4095), s.has(1))"
+
+    assert_eq(out(program), "3000 3000 3000 false false")
+end KEYS_A_POWER_OF_TWO_APART_DO_NOT_SHARE_A_SLOT
+
+@test
+A_RUN_OF_INTEGER_KEYS_AND_A_STRIDED_ONE_EACH_FIND_THEIR_KEY_IN_FEW_PROBES()
+    // The witness for the spreading, which no answer can show: the largest number of slots any one
+    // key of the run had to look at before its own. A low-bit start with the key as its own hash
+    // would need thousands for the strided run.
+    for stride in [1, 4096, 1048576]
+        val t = new_object()
+
+        for i in 0..<2000
+            val key = Int(long(i) * long(stride))
+
+            assert(obj_put(t, key, Int(long(i)), nowhere()).is_ok())
+
+        val worst = longest_probe(t)
+
+        assert(worst < 16usize, s"keys ${stride} apart: one had to look at ${worst} slots")
+end A_RUN_OF_INTEGER_KEYS_AND_A_STRIDED_ONE_EACH_FIND_THEIR_KEY_IN_FEW_PROBES
+
+// -- a discarded answer ------------------------------------------------------------------------------
+
+@test
+A_CALL_WHOSE_ANSWER_IS_THROWN_AWAY_IS_MARKED_AND_STILL_STANDS_OVER_ITS_DISCARD()
+    val ops = chunk_ops("f(m, s, g, i) =\n    m.set(i, i)\n    s.add(i)\n    g(i)\n    print(m.get(i))\n    m.size\n\nprint(f(Map(), Set(), x -> x, 3))", "f")
+
+    // `m.set`, `s.add`, `g(i)` and `print` are each a statement; `m.get(i)` is an argument and
+    // `m.size` the answer, so neither is marked.
+    assert_eq(unused_calls(ops), 4usize)
+end A_CALL_WHOSE_ANSWER_IS_THROWN_AWAY_IS_MARKED_AND_STILL_STANDS_OVER_ITS_DISCARD
+
+@test
+A_DISCARDED_CALL_LEAVES_THE_STACK_AS_IT_FOUND_IT_WHATEVER_IT_CALLED()
+    // **Every kind of callee behind a marked call**: a builtin method (its answer never pushed and
+    // the `Discard` stepped over), a builtin a program's own object carries as a field (the same, by
+    // the other receiver rule), a slate function (the frame returns to the `Discard`, which runs), a
+    // method a class declares, and a free builtin. A slot left over or taken twice would show as a
+    // wrong answer from the expression the statements sit inside, which reads the stack after them.
+    val program = "class C\n    var n\n    bump(self) = self.n + 1\n\n" +
+                  "f(x) = x * 2\n\n" +
+                  "run()\n    val m = Map()\n    val o = { g: max }\n    val c = C(1)\n    var total = 0\n    var i = 0\n\n" +
+                  "    while i < 1000\n        m.set(i, i)\n        o.g(i, 3)\n        f(i)\n        c.bump()\n        abs(i)\n        total = total + i\n        i = i + 1\n\n" +
+                  "    [total, m.size, m.get(999)]\n\nprint(run())"
+
+    assert_eq(out(program), "[499500, 1000, 999]")
+end A_DISCARDED_CALL_LEAVES_THE_STACK_AS_IT_FOUND_IT_WHATEVER_IT_CALLED
+
+@test
+A_DISCARDED_BUILTIN_THAT_FAULTS_IS_CAUGHT_WHERE_IT_WAS_WRITTEN()
+    // The refusal comes back out of the call before anything is skipped, so a `try` around a
+    // statement call sees it and the statement after the `try` runs on a balanced stack.
+    val program = "val m = Map()\nfreeze(m)\n\ntry\n    m.set(1, 2)\ncatch e\n    print(\"refused\")\n\nprint(m.size)"
+
+    assert_eq(out(program), "refused\n0")
+end A_DISCARDED_BUILTIN_THAT_FAULTS_IS_CAUGHT_WHERE_IT_WAS_WRITTEN
+
+@test
+A_PROFILE_STILL_TIMES_A_BUILTIN_WHOSE_ANSWER_IS_THROWN_AWAY()
+    // `timing` is read once where the loop starts and a discarded call takes the same road as any
+    // other when it is on.
+    profile_start()
+    val printed = out("run()\n    val m = Map()\n    var i = 0\n\n    while i < 250\n        m.set(i, i)\n        i = i + 1\n\n    m.size\n\nprint(run())")
+    profile_stop()
+
+    assert_eq(printed, "250")
+    assert_eq(profile_call_count("Map.set"), 250u64)
+end A_PROFILE_STILL_TIMES_A_BUILTIN_WHOSE_ANSWER_IS_THROWN_AWAY
+
+// -- the remainder fusion takes priority over a pair of loads -----------------------------------------
+
+@test
+A_REMAINDER_OF_A_LOCAL_IS_FOLDED_EVEN_AFTER_ANOTHER_LOAD()
+    // `m.set(i % 1000, i)` is `LoadSlot(m); LoadSlot(i); PushInt; Rem`: the first load stays single
+    // so that the other three fold into one `SlotIntRem`.
+    val ops = chunk_ops("f(m, i) =\n    m.set(i % 1000, i)\n    m.get(i % 1000)\n\nprint(f(Map(), 1234))", "f")
+    var rems: usize = 0
+    var pairs: usize = 0
+
+    for i in 0..<ops.len()
+        ops.at(i) match
+            SlotIntRem(_, v) ->
+                rems += 1
+                assert_eq(v, 1000)
+            LoadSlot2(_, _) -> pairs += 1
+            _ -> ()
+
+    assert_eq(rems, 2usize)
+    assert_eq(pairs, 0usize, "a pair of loads took the head of the remainder")
+    assert_eq(out("f(m, i) =\n    m.set(i % 1000, i)\n    m.get(i % 1000)\n\nprint(f(Map(), 1234))"), "1234")
+end A_REMAINDER_OF_A_LOCAL_IS_FOLDED_EVEN_AFTER_ANOTHER_LOAD

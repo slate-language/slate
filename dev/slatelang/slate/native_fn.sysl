@@ -55,7 +55,17 @@ type NativeFn = u32
 // stack, pushing above the arguments standing here; a stack deep enough to grow replaces its
 // storage, so a pointer or a slice taken before the callback names freed memory after it. An index
 // survives a reallocation, and `at` reads the running machine's stack afresh every time.
+//
+// **THE WINDOW CARRIES THE VM IT STANDS IN**, which is what makes reading an argument cost a load
+// rather than a call. The running VM is found through a thread-local, and on this platform every
+// thread-local read is a call to `_tlv_get_addr` -- so a builtin that asked for it once per argument,
+// or even once per call, paid for a lookup whose answer the caller already had in hand. The VM is the
+// same for the whole of a call (a park swaps the MACHINE inside it, and `at` reads the machine
+// afresh), so it is written into the window once, where the window is made.
 struct Args
+    // The VM whose running machine the arguments stand on.
+    vm: *Vm
+
     // Where the first argument stands, as an index into the running machine's operand stack.
     base: usize
 
@@ -63,11 +73,10 @@ struct Args
     count: usize
 
     // The `i`th argument. The caller has already checked there is one -- `len` is how.
-    at(self, i: usize) -> Value = machine().stack.at(self.base + i)
+    at(self, i: usize) -> Value = self.vm.machine.stack.at(self.base + i)
 
-    // The `i`th argument, read through a VM the builtin already holds. **`at` finds the running
-    // machine through a thread-local on every read**, and a builtin that reads three arguments and
-    // checks two of them pays for five; one that takes `current()` once pays for one.
+    // The `i`th argument, read through a VM the builtin already holds -- which is the one the window
+    // carries, so this is `at` spelled for a caller that has it in a local anyway.
     on(self, vm: *Vm, i: usize) -> Value = vm.machine.stack.at(self.base + i)
 
     len(self) -> usize = self.count
@@ -75,8 +84,8 @@ struct Args
     is_empty(self) -> bool = self.count == 0
 
     // The first `n` of them, as a window of their own, for a builtin that hands its work to another
-    // one that takes fewer arguments. A window is two numbers, so this costs nothing.
-    take(self, n: usize) -> Args = Args(self.base, if n < self.count then n else self.count)
+    // one that takes fewer arguments. A window is three words, so this costs nothing.
+    take(self, n: usize) -> Args = Args(self.vm, self.base, if n < self.count then n else self.count)
 
 // What a builtin runs, as the table holds it.
 //
@@ -89,10 +98,22 @@ type NativeGo = &sync Fn(Args, Span) -> Step
 // that grows being one that can move while another thread is reading it.
 const MaxNatives: usize = 1024
 
-// process-wide: the function for every id, in registration order, and `None` for a slot no name has
-// been given yet. A fixed array so that the storage a dispatch reads never moves, and `&sync` so that
-// reading one costs an atomic rather than a lock.
-private var native_go: [MaxNatives]Option[NativeGo] = [None; MaxNatives]
+// What a slot no name has been given yet runs: the sentence a dispatch through it has always said.
+private unregistered(args: Args, at: Span) -> Step =
+    fault(at, "this builtin was never registered, which is a defect in slate itself")
+
+// process-wide: the function for every id, in registration order, and `unregistered` for a slot no
+// name has been given yet. A fixed array so that the storage a dispatch reads never moves, and
+// `&sync` so that a thread writing a slot cannot tear a count another thread is reading.
+//
+// **NOT an `Option`, and that is what makes a dispatch free of atomics.** Matching `Some(go)` binds a
+// copy of the box, and a copy of a `&sync` is an atomic increment before the call and an atomic
+// decrement after it -- two locked read-modify-writes on every builtin call a program makes. Calling
+// the element where it stands (`native_go[i](args, at)`) borrows it instead, which is sound here for
+// the reason the table is shaped as it is: a slot is written once, by `register`, before its id is
+// published, and never again -- so nothing a builtin does while it runs can release the box it was
+// called through.
+private var native_go: [MaxNatives]NativeGo = [unregistered; MaxNatives]
 
 // process-wide: the name every id was registered under, for a diagnostic to read back. Written and
 // read under `registry_lock`.
@@ -134,7 +155,7 @@ register(name: string, go: NativeGo) -> NativeFn
                 print("panic: slate registered more than", MaxNatives, "builtins")
                 exit(1)
 
-            native_go[usize(fresh) - 1] = Some(go)
+            native_go[usize(fresh) - 1] = go
             native_ids.put(name, fresh)
             fresh
 
@@ -146,14 +167,12 @@ end register
 //
 // **One indirection and no match over builtins.** A builtin's id is its slot, so what used to be a
 // 371-line match over every arm of a closed enum is a bounds check and a call through the slot the
-// registry already holds.
+// registry already holds -- a slot nobody registered answering the same sentence as an id out of
+// range.
 run_native(f: NativeFn, args: Args, at: Span) -> Step
-    if f == 0u32 || usize(f) > MaxNatives
-        return fault(at, "this builtin was never registered, which is a defect in slate itself")
+    if f == 0u32 || usize(f) > MaxNatives then return unregistered(args, at)
 
-    native_go[usize(f) - 1] match
-        None -> fault(at, "this builtin was never registered, which is a defect in slate itself")
-        Some(go) -> go(args, at)
+    native_go[usize(f) - 1](args, at)
 end run_native
 
 // Run something that takes a builtin's arguments, over values made up here rather than written at a
@@ -168,13 +187,14 @@ end run_native
 // **The cut is skipped after a park**, as `run_chunk`'s is: a suspended call swapped the running
 // machine for a fresh one and this height belongs to the other stack.
 with_args(vals: Buf[Value], at: Span, go: &Fn(Args, Span) -> Step) -> Step
-    val vm = machine()
+    val running = current()
+    val vm = &running.machine
     val base = vm.stack.len()
 
     for i in 0..<vals.len()
         vm.stack.push(vals.at(i))
 
-    val answer = go(Args(base, vals.len()), at)
+    val answer = go(Args(running, base, vals.len()), at)
 
     answer match
         Err(Wait) -> ()
