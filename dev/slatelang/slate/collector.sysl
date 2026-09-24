@@ -121,8 +121,17 @@ env_payload(o: *EnvObj) -> usize = o.names.capacity() * map_slot(sizeof(string),
 // Count an object the mark phase has just reached. **Every kind's tracer calls this exactly once per
 // collection**, because `gc.drain` traces an object only on the pass that marks it -- which is what
 // makes the total an exact recount of the live payload rather than an accumulation.
-mark_payload(n: usize)
-    current().payload_marked += n
+//
+// **The VM is found from the heap and not from `current()`**, which is a thread-local read -- a
+// `_tlv_get_addr` call on this platform -- once per object marked. A collection of a heap holding
+// twenty thousand strings made twenty thousand of them. Every heap slate collects is the `heap` field
+// of a `Vm` (`new_vm` lays it there and nothing else makes one), so the VM is at a fixed distance
+// before it, and a tracer is only ever handed that heap.
+mark_payload(h: *gc.Heap, n: usize)
+    heap_owner(h).payload_marked += n
+
+// Not `private`: `tests_split.sysl` asserts it answers the VM that owns the heap.
+heap_owner(h: *gc.Heap) -> *Vm = ptr_cast(usize(h) - offsetof(Vm, heap))
 
 // **A FINALIZER DOES NOT CREDIT, AND THAT IS DELIBERATE.** A finalizer touches no VM state, which is
 // what makes `dispose_vm(v)` safe to call for a VM that is not the current one -- a credit there
@@ -133,7 +142,7 @@ mark_payload(n: usize)
 trace_str(p: *u8, h: *gc.Heap)
     val o: *StrObj = ptr_cast(p)
 
-    mark_payload(str_payload(o))
+    mark_payload(h, str_payload(o))
     gc.mark(h, ptr_cast(o.room))
 
 finalize_str(p: *u8)
@@ -148,7 +157,7 @@ finalize_str(p: *u8)
 trace_big(p: *u8, h: *gc.Heap)
     val o: *BigObj = ptr_cast(p)
 
-    mark_payload(big_payload(o))
+    mark_payload(h, big_payload(o))
 
 finalize_big(p: *u8)
     val o: *BigObj = ptr_cast(p)
@@ -160,10 +169,14 @@ finalize_big(p: *u8)
 trace_array(p: *u8, h: *gc.Heap)
     val o: *ArrayObj = ptr_cast(p)
 
-    mark_payload(array_payload(o))
+    mark_payload(h, array_payload(o))
 
-    for i in 0..<o.items.len()
-        mark_value(h, o.items.at(i))
+    // **The items are walked as one view rather than read one `at` at a time.** `Buf.at` takes the
+    // buffer by value, so each read retained and released its storage -- a count taken and given back
+    // per element, at every collection, for every live array. A twenty-thousand-line text split into
+    // lines is twenty thousand of those per collection.
+    for item in o.items.view()
+        mark_value(h, item)
 
 finalize_array(p: *u8)
     val o: *ArrayObj = ptr_cast(p)
@@ -176,7 +189,7 @@ finalize_array(p: *u8)
 trace_bytes(p: *u8, h: *gc.Heap)
     val o: *BytesObj = ptr_cast(p)
 
-    mark_payload(bytes_payload(o))
+    mark_payload(h, bytes_payload(o))
 
 finalize_bytes(p: *u8)
     val o: *BytesObj = ptr_cast(p)
@@ -188,7 +201,7 @@ finalize_bytes(p: *u8)
 trace_object(p: *u8, h: *gc.Heap)
     val o: *ObjectObj = ptr_cast(p)
 
-    mark_payload(object_payload(o))
+    mark_payload(h, object_payload(o))
 
     for i in 0..<o.entries.len()
         val e = o.entries.at(i)
@@ -232,7 +245,7 @@ finalize_object(p: *u8)
 trace_closure(p: *u8, h: *gc.Heap)
     val o: *ClosureObj = ptr_cast(p)
 
-    mark_payload(closure_payload(o))
+    mark_payload(h, closure_payload(o))
     gc.mark(h, ptr_cast(o.scope))
 
 finalize_closure(p: *u8)
@@ -245,7 +258,7 @@ finalize_closure(p: *u8)
 trace_promise(p: *u8, h: *gc.Heap)
     val o: *PromiseObj = ptr_cast(p)
 
-    mark_payload(promise_payload(o))
+    mark_payload(h, promise_payload(o))
     mark_value(h, o.value)
 
 finalize_promise(p: *u8)
@@ -257,7 +270,7 @@ finalize_promise(p: *u8)
 trace_env(p: *u8, h: *gc.Heap)
     val o: *EnvObj = ptr_cast(p)
 
-    mark_payload(env_payload(o))
+    mark_payload(h, env_payload(o))
     gc.mark(h, ptr_cast(o.parent))
     mark_map(h, o.names)
 
@@ -276,7 +289,7 @@ finalize_env(p: *u8)
 trace_weak_map(p: *u8, h: *gc.Heap)
     val o: *ObjectObj = ptr_cast(p)
 
-    mark_payload(object_payload(o))
+    mark_payload(h, object_payload(o))
 
 // Mark the values whose keys turned out live, and answer whether that marked anything new.
 //
@@ -447,6 +460,12 @@ roots(h: *gc.Heap)
 
     for i in 0..<current().root_values.len()
         mark_value(h, current().root_values.at(i))
+
+    // The pieces a `split` has gathered and not yet put in the array it answers, which a collection
+    // inside that split's own allocations must not take (`do_split` in `text.sysl`). Empty between
+    // calls.
+    for piece in current().split_pieces.view()
+        mark_value(h, piece)
 
     for i in 0..<current().root_envs.len()
         gc.mark(h, ptr_cast(current().root_envs.at(i)))
