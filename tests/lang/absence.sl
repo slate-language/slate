@@ -260,3 +260,34 @@ orDefault(o)
 
 nothing()
     return
+
+// -- a call's answer, handed straight on --------------------------------------------------------
+//
+// Nothing a call reaches can answer an absence, so its answer is passed, bound and handed back
+// with no check in front of it -- a function's, a builtin's, a method's, an operator a class wrote,
+// and a `?.()` that found nothing to call. The refusal is where the absence was answered.
+
+@test
+A_CALLS_ANSWER_IS_HANDED_ON_AS_IT_STANDS() =
+    val o = { m: x -> x * 2 }
+    val bound = relay(abs(-3))
+
+    assertEq(bound, 3)
+    assertEq(relay(relay(o.m(4))), 8)
+    assertEq(relay(Pence(1) + Pence(2)).n, 3)
+    assertEq(relay(o.nope?.()), null)
+    assertEq(answersOn(o), 10)
+
+relay(a) = a
+
+answersOn(o) = o.m(5)
+
+class Pence
+    var n
+    +(self, other) = Pence(self.n + other.n)
+
+@test
+A_CALLEE_ANSWERING_AN_ABSENCE_IS_REFUSED_BEFORE_ITS_CALLER_PASSES_IT_ON() =
+    assertFaults(() -> relay(returnsBare({})), refused("returned"))
+    assertFaults(() -> relay(relay(returnsField({}))), refused("returned"))
+    assertFaults(() -> relay(Holder().missing()), refused("returned"))
