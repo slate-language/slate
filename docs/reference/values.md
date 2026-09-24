@@ -440,8 +440,8 @@ otherwise looks unrelated:
   value that might be absent.
 
 Keeping one is refused where it is attempted — binding it to a `val`, a `var` or a `for` head,
-writing it over a local, storing it in a field, an array or an object, or passing it to a function —
-and in the same words under `slate js`:
+writing it over a local, storing it in a field, an array or an object, passing it to a function, or
+returning it from one — and in the same words under `slate js`:
 
 ```slate
 val settings = { port: 8080 }
@@ -455,3 +455,20 @@ this field is not there, and `undefined` cannot be bound to `host` -- give it a 
 ```
 
 `settings.host ?? "localhost"` is the program that runs.
+
+**A function answering one is refused at its `return`**, or where its body falls out, rather than at
+whatever the caller did with the answer — which is the line that read nothing:
+
+```slate
+hostOf(settings) = settings.host
+
+val host = hostOf({ port: 8080 })
+```
+
+```error
+this field is not there, and `undefined` cannot be returned -- give it a value with `??`, or ask `has` first
+```
+
+A function with nothing to answer answers `null`, so `hostOf(settings) = settings.host ?? null` is the
+lookup that says *maybe*, and `undefined` written out as a function's answer is refused before the
+program runs.

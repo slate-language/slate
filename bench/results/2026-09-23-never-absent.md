@@ -104,3 +104,7 @@ A parameter passed straight on — `dispatch`, `options`, `csv` — keeps the ch
 need the CALLER's knowledge that it gave every argument, which a slot's padding does not carry; a
 chunk-level "every call site of this function gave all its parameters" is not knowable while
 functions are values.
+
+**A call's RESULT is now provably present** (`return-undefined`, 2026-09-24): `Ret` refuses an
+absence, so a slate function cannot answer one and a builtin never did. Marking call results
+never-absent in the analysis is the follow-up that reaches the ~20% of calls this item left checked.
