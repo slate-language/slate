@@ -1,0 +1,631 @@
+module dev.slatelang.slate
+
+import sh.sysl.gc
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+import sysl.math.bigint.{BigInt, zero as big_zero}
+
+// The collector's half of the heap: how each kind of object is traced, measured and finalized, the
+// `gc.Kind` tables that name those hooks, the roots and the shadow stack, and when a collection runs.
+//
+// **Not `obj.sysl`, which is the objects themselves and how one is made**, because that file passed a
+// thousand lines and this is the seam that crosses nothing: no `private` name of either file is read
+// from the other. Everything here reaches the objects through their struct types and the public
+// payload accounting (`charge`, `heap_in_use`), and `obj.sysl` reaches this file only through the ten
+// `*_kind` tables its constructors allocate under and the public `roots`/`hold`/`release` family.
+// `mark_spares` moved here from beside `reserve_spares`, `roots` being its only caller.
+
+// -- tracing ------------------------------------------------------------------------------------
+
+// Grey whatever a value points at. Scalars point at nothing and cost one comparison.
+mark_value(h: *gc.Heap, v: Value)
+    v match
+        Str(p) -> gc.mark(h, ptr_cast(p))
+        Big(p) -> gc.mark(h, ptr_cast(p))
+        Array(p) -> gc.mark(h, ptr_cast(p))
+        Bytes(p) -> gc.mark(h, ptr_cast(p))
+        Object(p) -> gc.mark(h, ptr_cast(p))
+
+        // **The same object kind, so the same tracer walks it**: a set and a map are an
+        // `ObjectObj`, and `trace_object` already marks every key and every value in one.
+        SetVal(p) -> gc.mark(h, ptr_cast(p))
+        MapVal(p) -> gc.mark(h, ptr_cast(p))
+        Fn(p) -> gc.mark(h, ptr_cast(p))
+        Promise(p) -> gc.mark(h, ptr_cast(p))
+
+        // **The weak pair is marked STRONGLY from outside and weakly from inside**, which is not a
+        // contradiction: a weak map is an ordinary object as far as everything holding *it* is
+        // concerned, and it is the entries inside it that do not keep their keys. A value naming one
+        // has to mark it, or a weak map held in a variable would be swept out from under the
+        // variable.
+        WeakMapVal(p) -> gc.mark(h, ptr_cast(p))
+        WeakRefVal(p) -> gc.mark(h, ptr_cast(p))
+        _ -> ()
+end mark_value
+
+// The collected object a value points at, or null for one that points at nothing.
+//
+// **This is what a weak slot asks about**, `gc.is_live` taking the pointer marking decided about --
+// and a value with none is one the collector cannot free, so a weak slot holding it never clears.
+// An external is the case that matters: it is an interned path rather than an object, so a weak map
+// keyed by one is an ordinary identity-keyed map whose entries live as long as the map does.
+private object_of(v: Value) -> *u8 = v match
+    Str(p) -> ptr_cast(p)
+    Big(p) -> ptr_cast(p)
+    Array(p) -> ptr_cast(p)
+    Bytes(p) -> ptr_cast(p)
+    Object(p) -> ptr_cast(p)
+    SetVal(p) -> ptr_cast(p)
+    MapVal(p) -> ptr_cast(p)
+    WeakMapVal(p) -> ptr_cast(p)
+    WeakRefVal(p) -> ptr_cast(p)
+    Fn(p) -> ptr_cast(p)
+    Promise(p) -> ptr_cast(p)
+    _ -> null
+
+// Whether marking has decided this value survives. **A value with no object of its own always
+// does**, there being nothing for the collector to take away.
+private value_survives(h: *gc.Heap, v: Value) -> bool
+    val p = object_of(v)
+
+    p == null || gc.is_live(h, p)
+end value_survives
+
+// Grey every value in a map. Used by both the object kind and the scope kind.
+private mark_map(h: *gc.Heap, m: Map[string, Value])
+    var walk = m.walk()
+
+    loop
+        walk.next() match
+            None -> break
+            Some(pair) -> mark_value(h, pair.1)
+end mark_map
+
+// -- what each kind holds outside the heap --------------------------------------------------------
+//
+// **One function per kind, read by three callers that must agree**: the constructor charging what it
+// was handed, the mutators charging what a regrow took, and the mark phase recounting what survived.
+// A fourth would be a second opinion about the same bytes.
+
+// A string is its bytes. The `string` box itself is a word or two and is not worth counting.
+str_payload(o: *StrObj) -> usize = if o.room != null then 0 else o.s.bytes.len
+
+// A big integer is its limbs, which are 32 bits each. The sign is a byte in the cell.
+big_payload(o: *BigObj) -> usize = o.n.limbs() * 4
+
+array_payload(o: *ArrayObj) -> usize = o.items.cap() * sizeof(Value)
+
+bytes_payload(o: *BytesObj) -> usize = o.data.cap()
+
+// Both halves of the compact dict: the entries and the index that probes into them.
+object_payload(o: *ObjectObj) -> usize = o.entries.cap() * sizeof(Entry) + o.index.cap() * sizeof(usize)
+
+closure_payload(o: *ClosureObj) -> usize = o.params.cap() * sizeof(string)
+
+promise_payload(o: *PromiseObj) -> usize = o.message.bytes.len + o.waiters.cap() * sizeof(usize)
+
+// A map's table costs a key, a value and the slot's own state per slot. **`Slot` is
+// `sysl.container`'s own type and cannot be named from here**, so the width is spelled out -- and
+// because the charge and the recount both read this one function, the two agree whatever the real
+// figure turns out to be.
+private map_slot(key: usize, value: usize) -> usize = key + value + 8
+
+env_payload(o: *EnvObj) -> usize = o.names.capacity() * map_slot(sizeof(string), sizeof(Value)) + o.mutable.capacity() * map_slot(sizeof(string), sizeof(bool))
+
+// Count an object the mark phase has just reached. **Every kind's tracer calls this exactly once per
+// collection**, because `gc.drain` traces an object only on the pass that marks it -- which is what
+// makes the total an exact recount of the live payload rather than an accumulation.
+mark_payload(n: usize)
+    current().payload_marked += n
+
+// **A FINALIZER DOES NOT CREDIT, AND THAT IS DELIBERATE.** A finalizer touches no VM state, which is
+// what makes `dispose_vm(v)` safe to call for a VM that is not the current one -- a credit there
+// would take the bytes off whichever VM happened to be running. The recount in the mark phase is
+// what makes the figure right after a sweep, and it needs nothing from the sweep to do it.
+
+// A string owns its sysl `string` and points at nothing but the room it may have been appended in.
+trace_str(p: *u8, h: *gc.Heap)
+    val o: *StrObj = ptr_cast(p)
+
+    mark_payload(str_payload(o))
+    gc.mark(h, ptr_cast(o.room))
+
+finalize_str(p: *u8)
+    val o: *StrObj = ptr_cast(p)
+
+    // Writing an empty string here releases the one that was there, which is the whole of what a
+    // finalizer owes: give back what the object held outside the collected heap.
+    o.s = ""
+
+// A big integer owns its limbs and points at nothing, so it needs a finalizer and no tracer --
+// which is `trace_str`'s arrangement exactly.
+trace_big(p: *u8, h: *gc.Heap)
+    val o: *BigObj = ptr_cast(p)
+
+    mark_payload(big_payload(o))
+
+finalize_big(p: *u8)
+    val o: *BigObj = ptr_cast(p)
+
+    // Writing zero here releases the magnitude that was there, which is the whole of what a
+    // finalizer owes.
+    o.n = big_zero()
+
+trace_array(p: *u8, h: *gc.Heap)
+    val o: *ArrayObj = ptr_cast(p)
+
+    mark_payload(array_payload(o))
+
+    for i in 0..<o.items.len()
+        mark_value(h, o.items.at(i))
+
+finalize_array(p: *u8)
+    val o: *ArrayObj = ptr_cast(p)
+
+    o.items = buf()
+
+// **A byte buffer holds no `Value`, so the collector walks none of it** -- which is `trace_str`'s
+// arrangement and is what makes a megabyte of bytes cost the tracer one object rather than a million
+// edges. The `Buf` is counted storage outside the heap, so the finalizer is what gives it back.
+trace_bytes(p: *u8, h: *gc.Heap)
+    val o: *BytesObj = ptr_cast(p)
+
+    mark_payload(bytes_payload(o))
+
+finalize_bytes(p: *u8)
+    val o: *BytesObj = ptr_cast(p)
+
+    o.data = buf()
+
+// **A key is traced as well as a value**, which is new: a field name used to be a sysl `string` that
+// the collector never saw, and it is now a `Value` that may be an array or an object of its own.
+trace_object(p: *u8, h: *gc.Heap)
+    val o: *ObjectObj = ptr_cast(p)
+
+    mark_payload(object_payload(o))
+
+    for i in 0..<o.entries.len()
+        val e = o.entries.at(i)
+
+        if !e.dead
+            mark_value(h, e.key)
+            mark_value(h, e.value)
+
+// The capacity a `Buf` takes at its first push, which is therefore the table every object of fewer
+// than eight fields has.
+private const FirstTable: usize = 8
+
+// How many emptied tables a VM keeps for reuse.
+private const SpareEntries: usize = 4096
+
+// **A SWEEP KEEPS A SMALL OBJECT'S ENTRY TABLE FOR THE NEXT OBJECT, AND THAT IS THE ALLOCATION A
+// CONSTRUCTOR CALL USED TO MAKE.** An object's fields live in a `Buf` outside the heap, so every
+// `Counter(n)` asked `malloc` for a table of `SmallTable` entries, wrote every one of them, and the
+// sweep that freed the object handed the table back to `free` -- a malloc, a fill and a free per
+// object, which a loop making one object a turn pays every turn. A table of exactly the size the
+// first push gives is emptied and kept instead, up to `SpareEntries` of them, and `new_object` takes
+// one before it asks for memory.
+//
+// **Only during a SWEEP, which `sweeping` says.** A heap being disposed is going away with its VM,
+// and keeping its tables would only move the free to later.
+//
+// **Bounded, so the tables kept are never more than a sweep's worth of small objects**: a program
+// that made a million and dropped them keeps `SpareEntries` tables -- two megabytes -- and gives the
+// rest back as it always did.
+finalize_object(p: *u8)
+    val o: *ObjectObj = ptr_cast(p)
+    val v = current()
+
+    if v.sweeping && o.entries.cap() == FirstTable && v.spare_entries.len() < SpareEntries
+        o.entries.clear()
+        v.spare_entries.push(o.entries)
+
+    o.entries = buf()
+    o.index = buf()
+
+trace_closure(p: *u8, h: *gc.Heap)
+    val o: *ClosureObj = ptr_cast(p)
+
+    mark_payload(closure_payload(o))
+    gc.mark(h, ptr_cast(o.scope))
+
+finalize_closure(p: *u8)
+    val o: *ClosureObj = ptr_cast(p)
+
+    o.params = buf()
+
+// **A parked machine's own roots are not reached from here.** The waiters are ids, and `mark_vm`
+// walks `parked` on its own -- so what this owes is the settled value and nothing else.
+trace_promise(p: *u8, h: *gc.Heap)
+    val o: *PromiseObj = ptr_cast(p)
+
+    mark_payload(promise_payload(o))
+    mark_value(h, o.value)
+
+finalize_promise(p: *u8)
+    val o: *PromiseObj = ptr_cast(p)
+
+    o.message = ""
+    o.waiters = buf()
+
+trace_env(p: *u8, h: *gc.Heap)
+    val o: *EnvObj = ptr_cast(p)
+
+    mark_payload(env_payload(o))
+    gc.mark(h, ptr_cast(o.parent))
+    mark_map(h, o.names)
+
+finalize_env(p: *u8)
+    val o: *EnvObj = ptr_cast(p)
+
+    o.names = map()
+    o.mutable = map()
+
+// **A weak map's tracer marks NEITHER HALF, and that is the whole of what makes it weak.** A key
+// nothing else holds is free to go; a value is marked by the ephemeron below, and only because its
+// key turned out live. The table's `Buf`s are reference counted and belong to a finalizer, which is
+// `finalize_object` -- the storage is an `ObjectObj` and only the hooks differ.
+// **The storage is still charged even though neither half is marked** -- the table is an `ObjectObj`
+// and its two `Buf`s cost what any object's do.
+trace_weak_map(p: *u8, h: *gc.Heap)
+    val o: *ObjectObj = ptr_cast(p)
+
+    mark_payload(object_payload(o))
+
+// Mark the values whose keys turned out live, and answer whether that marked anything new.
+//
+// **The answer is what terminates the fixpoint**, so it must be false once there is nothing left to
+// do: a value already marked is not marked again, and a value with no object of its own -- a number,
+// a string of a kind the collector does not own -- counts as marked, having nothing to lose.
+//
+// **A value may be some other entry's key**, which is why `collect` runs this again after the
+// worklist drains rather than once: `wm.set(a, b)` and `wm.set(b, c)` with only `a` held from
+// outside keeps all three, and it takes two passes to find that out.
+ephemeron_weak_map(p: *u8, h: *gc.Heap) -> bool
+    val o: *ObjectObj = ptr_cast(p)
+    var changed = false
+
+    for i in 0..<o.entries.len()
+        val e = o.entries.at(i)
+
+        if !e.dead && value_survives(h, e.key) && !value_survives(h, e.value)
+            mark_value(h, e.value)
+            changed = true
+
+    changed
+end ephemeron_weak_map
+
+// Drop the entries whose keys did not survive, before anything is freed.
+//
+// **The entry is dropped by POSITION and its key is never hashed again**, which is not an
+// optimization: hashing a slate value may run a class's own `hash`, and running a program's code
+// from inside a collection is the one thing a hook may not do. The hash is on the entry, which is
+// what `obj_drop_at` needs to find its slot in the index.
+weaken_weak_map(p: *u8, h: *gc.Heap)
+    val o: *ObjectObj = ptr_cast(p)
+
+    for i in 0..<o.entries.len()
+        val e = o.entries.at(i)
+
+        if !e.dead && !value_survives(h, e.key) then obj_drop_at(o, i)
+end weaken_weak_map
+
+// A weak reference points at nothing as far as marking is concerned, which is the definition.
+trace_weak_ref(p: *u8, h: *gc.Heap)
+    ()
+
+// Null the slot once marking has decided the target is dead.
+//
+// **This runs before anything is freed**, so the slot is never read after its target's storage has
+// gone -- and `Null` is what `deref` then answers, slate having no `undefined` to store.
+weaken_weak_ref(p: *u8, h: *gc.Heap)
+    var o: *WeakRefObj = ptr_cast(p)
+
+    if !value_survives(h, o.target) then o.target = Null
+
+// A `Kind` must outlive every object naming it and its address must not move, so these are module
+// storage. Module storage states its type, which is why each is written out.
+//
+// process-wide: ten tables of function addresses, built at startup and never written again. A VM
+// of its own would hold the same ten, so each is one table and not one per VM.
+var str_kind: gc.Kind = gc.Kind(&trace_str, &finalize_str, null, null)
+// process-wide: see `str_kind`.
+var big_kind: gc.Kind = gc.Kind(&trace_big, &finalize_big, null, null)
+// process-wide: see `str_kind`.
+var array_kind: gc.Kind = gc.Kind(&trace_array, &finalize_array, null, null)
+// process-wide: see `str_kind`.
+var bytes_kind: gc.Kind = gc.Kind(&trace_bytes, &finalize_bytes, null, null)
+// process-wide: see `str_kind`.
+var object_kind: gc.Kind = gc.Kind(&trace_object, &finalize_object, null, null)
+// process-wide: see `str_kind`.
+var closure_kind: gc.Kind = gc.Kind(&trace_closure, &finalize_closure, null, null)
+// process-wide: see `str_kind`.
+var env_kind: gc.Kind = gc.Kind(&trace_env, &finalize_env, null, null)
+// process-wide: see `str_kind`.
+var promise_kind: gc.Kind = gc.Kind(&trace_promise, &finalize_promise, null, null)
+
+// **The two kinds that use the hooks the other six leave null**, and they are the reason the
+// collector has four rather than two. A weak map shares the object's storage and its finalizer and
+// differs in nothing else; a weak reference is one slot, so it needs no finalizer at all.
+// process-wide: see `str_kind`.
+var weak_map_kind: gc.Kind = gc.Kind(&trace_weak_map, &finalize_object, &weaken_weak_map, &ephemeron_weak_map)
+// process-wide: see `str_kind`.
+var weak_ref_kind: gc.Kind = gc.Kind(&trace_weak_ref, null, &weaken_weak_ref, null)
+
+// -- the roots ----------------------------------------------------------------------------------
+
+// **`alloc` never collects, so a value held only in a sysl local is invisible to the mark phase.**
+// A tree-walker has those everywhere -- the subject of a `match`, a half-built array literal, the
+// evaluated arguments of a call -- and none of them is in any scope. So the interpreter pushes what
+// it is holding onto these, and pops on the way out.
+//
+// This is the shadow stack every precise collector's client has to keep, and it is the real cost of
+// tracing over refcounting. The alternative -- scanning the machine stack -- is what makes a
+// conservative collector a porting project rather than a dependency.
+// The two are `current().root_values` and `current().root_envs` -- fields of the VM, see
+// `vm_state.sysl`.
+
+// Where the stacks stand now, to be given back to `release` on the way out.
+root_mark() -> usize = current().root_values.len()
+
+env_mark() -> usize = current().root_envs.len()
+
+// Hold a value across a point that may collect.
+hold(v: Value)
+    current().root_values.push(v)
+
+// Let go of everything pushed since a mark.
+release(mark: usize)
+    current().root_values.truncate(mark)
+
+// Hold a scope across a point that may collect.
+hold_env(e: *EnvObj)
+    current().root_envs.push(e)
+
+release_env(mark: usize)
+    current().root_envs.truncate(mark)
+
+// Everything the program can still reach.
+//
+// **A top-level function, because a hook is reached by address** and a nested one has no address to
+// take. **It reaches the VM through `current()`**, which is what lets it be one function over any
+// number of heaps: `gc.collect` hands it the heap it is collecting, and that is `current().heap`
+// because the caller asked for it through `slate_heap()`.
+roots(h: *gc.Heap)
+    // The machine's operand and frame stacks. **These are what the shadow stack below exists to
+    // stand in for**, and once the walker is gone most of it goes with it.
+    mark_vm(h)
+
+    // What every module exported, which is what a name imported from one is reached through.
+    mark_modules(h)
+
+    // Everything the event loop may still call. Nothing else knows these are reachable.
+    mark_pending(h)
+
+    // And what a signal may call, which is a table of its own: a watcher is armed rather than
+    // outstanding, so it is not one of the things above.
+    mark_watches(h)
+
+    // And what a child process and a channel may call, for the reason a watcher's table is separate:
+    // a child is neither waiting for an answer nor armed -- it is a process, running.
+    mark_children(h)
+
+    // And what a page can still call, which is a table of its own for a watcher's reason: a function
+    // bound into a window is neither waiting for an answer nor outstanding on the loop -- it lasts as
+    // long as the window does.
+#if feature_webview
+    mark_windows(h)
+#endif
+
+    // And what an actor is holding: the instance of its own declaration, and the promises its
+    // handlers answered with. A table of its own for a watcher's reason -- a handler's promise is
+    // neither outstanding on the loop nor awaited by anything on this machine.
+    mark_actors(h)
+
+    // And the scope every declared type is holding, which is a table of its own for the reason a
+    // watcher's is: a shape is not waiting for anything and is not armed either -- it simply lasts
+    // as long as the program.
+    mark_shapes(h)
+
+    // The answers waiting to be handed back to a suspended call, and the promises that failed with
+    // nobody watching. Both are held in module storage and nowhere else.
+    mark_scheduler(h)
+
+    // **What a travelling fault carries is marked here, wherever the `Signal` naming it is** -- a
+    // sysl local, `loop_fault`, a machine's `suppressed`. A `Signal` holds only an index into this
+    // table, so the table is the one place a thrown value is reachable from between the `throw` and
+    // whatever takes it; a timer's `throw NotFound(3)` is reported after the drain, by which time any
+    // number of collections have run.
+    for i in 0..<current().carried.len()
+        mark_value(h, current().carried.at(i))
+
+    for i in 0..<current().root_values.len()
+        mark_value(h, current().root_values.at(i))
+
+    for i in 0..<current().root_envs.len()
+        gc.mark(h, ptr_cast(current().root_envs.at(i)))
+
+    // The emergency objects a full heap is answered with. Nothing else refers to them until the
+    // moment they are handed out, so nothing else would keep them.
+    mark_spares(h)
+end roots
+
+// Keep the reserves alive. They are rooted rather than special-cased in the sweep, because a rooted
+// object is one the collector already knows how to keep. The reserves themselves are taken by
+// `reserve_spares` in `obj.sysl`.
+private mark_spares(h: *gc.Heap)
+    val v = current()
+
+    gc.mark(h, ptr_cast(v.spare_str))
+    gc.mark(h, ptr_cast(v.pending_room))
+    gc.mark(h, ptr_cast(v.spare_big))
+    gc.mark(h, ptr_cast(v.spare_array))
+    gc.mark(h, ptr_cast(v.spare_bytes))
+    gc.mark(h, ptr_cast(v.spare_object))
+    gc.mark(h, ptr_cast(v.spare_closure))
+    gc.mark(h, ptr_cast(v.spare_env))
+    gc.mark(h, ptr_cast(v.spare_promise))
+    gc.mark(h, ptr_cast(v.spare_weak_map))
+    gc.mark(h, ptr_cast(v.spare_weak_ref))
+
+// How much of the heap is spoken for.
+heap_used() -> usize = gc.used(slate_heap())
+
+// How many collections this program has run is `current().collections`, which is what makes a claim
+// about *when* slate collects something a test can check rather than something a comment asserts.
+
+// Collect, at a point the interpreter has chosen because it knows what is live.
+//
+// **The payload count is RECOMPUTED here and not adjusted**, which is what bounds the damage a
+// missed charge can do: the tracers add up what every surviving object holds, and that total
+// replaces whatever the running estimate had become. So a charge whose credit was forgotten costs a
+// schedule that collects a little early until the next collection, and never a figure that grows
+// without bound into a false out-of-memory.
+collect_now()
+    val v = current()
+    val began = profile_began()
+
+    v.collections += 1
+    v.payload_marked = 0
+
+    v.sweeping = true
+    gc.collect(slate_heap(), &roots)
+    v.sweeping = false
+
+    v.payload = v.payload_marked
+    profile_collected(began)
+
+// The smallest live set worth collecting over. Below this a program is cheap enough that tracing it
+// costs more than the storage it would give back.
+// Not `private`: `new_vm` in `vm_state.sysl` starts a VM's `collect_above` here.
+const CollectFloor: usize = 262144
+
+// The same question asked about payload, and the answer is four times larger because a byte of
+// payload is nothing like a byte of cells to reclaim.
+//
+// **A collection costs what the OBJECT GRAPH costs and not what the bytes cost.** `gc.collect` walks
+// the heap's object list once per phase and the mark phase follows every pointer a live object has,
+// so a sweep that hands back a megabyte of string storage costs exactly what one handing back a
+// kilobyte of cells costs -- the megabyte is one `finalize` call. **So the two figures cannot share
+// a floor.** 256 KiB is a sensible smallest-worth-collecting for cells, where it is thousands of
+// objects; for payload it is one medium string, which is why a program building text crossed its
+// threshold every turn.
+//
+// **THE FLOOR IS WHAT A PROGRAM MAY HOLD IN DROPPED PAYLOAD, AND IT BUYS SPEED WITH RESIDENT
+// MEMORY -- 4 MiB WAS MEASURED AND REFUSED.** `bench/strings` churns 22 GB of string copies over a
+// live set of 383 KB, and the floor is what decides how much of that stands at once: at 1 MiB it
+// runs 45,627 collections in 823 ms and peaks at 30.9 MB resident, at 4 MiB 10,964 collections in
+// 761 ms and **83.1 MB** -- against 123,925 collections, 908 ms and 14.3 MB with one shared
+// threshold. Resident memory grows by far more than the floor itself, the freed strings being every
+// size the program grew through, so the larger floor buys 8% of that benchmark for six times the
+// memory. A server holding a heap all day is what this language is for, so the smaller number wins.
+// Not `private`: `new_vm` in `vm_state.sysl` starts a VM's `payload_above` here.
+const PayloadFloor: usize = 1048576
+
+// How much the live set may grow to before the next collection is `current().collect_above`. Raised
+// after every collection to a multiple of what survived it.
+
+// How much bigger than the surviving set the heap may get before collecting again.
+//
+// **Two means half the work a program does is collecting a heap that has doubled**, which is the
+// usual place to start and is what most generational-free collectors settle on.
+private const Headroom: usize = 2
+
+// Collect if enough has been allocated to be worth it.
+//
+// **Called only at a statement boundary, and that is the whole of the safety argument.** `alloc`
+// never collects, so the one moment a collection can happen is one the interpreter chose -- and it
+// chose the top of a statement, where what is live is the scope chain plus whatever the frames above
+// have pushed onto the shadow stack. A collection anywhere else would sweep a value some sysl local
+// was halfway through building.
+//
+// **The number read is `live_size` and the threshold moves, and both halves were wrong here.** This
+// asked whether `used` had passed a *fixed* 256 KiB, and `used` is the bump high-water mark, which
+// never falls -- so once a program had ever allocated that much it ran a full mark-sweep at **every
+// statement** for the rest of its life, reclaiming almost nothing each time. A 20,000-iteration loop
+// building one small object per turn ran **19,629 collections**. Nothing was wrong with the answers,
+// which is why it went unnoticed: the only symptom was speed.
+//
+// Reading `live_size` fixes half of it. The other half is that a fixed threshold puts a program
+// whose genuine live set sits above it straight back into the same loop -- so the threshold is
+// raised to a multiple of what survived, which is what makes the cost of collecting proportional to
+// the garbage produced rather than to the statements executed.
+// **The number read is cells PLUS PAYLOAD, and reading cells alone was the third half of the same
+// mistake.** A slate string is a cell of a few words owning a sysl `string`; an array owns a `Buf`,
+// an object a `Map`, a byte buffer its bytes -- none of it inside the block the collector manages.
+// A program making and dropping four thousand one-megabyte buffers therefore moved `live_size` by
+// almost nothing, no collection was ever due, and 1.67 GB of garbage piled up that a collection
+// would have taken. **Payload is therefore SCHEDULED**, and `Headroom ×` applies to it for the
+// reason it applies to the cells: a threshold below a program's genuine live payload puts it
+// straight back into collect-every-statement.
+//
+// **The ceiling is read here too, and it is the same combined figure.** A collection is attempted
+// first whichever of the two questions brought us here, so a program is never told it has run out of
+// memory over storage a sweep was about to give back.
+//
+// **CELLS AND PAYLOAD ARE TWO SCHEDULES, AND ONE THRESHOLD OVER THE COMBINED FIGURE WAS THE FOURTH
+// HALF OF THE SAME MISTAKE.** Doubling is right for both, and the FLOOR is not: a single threshold
+// of `max(Headroom × (cells + payload), CollectFloor)` gives payload a smallest-worth-collecting of
+// 256 KiB, which one medium string is already past. A program whose live set is one growing string
+// then allocates about as much payload per turn as it is holding, crosses its own threshold every
+// turn, and collects almost once a statement -- 123,884 collections over 150,000 turns of
+// `bench/strings`, a quarter of its wall time, each one walking the object graph to hand back the
+// previous copy of the string. So each figure is compared against a threshold of its own, raised to
+// `Headroom ×` what survived with its own floor under it, and a collection either question asks for
+// re-schedules both.
+//
+// **THE VM IS A PARAMETER BECAUSE THE SAFE POINT IS ON THE HOT PATH.** `current()` is a thread-local
+// read -- a `_tlv_get_addr` call on this platform -- and this stands in front of every statement the
+// program executes; the instruction loop is already holding the pointer, so asking again is a lookup
+// nobody needs. There is exactly one caller and it has the VM in hand, so there is no wrapper here.
+maybe_collect_on(v: *Vm)
+    val capped = v.payload_capped
+    val cells = gc.live_size(&v.heap)
+    val in_use = cells + v.payload
+
+    // **The high-water mark is taken HERE and not in `charge`**, which is what makes it the figure
+    // the schedule is answerable for: the largest combined size the schedule ever let stand at a
+    // statement boundary, read where the decision to collect is made and before it is made.
+    if in_use > v.high_water then v.high_water = in_use
+
+    if (capped && in_use > v.heap_limit) || cells > v.collect_above || v.payload > v.payload_above
+        collect_now()
+
+        val cells_left = gc.live_size(&v.heap) * Headroom
+        val payload_left = v.payload * Headroom
+
+        v.collect_above = if cells_left > CollectFloor then cells_left else CollectFloor
+        v.payload_above = if payload_left > PayloadFloor then payload_left else PayloadFloor
+
+    if capped && gc.live_size(&v.heap) + v.payload > v.heap_limit then v.heap_exhausted = true
+end maybe_collect_on
+
+// Give the heap back, and run every finalizer still outstanding.
+//
+// **Without it a finalizer never runs for anything still reachable when the program stops**, so
+// every sysl string and `Buf` a live object holds would leak. It is also what lets two programs run
+// in one process, which every test in this repo does.
+reset_heap()
+    gc.dispose(slate_heap())
+
+    // **Rebuilt rather than reused, because the limit may have moved.** `dispose` hands every block
+    // back to the free list, which is the right thing for a heap of the same size and the wrong one
+    // for a heap that has just changed size -- the free list would still describe the old extent.
+    val v = current()
+
+    v.heap = gc.heap(v.region, v.heap_limit)
+    v.spare_entries = buf()
+    v.root_values.clear()
+    v.root_envs.clear()
+    forget_carried()
+    v.collections = 0
+    v.collect_above = CollectFloor
+    v.payload_above = PayloadFloor
+
+    // `dispose` ran every finalizer, so nothing is held outside the heap any more.
+    v.payload = 0
+    v.payload_marked = 0
+    v.high_water = 0
+
+    v.heap_exhausted = false
+    reserve_spares(v)
