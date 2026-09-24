@@ -1,0 +1,119 @@
+module dev.slatelang.slate
+
+import sh.sysl.gc
+import sysl.buf.{Buf, buf}
+import sysl.text.{from_utf8_unchecked, str_builder}
+
+// A string of one ASCII character is made once per VM and handed out every time after that.
+//
+// **`string(i % 10)`, `s[i]`, a `for` over a string, `chars(s)` and `split(s, "")` each answer a
+// string of one character**, and until this every one of them was a heap cell and a `malloc`ed byte
+// -- two allocations, a finalizer and a `free`, for a value that is one of 128 texts. A slate string
+// is immutable and `==` compares text, so which cell answers is invisible to a program: the table
+// only changes how many cells there are.
+//
+// **The table lives on the `Vm` and is filled lazily**, one cell the first time its character is
+// asked for. A cell is an ordinary `StrObj` in the VM's own heap, charged as any string is, and
+// `mark_small_strs` roots every one of them -- so a cell is never swept while the table names it,
+// and a rebuilt heap (`reserve_spares`) empties the table before anything can read a dead cell.
+//
+// **Only ASCII is interned**, which is what makes the table a fixed 128 entries indexed by the
+// byte. A byte of 0x80 or above is either part of a longer character or an ill-formed byte that
+// counts as one character on its own, and neither is common enough to be worth a second table.
+//
+// **What an interned cell must never have is a room or a moving cursor**, and it has neither: a
+// room is only ever made for a joined string of at least `RoomFrom` bytes, and a one-byte string
+// indexes by arithmetic without touching its cursor. So the one cell being shared by every holder
+// changes nothing any of them can read.
+
+// How many texts the table holds: one per ASCII byte.
+private const SmallTexts: usize = 128
+
+// The table a fresh VM starts with, every entry empty.
+//
+// Not `private`: `vm_over` in `vm_state.sysl` builds a VM with it.
+no_small_strs() -> Buf[*StrObj]
+    var t: Buf[*StrObj] = buf()
+
+    for i in 0..<SmallTexts
+        t.push(null)
+
+    t
+end no_small_strs
+
+// Empty the table, for a heap that has just been rebuilt: every cell it named has been given back.
+//
+// Not `private`: `reserve_spares` in `obj.sysl` calls it for every new heap.
+forget_small_strs(v: *Vm)
+    for i in 0..<v.small_strs.len()
+        v.small_strs.set(i, null)
+
+// Keep every interned cell alive.
+//
+// Not `private`: `mark_spares` in `obj.sysl` roots them beside the reserves.
+mark_small_strs(h: *gc.Heap, v: *Vm)
+    for i in 0..<v.small_strs.len()
+        val p = v.small_strs.at(i)
+
+        if p != null then gc.mark(h, ptr_cast(p))
+
+// The string of one ASCII byte, `b` below 128.
+//
+// **A full heap answers the reserve cell, and that one is never kept**: the reserve is shared by
+// whatever else the exhausted statement makes and is written over, and the program stops at the end
+// of that statement anyway. The next VM's table starts empty.
+small_str(b: u8) -> Value
+    val v = current()
+    val at = usize(b)
+    val have = v.small_strs.at(at)
+
+    if have != null then return Str(have)
+
+    var out = str_builder()
+
+    out.bytes.push(b)
+
+    val made = new_str_counted(out.finish(), 1)
+
+    if made != v.spare_str then v.small_strs.set(at, made)
+
+    Str(made)
+end small_str
+
+// Whether a run of bytes is one ASCII character.
+private one_ascii(bytes: []const u8, a: usize, b: usize) -> bool = b == a + 1 && bytes[a] < 0x80
+
+// The character at position `i` of a string, as a string -- interned where it is ASCII.
+//
+// Not `private`: `s[i]`'s `at`, and a `for` over a string in `run_frames.sysl`, both answer with it.
+str_char_value(o: *StrObj, i: usize) -> Value
+    val a = str_byte_at(o, i)
+    val b = str_byte_at(o, i + 1)
+    val bytes = o.s.bytes
+
+    if one_ascii(bytes, a, b) then return small_str(bytes[a])
+
+    str_counted(if b <= a then "" else from_utf8_unchecked(bytes[a..<b]), 1)
+end str_char_value
+
+// The bytes `a..<b` of `text` as a string of `chars` characters -- interned where they are one
+// ASCII character, so a cut of one character copies nothing.
+//
+// Not `private`: `str_slice` and `chars` in `text.sysl` cut with it.
+cut_value(text: string, a: usize, b: usize, chars: usize) -> Value
+    val bytes = text.bytes
+
+    if one_ascii(bytes, a, b) then return small_str(bytes[a])
+
+    str_counted(from_utf8_unchecked(bytes[a..<b]), chars)
+end cut_value
+
+// A piece somebody has already cut, as a string of `chars` characters -- interned where it is one
+// ASCII character. Not `private`: `split` in `text.sysl` answers each piece with it.
+piece_value(piece: string, chars: usize) -> Value
+    val bytes = piece.bytes
+
+    if one_ascii(bytes, 0, bytes.len) then return small_str(bytes[0])
+
+    str_counted(piece, chars)
+end piece_value
