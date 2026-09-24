@@ -1,0 +1,122 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.{Span}
+import sysl.text.Search
+
+// What a `Value` is as wide as, and the kinds that had to change shape to make it so.
+//
+// **Sixteen bytes: a tag and one word.** Every push, pop, slot read, array element and table entry
+// moves one whole `Value`, so the width is paid by every program on every instruction. It was 40
+// while a range carried three numbers and three flags inline; a range, a civil reading and a zoned
+// reading are now cells (`boxed.sysl`), and the kinds that were two numbers -- a socket, a child, a
+// generator, an actor, a message -- are packed into the one word. These tests pin the width and
+// that every one of those kinds still says, compares and hashes what it did.
+
+private here() -> Span = Span(0, 0)
+
+private equal(a: Value, b: Value) -> bool = same(a, b, here()).unwrap_or(false)
+
+private hashed(v: Value) -> u64 = hash_value(v, here()) match
+    Ok(h) -> h
+    Err(_) -> 0
+
+@test
+A_VALUE_IS_A_TAG_AND_ONE_WORD()
+    // A field added to a variant that pushes this past sixteen has to answer to the measurement in
+    // `bench/results/2026-09-24-narrow-value.md`, every instruction in every program paying for it.
+    assert_eq(sizeof(Value), 16usize)
+
+    // A `Step` is still as wide as its widest fault (`tests_carried.sysl`), the `Value` inside `Ok`
+    // and `Ret` being narrower than that now.
+    assert(sizeof(Step) <= 64)
+
+@test
+A_SOCKET_A_CHILD_AND_A_GENERATOR_KEEP_BOTH_HALVES_AT_THE_TOP_OF_THEIR_RANGE()
+    // The two halves share one word, so a slot and a generation near the top of 32 bits must come
+    // back out as themselves and must not bleed into each other.
+    val top = 4294967295u32
+
+    assert(equal(Socket(top, 7u32), Socket(top, 7u32)))
+    assert(!equal(Socket(top, 7u32), Socket(top, 8u32)))
+    assert(!equal(Socket(7u32, top), Socket(top, 7u32)))
+    assert(hashed(Socket(top, 7u32)) == hashed(Socket(top, 7u32)))
+    assert(hashed(Socket(top, 7u32)) != hashed(Socket(7u32, top)))
+
+    assert(equal(ChildVal(3u32, top), ChildVal(3u32, top)))
+    assert(!equal(ChildVal(3u32, top), ChildVal(3u32, 1u32)))
+    assert(equal(Gen(top, top), Gen(top, top)))
+    assert(!equal(Gen(top, 1u32), Gen(1u32, top)))
+
+    // A socket and a generator with the same halves are two kinds, and hash apart.
+    assert(!equal(Socket(1u32, 2u32), Gen(1u32, 2u32)))
+    assert(hashed(Socket(1u32, 2u32)) != hashed(Gen(1u32, 2u32)))
+
+    Socket(top, 9u32) match
+        Socket(id, gen) ->
+            assert(usize(id) == 4294967295usize)
+            assert(usize(gen) == 9usize)
+        _ -> assert(false)
+
+@test
+A_MESSAGE_KEEPS_ITS_ACTOR_ITS_GENERATION_AND_ITS_NAME()
+    val m = message_value(1023u32, 4000000000u32, "total", here()).unwrap_or(Null)
+
+    m match
+        MessageVal(gen, id, name) ->
+            assert(usize(id) == 1023usize)
+            assert(usize(gen) == 4000000000usize)
+            assert_eq(message_name_of(usize(name)), "total")
+        _ -> assert(false)
+
+    assert(equal(m, message_value(1023u32, 4000000000u32, "total", here()).unwrap_or(Null)))
+    assert(!equal(m, message_value(1023u32, 4000000000u32, "count", here()).unwrap_or(Null)))
+
+@test
+THE_HANDLER_NAME_PAST_THE_LAST_A_MESSAGE_CAN_HOLD_IS_REFUSED_RATHER_THAN_WRAPPED()
+    // Sixteen bits of name: the one past the last would otherwise wrap onto the first and send
+    // every message for it to a handler somebody else named.
+    val v = current()
+    val had = v.message_names.len()
+
+    while v.message_names.len() < 65536
+        v.message_names.push(s"h${v.message_names.len()}")
+
+    message_value(0u32, 1u32, "oneMore", here()) match
+        Ok(_) -> assert(false)
+        Err(Fail(_, _, _, message)) -> assert(message.contains("as many as one can"))
+        Err(_) -> assert(false)
+
+    // A name already interned still makes a message at the ceiling.
+    assert(message_value(0u32, 1u32, "h65535", here()).is_ok())
+    v.message_names.truncate(had)
+
+@test
+A_RANGE_IS_A_CELL_AND_STILL_COMPARES_HASHES_PRINTS_AND_WALKS_AS_IT_DID()
+    // `1..3` and `1..<4` are one range, so they are one member of a set -- the cell's address is
+    // not what either compares.
+    val prog = "val r = 1..3\nval s = 1..<4\nprint(r == s, Set([r, s, 0..<10 by 2, 0..8 by 2]).size, r, 5.., ..<7, 10..0 by -3)\nvar t = 0\nfor i in 0..<5\n    for j in 0..i\n        t = t + j\nprint(t, [10, 20, 30, 40][1..2], \"abcdef\"[0..<6 by 2], (0..<10 by 3).length)"
+
+    assert_eq(out(prog), "true 2 1..3 5.. ..<7 10..0 by -3\n20 [20, 30] ace 4")
+
+@test
+A_RANGE_HELD_ACROSS_COLLECTIONS_IS_STILL_THE_RANGE_THAT_WAS_MADE()
+    // Twenty thousand cells in an array while the collector runs: a cell the tracer did not mark
+    // would be handed to the next allocation and a range would change under the program.
+    val prog = "val keep = []\nfor i in 0..<20000\n    push(keep, i..(i + 2))\n    val junk = [i, i, i]\nvar n = 0\nfor r in keep\n    n = n + r.length\nprint(n, keep[19999])"
+
+    assert_eq(out(prog), "60000 19999..20001")
+
+    // The control: the collector did run while the cells were held, or the test proved nothing.
+    assert(current().collections > 0)
+
+@test
+A_BIG_INTEGER_AND_THE_ODD_REALS_ARE_UNCHANGED_BY_THE_NARROWER_VALUE()
+    val prog = "val big = 9223372036854775807 + 1\nprint(big, big - big + 5 == 5, Set([big, big + 0]).size, big * big)\nprint(0.0 == -0.0, 1.0 / 0.0, -1.0 / 0.0, (0.0 / 0.0) == (0.0 / 0.0), Set([0.0, -0.0]).size)"
+
+    assert_eq(out(prog), "9223372036854775808 true 1 85070591730234615865843651857942052864\ntrue Infinity -Infinity false 1")
+
+@test
+A_CIVIL_AND_A_ZONED_READING_ARE_CELLS_AND_STILL_COMPARE_HASH_AND_MOVE()
+    val prog = "val a = dateTime(2026, 3, 7, 9, 0)\nval b = dateTime(2026, 3, 7, 9, 0)\nval z = zone(\"America/Toronto\").value\nval t = a.at(z).value\nval u = b.at(z).value\nprint(a == b, Set([a, b]).size, a + days(1), a + months(1), (a + hours(30)) - a)\nprint(t == u, Set([t, u]).size, t, t + days(1), t + hours(24), startOf(t, \"month\"), (t + hours(3)) > t)"
+
+    assert_eq(out(timed(prog)), "true 1 2026-03-08T09:00:00 2026-04-07T09:00:00 30h\ntrue 1 2026-03-07T09:00:00-05:00[America/Toronto] 2026-03-08T09:00:00-04:00[America/Toronto] 2026-03-08T10:00:00-04:00[America/Toronto] 2026-03-01T00:00:00-05:00[America/Toronto] true")
