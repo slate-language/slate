@@ -18,7 +18,6 @@
 
 import { cluster, isPrimary, isWorker, workerId } from slate:cluster
 import { cpus, pid, spawn } from slate:process
-import { monotonic, millis } from slate:time
 
 // A value whose type the checker cannot see, so a refusal is the machine's rather than the pass's.
 anything(v) = v
@@ -282,13 +281,12 @@ async A_SHUTDOWN_ASKED_FOR_TWICE_IS_NOT_AN_ERROR()
     assert(true)
 
 @test
-async A_ROLL_LEAVES_THE_OLD_WORKER_A_MOMENT_BEFORE_TELLING_IT_TO_GO()
-    // **A connection handed to a worker just before a roll is still being read when the roll reaches
-    // it**, and a worker told to drain in that window answers it as a server that is shutting down. So
-    // the supervisor waits a quarter of a second after taking the old worker out of the rotation, and
-    // only then sends `shutdown`. A shell worker exits the moment it is told, so the time from the
-    // `SIGHUP` to its exit is at least that wait; without it, it is the few milliseconds a shell takes
-    // to start and say hello.
+async A_ROLL_TELLS_THE_OLD_WORKER_TO_GO_ONLY_ONCE_ITS_REPLACEMENT_HAS_SAID_HELLO()
+    // **The replacement is serving before the old worker is asked to leave, and the old one is TOLD
+    // rather than killed.** The supervisor does not wait after that: a connection it handed the old
+    // worker just before is ahead of the `shutdown` on the same ordered channel, and the WORKER holds
+    // its `onShutdown` until that connection has been heard -- which `tests_cluster.sysl` pins against
+    // a real handed socket, since a shell worker has no server to hold anything for.
     var heard = []
     var exits = []
     var stop = null
@@ -302,12 +300,10 @@ async A_ROLL_LEAVES_THE_OLD_WORKER_A_MOMENT_BEFORE_TELLING_IT_TO_GO()
         w -> null)
 
     val first = await until(() -> heard.length == 1, 8000)
-    val began = monotonic()
 
     await spawn("/bin/sh", ["-c", "kill -HUP $PPID"]).value.exited
 
     val rolled = await until(() -> exits.length == 1, 8000)
-    val took = monotonic() - began
     val second = heard.length
 
     stop()
@@ -320,7 +316,6 @@ async A_ROLL_LEAVES_THE_OLD_WORKER_A_MOMENT_BEFORE_TELLING_IT_TO_GO()
     // The replacement said hello before the old one was asked to leave.
     assertEq(second, 2)
 
-    // The old worker was TOLD, not killed, and only after the wait.
+    // The old worker was TOLD, not killed.
     assertEq(exits[0].id, 1)
     assertEq(exits[0].signal, null)
-    assert(took >= millis(250))
