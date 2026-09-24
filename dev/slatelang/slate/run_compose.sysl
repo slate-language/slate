@@ -329,6 +329,39 @@ compose_joined_arrays(vm: *Machine, n: usize, at: Span) -> Result[unit, Signal]
     Ok(())
 end compose_joined_arrays
 
+// `GetIndex`: `o[k]`, the container standing under the key.
+//
+// **An array at a whole number inside it is answered where the two stand**, the element written over
+// the container and the key cut off -- no pop, no push and no `Step` coming back through `read_at`.
+// Everything else, a range subscript, a string, bytes, a key out of range and every sentence, is
+// `read_at`'s, reached exactly as the arm always reached it.
+compose_get_index(vm: *Machine, at: Span) -> Result[unit, Signal]
+    val n = vm.stack.len()
+
+    if indexed_in_place(vm, n - 2, vm.stack.at(n - 1))
+        vm.stack.truncate(n - 1)
+        return Ok(())
+
+    val k = pop_on(vm)
+    val target = pop_on(vm)
+
+    vm.stack.push(read_at(target, k, at)?)
+    Ok(())
+end compose_get_index
+
+// Whether the value at `t` is an array holding a place `k` names, and if so the element is written
+// over it. Not `private`: `run_fused.sysl`'s `LoadSlotIndex` asks it with the index still in its cell.
+@inline
+indexed_in_place(vm: *Machine, t: usize, k: Value) -> bool = vm.stack.at(t) match
+    Array(a) -> k match
+        Int(i) ->
+            if i < 0 || usize(i) >= a.items.len() then return false
+
+            vm.stack.set(t, a.items.at(usize(i)))
+            true
+        _ -> false
+    _ -> false
+
 // `o[k] = v`.
 write_indexed(vm: *Machine, at: Span) -> Result[unit, Signal]
     val v = pop()
@@ -387,6 +420,85 @@ compose_iter_init(vm: *Machine, at: Span) -> Result[unit, Signal]
 
     Ok(())
 end compose_iter_init
+
+// `IterNext`'s step: the next element of the walk standing under its counter, with the counter moved
+// past it, or `None` where the walk is over. Not `private`: the two walk instructions in
+// `run_frames.sysl` are its callers.
+//
+// **An array and a range are answered here, inline, and every other kind by a call**, those two
+// being nearly every `for` a program writes; the element is read at the counter and the counter is
+// moved one on in place.
+@inline
+iter_next_on(vm: *Machine, at: Span) -> Result[Option[Value], Signal]
+    val n = vm.stack.len()
+    val i = vm.stack.at(n - 1) match
+        Int(c) -> usize(c)
+        _ -> 0
+
+    val step = vm.stack.at(n - 2) match
+        Array(p) -> if i >= p.items.len() then None else Some(p.items.at(i))
+        RangeVal(r) ->
+            if i >= range_count(r.lo, r.hi, r.inclusive, r.step) then None else Some(Int(range_at(r.lo, r.step, i)))
+        _ -> return iter_next_other(vm, i, at)
+
+    if step.is_some() then vm.stack.set(n - 1, Int(long(i + 1)))
+    Ok(step)
+end iter_next_on
+
+// The step for every kind but an array and a range, the counter moved where it has to go.
+private iter_next_other(vm: *Machine, i: usize, at: Span) -> Result[Option[Value], Signal]
+    // **Where the counter goes next, which is one on for everything but a table.** A removed entry
+    // stays in place so that the positions in the index do not shift, so a walk over a set or a map
+    // skips it and lands past it.
+    var ahead = i + 1
+
+    val step = peek_on(vm, 1) match
+        Bytes(p) ->
+            if i >= p.data.len() then None else Some(Int(long(p.data.at(i))))
+        Str(p) ->
+            if i >= str_count(p) then None else Some(str_char_value(p, i))
+
+        // **A set yields its members and a map its pairs**, which is what JavaScript's `for...of`
+        // does with each -- so `for (k, v) in m` is an array pattern over the pair, needing nothing
+        // of its own.
+        SetVal(t) ->
+            var j = i
+
+            while j < t.entries.len() && t.entries.at(j).dead
+                j += 1
+
+            ahead = j + 1
+
+            if j >= t.entries.len() then None else Some(t.entries.at(j).key)
+        MapVal(t) ->
+            var j = i
+
+            while j < t.entries.len() && t.entries.at(j).dead
+                j += 1
+
+            ahead = j + 1
+
+            if j >= t.entries.len()
+                None
+            else
+                val e = t.entries.at(j)
+
+                var pair: Buf[Value] = buf()
+
+                pair.push(e.key)
+                pair.push(e.value)
+                Some(Array(new_array(pair)))
+
+        // **A generator ignores the counter and is asked instead.** The loop keeps counting beside
+        // it, which costs an integer and keeps this instruction one shape; what says whether there
+        // is another value is the generator, and only it can know. This runs slate code from inside
+        // the instruction loop, which is what a native calling back already does.
+        Gen(id, gen) -> gen_iter_next(usize(id), usize(gen), at)?
+        _ -> return Err(failure(at, "`for` walks an array, bytes, a string, a range, a generator, a set or a map"))
+
+    if step.is_some() then vm.stack.set(vm.stack.len() - 1, Int(long(ahead)))
+    Ok(step)
+end iter_next_other
 
 // `IterAwaitCheck`: whether the subject of a `for await` is a thing `next()` can be asked of.
 //
