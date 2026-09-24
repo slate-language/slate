@@ -403,3 +403,166 @@ A_BREAK_AND_A_CONTINUE_LEAVE_A_FOLDED_LOOP_WHERE_THE_UNFUSED_ONE_LEFT_IT()
         seen.push(i)
 
     assertEq(seen, [1, 3, 5, 7])
+
+// -- a local's field, a product summed, an arm's test, a module variable and a remainder, each
+// -- folded; and an equality before a jump and a walk's head, each left as it was --
+
+class Point
+    var x
+    var y
+
+    dot(self, o) = self.x * o.x + self.y * o.y
+
+var ticked = 0
+
+bumped(k) =
+    ticked = ticked + 1
+    ticked + k
+
+shape(v) = v match
+    [a, b] -> a + b
+    { name } -> name
+    _ -> "other"
+
+negated(v) = -v
+
+down(n, z) = if n == z then 0 else down(n - 1, z) + 1
+
+@test
+A_LOCALS_FIELD_READ_AS_ONE_ANSWERS_AND_REFUSES_AS_TWO()
+    val p = Point(2, 3)
+    val q = Point(5, 7)
+
+    assertEq(p.dot(q), 31)
+    assertEq(p.x + q.y, 9)
+
+    var said = ""
+
+    try
+        val n = anything(4)
+        said = string(n.nope)
+    catch e
+        said = e.message
+
+    assert(said != "" && said != "undefined", "a missing field on a number was read")
+
+@test
+A_PRODUCT_SUMMED_AS_ONE_PROMOTES_AND_MIXES_AS_TWO()
+    val a = 4611686018427387904
+    val b = 2
+    val c = 1
+
+    assertEq(string(c + a * b), "9223372036854775809")
+    assertEq(c + 3 * 4, 13)
+
+    val r = 0.5
+
+    assertEq(r + 2 * 3, 6.5)
+    assertEq(1 + r * 4, 3.0)
+
+    val big = 9223372036854775807
+
+    assertEq(string(big + 1 * 1), "9223372036854775808")
+
+@test
+A_MATCH_ARM_TESTED_AS_ONE_PICKS_THE_SAME_ARM()
+    assertEq(shape([1, 2]), 3)
+    assertEq(shape({ name: "n" }), "n")
+    assertEq(shape([1, 2, 3]), "other")
+    assertEq(shape(5), "other")
+
+@test
+A_MODULE_VARIABLE_AND_A_LITERAL_READ_AS_ONE_SEE_EVERY_WRITE()
+    ticked = 0
+
+    assertEq(bumped(10), 11)
+    assertEq(bumped(10), 12)
+    assertEq(ticked + 100, 102)
+
+@test
+A_REMAINDER_BY_A_LITERAL_AS_ONE_TRUNCATES_PROMOTES_AND_REFUSES_AS_TWO()
+    var odd = 0
+
+    for i in 0..<9
+        if i % 2 == 1
+            odd = odd + 1
+
+    assertEq(odd, 4)
+
+    val n = -7
+    val r = 7.5
+
+    assertEq(n % 3, -1)
+
+    var real_said = ""
+
+    try
+        real_said = string(r % 3)
+    catch e
+        real_said = e.message
+
+    assertEq(real_said, "a remainder is taken of integers")
+
+    var said = ""
+
+    try
+        val m = 7
+        said = string(m % 0)
+    catch e
+        said = e.message
+
+    assert(said != "", "a remainder by zero was answered")
+
+@test
+AN_EQUALITY_BEFORE_A_JUMP_ANSWERS_FOR_EVERY_KIND()
+    val pairs = [[1, 1], [1, 1.0], ["x", "x"], [[1], [1]], [1, "1"], [null, null]]
+    var same = []
+
+    for [a, b] in pairs
+        if a == b
+            same.push(true)
+        else
+            same.push(false)
+
+    assertEq(same, [true, true, true, true, false, true])
+
+@test
+A_WALK_OVER_EVERY_KIND_AND_A_RECURSION_ANSWER_ON_BOTH_HOSTS()
+    var t = 0
+
+    for x in [1, 2, 3]
+        t = t + x
+
+    for x in 0..<4
+        t = t + x
+
+    var chars = ""
+
+    for c in "abc"
+        chars = chars + c
+
+    var keys = 0
+
+    for [k, v] in Map([["a", 1], ["b", 2]])
+        keys = keys + v
+
+    assertEq(t, 12)
+    assertEq(chars, "abc")
+    assertEq(keys, 3)
+    assertEq(negated(4), -4)
+    assertEq(down(200, 0), 200)
+
+    var said = ""
+
+    try
+        val five = anything(5)
+
+        for x in five
+            t = t + 1
+    catch e
+        said = e.message
+
+    // The two hosts word it differently; what both owe is the refusal.
+    assert(said != "", "a `for` over a number walked")
+
+anything(v) = v
