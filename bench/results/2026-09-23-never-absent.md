@@ -4,8 +4,8 @@ The item `call-return` and `placed-call` both left open ([call-return](2026-09-2
 *What was tried and backed out*; [placed-call](2026-09-23-placed-call.md), *What was not tried*):
 every in-place call ran `keepable_on` once per argument, and the per-CALL version of the check lost
 to layout. What was owed was a proof, made while compiling, that no argument can be an absence, so
-the check does not run at all. Control dev `b95fbcf` (the `construction` merge); branch
-`never-absent-bit`.
+the check does not run at all. Control dev `c93c580` (the `mapset-sorting` merge, which had just
+inlined `keepable_on`'s tag test); branch `never-absent-bit`.
 
 ## What changed
 
@@ -20,10 +20,11 @@ the check does not run at all. Control dev `b95fbcf` (the `construction` merge);
   and a name the file reads by name.
 - **`Emit.sure`** (`emit.sysl`, `slots.sysl`): whether each slot, by number, is one `declare_name`
   filled. Such a slot is written only by `DeclareSlot` and `StoreSlot`, both of which refuse
-  `undefined`, and before it is declared a lookup cannot reach it. A **parameter's** slot says no —
-  a parameter nobody gave reads as the absence `lay_frame` padded it with — and so does a pattern's.
+  `undefined`, and before it is declared a lookup cannot reach it (a non-parameter slot is padded
+  with `null` in any case). A **parameter's** slot says no — a parameter nobody gave reads as the
+  absence `lay_frame` padded it with — and so does a pattern's.
 - **Both in-place arms** (`run_frames.sysl`) skip the per-argument loop when the bit is set. The
-  buffered path checks every argument whatever the bit says. `run_frames.sysl` 992 → 994 lines.
+  buffered path checks every argument whatever the bit says. `run_frames.sysl` +2 lines.
 - **The profile files a marked call apart** (`CallFnKept`, `CallMethodKept`), which is how the reach
   below was counted.
 
@@ -37,51 +38,45 @@ straight on, which is the one local the proof cannot cover.
 
 ## The disassembly
 
-`otool -tV -p '_dev.slatelang.slate$run_frames'`, the `CallFn` `InPlace` arm's argument check:
+`otool -tV -p '_dev.slatelang.slate$run_frames'`, the `CallFn` `InPlace` arm's argument check, with
+`keepable_on`'s tag test already inlined on dev (the refusal itself is `absent_refusal`, out of line):
 
 | | control | branch, bit clear | branch, bit set |
 |---|---|---|---|
-| before the loop | 2 (`cbz`, `neg`) | 3 (`tbnz w17, #31`, `cbz`, `neg`) | **1** (`tbnz`, taken) |
-| per argument, in the arm | 24 (peek, bounds, 5-word load, set-up, `bl`, `cbnz`, step) | 24 | 0 |
-| per argument, `keepable_on` itself | 20 (5 `stp`, `cmp`, `b.eq`, 8 `mov`, 5 `ldp`, `ret`) | 20 | 0 |
-| **`fib(n - 1)`, one argument** | **46** | **47** | **1** |
+| before the loop | 4 (`cbz`, a spill, `neg`, `mov`) | 4 (`tbnz w17, #31`, a reload, `cbz`, `neg`) | **1** (`tbnz`, taken) |
+| per argument | ~20 (bounds-checked peek, tag load, `cmp`/`b.ne`, loop step) | ~20 | 0 |
+| **`fib(n - 1)`, one argument** | **~24** | **~24** | **1** |
 
-`CallMethod`'s arm is the same shape. **The whole of `run_frames` also changed**: 27,874 lines of
-disassembly to 26,234, and references to `sp` from 4,026 to 3,379 — the register allocator, which
-works over the whole function, spilling ~650 fewer times. That is the larger part of what follows.
+`CallMethod`'s arm is the same shape.
 
 ## The numbers
 
-Alternating best-of-9 (`bench/alternate.pl 9`), control `b95fbcf` against the branch at `694c29d`,
-box at 87.2% idle with `pgrep -x java` empty, then **again with the two binaries' order swapped**
-(86.9% idle):
+Alternating best-of-9 (`bench/alternate.pl 9`), control `c93c580` against the branch at the merge
+of that dev, box at 89.8% idle with `pgrep -x java` empty, then **again with the two binaries' order
+swapped** (83.1% idle at the start; the swapped column is that run's change inverted, so both read
+branch against control):
 
 | program | control ms | branch ms | change | swapped: change |
 |---|---|---|---|---|
-| fib | 284.8 | 240.2 | **−15.7%** | −14.2% |
-| funcs | 145.9 | 118.7 | **−18.7%** | −21.2% |
-| calls | 212.5 | 202.8 | −4.6% | −5.1% |
-| methods | 299.9 | 269.2 | **−10.3%** | −11.0% |
-| closures | 121.4 | 112.4 | −7.4% | −8.6% |
-| nested | 242.7 | 230.7 | −4.9% | −5.8% |
-| branches | 296.3 | 232.4 | −21.6% | −18.2% |
-| globals | 198.7 | 163.2 | −17.9% | −17.6% |
-| dispatch | 296.8 | 262.0 | −11.7% | −10.5% |
-| mapset | 188.7 | 190.7 | +1.0% | +0.5% |
-| sorting | 498.9 | 504.2 | +1.1% | +1.2% |
-| **geometric mean** | | | **−7.83%** | **−7.29%** |
+| funcs | 128.3 | 116.3 | **−9.4%** | −9.1% |
+| methods | 278.4 | 265.3 | **−4.7%** | −3.8% |
+| calls | 179.1 | 171.8 | −4.1% | −3.6% |
+| fib | 252.3 | 243.7 | −3.4% | −3.2% |
+| closures | 113.1 | 110.5 | −2.3% | −3.5% |
+| nested | 228.0 | 223.3 | −2.1% | −1.5% |
+| sorting | 125.6 | 120.1 | −4.3% | −2.1% |
+| dispatch | 258.1 | 252.9 | −2.0% | −3.0% |
+| arrays | 187.2 | 196.3 | +4.9% | +3.2% |
+| arith | 137.1 | 139.7 | +1.9% | +3.1% |
+| **geometric mean** | | | **−2.19%** | **−0.93%** |
 
-(The swapped column is the second run's change inverted, so both columns read branch against
-control.) **Both orderings agree to within a point on every row**, so this is not the box drifting.
-
-**What it is, honestly: two effects of different sizes.** The check skipped is real and is on the
-programs with calls in their loop — `fib`, `funcs`, `methods`, `closures`. But `branches`, `globals`,
-`arith`, `fields` and `dispatch` make **no marked call in their loop**, and they moved by as much:
-that is the register allocation of `run_frames` above, which dropping a `bl` from two arms of a
-function the size of the dispatch let LLVM redo. The previous agent's per-call version moved the
-same programs the **other** way (+4–6%). So a later change to `run_frames` can give some of this
-back without touching calls at all, and anyone measuring an item against this dev should expect the
-no-call programs to be sensitive.
+**The call programs agree in both orderings** (`funcs`, `methods`, `calls`, `fib`, `closures` all
+−3 to −9%), and they are the programs whose loop makes a marked in-place call. The no-call programs
+scatter both ways by a few percent, which is layout: the branch's `run_frames` makes ~600 more stack
+references than the control's (3,339 against 2,735), so the register allocator did not come out
+ahead elsewhere. The first measurement, against `b95fbcf` before `keepable_on` was inlined, read
+−7.8% with `branches` −21.6% on no call at all; the merge of `mapset-sorting` took that away, and the
+numbers above are the ones against the dev this lands on.
 
 ## The tests
 
