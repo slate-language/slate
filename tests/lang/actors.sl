@@ -9,7 +9,7 @@
 // how a handle prints, its number being one implementation's slot and the other's worker id.
 
 import { spawn, send, ask, done, stop, detach, me, transfer } from slate:actor
-import { date, seconds, months } from slate:time
+import { date, dateTime, zone, seconds, months } from slate:time
 import { regex } from slate:regex
 import { encodeComponent } from slate:url
 import { Limit, addStock, stockCount, label, Keeper } from "./lib/shop.sl"
@@ -204,7 +204,17 @@ async every_sendable_kind_arrives_as_itself() =
     assertEq(await ask(e.back, [1, [2, 3]]), [1, [2, 3]])
     assertEq(await ask(e.back, { a: 1, b: "two" }), { a: 1, b: "two" })
     assertEq(await ask(e.back, 1..<4), 1..<4)
+    assertEq(await ask(e.back, 20..0 by -5), 20..0 by -5)
+    assertEq(await ask(e.back, 3..), 3..)
     assertEq(await ask(e.back, date(2026, 9, 18)), date(2026, 9, 18))
+    assertEq(await ask(e.back, dateTime(2026, 9, 18, 7, 30)), dateTime(2026, 9, 18, 7, 30))
+
+    val z = zone("America/Toronto").value
+    val t = dateTime(2026, 9, 18, 7, 30).at(z).value
+
+    assertEq(await ask(e.back, z), z)
+    assertEq(await ask(e.back, t), t)
+    assertEq(await ask(e.back, e.back), e.back)
     assertEq(await ask(e.back, seconds(90)), seconds(90))
     assertEq(await ask(e.back, months(3)), months(3))
     assertEq(await ask(e.back, regex("a+b")), regex("a+b"))
