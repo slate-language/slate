@@ -216,6 +216,24 @@ from that:
 - A default may read the parameters to its left: `slice(xs, from, to = xs.length)`.
 - A default that would fault costs nothing to a call that gave the argument.
 
+**A default may not read its own parameter or one to its right**, since those are not bound yet when
+it runs. That holds anywhere in the default — a lambda written inside one may not mention a later
+parameter either, since nothing says when the lambda runs — and it is refused before the program
+runs:
+
+```slate
+t(v) = v
+early(a = t(b), b = 2) = a
+print(early(b = 3))
+```
+
+```error
+the default of `a` reads `b`, which is to its right -- a default sees only the parameters before it
+```
+
+A pattern's defaults follow the same rule: in `val { a = 1, b = a + 1 } = o`, `b` may read `a` and `a`
+may not read `b`.
+
 **A parameter that may be left out has to come last**, or leaving it out would slide every later
 argument one place left. The parser says so where it is written, and an arity complaint then names a
 **range** rather than only its upper end.
