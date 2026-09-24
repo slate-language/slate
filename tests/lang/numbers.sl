@@ -499,5 +499,16 @@ isNaN_and_isFinite_convert_nothing_and_so_answer_false_for_anything_else() =
     // have to answer about a string, where the call answers `false` and says nothing.
     assert((unseen(nan).isNaN()) catch e -> true)
 
+@test
+a_position_that_was_not_found_is_no_number() =
+    // `indexOf` answers `null` for nothing found, and the machine refuses to order or add it. The
+    // compiler refuses the same line written directly; through `unseen` it is the machine that says so.
+    val at = unseen(indexOf([1, 2, 3], 9))
+
+    assertEq((at < 0) catch e -> e.message, "`<` does not apply to null and an integer")
+    assertEq((at + 1) catch e -> e.message, "`+` does not apply to null and an integer")
+    assertEq((indexOf([1, 2, 3], 9) ?? -1) < 0, true)
+    assertEq(at == null, true)
+
 // A value the checker cannot see the type of, so the refusal above is the machine's.
 unseen(v) = v
