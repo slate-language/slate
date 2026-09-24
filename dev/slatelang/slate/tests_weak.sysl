@@ -1,6 +1,7 @@
 module dev.slatelang.slate
 @tests
 
+import sh.sysl.gc
 import sh.sysl.parsing.*
 import sysl.text.Search
 
@@ -456,3 +457,106 @@ A_FULL_HEAP_ANSWERS_A_WEAK_REFERENCE_WITH_ITS_RESERVE_AND_reset_heap_TAKES_ANOTH
 
     reset_vm()
 end A_FULL_HEAP_ANSWERS_A_WEAK_REFERENCE_WITH_ITS_RESERVE_AND_reset_heap_TAKES_ANOTHER
+
+// -- a program with no weak value pays nothing for the kind -----------------------------------------
+//
+// **`sh.sysl.gc` skips a collection's ephemeron pass and its weaken pass where no live object has
+// the hook**, and `gc.weak_walks` counts the passes it did run. What these pin is slate's half of
+// that bargain: the reserves are taken under hook-less kinds, so a program that never makes a weak
+// value has no weak object on its heap at all. `run` rebuilds the heap on the way in, so every
+// figure read after `out` is that program's own.
+
+// Allocates enough, over a loop, to collect many times and makes no weak value anywhere.
+private const Churn: string = "var n = 0\nvar i = 0\nwhile i < 200000\n    val o = { a: i, b: [i, i] }\n    n = n + o.b.length\n    i = i + 1\nprint(n)"
+
+@test
+A_HEAP_WITH_ONLY_ITS_RESERVES_HOLDS_NO_WEAK_OBJECT()
+    reset_heap()
+    reset_vm()
+
+    assert_eq(gc.weak_objects(slate_heap()), 0, "no reserve carries a weaken hook")
+    assert_eq(gc.ephemeron_objects(slate_heap()), 0, "and none carries an ephemeron hook")
+
+    collect_now()
+    assert_eq(gc.weak_walks(slate_heap()), 0, "so a collection walks no weak object")
+    reset_vm()
+end A_HEAP_WITH_ONLY_ITS_RESERVES_HOLDS_NO_WEAK_OBJECT
+
+@test
+A_PROGRAM_WITH_NO_WEAK_VALUE_COLLECTS_WITHOUT_EVER_WALKING_THE_WEAK_OBJECTS()
+    assert_eq(out(Churn), "400000", "the program ran")
+
+    // The control: without collections the zero below would say nothing.
+    assert(current().collections > 5, s"the program collected, and it ran ${str(current().collections)} collections")
+    assert_eq(gc.weak_walks(slate_heap()), 0, "and not one of them walked a weak object")
+end A_PROGRAM_WITH_NO_WEAK_VALUE_COLLECTS_WITHOUT_EVER_WALKING_THE_WEAK_OBJECTS
+
+// The other half, and the one a gc that skipped unconditionally would fail: a program holding a weak
+// map is walked, and its entries still go.
+@test
+A_PROGRAM_HOLDING_A_WEAK_MAP_IS_WALKED_AT_EVERY_COLLECTION()
+    val prog = "val wm = WeakMap()\nval k = { name: \"kept\" }\nwm.set(k, 1)\n" + Churn + "\nprint(wm.get(k))"
+
+    assert_eq(out(prog), "400000\n1", "the program ran and the held key kept its entry")
+    assert(current().collections > 5, s"the program collected, and it ran ${str(current().collections)} collections")
+    assert_eq(gc.weak_objects(slate_heap()), 1, "the weak map is the one weak object")
+    assert(gc.weak_walks(slate_heap()) >= current().collections,
+        s"every collection walked it: ${str(gc.weak_walks(slate_heap()))} walks over ${str(current().collections)} collections")
+end A_PROGRAM_HOLDING_A_WEAK_MAP_IS_WALKED_AT_EVERY_COLLECTION
+
+// **The reserve is a STRONG table now, and it must still serve as a weak map for the statement that
+// took it**: written through, read back, and traced like the object it is, so what it was handed
+// survives the collection the full heap goes on asking for.
+@test
+A_FULL_HEAP_ANSWERS_A_WEAK_MAP_WITH_ITS_RESERVE_AND_THE_RESERVE_HOLDS_WHAT_IT_WAS_GIVEN()
+    reset_vm()
+    set_heap_limit(ReuseCeiling)
+    reset_heap()
+
+    val mark = root_mark()
+    var made: usize = 0
+
+    while made < 40000 && !current().heap_exhausted
+        hold(Object(new_object()))
+        made += 1
+
+    val ran_out = current().heap_exhausted
+    val reserve = new_weak_map()
+    val was_reserve = reserve == current().spare_weak_map
+
+    // Let the filler go, so the key and the value below are fresh cells held by nothing but the
+    // reserve: a weak table would drop the entry at the next collection, and the reserve is a strong
+    // one, which is the safe direction for a table the program is still inside.
+    release(mark)
+
+    val key = Object(new_object())
+
+    write_entry(reserve, key, str_value("from the reserve"))
+    collect_now()
+
+    val kept = reserve.live
+    val answered = obj_get(reserve, key, point(0)) match
+        Ok(Some(v)) -> value_text(v)
+        _ -> "nothing"
+
+    set_heap_limit(HeapBytes)
+    reset_heap()
+
+    assert(ran_out, s"a heap that is full says so, and this made ${str(made)} objects without filling it")
+    assert(was_reserve, "the full heap answered the weak map with its reserve")
+    assert_eq(kept, 1, "the reserve kept its entry across a collection")
+    assert_eq(answered, "from the reserve", "and reads back what it was given")
+    assert_eq(gc.weak_objects(slate_heap()), 0, "and the reserve taken again is still no weak object")
+
+    reset_vm()
+end A_FULL_HEAP_ANSWERS_A_WEAK_MAP_WITH_ITS_RESERVE_AND_THE_RESERVE_HOLDS_WHAT_IT_WAS_GIVEN
+
+// The error path a program sees: a weak map made on a heap that is already full is reported with
+// the ordinary sentence, against the statement that was running -- here the loop making them.
+@test
+A_WEAK_MAP_MADE_ON_A_FULL_HEAP_GETS_THE_ORDINARY_OUT_OF_MEMORY_SENTENCE()
+    val said = in_small_heap("val keep = []\nwhile true\n    keep.push(WeakMap())")
+
+    assert(said.contains("run out of memory"), s"a full heap says so, and this said: ${said}")
+    assert(said.contains("t:2:1"), s"against the statement that made the weak maps, and this said: ${said}")
+end A_WEAK_MAP_MADE_ON_A_FULL_HEAP_GETS_THE_ORDINARY_OUT_OF_MEMORY_SENTENCE
