@@ -1,0 +1,167 @@
+module dev.slatelang.slate
+@tests
+
+import sh.sysl.parsing.{Span}
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// A builtin method answered from its call site's memory, and a local in front of a remainder run
+// taken in one dispatch.
+//
+// **Two things are pinned here**, each beside the neighbouring case that still takes the long road:
+//
+// - `builtin_from_site`'s hit is inlined into the call instruction, and `placing` answers a builtin
+//   without leaving it -- so what a site remembers must still be what the tables would say, for
+//   every kind of receiver a site meets and in whatever order it meets them;
+// - `LoadSlot(a); LoadSlot(i); PushInt(v); Rem` is one `LoadSlotSlotIntRem`, and the `SlotIntRem`
+//   it covers still stands for a jump that lands on its first slot.
+//
+// `tests/lang/mapset2.sl` asks the same questions of both back ends through a program.
+
+// The instructions of the largest chunk of that name, as `tests_mapset_chain.sysl` reads them.
+private ops_of(program: string, name: string) -> Buf[Op]
+    out(program)
+
+    var best: Buf[Op] = buf()
+    var found = false
+
+    for i in 0..<running_unit().chunks.len()
+        if running_unit().chunks.at(i).name != name then continue
+
+        found = true
+
+        val code = running_unit().chunks.at(i).code
+        var ops: Buf[Op] = buf()
+
+        for k in 0..<code.len()
+            ops.push(code.at(k).op)
+
+        if ops.len() > best.len() then best = ops
+
+    assert(found, s"no chunk is called `${name}`")
+    best
+end ops_of
+
+// -- a call site's memory ----------------------------------------------------------------------------
+
+@test
+ONE_SITE_MEETING_A_MAP_A_SET_AN_OBJECT_AND_A_MAP_AGAIN_ANSWERS_EACH_ITS_OWN()
+    // **The site remembers the KIND with the builtin**, so a set arriving where a map was seen asks
+    // the tables again, an object is answered by its own field and leaves the builtin memory alone,
+    // and the map after them finds `has` as a map's once more.
+    val program = "g(x, k) = x.has(k)\nval m = Map()\nm.set(1, 2)\nval s = Set()\ns.add(3)\nval o = { has: k -> \"own\" }\n" +
+                  "print(g(m, 1), g(s, 1), g(o, 1), g(m, 5), g(s, 3), g(m, 1))"
+
+    assert_eq(out(program), "true false own false true true")
+end ONE_SITE_MEETING_A_MAP_A_SET_AN_OBJECT_AND_A_MAP_AGAIN_ANSWERS_EACH_ITS_OWN
+
+@test
+A_SITE_THAT_KNOWS_A_MAP_STILL_REFUSES_A_KIND_WITHOUT_THE_METHOD()
+    // The memory is keyed on the kind, so an array reaching a site that has only seen maps takes the
+    // tables and their sentence -- not the map's builtin handed an array.
+    val program = "g(x, k) = x.has(k)\nval m = Map()\nprint(g(m, 1))\nprint(g([1], 1))"
+
+    assert(fails(program).contains("`has` is not something an array can do"), "an array was answered as a map")
+end A_SITE_THAT_KNOWS_A_MAP_STILL_REFUSES_A_KIND_WITHOUT_THE_METHOD
+
+@test
+EVERY_KIND_OF_KEY_THROUGH_ONE_SITE_IS_THE_KEY_THE_TABLE_WOULD_FIND()
+    // One `set` site and one `get` site, handed an integer, the real of the same value, text, an
+    // object, an array and a negative integer in turn: `1` and `1.0` are one key, two objects of one
+    // shape are one key, and nothing else collides.
+    val program = "val m = Map()\nval keys = [1, 1.0, \"a\", { x: 1 }, { x: 1 }, [1, 2], -1]\nvar i = 0\n\n" +
+                  "while i < keys.length\n    m.set(keys[i], i)\n    i = i + 1\n\n" +
+                  "print(m.size, m.get(1), m.get(1.0), m.get(\"a\"), m.get({ x: 1 }), m.get([1, 2]), m.get(-1), m.get(2))"
+
+    assert_eq(out(program), "5 1 1 2 4 5 6 null")
+end EVERY_KIND_OF_KEY_THROUGH_ONE_SITE_IS_THE_KEY_THE_TABLE_WOULD_FIND
+
+@test
+A_MAP_AND_A_SET_THAT_GROW_PAST_THEIR_FIRST_SIZE_MID_LOOP_KEEP_EVERY_KEY()
+    // The loop `bench/mapset.sl` runs, with the key space wider than any index the table starts with,
+    // so the inline find meets a table that has been rebuilt under it many times.
+    val program = "val m = Map()\nval s = Set()\nvar i = 0\n\nwhile i < 9000\n    m.set(i % 3000, i)\n    s.add(i % 3000)\n    i = i + 1\n\n" +
+                  "print(m.size, s.size, m.get(0), m.get(2999), s.has(2999), s.has(3000))"
+
+    assert_eq(out(program), "3000 3000 6000 8999 true false")
+end A_MAP_AND_A_SET_THAT_GROW_PAST_THEIR_FIRST_SIZE_MID_LOOP_KEEP_EVERY_KEY
+
+@test
+A_MAP_FILLED_THROUGH_ONE_SITE_PROBES_NO_FURTHER_THAN_ONE_FILLED_DIRECTLY()
+    // The witness for the table under the loop above: the three thousand keys `i % 3000` lands on
+    // look at few slots past their own, however many times the loop wrote each one.
+    val t = new_object()
+
+    for i in 0..<9000
+        assert(obj_put(t, Int(long(i % 3000)), Int(long(i)), Span(0, 0)).is_ok())
+
+    val worst = longest_probe(t)
+
+    assert(worst < 16usize, s"a key had to look at ${worst} slots")
+    assert(worst < 3000usize, "the control: a bound the table could not have met by walking every key")
+end A_MAP_FILLED_THROUGH_ONE_SITE_PROBES_NO_FURTHER_THAN_ONE_FILLED_DIRECTLY
+
+// -- a local in front of a remainder -----------------------------------------------------------------
+
+@test
+A_LOCAL_IN_FRONT_OF_A_REMAINDER_OF_A_LOCAL_IS_ONE_INSTRUCTION()
+    val ops = ops_of("f(m, i) =\n    m.set(i % 1000, i)\n    m.get(i % 1000)\n\nprint(f(Map(), 1234))", "f")
+    var runs: usize = 0
+
+    for i in 0..<ops.len()
+        ops.at(i) match
+            LoadSlotSlotIntRem(a, r, v) ->
+                runs += 1
+                assert_eq(usize(a), 0usize)
+                assert_eq(usize(r), 1usize)
+                assert_eq(long(v), 1000)
+
+                // The run it covers stands behind it, for a jump that lands there.
+                val inner = ops.at(i + 1) match
+                    SlotIntRem(_, n) -> n == 1000
+                    _ -> false
+
+                assert(inner, "the remainder the run covers is not standing behind it")
+            _ -> ()
+
+    assert_eq(runs, 2usize)
+    assert_eq(out("f(m, i) =\n    m.set(i % 1000, i)\n    m.get(i % 1000)\n\nprint(f(Map(), 1234))"), "1234")
+end A_LOCAL_IN_FRONT_OF_A_REMAINDER_OF_A_LOCAL_IS_ONE_INSTRUCTION
+
+@test
+A_JUMP_LANDING_ON_THE_REMAINDER_RUNS_THE_REMAINDER_ALONE()
+    // `c && a` jumps past its `LoadSlot(a)` when `c` is false, landing on the first slot of the
+    // remainder run -- which is the `SlotIntRem` the fused run covers, so the answer is the one the
+    // unfused four would have given on both roads.
+    val ops = ops_of("f(c, a, i) = [c && a, i % 3]\n\nprint(f(false, 9, 7), f(true, 9, 8))", "f")
+    var runs: usize = 0
+
+    for i in 0..<ops.len()
+        ops.at(i) match
+            LoadSlotSlotIntRem(_, _, _) -> runs += 1
+            _ -> ()
+
+    assert_eq(runs, 1usize, "the control: the run this test is about was not folded")
+    assert_eq(out("f(c, a, i) = [c && a, i % 3]\n\nprint(f(false, 9, 7), f(true, 9, 8))"), "[false, 1] [9, 2]")
+end A_JUMP_LANDING_ON_THE_REMAINDER_RUNS_THE_REMAINDER_ALONE
+
+@test
+A_FOLDED_REMAINDER_BY_ZERO_IS_REFUSED_AT_THE_REMAINDER()
+    val said = fails("f(xs, i) = xs[i % 0]\nprint(f([1], 3))")
+
+    assert(said.contains("this takes a remainder by zero"), said)
+    assert(said.contains("^^^^^"), "the sentence does not point at `i % 0`")
+end A_FOLDED_REMAINDER_BY_ZERO_IS_REFUSED_AT_THE_REMAINDER
+
+@test
+A_FOLDED_REMAINDER_OF_ANYTHING_BUT_AN_INTEGER_IS_REFUSED_AS_THE_UNFOLDED_ONE_IS()
+    // The run pushes its local and hands the remainder to the general arithmetic, so a negative
+    // truncates toward zero and a real or text is refused in the unfolded remainder's own sentence.
+    assert_eq(out("f(m, x) = [m, x % 2]\n\nprint(f(0, -7))"), "[0, -1]")
+
+    val real = fails("f(m, x) = [m, x % 2]\nanything(v) = v\n\nprint(f(0, anything(5.5)))")
+    val text = fails("f(m, x) = [m, x % 2]\nanything(v) = v\n\nprint(f(0, anything(\"a\")))")
+
+    assert(real.contains("a remainder is taken of integers"), real)
+    assert(text.contains("`%` does not apply to a string and an integer"), text)
+end A_FOLDED_REMAINDER_OF_ANYTHING_BUT_AN_INTEGER_IS_REFUSED_AS_THE_UNFOLDED_ONE_IS
