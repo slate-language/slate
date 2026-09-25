@@ -111,7 +111,17 @@ engine, so there is nothing to install for it either.
 [`slate:window`](docs/library/window.md) — a desktop window with a web page in it, over the platform's
 own web view — and it is out of `default` deliberately: a server does not want a window, and putting
 it in would add a library to what everybody installing slate has to have and a line to the Homebrew
-formula. So the released binary is unchanged, and a desktop build is one flag:
+formula. So the standard binary is unchanged, and the desktop build is a second edition of slate,
+released beside it:
+
+```
+brew install slate-language/tap/slate-desktop
+```
+
+Its binary is still called `slate`, so scripts and `#!` lines never care which edition runs them, and
+the two formulas conflict rather than install side by side. On Linux the desktop edition links GTK and
+WebKitGTK from the system. Building it from source is one flag, which is the `desktop` feature list
+in `package.hocon` spelled as the one feature it adds:
 
 ```
 brew install sysl-lang/tap/webview
