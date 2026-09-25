@@ -36,6 +36,13 @@ clang main.c -I. libslate.a -luv -llmdb -lnghttp2 -lssl -lcrypto -lsqlite3 -lm $
 
 The lists above are those of a build with every default feature on; read them off your own build
 rather than off this page, since a build with fewer features names fewer libraries.
+
+The archive is native objects, so any C toolchain links it: gcc or clang, with GNU ld, lld or the
+macOS linker, and nothing added to the line above. A host that links with clang and lld and wants
+link-time optimisation across the boundary can ask for the bitcode form with
+`sysl build-c . --lto thin -o libslate.a` (or `--lto full`); `build-c` then also prints
+`sysl: this archive is LLVM bitcode: link it with clang and lld (-fuse-ld=lld), or with a linker that carries LLVM's plugin`,
+and that link takes `-fuse-ld=lld` (Apple's clang links it without).
 `examples/embed/` in the repository is a whole program built this way, and
 `scripts/embed-check.sh` builds, links and runs it.
 

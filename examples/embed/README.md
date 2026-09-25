@@ -203,9 +203,19 @@ clang hello.c -I. libslate.a -luv -llmdb -lnghttp2 -lssl -lcrypto -lsqlite3 -lm 
 ./hello
 ```
 
-**On Linux add `-fuse-ld=lld`.** The archive's main object is LLVM bitcode — the manifest's
-`lto = "thin"` reaches `build-c` too — and GNU ld cannot read it, where lld and the macOS linker can.
-For the same reason it is linked with clang, not gcc.
+The archive is native objects, so any C toolchain links it — gcc or clang, GNU ld, lld or the macOS
+linker — with nothing added to that line.
+
+**A host that links with clang and lld and wants link-time optimisation across the boundary** can
+build the bitcode form instead, with `sysl build-c . --lto thin -o libslate.a` (or `--lto full`).
+`build-c` then adds a line to its advice saying how that archive links:
+
+```
+sysl: this archive is LLVM bitcode: link it with clang and lld (-fuse-ld=lld), or with a linker that carries LLVM's plugin
+```
+
+On macOS Apple's clang links it as it stands; elsewhere add `-fuse-ld=lld`, with an lld from the same
+LLVM as sysl's. The release ships the native form.
 
 **Each Linux release carries this already built**, as `libslate-<version>-linux-<arch>.tar.gz`: a
 prefix holding `lib/libslate.a`, `include/slate.h`, `LINK.txt` (the two lines of advice above, as
