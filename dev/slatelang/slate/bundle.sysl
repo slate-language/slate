@@ -1,0 +1,373 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.{Source, source}
+import sysl.buf.{Buf, buf}
+import sysl.fs.current_dir
+import sysl.text.{Search, StrBuilder, from_utf8_unchecked, parse_long, split, str_builder}
+
+// A program and everything it imports, written as one file that runs as itself.
+//
+// **A bundle is what `slate bundle` writes and what the loader reads back**, and nothing else in slate
+// knows the word: a bundled program is loaded, checked, compiled and run exactly as the tree of files
+// it came from was, because the loader is handed the same sources and the same answers to "where
+// does this import point" that it worked out the first time. That is the whole design -- the
+// resolver's answers are RECORDED rather than the sources being rewritten, so no import is re-spelt
+// and no file's text changes between the tree and the bundle.
+//
+// **The format is text, and it is lengths rather than separators.** A header names every file and
+// asset with its size in bytes and every import edge by index, and the bodies follow back to back;
+// so a body may hold anything at all, including a line that looks like a header line. It opens with
+// a `#!` line so that the file is a command, and the marker line under it is what tells the loader
+// it is reading a bundle rather than a program -- `#` begins nothing in slate, so no program's
+// second line can be mistaken for it.
+//
+// **A bundle carries NO PACKAGE MACHINERY.** The packages the program used were resolved when it was
+// bundled, and what the bundle records is the file each package import came to -- so the machine it
+// runs on needs no cache, no `vendor/`, no `package.sl` and no network. `slate` itself is the one
+// thing it needs, which is what makes a bundle the shape of a program installed through a package
+// manager.
+
+// The line under the `#!` that says the file is a bundle, with the format's version in it.
+val BundleMark: string = "#slate bundle 1"
+
+private val Shebang: string = "#!/usr/bin/env slate\n"
+
+// -- reading ---------------------------------------------------------------------------------------
+
+// Where the bundle header begins, or nothing where these bytes are not a bundle.
+//
+// **After the `#!` line where there is one and at byte zero otherwise**, which is the lexer's own
+// rule for the line: a bundle read through `slate <file>` and one run by name are the same bytes.
+bundle_header_at(bytes: []const u8) -> Option[usize]
+    var at: usize = 0
+
+    if bytes.len > 1 && bytes[0] == u8('#') && bytes[1] == u8('!')
+        loop
+            if at >= bytes.len then return None
+            if bytes[at] == u8('\n')
+                at += 1
+                break
+
+            at += 1
+
+    val mark = BundleMark.bytes
+
+    if bytes.len < at + mark.len + 1 then return None
+
+    for i in 0..<mark.len
+        if bytes[at + i] != mark[i] then return None
+
+    if bytes[at + mark.len] != u8('\n') then return None
+
+    Some(at + mark.len + 1)
+end bundle_header_at
+
+// Whether the program being loaded came out of a bundle, which is what every hook below asks.
+bundled() -> bool = current().bundled
+
+// Forget a bundle, which `load_program` does first so that one program's table never answers for the
+// next -- a suite runs many programs through one VM.
+clear_bundle()
+    val vm = current()
+
+    vm.bundled = false
+    vm.bundle_names.clear()
+    vm.bundle_bodies.clear()
+    vm.bundle_importers.clear()
+    vm.bundle_raws.clear()
+    vm.bundle_targets.clear()
+    vm.bundle_specs.clear()
+    vm.bundle_spec_paths.clear()
+end clear_bundle
+
+// Read a bundle into the VM's table, answering what was wrong with it where something was.
+//
+// **The entry is not a `Source` yet**: what arrived is the whole bundle, and the program it holds is
+// the first file in it. `bundle_entry` is that file, and it is what `load_program` goes on with.
+//
+// **A length that runs past the end is refused rather than clipped**, and so is a record the header
+// does not spell -- a bundle is written by a tool, so anything wrong with one is a truncated copy or
+// a different version of the format, and either is worth naming rather than running half of.
+unpack_bundle(bytes: []const u8, from: usize) -> Option[string]
+    val vm = current()
+    var at = from
+    var sizes: Buf[usize] = buf()
+    var kinds: Buf[bool] = buf()
+
+    // The header, one record a line, ended by `end`.
+    loop
+        val (line, next) = line_at(bytes, at)
+
+        if next == at then return Some("the bundle's header has no `end`, so the file is cut short")
+
+        at = next
+
+        if line == "end" then break
+
+        val words = split(line, " ")
+
+        if words.len < 2 then return Some(s"the bundle's header has a line it should not: `${line}`")
+
+        words[0] match
+            "file" | "asset" ->
+                if words.len < 3 then return Some(s"a `${words[0]}` line in the bundle's header names no file: `${line}`")
+
+                parse_long(words[1]) match
+                    Err(_) -> return Some(s"a `${words[0]}` line in the bundle's header has no size: `${line}`")
+                    Ok(n) ->
+                        sizes.push(usize(n))
+                        kinds.push(words[0] == "file")
+                        vm.bundle_names.push(tail_from(words, 2))
+            "import" ->
+                if words.len < 4 then return Some(s"an `import` line in the bundle's header is short: `${line}`")
+
+                val a = index_in(words[1], vm.bundle_names.len())
+                val b = index_in(words[2], vm.bundle_names.len())
+
+                if a.is_none() || b.is_none() then return Some(s"an `import` line in the bundle's header names a file the header does not: `${line}`")
+
+                vm.bundle_importers.push(vm.bundle_names.at(a.unwrap()))
+                vm.bundle_targets.push(vm.bundle_names.at(b.unwrap()))
+                vm.bundle_raws.push(tail_from(words, 3))
+            "package" ->
+                if words.len < 3 then return Some(s"a `package` line in the bundle's header is short: `${line}`")
+
+                index_in(words[1], vm.bundle_names.len()) match
+                    None -> return Some(s"a `package` line in the bundle's header names a file the header does not: `${line}`")
+                    Some(i) ->
+                        vm.bundle_spec_paths.push(vm.bundle_names.at(i))
+                        vm.bundle_specs.push(tail_from(words, 2))
+            other -> return Some(s"the bundle's header has a `${other}` line, which this slate does not read -- it may have been written by a newer slate")
+
+    if sizes.len() == 0 then return Some("the bundle holds no program")
+
+    // The bodies, each exactly as long as the header said.
+    for i in 0..<sizes.len()
+        val n = sizes.at(i)
+
+        if at + n > bytes.len then return Some(s"the bundle is cut short: `${vm.bundle_names.at(i)}` should be ${n} bytes and the file ends first")
+
+        vm.bundle_bodies.push(bytes[at..<at + n])
+        at += n
+
+    // An asset is what `take_asset` would have read, and it goes where `take_asset` would have put
+    // it -- `asset_text` is what both back ends ask, and it reads that table and nothing else.
+    for i in 0..<sizes.len()
+        if !kinds.at(i)
+            current().asset_paths.push(vm.bundle_names.at(i))
+            current().asset_texts.push(from_utf8_unchecked(vm.bundle_bodies.at(i)))
+
+    vm.bundled = true
+    None
+end unpack_bundle
+
+// The program a bundle holds: its first file, under the name it was bundled as.
+bundle_entry() -> Source = source(current().bundle_names.at(0), current().bundle_bodies.at(0))
+
+// The bytes a file in the bundle holds, or nothing where the bundle has no file of that name.
+bundled_bytes(path: string) -> Option[[]const u8]
+    val vm = current()
+
+    for i in 0..<vm.bundle_names.len()
+        if vm.bundle_names.at(i) == path then return Some(vm.bundle_bodies.at(i))
+
+    None
+end bundled_bytes
+
+// Where an import written in a bundled file was found to point when the bundle was made.
+//
+// **Answered from the record and never worked out again**, which is what lets the names in a
+// bundle be short: `resolve_import` asks this first, and only a program that was not bundled has its
+// paths joined.
+bundled_import(importer: string, raw: string) -> Option[string]
+    val vm = current()
+
+    for i in 0..<vm.bundle_importers.len()
+        if vm.bundle_importers.at(i) == importer && vm.bundle_raws.at(i) == raw then return Some(vm.bundle_targets.at(i))
+
+    None
+end bundled_import
+
+// Where a package import was found to point when the bundle was made, and the sentence for one that
+// was not -- which is a bundle made from a different program than the one now naming it, and is not
+// something a bundled program can do by itself.
+bundled_package(spec: string) -> (string, string)
+    val vm = current()
+
+    for i in 0..<vm.bundle_specs.len()
+        if vm.bundle_specs.at(i) == spec then return (vm.bundle_spec_paths.at(i), "")
+
+    ("", s"this bundle carries no package called `${spec}`")
+end bundled_package
+
+// One line of the header, and where the next begins -- the same offset where there is none left.
+private line_at(bytes: []const u8, from: usize) -> (string, usize)
+    var at = from
+
+    loop
+        if at >= bytes.len then return ("", from)
+        if bytes[at] == u8('\n') then return (from_utf8_unchecked(bytes[from..<at]), at + 1)
+
+        at += 1
+end line_at
+
+// The words from `from` onwards, put back together: a name may have a space in it.
+private tail_from(words: []string, from: usize) -> string
+    var out = str_builder()
+
+    for i in from..<words.len
+        if i > from then out.push(" ")
+
+        out.push(words[i])
+
+    out.finish()
+end tail_from
+
+// A header index, only where it names a record already read.
+private index_in(word: string, below: usize) -> Option[usize]
+    parse_long(word) match
+        Err(_) -> None
+        Ok(n) -> if n < 0 || usize(n) >= below then None else Some(usize(n))
+end index_in
+
+// -- writing ---------------------------------------------------------------------------------------
+
+// The bundle for a program the loader has read and found nothing wrong with.
+//
+// **It is written from `Loaded` and from nothing on disk**, so what goes in is exactly what the check
+// that just passed looked at: `sources` in the order they were read, the assets the loader kept, and
+// each import's answer asked of the same two functions the loader asked.
+//
+// **The names are made short where they can be** -- a project's files by their path under the
+// project, a package's under the cache or `vendor/` -- so a diagnostic from the installed program
+// says `src/main.sl` rather than where the file sat on the machine that bundled it. They are keys
+// and nothing joins them, so a name that cannot be shortened is left as it was and nothing is lost.
+write_bundle(l: Loaded) -> string
+    var head = str_builder()
+    var body: Buf[u8] = buf()
+    var names: Buf[string] = buf()
+    val bases = short_bases(l.packages.root, l.sources.at(0).name)
+
+    head.push(Shebang)
+    head.push(BundleMark)
+    head.push("\n")
+
+    for i in 0..<l.sources.len()
+        val src = l.sources.at(i)
+        val name = shorten(src.name, bases)
+
+        names.push(name)
+        head.push(s"file ${src.bytes.len} ${name}\n")
+        body.extend(src.bytes)
+
+    for i in 0..<current().asset_paths.len()
+        val name = shorten(current().asset_paths.at(i), bases)
+        val text = current().asset_texts.at(i)
+
+        names.push(name)
+        head.push(s"asset ${text.bytes.len} ${name}\n")
+        body.extend(text.bytes)
+
+    var specs: Buf[string] = buf()
+
+    for i in 0..<l.sources.len()
+        val importer = l.sources.at(i).name
+        val stmts = l.programs.at(i).stmts
+
+        for k in 0..<stmts.len()
+            val st = stmts.at(k)
+
+            *st.kind match
+                ImportNames(raw, _, origin, _, _) -> record_import(&head, &names, &specs, bases, i, importer, raw, origin, l.packages)
+                ImportAll(raw, _, origin, _) -> record_import(&head, &names, &specs, bases, i, importer, raw, origin, l.packages)
+                ImportAsset(raw, _, _) -> record_import(&head, &names, &specs, bases, i, importer, raw, Origin.FromFile, l.packages)
+                _ -> ()
+
+    head.push("end\n")
+
+    var whole: Buf[u8] = buf()
+
+    whole.extend(head.finish().bytes)
+    whole.extend(body.view())
+    from_utf8_unchecked(whole.view())
+end write_bundle
+
+// One import's answer, as the header line that records it.
+//
+// **Nothing here can fail to find its target**, the loader having already read every one of them --
+// a `Loaded` with an error in it is never bundled. A name the table does not hold would be a file
+// the loader read under another name, which is a defect in `shorten` rather than in the program, so
+// it is left out rather than written wrong: the bundle then refuses that import by name when run.
+private record_import(head: *StrBuilder, names: *Buf[string], specs: *Buf[string], bases: Buf[string], me: usize, importer: string, raw: string, origin: Origin, packages: Packages)
+    if raw == "" || origin == Origin.FromSlate then return
+
+    if origin == Origin.FromPackage
+        for i in 0..<specs.len()
+            if specs.at(i) == raw then return
+
+        val (entry, _) = package_entry(packages, raw)
+
+        index_of_name(names, shorten(entry, bases)) match
+            None -> ()
+            Some(t) ->
+                specs.push(raw)
+                head.push(s"package ${t} ${raw}\n")
+
+        return
+    end if
+
+    index_of_name(names, shorten(resolve_import(importer, raw), bases)) match
+        None -> ()
+        Some(t) -> head.push(s"import ${me} ${t} ${raw}\n")
+end record_import
+
+private index_of_name(names: *Buf[string], want: string) -> Option[usize]
+    for i in 0..<names.len()
+        if names.at(i) == want then return Some(i)
+
+    None
+end index_of_name
+
+// The directories a name is written relative to, most specific first.
+//
+// **The project's `vendor/` before the project, and the cache after both**: a vendored package sits
+// under the project, so trying the project first would name it `vendor/github.com/...`, which is
+// true and is not what the cache's copy of the same file would be called. A program under no
+// project is named from the directory its entry sits in, which is the project it would have had.
+private short_bases(root: string, entry: string) -> Buf[string]
+    var bases: Buf[string] = buf()
+
+    if root != ""
+        bases.push(vendor_root(root))
+        bases.push(root)
+
+        // The entry may have been named relatively, in which case its files are too, and the root --
+        // which is always absolute -- is not a prefix of any of them.
+        current_dir() match
+            Ok(cwd) ->
+                val under = s"${cwd}/"
+
+                if root.starts_with(under)
+                    val rel = from_utf8_unchecked(root.bytes[under.bytes.len..<root.bytes.len])
+
+                    bases.push(vendor_root(rel))
+                    bases.push(rel)
+            Err(_) -> ()
+    else
+        val d = dir_of(entry)
+
+        if d.bytes.len > 1 then bases.push(from_utf8_unchecked(d.bytes[0..<d.bytes.len - 1]))
+
+    bases.push(package_cache())
+    bases
+end short_bases
+
+private shorten(path: string, bases: Buf[string]) -> string
+    for i in 0..<bases.len()
+        val base = s"${bases.at(i)}/"
+
+        if bases.at(i) != "" && path.starts_with(base) && path.bytes.len > base.bytes.len
+            return from_utf8_unchecked(path.bytes[base.bytes.len..<path.bytes.len])
+
+    path
+end shorten

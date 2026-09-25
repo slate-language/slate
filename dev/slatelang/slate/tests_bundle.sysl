@@ -1,0 +1,213 @@
+module dev.slatelang.slate
+@tests
+
+import sh.sysl.libuv
+import sysl.fs.{metadata, read_bytes, write_text}
+import sysl.text.{Search, from_utf8_unchecked}
+
+// `slate bundle`: a program and everything it imports, written as one file that runs as itself.
+//
+// **Every test here runs the bundle it made**, and runs it from a directory the sources are not in,
+// with the package cache pointed somewhere empty -- because the claim a bundle makes is exactly that
+// nothing but the file is needed, and a bundle read back on the machine that wrote it would pass
+// for reasons that have nothing to do with the bundle.
+
+// `slate bundle <program> -o <dir>/<name>`, against the fixture cache, answering the file written.
+bundled(program: string, name: string) -> string
+    val dir = libuv.mkdtemp_sync("/tmp/slate-bundle-XXXXXX").unwrap()
+    val out = s"${dir}/${name}"
+
+    set_package_cache("tests/cache")
+
+    val status = cli_status(["slate", "bundle", program, "-o", out])
+
+    set_package_cache("")
+    assert_eq(status, 0, s"`slate bundle ${program}` exited ${status}")
+    out
+end bundled
+
+// The bundle run where nothing it came from can be found: an empty cache, a directory of its own.
+ran_alone(bundle: string) -> string
+    set_package_cache("/tmp/slate-no-cache-here")
+
+    val said = ran_out(bundle)
+
+    set_package_cache("")
+    said
+end ran_alone
+
+header_of(bundle: string) -> string
+    val text = from_utf8_unchecked(read_bytes(bundle).unwrap())
+    val at = text.index_of("\nend\n").unwrap()
+
+    from_utf8_unchecked(text.bytes[0..<at + 5])
+end header_of
+
+@test
+A_BUNDLED_PROJECT_RUNS_WITH_NO_CACHE_AND_NO_PROJECT()
+    // `tests/proj/app.sl` imports two packages, one of which imports the other. The bundle is run
+    // from `/tmp`, with the cache pointed at nothing, and answers what the project answers.
+    val out = bundled("tests/proj/app.sl", "app")
+
+    assert_eq(ran_alone(out), "hello world (greet 2)\nHELLO WORLD (GREET 2)")
+
+@test
+THE_NAMES_IN_A_BUNDLE_ARE_SHORT()
+    // A diagnostic from an installed program should say `app.sl`, not where the file sat on the
+    // machine that bundled it -- so a project's files are named under the project and a package's
+    // under the cache, and the whole header is what a reader sees at the top of the file.
+    val out = bundled("tests/proj/app.sl", "app")
+
+    assert_eq(header_of(out),
+        "#!/usr/bin/env slate\n#slate bundle 1\n" +
+        "file 100 app.sl\n" +
+        "file 52 github.com/example/greet/@v2.0.0/greet.sl\n" +
+        "file 69 github.com/example/loud/@v1.0.0/loud.sl\n" +
+        "package 1 greet\npackage 2 loud\nend\n")
+
+@test
+A_FILE_IMPORTED_TWICE_IS_IN_THE_BUNDLE_ONCE()
+    // The diamond: two files import a third. The bundle holds four files, and the edges say who
+    // imports whom, so the third runs once as it does from the tree.
+    val out = bundled("tests/mods/diamond.sl", "diamond")
+    val head = header_of(out)
+
+    assert_eq(head.count_of("\nfile "), 4)
+    assert(head.contains("\nimport 1 2 ./base.sl\n"))
+    assert(head.contains("\nimport 3 2 ./base.sl\n"))
+    assert_eq(ran_alone(out), ran_out("tests/mods/diamond.sl"))
+
+@test
+AN_ASSET_TRAVELS_IN_THE_BUNDLE()
+    // A stylesheet imported as a string is a file the program needs, so it is in the bundle as an
+    // `asset` -- and `asset_text` answers it out of the bundle exactly as it would off the disk.
+    val out = bundled("tests/assets/uses_css.sl", "css")
+
+    assert(header_of(out).contains("\nasset 72 button.css\n"))
+    assert_eq(ran_alone(out), ran_out("tests/assets/uses_css.sl"))
+
+@test
+A_FAULT_IN_A_BUNDLED_FILE_IS_DRAWN_AGAINST_THAT_FILE()
+    // The bundled files keep their own text and their own names, so a fault in the second file says
+    // the second file and its line -- not the bundle and a line into the middle of it.
+    val dir = libuv.mkdtemp_sync("/tmp/slate-bundle-src-XXXXXX").unwrap()
+
+    write_text(s"${dir}/main.sl", "import { f } from \"./lib.sl\"\n\nf()\n").unwrap()
+    write_text(s"${dir}/lib.sl", "export f() =\n    throw \"boom\"\n").unwrap()
+
+    val out = bundled(s"${dir}/main.sl", "faulty")
+    val said = ran_alone(out)
+
+    assert(said.contains("boom"), said)
+    assert(said.contains("lib.sl:2"), said)
+    assert(!said.contains(dir), said)
+
+@test
+THE_BUNDLE_IS_EXECUTABLE_AND_OPENS_WITH_A_SHEBANG()
+    val out = bundled("tests/mods/diamond.sl", "diamond")
+    val mode = metadata(out).unwrap().permissions()
+
+    assert_eq(mode & 0o111, 0o111, s"mode was ${mode}")
+    assert(header_of(out).starts_with("#!/usr/bin/env slate\n"))
+
+@test
+A_BUNDLE_GOES_TO_STANDARD_OUTPUT_WHERE_NO_FILE_IS_NAMED()
+    val said = cli_said(["slate", "bundle", "tests/mods/diamond.sl"])
+
+    assert(said.starts_with("#!/usr/bin/env slate\n#slate bundle 1\nfile "))
+    assert(said.contains("\nend\n"))
+
+@test
+A_PROGRAM_WITH_ANYTHING_WRONG_IS_NOT_BUNDLED()
+    // The bundle is written from what the check looked at, so a program the check refuses writes
+    // nothing -- the diagnostic is the whole answer, and there is no half-made file beside it.
+    val dir = libuv.mkdtemp_sync("/tmp/slate-bundle-bad-XXXXXX").unwrap()
+
+    write_text(s"${dir}/bad.sl", "print(nothingByThisName)\n").unwrap()
+
+    val out = s"${dir}/bad"
+    val status = cli_status(["slate", "bundle", s"${dir}/bad.sl", "-o", out])
+
+    assert_eq(status, 1)
+    assert(cli_said(["slate", "bundle", s"${dir}/bad.sl", "-o", out]).contains("`nothingByThisName` is not defined"))
+
+    read_bytes(out) match
+        Ok(_) -> assert(false, "a refused program left a bundle behind")
+        Err(_) -> ()
+
+@test
+A_BUNDLE_CUT_SHORT_IS_REFUSED_BY_NAME()
+    // A length that runs past the end is a truncated copy, and running the part that arrived would
+    // fail somewhere inside it with a message about the wrong thing.
+    val out = bundled("tests/proj/app.sl", "app")
+    val whole = read_bytes(out).unwrap()
+    val cut = s"${out}.cut"
+
+    write_text(cut, from_utf8_unchecked(whole[0..<300])).unwrap()
+
+    val said = ran_fault(cut)
+
+    assert(said.contains("is a slate bundle that cannot be read"), said)
+    assert(said.contains("cut short"), said)
+    assert(said.contains("greet.sl` should be 52 bytes"), said)
+
+@test
+A_HEADER_NAMING_A_FILE_IT_DOES_NOT_HOLD_IS_REFUSED()
+    val dir = libuv.mkdtemp_sync("/tmp/slate-bundle-hand-XXXXXX").unwrap()
+    val out = s"${dir}/hand"
+
+    write_text(out, "#!/usr/bin/env slate\n#slate bundle 1\nfile 8 main.sl\nimport 0 1 ./x.sl\nend\nprint(1)").unwrap()
+
+    val said = ran_fault(out)
+
+    assert(said.contains("names a file the header does not"), said)
+
+@test
+A_BUNDLE_FROM_A_NEWER_FORMAT_SAYS_SO()
+    val dir = libuv.mkdtemp_sync("/tmp/slate-bundle-newer-XXXXXX").unwrap()
+    val out = s"${dir}/newer"
+
+    write_text(out, "#!/usr/bin/env slate\n#slate bundle 1\nfile 8 main.sl\nsigned 0 abc\nend\nprint(1)").unwrap()
+
+    val said = ran_fault(out)
+
+    assert(said.contains("`signed` line, which this slate does not read"), said)
+
+@test
+A_BUNDLE_WITHOUT_A_SHEBANG_IS_STILL_A_BUNDLE()
+    // The marker is looked for after the `#!` line where there is one and at the start otherwise,
+    // which is the lexer's own rule for the line.
+    val dir = libuv.mkdtemp_sync("/tmp/slate-bundle-bare-XXXXXX").unwrap()
+    val out = s"${dir}/bare"
+
+    write_text(out, "#slate bundle 1\nfile 9 main.sl\nend\nprint(42)\n").unwrap()
+    assert_eq(ran_alone(out), "42")
+
+@test
+THE_JAVASCRIPT_BACK_END_READS_A_BUNDLE_TOO()
+    // The loader is the one thing that learned the word, so everything downstream of it -- the
+    // checker, the machine, the emitter -- takes a bundle as it takes a tree.
+    val out = bundled("tests/proj/app.sl", "app")
+
+    set_package_cache("/tmp/slate-no-cache-here")
+
+    val said = cli_said(["slate", "js", out])
+
+    set_package_cache("")
+    assert(said.contains("greet 2"), "the emitted program should carry the package's text")
+
+@test
+A_PROGRAM_RUN_AFTER_A_BUNDLE_IS_NOT_READ_OUT_OF_IT()
+    // One VM runs many programs, so the bundle's table is emptied by the next load -- otherwise the
+    // diamond's own imports would be looked for in the bundle and refused as not in it.
+    val out = bundled("tests/proj/app.sl", "app")
+
+    assert_eq(ran_alone(out), "hello world (greet 2)\nHELLO WORLD (GREET 2)")
+    assert_eq(ran_out("tests/mods/diamond.sl"), "base ran\nleft sees base\nright sees base")
+    assert(!bundled())
+
+@test
+slate_bundle_WITH_NOTHING_TO_BUNDLE_IS_MISUSED()
+    assert_eq(cli_status(["slate", "bundle"]), 2)
+    assert_eq(cli_status(["slate", "bundle", "tests/mods/diamond.sl", "-o"]), 2)
+    assert_eq(cli_status(["slate", "bundle", "tests/mods/diamond.sl", "--out", "x"]), 2)

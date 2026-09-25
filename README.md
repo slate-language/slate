@@ -144,6 +144,7 @@ slate hello.sl one two three         ... and give it arguments
 slate test .                         run every `@test` in a file or a directory
 slate test --js .                    ... in the JavaScript engine instead
 slate js hello.sl -o hello.js        the same program, as JavaScript
+slate bundle hello.sl -o hello       the program and everything it imports, as one executable file
 slate install github.com/owner/pkg   install a package (`add` is an alias)
 slate --version                      which slate this is
 slate --help                         the whole list
@@ -279,6 +280,11 @@ $ ./greet.sl world slate
 Hello, world!
 Hello, slate!
 ```
+
+A script that imports other files, or a package, ships as one file with `slate bundle greet.sl -o greet`:
+the program, everything it imports and every package it uses, at the versions the project resolved,
+written as one executable that needs nothing but `slate`. That is what a Homebrew formula for a slate
+program installs.
 
 ## Writing a page
 

@@ -181,6 +181,40 @@ a perfectly good slate program.
 
 **The cache is `$HOME/.slate/pkg`**, overridable by `SLATE_CACHE`.
 
+## Shipping a program
+
+**`slate bundle` writes a program and everything it imports as one file that runs as itself**, so what
+is installed on another machine is that file and `slate`. It is loaded and checked first — a program the
+check refuses is not bundled — and the bundle holds every file the program is made of: its own, the
+assets it imports, and the files of every package it uses, at the versions the project resolved them
+to. Nothing in it is fetched, looked up in a cache or read from a `package.sl` when it runs.
+
+```
+$ slate bundle src/main.sl -o greet
+$ ./greet world
+Hello, world!
+```
+
+The file opens with `#!/usr/bin/env slate` and is made executable, so it is a command; with no `-o` it
+goes to standard output. It is text, and its head is readable:
+
+```
+#!/usr/bin/env slate
+#slate bundle 1
+file 100 src/main.sl
+file 52 github.com/example/greet/@v2.0.0/greet.sl
+import 0 1 ./util.sl
+package 1 greet
+end
+```
+
+**A diagnostic from a bundled program names the file it was written in** — `src/main.sl:12`, not the
+bundle and a line into the middle of it — because the files keep their own text and their own names.
+A project's files are named under the project and a package's under the cache, so nothing about the
+machine that made the bundle is in it.
+
+A bundle is what a Homebrew formula installs: it depends on `slate` and puts the one file in `bin/`.
+
 ## `slate.sum`
 
 `slate.sum` records what was fetched. **The hash is over the extracted tree, not over the download**, so

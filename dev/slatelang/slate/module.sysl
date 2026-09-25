@@ -65,7 +65,16 @@ normalize_path(path: string) -> string = normalize(path)
 // **Relative to the importing FILE, not to the working directory**, which is the rule every module
 // system worth copying uses: a directory of files that import each other keeps working wherever the
 // program is run from.
+//
+// **A bundled program's answer was recorded when the bundle was made** and is read back rather than
+// worked out, so the names inside a bundle can be short (`bundle.sysl`). Every caller -- the loader
+// twice, the compiler, the emitter -- comes through here, which is what makes that one rule.
 resolve_import(importer: string, raw: string) -> string
+    if bundled()
+        bundled_import(importer, raw) match
+            Some(target) -> return target
+            None -> ()
+
     if raw.bytes.len > 0 && raw.bytes[0] == u8('/') then return normalize_path(raw)
 
     normalize_path(s"${dir_of(importer)}${raw}")
@@ -165,9 +174,30 @@ end Loaded
 // a file, standard input, a test's string literal. Everything it imports is read here.
 load_program(entry: Source) -> Loaded
     clear_bodies()
+    clear_bundle()
     current().asset_paths.clear()
     current().asset_texts.clear()
 
+    // **A bundle is unpacked before anything is resolved**, `packages_for` and every read below
+    // asking `bundled()` -- and the program the loader goes on with is the bundle's first file,
+    // under the name it was bundled as, so a diagnostic names `src/main.sl` and its real line.
+    bundle_header_at(entry.bytes) match
+        None -> ()
+        Some(from) -> unpack_bundle(entry.bytes, from) match
+            None -> return load_program_from(bundle_entry())
+            Some(wrong) ->
+                var l = Loaded(buf(), buf(), report(), buf(), buf(), Packages(buf(), "", buf()))
+
+                l.sources.push(entry)
+                l.programs.push(Program(buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), "", "", "", "", false, false))
+                l.order.push(0)
+                complain(&l, 0, Span(0, 0), s"${entry.name} is a slate bundle that cannot be read: ${wrong}")
+                return l
+
+    load_program_from(entry)
+end load_program
+
+private load_program_from(entry: Source) -> Loaded
     val name = normalize_path(entry.name)
     var l = Loaded(buf(), buf(), report(), buf(), buf(), packages_for(name))
     var stack: Buf[string] = buf()
@@ -175,7 +205,7 @@ load_program(entry: Source) -> Loaded
     load_file(&l, source(name, entry.bytes), &stack)
     check_exports(&l)
     l
-end load_program
+end load_program_from
 
 // The packages the file's project reaches, or none where it sits under no project.
 //
@@ -184,6 +214,9 @@ end load_program
 // is not an error -- a single file that imports nothing is a perfectly good slate program, and it is
 // what nearly every test in this repo is.
 private packages_for(entry: string) -> Packages
+    // A bundle resolved its packages when it was made, and the disk it now sits on is not asked.
+    if bundled() then return Packages(buf(), "", buf())
+
     val root = project_root_of(entry)
 
     if root == "" then return Packages(buf(), "", buf())
@@ -365,10 +398,28 @@ private take_file(l: *Loaded, me: usize, path: string, path_at: Span, whole: Spa
         Some(_) -> return
         None -> ()
 
-    read_bytes(path) match
+    source_bytes(path) match
         Err(e) -> complain(l, me, path_at, s"cannot read `${path}`: ${e}")
         Ok(bytes) -> load_file(l, source(path, bytes), stack)
 end take_file
+
+// The bytes of a file the program imports: out of the bundle where the program is one, off the disk
+// otherwise.
+//
+// **A bundled program never reaches the disk, even for a file the bundle lacks.** A bundle made from
+// the program has every file the program imports; one that does not was not made from this program,
+// and reading the file from wherever the bundle happens to sit would make that work by accident on
+// one machine and fail on the next.
+private source_bytes(path: string) -> Result[[]const u8, string]
+    if !bundled()
+        return read_bytes(path) match
+            Ok(bytes) -> Ok(bytes)
+            Err(e) -> Err(s"${e}")
+
+    bundled_bytes(path) match
+        Some(bytes) -> Ok(bytes)
+        None -> Err("it is not in the bundle")
+end source_bytes
 
 // One asset: read it, check it is text, and remember what it holds.
 //
@@ -397,7 +448,7 @@ private take_asset(l: *Loaded, me: usize, raw: string, path_at: Span)
     for i in 0..<current().asset_paths.len()
         if current().asset_paths.at(i) == path then return
 
-    read_bytes(path) match
+    source_bytes(path) match
         Err(e) -> complain(l, me, path_at, s"cannot read `${path}`, which `${l.sources.at(me).name}` imports: ${e}")
         Ok(bytes) -> from_utf8(bytes) match
             Err(_) -> complain(l, me, path_at, s"`${path}` is not UTF-8 text, and an import brings a file in as a string -- read a file of bytes with `readBytes` from `slate:fs` instead, which reads it while the program runs")
@@ -416,6 +467,9 @@ end take_asset
 // reading `lath/dom` knows only that a slash was written; which files a package exposes, and whether
 // `dom` is one of them, is a question about a file the parser has never opened.
 package_entry(packages: Packages, spec: string) -> (string, string)
+    // A bundled program's packages were resolved when the bundle was made (`bundle.sysl`).
+    if bundled() then return bundled_package(spec)
+
     val parts = split(spec, "/")
     val name = parts[0]
 
