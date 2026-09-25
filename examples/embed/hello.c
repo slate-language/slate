@@ -1,21 +1,37 @@
-/* A C program with its own main, running a slate program through libslate.a. */
+/* slate embedded in a C program.
+ *
+ * Build the archive and its header from the repository root, then this file against them; the
+ * README beside it has the two commands. `slate_new` makes an interpreter of its own, `slate_eval`
+ * runs a program on it, and `slate_error` says why one was refused. */
+
 #include <stdio.h>
 #include <string.h>
 
 #include "libslate.a.h"
 
+static int32_t run(slate_vm *vm, const char *name, const char *program) {
+    int32_t code = slate_eval(vm, (uint8_t *)program, strlen(program), (uint8_t *)name, strlen(name));
+
+    if (slate_error_len(vm) > 0)
+        fprintf(stderr, "%s\n", slate_error(vm));
+
+    return code;
+}
+
 int main(void) {
-    printf("slate major version: %d\n", slate_version_major());
+    printf("slate %s\n", slate_version());
 
-    const char *program = "print(\"hello from C\")\n";
-    int32_t code = slate_run_source((uint8_t *)program, strlen(program));
-    printf("slate_run_source returned %d\n", code);
+    slate_vm *vm = slate_new(0);
 
-    /* A second run in the same process, of a program slate refuses: the diagnostic goes to
-       stdout as it does for `slate <file>`, and the status is 1. */
-    const char *refused = "nope()\n";
-    code = slate_run_source((uint8_t *)refused, strlen(refused));
-    printf("second run returned %d\n", code);
+    /* A program that runs, printing as it goes. */
+    printf("first run: %d\n", run(vm, "hello.sl", "print(\"hello from C\")"));
 
+    /* One slate refuses: the status is one and the diagnostic names the file we gave it. */
+    printf("second run: %d\n", run(vm, "broken.sl", "nope()"));
+
+    /* One that chooses its own status. */
+    printf("third run: %d\n", run(vm, "exit.sl", "import { exit } from slate:process\nexit(3)"));
+
+    slate_free(vm);
     return 0;
 }

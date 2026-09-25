@@ -1,36 +1,39 @@
-# Embedding slate in a C program
+# slate embedded in C
 
-`sysl build-c` compiles the interpreter into a static archive and a header declaring what
-`dev/slatelang/slate/embed.sysl` exports: `slate_version_major` and `slate_run_source`, which runs a
-buffer of slate source exactly as `slate <file>` runs a file and answers its exit status. There is
-no init call to make: the archive fills its module storage from a constructor the platform runs
-before the C program's `main`.
+`hello.c` is a C program with a `main` of its own that links slate as a static archive and runs
+three slate programs through it. The archive and its header come from `sysl build-c`; the C API is
+`dev/slatelang/slate/embed.sysl`, and the header it produces declares:
 
-From the project root:
+```c
+uint8_t *slate_version(void);
+slate_vm *slate_new(uint64_t heap_bytes);
+void slate_free(slate_vm *vm);
+int32_t slate_eval(slate_vm *vm, uint8_t *text, uint64_t len, uint8_t *name, uint64_t name_len);
+uint8_t *slate_error(slate_vm *vm);
+uint64_t slate_error_len(slate_vm *vm);
+```
+
+`slate_new` makes an interpreter with a heap of its own (`0` takes the size `slate` itself uses);
+`slate_eval` runs a program on it and answers its status: `0` where it ran to the end, what it passed
+to `exit`, or `1` where slate refused it, in which case `slate_error` is the diagnostic. What a
+program prints goes to stdout as it prints it. Each `slate_eval` is a whole program from a fresh
+global scope.
+
+## Building it
+
+From the repository root, build the archive and the header:
 
 ```
 sysl build-c . -o examples/embed/libslate.a
+```
+
+`build-c` prints the libraries the archive still needs — the ones `@link` named, and the packages'
+`pkg_config` modules as a `pkg-config --libs …` line. Link `hello.c` with both:
+
+```
 cd examples/embed
-clang hello.c -I. libslate.a $(pkg-config --libs --static libuv lmdb libnghttp2 openssl libbrotlienc libbrotlidec libwebp libzstd hiredis) -lsqlite3 -o hello
+clang hello.c -I. libslate.a -luv -llmdb -lnghttp2 -lssl -lcrypto -lsqlite3 -lm $(pkg-config --libs libbrotlidec libbrotlienc hiredis libuv libwebp lmdb libnghttp2 libcrypto libssl sqlite3 libzstd) -o hello
 ./hello
 ```
 
-It prints:
-
-```
-slate major version: 0
-hello from C
-slate_run_source returned 0
-error: `nope` is not defined
- --> <embedded>:1:1
-  |
-1 | nope()
-  | ^^^^
-
-second run returned 1
-```
-
-`build-c` announces `link this against: uv, lmdb, nghttp2, ssl, crypto, sqlite3, m`, and that list
-is short: brotli, libwebp, zstd and hiredis are needed as well, and the link fails without them.
-The build takes about a minute and a half and the archive is about 24 MB. The libraries are linked
-dynamically here; `package.hocon`'s `link = "static"` governs `sysl build`, not a C link line.
+`scripts/embed-check.sh` does all of that and checks what `hello` prints; the release runs it.

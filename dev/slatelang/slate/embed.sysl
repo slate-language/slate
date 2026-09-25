@@ -1,32 +1,117 @@
 module dev.slatelang.slate
 
 import sysl.buf.{Buf, buf}
+import sysl.text.{CString, StrBuilder, cstring, from_utf8_unchecked, str_builder}
 
 // The C surface of the interpreter: what `sysl build-c` exports, so a C program with a `main` of its
 // own can link slate as an archive and run slate programs through it.
 //
-// **Every signature here is C-shaped on purpose** -- integers and a pointer with its length -- because
+// **Every signature here is C-shaped on purpose** -- integers, and a pointer with its length -- because
 // C has no declaration for a sysl `string` or a slice. The facade converts at the door and hands the
 // text to the very function `slate <file>` runs a file through, so an embedded run and a command-line
 // run cannot drift about what running a program means.
+//
+// **The handle C holds is a pointer to an `Embedded`, and the header spells it as an opaque struct.**
+// A VM is built with `new_vm` exactly as an actor builds its own, then entered for the length of each
+// call and left again -- `enter`/`leave` are the only way a second VM runs on a thread, and a C caller
+// is a second VM by definition, the program's own being the one `main_vm` the process keeps. What is
+// beside the VM is what the caller asks about afterwards: the last run's complaint, kept in the shape C
+// reads, because a diagnostic handed back as a sysl `string` would be bytes with no terminator and a
+// length nobody told the caller.
+//
+// **The sysl names carry an `embed_` prefix and the exported names a `slate_` one.** The exported name
+// is the C API's and follows C's habit of a library prefix; the sysl name cannot be the bare word,
+// `error`, `free` and `new` all being names something in this module or the library already answers to.
 
-// The leading number of `SlateVersion`, read off the one string `slate --version` answers rather
-// than written a second time.
-@export("slate_version_major")
-version_major() -> i32
-    var n: i32 = 0
+// What one C caller owns: a VM of its own and the text of the last thing that went wrong in it.
+struct Embedded
+    vm: Vm
 
-    for c in SlateVersion.bytes
-        if c < u8('0') || c > u8('9') then return n
+    // What the last `slate_eval` complained of, rendered, or empty where it ran. **A `CString` and not
+    // a `string`**, so the pointer handed to C is NUL-terminated and stays valid until the next call
+    // replaces it, which is the promise the header makes.
+    error: CString
 
-        n = n * 10 + i32(c - u8('0'))
+// libc's zeroing allocator, for the handle's record. **Zeroed rather than merely taken**, because the
+// record is written by assignment, and an assignment gives back what the place held before -- which
+// over fresh bytes would be a count read out of garbage. Every counted field of a zeroed record is
+// an empty one that owns nothing, so releasing it does nothing, which is what makes the first write
+// safe.
+extern calloc(count: usize, size: usize) -> *u8
 
-    n
+// **Held here rather than made per call**, because the pointer handed to C has to outlive the call
+// that answered it, and a `CString` made inside `embed_version` would be freed on the way out.
+private val version_text: CString = cstring(SlateVersion)
 
-// Runs `len` bytes of slate source as a program and answers its exit status, printing what it prints
-// to stdout as it goes. `<embedded>` is the name a diagnostic quotes, there being no file.
-@export("slate_run_source")
-run_source(text: *u8, len: usize) -> i32
+// The version `slate --version` answers, as a NUL-terminated string that lives as long as the process.
+@export("slate_version")
+embed_version() -> *u8 = version_text.ptr
+
+// A VM of the caller's own, over a heap of `heap_bytes`, or of the size `slate` itself uses where
+// that is zero. The caller frees it with `slate_free`.
+//
+// **The default loop, as a second VM on the main thread takes it.** An actor is a thread and so needs
+// a loop of its own; a C caller runs on whatever thread it calls from, one call at a time, and shares
+// the loop the way `slate test` running several programs does. A host that owns its own loop is a
+// later surface.
+@export("slate_new")
+embed_new(heap_bytes: usize) -> *Embedded
+    val ceiling = if heap_bytes == 0 then HeapBytes else heap_bytes
+    var h: *Embedded = ptr_cast(calloc(1, sizeof(Embedded)))
+
+    if h == null then panic("slate could not take the few bytes an embedded VM's record needs")
+
+    h.vm = new_vm(ceiling)
+    h.error = cstring("")
+    h
+
+// Give back everything `slate_new` took: the VM's heap, with every finalizer run, and the record.
+@export("slate_free")
+embed_free(h: *Embedded)
+    if h == null then return
+
+    dispose_vm(&h.vm)
+    free(ptr_cast(h))
+
+// Run `len` bytes of slate source as a program on this VM and answer its status: zero where it ran to
+// the end, what it passed to `exit` where it called that, and one where it was refused or faulted --
+// in which case `slate_error` has the diagnostic. `name` is what a diagnostic quotes as the file, the
+// text having none.
+//
+// **What the program prints goes to stdout as it prints it**, exactly as `slate <file>` behaves;
+// only the complaint is kept. A host that wants the output itself is the same later surface as the
+// loop above.
+//
+// **Each call is a whole program**, run from a fresh global scope: what one call defined the next
+// does not see. That is `run`'s own rule -- it resets the heap on the way in -- and a session that
+// keeps its definitions between calls is work in the interpreter rather than here.
+@export("slate_eval")
+embed_eval(h: *Embedded, text: *u8, len: usize, name: *u8, name_len: usize) -> i32
     var no_args: Buf[string] = buf()
+    var complaint = str_builder()
+    val was = enter(&h.vm)
 
-    i32(run_bytes("slate", "<embedded>", text[0..<len], no_args, line -> print(line)))
+    val code = run_bytes("slate", from_utf8_unchecked(name[0..<name_len]), text[0..<len], no_args,
+                         line -> print(line), line -> complain(line, &complaint))
+
+    leave(was)
+
+    h.error = cstring(complaint.finish())
+    i32(code)
+end embed_eval
+
+// The diagnostic the last `slate_eval` left, NUL-terminated, or an empty string where it ran. The
+// pointer is good until the next call on this handle.
+@export("slate_error")
+embed_error(h: *Embedded) -> *u8 = h.error.ptr
+
+// How many bytes `slate_error` points at, not counting the terminator.
+@export("slate_error_len")
+embed_error_len(h: *Embedded) -> usize = h.error.len
+
+// One line of a complaint, kept. **A newline between lines and not after the last**, so a one-line
+// diagnostic is exactly its sentence.
+private complain(line: string, into: *StrBuilder)
+    if into.bytes.len() > 0 then into.push("\n")
+
+    into.push(line)
