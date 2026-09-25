@@ -18,7 +18,7 @@
 #include <string.h>
 #include <unistd.h>
 
-#include "libslate.a.h"
+#include "slate.h"
 
 /* A C function a program calls as `host_add(a, b)`: each argument arrives as a handle, and the answer
  * goes back as a handle slate takes over -- `0` would be `null`. */

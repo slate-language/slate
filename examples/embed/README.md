@@ -191,7 +191,7 @@ them.
 From the repository root, build the archive and the header:
 
 ```
-sysl build-c . -o examples/embed/libslate.a
+sysl build-c . -o examples/embed/libslate.a --header examples/embed/slate.h
 ```
 
 `build-c` prints the libraries the archive still needs — the ones `@link` named, and the packages'
@@ -203,4 +203,14 @@ clang hello.c -I. libslate.a -luv -llmdb -lnghttp2 -lssl -lcrypto -lsqlite3 -lm 
 ./hello
 ```
 
-`scripts/embed-check.sh` does all of that and checks what `hello` prints; the release runs it.
+**On Linux add `-fuse-ld=lld`.** The archive's main object is LLVM bitcode — the manifest's
+`lto = "thin"` reaches `build-c` too — and GNU ld cannot read it, where lld and the macOS linker can.
+For the same reason it is linked with clang, not gcc.
+
+**Each Linux release carries this already built**, as `libslate-<version>-linux-<arch>.tar.gz`: a
+prefix holding `lib/libslate.a`, `include/slate.h`, `LINK.txt` (the two lines of advice above, as
+`build-c` printed them) and `example/` (this file, `hello.c`, and `expected.txt`, what `hello`
+prints). The libraries `LINK.txt` names come from the distribution's `-dev` packages.
+
+`scripts/embed-check.sh` does all of that and checks what `hello` prints; the release runs it, and
+`scripts/embed-check.sh --prefix <dir>` checks an unpacked tarball the same way.

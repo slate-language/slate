@@ -95,15 +95,17 @@ jobs:
     # it to the system `ld` through LLVM's gold plugin, which the pinned `llvm-N` package carries.
     # 0.0.129 with the floor, for `sysl.text.str_view`; 0.0.131 with the floor, which moved for speed;
     # 0.0.133 with the floor, for the manifest's `link` key and the Ryu `display_real_shortest`;
-    # 0.0.134 with the floor, for `link = "static"` taking every archive that exists.
+    # 0.0.134 with the floor, for `link = "static"` taking every archive that exists; 0.0.138 with
+    # the floor, for `build-c`'s opaque `slate_vm` and the `libslate` tarball staged below.
     env:
-      SYSL_VERSION: 0.0.134
+      SYSL_VERSION: 0.0.138
       GC_INITIAL_HEAP_SIZE: 8g
       GC_MAXIMUM_HEAP_SIZE: 50g
       SLATE_STEP_TIMEOUT: 90m
 
     outputs:
       version: ${{ steps.version.outputs.version }}
+      ref: ${{ steps.what.outputs.ref }}
 
     steps:
       # Before the checkout, because it decides what to check out. A dispatch may name a tag; a tag
@@ -277,6 +279,50 @@ jobs:
           gh release upload "$tag" "${{ steps.archive.outputs.tarball }}" \
             --repo "$GITHUB_REPOSITORY" --clobber
 
+      # **`libslate` is the same tree as a static archive and a C header, for a C program that
+      # embeds slate**, and it comes after the binary is attached so that nothing here can cost a
+      # release its interpreter. `build-c` is a second full compile -- it shares no cache with
+      # `build` -- so this is the step's own quarter of an hour or so, under its own deadline.
+      #
+      # **`scripts/embed-check.sh --stage` builds the prefix and proves it before anything is
+      # tarred**: `hello.c` linked with exactly the libraries `build-c` named -- read back out of the
+      # `LINK.txt` it has just written, against the static archives `scripts/linux-deps.sh` put in
+      # `/usr/local` -- run, and compared with the `expected.txt` it wrote beside it. The tarball IS
+      # the prefix (`-C stage-lib .`, for the binary tarball's reason): `lib/libslate.a`,
+      # `include/slate.h`, `LINK.txt`, `example/`.
+      - name: Build, prove and archive libslate
+        id: libslate
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends zsh
+          ./scripts/linux-measure.sh "sysl build-c ." zsh scripts/embed-check.sh --stage stage-lib
+
+          tarball="libslate-${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}.tar.gz"
+          tar -czf "$tarball" -C stage-lib .
+          tar -tzf "$tarball"
+
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(sha256sum "$tarball" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Keep libslate whatever happens next
+        uses: actions/upload-artifact@v4
+        with:
+          name: libslate-linux-${{ matrix.arch }}
+          path: ${{ steps.libslate.outputs.tarball }}
+          if-no-files-found: error
+          overwrite: true
+          compression-level: 0
+
+      # The release is known to exist by now: "Wait for the release, then attach" waited for it.
+      - name: Attach libslate
+        if: steps.what.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ steps.what.outputs.tag }}" "${{ steps.libslate.outputs.tarball }}" \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
       - name: Say what was built
         run: |
           {
@@ -286,6 +332,8 @@ jobs:
             echo "|---|---|"
             echo "| tarball | \`${{ steps.archive.outputs.tarball }}\` |"
             echo "| sha256 | \`${{ steps.archive.outputs.sha256 }}\` |"
+            echo "| libslate | \`${{ steps.libslate.outputs.tarball }}\` |"
+            echo "| libslate sha256 | \`${{ steps.libslate.outputs.sha256 }}\` |"
             echo "| glibc floor | \`${{ steps.glibc.outputs.floor }}\` |"
             echo "| attached to | \`${{ steps.what.outputs.tag || 'nothing -- build only' }}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -433,3 +481,60 @@ jobs:
 
           slate libs.sl > got.txt
           diff -u want.txt got.txt
+
+  # **`libslate` on a machine that did not build it**, which is the question the build job cannot
+  # ask: its link found the static archives `scripts/linux-deps.sh` left in `/usr/local`, and a
+  # person's machine has the distribution's `-dev` packages instead. One distribution, the newest
+  # the job above lists, on both architectures.
+  #
+  # **Unlike the binary's check this one installs headers and a compiler**, because linking is what
+  # a person with this tarball is about to do. The packages are the ones `LINK.txt`'s two lines name
+  # -- the `-l` names and the pkg-config modules -- in Debian's spelling, and they mirror the list
+  # `scripts/linux-deps.sh` builds or installs for the binary. clang and lld rather than gcc: the
+  # archive's main object is LLVM bitcode (the manifest's `lto = "thin"`), which gcc cannot link.
+  #
+  # The check itself is `scripts/embed-check.sh --prefix`, the same script that made the prefix,
+  # reading its `LINK.txt` and `example/expected.txt` -- so the link line and the answer are written
+  # once, by the build.
+  compat-libslate:
+    needs: build
+    if: ${{ !cancelled() }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64
+          - runner: ubuntu-22.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    container:
+      image: ubuntu:26.04
+    steps:
+      - name: Install a C toolchain and the libraries LINK.txt names
+        run: |
+          set -eu
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates clang lld pkg-config zsh tzdata \
+            libbrotli-dev libhiredis-dev liblmdb-dev libnghttp2-dev libsqlite3-dev libssl-dev \
+            libuv1-dev libwebp-dev libzstd-dev
+          clang --version | head -1
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.build.outputs.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: libslate-linux-${{ matrix.arch }}
+
+      - name: Unpack, link hello.c, run it
+        run: |
+          set -eu
+          mkdir -p prefix
+          tar -xzf libslate-*-linux-*.tar.gz -C prefix
+          cat prefix/LINK.txt
+          zsh scripts/embed-check.sh --prefix prefix
