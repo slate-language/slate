@@ -44,9 +44,11 @@ A project or a package is a directory holding a **`package.sl`**, which is a sla
 }
 ```
 
-The keys are `name`, `version`, `main`, `modules`, `dependencies` and `devDependencies`, and nothing else —
-an unknown one is named. `name` and `version` are required; a dependency takes `git` and `version`, both
-required. Comments are `//`, as everywhere else, which is most of why the format is slate's rather than
+The keys are `name`, `version`, `main`, `description`, `homepage`, `license`, `modules`, `dependencies`,
+`devDependencies` and `scripts`, and nothing else — an unknown one is named. `name` and `version` are
+required; a dependency takes `git` and `version`, both required. `description`, `homepage` and `license`
+are what `slate brew` writes into a formula (see [A Homebrew formula](#a-homebrew-formula)), and nothing
+else reads them. Comments are `//`, as everywhere else, which is most of why the format is slate's rather than
 JSON's.
 
 **`devDependencies` differs from `dependencies` in who resolves it and in nothing else.** It is fetched,
@@ -214,6 +216,50 @@ A project's files are named under the project and a package's under the cache, s
 machine that made the bundle is in it.
 
 A bundle is what a Homebrew formula installs: it depends on `slate` and puts the one file in `bin/`.
+
+## A Homebrew formula
+
+**`slate brew` writes a project's bundle and the formula that installs it, together.** It bundles the
+manifest's `main` exactly as `slate bundle` does, takes the SHA-256 of those bytes, and writes both files
+beside the manifest — or under `-o <directory>`:
+
+```
+$ slate brew
+wrote greet (sha256 3b2a…)
+wrote greet.rb
+```
+
+The formula is short, because a bundle needs nothing from the machine but `slate`:
+
+```ruby
+class Greet < Formula
+  desc "Says hello"
+  homepage "https://github.com/example/greet"
+  url "https://github.com/example/greet/releases/download/v2.0.0/greet"
+  sha256 "3b2a…"
+  license "ISC"
+
+  depends_on "slate-language/tap/slate"
+
+  def install
+    bin.install "greet"
+  end
+
+  test do
+    assert_predicate bin/"greet", :executable?
+  end
+end
+```
+
+The manifest supplies every field: `name`, `version`, `description`, `homepage` and `license`. The URL is
+the GitHub release asset, `<homepage>/releases/download/v<version>/<name>`, so **`homepage` is the
+repository and is required** — a formula cannot be written without somewhere to fetch from — as is `main`.
+`description` and `license` are optional and left out of the formula where absent.
+
+**The hash is taken from the bytes that were written and not from a file read back later**, which is
+why the two are one command: a formula made afterwards by hand can name the wrong file, and this one
+cannot. What remains is the release itself — attach the bundle to a `v<version>` release of the repository,
+put the formula in a tap, and `brew install <tap>/<name>` fetches the one file and links it.
 
 ## `slate.sum`
 
