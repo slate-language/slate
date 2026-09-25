@@ -160,3 +160,32 @@ A_DATA_VALUE_REFUSES_A_FIELD_IT_DOES_NOT_HAVE_IN_ONE_SENTENCE_ON_EITHER_SIDE() =
 A_MISSING_FIELD_IS_ABSENT_ON_EITHER_SIDE_OF_THE_LINE() =
     assertEq(upTo(3).k3 ?? "none", "none")
     assertEq(upTo(5).k9 ?? "none", "none")
+
+// The table moves when it spills and again each time it grows -- 6, 12, 24, 48 -- and every field
+// written so far is read back after each write, so a read through a stale place would show.
+@test
+A_TABLE_READ_WHILE_IT_GROWS_ANSWERS_EVERY_FIELD_AT_EVERY_SIZE() =
+    val o = {}
+
+    for i in 0..<30
+        o[s"k${i}"] = i * 10
+
+        for j in 0..<(i + 1)
+            assertEq(o[s"k${j}"], j * 10)
+
+        assertEq(keys(o).length, i + 1)
+
+// `without` answers a new, smaller object, which is back in its cell once it holds three.
+@test
+WITHOUT_SHRINKS_A_TABLE_BACK_INTO_ITS_CELL_AND_EVERY_FIELD_READS() =
+    var o = upTo(8)
+
+    for i in 0..<8
+        o = without(o, s"k${i}")
+
+        assertEq(keys(o).length, 7 - i)
+
+        for j in (i + 1)..<8
+            assertEq(o[s"k${j}"], j)
+
+    assertEq(o, {})

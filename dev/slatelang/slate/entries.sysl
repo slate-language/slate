@@ -24,8 +24,19 @@ import sysl.buf.{Buf, buf, buf_with_capacity}
 // **Spilling the whole table rather than keeping the first few inline is measured, not tidy.** With
 // the first `InlineEntries` positions always inline, a lookup in a large table asked `i < N` of a
 // position the hash had just chosen, and a map read at random mispredicted it: `mapset` read +3.7%
-// and `methods` +2.9%. Asking whether THE OBJECT has spilled is the same answer for every read of
-// one object, so the branch is predicted and a large table reads as it always did.
+// and `methods` +2.9%.
+//
+// **AND NO READ ASKS WHICH SIDE THE TABLE IS ON: `at` POINTS AT WHEREVER THE ENTRIES ARE.** Asking
+// "has this object spilled" on every read was predicted and still cost a large table 2-4%, so the
+// answer is kept in the cell instead -- `at` is `small`'s first entry or the `Buf`'s storage, and a
+// read, a write and a value write are one index off it. The price is that every change of storage
+// re-points it, and there are exactly four: a new or emptied table (`entries_fresh_on`,
+// `entries_drop`, `entries_release`) points at the cell, and a push past the cell (`pushed_outside`)
+// points at the `Buf` after EVERY push -- a `Buf` that grows moves, and a pointer into its old
+// storage is a read of freed memory. A rehash compacts in place and truncates, which moves nothing.
+// It is a raw `*Entry`, not a counted `&T`, so the zeroing rule for collected memory has nothing to
+// say about it; and nothing copies an `ObjectObj` by value, which would carry a pointer into the
+// cell it was copied from -- an actor's copy is a new object filled by `entry_push`.
 //
 // **An inline `Entry` is legal in collected memory** because it holds no counted member: a hash, two
 // `Value`s and a flag, none of which a zeroed cell can make a first assignment release wrongly.
@@ -44,17 +55,17 @@ entry_count(o: *ObjectObj) -> usize = o.count
 
 // The entry at position `i`, which must be below `entry_count`.
 @inline
-entry_at(o: *ObjectObj, i: usize) -> Entry = if spilled(o) then o.stored.at(i) else o.small[i]
+entry_at(o: *ObjectObj, i: usize) -> Entry = o.at[i]
 
 // Write the entry at position `i`, which must be below `entry_count`.
 @inline
 entry_set(o: *ObjectObj, i: usize, e: Entry)
-    if spilled(o) then o.stored.set(i, e) else o.small[i] = e
+    o.at[i] = e
 
 // Replace the value at position `i`, keeping its key, hash and liveness.
 @inline
 entry_value_set(o: *ObjectObj, i: usize, v: Value)
-    if spilled(o) then o.stored.elems[i].value = v else o.small[i].value = v
+    o.at[i].value = v
 
 // Drop every tombstone, keeping the live entries in their order, and answer how many are left.
 //
@@ -83,6 +94,7 @@ end entries_compact
 entries_drop(o: *ObjectObj)
     o.count = 0
     o.stored = buf()
+    o.at = &o.small[0]
 
 // What the entries hold outside the heap, which `object_payload` charges. The inline ones are the
 // cell's and are counted with it.
@@ -101,6 +113,7 @@ const SpareEntries: usize = 4096
 entries_fresh_on(v: *Vm, o: *ObjectObj)
     o.count = 0
     o.stored = buf()
+    o.at = &o.small[0]
 
 // **A SWEEP KEEPS AN EMPTIED SPILL TABLE FOR THE NEXT OBJECT THAT OUTGROWS ITS CELL**, so a loop
 // making objects of four to six fields asks `malloc` for nothing a turn -- which is what every
@@ -120,6 +133,7 @@ entries_release(v: *Vm, o: *ObjectObj)
 
     o.count = 0
     o.stored = buf()
+    o.at = &o.small[0]
 
 // Append an entry to an object's table.
 //
@@ -153,5 +167,6 @@ private pushed_outside(v: *Vm, o: *ObjectObj, e: Entry)
             o.stored.push(o.small[i])
 
     o.stored.push(e)
+    o.at = &o.stored.elems[0]
 
     if o.stored.cap() != was then charge_on(v, (o.stored.cap() - was) * sizeof(Entry))

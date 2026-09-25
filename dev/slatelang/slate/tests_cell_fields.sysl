@@ -33,14 +33,143 @@ private field(o: *ObjectObj, name: string) -> long = obj_get_name(o, name) match
     Some(Int(n)) -> n
     _ -> -1
 
-// **The cell is the price of the layout, and it is written down so a change to it is noticed**: 96
-// bytes of table, count, index and flags (88 before the entries moved in), then the inline entries at
-// 48 bytes each -- a hash, two 16-byte `Value`s and a flag.
+// **The cell is the price of the layout, and it is written down so a change to it is noticed**: 104
+// bytes of storage pointer, table, count, index and flags (88 before the entries moved in), then the
+// inline entries at 48 bytes each -- a hash, two 16-byte `Value`s and a flag.
 @test
 THE_CELL_IS_THE_TABLE_HEADER_AND_THREE_ENTRIES()
     assert_eq(sizeof(Entry), 48, "an entry is a hash, two values and a flag")
-    assert_eq(sizeof(ObjectObj), 96 + InlineEntries * sizeof(Entry), "the cell is the header and the inline entries")
+    assert_eq(sizeof(ObjectObj), 104 + InlineEntries * sizeof(Entry), "the cell is the header and the inline entries")
 end THE_CELL_IS_THE_TABLE_HEADER_AND_THREE_ENTRIES
+
+// Whether `at` points at where the entries actually are: the cell's own for a table that fits it,
+// the spill table's storage for one that does not. Every read goes through `at` and asks nothing
+// else, so a stale one is a read of the wrong entries or of freed memory.
+private points_home(o: *ObjectObj) -> bool =
+    if o.stored.cap() == 0 then o.at == &o.small[0] else o.at == &o.stored.elems[0]
+
+// **A spill table that grows MOVES, and `at` has to follow it every time.** Six fields fill the first
+// spill table, twelve and twenty-four the next two, and every field written so far is read back at
+// each step -- through `at`, which is the only way a read reaches them.
+@test
+THE_STORAGE_POINTER_FOLLOWS_THE_TABLE_THROUGH_EVERY_GROWTH()
+    reset_vm()
+    reset_heap()
+
+    val o = new_object()
+
+    assert(points_home(o), "a new object points at its own cell")
+
+    var moves = 0
+    var was = o.at
+
+    for i in 0..<25
+        obj_put_name(o, s"k${i}", Int(long(i)))
+
+        assert(points_home(o), s"after ${i + 1} fields the pointer is where the entries are")
+
+        if o.at != was
+            moves += 1
+            was = o.at
+
+        for j in 0..<(i + 1)
+            assert_eq(field(o, s"k${j}"), long(j), s"with ${i + 1} fields, k${j} reads back")
+
+    assert_eq(o.stored.cap(), 48, "the table grew from 6 to 12 to 24 to 48")
+    assert(moves >= 4, s"the pointer moved at the spill and at each growth, and moved ${moves} times")
+end THE_STORAGE_POINTER_FOLLOWS_THE_TABLE_THROUGH_EVERY_GROWTH
+
+// A rehash compacts in place and truncates, which moves nothing -- and after it the pointer is
+// still where the entries are, on both sides of the line.
+@test
+THE_STORAGE_POINTER_IS_RIGHT_AFTER_A_REHASH()
+    reset_vm()
+    reset_heap()
+
+    val o = fields(6)
+
+    for name in ["k0", "k2", "k4"]
+        obj_remove(o, str_value(name), point(0)) match
+            _ -> ()
+
+    for i in 6..<40
+        obj_put_name(o, s"k${i}", Int(long(i)))
+
+    assert(points_home(o), "after the rehash the pointer is where the entries are")
+    assert_eq(field(o, "k39"), 39, "and a field written after it reads back")
+    assert_eq(field(o, "k5"), 5, "and so does one from before it")
+end THE_STORAGE_POINTER_IS_RIGHT_AFTER_A_REHASH
+
+// **A kept table from a swept object is a different block from the one the object had**, and the
+// object taking it must point at it, not at wherever its own cell's entries were.
+@test
+THE_STORAGE_POINTER_FOLLOWS_A_KEPT_TABLE_INTO_ITS_NEXT_OBJECT()
+    reset_vm()
+    reset_heap()
+    collect_now()
+
+    for i in 0..<50
+        val dropped = fields(InlineEntries + 1)
+
+        assert(points_home(dropped), "a spilled object points at its table")
+
+    collect_now()
+
+    val kept = current().spare_entries.len()
+
+    assert(kept > 0, "the sweep kept tables")
+
+    val o = fields(InlineEntries)
+
+    assert(points_home(o), "an object in its cell points at the cell")
+
+    obj_put_name(o, "past", Int(9))
+
+    assert_eq(current().spare_entries.len(), kept - 1, "the field past the cell took a kept table")
+    assert(points_home(o), "and the pointer is that table's storage")
+    assert_eq(names(o), "k0 k1 k2 past ", "every field reads through it in order")
+    assert_eq(field(o, "past"), 9, "including the one that took it")
+end THE_STORAGE_POINTER_FOLLOWS_A_KEPT_TABLE_INTO_ITS_NEXT_OBJECT
+
+// **A table read while it grows, in a heap small enough that collections land between the reads.**
+// Every growth moves the table and every collection sweeps spilled tables into the kept list for the
+// next object to take, so a pointer left behind by either would read another object's entries or
+// freed memory -- and the sum would be wrong or the program would fault. A second, throwaway table
+// spills every turn so there are dropped tables to keep and hand out.
+@test
+A_TABLE_READ_WHILE_IT_GROWS_UNDER_A_MEGABYTE_HEAP_READS_EVERY_FIELD()
+    val program = "var o = {}\nvar sum = 0\nfor i in 0..<200\n    o[\"k\" + string(i)] = i\n    val junk = { a: i, b: [i], c: \"x\" + string(i), d: i, e: i }\n    for j in 0..<(i + 1)\n        sum = sum + o[\"k\" + string(j)]\nprint([sum, keys(o).length, junk.e])"
+
+    set_heap_limit(1048576)
+
+    val said = out(program)
+
+    set_heap_limit(268435456)
+
+    assert_eq(said, "[1333300, 200, 199]")
+    assert(current().collections > 0, "and the heap collected while it ran")
+end A_TABLE_READ_WHILE_IT_GROWS_UNDER_A_MEGABYTE_HEAP_READS_EVERY_FIELD
+
+// An emptied table -- a cleared set or map -- goes back to its cell, and so does its pointer.
+@test
+AN_EMPTIED_TABLE_POINTS_BACK_AT_ITS_CELL()
+    reset_vm()
+    reset_heap()
+
+    val o = fields(10)
+
+    // What a set's or a map's `clear` does to its table.
+    entries_drop(o)
+    o.index = buf()
+    o.live = 0
+
+    assert(points_home(o), "a dropped table points at the cell")
+    assert(o.at == &o.small[0], "which is the cell's first entry")
+
+    obj_put_name(o, "a", Int(1))
+
+    assert_eq(field(o, "a"), 1, "and a field written after reads back from the cell")
+end AN_EMPTIED_TABLE_POINTS_BACK_AT_ITS_CELL
 
 @test
 A_SMALL_OBJECT_HOLDS_NOTHING_OUTSIDE_THE_HEAP_AND_THE_FIELD_PAST_IT_MOVES_THE_TABLE()
@@ -227,6 +356,8 @@ AN_ACTORS_COPY_OF_AN_OBJECT_IS_THE_SAME_FIELDS_ON_THE_SAME_SIDE_OF_THE_LINE()
             Ok(Object(c)) ->
                 assert_eq(names(c), names(o), s"the copy of ${size} fields has them in order")
                 assert_eq(entries_payload(c) == 0, entries_payload(o) == 0, "and is on the same side of the line")
+                assert(points_home(c), "and its pointer is its own storage")
+                assert(c.at != o.at, "never the original's")
 
                 for i in 0..<size
                     assert_eq(field(c, s"k${i}"), long(i), "holding the same values")
