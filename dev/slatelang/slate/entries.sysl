@@ -1,7 +1,5 @@
 module dev.slatelang.slate
 
-import sysl.buf.{Buf, buf, buf_with_capacity}
-
 // Where an object's entries are kept, and the only functions that reach them by position.
 //
 // **EVERY READER AND WRITER OF AN OBJECT'S TABLE GOES THROUGH THIS FILE**, and that is the whole of
@@ -45,9 +43,12 @@ import sysl.buf.{Buf, buf, buf_with_capacity}
 // fields, and a literal's three; `bench/results/2026-09-24-inline-object.md` has 3, 4 and 8 side by side.
 const InlineEntries: usize = 3
 
+// The C allocator's resize, beside the `malloc` and `free` `vm_state.sysl` declares.
+extern realloc(block: *u8, bytes: usize) -> *u8
+
 // Whether the table has outgrown its cell, which a spilled table never un-does until it is emptied.
 @inline
-private spilled(o: *ObjectObj) -> bool = o.stored.cap() != 0
+private spilled(o: *ObjectObj) -> bool = o.spill_cap != 0
 
 // How many entries the table holds, tombstones included.
 @inline
@@ -67,6 +68,16 @@ entry_set(o: *ObjectObj, i: usize, e: Entry)
 entry_value_set(o: *ObjectObj, i: usize, v: Value)
     o.at[i].value = v
 
+// Where position 0 is -- the cell's first entry or the spill block -- which is what the tests ask.
+entries_at(o: *ObjectObj) -> *Entry = o.at
+
+// Point a table back at its own cell, giving nothing back -- for a cell that holds no spill block.
+@inline
+private home(o: *ObjectObj)
+    o.count = 0
+    o.spill_cap = 0
+    o.at = &o.small[0]
+
 // Drop every tombstone, keeping the live entries in their order, and answer how many are left.
 //
 // **In place**, which is what a rehash wants: the positions the index is about to be rebuilt from
@@ -84,21 +95,18 @@ entries_compact(o: *ObjectObj) -> usize
             kept += 1
 
     o.count = kept
-
-    if spilled(o) then o.stored.truncate(kept)
-
     kept
 end entries_compact
 
 // Empty the table and give back what held its entries, which puts it back in its cell.
 entries_drop(o: *ObjectObj)
-    o.count = 0
-    o.stored = buf()
-    o.at = &o.small[0]
+    if spilled(o) then free(ptr_cast(o.at))
+
+    home(o)
 
 // What the entries hold outside the heap, which `object_payload` charges. The inline ones are the
 // cell's and are counted with it.
-entries_payload(o: *ObjectObj) -> usize = o.stored.cap() * sizeof(Entry)
+entries_payload(o: *ObjectObj) -> usize = o.spill_cap * sizeof(Entry)
 
 // The capacity a table takes when it spills, which is therefore the only size a sweep keeps.
 //
@@ -110,10 +118,14 @@ const FirstOverflow: usize = InlineEntries * 2
 const SpareEntries: usize = 4096
 
 // Give a new object its empty table: nothing in the cell and nothing outside it.
+//
+// **The cell is zeroed collected memory, so there is nothing in it to give back** -- except in a
+// reserve handed out a second time on a full heap, which `entries_drop` would free and this may not
+// assume either way. Asking costs one predicted branch on a construction.
 entries_fresh_on(v: *Vm, o: *ObjectObj)
-    o.count = 0
-    o.stored = buf()
-    o.at = &o.small[0]
+    if spilled(o) then free(ptr_cast(o.at))
+
+    home(o)
 
 // **A SWEEP KEEPS AN EMPTIED SPILL TABLE FOR THE NEXT OBJECT THAT OUTGROWS ITS CELL**, so a loop
 // making objects of four to six fields asks `malloc` for nothing a turn -- which is what every
@@ -127,13 +139,21 @@ entries_fresh_on(v: *Vm, o: *ObjectObj)
 // made a million and dropped them keeps `SpareEntries` tables -- about a megabyte -- and gives the
 // rest back as it always did.
 entries_release(v: *Vm, o: *ObjectObj)
-    if v.sweeping && o.stored.cap() == FirstOverflow && v.spare_entries.len() < SpareEntries
-        o.stored.clear()
-        v.spare_entries.push(o.stored)
+    if spilled(o)
+        if v.sweeping && o.spill_cap == FirstOverflow && v.spare_entries.len() < SpareEntries
+            v.spare_entries.push(o.at)
+        else
+            free(ptr_cast(o.at))
 
-    o.count = 0
-    o.stored = buf()
-    o.at = &o.small[0]
+    home(o)
+
+// Give back every kept spill block, which a heap being rebuilt or a VM being disposed owes: the list
+// is sysl memory and the blocks are `malloc`'s, so dropping the list alone would leak them.
+entries_spares_free(v: *Vm)
+    for block in v.spare_entries.view()
+        free(ptr_cast(block))
+
+    v.spare_entries.clear()
 
 // Append an entry to an object's table.
 //
@@ -154,19 +174,29 @@ entry_push_on(v: *Vm, o: *ObjectObj, e: Entry)
 
 // A push the cell cannot take: the first one moves the cell's entries out into a kept table or one
 // of `FirstOverflow`, and every one charges what the capacity grew by.
+//
+// **`at` is re-pointed at every change of block, and a doubling is one**: `realloc` may move the
+// entries, and a pointer left at the old block is a read of freed memory on the next field.
 @noinline
 private pushed_outside(v: *Vm, o: *ObjectObj, e: Entry)
-    val was = o.stored.cap()
+    val n = o.count
 
-    if was == 0
-        o.stored = v.spare_entries.pop() match
+    if !spilled(o)
+        val block: *Entry = v.spare_entries.pop() match
             Some(kept) -> kept
-            None -> buf_with_capacity(FirstOverflow, e)
+            None -> ptr_cast(malloc(FirstOverflow * sizeof(Entry)))
 
-        for i in 0..<o.count
-            o.stored.push(o.small[i])
+        for i in 0..<n
+            block[i] = o.small[i]
 
-    o.stored.push(e)
-    o.at = &o.stored.elems[0]
+        o.at = block
+        o.spill_cap = FirstOverflow
+        charge_on(v, FirstOverflow * sizeof(Entry))
+    elif n == o.spill_cap
+        val grown = o.spill_cap * 2
 
-    if o.stored.cap() != was then charge_on(v, (o.stored.cap() - was) * sizeof(Entry))
+        o.at = ptr_cast(realloc(ptr_cast(o.at), grown * sizeof(Entry)))
+        charge_on(v, (grown - o.spill_cap) * sizeof(Entry))
+        o.spill_cap = grown
+
+    o.at[n] = e
