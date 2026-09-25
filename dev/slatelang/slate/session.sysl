@@ -1,0 +1,128 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.{Source, report}
+
+// A session: one VM running program after program, each seeing what the ones before it defined.
+//
+// **This is Lua's `luaL_dostring` on one state, and a REPL's rule.** The first program a session is
+// handed starts from nothing, exactly as `run` does; every later one is loaded and compiled into the
+// SAME unit, and its entry file runs in the SAME scope every earlier entry file ran in -- so a
+// definition, a `val`, a class or an import one program made at its top level is a name the next can
+// read, and a name the new program binds joins them. Every other file a program imports is a module
+// as it always is, run once in a scope of its own; a module an earlier program already imported is
+// not run a second time.
+//
+// **What is per session and what is per program, decided reset by reset** -- `fresh_start` is the
+// whole of the first list and is done once:
+//
+// - the heap is not reset between programs, which is the point: what one program bound is still
+//   there for the next. Collections happen exactly as they do inside one program.
+// - `reset_vm` is per session: it empties the module table and the definitions reads were resolved
+//   to, which the earlier programs' compiled code indexes into.
+// - `reset_types` is per session: it forgets every class and type, and a class one program declared
+//   is a pattern the next may test against. Only its compiler REPORT is emptied per program, or one
+//   refused program would refuse every one after it.
+// - `reset_events` and `reset_async` are per session: a timer, a socket or a promise a program left
+//   behind belongs to the loop, and the loop is the session's. Rejections already reported are marked
+//   dealt with per program, so one is never reported again by the program after it.
+// - the output and the machine are per program: a program answers what it printed, and one that
+//   faulted mid-statement leaves nothing on the stack for the next.
+//
+// **A refused program leaves the session exactly as it was.** A parse or check refusal compiles
+// nothing that runs and runs nothing, so the scope is untouched and the modules it would have added
+// are taken out of the unit again. **A program that faults after some statements ran keeps what they
+// bound**, which is Lua's rule too: `val y = 2` and then a fault leaves `y` defined.
+
+// What a session keeps between two programs.
+//
+// **The three scopes are rooted for the whole session** -- `hold_env` at its first program, and
+// nothing releases them: every other hold in the interpreter is taken and let go of by a mark above
+// them, so they stay at the bottom of the VM's root stack until `reset_heap` begins another session
+// or `dispose_vm` gives the heap back. A `Value` in a sysl local is not a root, and neither is a
+// scope held only in this struct; a session whose scope were collected between two programs would
+// read every earlier name back as undefined.
+//
+// **Not `Session`**, which is `sh.sysl.nghttp2`'s and is in scope here through `h2.sysl`.
+struct ProgramSession
+    // Every builtin, which slate's own modules run against.
+    natives: *EnvObj
+
+    // The builtins no module has taken, which a program's own files run against.
+    core: *EnvObj
+
+    // Where every program's entry file runs, under `core`: the session's shared top level.
+    top: *EnvObj
+
+    begun: bool
+
+// A session that has not begun, whose first program begins it.
+program_session() -> ProgramSession = ProgramSession(null, null, null, false)
+
+// Run one more program in this session and answer it as `run` answers one.
+add_program(s: *ProgramSession, src: Source) -> Ran
+    if !s.begun then begin_session(s)
+
+    val v = current()
+
+    v.output.clear()
+    v.compile_faults = report()
+    v.compile_fault_srcs.clear()
+    v.machine = fresh_machine()
+    forget_rejections()
+
+    val loaded = load_program(src)
+
+    if !loaded.ok() then return Ran(Null, loaded.report, loaded.srcs, loaded.sources, v.output, 0)
+
+    val u = running_unit()
+    val base = u.sources.len()
+    val first = u.modules.len()
+
+    compile_loaded(loaded, base, s.top)
+
+    if compile_went_wrong()
+        // **Taken back out, so the module table stays in step with what has run.** `PushModule`
+        // indexes `module_values` by a module's place in the unit, and a module that is compiled and
+        // never runs would leave every later one answering its neighbour's exports.
+        u.modules.truncate(first)
+        u.module_decls.truncate(first)
+        u.module_paths.truncate(first)
+
+        return compile_refused(loaded, base)
+    end if
+
+    // **Recorded once the program has compiled**, so a refused one declares nothing to the next.
+    val entry = loaded.programs.at(0)
+
+    for i in 0..<entry.type_names.len()
+        v.session_type_names.push(entry.type_names.at(i))
+        v.session_type_pats.push(entry.type_pats.at(i))
+
+    val answer = settled_run(ran_modules(s.natives, s.core, first, s.top), loaded, base)
+
+    // **A module that faulted answered nothing**, and one after it never ran; each is given an empty
+    // answer so the table stays in step with the unit for the program after this one.
+    while v.module_values.len() < u.modules.len()
+        v.module_values.push(Null)
+
+    answer
+end add_program
+
+// The first program's half of `run`: every reset, a fresh unit, and the scopes the session keeps.
+private begin_session(s: *ProgramSession)
+    fresh_start()
+    current().current_unit = new_unit()
+
+    s.natives = new_env(null)
+    s.core = new_env(null)
+
+    hold_env(s.natives)
+    hold_env(s.core)
+    install_builtins(s.natives)
+    install_core(s.core)
+
+    s.top = new_env(s.core)
+
+    hold_env(s.top)
+    s.begun = true
+end begin_session

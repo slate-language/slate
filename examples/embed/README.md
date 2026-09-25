@@ -1,7 +1,7 @@
 # slate embedded in C
 
 `hello.c` is a C program with a `main` of its own that links slate as a static archive and runs
-three slate programs through it. The archive and its header come from `sysl build-c`; the C API is
+five slate programs through it. The archive and its header come from `sysl build-c`; the C API is
 `dev/slatelang/slate/embed.sysl`, and the header it produces declares:
 
 ```c
@@ -16,8 +16,12 @@ uint64_t slate_error_len(slate_vm *vm);
 `slate_new` makes an interpreter with a heap of its own (`0` takes the size `slate` itself uses);
 `slate_eval` runs a program on it and answers its status: `0` where it ran to the end, what it passed
 to `exit`, or `1` where slate refused it, in which case `slate_error` is the diagnostic. What a
-program prints goes to stdout as it prints it. Each `slate_eval` is a whole program from a fresh
-global scope.
+program prints goes to stdout as it prints it.
+
+Every `slate_eval` on one `slate_vm` runs in one session, the way a REPL or Lua's `luaL_dostring` on
+one state does: what an earlier call bound at its top level -- a function, a `val`, a class, an
+import -- a later call can use, and what the later call binds joins it. A call slate refuses changes
+nothing; one that faults keeps whatever it bound before the fault. Two handles share nothing.
 
 ## Building it
 

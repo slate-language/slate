@@ -2,7 +2,7 @@ module dev.slatelang.slate
 @tests
 
 import sysl.buf.{Buf, buf}
-import sysl.text.{Search, cstring, from_utf8_unchecked}
+import sysl.text.{Search, StrBuilder, cstring, from_utf8_unchecked, str_builder}
 
 // The C surface in `embed.sysl`, driven from sysl with the pointers a C caller would hand it.
 //
@@ -141,6 +141,161 @@ FREEING_A_HANDLE_TWICE_OR_A_POINTER_NEVER_HANDED_OUT_DOES_NOTHING()
 
     assert_eq(evaluated(next, "val ok = true", "host.sl"), 0)
     embed_free(next)
+
+// -- one handle is one session ------------------------------------------------------------------
+
+// A call on the handle, answered as its status and what it printed, one line each: `"0|42"`.
+private printed_by(h: *Embedded, program: string) -> string
+    var lines = str_builder()
+    val code = embed_eval_with(h, program, "host.sl", line -> kept(line, &lines))
+
+    s"${code}|${lines.finish()}"
+
+private kept(line: string, into: *StrBuilder)
+    if into.bytes.len() > 0 then into.push("\n")
+
+    into.push(line)
+
+@test
+A_val_ONE_CALL_BOUND_IS_READ_BY_THE_NEXT()
+    val h = embed_new(0)
+
+    assert_eq(printed_by(h, "val x = 41"), "0|")
+    assert_eq(printed_by(h, "print(x + 1)"), "0|42")
+    embed_free(h)
+
+@test
+A_FUNCTION_ONE_CALL_DEFINED_IS_CALLED_BY_THE_NEXT()
+    val h = embed_new(0)
+
+    assert_eq(printed_by(h, "double(n) = n * 2"), "0|")
+    assert_eq(printed_by(h, "print(double(21))"), "0|42")
+    embed_free(h)
+
+// The class is a value in the shared scope AND a type the next call's patterns resolve against,
+// which are two different tables -- `is` would compile as a binding without the second.
+@test
+A_CLASS_ONE_CALL_DECLARED_IS_BUILT_AND_TESTED_BY_THE_NEXT()
+    val h = embed_new(0)
+
+    assert_eq(printed_by(h, "class Point\n    var x\n    var y"), "0|")
+    assert_eq(printed_by(h, "val p = Point.new(1, 2)\nprint(p is Point)\nprint(p.x + p.y)\nprint(3 is Point)"),
+              "0|true\n3\nfalse")
+    embed_free(h)
+
+// An import binds its names at the top level like any other binding, so the next call has them; an
+// import written again reads the module the first one ran rather than running it a second time.
+@test
+AN_IMPORT_ONE_CALL_MADE_IS_THERE_FOR_THE_NEXT_AND_MAY_BE_WRITTEN_AGAIN()
+    val h = embed_new(0)
+
+    assert_eq(printed_by(h, "import { cpus } from slate:process"), "0|")
+    assert_eq(printed_by(h, "print(cpus() > 0)"), "0|true")
+    assert_eq(printed_by(h, "import { cpus } from slate:process\nprint(cpus() > 0)"), "0|true")
+    embed_free(h)
+
+@test
+TWO_HANDLES_ARE_TWO_SESSIONS_AND_A_REFUSAL_ON_ONE_LEAVES_THE_OTHER_ALONE()
+    val a = embed_new(0)
+    val b = embed_new(0)
+
+    assert_eq(printed_by(a, "val x = 1"), "0|")
+    assert_eq(printed_by(b, "print(x)"), "1|")
+
+    val said = complaint_of(b)
+
+    assert(said.contains("`x` is not defined"), s"the other handle never bound it: ${said}")
+    assert_eq(printed_by(a, "print(x)"), "0|1")
+    embed_free(a)
+    embed_free(b)
+
+@test
+A_REFUSED_CALL_BETWEEN_TWO_GOOD_ONES_LEAVES_THE_SESSION_AS_IT_WAS()
+    val h = embed_new(0)
+
+    assert_eq(printed_by(h, "val x = 1"), "0|")
+    assert_eq(printed_by(h, "nope("), "1|")
+    assert(embed_error_len(h) > 0)
+    assert_eq(printed_by(h, "print(x)"), "0|1")
+    assert_eq(embed_error_len(h), 0)
+    embed_free(h)
+
+// A compile refusal that got as far as compiling a module it imported takes the module back out, so
+// the next call's imports still read the right module's exports.
+@test
+A_CALL_THE_CHECKER_REFUSES_AFTER_AN_IMPORT_COMPILED_LEAVES_THE_MODULES_IN_STEP()
+    val h = embed_new(0)
+
+    assert_eq(printed_by(h, "import { cpus } from slate:process\nnope()"), "1|")
+    assert_eq(printed_by(h, "val n = 1\nprint(n)"), "0|1")
+    assert_eq(printed_by(h, "import { cpus } from slate:process\nprint(cpus() > 0)"), "0|true")
+    embed_free(h)
+
+// A function reads the session's top level by name, so a later call that writes or rebinds a name
+// is what the function sees -- not a copy the defining call kept of it.
+@test
+A_FUNCTION_SEES_WHAT_A_LATER_CALL_WROTE_OR_REBOUND()
+    val h = embed_new(0)
+
+    assert_eq(printed_by(h, "var n = 0\nval k = 1\nbump() =\n    n = n + 1\n    n\nshow() = k"), "0|")
+    assert_eq(printed_by(h, "n = 10\nval k = 2"), "0|")
+    assert_eq(printed_by(h, "print(bump())\nprint(show())"), "0|11\n2")
+    embed_free(h)
+
+// Lua's rule: what ran before the fault stays bound.
+@test
+A_FAULT_AFTER_A_BINDING_KEEPS_THE_BINDING()
+    val h = embed_new(0)
+
+    assert_eq(printed_by(h, "val y = 2\nval empty = []\nempty.pop()"), "1|")
+    assert(complaint_of(h).contains("host.sl:3:"), s"the fault is the pop: ${complaint_of(h)}")
+    assert_eq(printed_by(h, "print(y)"), "0|2")
+    embed_free(h)
+
+// A function one call defined faults in a later call, and the diagnostic is drawn against the text
+// it was written in -- which the session has kept.
+@test
+A_FAULT_IN_A_FUNCTION_AN_EARLIER_CALL_DEFINED_POINTS_AT_THAT_CALLS_TEXT()
+    val h = embed_new(0)
+
+    assert_eq(evaluated(h, "\n\nlast(xs) = xs.pop()", "defs.sl"), 0)
+    assert_eq(printed_by(h, "last([])"), "1|")
+    assert(complaint_of(h).contains("defs.sl:3:"), s"drawn against the defining call: ${complaint_of(h)}")
+    embed_free(h)
+
+// The session's heap is collected as a program's is: every call rebinds `big`, so what the earlier
+// ones built is garbage and the live figure stays near one array's worth.
+@test
+TWO_HUNDRED_CALLS_EACH_BUILDING_AN_ARRAY_DO_NOT_GROW_THE_HEAP_WITHOUT_BOUND()
+    val h = embed_new(0)
+
+    for i in 0..<200
+        assert_eq(printed_by(h, "val big = []\nfor i in 0..<5000\n    big.push(i)"), "0|")
+
+    assert_eq(printed_by(h, "print(big.length)"), "0|5000")
+
+    // Measured after a collection, so the figure is what the session still reaches rather than what
+    // the schedule has not got round to.
+    val was = enter(&h.vm)
+
+    collect_now()
+
+    val live = heap_in_use()
+
+    leave(was)
+    assert(live < 4194304, s"the heap holds ${live} bytes after 200 calls")
+    embed_free(h)
+
+// **The drain waits for the timer**, node's rule and `run`'s: a call does not return while its own
+// timer is pending, so the call that armed it is the one that prints, and the next call sees nothing
+// left over.
+@test
+A_TIMER_A_CALL_ARMS_FIRES_BEFORE_THAT_CALL_RETURNS()
+    val h = embed_new(0)
+
+    assert_eq(printed_by(h, "setTimeout(() -> print(\"later\"), 10)\nprint(\"now\")"), "0|now\nlater")
+    assert_eq(printed_by(h, "print(\"next\")"), "0|next")
+    embed_free(h)
 
 @test
 THE_VERSION_THE_C_SURFACE_ANSWERS_IS_THE_ONE_slate_REPORTS()

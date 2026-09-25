@@ -14,13 +14,12 @@ import sysl.text.{str_builder, Search}
 // -- the entry point --------------------------------------------------------------------------------
 
 // Compile a source and everything it imports, and run the lot.
+//
+// **An embedded session (`session.sysl`) is this same sequence cut at its seams**: `fresh_start` and
+// the two scopes once, then `compile_loaded`, `ran_modules` and `settled_run` for every program it is
+// handed. So what running a program means is written once and a session cannot drift from it.
 run(src: Source) -> Ran
-    reset_heap()
-    reset_vm()
-    reset_events()
-    reset_async()
-    reset_types()
-    current().output.clear()
+    fresh_start()
 
     val loaded = load_program(src)
 
@@ -29,36 +28,13 @@ run(src: Source) -> Ran
     if !loaded.ok() then return Ran(Null, loaded.report, loaded.srcs, loaded.sources, current().output, 0)
 
     current().current_unit = new_unit()
-    running_unit().packages = loaded.packages
 
-    // **The unit is told about every file before anything is compiled from any of them**, because a
-    // chunk is stamped with an index into this list and a fault carries the same index out.
-    for i in 0..<loaded.sources.len()
-        running_unit().sources.push(loaded.sources.at(i))
-
-    // Post-order, so a module is compiled -- and later run -- only once everything it imports has
-    // been. The entry is the last of them.
-    for i in 0..<loaded.order.len()
-        val which = loaded.order.at(i)
-
-        compile_module(running_unit(), loaded.programs.at(which), which, loaded.sources.at(which).name, which == 0)
+    compile_loaded(loaded, 0, null)
 
     // **The compiler has complaints of its own, and they stop the program exactly as the parser's
     // do.** A name in a pattern that turned out to be a binding where a type was wanted is knowable
     // only once the types are resolved, which is here rather than while parsing.
-    if compile_went_wrong()
-        var found = loaded.report
-        var found_srcs = loaded.srcs
-
-        found.absorb(compile_report())
-
-        val more = compile_report_srcs()
-
-        for i in 0..<more.len()
-            found_srcs.push(more.at(i))
-
-        return Ran(Null, found, found_srcs, loaded.sources, current().output, 0)
-    end if
+    if compile_went_wrong() then return compile_refused(loaded, 0)
 
     // **TWO scopes, because a built-in module sees names a program does not.** `natives` holds every
     // builtin and is what `slate:time`'s own chunk is run against -- it is a `LoadName` per export and
@@ -72,12 +48,100 @@ run(src: Source) -> Ran
     install_builtins(natives)
     install_core(core)
 
+    settled_run(ran_modules(natives, core, 0, null), loaded, 0)
+end run
+
+// What every program starts from: an empty heap, machine, loop, queue and type table, and nothing
+// printed. Not `private`: a session (`session.sysl`) starts from it once, where `run` starts from it
+// every time.
+fresh_start()
+    reset_heap()
+    reset_vm()
+    reset_events()
+    reset_async()
+    reset_types()
+    current().output.clear()
+
+// Every file `load_program` read, compiled into the running unit.
+//
+// **`base` is where this program's files start in the unit's list of sources**, zero for a fresh
+// unit. A chunk is stamped with an index into that list and a fault carries the same index out, so a
+// unit that already holds another program's files numbers the new ones after them.
+//
+// **`entry_scope` is null for an ordinary program.** A session passes the scope its programs' top
+// levels share, and two things follow from it: the entry file is checked against that scope, so a
+// name an earlier program bound is a name this one may read; and a module the unit has already
+// compiled is not compiled again -- an import of it reads the copy that already ran, which is what
+// importing a module twice in one program means too.
+//
+// Not `private`: reached from `session.sysl`.
+compile_loaded(loaded: Loaded, base: usize, entry_scope: *EnvObj)
+    val u = running_unit()
+
+    u.packages = loaded.packages
+
+    // **The unit is told about every file before anything is compiled from any of them**, because a
+    // chunk is stamped with an index into this list and a fault carries the same index out.
+    for i in 0..<loaded.sources.len()
+        u.sources.push(loaded.sources.at(i))
+
+    // Post-order, so a module is compiled -- and later run -- only once everything it imports has
+    // been. The entry is the last of them.
+    for i in 0..<loaded.order.len()
+        val which = loaded.order.at(i)
+        val name = loaded.sources.at(which).name
+        val entry = which == 0
+
+        if entry_scope == null || entry || !compiled_already(u, name)
+            if entry then current().session_scope = entry_scope
+
+            compile_module(u, loaded.programs.at(which), base + which, name, entry)
+            current().session_scope = null
+end compile_loaded
+
+private compiled_already(u: *Unit, path: string) -> bool
+    for i in 0..<u.module_paths.len()
+        if u.module_paths.at(i) == path then return true
+
+    false
+end compiled_already
+
+// A program the compiler refused, answered with the parser's complaints and its own. Not `private`:
+// reached from `session.sysl`.
+compile_refused(loaded: Loaded, base: usize) -> Ran
+    var found = loaded.report
+    var found_srcs = offset_srcs(loaded, base)
+
+    found.absorb(compile_report())
+
+    val more = compile_report_srcs()
+
+    for i in 0..<more.len()
+        found_srcs.push(more.at(i))
+
+    Ran(Null, found, found_srcs, running_unit().sources, current().output, 0)
+end compile_refused
+
+// The loader's diagnostics name files by their place in `loaded.sources`; the unit numbers the same
+// files `base` further on.
+private offset_srcs(loaded: Loaded, base: usize) -> Buf[usize]
+    var out: Buf[usize] = buf()
+
+    for i in 0..<loaded.srcs.len()
+        out.push(base + loaded.srcs.at(i))
+
+    out
+end offset_srcs
+
+// What running the modules came to, once the loop has drained, as the answer a run gives. Not
+// `private`: reached from `session.sysl`.
+settled_run(step: Step, loaded: Loaded, base: usize) -> Ran
     var rep = loaded.report
 
     // **The report and the file list are copied out of `loaded` because a fault appends to both.**
     // The signal the program stopped with carries the file its span belongs to, so the pair stays in
     // step exactly as the parse-time ones did.
-    var srcs = loaded.srcs
+    var srcs = offset_srcs(loaded, base)
 
     // **The program runs, and then the loop drains.** A slate program with a timer or a pending
     // `await` in it does not exit when its last statement does, which is node's rule and the whole
@@ -87,10 +151,11 @@ run(src: Source) -> Ran
     // settled: until then there is no telling a promise that will be awaited on the next line from
     // one that never will be.
     // **Rooted for the drain, for `run_one_test`'s reason** -- this is the same `Value` in the same
-    // sysl local across the same call, and the whole program's answer rather than one test's.
+    // sysl local across the same call, and the whole program's answer rather than one test's. Nothing
+    // allocates between the modules answering and the hold.
     val mark = root_mark()
 
-    val answer: Step = run_modules(natives, core) match
+    val answer: Step = step match
         Ok(v) ->
             hold(v)
 
@@ -103,19 +168,21 @@ run(src: Source) -> Ran
 
     release(mark)
 
+    val sources = running_unit().sources
+
     answer match
-        Ok(v) -> Ran(v, rep, srcs, loaded.sources, current().output, 0)
+        Ok(v) -> Ran(v, rep, srcs, sources, current().output, 0)
 
         // **`exit` is not a failure and is not reported**, which is the whole of what makes it
         // different from every other way a run ends early. The status travels out to the driver and
         // the report stays as it was, so a script that prints its answer and exits 3 prints its
         // answer -- where adding a complaint would have it print a diagnostic nobody asked for.
-        Err(Quit(_, n)) -> Ran(Null, rep, srcs, loaded.sources, current().output, n)
+        Err(Quit(_, n)) -> Ran(Null, rep, srcs, sources, current().output, n)
         Err(s) ->
             rep.add(error(signal_span(s), signal_message(s)))
             srcs.push(signal_source(s))
-            Ran(Null, rep, srcs, loaded.sources, current().output, 0)
-end run
+            Ran(Null, rep, srcs, sources, current().output, 0)
+end settled_run
 
 // -- running the tests a file declared -------------------------------------------------------------
 
@@ -331,7 +398,7 @@ private prepared(src: Source, decls_only: bool, as_manifest: bool) -> string
         return ""
     end if
 
-    run_modules(natives, core) match
+    ran_modules(natives, core, 0, null) match
         Err(sig) -> return complaint(sig)
         Ok(_) -> ()
 
@@ -755,7 +822,15 @@ private elapsed(began: u64) -> u64 = (libuv.hrtime() - began) / 1000000
 // two files may each call something `helper` without either knowing.
 //
 // The value answered is the entry module's exports, the entry being the last to run.
-private run_modules(natives: *EnvObj, core: *EnvObj) -> Step = each_module(natives, core, false)
+//
+// **`from` is the first module to run and `entry_scope` the scope the entry runs in**, zero and null
+// for a program run whole. A session (`session.sysl`) runs only the modules its latest program added,
+// and runs that program's entry in the scope every earlier one's top level ran in -- which is the
+// whole of what makes a name one program bound a name the next can read.
+//
+// Not `private`: reached from `session.sysl`.
+ran_modules(natives: *EnvObj, core: *EnvObj, from: usize, entry_scope: *EnvObj) -> Step =
+    each_module(natives, core, false, from, entry_scope)
 
 // The same walk, with the ENTRY module's DECLARATIONS chunk in place of its own.
 //
@@ -769,18 +844,21 @@ private run_modules(natives: *EnvObj, core: *EnvObj) -> Step = each_module(nativ
 // a second time on the actor's thread: a program whose top level spawns an actor and prints would
 // otherwise spawn and print again in every actor it starts. So a top-level `val` of the entry file is
 // not bound here, and `unbound_here` in `run_frames.sysl` is the sentence that says so.
-private declare_modules(natives: *EnvObj, core: *EnvObj) -> Step = each_module(natives, core, true)
+private declare_modules(natives: *EnvObj, core: *EnvObj) -> Step = each_module(natives, core, true, 0, null)
 
-private each_module(natives: *EnvObj, core: *EnvObj, decls_only: bool) -> Step
+private each_module(natives: *EnvObj, core: *EnvObj, decls_only: bool, from: usize, entry_scope: *EnvObj) -> Step
     val u = running_unit()
 
     var last: Value = Null
 
-    for i in 0..<u.modules.len()
+    for i in from..<u.modules.len()
         // **One of slate's own modules is compiled against every builtin; a program's file is not.**
         // The module's chunk is a `LoadName` per export and nothing else, so it has to be able to see
         // what it exports -- and a program that has not imported a name must not.
-        val scope = new_env(if is_slate_module(u.module_paths.at(i)) then natives else core)
+        val scope = if entry_scope != null && i == u.modules.len() - 1
+            entry_scope
+        else
+            new_env(if is_slate_module(u.module_paths.at(i)) then natives else core)
         val mark = env_mark()
 
         hold_env(scope)

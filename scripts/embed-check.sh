@@ -34,6 +34,9 @@ expected="slate $(./slate --version 2>/dev/null | sed 's/^slate //' || true)"
 cat > "$work/want.txt" <<EOF
 hello from C
 first run: 0
+define: 0
+42
+use: 0
 second run: 1
 third run: 3
 EOF

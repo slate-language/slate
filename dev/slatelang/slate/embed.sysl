@@ -37,6 +37,11 @@ opaque struct Embedded
     // replaces it, which is the promise the header makes.
     error: CString
 
+    // What every `slate_eval` on this handle runs in, so a later call sees what an earlier one
+    // defined (`session.sysl`). Its scopes are rooted in `vm` from the first call until `slate_free`
+    // gives the heap back.
+    session: ProgramSession
+
 // How many handles may be live at once.
 const MaxEmbedded: usize = 64
 
@@ -76,7 +81,7 @@ embed_version() -> *u8 = version_text.ptr
 @export("slate_new")
 embed_new(heap_bytes: usize) -> *Embedded
     val ceiling = if heap_bytes == 0 then HeapBytes else heap_bytes
-    val box: &Embedded = Embedded(new_vm(ceiling), cstring(""))
+    val box: &Embedded = Embedded(new_vm(ceiling), cstring(""), program_session())
     var h: *Embedded = null
 
     embedded_lock.lock()
@@ -129,23 +134,40 @@ end embed_free
 // only the complaint is kept. A host that wants the output itself is the same later surface as the
 // loop above.
 //
-// **Each call is a whole program**, run from a fresh global scope: what one call defined the next
-// does not see. That is `run`'s own rule -- it resets the heap on the way in -- and a session that
-// keeps its definitions between calls is work in the interpreter rather than here.
+// **Every call on one handle runs in one session**, so what an earlier call defined at its top level
+// -- a function, a `val`, a class, an import -- the next can use, and what it binds joins them. A
+// refused call changes nothing; one that faults keeps whatever it bound before the fault.
+// `session.sysl` has the rule, and what is per call rather than per handle.
 @export("slate_eval")
-embed_eval(h: *Embedded, text: *u8, len: usize, name: *u8, name_len: usize) -> i32
+embed_eval(h: *Embedded, text: *u8, len: usize, name: *u8, name_len: usize) -> i32 =
+    embed_eval_with(h, owned(text, len), owned(name, name_len), line -> print(line))
+
+// Bytes C handed over, copied into a string of the facade's own. **A session keeps every program's
+// source for as long as the handle lives** -- a function one call defined may fault in a later one,
+// and the diagnostic is drawn against the text it was written in -- while a slice of C's memory owns
+// nothing and is good only until the call returns.
+private owned(p: *u8, n: usize) -> string
+    var copy = str_builder()
+
+    copy.push(from_utf8_unchecked(p[0..<n]))
+    copy.finish()
+
+// The call, with where the program's output goes handed in -- `print` from C, and a test's own
+// buffer from `tests_embed.sysl`, which is how a test reads what one call printed.
+embed_eval_with(h: *Embedded, program: string, name: string, say: string -> unit) -> i32
     var no_args: Buf[string] = buf()
     var complaint = str_builder()
+    val session = &h.session
     val was = enter(&h.vm)
 
-    val code = run_bytes("slate", from_utf8_unchecked(name[0..<name_len]), text[0..<len], no_args,
-                         line -> print(line), line -> complain(line, &complaint))
+    val code = ran_bytes("slate", name, program.bytes, no_args, say, line -> complain(line, &complaint),
+                         src -> add_program(session, src))
 
     leave(was)
 
     h.error = cstring(complaint.finish())
     i32(code)
-end embed_eval
+end embed_eval_with
 
 // The diagnostic the last `slate_eval` left, NUL-terminated, or an empty string where it ran. The
 // pointer is good until the next call on this handle.
