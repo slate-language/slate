@@ -2,8 +2,8 @@
 
 `hello.c` is a C program with a `main` of its own that links slate as a static archive, runs slate
 programs through it, and calls a slate function with values it made. The archive and its header come
-from `sysl build-c`; the C API is `dev/slatelang/slate/embed.sysl` and `embed_values.sysl`, and the
-header they produce declares:
+from `sysl build-c`; the C API is `dev/slatelang/slate/embed.sysl`, `embed_values.sysl` and
+`embed_loop.sysl`, and the header they produce declares:
 
 ```c
 uint8_t *slate_version(void);
@@ -134,6 +134,57 @@ calling the function it was. A host function prints as `<host name>` and `slate_
 with the `user` pointer beside it — from `slate_eval` and from a function `slate_call` runs alike —
 instead of to stdout; `f` null puts stdout back. The bytes are good for the length of the call.
 Diagnostics still go to `slate_error`, never to the output function.
+
+## A host with a loop of its own
+
+```c
+void slate_set_manual_loop(slate_vm *vm, int32_t manual);
+int32_t slate_pump(slate_vm *vm);
+int32_t slate_run_until_idle(slate_vm *vm);
+int32_t slate_loop_fd(slate_vm *vm);
+int32_t slate_loop_timeout(slate_vm *vm);
+```
+
+Every `slate_vm` has an event loop of its own, and there are two ways to turn it.
+
+- **Slate turns it (the default)**, which is right for a script host: `slate_eval` and `slate_call`
+  drain the loop before they return, so every timer a program armed has fired, every socket has
+  closed and every `await` has settled by the time C sees the status.
+- **The host turns it**, which is right for a GUI or a server with a main loop of its own:
+  after `slate_set_manual_loop(vm, 1)`, `slate_eval` and `slate_call` run the program or the call to
+  its first suspension and return with the rest still pending. `slate_eval` answers the status it
+  always does. `slate_call` answers the value where it has one; for an `async` function still
+  waiting it answers the promise itself, a handle `slate_kind` calls `8`. Read it later through a
+  call to an `async` function that `await`s it. `slate_set_manual_loop(vm, 0)` puts the default back.
+
+`slate_pump` runs one turn of the loop without waiting: the callbacks already due run, then what
+they resumed. It answers `1` while work is still outstanding and `0` once the loop is idle. It
+answers `-1` where a callback faulted or a promise rejected with nothing awaiting it, with
+`slate_error` saying so. Each is reported once and the next pump carries on. It works in either
+mode. Where C is content to wait, `slate_run_until_idle` does the whole drain in one call, as
+`slate_eval` would have done, and answers `0` or `-1` the same way.
+
+A host with a `poll`, `kqueue` or `epoll` loop adds `slate_loop_fd` to it and waits at most
+`slate_loop_timeout` milliseconds, then pumps. The timeout is `-1` where only the descriptor can
+wake the loop, as with a listening socket and no timer. It is `0` where something is due now, and
+also where nothing at all is pending, which `slate_pump` answering `0` tells apart. `hello.c`'s last
+section is the simplest form, a short sleep standing in for the poll:
+
+```c
+slate_set_manual_loop(vm, 1);
+run(vm, "timer.sl", "setTimeout(() -> print(\"tick\"), 20)");
+
+while (slate_pump(vm) == 1)
+    usleep(2000);
+```
+
+Two handles never share a loop, so pumping one runs nothing of the other's. Pumping from inside a
+host function is refused, the run that called the function being the one turning the loop.
+`slate_free` closes whatever a manual-mode handle left pending.
+
+A program that `await`s at its own top level is still settled before `slate_eval` returns, in
+either mode: that is the rule that gives an imported file's exports before its importer reads
+them.
 
 ## Building it
 

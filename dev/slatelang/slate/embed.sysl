@@ -54,6 +54,10 @@ opaque struct Embedded
     // `slate_call` it was made from inside one.
     depth: usize
 
+    // Whether the host owns the loop (`slate_set_manual_loop`, `embed_loop.sysl`): a program or a call
+    // then returns at its first suspension and the host pumps what is left.
+    manual: bool
+
 // How many handles may be live at once.
 const MaxEmbedded: usize = 64
 
@@ -86,14 +90,19 @@ embed_version() -> *u8 = version_text.ptr
 // that is zero, or null where `MaxEmbedded` handles are already live. The caller frees it with
 // `slate_free`.
 //
-// **The default loop, as a second VM on the main thread takes it.** An actor is a thread and so needs
-// a loop of its own; a C caller runs on whatever thread it calls from, one call at a time, and shares
-// the loop the way `slate test` running several programs does. A host that owns its own loop is a
-// later surface.
+// **A libuv loop of its own, as an actor is given one** (`actor_thread`), and closed by `slate_free`.
+// A host that owns its main loop pumps one handle's work at a time (`slate_pump`), and a loop shared
+// with the process -- or with another handle -- cannot be pumped for one VM without running every
+// other VM's callbacks on the wrong heap. It costs nothing a script host notices: the loop is drained
+// after every call exactly as the shared one was. Null where no loop could be made either.
 @export("slate_new")
 embed_new(heap_bytes: usize) -> *Embedded
+    val lp = libuv.new_loop() match
+        Ok(made) -> made
+        Err(_) -> return null
+
     val ceiling = if heap_bytes == 0 then HeapBytes else heap_bytes
-    val box: &Embedded = Embedded(new_vm(ceiling), cstring(""), program_session(), cstring(""), null, null, 0)
+    val box: &Embedded = Embedded(new_vm(ceiling, lp), cstring(""), program_session(), cstring(""), null, null, 0, false)
     var h: *Embedded = null
 
     embedded_lock.lock()
@@ -106,7 +115,7 @@ embed_new(heap_bytes: usize) -> *Embedded
 
     embedded_lock.unlock()
 
-    if h == null then dispose_vm(&box.vm)
+    if h == null then given_back(&box.vm)
 
     h
 end embed_new
@@ -133,9 +142,31 @@ embed_free(h: *Embedded)
     embedded_lock.unlock()
 
     mine match
-        Some(b) -> dispose_vm(&b.vm)
+        Some(b) -> given_back(&b.vm)
         None -> ()
 end embed_free
+
+// A VM's heap and its loop, given back. **What a manual-loop handle left pending is closed first**:
+// a timer or a socket still open keeps the loop from closing, so every slot is surrendered and the
+// loop turned once without waiting, which is when libuv runs the close callbacks.
+private given_back(vm: *Vm)
+    val lp = vm.uv_loop
+    val was = enter(vm)
+
+    reset_events()
+    lp.run(libuv.RUN_NOWAIT) match
+        Ok(_) -> ()
+        Err(_) -> ()
+
+    leave(was)
+    dispose_vm(vm)
+
+    // **Refused only while something is still open**, which the surrender above has closed; a loop
+    // that will not close is left to the process rather than failing the free.
+    lp.close() match
+        Ok(_) -> ()
+        Err(_) -> ()
+end given_back
 
 // Run `len` bytes of slate source as a program on this VM and answer its status: zero where it ran to
 // the end, what it passed to `exit` where it called that, and one where it was refused or faulted --
@@ -181,8 +212,9 @@ embed_eval_with(h: *Embedded, program: string, name: string, say: string -> unit
     val session = &h.session
     val was = enter(&h.vm)
 
+    val drain = !h.manual
     val code = ran_bytes("slate", name, program.bytes, no_args, say, line -> complain(line, &complaint),
-                         src -> add_program(session, src))
+                         src -> add_program(session, src, drain))
 
     leave(was)
 

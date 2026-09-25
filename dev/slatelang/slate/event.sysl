@@ -887,3 +887,52 @@ private settle_promise(pr: *PromiseObj) -> Result[unit, Signal]
 
     Ok(())
 end settle_promise
+
+// One turn of the loop that never waits, and whether work is still outstanding after it. Not
+// `private`: `slate_pump` in `embed_loop.sysl` is the caller, a host that owns its main loop driving
+// this one from inside it.
+//
+// **The order is `drain_events_to`'s, one turn of it**: what suspended calls are owed is handed back
+// before the loop turns, and again after, so a promise a callback settles moves its awaiting function
+// along in the same turn rather than the next. `RUN_NOWAIT` and not `RUN_ONCE` because the host is
+// the one that waits -- on `backend_fd` or a timeout -- and a turn that blocked would block it.
+//
+// **Work is outstanding where slate's own count says so or the loop is alive**, the count being the
+// authority for a request that has just been answered and the loop for a handle slate does not count.
+turn_events() -> Result[bool, Signal]
+    run_microtasks()
+    turn_fault()?
+
+    event_loop().run(libuv.RUN_NOWAIT) match
+        Err(e) -> return Err(failure(point(0), s"the event loop stopped: ${e}"))
+        Ok(_) -> ()
+
+    run_microtasks()
+    turn_fault()?
+
+    // **A handle closed in that turn keeps the loop alive until its close callback has run**, which
+    // is the next turn -- a fired timer gives its slot back by closing. With nothing of slate's left
+    // outstanding that turn is taken now, as `drain_events_to`'s closing turn is, so the host is told
+    // the loop is idle at the pump that finished the work rather than one pump later.
+    if current().outstanding == 0 && event_loop().alive()
+        event_loop().run(libuv.RUN_NOWAIT) match
+            Err(e) -> return Err(failure(point(0), s"the event loop stopped: ${e}"))
+            Ok(_) -> ()
+
+        run_microtasks()
+        turn_fault()?
+    end if
+
+    Ok(current().outstanding > 0 || event_loop().alive())
+end turn_events
+
+// The fault a callback or a resumption raised during a turn, taken off the VM so the turn after it
+// starts clean -- a host pumping the loop is told once and carries on, where a drain stops there.
+private turn_fault() -> Result[unit, Signal]
+    val v = current()
+
+    v.loop_fault match
+        Some(s) ->
+            v.loop_fault = None
+            Err(s)
+        None -> Ok(())

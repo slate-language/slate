@@ -9,10 +9,14 @@
  * level -- a function, a `val`, a class, an import -- a later call can use.
  *
  * The traffic goes the other way too: `slate_register` names a C function programs can call, and
- * `slate_on_output` hands C every line a program prints instead of writing it to stdout. */
+ * `slate_on_output` hands C every line a program prints instead of writing it to stdout.
+ *
+ * And a host with a loop of its own turns slate's from it: `slate_set_manual_loop` makes a program
+ * come back before its timers fire, and `slate_pump` runs them when C says. */
 
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "libslate.a.h"
 
@@ -99,6 +103,25 @@ int main(void) {
     slate_on_output(vm, NULL, NULL);
     run(vm, "plain.sl", "print(host_add(1, 2, 3))");
 
+    /* A host with a main loop of its own. In manual mode the program comes back at its first
+     * suspension with its timer still pending, and C turns slate's loop from its own: here a short
+     * sleep stands in for a `poll` on `slate_loop_fd` for up to `slate_loop_timeout` milliseconds. */
+    slate_on_output(vm, heard, (uint8_t *)"[loop] ");
+    slate_set_manual_loop(vm, 1);
+
+    printf("armed: %d\n", run(vm, "timer.sl", "setTimeout(() -> print(\"tick\"), 20)\nprint(\"armed\")"));
+    printf("pending: %d\n", slate_pump(vm));
+    printf("descriptor: %s, wait: %s\n", slate_loop_fd(vm) >= 0 ? "yes" : "no",
+           slate_loop_timeout(vm) > 0 ? "yes" : "no");
+
+    int32_t busy;
+
+    while ((busy = slate_pump(vm)) == 1)
+        usleep(2000);
+
+    printf("idle: %d\n", busy);
+
+    slate_set_manual_loop(vm, 0);
     slate_free(vm);
     return 0;
 }

@@ -45,6 +45,12 @@ listed(3) from C: [3, 6, "done"] (3 elements)
 [slate] from slate
 host: 0
 6
+[loop] armed
+armed: 0
+pending: 1
+descriptor: yes, wait: yes
+[loop] tick
+idle: 0
 EOF
 
 if ! diff <(grep -v '^slate ' "$work/out.txt") "$work/want.txt"; then
@@ -65,6 +71,9 @@ grep -hE '(typedef|struct).*slate_vm' "$work"/*.h || true
 # The two host callbacks as the header spells them: a function-pointer parameter is `R (*name)(A)`,
 # which is the one spelling clang accepts.
 grep -hE 'slate_register|slate_on_output' "$work"/*.h || true
+
+# The loop a host owns: the mode, the turn, the blocking drain, and the two things a `poll` reads.
+grep -hE 'slate_set_manual_loop|slate_pump|slate_run_until_idle|slate_loop_fd|slate_loop_timeout' "$work"/*.h || true
 
 echo "embed-check: OK"
 rm -rf "$work"

@@ -1,0 +1,227 @@
+module dev.slatelang.slate
+@tests
+
+import sh.sysl.libuv
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, cstring, from_utf8_unchecked}
+
+// The C surface for a host that owns its main loop (`embed_loop.sysl`), driven from sysl with the
+// pointers a C caller would hand it. That the DEFAULT mode is unchanged -- a call's timer has fired by
+// the time the call returns -- is `A_TIMER_A_CALL_ARMS_FIRES_BEFORE_THAT_CALL_RETURNS` in
+// `tests_embed.sysl`, and it runs on the per-handle loop now too.
+
+// What a handle printed, a line to an element, heard through `slate_on_output` as C hears it.
+private struct Heard
+    lines: Buf[string]
+
+private heard() -> Heard = Heard(buf())
+
+private heard_line(bytes: *u8, len: usize, user: *u8)
+    val into: *Heard = ptr_cast(user)
+
+    into.lines.push(from_utf8_unchecked(bytes[0..<len]))
+
+// A handle in manual mode whose output lands in `into`.
+private manual_handle(into: *Heard) -> *Embedded
+    val h = embed_new(0)
+
+    embed_on_output(h, &heard_line, ptr_cast(into))
+    embed_set_manual_loop(h, 1)
+    h
+
+private ran(h: *Embedded, program: string) -> i32
+    val text = cstring(program)
+    val file = cstring("loop.sl")
+
+    embed_eval(h, text.ptr, text.len, file.ptr, file.len)
+
+private said(h: *Embedded) -> string = from_utf8_unchecked(embed_error(h)[0..<embed_error_len(h)])
+
+private named(h: *Embedded, name: string) -> u64
+    val c = cstring(name)
+
+    embed_global(h, c.ptr, c.len)
+
+// Pump until the loop answers something other than "still busy", with a short wait between turns as
+// a host's `poll` would give it -- and never for ever.
+private pumped_out(h: *Embedded) -> i32
+    var code = embed_pump(h)
+    var turns = 0
+
+    while code == 1 && turns < 5000
+        libuv.sleep(1)
+        code = embed_pump(h)
+        turns += 1
+
+    code
+end pumped_out
+
+@test
+IN_MANUAL_MODE_A_C_HOST_GETS_THE_PROGRAM_BACK_BEFORE_ITS_TIMER_AND_A_PUMP_FIRES_IT_ONCE_DUE()
+    var out = heard()
+    val h = manual_handle(&out)
+
+    assert_eq(ran(h, "setTimeout(() -> print(\"later\"), 20)\nprint(\"now\")"), 0, said(h))
+    assert_eq(out.lines.len(), 1)
+    assert_eq(out.lines.at(0), "now")
+
+    // Not due yet: the turn waits for nothing and says there is still work.
+    assert_eq(embed_pump(h), 1)
+    assert_eq(out.lines.len(), 1)
+
+    libuv.sleep(40)
+
+    assert_eq(embed_pump(h), 0, said(h))
+    assert_eq(out.lines.len(), 2)
+    assert_eq(out.lines.at(1), "later")
+    assert_eq(embed_pump(h), 0)
+    embed_free(h)
+end IN_MANUAL_MODE_A_C_HOST_GETS_THE_PROGRAM_BACK_BEFORE_ITS_TIMER_AND_A_PUMP_FIRES_IT_ONCE_DUE
+
+@test
+RUN_UNTIL_IDLE_AFTER_A_MANUAL_PROGRAM_WAITS_OUT_ITS_TIMER_FOR_THE_C_HOST()
+    var out = heard()
+    val h = manual_handle(&out)
+
+    assert_eq(ran(h, "setTimeout(() -> print(\"later\"), 20)"), 0, said(h))
+    assert_eq(out.lines.len(), 0)
+    assert_eq(embed_run_until_idle(h), 0, said(h))
+    assert_eq(out.lines.len(), 1)
+    assert_eq(out.lines.at(0), "later")
+    assert_eq(embed_pump(h), 0)
+    embed_free(h)
+
+// **What is pinned is the answer's kind and then its value**: the call answers the promise itself
+// while it is pending (kind 8), and once pumped to idle an `async` wrapper awaiting it answers what
+// it settled with -- a call whose promise HAS settled being read through, as in the default mode.
+@test
+A_C_CALL_IN_MANUAL_MODE_ANSWERS_A_PENDING_PROMISE_THAT_PUMPS_SETTLE()
+    var out = heard()
+    val h = manual_handle(&out)
+
+    assert_eq(ran(h, "async slow()\n    await sleep(20)\n    return 42\n\nasync unwrap(p) = await p"), 0, said(h))
+
+    var promise: u64 = 0
+
+    assert_eq(embed_call(h, named(h, "slow"), null, 0, &promise), 0, said(h))
+    assert_eq(embed_kind(h, promise), 8)
+    assert_eq(pumped_out(h), 0, said(h))
+
+    var laid: [1]u64 = [promise]
+    var answer: u64 = 0
+
+    assert_eq(embed_call(h, named(h, "unwrap"), &laid[0], 1, &answer), 0, said(h))
+    assert_eq(embed_kind(h, answer), 2)
+    assert_eq(embed_to_int(h, answer), 42)
+    embed_free(h)
+end A_C_CALL_IN_MANUAL_MODE_ANSWERS_A_PENDING_PROMISE_THAT_PUMPS_SETTLE
+
+@test
+A_REJECTION_NOTHING_AWAITED_REACHES_THE_C_HOST_FROM_ONE_PUMP_AND_THE_NEXT_CARRIES_ON()
+    var out = heard()
+    val h = manual_handle(&out)
+
+    assert_eq(ran(h, "async boom()\n    await sleep(10)\n    throw \"gone wrong\"\n\nboom()"), 0, said(h))
+    assert_eq(pumped_out(h), -1)
+    assert(said(h).contains("gone wrong"), s"the sentence is the rejection's: ${said(h)}")
+    assert_eq(embed_pump(h), 0, said(h))
+    assert_eq(embed_error_len(h), 0)
+    embed_free(h)
+
+@test
+A_FAULT_IN_A_TIMER_CALLBACK_REACHES_THE_C_HOST_FROM_ONE_PUMP_AND_THE_NEXT_CARRIES_ON()
+    var out = heard()
+    val h = manual_handle(&out)
+
+    assert_eq(ran(h, "tick()\n    throw \"bad tick\"\n\nsetTimeout(tick, 1)\nsetTimeout(() -> print(\"after\"), 30)"), 0, said(h))
+    assert_eq(pumped_out(h), -1)
+    assert(said(h).contains("bad tick"), s"the sentence is the fault's: ${said(h)}")
+    assert_eq(pumped_out(h), 0, said(h))
+    assert_eq(out.lines.len(), 1)
+    assert_eq(out.lines.at(0), "after")
+    embed_free(h)
+
+@test
+EACH_C_HANDLE_HAS_A_LOOP_OF_ITS_OWN_SO_PUMPING_ONE_RUNS_NONE_OF_THE_OTHERS_WORK()
+    var heard_a = heard()
+    var heard_b = heard()
+    val a = manual_handle(&heard_a)
+    val b = manual_handle(&heard_b)
+
+    assert_eq(ran(a, "setTimeout(() -> print(\"A\"), 5)"), 0, said(a))
+    assert_eq(ran(b, "val quiet = 1"), 0, said(b))
+    libuv.sleep(20)
+
+    assert_eq(embed_pump(b), 0)
+    assert_eq(heard_a.lines.len(), 0)
+    assert(embed_loop_fd(a) != embed_loop_fd(b), "two loops, two descriptors")
+
+    assert_eq(embed_pump(a), 0, said(a))
+    assert_eq(heard_a.lines.len(), 1)
+    assert_eq(heard_a.lines.at(0), "A")
+    assert_eq(heard_b.lines.len(), 0)
+    embed_free(a)
+    embed_free(b)
+end EACH_C_HANDLE_HAS_A_LOOP_OF_ITS_OWN_SO_PUMPING_ONE_RUNS_NONE_OF_THE_OTHERS_WORK
+
+// libuv's own answers, which a C host's `poll` reads: 0 with nothing pending at all (`slate_pump`
+// answering 0 is what tells that from "due now"), -1 where only a descriptor can wake the loop, a
+// wait no longer than the timer asked for, and 0 once the timer is due -- counted from the clock as
+// it is now, not as the loop last cached it.
+@test
+THE_C_HOST_IS_TOLD_WHICH_DESCRIPTOR_TO_POLL_AND_HOW_LONG_IT_MAY_WAIT()
+    var out = heard()
+    val h = manual_handle(&out)
+
+    assert(embed_loop_fd(h) >= 0, "there is a descriptor to poll")
+    assert_eq(embed_loop_timeout(h), 0)
+
+    assert_eq(ran(h, "import { listen, close } from slate:net\nval server = listen(0, conn -> conn)"), 0, said(h))
+    assert_eq(embed_pump(h), 1)
+    assert_eq(embed_loop_timeout(h), -1)
+    assert_eq(ran(h, "close(server)"), 0, said(h))
+    assert_eq(pumped_out(h), 0, said(h))
+
+    assert_eq(ran(h, "setTimeout(() -> print(\"late\"), 1000)"), 0, said(h))
+
+    val wait = embed_loop_timeout(h)
+
+    assert(wait > 0 && wait <= 1000, s"a future timer is a wait of at most its own: ${wait}")
+    assert_eq(ran(h, "setTimeout(() -> print(\"soon\"), 5)"), 0, said(h))
+    libuv.sleep(20)
+    assert_eq(embed_loop_timeout(h), 0)
+
+    // Freed with the second-long timer still pending, which the free closes.
+    embed_free(h)
+end THE_C_HOST_IS_TOLD_WHICH_DESCRIPTOR_TO_POLL_AND_HOW_LONG_IT_MAY_WAIT
+
+@test
+A_THOUSAND_ALLOCATING_TIMERS_PUMPED_BY_A_C_HOST_COLLECT_AND_KEEP_NO_HANDLES()
+    var out = heard()
+    val h = manual_handle(&out)
+
+    assert_eq(ran(h, "var done = 0\n\nwork()\n    val xs = []\n    for j in 0..<200\n        xs.push(string(j) + \"x\")\n    done += 1\n\nfor i in 0..<1000\n    setTimeout(work, i % 5)"), 0, said(h))
+
+    val held = h.vm.host_held.len()
+    val collections = h.vm.collections
+
+    assert_eq(pumped_out(h), 0, said(h))
+    assert(h.vm.collections > collections, "the pumps collected")
+    assert_eq(h.vm.host_held.len(), held)
+    assert_eq(ran(h, "print(done)"), 0, said(h))
+    assert_eq(out.lines.at(out.lines.len() - 1), "1000")
+    embed_free(h)
+end A_THOUSAND_ALLOCATING_TIMERS_PUMPED_BY_A_C_HOST_COLLECT_AND_KEEP_NO_HANDLES
+
+@test
+A_C_HOST_CANNOT_PUMP_FROM_INSIDE_A_FUNCTION_IT_REGISTERED()
+    var out = heard()
+    val h = manual_handle(&out)
+
+    h.depth = 1
+    assert_eq(embed_pump(h), -1)
+    assert(said(h).contains("inside a host function"), said(h))
+    assert_eq(embed_run_until_idle(h), -1)
+    h.depth = 0
+    assert_eq(embed_pump(h), 0)
+    embed_free(h)

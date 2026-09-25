@@ -1,0 +1,105 @@
+module dev.slatelang.slate
+
+import sysl.text.cstring
+
+// The C surface for a host that OWNS its main loop -- a GUI toolkit's, a server's -- and wants slate's
+// timers, sockets and promises interleaved with its own work rather than settled before every call
+// returns.
+//
+// **Two modes, and the default is the script host's.** `slate_eval` and `slate_call` drain the
+// handle's loop before they return, so a program's timers have fired by the time C sees its status.
+// `slate_set_manual_loop(h, 1)` makes both return at the first suspension instead, leaving what is
+// pending on the handle's loop; the host then calls `slate_pump` from its own loop -- when
+// `slate_loop_fd` is readable, or `slate_loop_timeout` milliseconds have passed -- or
+// `slate_run_until_idle` where it is content to wait.
+//
+// **Every handle has a loop of its own** (`embed_new`), which is what makes pumping one handle mean
+// that handle's work and nobody else's.
+
+// A turn's answer and what `slate_error` should then say.
+private struct Turned
+    code: i32
+    said: string
+
+// Choose who turns this handle's loop: slate, draining it before `slate_eval` and `slate_call`
+// return (zero, the default), or the host, through `slate_pump` (non-zero). Takes effect at the next
+// call; work already pending stays pending either way.
+@export("slate_set_manual_loop")
+embed_set_manual_loop(h: *Embedded, manual: i32)
+    h.manual = manual != 0
+
+// One turn of the handle's loop, WITHOUT waiting: the callbacks already due run, then the
+// resumptions they owe. Answers 1 where work is still outstanding, 0 where the loop is idle, and -1
+// where the turn found a fault or a rejection nothing awaited -- `slate_error` has the sentence, it
+// is reported once, and the next turn carries on. Legal in either mode.
+@export("slate_pump")
+embed_pump(h: *Embedded) -> i32 = turned(h, "slate_pump", () -> pumped())
+
+// Turn the handle's loop until it has nothing left -- what `slate_eval` does after a program in the
+// default mode, for a manual-loop host that wants it once. Answers 0, or -1 with `slate_error`
+// saying why: a fault in a callback, or a rejection nothing awaited.
+@export("slate_run_until_idle")
+embed_run_until_idle(h: *Embedded) -> i32 = turned(h, "slate_run_until_idle", () -> drained())
+
+// The descriptor the handle's loop waits on -- a kqueue on macOS, an epoll on Linux -- for a host
+// to add to its own `poll`: readable means `slate_pump` has something to do. -1 where the platform
+// has none.
+@export("slate_loop_fd")
+embed_loop_fd(h: *Embedded) -> i32 = h.vm.uv_loop.backend_fd()
+
+// How long the host may wait before the next `slate_pump`, in milliseconds: 0 where something is
+// due now -- or where nothing at all is pending, which `slate_pump` answering 0 tells apart -- and
+// -1 where only a descriptor can wake it, a listening socket with no timer beside it.
+//
+// **Counted from the clock as it is NOW**: libuv's loop caches the time at each turn, so a host that
+// has been busy since the last pump would otherwise be told to wait for a timer already due.
+@export("slate_loop_timeout")
+embed_loop_timeout(h: *Embedded) -> i32
+    val lp = h.vm.uv_loop
+
+    lp.update_time()
+    lp.backend_timeout()
+end embed_loop_timeout
+
+// The turn, on the handle's VM with its output going where `slate_eval`'s goes. **Refused from inside
+// a host function**, whose run is already turning this loop -- libuv's is not re-entered.
+private turned(h: *Embedded, what: string, go: () -> Turned) -> i32
+    if h.depth > 0
+        h.error = cstring(s"`${what}` cannot turn the loop from inside a host function -- the run that called it is turning it already")
+        return -1
+    end if
+
+    val t = on_vm(h, () -> with_output(h, go))
+
+    h.error = cstring(t.said)
+    t.code
+end turned
+
+// `go`, with what a callback prints reaching the host live, as a program's own output does.
+private with_output(h: *Embedded, go: () -> Turned) -> Turned
+    val v = current()
+
+    v.live_output = true
+    v.live_sink = line -> host_say(h, line)
+
+    val t = go()
+
+    v.live_output = false
+    v.live_sink = no_live_sink
+    t
+end with_output
+
+private pumped() -> Turned = turn_events() match
+    Err(sig) -> Turned(-1, complaint(sig))
+    Ok(more) -> reported_rejection() match
+        Some(sig) -> Turned(-1, complaint(sig))
+        None -> Turned(if more then 1 else 0, "")
+
+// **The fault is taken off the VM once said**, as a pump's is, so the host's next call starts clean.
+private drained() -> Turned = drain_events() match
+    Err(sig) ->
+        current().loop_fault = None
+        Turned(-1, complaint(sig))
+    Ok(_) -> reported_rejection() match
+        Some(sig) -> Turned(-1, complaint(sig))
+        None -> Turned(0, "")
