@@ -1,6 +1,6 @@
 module dev.slatelang.slate
 
-import sysl.buf.{Buf, buf}
+import sysl.buf.{Buf, buf, buf_with_capacity}
 
 // Where an object's entries are kept, and the only functions that reach them by position.
 //
@@ -12,90 +12,146 @@ import sysl.buf.{Buf, buf}
 //
 // **A position is the insertion order**, tombstones included: `keys` order, the index's biased
 // positions and a call site's remembered guess (`site_cache.sysl`) all name the same numbers.
+//
+// **A SMALL OBJECT'S ENTRIES LIVE IN ITS OWN CELL, AND A LARGER ONE'S ALL IN A `Buf`.** Nearly every
+// object a program makes is small -- a class instance is its `proto` and a field or two, a literal a
+// point or a pair -- so up to `InlineEntries` entries sit in the `ObjectObj` the allocator already
+// handed out: a construction asks `malloc` for nothing, a field read is one load off the object
+// rather than a load of the table and a second through it, and the sweep that frees it has no second
+// block to give back. The entry that does not fit SPILLS the whole table into `stored`, and from then
+// on every position is there.
+//
+// **Spilling the whole table rather than keeping the first few inline is measured, not tidy.** With
+// the first `InlineEntries` positions always inline, a lookup in a large table asked `i < N` of a
+// position the hash had just chosen, and a map read at random mispredicted it: `mapset` read +3.7%
+// and `methods` +2.9%. Asking whether THE OBJECT has spilled is the same answer for every read of
+// one object, so the branch is predicted and a large table reads as it always did.
+//
+// **An inline `Entry` is legal in collected memory** because it holds no counted member: a hash, two
+// `Value`s and a flag, none of which a zeroed cell can make a first assignment release wrongly.
+
+// How many entries an object holds in its own cell. Three is a class instance's `proto` and two
+// fields, and a literal's three; `bench/results/2026-09-24-inline-object.md` has 3, 4 and 8 side by side.
+const InlineEntries: usize = 3
+
+// Whether the table has outgrown its cell, which a spilled table never un-does until it is emptied.
+@inline
+private spilled(o: *ObjectObj) -> bool = o.stored.cap() != 0
 
 // How many entries the table holds, tombstones included.
 @inline
-entry_count(o: *ObjectObj) -> usize = o.stored.len()
+entry_count(o: *ObjectObj) -> usize = o.count
 
 // The entry at position `i`, which must be below `entry_count`.
 @inline
-entry_at(o: *ObjectObj, i: usize) -> Entry = o.stored.at(i)
+entry_at(o: *ObjectObj, i: usize) -> Entry = if spilled(o) then o.stored.at(i) else o.small[i]
 
 // Write the entry at position `i`, which must be below `entry_count`.
 @inline
-entry_set(o: *ObjectObj, i: usize, e: Entry) = o.stored.set(i, e)
+entry_set(o: *ObjectObj, i: usize, e: Entry)
+    if spilled(o) then o.stored.set(i, e) else o.small[i] = e
 
 // Replace the value at position `i`, keeping its key, hash and liveness.
 @inline
 entry_value_set(o: *ObjectObj, i: usize, v: Value)
-    var e = entry_at(o, i)
+    if spilled(o) then o.stored.elems[i].value = v else o.small[i].value = v
 
-    e.value = v
-    entry_set(o, i, e)
+// Drop every tombstone, keeping the live entries in their order, and answer how many are left.
+//
+// **In place**, which is what a rehash wants: the positions the index is about to be rebuilt from
+// are the compacted ones, and nothing is allocated to move them. A spilled table stays spilled and
+// keeps its capacity -- a table that grew to hold many keys is likely to hold them again.
+entries_compact(o: *ObjectObj) -> usize
+    var kept: usize = 0
 
-// What the entries hold outside the heap, which `object_payload` charges.
+    for i in 0..<o.count
+        val e = entry_at(o, i)
+
+        if !e.dead
+            if kept != i then entry_set(o, kept, e)
+
+            kept += 1
+
+    o.count = kept
+
+    if spilled(o) then o.stored.truncate(kept)
+
+    kept
+end entries_compact
+
+// Empty the table and give back what held its entries, which puts it back in its cell.
+entries_drop(o: *ObjectObj)
+    o.count = 0
+    o.stored = buf()
+
+// What the entries hold outside the heap, which `object_payload` charges. The inline ones are the
+// cell's and are counted with it.
 entries_payload(o: *ObjectObj) -> usize = o.stored.cap() * sizeof(Entry)
 
-// The capacity a `Buf` takes at its first push, which is therefore the table every object of fewer
-// than eight fields has.
-private const FirstTable: usize = 8
-
-// How many emptied tables a VM keeps for reuse.
-private const SpareEntries: usize = 4096
-
-// Give a new object its empty table.
+// The capacity a table takes when it spills, which is therefore the only size a sweep keeps.
 //
-// **A table a sweep kept, where there is one** -- `entries_release` says why. It is empty and
-// already the size a first field would have grown it to, and the charge `new_object_on` makes is
-// what that growth would have charged.
-entries_fresh_on(v: *Vm, o: *ObjectObj)
-    o.stored = v.spare_entries.pop() match
-        Some(kept) -> kept
-        None -> buf()
+// **Twice the cell, not the eight a `Buf`'s first push would give**, so an object of four to six
+// fields pays for what it holds; past that the `Buf` doubles as it always did.
+const FirstOverflow: usize = InlineEntries * 2
 
-// **A SWEEP KEEPS A SMALL OBJECT'S ENTRY TABLE FOR THE NEXT OBJECT, AND THAT IS THE ALLOCATION A
-// CONSTRUCTOR CALL USED TO MAKE.** An object's fields live in a `Buf` outside the heap, so every
-// `Counter(n)` asked `malloc` for a table of `SmallTable` entries, wrote every one of them, and the
-// sweep that freed the object handed the table back to `free` -- a malloc, a fill and a free per
-// object, which a loop making one object a turn pays every turn. A table of exactly the size the
-// first push gives is emptied and kept instead, up to `SpareEntries` of them, and `new_object` takes
-// one before it asks for memory.
+// How many emptied spill tables a VM keeps for reuse.
+const SpareEntries: usize = 4096
+
+// Give a new object its empty table: nothing in the cell and nothing outside it.
+entries_fresh_on(v: *Vm, o: *ObjectObj)
+    o.count = 0
+    o.stored = buf()
+
+// **A SWEEP KEEPS AN EMPTIED SPILL TABLE FOR THE NEXT OBJECT THAT OUTGROWS ITS CELL**, so a loop
+// making objects of four to six fields asks `malloc` for nothing a turn -- which is what every
+// object with a field used to cost before the small ones moved into the cell. `spill` takes one
+// before it asks for memory.
 //
 // **Only during a SWEEP, which `sweeping` says.** A heap being disposed is going away with its VM,
 // and keeping its tables would only move the free to later.
 //
-// **Bounded, so the tables kept are never more than a sweep's worth of small objects**: a program
-// that made a million and dropped them keeps `SpareEntries` tables -- two megabytes -- and gives the
+// **Bounded, so the tables kept are never more than a sweep's worth of objects**: a program that
+// made a million and dropped them keeps `SpareEntries` tables -- about a megabyte -- and gives the
 // rest back as it always did.
 entries_release(v: *Vm, o: *ObjectObj)
-    if v.sweeping && o.stored.cap() == FirstTable && v.spare_entries.len() < SpareEntries
+    if v.sweeping && o.stored.cap() == FirstOverflow && v.spare_entries.len() < SpareEntries
         o.stored.clear()
         v.spare_entries.push(o.stored)
 
-    o.stored = buf()
-
-// Take the entries a rehash kept in place of the ones the table had.
-entries_replace(o: *ObjectObj, kept: Buf[Entry])
-    o.stored = kept
-
-// Empty the table and give back what held its entries.
-entries_drop(o: *ObjectObj)
+    o.count = 0
     o.stored = buf()
 
 // Append an entry to an object's table.
 //
 // **EVERY KEY A TABLE TAKES ARRIVES HERE, which is what makes the summary in `keys_bloom` sound.**
-// A rehash rebuilds the entries without coming through this function and deliberately leaves the
+// A rehash compacts the entries without coming through this function and deliberately leaves the
 // summary alone: what it drops are tombstones, so the bits it keeps stay a superset of the keys.
 entry_push(o: *ObjectObj, e: Entry) = entry_push_on(current(), o, e)
 
 // The same, charged to a VM the caller already holds.
+@inline
 entry_push_on(v: *Vm, o: *ObjectObj, e: Entry)
-    val was = o.stored.cap()
+    val n = o.count
 
-    o.stored.push(e)
+    if n < InlineEntries && !spilled(o) then o.small[n] = e else pushed_outside(v, o, e)
+
+    o.count = n + 1
     o.keys_bloom = o.keys_bloom | (u64(1) << (e.hash & 63))
 
-    // A table a sweep kept is already the size its first push would grow it to, so a literal's
-    // pushes nearly never move the capacity and there is nothing to charge.
+// A push the cell cannot take: the first one moves the cell's entries out into a kept table or one
+// of `FirstOverflow`, and every one charges what the capacity grew by.
+@noinline
+private pushed_outside(v: *Vm, o: *ObjectObj, e: Entry)
+    val was = o.stored.cap()
+
+    if was == 0
+        o.stored = v.spare_entries.pop() match
+            Some(kept) -> kept
+            None -> buf_with_capacity(FirstOverflow, e)
+
+        for i in 0..<o.count
+            o.stored.push(o.small[i])
+
+    o.stored.push(e)
+
     if o.stored.cap() != was then charge_on(v, (o.stored.cap() - was) * sizeof(Entry))

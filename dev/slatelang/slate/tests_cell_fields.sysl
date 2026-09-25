@@ -1,0 +1,234 @@
+module dev.slatelang.slate
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// An object of up to `InlineEntries` entries keeps them in its own cell, and the entry that does not
+// fit moves the whole table into a `Buf` (`entries.sysl`). What these pin is the part a slate
+// program cannot see: that a small object holds nothing outside the heap, that the payload a
+// collection recounts is exact with objects on both sides of the line alive, that a rehash compacts
+// across it, that a weak map drops by position on both sides of it, and that an actor's copy of an
+// object comes out the same size it went in.
+
+// An object of `n` fields named `k0`, `k1`, ... holding their own index.
+private fields(n: usize) -> *ObjectObj
+    val o = new_object()
+
+    for i in 0..<n
+        obj_put_name(o, s"k${i}", Int(long(i)))
+
+    o
+
+// The key names of an object in its own order.
+private names(o: *ObjectObj) -> string
+    var out = ""
+
+    for k in obj_keys(o).view()
+        out = out + value_text(k) + " "
+
+    out
+
+private field(o: *ObjectObj, name: string) -> long = obj_get_name(o, name) match
+    Some(Int(n)) -> n
+    _ -> -1
+
+// **The cell is the price of the layout, and it is written down so a change to it is noticed**: 96
+// bytes of table, count, index and flags (88 before the entries moved in), then the inline entries at
+// 48 bytes each -- a hash, two 16-byte `Value`s and a flag.
+@test
+THE_CELL_IS_THE_TABLE_HEADER_AND_THREE_ENTRIES()
+    assert_eq(sizeof(Entry), 48, "an entry is a hash, two values and a flag")
+    assert_eq(sizeof(ObjectObj), 96 + InlineEntries * sizeof(Entry), "the cell is the header and the inline entries")
+end THE_CELL_IS_THE_TABLE_HEADER_AND_THREE_ENTRIES
+
+@test
+A_SMALL_OBJECT_HOLDS_NOTHING_OUTSIDE_THE_HEAP_AND_THE_FIELD_PAST_IT_MOVES_THE_TABLE()
+    reset_vm()
+    reset_heap()
+
+    val o = fields(InlineEntries)
+
+    assert_eq(entries_payload(o), 0, "an object that fits its cell holds nothing outside the heap")
+    assert_eq(entry_count(o), InlineEntries, "and has every field it was given")
+
+    obj_put_name(o, "past", Int(99))
+
+    assert_eq(entries_payload(o), FirstOverflow * sizeof(Entry), "the field past the cell moved the table out, at twice the cell")
+    assert_eq(entry_count(o), InlineEntries + 1, "and lost nothing on the way")
+    assert_eq(names(o), "k0 k1 k2 past ", "in the order they were written")
+
+    for i in 0..<InlineEntries
+        assert_eq(field(o, s"k${i}"), long(i), "every field that was in the cell reads back from the table")
+
+    assert_eq(field(o, "past"), 99, "and so does the one that moved it")
+end A_SMALL_OBJECT_HOLDS_NOTHING_OUTSIDE_THE_HEAP_AND_THE_FIELD_PAST_IT_MOVES_THE_TABLE
+
+// **A rehash is the one place entries move to other positions**, so it is where a mistake about
+// which positions live where would show: removed fields leave tombstones in the cell and in the
+// table, and the write that outgrows the small case compacts them all.
+@test
+A_REHASH_COMPACTS_TOMBSTONES_ON_BOTH_SIDES_OF_THE_LINE()
+    reset_vm()
+    reset_heap()
+
+    val o = fields(6)
+
+    for name in ["k0", "k2", "k4"]
+        obj_remove(o, str_value(name), point(0)) match
+            Ok(true) -> ()
+            _ -> assert(false, s"removing ${name} answered nothing")
+
+    for i in 6..<12
+        obj_put_name(o, s"k${i}", Int(long(i)))
+
+    assert_eq(o.live, 9, "three removed, six added")
+    assert_eq(entry_count(o), 9, "and the rehash dropped every tombstone")
+    assert_eq(names(o), "k1 k3 k5 k6 k7 k8 k9 k10 k11 ", "keeping the order of what was left")
+
+    assert_eq(field(o, "k5"), 5, "a field from before the rehash reads back")
+    assert_eq(field(o, "k11"), 11, "and one from after it")
+    assert(obj_get_name(o, "k0").is_none(), "and a removed one stays removed")
+end A_REHASH_COMPACTS_TOMBSTONES_ON_BOTH_SIDES_OF_THE_LINE
+
+// **A cell that holds its entries is not a place a `remove` may skip**: one removed from the cell
+// and written again goes to the end, exactly as one removed from the table does.
+@test
+A_FIELD_REMOVED_FROM_THE_CELL_AND_WRITTEN_AGAIN_GOES_TO_THE_END()
+    reset_vm()
+    reset_heap()
+
+    val o = fields(2)
+
+    obj_remove(o, str_value("k0"), point(0)) match
+        _ -> ()
+
+    obj_put_name(o, "k0", Int(7))
+
+    assert_eq(names(o), "k1 k0 ", "the rewritten field is last")
+    assert_eq(field(o, "k0"), 7, "and holds what was written")
+    assert_eq(entry_count(o), 3, "the tombstone keeps its position in the cell")
+    assert_eq(entries_payload(o), 0, "and three positions still fit it")
+
+    obj_put_name(o, "k9", Int(9))
+
+    assert_eq(entries_payload(o), FirstOverflow * sizeof(Entry), "so the next field is the fourth position and moves the table out")
+    assert_eq(names(o), "k1 k0 k9 ", "without the tombstone showing")
+end A_FIELD_REMOVED_FROM_THE_CELL_AND_WRITTEN_AGAIN_GOES_TO_THE_END
+
+// A weak map drops an entry by POSITION from inside a collection. Keys at a cell position and at a
+// table position are both unreachable here, and both must go without the others moving.
+@test
+A_WEAK_MAP_DROPS_BY_POSITION_ON_BOTH_SIDES_OF_THE_LINE()
+    for size in [InlineEntries, InlineEntries + 3]
+        reset_heap()
+        reset_vm()
+
+        val t = new_weak_map()
+        var held: Buf[Value] = buf()
+
+        machine().stack.push(WeakMapVal(t))
+
+        for i in 0..<size
+            val k = Object(new_object())
+
+            if i % 2 == 1
+                machine().stack.push(k)
+                held.push(k)
+
+            obj_put(t, k, Int(long(i)), point(0)) match
+                _ -> ()
+
+        collect_now()
+
+        assert_eq(t.live, held.len(), s"of ${size} entries, the ones whose keys were held survive")
+
+        for i in 0..<held.len()
+            obj_get(t, held.at(i), point(0)) match
+                Ok(Some(Int(n))) -> assert_eq(n, long(i * 2 + 1), "and each still holds its own value")
+                _ -> assert(false, "a held key answered nothing")
+
+        reset_vm()
+end A_WEAK_MAP_DROPS_BY_POSITION_ON_BOTH_SIDES_OF_THE_LINE
+
+// **The payload a collection recounts is what `charge` said, with both kinds alive.** A small object
+// charges its keys' text and nothing for its table; a spilled one charges its table on top, so the
+// difference between a hundred of each is exactly a hundred tables.
+@test
+THE_RECOUNTED_PAYLOAD_IS_EXACT_WITH_SMALL_AND_SPILLED_OBJECTS_ALIVE()
+    reset_vm()
+    reset_heap()
+    collect_now()
+
+    val start = current().payload
+
+    for i in 0..<100
+        machine().stack.push(Object(fields(InlineEntries)))
+
+    val small = current().payload - start
+
+    for i in 0..<100
+        val o = fields(InlineEntries)
+
+        obj_put_name(o, "k0", Int(1))
+        machine().stack.push(Object(o))
+
+    assert_eq(current().payload - start - small, small, "rewriting a field in the cell charges nothing more")
+
+    for i in 0..<100
+        val o = fields(InlineEntries)
+
+        obj_put_name(o, "k", Int(1))
+        machine().stack.push(Object(o))
+
+    val charged = current().payload
+
+    // Each of the last hundred holds one more key than the first two hundred did, charged as any
+    // string of its text is.
+    val before_key = current().payload
+
+    machine().stack.push(str_value("k"))
+
+    val key = current().payload - before_key
+    val tables = charged - start - 3 * small - 100 * key
+
+    assert_eq(tables, 100 * FirstOverflow * sizeof(Entry), "the spilled hundred charged exactly a table each")
+
+    machine().stack.pop() match
+        _ -> ()
+
+    collect_now()
+
+    assert_eq(current().payload, charged, "and the recount at a collection agrees exactly")
+
+    reset_vm()
+    collect_now()
+    assert_eq(current().payload, start, "and dropping them gives every byte back")
+end THE_RECOUNTED_PAYLOAD_IS_EXACT_WITH_SMALL_AND_SPILLED_OBJECTS_ALIVE
+
+// An object crossing to an actor is encoded and decoded into another table, so the copy is built
+// through the same pushes -- and comes out on the same side of the line it went in on.
+@test
+AN_ACTORS_COPY_OF_AN_OBJECT_IS_THE_SAME_FIELDS_ON_THE_SAME_SIDE_OF_THE_LINE()
+    for size in [0, 1, InlineEntries, InlineEntries + 1, 9]
+        reset_vm()
+        reset_heap()
+
+        val o = fields(size)
+        val bytes = encode_single(Object(o), point(0)) match
+            Ok(b) -> b
+            Err(_) -> buf()
+
+        assert(bytes.len() > 0, s"an object of ${size} fields encodes")
+
+        var w = wire_over(&bytes.elems[0], bytes.len())
+
+        decode_value(&w, point(0)) match
+            Ok(Object(c)) ->
+                assert_eq(names(c), names(o), s"the copy of ${size} fields has them in order")
+                assert_eq(entries_payload(c) == 0, entries_payload(o) == 0, "and is on the same side of the line")
+
+                for i in 0..<size
+                    assert_eq(field(c, s"k${i}"), long(i), "holding the same values")
+            _ -> assert(false, s"an object of ${size} fields did not come back as one")
+end AN_ACTORS_COPY_OF_AN_OBJECT_IS_THE_SAME_FIELDS_ON_THE_SAME_SIDE_OF_THE_LINE
