@@ -236,6 +236,7 @@ class Greet < Formula
   desc "Says hello"
   homepage "https://github.com/example/greet"
   url "https://github.com/example/greet/releases/download/v2.0.0/greet"
+  version "2.0.0"
   sha256 "3b2a…"
   license "ISC"
 
