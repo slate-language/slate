@@ -8,18 +8,21 @@ weight: 220
 A desktop window with a web page in it, and a bridge between that page and the program — the
 platform's own web view, so nothing is bundled and a window weighs what the system already loaded.
 
-**This module is behind the `webview` build feature, and it is the one feature that is _not_ on by
-default.** The released binary and the Homebrew formula are unchanged by it; a desktop build is
+**This module is in the desktop edition of slate, and not in the standard one.** The desktop
+edition is `brew install slate-language/tap/slate-desktop`; its binary is still called `slate`, so a
+script and a `#!` line never care which edition runs them, and the two formulas are alternatives to
+each other rather than companions. Building from source, the edition is the `webview` build feature
+— the one feature that is _not_ on by default — so a desktop build is
 `sysl build . --features webview`, and the library it needs is
 `brew install sysl-lang/tap/webview`. A build without it says so when a program imports this module,
-naming the feature rather than claiming slate has no such module:
+naming the edition and the feature rather than claiming slate has no such module:
 
 ```slate
 import { window } from slate:window
 ```
 
 ```text
-error: `slate:window` is not in this build -- it is behind the `webview` feature, so build with `--features webview`
+error: `slate:window` is not in this build -- it is the desktop edition's: install `slate-desktop`, or build with `--features webview`
 ```
 
 ## A window in fourteen lines
