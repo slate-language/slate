@@ -168,6 +168,19 @@ sysl test .
 sysl run . -- examples/tour.sl
 ```
 
+## Embedding
+
+slate is also a C library. From a clone, one command builds the interpreter as a static archive and
+writes its header beside it, and prints the libraries to link it with; a C program with a `main` of
+its own then makes an interpreter, runs slate programs on it in one session, calls the functions they
+define, and registers C functions for them to call:
+
+```
+sysl build-c . -o libslate.a
+```
+
+[Embedding](docs/library/embedding.md) is the C API, and `examples/embed/` a whole program.
+
 ## A taste
 
 ```
