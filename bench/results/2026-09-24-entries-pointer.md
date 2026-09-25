@@ -38,15 +38,15 @@ Each cell below gives the two orders:
 |---|---:|---:|---:|---:|---:|---:|
 | A: `at` beside the `Buf` (cell 248 bytes) | −7.3 / −6.6% | −1.6 / −2.0% | −5.3 / −3.2% | −2.7 / −2.9% | **+3.9 / +3.7%** | +0.7 / +0.8% |
 | B: no pointer; the spilled read unchecked (`&stored.elems[0]`) | −4.1 / −3.3% | −1.8 / −1.8% | +0.7 / −0.1% | −0.1 / −0.1% | +1.3 / +0.7% | +2.5 / +2.4% |
-| **C: `at` + a `malloc`ed block (cell 232 bytes, landed)** | **−5.8 / −5.8%** | **−2.9 / −2.7%** | **−4.5 / −2.2%** | **−2.8 / −2.3%** | **+0.5 / +0.4%** | **−0.3 / −0.3%** |
+| **C: `at` + a `malloc`ed block (cell 224 bytes, landed)** | **−5.8 / −5.8%** | **−2.9 / −2.7%** | **−4.5 / −2.2%** | **−2.8 / −2.3%** | **+0.5 / +0.4%** | **−0.3 / −0.3%** |
 
 - **A** recovered the large-table rows. It gave back half of `alloc`'s gain because the cell grew
   by 8 bytes, across a 16-byte size class.
 - **B** kept `alloc` roughly flat, but compared with the layout before `56f28f9` it left `options`
   at +3.6%, `csv` at +3.3% and `methods` at +1.7%. The spilled branch was not the only cost; the two
   bounds checks were part of it.
-- **C** has the pointer at 16 bytes of header (`at`, `spill_cap`) where the `Buf` took 24, so the
-  cell is **8 bytes smaller than dev's**. Reads carry no branch and no bounds check. Construction is
+- **C** keeps the pointer in less header than the `Buf` alone took (`at` and `spill_cap`), so the
+  cell is **16 bytes smaller than dev's**. Reads carry no branch and no bounds check. Construction is
   unchanged.
 
 ## Timing (the landed build)
@@ -88,7 +88,7 @@ layout's gain. `fib` and `arith` touch no object and move within noise. `reals` 
 
 ## Memory
 
-The cell is 240 → **232 bytes**: an 88-byte header (`at`, `spill_cap`, `count`, the index, `live`,
+The cell is 240 → **224 bytes**: an 80-byte header (`at`, `spill_cap`, `count`, the index, `live`,
 the flags, the summary) and three 48-byte entries. `tests_cell_fields.sysl` pins it. Peak RSS
 (`/usr/bin/time -l`), dev → branch: `alloc` 5.54 → 5.44 MB, `methods` 5.49 → 5.34 MB.
 
