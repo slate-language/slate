@@ -6,12 +6,33 @@
  * call a function the programs defined, with values C made, and read what it answered.
  *
  * Every `slate_eval` on one interpreter runs in one session: what an earlier call defined at its top
- * level -- a function, a `val`, a class, an import -- a later call can use. */
+ * level -- a function, a `val`, a class, an import -- a later call can use.
+ *
+ * The traffic goes the other way too: `slate_register` names a C function programs can call, and
+ * `slate_on_output` hands C every line a program prints instead of writing it to stdout. */
 
 #include <stdio.h>
 #include <string.h>
 
 #include "libslate.a.h"
+
+/* A C function a program calls as `host_add(a, b)`: each argument arrives as a handle, and the answer
+ * goes back as a handle slate takes over -- `0` would be `null`. */
+static uint64_t host_add(slate_vm *vm, uint64_t *argv, uint64_t argc, uint8_t *user) {
+    (void)user;
+
+    int64_t sum = 0;
+
+    for (uint64_t i = 0; i < argc; i++)
+        sum += slate_to_int(vm, argv[i]);
+
+    return slate_int(vm, sum);
+}
+
+/* Every line a program prints, without its newline; `user` is what `slate_on_output` was handed. */
+static void heard(uint8_t *bytes, uint64_t len, uint8_t *user) {
+    printf("%s%.*s\n", (const char *)user, (int)len, (const char *)bytes);
+}
 
 static int32_t run(slate_vm *vm, const char *name, const char *program) {
     /* What C has printed goes out before what the slate program prints, so the two stay in order. */
@@ -67,6 +88,16 @@ int main(void) {
     slate_release(vm, answer);
     slate_release(vm, three[0]);
     slate_release(vm, listed);
+
+    /* A C function programs call by name, and C hearing what they print. */
+    slate_register(vm, (uint8_t *)"host_add", 8, host_add, NULL);
+    slate_on_output(vm, heard, (uint8_t *)"[slate] ");
+
+    printf("host: %d\n", run(vm, "host.sl", "print(host_add(40, 2))\nprint(\"from\", \"slate\")"));
+
+    /* Output back to stdout. */
+    slate_on_output(vm, NULL, NULL);
+    run(vm, "plain.sl", "print(host_add(1, 2, 3))");
 
     slate_free(vm);
     return 0;

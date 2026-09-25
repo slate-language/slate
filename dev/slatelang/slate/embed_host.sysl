@@ -1,0 +1,139 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.{Span}
+import sysl.buf.{Buf, buf}
+import sysl.text.{CString, cstring}
+
+// The C surface's host callbacks: a function C registers that slate programs call by name, and the
+// function C installs to receive what a program prints. `embed.sysl` is the handle and `slate_eval`,
+// `embed_values.sysl` the handles C holds; this is the traffic going the other way.
+//
+// **A host function is a `Value.HostFn`, an index into the VM's own `host_fns`**, and not a builtin.
+// The builtin registry (`native_fn.sysl`) is process-wide and append-only -- one table every VM in the
+// process dispatches through -- so a function one embedding registered would be callable from every
+// other handle and from `slate` itself, and registering a name twice would have nowhere to go. The
+// table here is per VM, dies with it, and is reached only through a value the handle's own session
+// bound.
+//
+// **A call is C's shape at the door and slate's inside.** The arguments become handles in the VM's
+// `host_held` table, so they are roots for as long as C may look at them -- a collection runs inside
+// the host function if it calls back into slate -- and the handle C answers with is read back as a
+// value and taken over. Both are released when the host function returns.
+
+// What C registers: `(vm, argument handles, how many, the user pointer) -> the answer's handle`, `0`
+// for null. The header spells it as the raw function-pointer type; the README gives it a name.
+type HostCall = *extern(*Embedded, *u64, usize, *u8) -> u64
+
+// What C installs to hear a program's output: `(bytes, how many, the user pointer)`, once per line
+// and without the newline.
+type OutputCall = *extern(*u8, usize, *u8) -> unit
+
+// One registered function: what to call, what to hand it, and the name a complaint uses.
+//
+// **The handle is kept beside the function** because the call arrives from inside the machine, which
+// knows its `Vm` and not the `Embedded` around it -- and the handle is the first thing C is handed.
+struct HostFunction
+    go: HostCall
+    user: *u8
+    name: string
+    embedded: *Embedded
+
+// process-wide: THE TEXT AN EMPTY LINE POINTS AT. C is handed a pointer and a length for every line,
+// and an empty one has no first byte to take the address of; nothing ever writes through it.
+private val no_text: CString = cstring("")
+
+// Bind `name` in the session's top level to `f`, so every later program on this handle can call it.
+// Answers `0`, or `1` with `slate_error` saying why: the name is not one a program could write, or
+// `f` is null. **Registering a name again replaces what it holds** -- Lua's rule -- while a value a
+// program already took keeps calling the function it was.
+@export("slate_register")
+embed_register(h: *Embedded, name: *u8, name_len: usize, f: HostCall, user: *u8) -> i32
+    val said = on_vm(h, () -> registered(h, owned(name, name_len), f, user))
+
+    h.error = cstring(said)
+    if said == "" then 0 else 1
+
+// The registration on the VM already entered, answering what was wrong or nothing.
+private registered(h: *Embedded, name: string, f: HostCall, user: *u8) -> string
+    if f == null then return s"`slate_register` was handed a null function for `${name}`"
+    if !plain_name(name) then return s"`slate_register` needs a name a program can write bare, and `${name}` is not one"
+
+    val v = current()
+
+    v.host_fns.push(HostFunction(f, user, name, h))
+    declare(h.session.top, name, HostFn(v.host_fns.len() - 1), false)
+    ""
+end registered
+
+// Send every line a program prints on this handle to `f`, with `user` beside it, instead of to
+// stdout; `f` null puts stdout back. **Every entry point goes through it** -- `slate_eval`, and a
+// function `slate_call` runs -- while a diagnostic still goes to `slate_error` and never here.
+@export("slate_on_output")
+embed_on_output(h: *Embedded, f: OutputCall, user: *u8)
+    h.output = f
+    h.output_user = user
+
+// One printed line, to wherever this handle's output goes.
+//
+// Not `private`: `embed.sysl` and `embed_values.sysl` make it the live sink of every run.
+host_say(h: *Embedded, line: string)
+    val go = h.output
+
+    if go == null
+        print(line)
+        return
+
+    val at = if line.bytes.len == 0 then no_text.ptr else &line.bytes[0]
+
+    go(at, line.bytes.len, h.output_user)
+end host_say
+
+// The name a host function was registered under, which is what it prints as and what a complaint
+// about it says.
+//
+// Not `private`: `render.sysl` prints one and `execute.sysl` complains about one.
+host_fn_name(id: usize) -> string
+    val fns = &current().host_fns
+
+    if id >= fns.len() then return "?"
+
+    fns.at(id).name
+
+// Call the host function `id` with `args`, and answer what it answered.
+//
+// **C may call back into slate from inside it** -- `slate_call`, and every function that reads or
+// makes a value -- because the VM is already entered and `enter` nests; `slate_call` sees `depth` and
+// runs the function on the machine already running, as a builtin's callback runs. `slate_eval` is
+// refused there, a program being a whole run of its own.
+//
+// Not `private`: `invoke` in `execute.sysl` and `apply` in `index.sysl` are the two ways in.
+call_host(id: usize, args: Buf[Value], at: Span) -> Step
+    val host = current().host_fns.at(id)
+    val h = host.embedded
+    var handles: Buf[u64] = buf()
+
+    for i in 0..<args.len()
+        handles.push(host_keep(args.at(i)))
+
+    val argv: *u64 = if handles.len() == 0 then null else &handles.elems[0]
+    val go = host.go
+
+    h.depth += 1
+
+    val answer = go(h, argv, handles.len(), host.user)
+
+    h.depth -= 1
+
+    // **Read before anything is released**: an answer may be one of the argument handles.
+    val live = answer == 0 || host_live(answer)
+    val value = if answer == 0 then Null else host_value(answer)
+
+    for i in 0..<handles.len()
+        host_release(handles.at(i))
+
+    host_release(answer)
+
+    if !live then return fault(at, s"the host function `${host.name}` answered a handle that names no value -- one already released, or never made")
+
+    Ok(value)
+end call_host

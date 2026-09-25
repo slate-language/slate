@@ -41,6 +41,10 @@ second run: 1
 third run: 3
 double(21) from C: 42
 listed(3) from C: [3, 6, "done"] (3 elements)
+[slate] 42
+[slate] from slate
+host: 0
+6
 EOF
 
 if ! diff <(grep -v '^slate ' "$work/out.txt") "$work/want.txt"; then

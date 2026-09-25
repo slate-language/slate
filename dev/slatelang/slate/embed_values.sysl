@@ -47,7 +47,9 @@ private val empty_text: CString = cstring("")
 // -- the table ------------------------------------------------------------------------------------
 
 // Run `go` on the handle's VM, with its session begun.
-private on_vm[T](h: *Embedded, go: () -> T) -> T
+//
+// Not `private`, and nor are the four below: `embed_host.sysl` registers and calls through them.
+on_vm[T](h: *Embedded, go: () -> T) -> T
     val was = enter(&h.vm)
 
     open_session(&h.session)
@@ -59,7 +61,7 @@ private on_vm[T](h: *Embedded, go: () -> T) -> T
 end on_vm
 
 // Hand C a handle to `v`, reusing a released slot before the table grows.
-private host_keep(v: Value) -> u64
+host_keep(v: Value) -> u64
     val vm = current()
 
     // Slot zero is taken by nothing, so no handle is ever 0.
@@ -79,7 +81,7 @@ end host_keep
 
 // What a handle holds, or `Undefined` for `0`, an index the table never handed out, and a released
 // slot -- which is what every reader below takes as "no value".
-private host_value(id: u64) -> Value
+host_value(id: u64) -> Value
     val vm = current()
 
     if id == 0 || id >= u64(vm.host_held.len()) then return Undefined
@@ -88,7 +90,7 @@ private host_value(id: u64) -> Value
 end host_value
 
 // Whether a handle names a value, asked of the VM a caller has already entered.
-private host_live(id: u64) -> bool = host_value(id) match
+host_live(id: u64) -> bool = host_value(id) match
     Undefined -> false
     _ -> true
 
@@ -97,7 +99,7 @@ private host_live(id: u64) -> bool = host_value(id) match
 @export("slate_release")
 embed_release(h: *Embedded, v: u64) = on_vm(h, () -> host_release(v))
 
-private host_release(v: u64)
+host_release(v: u64)
     if !host_live(v) then return
 
     current().host_held.set(usize(v), Undefined)
@@ -184,6 +186,7 @@ embed_kind(h: *Embedded, v: u64) -> i32 = on_vm(h, () -> host_value(v) match
     Object(_) -> KindObject
     Fn(_) -> KindFunction
     Native(_) -> KindFunction
+    HostFn(_) -> KindFunction
     _ -> KindOther)
 
 // An integer as C's `int64_t`; a real is truncated toward zero, and anything else -- an integer too
@@ -275,19 +278,24 @@ private global_handle(top: *EnvObj, name: string) -> u64 = lookup(top, name) mat
 // `out`. Answers `0`, or `1` with `slate_error` saying why and `*out` left `0`: a fault carries the
 // file and line it happened at, as it does from `slate_eval`.
 //
-// **What it prints goes to stdout as it prints it**, which is `slate_eval`'s rule.
+// **What it prints goes where `slate_eval`'s output goes** -- stdout, or `slate_on_output`'s function.
+//
+// **It may be made from inside a host function**, C calling slate calling C calling slate: the
+// function then runs on the machine already running, as a builtin's callback does, and answers when
+// it returns -- the loop is the outer run's to drain, so an `async` function that has to wait is
+// reported as never finishing rather than waited for.
 @export("slate_call")
 embed_call(h: *Embedded, f: u64, argv: *u64, argc: usize, out: *u64) -> i32
     if out != null then *out = 0
 
-    val said = on_vm(h, () -> called(f, argv, argc, out))
+    val said = on_vm(h, () -> called(h, f, argv, argc, out))
 
     h.error = cstring(said)
     if said == "" then 0 else 1
 end embed_call
 
 // The call on the VM already entered, answering what went wrong or nothing.
-private called(f: u64, argv: *u64, argc: usize, out: *u64) -> string
+private called(h: *Embedded, f: u64, argv: *u64, argc: usize, out: *u64) -> string
     val callee = host_value(f)
 
     if !host_live(f) then return "`slate_call` was handed a function handle that names no value -- 0, or one already released"
@@ -304,6 +312,8 @@ private called(f: u64, argv: *u64, argc: usize, out: *u64) -> string
         args.push(host_value(argv[i]))
     end for
 
+    if h.depth > 0 then return called_within(callee, args, out)
+
     val v = current()
 
     // **A fresh machine, as `add_program` gives each program**: one a faulted program left standing
@@ -311,7 +321,7 @@ private called(f: u64, argv: *u64, argc: usize, out: *u64) -> string
     v.machine = fresh_machine()
     forget_rejections()
     v.live_output = true
-    v.live_sink = line -> print(line)
+    v.live_sink = line -> host_say(h, line)
 
     val mark = root_mark()
 
@@ -343,10 +353,25 @@ private called(f: u64, argv: *u64, argc: usize, out: *u64) -> string
     said
 end called
 
+// A call made while a host function is running: on the machine standing there, with its sink, its
+// rejections and its loop left to the run that is already under way. `run_chunk` cuts a fault back
+// to the depth it entered at, so a call that faults leaves the outer run where it was.
+private called_within(callee: Value, args: Buf[Value], out: *u64) -> string
+    val mark = root_mark()
+
+    val said = apply(callee, args, point(0)) match
+        Ok(answer) -> answered(answer, out)
+        Err(sig) -> complaint(sig)
+
+    release(mark)
+    said
+end called_within
+
 // Whether `apply` can call a value: a function, a builtin, or an object with a `new`.
 private can_call(v: Value) -> bool = v match
     Fn(_) -> true
     Native(_) -> true
+    HostFn(_) -> true
     Object(_) -> hook_of(v, "new").is_some()
     _ -> false
 

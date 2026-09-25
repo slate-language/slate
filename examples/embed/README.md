@@ -44,6 +44,21 @@ uint64_t slate_global(slate_vm *vm, uint8_t *name, uint64_t name_len);
 int32_t slate_call(slate_vm *vm, uint64_t f, uint64_t *argv, uint64_t argc, uint64_t *out);
 ```
 
+and, for the traffic going the other way — a C function programs call, and where they print:
+
+```c
+int32_t slate_register(slate_vm *vm, uint8_t *name, uint64_t name_len,
+                       uint64_t (*f)(slate_vm *, uint64_t *, uint64_t, uint8_t *), uint8_t *user);
+void slate_on_output(slate_vm *vm, void (*f)(uint8_t *, uint64_t, uint8_t *), uint8_t *user);
+```
+
+The header spells the two callbacks as raw function-pointer types; named, they are
+
+```c
+typedef uint64_t (*slate_host_fn)(slate_vm *vm, uint64_t *argv, uint64_t argc, uint8_t *user);
+typedef void (*slate_output_fn)(uint8_t *bytes, uint64_t len, uint8_t *user);
+```
+
 `slate_new` makes an interpreter with a heap of its own (`0` takes the size `slate` itself uses);
 `slate_eval` runs a program on it and answers its status: `0` where it ran to the end, what it passed
 to `exit`, or `1` where slate refused it, in which case `slate_error` is the diagnostic. What a
@@ -94,6 +109,31 @@ with `argc` handles from `argv`, runs it to its answer — through every `await`
 as it is after a program — writes a handle to the answer at `out`, and answers `0`. Where the call
 faults, or `f` is not something that can be called, it answers `1`, leaves `*out` `0`, and
 `slate_error` has the diagnostic, naming the file and line the fault happened at.
+
+## Host functions and output
+
+`slate_register` binds `name` at the session's top level to a C function, so every later program on
+that `slate_vm` — and no other — can call it like any function. It answers `0`, or `1` with
+`slate_error` set where `name` is not a name a program can write bare or `f` is null. **Registering
+a name again replaces it**, as Lua's `lua_register` does; a value a program already took keeps
+calling the function it was. A host function prints as `<host name>` and `slate_kind` calls it `7`.
+
+- **It is handed a handle per argument, `argc` of them — exactly as many as the call wrote**, since a
+  C function declares no count and slate's calls are JavaScript's: nothing is refused for being too
+  few or too many. The argument handles are slate's; read them, and do not release them.
+- **It answers a handle, or `0` for `null`.** The handle it answers is taken over by slate, which
+  reads the value and releases the slot — so answer one you just made, or one of the arguments. A
+  handle that names nothing by then (one already released) faults in the calling program with a
+  sentence naming the host function.
+- **It may call back into slate**: `slate_call` from inside a host function runs on the machine
+  already running, as a callback from a builtin does, so C → slate → C → slate works to any depth.
+  `slate_eval` is refused there, a program being a whole run of its own. The `user` pointer is
+  whatever was handed to `slate_register`, untouched.
+
+`slate_on_output` sends every line a program prints on that `slate_vm` to `f`, without the newline,
+with the `user` pointer beside it — from `slate_eval` and from a function `slate_call` runs alike —
+instead of to stdout; `f` null puts stdout back. The bytes are good for the length of the call.
+Diagnostics still go to `slate_error`, never to the output function.
 
 ## Building it
 

@@ -590,3 +590,237 @@ AN_ARRAY_SHOWN_TO_C_READS_AS_slate_PRINTS_IT()
     assert_eq(call(h, global(h, "mixed"), buf(), &out), 0)
     assert_eq(shown(h, out), "[1, \"two\", [3.5, null], {k: true}]")
     embed_free(h)
+
+// -- host callbacks -------------------------------------------------------------------------------
+//
+// **The callbacks are sysl functions of C's shape, handed over as `&f`**, which is a `*extern` -- so
+// these go through `slate_register` and `slate_on_output` exactly as a C caller's function pointer
+// does, and what they pin is the export and not a seam beside it.
+
+// Register `f` under `name`, the name crossing as C's pointer and length.
+private registered_as(h: *Embedded, name: string, f: HostCall) -> i32
+    val c = cstring(name)
+
+    embed_register(h, c.ptr, c.len, f, null)
+
+// `twice(n)`: the argument read as C reads it, doubled.
+private host_twice(h: *Embedded, argv: *u64, argc: usize, user: *u8) -> u64 =
+    embed_int(h, embed_to_int(h, argv[0]) * 2)
+
+// How many arguments arrived, and the kind, and the value, of each of three.
+private host_describe(h: *Embedded, argv: *u64, argc: usize, user: *u8) -> u64
+    val kinds = s"${embed_kind(h, argv[0])} ${embed_kind(h, argv[1])} ${embed_kind(h, argv[2])}"
+
+    text_handle(h, s"${argc}: ${kinds}: ${embed_to_int(h, argv[0])} ${string_of(h, argv[1])} ${embed_to_bool(h, argv[2])}")
+
+private host_nothing(h: *Embedded, argv: *u64, argc: usize, user: *u8) -> u64 = 0
+
+// A handle made and released before it is answered, which names nothing by the time slate reads it.
+private host_dead(h: *Embedded, argv: *u64, argc: usize, user: *u8) -> u64
+    val gone = embed_int(h, 1)
+
+    embed_release(h, gone)
+    gone
+
+private host_count(h: *Embedded, argv: *u64, argc: usize, user: *u8) -> u64 = embed_int(h, long(argc))
+
+private host_one(h: *Embedded, argv: *u64, argc: usize, user: *u8) -> u64 = embed_int(h, 1)
+
+private host_two(h: *Embedded, argv: *u64, argc: usize, user: *u8) -> u64 = embed_int(h, 2)
+
+// A fresh string on every call, which is what makes a hundred thousand of them a test of the table.
+private host_fresh(h: *Embedded, argv: *u64, argc: usize, user: *u8) -> u64 =
+    text_handle(h, s"s${embed_to_int(h, argv[0])}")
+
+// Back into slate from inside a host function: `inc` of the argument, through `slate_call`.
+private host_back(h: *Embedded, argv: *u64, argc: usize, user: *u8) -> u64
+    var out: u64 = 0
+    val f = global(h, "inc")
+
+    embed_call(h, f, argv, argc, &out)
+    embed_release(h, f)
+    out
+end host_back
+
+// The status of calling `boom`, which faults, from inside a host function.
+private host_tries(h: *Embedded, argv: *u64, argc: usize, user: *u8) -> u64
+    var out: u64 = 0
+    val f = global(h, "boom")
+    val code = embed_call(h, f, argv, argc, &out)
+
+    embed_release(h, f)
+    embed_int(h, long(code))
+end host_tries
+
+// The status of a whole program run from inside a host function, which is refused.
+private host_evals(h: *Embedded, argv: *u64, argc: usize, user: *u8) -> u64 =
+    embed_int(h, long(evaluated(h, "print(1)", "inner.sl")))
+
+// A line heard through `slate_on_output`, kept in the builder the user pointer names -- with a `|`
+// between lines, so a newline the sink was handed would show.
+private host_heard(bytes: *u8, len: usize, user: *u8)
+    val into: *StrBuilder = ptr_cast(user)
+
+    if into.bytes.len() > 0 then into.push("|")
+
+    into.push(from_utf8_unchecked(bytes[0..<len]))
+
+@test
+A_FUNCTION_C_REGISTERED_IS_CALLED_BY_A_PROGRAM_AND_ITS_ANSWER_PRINTED()
+    val h = embed_new(0)
+
+    assert_eq(registered_as(h, "twice", &host_twice), 0)
+    assert_eq(embed_error_len(h), 0usize)
+    assert_eq(printed_by(h, "print(twice(21))"), "0|42")
+    embed_free(h)
+
+@test
+A_C_FUNCTION_IS_HANDED_EVERY_ARGUMENT_AS_A_HANDLE_OF_ITS_OWN_KIND()
+    val h = embed_new(0)
+
+    assert_eq(registered_as(h, "describe", &host_describe), 0)
+    assert_eq(printed_by(h, "print(describe(7, \"seven\", true))"), "0|3: 2 4 1: 7 seven 1")
+    embed_free(h)
+
+@test
+A_C_FUNCTION_ANSWERING_0_IS_null_AND_ONE_ANSWERING_A_DEAD_HANDLE_FAULTS_NAMING_IT()
+    val h = embed_new(0)
+
+    assert_eq(registered_as(h, "nothing", &host_nothing), 0)
+    assert_eq(registered_as(h, "dead", &host_dead), 0)
+    assert_eq(printed_by(h, "print(nothing() == null)"), "0|true")
+    assert_eq(printed_by(h, "print(\"before\")\ndead()\nprint(\"after\")"), "1|before")
+
+    val said = complaint_of(h)
+
+    assert(said.contains("the host function `dead` answered a handle that names no value"), said)
+    assert(said.contains("host.sl:2:"), s"and it is reported at the call: ${said}")
+    embed_free(h)
+end A_C_FUNCTION_ANSWERING_0_IS_null_AND_ONE_ANSWERING_A_DEAD_HANDLE_FAULTS_NAMING_IT
+
+// **A host function declares no count, so no call of one is refused before it runs**: the checker
+// knows the name and not its parameters, and the machine hands over what was written -- JavaScript's
+// rule at run time, which is the only rule there is for a callee nobody declared.
+@test
+A_C_FUNCTION_IS_HANDED_EXACTLY_AS_MANY_ARGUMENTS_AS_THE_CALL_WROTE()
+    val h = embed_new(0)
+
+    assert_eq(registered_as(h, "arity", &host_count), 0)
+    assert_eq(printed_by(h, "print(arity(), arity(1), arity(1, \"a\", [2]))"), "0|0 1 3", complaint_of(h))
+    assert_eq(printed_by(h, "val xs = [1, 2, 3, 4]\nprint(arity(...xs))"), "0|4", complaint_of(h))
+    embed_free(h)
+
+@test
+A_C_FUNCTION_IS_THERE_FOR_EVERY_LATER_PROGRAM_ON_ITS_HANDLE_AND_ON_NO_OTHER()
+    val h = embed_new(0)
+    val other = embed_new(0)
+
+    assert_eq(registered_as(h, "twice", &host_twice), 0)
+    assert_eq(printed_by(h, "val n = 4"), "0|")
+    assert_eq(printed_by(h, "print(twice(n), twice is function, twice)"), "0|8 true <host twice>")
+
+    val f = global(h, "twice")
+
+    assert_eq(embed_kind(h, f), 7)
+    assert_eq(shown(h, f), "<host twice>")
+
+    assert_eq(evaluated(other, "twice(4)", "other.sl"), 1)
+    assert(complaint_of(other).contains("`twice` is not defined"), complaint_of(other))
+    embed_free(other)
+    embed_free(h)
+end A_C_FUNCTION_IS_THERE_FOR_EVERY_LATER_PROGRAM_ON_ITS_HANDLE_AND_ON_NO_OTHER
+
+// C calls slate, which calls C, which calls slate: the inner call runs on the machine already
+// running, and one that faults answers 1 to its C caller and leaves the outer program running.
+@test
+WHEN_C_CALLS_slate_WHICH_CALLS_C_WHICH_CALLS_slate_AGAIN_EACH_ANSWERS_ITS_OWN_CALLER()
+    val h = embed_new(0)
+
+    assert_eq(registered_as(h, "twice", &host_twice), 0)
+    assert_eq(registered_as(h, "back", &host_back), 0)
+    assert_eq(registered_as(h, "tries", &host_tries), 0)
+    assert_eq(registered_as(h, "evals", &host_evals), 0)
+    assert_eq(evaluated(h, "quad(n) = twice(twice(n))\ninc(n) = [n, n + 1][1]\nboom(n) = n.length", "lib.sl"), 0, complaint_of(h))
+
+    var args: Buf[u64] = buf()
+    var out: u64 = 0
+
+    args.push(embed_int(h, 5))
+
+    assert_eq(call(h, global(h, "quad"), args, &out), 0, complaint_of(h))
+    assert_eq(embed_to_int(h, out), 20)
+
+    assert_eq(printed_by(h, "print(back(41), back(back(1)))"), "0|42 3")
+    assert_eq(printed_by(h, "print(tries(9))\nprint(\"after\")"), "0|1\nafter")
+    assert_eq(printed_by(h, "print(evals())"), "0|1")
+    embed_free(h)
+end WHEN_C_CALLS_slate_WHICH_CALLS_C_WHICH_CALLS_slate_AGAIN_EACH_ANSWERS_ITS_OWN_CALLER
+
+@test
+REGISTERING_A_NAME_AGAIN_REPLACES_IT_AND_A_NAME_C_CANNOT_REGISTER_IS_REFUSED()
+    val h = embed_new(0)
+
+    assert_eq(registered_as(h, "pick", &host_one), 0)
+    assert_eq(printed_by(h, "val kept = pick\nprint(pick())"), "0|1")
+    assert_eq(registered_as(h, "pick", &host_two), 0)
+    assert_eq(printed_by(h, "print(pick(), kept())"), "0|2 1")
+
+    assert_eq(registered_as(h, "not a name", &host_one), 1)
+    assert(complaint_of(h).contains("`not a name` is not one"), complaint_of(h))
+    assert_eq(registered_as(h, "if", &host_one), 1)
+    assert_eq(registered_as(h, "empty", null), 1)
+    assert(complaint_of(h).contains("null function for `empty`"), complaint_of(h))
+    embed_free(h)
+end REGISTERING_A_NAME_AGAIN_REPLACES_IT_AND_A_NAME_C_CANNOT_REGISTER_IS_REFUSED
+
+// Every call makes a handle for its argument and C makes one for its answer, and both are given
+// back when it returns -- so the table stays at the size of one call however many are made, while
+// the collector sweeps the strings the program dropped.
+@test
+A_HUNDRED_THOUSAND_C_CALLS_EACH_ANSWERING_A_FRESH_STRING_LEAVE_THE_TABLE_AT_ONE_CALLS_SIZE()
+    val h = embed_new(0)
+
+    assert_eq(registered_as(h, "fresh", &host_fresh), 0)
+
+    val before = h.vm.collections
+
+    assert_eq(printed_by(h, "var total = 0\nfor i in 0..<100000\n    total += fresh(i).length\nprint(total, fresh(99999))"), "0|588890 s99999")
+    assert(h.vm.collections > before, "the run collected")
+    assert(h.vm.host_held.len() <= 4, s"the table grew to ${h.vm.host_held.len()} slots")
+    embed_free(h)
+end A_HUNDRED_THOUSAND_C_CALLS_EACH_ANSWERING_A_FRESH_STRING_LEAVE_THE_TABLE_AT_ONE_CALLS_SIZE
+
+@test
+WHAT_A_PROGRAM_PRINTS_REACHES_THE_C_OUTPUT_FUNCTION_A_LINE_AT_A_TIME_UNTIL_IT_IS_TAKEN_AWAY()
+    val h = embed_new(0)
+    var heard = str_builder()
+
+    embed_on_output(h, &host_heard, ptr_cast(&heard))
+    assert_eq(evaluated(h, "print(\"one\")\nprint(\"two\", 2)\nprint(\"\")\nprint(\"é\")", "host.sl"), 0)
+
+    val was = heard.bytes.len()
+
+    embed_on_output(h, null, null)
+    assert_eq(evaluated(h, "val quiet = 1", "host.sl"), 0)
+    assert_eq(heard.bytes.len(), was)
+    assert_eq(heard.finish(), "one|two 2||é")
+    embed_free(h)
+end WHAT_A_PROGRAM_PRINTS_REACHES_THE_C_OUTPUT_FUNCTION_A_LINE_AT_A_TIME_UNTIL_IT_IS_TAKEN_AWAY
+
+@test
+WHAT_A_FUNCTION_C_CALLS_PRINTS_REACHES_THE_SAME_C_OUTPUT_FUNCTION()
+    val h = embed_new(0)
+    var heard = str_builder()
+
+    embed_on_output(h, &host_heard, ptr_cast(&heard))
+    assert_eq(evaluated(h, "shout(s) = print(s + \"!\")\nprint(\"defined\")", "lib.sl"), 0)
+
+    var args: Buf[u64] = buf()
+    var out: u64 = 0
+
+    args.push(text_handle(h, "hey"))
+
+    assert_eq(call(h, global(h, "shout"), args, &out), 0, complaint_of(h))
+    assert_eq(heard.finish(), "defined|hey!")
+    embed_free(h)
+end WHAT_A_FUNCTION_C_CALLS_PRINTS_REACHES_THE_SAME_C_OUTPUT_FUNCTION
