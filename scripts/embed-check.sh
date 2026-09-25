@@ -62,5 +62,9 @@ fi
 # C caller can hold, and a field list here would name sysl types clang has never heard of.
 grep -hE '(typedef|struct).*slate_vm' "$work"/*.h || true
 
+# The two host callbacks as the header spells them: a function-pointer parameter is `R (*name)(A)`,
+# which is the one spelling clang accepts.
+grep -hE 'slate_register|slate_on_output' "$work"/*.h || true
+
 echo "embed-check: OK"
 rm -rf "$work"
