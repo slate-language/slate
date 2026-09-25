@@ -39,6 +39,8 @@ define: 0
 use: 0
 second run: 1
 third run: 3
+double(21) from C: 42
+listed(3) from C: [3, 6, "done"] (3 elements)
 EOF
 
 if ! diff <(grep -v '^slate ' "$work/out.txt") "$work/want.txt"; then

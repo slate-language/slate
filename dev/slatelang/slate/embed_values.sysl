@@ -1,0 +1,366 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.{point}
+import sysl.buf.{Buf, buf}
+import sysl.text.{CString, cstring}
+
+// The C surface's values and calls: a host builds slate values, calls a slate function by name with
+// them, and reads the answer. `embed.sysl` is the handle and `slate_eval`; this is what a host does
+// with the values on either side of a call.
+//
+// **A value C holds is a HANDLE, an index into the VM's `host_held` table**, and the table is a root
+// (`roots` in `collector.sysl`). A `Value` cannot cross to C as itself -- it points into a heap the
+// collector sweeps, and nothing on the C side is a root -- so what crosses is a number the collector
+// can follow back. The header spells it `uint64_t`: sysl has no exported integer alias to name it
+// `slate_value` with, and a struct around one would cost every C caller a `.id` to compare with zero.
+//
+// - **`0` is never a handle**, so a C caller may read it as "none": `slate_global` and `slate_get`
+//   answer it for a name that is not there, and every function handed one treats it as nothing.
+// - **Every handle is the caller's until `slate_release`**, including the new one `slate_at`,
+//   `slate_get` and `slate_call` answer. A released slot goes on a free list and the next value made
+//   takes it, so a host that releases what it is done with holds a table of its high-water size.
+// - **A handle belongs to one VM.** Handed to another it names whatever that VM keeps at the index, if
+//   anything; nothing can tell the two apart, exactly as with a pointer.
+//
+// **Every entry point enters the handle's VM and leaves it**, as `slate_eval` does, and **begins the
+// session** where no program has yet (`open_session`): beginning a session resets the heap, so a
+// value made before the first `slate_eval` would otherwise be swept by it.
+
+// What `slate_kind` answers, one number per kind a C caller can do something with.
+const KindNull: i32 = 0
+const KindBool: i32 = 1
+const KindInt: i32 = 2
+const KindReal: i32 = 3
+const KindString: i32 = 4
+const KindArray: i32 = 5
+const KindObject: i32 = 6
+const KindFunction: i32 = 7
+const KindOther: i32 = 8
+
+// And for `0` or a handle already released, which is no kind at all.
+const KindNoValue: i32 = -1
+
+// process-wide: THE TEXT AN EMPTY STRING POINTS AT. A slate string with no bytes has no first byte to
+// take the address of, and C wants a pointer that is not null; nothing ever writes through it.
+private val empty_text: CString = cstring("")
+
+// -- the table ------------------------------------------------------------------------------------
+
+// Run `go` on the handle's VM, with its session begun.
+private on_vm[T](h: *Embedded, go: () -> T) -> T
+    val was = enter(&h.vm)
+
+    open_session(&h.session)
+
+    val answer = go()
+
+    leave(was)
+    answer
+end on_vm
+
+// Hand C a handle to `v`, reusing a released slot before the table grows.
+private host_keep(v: Value) -> u64
+    val vm = current()
+
+    // Slot zero is taken by nothing, so no handle is ever 0.
+    if vm.host_held.len() == 0 then vm.host_held.push(Undefined)
+
+    if vm.host_free.len() > 0
+        val i = vm.host_free.at(vm.host_free.len() - 1)
+
+        vm.host_free.truncate(vm.host_free.len() - 1)
+        vm.host_held.set(i, v)
+        return u64(i)
+    end if
+
+    vm.host_held.push(v)
+    u64(vm.host_held.len() - 1)
+end host_keep
+
+// What a handle holds, or `Undefined` for `0`, an index the table never handed out, and a released
+// slot -- which is what every reader below takes as "no value".
+private host_value(id: u64) -> Value
+    val vm = current()
+
+    if id == 0 || id >= u64(vm.host_held.len()) then return Undefined
+
+    vm.host_held.at(usize(id))
+end host_value
+
+// Whether a handle names a value, asked of the VM a caller has already entered.
+private host_live(id: u64) -> bool = host_value(id) match
+    Undefined -> false
+    _ -> true
+
+// Give a slot back. `0`, an index never handed out and a slot already released are all ignored, so a
+// double release cannot put one slot on the free list twice and hand it to two values.
+@export("slate_release")
+embed_release(h: *Embedded, v: u64) = on_vm(h, () -> host_release(v))
+
+private host_release(v: u64)
+    if !host_live(v) then return
+
+    current().host_held.set(usize(v), Undefined)
+    current().host_free.push(usize(v))
+
+// -- making values --------------------------------------------------------------------------------
+
+@export("slate_int")
+embed_int(h: *Embedded, n: long) -> u64 = on_vm(h, () -> host_keep(Int(n)))
+
+@export("slate_real")
+embed_real(h: *Embedded, x: real) -> u64 = on_vm(h, () -> host_keep(Real(x)))
+
+// Any non-zero integer is true, which is C's reading.
+@export("slate_bool")
+embed_bool(h: *Embedded, b: i32) -> u64 = on_vm(h, () -> host_keep(Bool(b != 0)))
+
+@export("slate_null")
+embed_null(h: *Embedded) -> u64 = on_vm(h, () -> host_keep(Null))
+
+// A string of `len` bytes, COPIED -- the bytes are C's and good only until this returns. **Its
+// character count is scanned**, the bytes coming from outside, where every string a program builds
+// carries a count derived as it is made.
+@export("slate_string")
+embed_string(h: *Embedded, p: *u8, len: usize) -> u64 = on_vm(h, () -> host_keep(str_value(owned(p, len))))
+
+// An empty array, which `slate_push` fills.
+@export("slate_array")
+embed_array(h: *Embedded) -> u64 = on_vm(h, () -> host_keep(Array(new_array(buf()))))
+
+// Put `v` on the end of `array`: `0` where it did, `1` where `array` is not a live array, is frozen,
+// or `v` is not a live handle.
+@export("slate_push")
+embed_push(h: *Embedded, array: u64, v: u64) -> i32 = on_vm(h, () -> pushed(array, v))
+
+private pushed(array: u64, v: u64) -> i32
+    if !host_live(v) then return 1
+
+    host_value(array) match
+        Array(a) ->
+            if a.frozen then return 1
+
+            array_push(a, host_value(v))
+            0
+        _ -> 1
+end pushed
+
+// An empty object, which `slate_set` fills.
+@export("slate_object")
+embed_object(h: *Embedded) -> u64 = on_vm(h, () -> host_keep(Object(new_object())))
+
+// Set the field named by `key_len` bytes at `key` to `v`: `0` where it did, `1` where `object` is not
+// a live object, is frozen, or `v` is not a live handle. The key is copied.
+@export("slate_set")
+embed_set(h: *Embedded, object: u64, key: *u8, key_len: usize, v: u64) -> i32 =
+    on_vm(h, () -> set_field(object, owned(key, key_len), v))
+
+private set_field(object: u64, key: string, v: u64) -> i32
+    if !host_live(v) then return 1
+
+    host_value(object) match
+        Object(o) ->
+            if o.frozen then return 1
+
+            obj_put_name(o, key, host_value(v))
+            0
+        _ -> 1
+end set_field
+
+// -- reading them ---------------------------------------------------------------------------------
+
+// Which kind of value a handle names: 0 null, 1 bool, 2 integer, 3 real, 4 string, 5 array, 6 object
+// -- a class instance included -- 7 function, 8 anything else, and -1 for `0` or a released handle.
+@export("slate_kind")
+embed_kind(h: *Embedded, v: u64) -> i32 = on_vm(h, () -> host_value(v) match
+    Undefined -> KindNoValue
+    Null -> KindNull
+    Bool(_) -> KindBool
+    Int(_) -> KindInt
+    Big(_) -> KindInt
+    Real(_) -> KindReal
+    Str(_) -> KindString
+    Array(_) -> KindArray
+    Object(_) -> KindObject
+    Fn(_) -> KindFunction
+    Native(_) -> KindFunction
+    _ -> KindOther)
+
+// An integer as C's `int64_t`; a real is truncated toward zero, and anything else -- an integer too
+// wide for 64 bits included -- is `0`.
+@export("slate_to_int")
+embed_to_int(h: *Embedded, v: u64) -> long = on_vm(h, () -> host_value(v) match
+    Int(n) -> n
+    Real(x) -> long(x)
+    _ -> 0)
+
+// A real as C's `double`; an integer is converted, and anything else is `0.0`.
+@export("slate_to_real")
+embed_to_real(h: *Embedded, v: u64) -> real = on_vm(h, () -> host_value(v) match
+    Real(x) -> x
+    Int(n) -> real(n)
+    _ -> 0.0)
+
+// Whether a value is true in a condition -- slate's rule, so `0`, `""` and `null` are false -- as `1`
+// or `0`. `0` or a released handle is false.
+@export("slate_to_bool")
+embed_to_bool(h: *Embedded, v: u64) -> i32 = on_vm(h, () -> if host_live(v) && host_value(v).truthy() then 1 else 0)
+
+// The UTF-8 bytes of a string, NOT terminated -- `slate_string_len` says how many. **Good for as long
+// as the handle is held**: a slate string never changes and slate's heap never moves an object, so a
+// collection leaves the bytes where they are. Anything that is not a string answers an empty string.
+@export("slate_string_ptr")
+embed_string_ptr(h: *Embedded, v: u64) -> *u8 = on_vm(h, () -> host_value(v) match
+    Str(p) -> if p.s.bytes.len == 0 then empty_text.ptr else &p.s.bytes[0]
+    _ -> empty_text.ptr)
+
+// How many BYTES `slate_string_ptr` points at, which is not how many characters: `"é"` is two.
+@export("slate_string_len")
+embed_string_len(h: *Embedded, v: u64) -> usize = on_vm(h, () -> host_value(v) match
+    Str(p) -> p.s.bytes.len
+    _ -> 0)
+
+// How many elements an array holds; anything else answers `0`.
+@export("slate_len")
+embed_len(h: *Embedded, array: u64) -> usize = on_vm(h, () -> host_value(array) match
+    Array(a) -> a.items.len()
+    _ -> 0)
+
+// A NEW handle to the element at `i`, or `0` where `array` is not an array or `i` is past its end.
+@export("slate_at")
+embed_at(h: *Embedded, array: u64, i: usize) -> u64 = on_vm(h, () -> host_value(array) match
+    Array(a) -> if i < a.items.len() then host_keep(a.items.at(i)) else 0
+    _ -> 0)
+
+// A NEW handle to the field named by `key_len` bytes at `key`, or `0` where `object` is not an
+// object or has no such field of its own.
+@export("slate_get")
+embed_get(h: *Embedded, object: u64, key: *u8, key_len: usize) -> u64 =
+    on_vm(h, () -> field_handle(object, owned(key, key_len)))
+
+private field_handle(object: u64, key: string) -> u64 = host_value(object) match
+    Object(o) -> obj_get_name(o, key) match
+        Some(found) -> host_keep(found)
+        None -> 0
+    _ -> 0
+
+// The value as `print` would write it, NUL-terminated. **One buffer per handle**, as `slate_error`
+// is: the pointer is good until the next `slate_show` on this `slate_vm`.
+@export("slate_show")
+embed_show(h: *Embedded, v: u64) -> *u8
+    val text = on_vm(h, () -> if host_live(v) then value_text(host_value(v)) else "")
+
+    h.shown = cstring(text)
+    h.shown.ptr
+end embed_show
+
+// How many bytes the last `slate_show` pointed at, not counting the terminator.
+@export("slate_show_len")
+embed_show_len(h: *Embedded) -> usize = h.shown.len
+
+// -- the call -------------------------------------------------------------------------------------
+
+// A handle to what a top-level name of the session holds -- a function, a `val`, a class, or one of
+// the builtins -- or `0` where nothing by that name is defined.
+@export("slate_global")
+embed_global(h: *Embedded, name: *u8, name_len: usize) -> u64 =
+    on_vm(h, () -> global_handle(h.session.top, owned(name, name_len)))
+
+private global_handle(top: *EnvObj, name: string) -> u64 = lookup(top, name) match
+    Some(found) -> host_keep(found)
+    None -> 0
+
+// Call `f` with the `argc` values whose handles are at `argv`, run it to its answer -- through every
+// `await`, and then the loop drained as it is after a program -- and write a handle to the answer at
+// `out`. Answers `0`, or `1` with `slate_error` saying why and `*out` left `0`: a fault carries the
+// file and line it happened at, as it does from `slate_eval`.
+//
+// **What it prints goes to stdout as it prints it**, which is `slate_eval`'s rule.
+@export("slate_call")
+embed_call(h: *Embedded, f: u64, argv: *u64, argc: usize, out: *u64) -> i32
+    if out != null then *out = 0
+
+    val said = on_vm(h, () -> called(f, argv, argc, out))
+
+    h.error = cstring(said)
+    if said == "" then 0 else 1
+end embed_call
+
+// The call on the VM already entered, answering what went wrong or nothing.
+private called(f: u64, argv: *u64, argc: usize, out: *u64) -> string
+    val callee = host_value(f)
+
+    if !host_live(f) then return "`slate_call` was handed a function handle that names no value -- 0, or one already released"
+    if !can_call(callee) then return s"`slate_call` was handed ${callee.type_name()}, which is not something that can be called"
+
+    // **The arguments stand in `host_held` for the whole call**, the host holding their handles, so
+    // this buffer is only a view of values that are already roots; `apply` holds whatever it makes
+    // from them for the call's own length.
+    var args: Buf[Value] = buf()
+
+    for i in 0..<argc
+        if !host_live(argv[i]) then return s"`slate_call` was handed an argument handle that names no value, at position ${i}"
+
+        args.push(host_value(argv[i]))
+    end for
+
+    val v = current()
+
+    // **A fresh machine, as `add_program` gives each program**: one a faulted program left standing
+    // holds whatever it was in the middle of.
+    v.machine = fresh_machine()
+    forget_rejections()
+    v.live_output = true
+    v.live_sink = line -> print(line)
+
+    val mark = root_mark()
+
+    val said = apply(callee, args, point(0)) match
+        Ok(answer) ->
+            // **Rooted across the drain**, which is `settled_call`'s rule in `run.sysl` for its
+            // reason: a `Value` in a sysl local is not a root, and the drain collects.
+            hold(answer)
+
+            answer match
+                Promise(pr) -> pr.handled = true
+                _ -> ()
+
+            val after = settle_call(answer) match
+                Err(sig) -> complaint(sig)
+                Ok(_) -> drain_events() match
+                    Err(sig) -> complaint(sig)
+                    Ok(_) -> unhandled_rejection() match
+                        Some(sig) -> complaint(sig)
+                        None -> answered(answer, out)
+
+            after
+        Err(sig) -> complaint(sig)
+
+    release(mark)
+    forget_rejections()
+    v.live_output = false
+    v.live_sink = no_live_sink
+    said
+end called
+
+// Whether `apply` can call a value: a function, a builtin, or an object with a `new`.
+private can_call(v: Value) -> bool = v match
+    Fn(_) -> true
+    Native(_) -> true
+    Object(_) -> hook_of(v, "new").is_some()
+    _ -> false
+
+// Write the handle of what a call came to, or say why there is none: an `async` function's answer is
+// what its promise settled with.
+private answered(answer: Value, out: *u64) -> string
+    val value = answer match
+        Promise(pr) ->
+            if !pr.settled then return "the call never finished -- something it awaited was never going to settle"
+            if pr.failed then return said_at(pr.message, pr.at, pr.src)
+
+            pr.value
+        other -> other
+
+    if out != null then *out = host_keep(value)
+    ""
+end answered

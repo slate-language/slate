@@ -2,7 +2,8 @@
  *
  * Build the archive and its header from the repository root, then this file against them; the
  * README beside it has the two commands. `slate_new` makes an interpreter of its own, `slate_eval`
- * runs a program on it, and `slate_error` says why one was refused.
+ * runs a program on it, and `slate_error` says why one was refused. `slate_global` and `slate_call`
+ * call a function the programs defined, with values C made, and read what it answered.
  *
  * Every `slate_eval` on one interpreter runs in one session: what an earlier call defined at its top
  * level -- a function, a `val`, a class, an import -- a later call can use. */
@@ -41,6 +42,31 @@ int main(void) {
 
     /* One that chooses its own status. */
     printf("third run: %d\n", run(vm, "exit.sl", "import { exit } from slate:process\nexit(3)"));
+
+    /* Call `double` from C: a handle to the function, one to the argument, and one to the answer. */
+    uint64_t twice = slate_global(vm, (uint8_t *)"double", 6);
+    uint64_t args[] = { slate_int(vm, 21) };
+    uint64_t answer = 0;
+
+    if (slate_call(vm, twice, args, 1, &answer) == 0)
+        printf("double(21) from C: %lld\n", (long long)slate_to_int(vm, answer));
+
+    /* An array slate answers, printed as slate prints it. */
+    run(vm, "list.sl", "listed(n) = [n, n * 2, \"done\"]");
+
+    uint64_t lister = slate_global(vm, (uint8_t *)"listed", 6);
+    uint64_t three[] = { slate_int(vm, 3) };
+    uint64_t listed = 0;
+
+    if (slate_call(vm, lister, three, 1, &listed) == 0)
+        printf("listed(3) from C: %s (%d elements)\n", slate_show(vm, listed), (int)slate_len(vm, listed));
+
+    slate_release(vm, lister);
+    slate_release(vm, twice);
+    slate_release(vm, args[0]);
+    slate_release(vm, answer);
+    slate_release(vm, three[0]);
+    slate_release(vm, listed);
 
     slate_free(vm);
     return 0;
