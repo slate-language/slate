@@ -22,9 +22,10 @@ cat "$work/build-c.log"
 # The link line is what build-c said and nothing else: `-l` for each `@link` name, and the
 # pkg-config modules' flags. A library it did not name is a defect in build-c, not something to add here.
 links=$(grep '^sysl: link this against:' "$work/build-c.log" | sed 's/^sysl: link this against: //' | tr -d ',' | sed 's/\([^ ][^ ]*\)/-l\1/g')
-modules=$(grep -o 'pkg-config --libs .*' "$work/build-c.log" | sed 's/^pkg-config --libs //')
+# Not `modules`: in zsh that is a read-only special parameter, and assigning to it kills the script.
+pkgs=$(grep -o 'pkg-config --libs .*' "$work/build-c.log" | sed 's/^pkg-config --libs //')
 
-clang examples/embed/hello.c -I"$work" "$work/libslate.a" ${=links} $(pkg-config --libs ${=modules}) -o "$work/hello"
+clang examples/embed/hello.c -I"$work" "$work/libslate.a" ${=links} $(pkg-config --libs ${=pkgs}) -o "$work/hello"
 
 "$work/hello" > "$work/out.txt" 2> "$work/err.txt"
 

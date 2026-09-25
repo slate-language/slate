@@ -1,5 +1,6 @@
 module dev.slatelang.slate
 
+import sh.sysl.libuv
 import sysl.buf.{Buf, buf}
 import sysl.text.{CString, StrBuilder, cstring, from_utf8_unchecked, str_builder}
 
@@ -23,8 +24,12 @@ import sysl.text.{CString, StrBuilder, cstring, from_utf8_unchecked, str_builder
 // is the C API's and follows C's habit of a library prefix; the sysl name cannot be the bare word,
 // `error`, `free` and `new` all being names something in this module or the library already answers to.
 
-// What one C caller owns: a VM of its own and the text of the last thing that went wrong in it.
-struct Embedded
+// What one C caller owns: a VM of its own and the text of the last thing that went wrong in it. The
+// header calls it `slate_vm`, the C API's own name for the handle, and **`opaque` is what keeps it a
+// handle there**: the header declares it without a layout, as C's `struct slate_vm;`, where a struct
+// with a body would be written out field by field down through the whole `Vm`.
+@export("slate_vm")
+opaque struct Embedded
     vm: Vm
 
     // What the last `slate_eval` complained of, rendered, or empty where it ran. **A `CString` and not
@@ -32,12 +37,25 @@ struct Embedded
     // replaces it, which is the promise the header makes.
     error: CString
 
-// libc's zeroing allocator, for the handle's record. **Zeroed rather than merely taken**, because the
-// record is written by assignment, and an assignment gives back what the place held before -- which
-// over fresh bytes would be a count read out of garbage. Every counted field of a zeroed record is
-// an empty one that owns nothing, so releasing it does nothing, which is what makes the first write
-// safe.
-extern calloc(count: usize, size: usize) -> *u8
+// How many handles may be live at once.
+const MaxEmbedded: usize = 64
+
+// Every embedded VM in the process, each in a counted box this table keeps alive.
+//
+// **The record cannot live in storage C or libc handed over**, because a `Vm` carries `&T` fields --
+// its loop, its live sink -- and an assignment into bytes the compiler did not lay out releases
+// whatever those bytes looked like, a zeroed `&T` being a null the release follows. So the record is
+// an ordinary box, made by a construction, and the handle C holds is the address of what is IN it: a
+// box never moves, and this table is what keeps it from being released between two calls.
+//
+// process-wide: THE EMBEDDED VMS OF THIS PROCESS. A C caller may make and free handles from any thread,
+// so the table cannot be per-VM. Every read and write of it is under `embedded_lock`, and a slot's box
+// is reached by nothing else -- C holds a raw pointer, which carries no count -- so no two threads ever
+// touch one box's count at once.
+private var embedded: [MaxEmbedded]Option[&Embedded] = [None; MaxEmbedded]
+
+// process-wide: what `embedded` is read and written under.
+private var embedded_lock: &sync libuv.Mutex = libuv.mutex().expect("a lock for the embedded VMs")
 
 // **Held here rather than made per call**, because the pointer handed to C has to outlive the call
 // that answered it, and a `CString` made inside `embed_version` would be freed on the way out.
@@ -48,7 +66,8 @@ private val version_text: CString = cstring(SlateVersion)
 embed_version() -> *u8 = version_text.ptr
 
 // A VM of the caller's own, over a heap of `heap_bytes`, or of the size `slate` itself uses where
-// that is zero. The caller frees it with `slate_free`.
+// that is zero, or null where `MaxEmbedded` handles are already live. The caller frees it with
+// `slate_free`.
 //
 // **The default loop, as a second VM on the main thread takes it.** An actor is a thread and so needs
 // a loop of its own; a C caller runs on whatever thread it calls from, one call at a time, and shares
@@ -57,21 +76,49 @@ embed_version() -> *u8 = version_text.ptr
 @export("slate_new")
 embed_new(heap_bytes: usize) -> *Embedded
     val ceiling = if heap_bytes == 0 then HeapBytes else heap_bytes
-    var h: *Embedded = ptr_cast(calloc(1, sizeof(Embedded)))
+    val box: &Embedded = Embedded(new_vm(ceiling), cstring(""))
+    var h: *Embedded = null
 
-    if h == null then panic("slate could not take the few bytes an embedded VM's record needs")
+    embedded_lock.lock()
 
-    h.vm = new_vm(ceiling)
-    h.error = cstring("")
+    for i in 0..<MaxEmbedded
+        if embedded[i].is_none()
+            embedded[i] = Some(box)
+            h = &*box
+            break
+
+    embedded_lock.unlock()
+
+    if h == null then dispose_vm(&box.vm)
+
     h
+end embed_new
 
-// Give back everything `slate_new` took: the VM's heap, with every finalizer run, and the record.
+// Give back everything `slate_new` took: the VM's heap, with every finalizer run, and the record --
+// which goes when the last hold on its box does, the slot's having been taken out under the lock. A
+// pointer the table never handed out, or one already freed, is ignored.
 @export("slate_free")
 embed_free(h: *Embedded)
-    if h == null then return
+    var mine: Option[&Embedded] = None
 
-    dispose_vm(&h.vm)
-    free(ptr_cast(h))
+    embedded_lock.lock()
+
+    for i in 0..<MaxEmbedded
+        val here = embedded[i] match
+            Some(b) -> &*b == h
+            None -> false
+
+        if here
+            mine = embedded[i]
+            embedded[i] = None
+            break
+
+    embedded_lock.unlock()
+
+    mine match
+        Some(b) -> dispose_vm(&b.vm)
+        None -> ()
+end embed_free
 
 // Run `len` bytes of slate source as a program on this VM and answer its status: zero where it ran to
 // the end, what it passed to `exit` where it called that, and one where it was refused or faulted --
