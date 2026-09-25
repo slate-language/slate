@@ -37,6 +37,9 @@ What a program has without writing it.
 | [`slate:nghttp2`](nghttp2.md) | HTTP/2 framing, and HPACK |
 | [`slate:window`](window.md) | a desktop window with a web page in it |
 
+**[Embedding](embedding.md)** is the other direction: slate as a C library, for a program with a
+`main` of its own that wants to run slate programs.
+
 **The document is not on that list any more.** `slate:dom` was built in until
 [`external`](../reference/external.md) made it writable in slate; it is a package now, and
 [its page](dom.md) says where it went.
