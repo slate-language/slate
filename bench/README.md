@@ -283,7 +283,15 @@ geomean                                                                         
 | yardstick | lua | node --jitless | CPython | QuickJS-ng | Ruby (no JIT) | PHP (no JIT) | LuaJIT `-joff` |
 |---|---|---|---|---|---|---|---|
 | **geomean, slate / it** | **1.2x** | **0.9x** | **0.6x** | **0.8x** | **0.6x** | **1.0x** | **1.6x** |
+| **0.1.8 release** (PGO `pgo/slate`, tag `v0.1.8`) | **0.7x** | **0.5x** | **0.4x** | **0.4x** | **0.4x** | **0.6x** | **1.0x** |
 | **0.1.7 release** (PGO `pgo/slate`, tag `v0.1.7`) | **0.8x** | **0.6x** | **0.4x** | **0.5x** | **0.4x** | **0.6x** | **1.1x** |
+
+**The 0.1.8 row** is the release's own PGO binary at tag `v0.1.8` (dev `b3ea0d1`), taken with
+`bench/run.sh -n 5 pgo/slate` under `caffeinate -dimsu`. The run started at 92% idle with no JVM
+running. At 0.1.8, slate is still behind LuaJIT's interpreter on 15 rows, behind Lua on 14, behind PHP
+on 4 (`methods`, `dispatch`, `csv`, `branches`), behind `node --jitless` on 4 (`calls`, `options`,
+`fields`, `alloc`), behind QuickJS on 3 (`startup`, `strindex`, `strwalk`) and behind CPython on 1
+(`csv`). It is behind Ruby on none. The whole table is in the v0.1.8 release notes.
 
 **The 0.1.7 row is not taken like the row above it, so the two cannot be compared.** It is the
 release's own PGO binary, `bench/run.sh -n 5 pgo/slate` under `caffeinate -dimsu`, started at 91%
