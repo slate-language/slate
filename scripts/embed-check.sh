@@ -49,5 +49,9 @@ if ! grep -q 'broken.sl' "$work/err.txt"; then
     exit 1
 fi
 
+# The handle's declaration as the header wrote it: a bare `typedef struct slate_vm slate_vm;` is what a
+# C caller can hold, and a field list here would name sysl types clang has never heard of.
+grep -hE '(typedef|struct).*slate_vm' "$work"/*.h || true
+
 echo "embed-check: OK"
 rm -rf "$work"
