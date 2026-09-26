@@ -36,6 +36,13 @@ concurrency:
   group: "release-linux-${{ github.event.inputs.tag || github.ref }}"
   cancel-in-progress: false
 
+# What these four are and why each has the value it has is the comment on `build`'s `runs-on`.
+env:
+  SYSL_VERSION: 0.0.141
+  GC_INITIAL_HEAP_SIZE: 8g
+  GC_MAXIMUM_HEAP_SIZE: 50g
+  SLATE_STEP_TIMEOUT: 90m
+
 jobs:
   build:
     strategy:
@@ -98,11 +105,9 @@ jobs:
     # 0.0.134 with the floor, for `link = "static"` taking every archive that exists; 0.0.138 with
     # the floor, for `build-c`'s opaque `slate_vm` and the `libslate` tarball staged below; 0.0.139
     # with the floor, for `build-c` writing native objects that GNU ld links.
-    env:
-      SYSL_VERSION: 0.0.141
-      GC_INITIAL_HEAP_SIZE: 8g
-      GC_MAXIMUM_HEAP_SIZE: 50g
-      SLATE_STEP_TIMEOUT: 90m
+    #
+    # **The four values are set at WORKFLOW level, at the top of this file**, so `build-desktop`
+    # compiles with the same compiler under the same ceiling and there is one copy of each.
 
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -339,6 +344,161 @@ jobs:
             echo "| attached to | \`${{ steps.what.outputs.tag || 'nothing -- build only' }}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
+  # **The desktop edition: the same interpreter with `webview` on, as a second tarball per
+  # architecture.** It is a job of its own rather than more steps in `build`, because each is a whole
+  # compile of forty minutes and more, and in one job the two would queue behind each other against
+  # one deadline; side by side they finish when the slower one does. Everything down to the build is
+  # `build`'s, for `build`'s reasons -- the same runner image and glibc floor, the same swap, the same
+  # `scripts/linux-deps.sh`, which is also what builds libwebview (static, at the tap formula's
+  # revision) and writes the `webview.pc` the package asks for.
+  #
+  # **GTK 3 and WebKitGTK 4.1 stay DYNAMIC in this binary by decision**, so the standard tarball's
+  # "glibc alone" expectation does not hold here and `compat-desktop` below asks its own question.
+  build-desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64
+          - runner: ubuntu-22.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - name: Work out what is being built
+        id: what
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag }}"
+          if [ -z "$tag" ] && [ "${{ github.ref_type }}" = "tag" ]; then
+            tag="${{ github.ref_name }}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "ref=${tag:-${{ github.ref }}}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.what.outputs.ref }}
+
+      - name: Work out the version
+        id: version
+        run: |
+          set -euo pipefail
+          declared=$(grep -oE '^[[:space:]]*version[[:space:]]*=[[:space:]]*"[^"]+"' package.hocon \
+                     | head -1 | sed 's/.*"\(.*\)"/\1/')
+          tag="${{ steps.what.outputs.tag }}"
+          if [ -n "$tag" ] && [ "${tag#v}" != "$declared" ]; then
+            echo "tag $tag names ${tag#v}, but package.hocon declares $declared" >&2
+            exit 1
+          fi
+          echo "version=$declared" >> "$GITHUB_OUTPUT"
+
+      - name: Give the runner room to compile
+        run: ./scripts/linux-swap.sh
+
+      - name: Install the toolchain and the libraries
+        run: sudo -E ./scripts/linux-deps.sh
+
+      - name: Put clang on the PATH
+        run: echo "/usr/lib/llvm-20/bin" >> "$GITHUB_PATH"
+
+      - name: Install sysl
+        run: sudo -E ./scripts/linux-install-sysl.sh /usr/local
+
+      - name: Build the desktop edition
+        run: ./scripts/linux-measure.sh "sysl build . --features webview" sysl build . --lto thin --features webview
+
+      - name: Stage and archive
+        id: archive
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          arch="${{ matrix.arch }}"
+
+          test -x ./slate
+          ./slate --version | grep -qx "slate $version"
+
+          mkdir -p stage/bin
+          cp ./slate stage/bin/slate
+
+          tarball="slate-desktop-$version-linux-$arch.tar.gz"
+          tar -czf "$tarball" -C stage .
+
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(sha256sum "$tarball" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "size=$(stat -c %s "$tarball")" >> "$GITHUB_OUTPUT"
+
+      - name: Keep the tarball whatever happens next
+        uses: actions/upload-artifact@v4
+        with:
+          name: slate-desktop-linux-${{ matrix.arch }}
+          path: ${{ steps.archive.outputs.tarball }}
+          if-no-files-found: error
+          overwrite: true
+          compression-level: 0
+
+      # The language suite, as `build` runs it: the desktop binary is the standard one plus a module,
+      # so everything the standard one answers it must answer the same.
+      - name: Gate
+        run: |
+          set -euo pipefail
+          ./slate test tests/lang
+          ./slate test --js tests/lang
+
+      - name: Report the glibc floor and the libraries
+        id: glibc
+        run: |
+          set -euo pipefail
+          floor=$(objdump -T stage/bin/slate | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' | sort -uV | tail -1)
+          echo "floor=${floor#GLIBC_}" >> "$GITHUB_OUTPUT"
+          echo "highest glibc symbol version required: $floor"
+          echo "--- shared libraries this binary needs ---"
+          ldd stage/bin/slate
+
+      - name: Wait for the release, then attach
+        if: steps.what.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.what.outputs.tag }}"
+
+          for _ in $(seq 1 60); do
+            if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+              found=yes
+              break
+            fi
+            sleep 30
+          done
+
+          if [ "${found:-no}" != "yes" ]; then
+            echo "release $tag still does not exist after 30 minutes" >&2
+            echo "the tarball is attached to this run as an artifact and can be uploaded by hand" >&2
+            exit 1
+          fi
+
+          gh release upload "$tag" "${{ steps.archive.outputs.tarball }}" \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Say what was built
+        run: |
+          {
+            echo "### desktop, ${{ matrix.arch }}"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| tarball | \`${{ steps.archive.outputs.tarball }}\` |"
+            echo "| sha256 | \`${{ steps.archive.outputs.sha256 }}\` |"
+            echo "| bytes | \`${{ steps.archive.outputs.size }}\` |"
+            echo "| glibc floor | \`${{ steps.glibc.outputs.floor }}\` |"
+            echo "| attached to | \`${{ steps.what.outputs.tag || 'nothing -- build only' }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   # **The tarball is built on the OLDEST distribution it is meant to run on, so the interesting
   # question is whether it runs on the NEWER ones.** A binary that starts on the image it was built
   # on and dies on the next release of the same distribution is the ordinary failure of a
@@ -539,3 +699,68 @@ jobs:
           tar -xzf libslate-*-linux-*.tar.gz -C prefix
           cat prefix/LINK.txt
           zsh scripts/embed-check.sh --prefix prefix
+
+  # **The desktop tarball on a machine that did not build it, given GTK 3 and WebKitGTK 4.1 and
+  # nothing else.** Those two are what a person installing the desktop edition is told to install,
+  # and every other library the binary names must arrive with them or be linked in -- so `ldd`
+  # reporting `not found` is the failure, exactly as in `compat`. libwebview itself is linked from
+  # its archive and must not appear at all.
+  #
+  # **Nothing here opens a window.** A container has no display, and a program that asks for one
+  # there does not fail, it waits -- so the checks are the version and a headless program.
+  compat-desktop:
+    needs: build-desktop
+    if: ${{ !cancelled() }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64
+          - runner: ubuntu-22.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    container:
+      image: ubuntu:24.04
+    steps:
+      - name: Install GTK 3 and WebKitGTK 4.1, and nothing else
+        run: |
+          set -eu
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          # 24.04 renamed GTK's package in the time_t transition, so both spellings are offered and
+          # the one that is not there fails; `ldd` below is what says the set was right.
+          for p in libgtk-3-0 libgtk-3-0t64 libwebkit2gtk-4.1-0; do
+            apt-get install -y --no-install-recommends "$p" || true
+          done
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: slate-desktop-linux-${{ matrix.arch }}
+
+      - name: Unpack and check what it needs
+        run: |
+          set -eu
+          mkdir -p prefix
+          tar -xzf slate-desktop-*-linux-*.tar.gz -C prefix
+          test -x prefix/bin/slate
+
+          echo "--- ldd on ubuntu:24.04 ---"
+          ldd prefix/bin/slate || true
+          if ldd prefix/bin/slate | grep -q "not found"; then
+            echo "a library the desktop binary needs is missing beside GTK 3 and WebKitGTK 4.1" >&2
+            exit 1
+          fi
+          if ldd prefix/bin/slate | grep -q "libwebview"; then
+            echo "libwebview is linked dynamically; it should come from its archive" >&2
+            exit 1
+          fi
+
+      - name: Run it, headless
+        run: |
+          set -eu
+          export PATH="$PWD/prefix/bin:$PATH"
+          slate --version | grep -qx "slate ${{ needs.build-desktop.outputs.version }}"
+          echo 'print(6 * 7)' > hello.sl
+          test "$(slate hello.sl)" = "42"

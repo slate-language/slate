@@ -50,6 +50,12 @@ LMDB_VERSION="${LMDB_VERSION:-1.0.1}"
 NGHTTP2_VERSION="${NGHTTP2_VERSION:-1.67.0}"
 ZSTD_VERSION="${ZSTD_VERSION:-1.5.7}"
 
+# **webview is the desktop edition's, and the revision is the tap formula's.** Upstream publishes no
+# releases and no tag for 0.12.0, so `sysl-lang/homebrew-tap`'s `Formula/webview.rb` pins the commit
+# `sysl-lang/webview` was written and tested against; this builds the same bytes. Move both together.
+WEBVIEW_REVISION="${WEBVIEW_REVISION:-cbbdee44afff22867de9fd88a9fc8350d9bdd399}"
+WEBVIEW_VERSION="${WEBVIEW_VERSION:-0.12.0}"
+
 export DEBIAN_FRONTEND=noninteractive
 
 apt-get update
@@ -84,6 +90,14 @@ apt-get install -y --no-install-recommends \
   libunwind-dev \
   libwebp-dev \
   tzdata
+
+# **GTK 3 and WebKitGTK 4.1 are what webview draws with on Linux, and they stay DYNAMIC.** The desktop
+# edition links them from the distribution by decision -- a browser engine is not a thing to carry
+# in a tarball -- so a person running it installs `libgtk-3-0` and `libwebkit2gtk-4.1-0`. These are
+# the headers webview compiles against; the standard edition never reads them.
+apt-get install -y --no-install-recommends \
+  libgtk-3-dev \
+  libwebkit2gtk-4.1-dev
 
 wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
 chmod +x /tmp/llvm.sh
@@ -203,8 +217,52 @@ Libs: -L\${libdir} -l:libzstd.a
 Cflags: -I\${includedir}
 PC
 
+echo "building webview $WEBVIEW_VERSION at ${WEBVIEW_REVISION:0:7} (static)"
+curl -fsSL "https://github.com/webview/webview/archive/$WEBVIEW_REVISION.tar.gz" \
+  | tar -xz -C "$work"
+cmake -S "$work/webview-$WEBVIEW_REVISION" -B "$work/webview-build" \
+  -DCMAKE_INSTALL_PREFIX=/usr/local \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DWEBVIEW_WEBKITGTK_API=4.1 \
+  -DWEBVIEW_BUILD_SHARED_LIBRARY=OFF \
+  -DWEBVIEW_BUILD_STATIC_LIBRARY=ON \
+  -DWEBVIEW_BUILD_AMALGAMATION=OFF \
+  -DWEBVIEW_BUILD_EXAMPLES=OFF \
+  -DWEBVIEW_BUILD_TESTS=OFF \
+  -DWEBVIEW_BUILD_DOCS=OFF \
+  -DWEBVIEW_INSTALL_DOCS=OFF \
+  -DWEBVIEW_INSTALL_TARGETS=ON \
+  -DWEBVIEW_ENABLE_CHECKS=OFF \
+  -DWEBVIEW_ENABLE_PACKAGING=OFF
+cmake --build "$work/webview-build" -j"$(nproc)"
+cmake --install "$work/webview-build"
+test -f /usr/local/lib/libwebview.a
+# **Upstream ships no pkg-config file, so this is the tap formula's, with one difference.** The tap
+# builds a SHARED libwebview whose own load commands name WebKit, so its `Libs` is `-lwebview` alone.
+# Here the library is the ARCHIVE -- `link = "static"` takes it, so the tarball carries no libwebview
+# for a person to install -- and an archive records nothing, so the toolkit it calls into and the C++
+# runtime it was compiled against are named on the line. They are written out as `pkg-config --libs`
+# answers them rather than as `Requires:`, because sysl reads a static link with `--static`, and that
+# would drag every private dependency of GTK onto the link line and take any of them that happens to
+# have an archive -- a static glib beside a dynamic GTK is two type systems in one process.
+webview_toolkit=$(pkg-config --libs gtk+-3.0 webkit2gtk-4.1)
+cat > /usr/local/lib/pkgconfig/webview.pc <<PC
+prefix=/usr/local
+exec_prefix=\${prefix}
+libdir=\${exec_prefix}/lib
+includedir=\${prefix}/include
+
+Name: webview
+Description: Tiny cross-platform webview library using the system's own browser engine
+URL: https://github.com/webview/webview
+Version: $WEBVIEW_VERSION
+Libs: -L\${libdir} -lwebview $webview_toolkit -lstdc++
+Cflags: -I\${includedir}
+PC
+
 ldconfig
 
 echo "toolchain is on /usr/lib/llvm-$LLVM_VERSION/bin"
 node --version
-pkg-config --modversion hiredis libuv lmdb libnghttp2 libzstd
+pkg-config --modversion hiredis libuv lmdb libnghttp2 libzstd webview
+pkg-config --libs webview

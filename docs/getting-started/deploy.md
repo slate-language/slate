@@ -44,6 +44,10 @@ collector are
 linked in, so nothing has to match a version. A bare container image also wants `tzdata`, which
 `zone(...)` reads from and any real installation already has.
 
+The desktop edition, which adds [`slate:window`](../library/window.md), is the same shape beside it —
+`slate-desktop-<version>-linux-x86_64.tar.gz`, or `-linux-arm64` — and needs `libgtk-3-0` and
+`libwebkit2gtk-4.1-0` on top of those four, the web view being the system's own.
+
 ## A program that uses every core
 
 One slate process is one thread; [`cluster`](../library/cluster.md) runs the program N times and
