@@ -245,7 +245,13 @@ test -f /usr/local/lib/libwebview.a
 # answers them rather than as `Requires:`, because sysl reads a static link with `--static`, and that
 # would drag every private dependency of GTK onto the link line and take any of them that happens to
 # have an archive -- a static glib beside a dynamic GTK is two type systems in one process.
-webview_toolkit=$(pkg-config --libs gtk+-3.0 webkit2gtk-4.1)
+#
+# **`-Wl,--export-dynamic` is taken OUT of that answer.** GTK asks for it through `gmodule-2.0` so
+# that GtkBuilder can find signal handlers in the executable by name, which slate never does. What it
+# does to slate is export every function the program holds, so a thin-LTO link can drop none of the
+# unused ones -- and those still call builtins nothing defines, so the link fails with dozens of
+# `undefined reference to 'real.nan'` and the like, from std modules the program never calls.
+webview_toolkit=$(pkg-config --libs gtk+-3.0 webkit2gtk-4.1 | sed 's/ *-Wl,--export-dynamic//')
 cat > /usr/local/lib/pkgconfig/webview.pc <<PC
 prefix=/usr/local
 exec_prefix=\${prefix}
