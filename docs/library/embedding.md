@@ -342,4 +342,4 @@ Here a short sleep stands in for the `poll`.
 - **One call at a time on a handle.** Each call enters the handle's interpreter and leaves it, so two
   threads may each drive a handle of their own, but calls on ONE handle from several threads at once
   are not allowed — serialise them in C.
-- **Building the archive needs sysl 0.0.138 or later**, the compiler slate 0.1.10 is built with.
+- **Building the archive needs sysl 0.0.141 or later**, the compiler slate 0.1.11 is built with.
