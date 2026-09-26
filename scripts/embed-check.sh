@@ -124,9 +124,19 @@ if [[ $lto == yes ]]; then
     fi
 fi
 
-# The handle's declaration as the header wrote it: a bare `typedef struct slate_vm slate_vm;` is what a
-# C caller can hold, and a field list here would name sysl types clang has never heard of.
-grep -hE '(typedef|struct).*slate_vm' "$prefix/include/slate.h" || true
+# The two handles' declarations as the header wrote them: a bare `typedef struct slate_vm slate_vm;` is
+# what a C caller can hold, and a field list here would name sysl types clang has never heard of; and
+# `typedef uint64_t slate_value;` is the name every value handle goes by.
+grep -hE '(typedef|struct).*slate_vm|typedef .* slate_value;' "$prefix/include/slate.h" || true
+
+# The value handle has its own C name, and a handle position says it: a header that has gone back to
+# a bare `uint64_t` there still compiles, so only reading it can tell.
+for want in 'typedef uint64_t slate_value;' 'slate_value slate_int('; do
+    if ! grep -qF "$want" "$prefix/include/slate.h"; then
+        echo "embed-check: the header does not declare '$want'" >&2
+        exit 1
+    fi
+done
 
 # The two host callbacks as the header spells them: a function-pointer parameter is `R (*name)(A)`,
 # which is the one spelling clang accepts.

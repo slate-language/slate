@@ -136,34 +136,37 @@ print(double(21))
 
 ## Values
 
-A value C holds is a **handle**: a `uint64_t` naming a slot in a table the interpreter keeps. The
-collector walks that table, so a value stays alive for exactly as long as C holds its handle, across
-any number of calls that collect. **`0` is never a handle**, so C can read it as "none".
+A value C holds is a **handle**: a `slate_value`, a typedef of `uint64_t`; 0 is never a handle. It
+names a slot in a table the interpreter keeps. The collector walks that table, so a value stays alive
+for exactly as long as C holds its handle, across any number of calls that collect, and C can read
+`0` as "none".
 
 ```c
-uint64_t slate_int(slate_vm * h, int64_t n);
-uint64_t slate_real(slate_vm * h, double x);
-uint64_t slate_bool(slate_vm * h, int32_t b);
-uint64_t slate_null(slate_vm * h);
-uint64_t slate_string(slate_vm * h, uint8_t * p, uint64_t len);
-uint64_t slate_array(slate_vm * h);
-int32_t slate_push(slate_vm * h, uint64_t array, uint64_t v);
-uint64_t slate_object(slate_vm * h);
-int32_t slate_set(slate_vm * h, uint64_t object, uint8_t * key, uint64_t key_len, uint64_t v);
-void slate_release(slate_vm * h, uint64_t v);
+typedef uint64_t slate_value;
+
+slate_value slate_int(slate_vm * h, int64_t n);
+slate_value slate_real(slate_vm * h, double x);
+slate_value slate_bool(slate_vm * h, int32_t b);
+slate_value slate_null(slate_vm * h);
+slate_value slate_string(slate_vm * h, uint8_t * p, uint64_t len);
+slate_value slate_array(slate_vm * h);
+int32_t slate_push(slate_vm * h, slate_value array, slate_value v);
+slate_value slate_object(slate_vm * h);
+int32_t slate_set(slate_vm * h, slate_value object, uint8_t * key, uint64_t key_len, slate_value v);
+void slate_release(slate_vm * h, slate_value v);
 ```
 
 ```c
-int32_t slate_kind(slate_vm * h, uint64_t v);
-int64_t slate_to_int(slate_vm * h, uint64_t v);
-double slate_to_real(slate_vm * h, uint64_t v);
-int32_t slate_to_bool(slate_vm * h, uint64_t v);
-uint8_t * slate_string_ptr(slate_vm * h, uint64_t v);
-uint64_t slate_string_len(slate_vm * h, uint64_t v);
-uint64_t slate_len(slate_vm * h, uint64_t array);
-uint64_t slate_at(slate_vm * h, uint64_t array, uint64_t i);
-uint64_t slate_get(slate_vm * h, uint64_t object, uint8_t * key, uint64_t key_len);
-uint8_t * slate_show(slate_vm * h, uint64_t v);
+int32_t slate_kind(slate_vm * h, slate_value v);
+int64_t slate_to_int(slate_vm * h, slate_value v);
+double slate_to_real(slate_vm * h, slate_value v);
+int32_t slate_to_bool(slate_vm * h, slate_value v);
+uint8_t * slate_string_ptr(slate_vm * h, slate_value v);
+uint64_t slate_string_len(slate_vm * h, slate_value v);
+uint64_t slate_len(slate_vm * h, slate_value array);
+slate_value slate_at(slate_vm * h, slate_value array, uint64_t i);
+slate_value slate_get(slate_vm * h, slate_value object, uint8_t * key, uint64_t key_len);
+uint8_t * slate_show(slate_vm * h, slate_value v);
 uint64_t slate_show_len(slate_vm * h);
 ```
 
@@ -203,8 +206,8 @@ uint64_t slate_show_len(slate_vm * h);
 ## Calling slate from C
 
 ```c
-uint64_t slate_global(slate_vm * h, uint8_t * name, uint64_t name_len);
-int32_t slate_call(slate_vm * h, uint64_t f, uint64_t * argv, uint64_t argc, uint64_t * out);
+slate_value slate_global(slate_vm * h, uint8_t * name, uint64_t name_len);
+int32_t slate_call(slate_vm * h, slate_value f, slate_value * argv, uint64_t argc, slate_value * out);
 ```
 
 `slate_global` answers a handle to what a top-level name of the session holds — something a
@@ -216,9 +219,9 @@ leaves `*out` as `0`, and `slate_error` has the diagnostic, naming the file and 
 happened at.
 
 ```c
-uint64_t twice = slate_global(vm, (uint8_t *)"double", 6);
-uint64_t args[] = { slate_int(vm, 21) };
-uint64_t answer = 0;
+slate_value twice = slate_global(vm, (uint8_t *)"double", 6);
+slate_value args[] = { slate_int(vm, 21) };
+slate_value answer = 0;
 
 if (slate_call(vm, twice, args, 1, &answer) == 0)
     printf("%lld\n", (long long)slate_to_int(vm, answer));
@@ -235,14 +238,14 @@ value the function returned and never a promise.
 ## Calling C from slate
 
 ```c
-int32_t slate_register(slate_vm * h, uint8_t * name, uint64_t name_len, uint64_t (*f)(slate_vm *, uint64_t *, uint64_t, uint8_t *), uint8_t * user);
+int32_t slate_register(slate_vm * h, uint8_t * name, uint64_t name_len, slate_value (*f)(slate_vm *, slate_value *, uint64_t, uint8_t *), uint8_t * user);
 void slate_on_output(slate_vm * h, void (*f)(uint8_t *, uint64_t, uint8_t *), uint8_t * user);
 ```
 
 The header spells the two callbacks as raw function-pointer types. Named, they are
 
 ```c
-typedef uint64_t (*slate_host_fn)(slate_vm *vm, uint64_t *argv, uint64_t argc, uint8_t *user);
+typedef slate_value (*slate_host_fn)(slate_vm *vm, slate_value *argv, uint64_t argc, uint8_t *user);
 typedef void (*slate_output_fn)(uint8_t *bytes, uint64_t len, uint8_t *user);
 ```
 
@@ -251,7 +254,7 @@ that handle — and no other — can call it like any function. It answers `0`, 
 set where `name` is not a name a program could write, or `f` is null.
 
 ```c
-static uint64_t host_add(slate_vm *vm, uint64_t *argv, uint64_t argc, uint8_t *user) {
+static slate_value host_add(slate_vm *vm, slate_value *argv, uint64_t argc, uint8_t *user) {
     int64_t sum = 0;
 
     for (uint64_t i = 0; i < argc; i++)

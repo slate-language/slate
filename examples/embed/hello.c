@@ -22,7 +22,7 @@
 
 /* A C function a program calls as `host_add(a, b)`: each argument arrives as a handle, and the answer
  * goes back as a handle slate takes over -- `0` would be `null`. */
-static uint64_t host_add(slate_vm *vm, uint64_t *argv, uint64_t argc, uint8_t *user) {
+static slate_value host_add(slate_vm *vm, slate_value *argv, uint64_t argc, uint8_t *user) {
     (void)user;
 
     int64_t sum = 0;
@@ -69,9 +69,9 @@ int main(void) {
     printf("third run: %d\n", run(vm, "exit.sl", "import { exit } from slate:process\nexit(3)"));
 
     /* Call `double` from C: a handle to the function, one to the argument, and one to the answer. */
-    uint64_t twice = slate_global(vm, (uint8_t *)"double", 6);
-    uint64_t args[] = { slate_int(vm, 21) };
-    uint64_t answer = 0;
+    slate_value twice = slate_global(vm, (uint8_t *)"double", 6);
+    slate_value args[] = { slate_int(vm, 21) };
+    slate_value answer = 0;
 
     if (slate_call(vm, twice, args, 1, &answer) == 0)
         printf("double(21) from C: %lld\n", (long long)slate_to_int(vm, answer));
@@ -79,9 +79,9 @@ int main(void) {
     /* An array slate answers, printed as slate prints it. */
     run(vm, "list.sl", "listed(n) = [n, n * 2, \"done\"]");
 
-    uint64_t lister = slate_global(vm, (uint8_t *)"listed", 6);
-    uint64_t three[] = { slate_int(vm, 3) };
-    uint64_t listed = 0;
+    slate_value lister = slate_global(vm, (uint8_t *)"listed", 6);
+    slate_value three[] = { slate_int(vm, 3) };
+    slate_value listed = 0;
 
     if (slate_call(vm, lister, three, 1, &listed) == 0)
         printf("listed(3) from C: %s (%d elements)\n", slate_show(vm, listed), (int)slate_len(vm, listed));
