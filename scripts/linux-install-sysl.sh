@@ -3,8 +3,11 @@
 # Install the sysl compiler from its release tarball.
 #
 # slate is a sysl program, so a Linux machine needs the Linux sysl before it can build anything here.
-# The version is `package.hocon`'s `sysl` key, which is a FLOOR -- the oldest compiler slate builds
-# with -- and it is read from that file rather than written twice, so the two cannot disagree.
+# The version is the repository's `sysl-version` file -- the one place that names the compiler a
+# release is built with, on every platform -- and nothing else: no environment variable overrides it,
+# so a workflow cannot carry a second copy that falls behind. (`package.hocon`'s `sysl` key is the
+# FLOOR, the oldest compiler slate builds with; `scripts/check-sysl-version.sh` refuses a
+# `sysl-version` behind it, and runs at the end of this script against what was installed.)
 #
 # Run as root, or under `sudo`. The prefix defaults to `/usr/local`.
 set -euo pipefail
@@ -12,13 +15,9 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 prefix="${1:-/usr/local}"
 
-version="${SYSL_VERSION:-}"
+version=$(tr -d '[:space:]' < "$repo_root/sysl-version")
 if [ -z "$version" ]; then
-  version=$(grep -oE '^[[:space:]]*sysl[[:space:]]*=[[:space:]]*"[^"]+"' "$repo_root/package.hocon" \
-            | head -1 | sed 's/.*"\(.*\)"/\1/')
-fi
-if [ -z "$version" ]; then
-  echo "could not read the sysl floor out of $repo_root/package.hocon" >&2
+  echo "$repo_root/sysl-version names no sysl version" >&2
   exit 1
 fi
 
@@ -39,4 +38,4 @@ curl -fsSL "$url" -o "$tmp/sysl.tar.gz"
 mkdir -p "$prefix"
 tar -xzf "$tmp/sysl.tar.gz" -C "$prefix"
 
-"$prefix/bin/sysl" --version
+PATH="$prefix/bin:$PATH" "$repo_root/scripts/check-sysl-version.sh"

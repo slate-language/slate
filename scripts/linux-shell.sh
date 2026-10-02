@@ -22,7 +22,9 @@ case "$(uname -m)" in
   *)             host_platform=linux/amd64 ;;
 esac
 platform="${SLATE_LINUX_PLATFORM:-$host_platform}"
-image="slate-linux:$(basename "$platform")"
+# The tag carries `sysl-version`, so moving the compiler builds a fresh image rather than reusing one
+# holding the old one.
+image="slate-linux:$(basename "$platform")-sysl-$(tr -d '[:space:]' < "$repo_root/sysl-version")"
 
 # **The image is built once and reused.** Installing LLVM and a dozen -dev packages takes minutes;
 # doing it per run would make the loop this script exists to shorten no shorter than CI.
@@ -35,8 +37,8 @@ RUN /tmp/linux-deps.sh && rm -rf /var/lib/apt/lists/* /tmp/linux-deps.sh
 ENV PATH=/usr/lib/llvm-20/bin:$PATH
 ENV HOME=/home/dev
 RUN mkdir -p /home/dev/.cache && chmod -R 777 /home/dev
-COPY scripts/linux-install-sysl.sh package.hocon /tmp/sysl/
-RUN cd /tmp/sysl && mkdir -p scripts && mv linux-install-sysl.sh scripts/ \
+COPY scripts/linux-install-sysl.sh scripts/check-sysl-version.sh package.hocon sysl-version /tmp/sysl/
+RUN cd /tmp/sysl && mkdir -p scripts && mv linux-install-sysl.sh check-sysl-version.sh scripts/ \
     && scripts/linux-install-sysl.sh /usr/local && rm -rf /tmp/sysl
 WORKDIR /src
 DOCKERFILE
