@@ -575,3 +575,97 @@ A_SOCKET_CROSSES_A_CHANNEL_BETWEEN_TWO_PROGRAMS_UNDER_NODE()
     // The connection the supervisor accepted is the one the worker answered on, so the client's own
     // socket -- which never left the supervisor -- carries what the other process wrote.
     assert_eq(said, "passed: true\nworker saw: hello")
+
+// The worker both tests below hand a connection to: it answers the first chunk and says so, and a
+// `busy` message holds its loop for 300 ms, which is what keeps it from acknowledging a handle.
+private handover_worker() -> string =
+    "import { channel } from slate:process\n" +
+    "import { onData, send, close } from slate:net\n" +
+    "import { monotonic, millis } from slate:time\n" +
+    "val ch = channel()\n" +
+    "ch.onMessage((m, conn) ->\n" +
+    "    if conn != null\n" +
+    "        onData(conn, (text) ->\n" +
+    "            send(conn, \"worker saw: \" + text)\n" +
+    "            close(conn)\n" +
+    "            ch.send({ done: true }))\n" +
+    "    else if has(m, \"busy\")\n" +
+    "        val began = monotonic()\n" +
+    "        var spins = 0\n" +
+    "        while monotonic() - began < millis(300)\n" +
+    "            spins += 1)\n" +
+    "ch.send({ hello: true })\n"
+
+// The supervisor's half both share: a deadline that ends the run with a sentence rather than a hang,
+// and the end of the conversation once the worker says it answered.
+private handover_ending() -> string =
+    "giveUp()\n" +
+    "    print(\"nothing came back\")\n" +
+    "    close(server)\n" +
+    "    worker.kill()\n" +
+    "val deadline = setTimeout(giveUp, 5000)\n" +
+    "worker.onMessage((m) ->\n" +
+    "    if has(m, \"hello\")\n" +
+    "        server = listen(0, accepted)\n" +
+    "        dial()\n" +
+    "    else if has(m, \"done\")\n" +
+    "        clearTimeout(deadline)\n" +
+    "        close(server)\n" +
+    "        worker.kill())\n"
+
+// **The bytes a client sent before its connection was handed over reach the worker.** node starts
+// reading an accepted connection at once, into a stream that `pause()` stops only on the JavaScript
+// side -- so a request already in the kernel was read by the supervisor and dropped with the handle,
+// and the worker waited for it for ever. That race is what made the test above fail about one run
+// in twenty under load; here it is forced, by handing over only once the request has certainly
+// arrived.
+@test
+A_CONNECTION_HANDED_OVER_AFTER_ITS_REQUEST_ARRIVED_STILL_CARRIES_IT_UNDER_NODE()
+    val said = node_supervisor_said(handover_worker(),
+        "import { spawn } from slate:process\n" +
+        "import { listen, connect, onData, send, close, localPort } from slate:net\n" +
+        "val worker = spawn(\"node\", [Worker], { ipc: true }).value\n" +
+        "var server = null\n" +
+        "var held = null\n" +
+        "accepted(conn)\n" +
+        "    held = conn\n" +
+        "async dial()\n" +
+        "    val client = (await connect(\"127.0.0.1\", localPort(server))).value\n" +
+        "    onData(client, (text) ->\n" +
+        "        print(text)\n" +
+        "        close(client))\n" +
+        "    await send(client, \"hello\")\n" +
+        "    await sleep(100)\n" +
+        "    print(\"passed: \" + string(worker.send({ job: 1 }, held).ok))\n" +
+        handover_ending())
+
+    assert_eq(said, "passed: true\nworker saw: hello")
+
+// **A connection this program was READING is handed over without losing what arrives during the
+// handover.** node keeps the sender's descriptor open, and reading, until the receiver acknowledges
+// the handle, and what it reads in that window goes nowhere. The worker is kept busy for 300 ms
+// before it can acknowledge, and the client writes in the same breath as the handover -- so the
+// bytes are in the kernel long before the acknowledgement can be, every run.
+@test
+A_CONNECTION_HANDED_OVER_WHILE_BEING_READ_LOSES_NOTHING_UNDER_NODE()
+    val said = node_supervisor_said(handover_worker(),
+        "import { spawn } from slate:process\n" +
+        "import { listen, connect, onData, send, close, localPort } from slate:net\n" +
+        "val worker = spawn(\"node\", [Worker], { ipc: true }).value\n" +
+        "var server = null\n" +
+        "var client = null\n" +
+        "accepted(conn)\n" +
+        "    onData(conn, (text) ->\n" +
+        "        print(\"supervisor saw: \" + text)\n" +
+        "        worker.send({ busy: true })\n" +
+        "        print(\"passed: \" + string(worker.send({ job: 1 }, conn).ok))\n" +
+        "        send(client, \"second\"))\n" +
+        "async dial()\n" +
+        "    client = (await connect(\"127.0.0.1\", localPort(server))).value\n" +
+        "    onData(client, (text) ->\n" +
+        "        print(text)\n" +
+        "        close(client))\n" +
+        "    send(client, \"first\")\n" +
+        handover_ending())
+
+    assert_eq(said, "supervisor saw: first\npassed: true\nworker saw: second")
