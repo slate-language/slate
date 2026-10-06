@@ -1038,8 +1038,9 @@ print(count({ a: 1 }), count(null), size("abc"), size(4))
 
 ```slate
 isPresent(m: object | null) -> boolean = m != null
+lookup(name: string) -> object | null = if name == "home" then { path: "/" } else null
 
-val entry = { name: "home", target: { path: "/" } }
+val entry = { name: "home", target: lookup("home") }
 
 first(m: object | null)
     assert(isPresent(m))
