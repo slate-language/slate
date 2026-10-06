@@ -1,0 +1,162 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// THE MACHINE HOLDS A TYPE PREDICATE TO ITS CLAIM, on both hosts, at every normal way out.
+//
+// `-> p is T`, `-> asserts p is T` and `-> asserts p` are what callers narrow by (`predicate.sysl`),
+// so a body that answers otherwise would steer a caller's branch somewhere a run does not go. This
+// file is what makes the run refuse it too, which is the rule the whole checker stands on: it may
+// only report what the machine would also refuse.
+//
+// - **`p is T` answering true** faults where the argument is not `T`.
+// - **`p is T` answering false** faults where the argument IS `T` -- only where `false_side_held`
+//   says a caller's else branch may lean on it, which is exactly where the checker lets one.
+// - **An assertion that returns** faults where the argument is not `T`, or is falsy for a bare
+//   `asserts p`. One that throws throws its own value; this is never reached.
+//
+// **The argument is the one the call PASSED**, read out of the slot `snapshot_claimed` filled on the
+// way in, so a body that reassigns its parameter is still held to what it was handed.
+//
+// **An inferred predicate carries no claim and so no check**: its body IS the test, so its answer is
+// right by construction and it costs nothing at run time. What an explicit claim costs is one store
+// on entry and, on the way out, one type test (two for a false answer that is held) -- the same
+// instructions an `is` written in the body would be.
+//
+// A file of its own because the two back ends write the same three checks, and because neither
+// `compile_stmt.sysl` nor `js_stmt.sysl` -- where a `return`'s half is written -- has room.
+
+// A claim, and whether its false answer is held to it, recorded on the way into a body so that every
+// `return` in it is checked as falling out is.
+struct ClaimCheck
+    claim: Claim
+    false_held: bool
+end ClaimCheck
+
+// What a body carrying `claim` is held to.
+//
+// Not `private`: `compile_expr`'s `Ensures` arm and its JavaScript twins record one.
+claim_check_of(claim: Option[Claim], body: Expr) -> Option[ClaimCheck] = claim match
+    Some(c) -> Some(ClaimCheck(c, false_side_held(c, body)))
+    None -> None
+
+// -- the interpreter ----------------------------------------------------------------------------------
+
+// Compile a claimed body and leave the scope of its block OPEN, answering whether one was opened.
+//
+// **The slot the argument was snapshotted into is declared inside the body's block** (`parse_def`
+// puts it beside `result`, among the parameters' checks), so the fall-out check has to be written
+// before that block's scope shuts or it names a slot nothing declares. The caller writes its checks
+// and then `shut_scope`s. A body with no claim is compiled as it always was.
+//
+// Not `private`: `compile_expr`'s `Ensures` arm.
+open_claimed(u: *Unit, e: *Emit, value: Expr, held: Option[ClaimCheck]) -> bool
+    if held.is_some()
+        *value.kind match
+            Block(stmts) ->
+                open_scope(e, value.span, scoped_block(e, stmts))
+                compile_stmts(u, e, stmts, value.span, Kept)
+                return true
+            _ -> ()
+
+    compile_expr(u, e, value)
+    false
+end open_claimed
+
+// The claim asked of the answer standing on the stack, which is left where it stands.
+//
+// **A jump over a fault, as a contract clause is**, so no instruction was added: `IsPat` asks the
+// question an `is` asks, and `FailShowing` says the sentence with the argument on the end. The
+// failing arm puts the argument on the stack for that and never comes back, so it is counted as
+// taking it off again.
+//
+// Not `private`: the `Ensures` arm asks it of the fall-out and `compile_stmt.sysl` of a `return`.
+claim_exit(u: *Unit, e: *Emit, held: Option[ClaimCheck], at: Span)
+    val check = held match
+        Some(c) -> c
+        None -> return
+
+    val claim = check.claim
+    val slot = claim_slot()
+
+    if claim.asserts
+        load_name(u, e, slot, at)
+        claim_test(u, e, claim, at)
+
+        val fails = push_n(e, JumpIfFalse(0), at, 1, 0)
+        val over = push_n(e, Jump(0), at, 0, 0)
+
+        patch(e, fails, here(e))
+        claim_fault(u, e, claim, "", at)
+        patch(e, over, here(e))
+        return
+    end if
+
+    // The answer has been checked as a boolean already (`CheckResult`), so its truth is its value.
+    push_n(e, Dup, at, 0, 1)
+
+    val answered_false = push_n(e, JumpIfFalse(0), at, 1, 0)
+
+    load_name(u, e, slot, at)
+    claim_test(u, e, claim, at)
+
+    val lied_true = push_n(e, JumpIfFalse(0), at, 1, 0)
+    val done_true = push_n(e, Jump(0), at, 0, 0)
+
+    patch(e, lied_true, here(e))
+    claim_fault(u, e, claim, "true", at)
+    patch(e, answered_false, here(e))
+
+    if check.false_held
+        load_name(u, e, slot, at)
+        claim_test(u, e, claim, at)
+
+        val honest = push_n(e, JumpIfFalse(0), at, 1, 0)
+
+        claim_fault(u, e, claim, "false", at)
+        patch(e, honest, here(e))
+
+    patch(e, done_true, here(e))
+end claim_exit
+
+// The claim's test of the value on top of the stack, answering a boolean in its place: `is T`, or
+// the value itself for a bare `asserts p`, whose truth is what the jump after it reads.
+private claim_test(u: *Unit, e: *Emit, claim: Claim, at: Span)
+    claim.pat match
+        Some(pat) -> push_n(e, IsPat(u32(intern_resolved(u, pat)), false), at, 1, 1)
+        None -> ()
+
+private claim_fault(u: *Unit, e: *Emit, claim: Claim, answered: string, at: Span)
+    load_name(u, e, claim_slot(), at)
+    push_n(e, FailShowing(intern_str(u, claim_lie(claim, answered))), at, 1, 0)
+
+// -- the JavaScript back end -------------------------------------------------------------------------
+
+// `claim_exit` over the answer held in `held`, word for word.
+//
+// Not `private`: `emit_ensures`, the assertion arms and a `return` in `js_stmt.sysl` all write it.
+js_claim_exit(j: *Js, claimed: Option[ClaimCheck], held: string)
+    val check = claimed match
+        Some(c) -> c
+        None -> return
+
+    val claim = check.claim
+    val arg = js_name(claim_slot())
+
+    val holds = claim.pat match
+        Some(pat) -> emit_test(j, pat, arg)
+        None -> s"$$.truthy(${arg})"
+
+    if claim.asserts
+        line(j, s"if (!(${holds})) ${js_claim_fault(claim, "", arg)}")
+        return
+    end if
+
+    line(j, s"if (${held} === true && !(${holds})) ${js_claim_fault(claim, "true", arg)}")
+
+    if check.false_held then line(j, s"if (${held} === false && (${holds})) ${js_claim_fault(claim, "false", arg)}")
+end js_claim_exit
+
+private js_claim_fault(claim: Claim, answered: string, arg: string) -> string =
+    s"$$.fault(${quoted_js(claim_lie(claim, answered))} + $$.plainShow(${arg}));"

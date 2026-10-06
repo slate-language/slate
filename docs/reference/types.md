@@ -1094,7 +1094,9 @@ count(m: object | null) = if isPresent(m) then keys(m).length else 0
 explicit type predicate. `-> p is T` says the function answers a boolean, and that where a call to it
 answers `true` the argument given for parameter `p` is a `T`. On the false side the argument is not a
 `T`, so a union holding `T` as one of its alternatives loses that alternative there, which is
-TypeScript's rule; a union `T` is not an alternative of loses nothing:
+TypeScript's rule; a union `T` is not an alternative of loses nothing. The false side is read only
+where `p` is undeclared or declared as a union with `T` among its alternatives, which is where the
+machine holds a false answer to the claim (below):
 
 ```slate
 type User = { id: integer, name: string }
@@ -1195,13 +1197,39 @@ ensureSmall(v: integer) -> asserts v is integer =
 `ensureSmall` is an assertion (`-> asserts v is integer`), so it answers nothing, and this answers integer
 ```
 
-**The claim itself is trusted, as it is in TypeScript.** At run time a predicate is a function
-declared `-> boolean` and an assertion one declared nothing — both back ends emit exactly that — and
-nothing checks that `true` really meant `User`. This is the one place the checker takes the
-program's word for something the machine never looks at, the way it does for an annotated `var`: a
-predicate that lies can make it miss a fault the run then finds, or refuse a branch the run would
-have taken with a value the predicate turned down. The checker is only as right as the predicate is,
-which is what writing one promises.
+**The machine holds every answer to the claim, where TypeScript trusts it.** Each time a predicate or
+an assertion returns, the argument it was handed is checked against what it answered, on both back
+ends:
+
+- `-> p is T` answering `true` faults where the argument is not a `T`;
+- `-> p is T` answering `false` faults where the argument **is** a `T` — wherever a caller's else
+  branch takes `T` away, which is where `p` is undeclared or declared as a union with `T` among its
+  alternatives;
+- `-> asserts p is T` returning faults where the argument is not a `T`, and `-> asserts p` where it is
+  falsy.
+
+So a predicate that lies faults in its own body, rather than steering a caller into a branch the run
+would not take:
+
+```slate
+isText(v: string | integer) -> v is string = v is integer
+
+print(isText(42))
+```
+
+```error
+`isText` answered true, but its claim `v is string` does not hold of what it was given -- a caller's then branch takes true to mean it does, so the predicate's body is what is wrong: `v` was 42
+```
+
+The argument checked is the one the call **passed**, so a body that reassigns its parameter is still
+answering about what it was handed. A predicate or an assertion that throws is never checked — the
+throw is what the caller gets. Where the false side is not held — `isWhole(n: number) -> n is
+integer`, whose parameter is no union — a call narrows on its true side only, so the checker and the
+machine agree about exactly which answers can be wrong.
+
+**An inferred predicate is not checked, and needs no check**: its body is the test, so its answer is
+right by construction and it costs nothing. An explicit claim costs one store when the function is
+entered and one type test when it returns — two for a false answer that is held.
 
 ### A callback knows what it is handed
 
