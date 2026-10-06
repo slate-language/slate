@@ -1231,6 +1231,103 @@ machine agree about exactly which answers can be wrong.
 right by construction and it costs nothing. An explicit claim costs one store when the function is
 entered and one type test when it returns — two for a false answer that is held.
 
+### A method can be a predicate too
+
+**A method is a function handed the object it was called on as its first parameter**, so everything
+above reaches it: a call `checker.isUser(v)` narrows `v` exactly as `isUser(checker, v)` would, whether
+the method's body is one test or its annotation says so, and `-> asserts` works the same way.
+
+**`this is T` is a claim about the receiver**, TypeScript's spelling — `this` names whatever the
+method calls its first parameter, so `-> self is T` says the same thing. A body that is one test of
+that parameter is read as one, just as a function's is, so `isCircle(self) = self is Circle` needs no
+annotation:
+
+```slate
+data Shape
+    Circle(r: real)
+    Square(side: real)
+
+    isCircle(self) = self is Circle
+    isSquare(self) -> this is Square =
+        val yes = self is Square
+        yes
+    ensureCircle(self) -> asserts this is Circle =
+        if !(self is Circle) then throw "not a circle"
+
+radius(c: Circle) = c.r
+side(q: Square) = q.side
+
+either(s: Circle | Square) = if s.isSquare() then side(s) else radius(s)
+
+round(s: Shape)
+    s.ensureCircle()
+    radius(s)
+
+print(either(Square(2.5)), either(Circle(1.5)), round(Circle(0.5)))
+```
+
+```output
+2.5 1.5 0.5
+```
+
+```slate
+type User = { id: integer, name: string }
+
+class Checker
+    var strict = false
+
+    isUser(self, v: User | string) -> v is User =
+        if !(v is object) then return false
+        v.id is integer
+
+greet(u: User) = "hello, " + u.name
+
+val check = Checker()
+
+say(v: User | string) = if check.isUser(v) then greet(v) else upper(v)
+
+print(say({ id: 1, name: "ann" }), say("bob"))
+```
+
+```output
+hello, ann BOB
+```
+
+**Which method a call reaches is worked out where the checker knows the receiver's class**: a `val`
+bound to `Checker()`, or a value whose type is a data type or some of its variants. The class's own
+members are looked at first and then the chain its `from` names, which is where the machine looks.
+A receiver whose class is not known — one typed `any`, or reached through anything else — narrows
+nothing, and neither does a `?.` call. A receiver that is a path of fields narrows as a path does,
+and a call still ends a path narrowed before it.
+
+**Where a subclass overrides a method, the class the checker knows decides, which is TypeScript's
+rule.** A receiver known to be the subclass reads the subclass's method — its own predicate, or none
+if it declares none — and one known only as the base reads the base's, whatever the run dispatches
+to. That is the same trust the claim itself is given.
+
+**The receiver is held to its class.** What a data type's method is called on is one of its
+variants, and what a class's method is called on is an object, so a claim that could never be true
+of it is refused — and so is `this` on something that is not a method:
+
+```slate
+data Shape
+    Circle(r: real)
+
+    isText(self) -> this is string = false
+```
+
+```error
+`this` is the `Shape` the method was called on, and string is not one, so `this is string` could never be true
+```
+
+```slate
+isText(v) -> this is string = v is string
+```
+
+```error
+`this` is the object a method was called on, and `isText` is not a method
+```
+
 ### A callback knows what it is handed
 
 `map`, `filter`, `forEach` and the rest call their function with one element; `sorted` calls its
