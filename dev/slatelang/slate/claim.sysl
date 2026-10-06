@@ -1,0 +1,172 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// EXPLICIT TYPE PREDICATES: reading `-> p is T`, `-> asserts p is T` and `-> asserts p` off a
+// definition, and holding the definition to what it claims.
+//
+// `predicate.sysl` is what a claim MEANS to a caller -- the `Claim` itself and the `Narrows` it
+// becomes, which is the one value an inferred predicate becomes too. This file is the two ends
+// that are only about the explicit form: the parser's half, which is a result annotation of
+// another shape, and the checker's, which is a definition answering for its own annotation. **A
+// file of its own because neither half is a narrowing**, and because `define.sysl`, where a result
+// annotation is read, is already at the thousand lines.
+//
+// **The words are not reserved.** `is` is a hard word already; `asserts` is recognised only right
+// after a definition's `->` and only where a name follows it, so `-> asserts` alone is still a type
+// a program declared under that name.
+
+// -- the parser's half ------------------------------------------------------------------------------
+
+// A type predicate written where a result type would be, or nothing where what follows the `->`
+// is an ordinary type.
+//
+// **It answers what the parser makes of any result annotation**: the type text the machine's
+// check quotes, the pattern it checks, and the claim. A predicate is checked as `-> boolean` -- so
+// it is emitted exactly as a definition saying `-> boolean` is, on both hosts -- and an assertion
+// carries a wildcard that neither back end turns into anything.
+//
+// **`p is T` is told from a type by its second token**: a type is never followed by `is`, so a name
+// standing before one is a parameter. **`asserts p` is told by a name after the word**, which no
+// type can be either.
+//
+// Not `private`: `parse_def` asks it right after the `->`.
+claim_result(p: *Parser, owner: string) -> Option[(string, Pattern, Option[Claim])]
+    val start = p.here()
+    val asserts = p.at(Ident) && p.text_at(0) == "asserts" && p.peek_kind_at(1) == Ident
+    val tested = p.at(Ident) && p.peek_kind_at(1) == Is
+
+    if !asserts && !tested then return None
+
+    if asserts then p.bump()
+
+    val param_at = p.here()
+    val param = p.text(param_at)
+
+    p.bump()
+
+    val typed = p.accept(Is)
+    val type_start = p.here()
+    val pat: Option[Pattern] = if typed then Some(parse_type(p)) else None
+    val type_at = if typed then type_start.to(p.just_taken()) else param_at
+    val said = start.to(p.just_taken())
+    val text = p.text(said)
+    val claim = Claim(owner, param, param_at, asserts, pat, type_at, text)
+
+    if asserts then return Some((text, pattern(said, Wild), Some(claim)))
+
+    Some(("boolean", pattern(said, TypePat(IsBool)), Some(claim)))
+end claim_result
+
+// -- the checker's half -----------------------------------------------------------------------------
+
+// Hold a definition to the claim its result annotation makes, if it made one.
+//
+// **Four things, and each is about the DEFINITION, never about a call**: `p` is one of its own
+// parameters, `T` is a type that parameter may hold, a predicate answers a boolean on every way
+// out, and an assertion answers no value. The claim itself is trusted (`predicate.sysl`).
+//
+// Not `private`: `check_stmt` asks it of a definition and `check_expr` of a class member.
+check_claim(params: Buf[string], body: Expr, is_async: bool, env: *TypeEnv)
+    val claim = claim_of(body) match
+        Some(c) -> c
+        None -> return
+
+    val kind = if claim.asserts then "an assertion" else "a type predicate"
+
+    if is_async
+        complain_here(claim.param_at, s"`${claim.owner}` is `async`, so a call to it answers a promise and `-> ${claim.text}` could never be read off one -- ${kind} has to answer straight away")
+        return
+
+    val at = claim_param(claim, params) match
+        Some(i) -> i
+        None -> return
+
+    claim.pat match
+        Some(pat) -> if !claim_fits(claim, pat, params, at, body) then return
+        None -> ()
+
+    val points = answer_points(params, body, env)
+
+    for i in 0..<points.len()
+        val point = points.at(i)
+
+        if claim.asserts
+            if !may_be(point.t, type_of(NullType))
+                complain_here(point.at, s"`${claim.owner}` is an assertion (`-> ${claim.text}`), so it answers nothing, and this answers ${show_type(point.t)} -- an assertion that fails throws, and one that holds simply returns")
+        elif !may_be(point.t, type_of(BooleanType))
+            complain_here(point.at, s"`${claim.owner}` is a type predicate (`-> ${claim.text}`), so every way out of it answers a boolean, and this one answers ${show_type(point.t)}")
+end check_claim
+
+// Which parameter the claim is about, complaining where it names none a call could hand over.
+private claim_param(claim: Claim, params: Buf[string]) -> Option[usize]
+    var named = ""
+
+    for i in 0..<params.len()
+        val plain = plain_param(params.at(i))
+
+        if params.at(i) == claim.param then return Some(i)
+
+        // **A rest parameter is spelled without its dots in the claim, and is still not one a call
+        // hands over whole** -- it is an array the machine gathers out of whatever is left.
+        if plain == claim.param
+            complain_here(claim.param_at, s"`${plain}` gathers what is left over into an array, so no one argument is the `${plain}` that `-> ${claim.text}` is about -- a predicate is about one parameter a call gives")
+            return None
+
+        // A destructured parameter's hidden name is nothing a program can write, so it is not
+        // offered.
+        if !plain.starts_with("(") then named = if named == "" then s"`${plain}`" else s"${named}, `${plain}`"
+
+    val takes = if named == "" then "takes no parameters" else s"takes ${named}"
+
+    complain_here(claim.param_at, s"`${claim.param}` is not a parameter of `${claim.owner}`, so `-> ${claim.text}` is about nothing a call hands over -- `${claim.owner}` ${takes}")
+    None
+end claim_param
+
+// Whether `T` is a type the parameter may hold, complaining where it is not.
+//
+// **TypeScript's rule: a predicate's type must be assignable to its parameter's.** A test that
+// could never be true makes every call's true side a branch nothing reaches, which is a mistake
+// in the annotation rather than in any caller.
+private claim_fits(claim: Claim, pat: Pattern, params: Buf[string], at: usize, body: Expr) -> bool
+    val shape = resolve_pattern(pat, 0)
+
+    first_binding(shape) match
+        Some(loose) ->
+            complain_here(claim.type_at, s"`${loose}` is not a type, so `-> ${claim.text}` would narrow to nothing${instead_of(loose)}")
+            return false
+        None -> ()
+
+    val narrowed = type_from_pattern(shape)
+
+    val declared = *signature_of(params, params.len(), body, false).kind match
+        FunctionType(types, _, _, _) -> if at < types.len() then types.at(at) else type_of(Any)
+        _ -> type_of(Any)
+
+    *declared.kind match
+        Any -> return true
+        TypeVar(_) -> return true
+        _ -> ()
+
+    if fits(narrowed, declared) then return true
+
+    complain_here(claim.type_at, s"`${claim.param}` is declared ${show_type(declared)}, and ${show_type(narrowed)} is not one, so `${claim.text}` could never be true -- a predicate narrows a parameter to something its declaration already allows")
+    false
+end claim_fits
+
+// Whether a value of this type could be one of `want`'s, which is the most a body read with no
+// branch's narrowing may say: an answer is complained about only where NONE of what it could be is
+// right.
+private may_be(t: Type, want: Type) -> bool
+    *t.kind match
+        Any -> true
+        TypeVar(_) -> true
+        OneOf(alts) ->
+            for i in 0..<alts.len()
+                if may_be(alts.at(i), want) then return true
+
+            false
+        _ -> fits(t, want) || fits(want, t)
+end may_be

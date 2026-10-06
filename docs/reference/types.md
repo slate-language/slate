@@ -1088,6 +1088,121 @@ count(m: object | null) = if isPresent(m) then keys(m).length else 0
 `keys` takes object | array here, and this is object | null
 ```
 
+### A function can say what its call proves
+
+**Where the body is more than one test, the result annotation says it instead** — TypeScript's
+explicit type predicate. `-> p is T` says the function answers a boolean, and that where a call to it
+answers `true` the argument given for parameter `p` is a `T`. On the false side the argument is not a
+`T`, so a union holding `T` as one of its alternatives loses that alternative there, which is
+TypeScript's rule; a union `T` is not an alternative of loses nothing:
+
+```slate
+type User = { id: integer, name: string }
+
+isUser(v: User | string) -> v is User =
+    if !(v is object) then return false
+    val id = v.id
+    id is integer && id > 0
+
+greet(u: User) = "hello, " + u.name
+shout(s: string) = upper(s)
+
+say(v: User | string) = if isUser(v) then greet(v) else shout(v)
+
+print(say({ id: 1, name: "ann" }), say("bob"))
+```
+
+```output
+hello, ann BOB
+```
+
+`-> asserts p is T` says the function answers nothing and that a call which returns at all proves the
+argument is a `T` — so the lines below a call written as a statement of its own know it, exactly as the
+lines below `assert` do. `-> asserts p` says the same of `p`'s truth. A call to an assertion used as a
+value — in a condition, or bound to a name — answers nothing and narrows nothing:
+
+```slate
+type User = { id: integer, name: string }
+
+ensureUser(v: any) -> asserts v is User =
+    if !(v is object) || !(v.id is integer) then throw "not a user"
+
+present(m: object | null) -> asserts m =
+    if !m then throw "nothing here"
+
+greet(u: User) = "hello, " + u.name
+
+welcome(v: User | string)
+    ensureUser(v)
+    greet(v)
+
+fields(m: object | null)
+    present(m)
+    keys(m)
+
+print(welcome({ id: 1, name: "ann" }), fields({ a: 1 }))
+```
+
+```output
+hello, ann ["a"]
+```
+
+Either form reaches everywhere an inferred predicate does — a `val` naming it, an import and a
+re-export, a path of fields, `!`, `&&` and `||`, an early exit, and `assert(isUser(x))` — and a spread,
+a named argument or a `?.` call gets nothing from it. **Where both could be read, the annotation
+wins.** The words are not reserved: `asserts` means this only right after a definition's `->` and
+before a name.
+
+**The definition is held to its own annotation.** `p` has to be one of its parameters, and `T` has to
+be something that parameter may hold:
+
+```slate
+isText(v: string | integer) -> w is string = v is string
+```
+
+```error
+`w` is not a parameter of `isText`, so `-> w is string` is about nothing a call hands over -- `isText` takes `v`
+```
+
+```slate
+isText(v: integer) -> v is string = false
+```
+
+```error
+`v` is declared integer, and string is not one, so `v is string` could never be true
+```
+
+A predicate answers a boolean on every way out of it, and an assertion answers no value — it fails by
+throwing and holds by returning. Each answer that cannot be right is named where it is written:
+
+```slate
+isSmall(v: integer) -> v is integer =
+    if v > 9 then return false
+    "yes"
+```
+
+```error
+`isSmall` is a type predicate (`-> v is integer`), so every way out of it answers a boolean, and this one answers string
+```
+
+```slate
+ensureSmall(v: integer) -> asserts v is integer =
+    if v > 9 then throw "too big"
+    v
+```
+
+```error
+`ensureSmall` is an assertion (`-> asserts v is integer`), so it answers nothing, and this answers integer
+```
+
+**The claim itself is trusted, as it is in TypeScript.** At run time a predicate is a function
+declared `-> boolean` and an assertion one declared nothing — both back ends emit exactly that — and
+nothing checks that `true` really meant `User`. This is the one place the checker takes the
+program's word for something the machine never looks at, the way it does for an annotated `var`: a
+predicate that lies can make it miss a fault the run then finds, or refuse a branch the run would
+have taken with a value the predicate turned down. The checker is only as right as the predicate is,
+which is what writing one promises.
+
 ### A callback knows what it is handed
 
 `map`, `filter`, `forEach` and the rest call their function with one element; `sorted` calls its

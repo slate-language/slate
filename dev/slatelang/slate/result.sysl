@@ -74,40 +74,75 @@ end note_answer
 // Whether the definition wrote its own `-> type`.
 private said_result(body: Expr) -> bool =
     *body.kind match
-        Ensures(_, _, _) -> true
+        Ensures(_, _, _, _) -> true
         _ -> false
 
 // The join of every `return` in the body and the value the body falls out with.
 private answer_of(params: Buf[string], body: Expr, env: *TypeEnv) -> Type
-    var answers: Buf[Type] = buf()
+    val answers = answer_points(params, body, env)
+
+    // No `return`, no `yield` (which gathers an `Any`) and no way out of the bottom: it never answers.
+    if answers.is_empty() then return never_type()
+
+    var out = answers.at(0).t
+
+    for i in 1..<answers.len()
+        out = joined(out, answers.at(i).t)
+
+    unpinned(out)
+end answer_of
+
+// One place a body can answer from, and what it answers there.
+struct AnswerPoint
+    t: Type
+
+    // The `return`'s value, or the expression the body falls out with -- where a complaint about
+    // the answer belongs.
+    at: Span
+end AnswerPoint
+
+// Every `return` in the body, and the value it falls out with where it can fall out at all.
+//
+// **Read with no branch's narrowing**, as everything here is: a `return x` under `if x is boolean`
+// reads `x` at its declared type. Inference only ever gives up on that, and `check_claim` reads it
+// for what an answer certainly is NOT, which narrowing cannot change.
+//
+// Not `private`: `check_claim` asks it of a type predicate's body.
+answer_points(params: Buf[string], body: Expr, env: *TypeEnv) -> Buf[AnswerPoint]
+    var answers: Buf[AnswerPoint] = buf()
 
     enter_scope(env)
     note_params(params, body, env)
     gather_returns(body, &answers, env)
 
-    val falls = falls_out(body, env)
-
-    falls match
-        Some(t) -> answers.push(t)
-
-        // **A body that cannot fall out of its bottom answers only through its returns**, a function
-        // ending in a `throw` or in a `return` on every branch being the ordinary case.
+    // **A body that cannot fall out of its bottom answers only through its returns**, a function
+    // ending in a `throw` or in a `return` on every branch being the ordinary case. **What falls out
+    // is read inside a result annotation**, whose own type is what was declared rather than found.
+    falls_out(inside_annotation(body), env) match
+        Some(t) -> answers.push(AnswerPoint(t, tail_span(body)))
         None -> ()
 
     leave_scope(env)
+    answers
+end answer_points
 
-    // No `return`, no `yield` (which gathers an `Any`) and no way out of the bottom: it never answers.
-    if answers.is_empty() && falls.is_none() then return never_type()
+private inside_annotation(x: Expr) -> Expr = *x.kind match
+    Ensures(value, _, _, _) -> value
+    _ -> x
 
-    if answers.is_empty() then return type_of(Any)
+// Where a body's fall-out value is written: its last statement, through the wrappers the parser
+// puts around one.
+private tail_span(x: Expr) -> Span
+    *x.kind match
+        Ensures(value, _, _, _) -> tail_span(value)
+        Block(stmts) ->
+            if stmts.is_empty() then return x.span
 
-    var out = answers.at(0)
-
-    for i in 1..<answers.len()
-        out = joined(out, answers.at(i))
-
-    unpinned(out)
-end answer_of
+            *stmts.at(stmts.len() - 1).kind match
+                Eval(e) -> tail_span(e)
+                _ -> stmts.at(stmts.len() - 1).span
+        _ -> x.span
+end tail_span
 
 // Two answers as one, which is the type they agree on and `Any` where they do not.
 //
@@ -256,7 +291,7 @@ end both_ways
 // **A NESTED FUNCTION IS NOT ENTERED.** A `Def` and a `Lambda` carry their body by index rather than
 // in this tree, so a `return` inside one belongs to it and is out of reach here without anything
 // having to say so -- the `Def` arm below skips its defaults for the same reason.
-private gather_returns(x: Expr, into: *Buf[Type], env: *TypeEnv)
+private gather_returns(x: Expr, into: *Buf[AnswerPoint], env: *TypeEnv)
     *x.kind match
         IntLit(_) -> ()
         BigLit(_) -> ()
@@ -282,7 +317,7 @@ private gather_returns(x: Expr, into: *Buf[Type], env: *TypeEnv)
         // statements that can carry a `return`.
         Yield(inner) ->
             gather_returns(inner, into, env)
-            into.push(type_of(Any))
+            into.push(AnswerPoint(type_of(Any), x.span))
         Unary(_, rhs) -> gather_returns(rhs, into, env)
         Binary(_, lhs, rhs) ->
             gather_returns(lhs, into, env)
@@ -351,7 +386,7 @@ private gather_returns(x: Expr, into: *Buf[Type], env: *TypeEnv)
                 gather_in_stmt(stmts.at(i), into, env)
 
             leave_scope(env)
-        Ensures(value, _, _) -> gather_returns(value, into, env)
+        Ensures(value, _, _, _) -> gather_returns(value, into, env)
         TryCatch(body, caught, handler) ->
             gather_returns(body, into, env)
             enter_scope(env)
@@ -360,21 +395,21 @@ private gather_returns(x: Expr, into: *Buf[Type], env: *TypeEnv)
             leave_scope(env)
 end gather_returns
 
-private gather_all(xs: Buf[Expr], into: *Buf[Type], env: *TypeEnv)
+private gather_all(xs: Buf[Expr], into: *Buf[AnswerPoint], env: *TypeEnv)
     for i in 0..<xs.len()
         gather_returns(xs.at(i), into, env)
 
-private gather_maybe(x: Option[Expr], into: *Buf[Type], env: *TypeEnv)
+private gather_maybe(x: Option[Expr], into: *Buf[AnswerPoint], env: *TypeEnv)
     x match
         Some(inner) -> gather_returns(inner, into, env)
         None -> ()
 
-private gather_in_stmt(s: Stmt, into: *Buf[Type], env: *TypeEnv)
+private gather_in_stmt(s: Stmt, into: *Buf[AnswerPoint], env: *TypeEnv)
     *s.kind match
         // **`return` with nothing is a null**, which is what the machine leaves.
         Return(value) -> value match
-            Some(x) -> into.push(type_of_expr(x, env))
-            None -> into.push(type_of(NullType))
+            Some(x) -> into.push(AnswerPoint(type_of_expr(x, env), x.span))
+            None -> into.push(AnswerPoint(type_of(NullType), s.span))
         Val(_, init) -> gather_returns(init, into, env)
         Var(_, init) -> gather_returns(init, into, env)
         Unpack(_, init, _) -> gather_returns(init, into, env)
