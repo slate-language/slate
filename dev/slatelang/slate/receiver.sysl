@@ -1,0 +1,259 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// A METHOD THAT IS A PREDICATE -- which method a call `recv.m(args)` reaches, where the checker can
+// tell, and what that method's test says.
+//
+// A method is a function whose first parameter is handed the object it was called on, so a call
+// `recv.m(a, b)` is the call `m(recv, a, b)` and a predicate's `Narrows` reads it in exactly those
+// coordinates: argument zero is the receiver. That is what makes `this is T` nothing new to the
+// narrowing -- it is a test of parameter zero -- and why an inferred `isCircle(self) = self is
+// Circle` narrows the receiver with no code of its own.
+//
+// **THE METHOD IS FOUND THE WAY THE MACHINE FINDS IT, FROM THE CLASS THE CHECKER KNOWS THE RECEIVER
+// TO BE**: the class's own members first, then up the chain its `from` names, a data variant's
+// chain reaching its data type's shared body. The receiver's class is known where it is a `val`
+// bound to `C(...)`, or where its type is a data type or one of its variants; anywhere else -- a
+// value typed `any`, a class reached through an expression -- nothing is found and nothing narrows.
+//
+// **AN OVERRIDE IS TYPESCRIPT'S RULE: THE STATICALLY KNOWN CLASS DECIDES.** The first member of the
+// name walking up from that class is the one read, predicate or not, so a subclass that overrides
+// with a predicate of its own is read where the receiver is known to be the subclass, and the base's
+// predicate is read where it is only known to be the base -- whatever the run then dispatches to.
+// That is one more place the claim is trusted, exactly as the claim itself is (`predicate.sysl`).
+
+// The class or data type an object literal's members belong to, which is what `this` is in them.
+struct Member
+    name: string
+
+    // What the receiver is known to be: the data type for a data declaration's shared body, and an
+    // object for a class -- a class having no type of its own in this lattice.
+    own: Type
+end Member
+
+// What an imported class's methods say, flattened along its chain at home: every method a call on
+// one would reach that is a predicate, by name.
+struct MethodTests
+    names: Buf[string]
+    tests: Buf[Narrows]
+
+    // Whose own member each one is, which is what lets two variants' tables agree (`method_test`).
+    owners: Buf[string]
+end MethodTests
+
+// How far up a chain of `from`s the lookup walks, which a circular chain would otherwise make
+// endless -- the machine's own ceiling.
+private const ChainLimit: usize = 64
+
+// Whose members an object literal holds, where it is a class's or a data type's shared body. A
+// variant's maker holds a constructor and no members, so it is nobody's.
+//
+// Not `private`: `check_expr`'s ObjectLit arm.
+member_of(keys: Buf[string], values: Buf[Expr]) -> Option[Member]
+    var data: Option[Member] = None
+
+    for i in 0..<keys.len()
+        if keys.at(i) == DataTag then return None
+
+        if keys.at(i) == ClassTag
+            return *values.at(i).kind match
+                StrLit(name) -> Some(Member(name, type_of(ObjectWith(buf(), buf(), buf()))))
+                _ -> None
+
+        if keys.at(i) == ShapeTag
+            *values.at(i).kind match
+                ShapeLit(name, pat) -> data = Some(Member(name, type_from_pattern(pat)))
+                _ -> ()
+
+    data
+end member_of
+
+// The literal a `data` declaration binds a name to -- its shared body, or a variant -- where `init`
+// is one. Not `private`: `what_it_holds`.
+shared_literal(init: Expr) -> Option[Expr]
+    *init.kind match
+        DataLit(inner) -> shared_literal(inner)
+        ObjectLit(keys, _, _) ->
+            var shaped = false
+
+            for i in 0..<keys.len()
+                if keys.at(i) == ClassTag then return None
+                if keys.at(i) == ShapeTag then shaped = true
+
+            if shaped then Some(init) else None
+        _ -> None
+end shared_literal
+
+// What the method a call `target.name(...)` reaches says about its arguments, the receiver being
+// argument zero -- or nothing, where the method is not known or is not a predicate.
+//
+// Not `private`: `called_test` in `narrow.sysl`.
+//
+// **A receiver that may be one of several variants reads the method they all reach**, which for the
+// variants of one data type is the shared body's -- so `s: Circle | Square` narrows on both sides,
+// where a data type alone has no alternative for the false side to take away. Where the
+// alternatives reach different members, nothing is read.
+method_test(target: Expr, name: string, env: *TypeEnv) -> Option[Narrows]
+    val classes = receiver_classes(target, env)
+
+    if classes.is_empty() then return None
+
+    var owner = ""
+    var test: Option[Narrows] = None
+
+    for i in 0..<classes.len()
+        val reached = class_method(env, classes.at(i), name, 0) match
+            Some(r) -> r
+            None -> return None
+
+        if i == 0
+            owner = reached.owner
+            test = reached.test
+        elif reached.owner != owner
+            return None
+
+    test
+end method_test
+
+// Where a method was found, and what it says.
+private struct Reached
+    test: Option[Narrows]
+
+    // The class or data type whose own member it is, which tells two alternatives' lookups apart.
+    owner: string
+end Reached
+
+// The classes the checker knows a receiver to be one of, or none where it does not know.
+private receiver_classes(target: Expr, env: *TypeEnv) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    *target.kind match
+        Name(n) -> bound_to(env, n) match
+            BoundInstance(cls) ->
+                out.push(cls)
+                return out
+            _ -> ()
+        _ -> ()
+
+    val t = type_of_expr(target, env)
+
+    *t.kind match
+        OneOf(alts) ->
+            for i in 0..<alts.len()
+                nominal(alts.at(i)) match
+                    Some(cls) -> out.push(cls)
+                    None -> return buf()
+        _ -> nominal(t) match
+            Some(cls) -> out.push(cls)
+            None -> ()
+
+    out
+end receiver_classes
+
+private nominal(t: Type) -> Option[string] = *t.kind match
+    DataType(name, _) -> Some(name)
+    VariantType(name) -> Some(name)
+    _ -> None
+
+private class_method(env: *TypeEnv, cls: string, name: string, depth: usize) -> Option[Reached]
+    if depth >= ChainLimit then return None
+
+    bound_to(env, cls) match
+        BoundClass(lit) -> literal_method(env, cls, lit, name, depth)
+        BoundShared(lit) -> literal_method(env, cls, lit, name, depth)
+
+        // **Flattened at home, so a name missing from the table is a method that is no predicate**
+        // -- or no method at all, which narrows nothing either.
+        BoundMethods(table) ->
+            for i in 0..<table.names.len()
+                if table.names.at(i) == name then return Some(Reached(Some(table.tests.at(i)), table.owners.at(i)))
+
+            Some(Reached(None, cls))
+        _ -> None
+end class_method
+
+// A member of this literal by that name, or the chain above it where it has none.
+private literal_method(env: *TypeEnv, cls: string, lit: Expr, name: string, depth: usize) -> Option[Reached]
+    *lit.kind match
+        DataLit(inner) -> literal_method(env, cls, inner, name, depth)
+        ObjectLit(keys, _, values) ->
+            for i in 0..<keys.len()
+                if keys.at(i) == name then return Some(Reached(member_test(values.at(i)), cls))
+
+            for i in 0..<keys.len()
+                if keys.at(i) == "proto"
+                    return *values.at(i).kind match
+                        Name(base) -> class_method(env, base, name, depth + 1)
+                        _ -> None
+
+            None
+        _ -> None
+end literal_method
+
+// What one member says, where it is a method whose body or annotation is a predicate.
+private member_test(value: Expr) -> Option[Narrows]
+    *value.kind match
+        Lambda(params, defaults, body, is_async) -> predicate_bound(params, defaults.len(), body_at(body), is_async) match
+            BoundTest(n) -> Some(n)
+            _ -> None
+        _ -> None
+
+// -- across files ----------------------------------------------------------------------------------
+
+// Every predicate a call on an instance of `cls` would reach, for `note_exports` -- walked as
+// `class_method` walks, so a name the class itself declares hides its base's whether or not either
+// is a predicate.
+//
+// Not `private`: `note_exports` in `signatures.sysl`.
+class_tests(env: *TypeEnv, cls: string) -> MethodTests
+    var out = MethodTests(buf(), buf(), buf())
+    var seen: Buf[string] = buf()
+
+    gather_class(env, cls, &out, &seen, 0)
+    out
+end class_tests
+
+private gather_class(env: *TypeEnv, cls: string, out: *MethodTests, seen: *Buf[string], depth: usize)
+    if depth >= ChainLimit then return
+
+    // `holds` is `js_stmt.sysl`'s, whether a list of names has this one.
+    bound_to(env, cls) match
+        BoundClass(lit) -> gather_literal(env, cls, lit, out, seen, depth)
+        BoundShared(lit) -> gather_literal(env, cls, lit, out, seen, depth)
+        BoundMethods(table) ->
+            for i in 0..<table.names.len()
+                if !holds(*seen, table.names.at(i))
+                    seen.push(table.names.at(i))
+                    out.names.push(table.names.at(i))
+                    out.tests.push(table.tests.at(i))
+                    out.owners.push(table.owners.at(i))
+        _ -> ()
+end gather_class
+
+private gather_literal(env: *TypeEnv, cls: string, lit: Expr, out: *MethodTests, seen: *Buf[string], depth: usize)
+    *lit.kind match
+        DataLit(inner) -> gather_literal(env, cls, inner, out, seen, depth)
+        ObjectLit(keys, _, values) ->
+            for i in 0..<keys.len()
+                val key = keys.at(i)
+
+                if key == "proto" || key == "new" || holds(*seen, key) then continue
+
+                seen.push(key)
+
+                member_test(values.at(i)) match
+                    Some(n) ->
+                        out.names.push(key)
+                        out.tests.push(n)
+                        out.owners.push(cls)
+                    None -> ()
+
+            for i in 0..<keys.len()
+                if keys.at(i) == "proto"
+                    *values.at(i).kind match
+                        Name(base) -> gather_class(env, base, out, seen, depth + 1)
+                        _ -> ()
+        _ -> ()
+end gather_literal
