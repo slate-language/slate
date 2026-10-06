@@ -169,7 +169,7 @@ the rule the type exists to keep.
 - **An opaque type takes no type parameters.** A representation over a parameter would have to be
   checked against an argument nobody wrote down when a value is made.
 
-A function imported from another file is normally `any` to the checker. The exception is a function
-whose signature names an opaque type: the checker carries that signature across the import, so the
-boundary is checked where it matters. Imports that do not involve an opaque type are checked
-exactly as before.
+The checker carries every imported function's signature across the import (see
+[Types](types.md#a-function-from-another-file-is-checked-as-one-written-here)), so the boundary is
+checked where it matters. An exported value that is not a function crosses only where its type
+names an opaque type.

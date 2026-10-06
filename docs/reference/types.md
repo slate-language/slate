@@ -1133,6 +1133,22 @@ thing the checker may not do.
   the caller may hold another name for it, and the annotation is checked on the way in and says nothing
   about after.
 
+### A function from another file is checked as one written here
+
+**A call to an imported function gets the checks a call beside its definition gets**: too few or
+too many arguments, and an argument that does not fit an annotated parameter, are refused before the
+program runs. The signature is the one the exporting file was checked with — its defaults, its rest
+parameter and the answer read off its body included — so this holds for a quoted file, a package,
+and one of slate's own modules written in slate alike, and for a name a file re-exports.
+
+- **Only a function crosses.** Any other exported value is `any` in the importing file (unless its
+  type names an [opaque type](opaque-types.md)): the importer holds a snapshot it may change, so a
+  shape read at home could be wrong by the time it is used.
+- **An unannotated parameter takes anything**, there as here.
+- **A function that throws on every path never answers**, imported or not, so a guard ending in a
+  call to one — `if n == null then refuse("…")` — narrows `n` below it exactly as a `throw` would.
+- **`import * as m` binds `m` as `any`**, so `m.f(1, 2)` is a call through a value and is not checked.
+
 ### Where it steps aside
 
 - **A call that spreads** — `f(...xs)` — is not checked for arity, the count being a run-time fact.
