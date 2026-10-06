@@ -1,0 +1,171 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// WHAT A FUNCTION'S TEST SAYS ABOUT ITS ARGUMENTS -- an inferred type predicate, TypeScript 5.5's.
+//
+// `isPresent(m: object | null) -> boolean = m != null` answers exactly what `m != null` answers, so
+// `if isPresent(m) then keys(m) else 0` knows what writing the test inline would have known. This
+// file reads a definition's body and says which test it is; `narrow_by_call` in `narrow.sysl` is
+// where a call to one narrows its arguments, by the very rules an inline test narrows by.
+//
+// **A FILE OF ITS OWN BECAUSE NOTHING HERE NARROWS.** What is here is reading a body and carrying
+// the answer -- beside a definition, a `val`, and across an import -- and what crosses into the
+// narrowing is one type, `Narrows`.
+//
+// **THE RULE IS THE PASS'S: A PREDICATE MAY ONLY SAY WHAT A RUN WOULD FIND, ON BOTH SIDES.** A call
+// to one is narrowed on its false side too, so a body is read as a predicate only where its answer
+// being false says as much as the inline test being false would. That holds for a body that IS one
+// test the walk already narrows on, over a parameter the call gives positionally:
+//
+// - `p == null`, `p != null` (either order), `p is T` and `p is not T` with a pattern that binds
+//   nothing, a bare `p` (truthiness, whose false side `narrow_truthy` already keeps sound), `!` of
+//   any of these, and `&&` of any of these -- over one parameter or several.
+// - `&&` false says nothing, exactly as inline, so a body over two parameters narrows both on the
+//   then side only.
+//
+// **Nothing else is a predicate**: a body of more than one statement, one carrying a `require` or a
+// snapshot, an `async` one, a parameter with a default or the dots, a test of a field, an `||`, and
+// anything this cannot classify. Getting no predicate is always safe -- the call then narrows
+// nothing, which is what it did before there were any.
+//
+// **The body runs no code but the test**, so the value the test looked at is still the argument's
+// when the call returns -- which is why the narrowing a predicate makes is stamped after its own
+// call and survives it, while a path narrowed before the call is still ended by it.
+
+struct Narrows
+    kind: &NarrowsKind
+end Narrows
+
+enum NarrowsKind
+    // `p == null` (`null_side` true) or `p != null` (false): which side of the test says null.
+    PredNull(at: usize, null_side: bool)
+
+    // `p is T`, `t` resolved where the definition was written -- so a call in another file narrows
+    // by the type the predicate's own file meant.
+    PredIs(at: usize, t: Type)
+
+    // A bare `p`, narrowed by truthiness.
+    PredTruthy(at: usize)
+
+    PredNot(inner: Narrows)
+    PredAnd(lhs: Narrows, rhs: Narrows)
+end NarrowsKind
+
+// What a definition's body says about its arguments, if it is a predicate at all.
+//
+// Not `private`: `check_stmts` and `note_answer` note a definition with it, and `what_it_holds` a
+// `val` bound to a lambda.
+predicate_bound(params: Buf[string], defaults: usize, body: Expr, is_async: bool) -> Bound
+    if is_async || params.is_empty() then return BoundPlain
+
+    // **A parameter with a default or the dots is not one a test may name**: the value the test saw
+    // need not be anything the call handed over. Those are the trailing ones.
+    val rest = rest_param(params.at(params.len() - 1)).is_some()
+    val fixed = (if rest then params.len() - 1 else params.len()) - defaults
+
+    val test = the_test(body) match
+        Some(x) -> x
+        None -> return BoundPlain
+
+    classify(test, params, fixed) match
+        Some(n) -> BoundTest(n)
+        None -> BoundPlain
+end predicate_bound
+
+// The one expression a body is, under the checks its annotations became and the `-> type` around
+// it.
+//
+// **Only `CheckType`s may stand above it.** Anything else the parser puts there -- an `Unpack` for a
+// destructured parameter, the `result` and snapshot slots a contract needs -- says the body is more
+// than a test, and the `require` a contract carries is wrapped around the body, not above it.
+private the_test(body: Expr) -> Option[Expr]
+    *body.kind match
+        Ensures(inner, _, _) -> the_test(inner)
+        Block(stmts) ->
+            if stmts.is_empty() then return None
+
+            for i in 0..<stmts.len() - 1
+                *stmts.at(i).kind match
+                    CheckType(_, _, _) -> ()
+                    _ -> return None
+
+            *stmts.at(stmts.len() - 1).kind match
+                Eval(x) -> the_test(x)
+                Return(value) -> value match
+                    Some(x) -> the_test(x)
+                    None -> None
+                _ -> None
+        _ -> Some(body)
+end the_test
+
+private classify(x: Expr, params: Buf[string], fixed: usize) -> Option[Narrows]
+    *x.kind match
+        Name(_) -> param_at(x, params, fixed) match
+            Some(at) -> Some(Narrows(PredTruthy(at)))
+            None -> None
+        IsPattern(subject, pat, negated) ->
+            first_binding(pat) match
+                Some(_) -> return None
+                None -> ()
+
+            param_at(subject, params, fixed) match
+                Some(at) ->
+                    val tested = Narrows(PredIs(at, type_from_pattern(resolve_pattern(pat, 0))))
+
+                    Some(if negated then Narrows(PredNot(tested)) else tested)
+                None -> None
+        Binary(op, lhs, rhs) ->
+            if op == AndAnd
+                val left = classify(lhs, params, fixed) match
+                    Some(n) -> n
+                    None -> return None
+
+                return classify(rhs, params, fixed) match
+                    Some(right) -> Some(Narrows(PredAnd(left, right)))
+                    None -> None
+
+            if op != EqEq && op != BangEq then return None
+
+            if !nothing_but_null(rhs) && !nothing_but_null(lhs) then return None
+
+            param_at(if nothing_but_null(rhs) then lhs else rhs, params, fixed) match
+                Some(at) -> Some(Narrows(PredNull(at, op == EqEq)))
+                None -> None
+        Unary(op, rhs) ->
+            if op != Bang then return None
+
+            classify(rhs, params, fixed) match
+                Some(n) -> Some(Narrows(PredNot(n)))
+                None -> None
+        _ -> None
+end classify
+
+// Which parameter a name in the body is, where it is one a call gives positionally.
+private param_at(x: Expr, params: Buf[string], fixed: usize) -> Option[usize]
+    val name = *x.kind match
+        Name(n) -> n
+        _ -> return None
+
+    for i in 0..<fixed
+        if params.at(i) == name then return Some(i)
+
+    None
+end param_at
+
+private nothing_but_null(x: Expr) -> bool
+    *x.kind match
+        NullLit -> true
+        _ -> false
+
+// What a `val` holds, where that is a predicate: a lambda whose body is one, or another name for a
+// function that is one. Not `private`: `what_it_holds` asks it.
+predicate_held(init: Expr, env: *TypeEnv) -> Bound
+    *init.kind match
+        Lambda(params, defaults, body, is_async) -> predicate_bound(params, defaults.len(), body_at(body), is_async)
+        Name(n) -> bound_to(env, n) match
+            BoundTest(said) -> BoundTest(said)
+            _ -> BoundPlain
+        _ -> BoundPlain
+end predicate_held

@@ -1015,6 +1015,78 @@ say(x: string | number) = if x is string then double(x) else 0
 `double` takes number here, and this is string
 ```
 
+**A function whose body is one test of its parameters narrows what a call hands it**, exactly as the
+test written inline would — TypeScript's inferred type predicate. Nothing is declared: the checker
+reads the body. The test may be a comparison with `null`, an `is`, a bare parameter read for its
+truth, `!` of one, or several joined with `&&`, over parameters with no default and no dots. A call to
+one narrows in both branches, under `!`, `&&` and `||`, below an early exit, under `assert`, and for
+a path of fields handed to it:
+
+```slate
+isPresent(m: object | null) -> boolean = m != null
+isText(v: string | integer) = v is string
+
+count(m: object | null) = if isPresent(m) then keys(m).length else 0
+size(v: string | integer) = if isText(v) then v.length else v + 1
+
+print(count({ a: 1 }), count(null), size("abc"), size(4))
+```
+
+```output
+1 0 3 5
+```
+
+```slate
+isPresent(m: object | null) -> boolean = m != null
+
+val entry = { name: "home", target: { path: "/" } }
+
+first(m: object | null)
+    assert(isPresent(m))
+    keys(m)
+
+print(first(entry.target), if isPresent(entry.target) then keys(entry.target) else [])
+```
+
+```output
+["path"] ["path"]
+```
+
+It travels with the function — to another name a `val` gives it, to a lambda a `val` is bound to,
+and to a file that imports it. The narrowing a predicate makes outlives its own call, the body
+running nothing but the test; a path narrowed before that call is still ended by it, as by any call.
+
+**The false side is narrowed too, so a body is a predicate only where its answer being false says as
+much as the inline test being false would.** `&&` being false says nothing, so a body testing two
+parameters narrows both on the true side only. A truthiness test keeps the rule a bare value has: a
+`string | null` turned down may still be the empty string, and the false side says nothing:
+
+```slate
+filled(s: string | null) = s
+shout(s: string) = upper(s)
+
+say(s: string | null) = if filled(s) then "-" else shout(s)
+```
+
+```error
+`shout` takes string here, and this is string | null
+```
+
+A body of more than one statement is not a predicate, however simple; nor is one with an `||`, a test
+of a field, or a test of anything but a parameter. A call to it narrows nothing:
+
+```slate
+isPresent(m: object | null)
+    val ok = m != null
+    ok
+
+count(m: object | null) = if isPresent(m) then keys(m).length else 0
+```
+
+```error
+`keys` takes object | array here, and this is object | null
+```
+
 ### A callback knows what it is handed
 
 `map`, `filter`, `forEach` and the rest call their function with one element; `sorted` calls its
