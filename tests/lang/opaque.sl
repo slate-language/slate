@@ -8,8 +8,21 @@
 // mistakes before the program runs where it CAN see, and `tests_opaque.sysl` pins that half.
 
 import { GlyphId, Points, glyph, next, twice, fromFive, raw, doubled, bigger, counted, total, pt, add, square } from "./lib/glyphs.sl"
+import { spawn, ask } from slate:actor
 
 anything(v) = v
+
+actor Echo
+    on back(self, v) = v
+
+@test
+async a_value_crosses_to_an_actor_as_its_own_type() =
+    val e = spawn(Echo)
+    val got = await ask(e.back, [glyph(7)])
+
+    assert(got[0] is GlyphId)
+    assertEq(raw(got[0]), 7)
+    assert(got[0] == glyph(7))
 
 @test
 the_declaring_file_uses_the_type_as_its_representation_with_no_cast() =

@@ -18,6 +18,7 @@ Every construct in slate, written down once, in its own place.
 | [Patterns](patterns.md) | `match`, `is`, what binds, what tests, exhaustiveness |
 | [Functions](functions.md) | definitions, lambdas, defaults, named arguments, `...rest` |
 | [Types](types.md) | `type`, annotations, what the checker will and will not say |
+| [Opaque types](opaque-types.md) | `opaque type` — a representation only its own file may treat as one |
 | [Objects](objects.md) | fields, `proto`, the receiver rule, operator methods |
 | [Collections](collections.md) | `Set` and `Map`, any value as a key, `size`, iteration |
 | [Classes](classes.md) | `class`, `from`, `is`, `new`, class patterns |
