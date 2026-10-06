@@ -1,0 +1,315 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+
+// `opaque type GlyphId = integer`: a type that IS its representation inside the file that declared it
+// and is a distinct type everywhere else. `docs/reference/types.md` is the language half; this is
+// the machinery.
+//
+// **THE MACHINE CARRIES THE TYPE, AND IT CARRIES NOTHING ELSE.** A value of one is a `Value.Veiled`
+// -- the representation in a cell, with the number of the declaration that made it -- and the machine
+// treats that cell as its own kind everywhere, the declaring file included: it is not an integer, it
+// has no operator, and a parameter declared `GlyphId` refuses a bare integer. That is what keeps the
+// checker's rule intact: what the checker says about one is exactly what the machine does with one.
+//
+// **WHAT MAKES THE DECLARING FILE SEE THROUGH IT IS CONVERSIONS WRITTEN INTO THAT FILE'S CODE**, never
+// a run-time question about who is asking -- the interpreter could ask a frame, and the JavaScript
+// back end has no frame to ask. Three kinds of instruction, all in `code.sysl`:
+//
+// - **`Veil`** makes a value of the type out of a representation. The CHECKER writes it, at a call
+//   argument, a binding's value or a function's answer, wherever the declaring file hands a
+//   representation to something declared with the type -- so `next(g: GlyphId) -> GlyphId = g + 1`
+//   needs no cast either way.
+// - **`Unveil`** takes the representation back out. The checker writes it where a value of the type
+//   meets something declared with a type the representation fits: in the declaring file always, and
+//   anywhere for a type declared with a bound (`opaque type Points is number = real`), as far as the
+//   bound reaches.
+// - **`UnveilHome`** is the one the COMPILER writes, needing no type at all: in the declaring file,
+//   every operand of an operator, a receiver, a field's or an index's holder and a `for`'s subject
+//   gives up the representation of any type that file declared. An unannotated helper in the module
+//   is handed the value as it is, and `x * 2` on it still works there.
+//
+// **A conversion is only written where the checker can SEE one is owed.** A value it knows nothing
+// about is `Any`, so nothing is written, and the machine refuses what does not fit with the ordinary
+// sentence -- which is the ordinary arrangement in slate: the pass says nothing it is unsure of, and
+// the machine still checks.
+//
+// **Every conversion leaves alone a value it was not written for**: `Veil` a value already of the
+// type or not fitting the representation, `Unveil` anything that is not of the type. So one written
+// twice, or written over an expression that turned out to hold something else, changes nothing --
+// which is what makes keying them by span safe.
+
+// One `opaque type` declaration.
+struct VeilKind
+    // What it is called, and the name of the file that declared it.
+    name: string
+    home: string
+
+    // That file's index in the unit, once it has been compiled; `NoHome` until then. What `UnveilHome`
+    // and the checker compare against, the name being what the PARSER has.
+    home_src: usize
+
+    // What a value of it is made of, and what it may be used as outside -- each resolved when the
+    // declaring file is compiled, so a name inside one means what it means there.
+    rep: Pattern
+    bound: Option[Pattern]
+
+// What `home_src` holds before the declaring file has been compiled. No file has this index.
+const NoHome: usize = 0xffffffffffffffff
+
+// A conversion the checker proved, at the span of the expression it applies to.
+enum Conversion
+    Veil(kind: usize)
+    Unveil(kind: usize)
+
+// -- the declarations --------------------------------------------------------------------------------
+
+// The number of `opaque type name` in file `home`.
+//
+// **Interned when the declaration is PARSED, and by file and name**, so the pattern the parser builds
+// already carries the number and every later pass -- the checker, both back ends, an import -- reads
+// one table. A second parse of the same file answers the same number and writes the new reading
+// over the old, which is what a session or a test that runs one file twice wants.
+//
+// Not `private`: `parse_stmt.sysl` declares one.
+declare_veil(name: string, home: string, rep: Pattern, bound: Option[Pattern]) -> usize
+    val v = current()
+
+    for i in 0..<v.veils.len()
+        if v.veils.at(i).name == name && v.veils.at(i).home == home
+            v.veils.set(i, VeilKind(name, home, NoHome, rep, bound))
+
+            return i
+
+    v.veils.push(VeilKind(name, home, NoHome, rep, bound))
+    v.veils.len() - 1
+end declare_veil
+
+veil_name(k: usize) -> string = current().veils.at(k).name
+
+// `a GlyphId`, which is what a complaint about one calls it.
+//
+// **The article is read off the first letter WHATEVER ITS CASE**, a type's name being capitalised --
+// `an Ems`, where the lower-case rule `article` keeps for words would say `a Ems`. The JavaScript
+// runtime's `typeName` reads it the same way.
+veil_type_name(k: usize) -> string
+    val name = veil_name(k)
+    val b = name.bytes
+
+    if b.len == 0 then return "a value"
+
+    val c = b[0] | 0x20u8
+    val an = c == u8('a') || c == u8('e') || c == u8('i') || c == u8('o') || c == u8('u')
+
+    (if an then "an " else "a ") + name
+end veil_type_name
+
+veil_home(k: usize) -> usize = current().veils.at(k).home_src
+
+veil_rep(k: usize) -> Pattern = current().veils.at(k).rep
+
+veil_bound(k: usize) -> Option[Pattern] = current().veils.at(k).bound
+
+// Whether file `src` declared type `k`.
+veiled_here(k: usize, src: usize) -> bool = veil_home(k) == src
+
+// Whether a file declares any opaque type, which is what decides whether its operands are given
+// `UnveilHome`.
+declares_veils(prog: Program) -> bool
+    for i in 0..<prog.type_pats.len()
+        *prog.type_pats.at(i).kind match
+            VeiledPat(_) -> return true
+            _ -> ()
+
+    false
+end declares_veils
+
+// Record where each of this file's opaque types lives, and read what they are made of the way the
+// file reads every other type.
+//
+// **Called from `open_types` once the file's own and imported types are open**, so a representation
+// naming one of them -- `opaque type Owner = User` -- resolves to what the file means by it. Resolving
+// later, from another file, would read the name in the wrong place.
+//
+// Not `private`: `compile.sysl`'s `open_types` is the caller.
+open_veils(prog: Program, src: usize)
+    val v = current()
+
+    for i in 0..<prog.type_pats.len()
+        val at = prog.type_pats.at(i).span
+
+        *prog.type_pats.at(i).kind match
+            VeiledPat(k) ->
+                val was = v.veils.at(k)
+                val rep = resolve_pattern(was.rep, 0)
+                val bound = was.bound match
+                    Some(b) -> Some(resolve_pattern(b, 0))
+                    None -> None
+
+                v.veils.set(k, VeilKind(was.name, was.home, src, rep, bound))
+
+                // **A representation may not bind, for a `type`'s reason**: a name in it would be
+                // introduced wherever a value is made.
+                first_binding(rep) match
+                    Some(loose) -> complain_here(at, s"`${loose}` is not a type, so `${was.name}` would be made of anything${instead_of(loose)}")
+                    None -> ()
+
+                bound match
+                    Some(b) ->
+                        first_binding(b) match
+                            Some(loose) -> complain_here(at, s"`${loose}` is not a type, so `${was.name}` would be usable as anything${instead_of(loose)}")
+                            None ->
+                                // **A bound the representation does not fit would promise the
+                                // outside something no value of the type is.**
+                                if !fits(type_from_pattern(rep), type_from_pattern(b))
+                                    complain_here(at, s"`${was.name}` is made of ${show_type(type_from_pattern(rep))}, which is not ${show_type(type_from_pattern(b))} -- a bound is what the representation may be used as outside, so it has to be something the representation is")
+                    None -> ()
+            _ -> ()
+end open_veils
+
+// What an answer is given in front of its `-> type` check, in file `src`: a `Veil` where the type is
+// one of the file's own, an `Unveil` (written as `UnveilHome`, the kind being any of the file's) where
+// the file declares one and the type names none of them and is not `any`, and nothing otherwise.
+//
+// **Both back ends ask this**, so a `return` deep in a block -- which no checker follows -- is
+// converted the same way by each.
+answer_conversion(shape: Pattern, src: usize) -> Option[Conversion]
+    *shape.kind match
+        VeiledPat(k) ->
+            if veiled_here(k, src) then return Some(Conversion.Veil(k))
+
+            return None
+        Wild -> return None
+        TypeVarPat(_) -> return None
+        _ -> ()
+
+    if !declares_here(src) || mentions_veil_from(shape, src) then return None
+
+    Some(Conversion.Unveil(0))
+end answer_conversion
+
+// Whether a pattern names any opaque type file `src` declared, anywhere inside it.
+private mentions_veil_from(pat: Pattern, src: usize) -> bool
+    *pat.kind match
+        VeiledPat(k) -> veiled_here(k, src)
+        At(_, inner) -> mentions_veil_from(inner, src)
+        ArrayPat(items, _, _, _) -> any_mentions(items, src)
+        ObjectPat(_, values, _, _) -> any_mentions(values, src)
+        EveryPat(_, element) -> mentions_veil_from(element, src)
+        HoldsPat(_, key, value) -> mentions_veil_from(key, src) || mentions_veil_from(value, src)
+        FnPat(params, result) -> any_mentions(params, src) || mentions_veil_from(result, src)
+        OrPat(alts) -> any_mentions(alts, src)
+        AndPat(parts) -> any_mentions(parts, src)
+        MadeFrom(_, inner) -> mentions_veil_from(inner, src)
+        GenericPat(_, inner) -> mentions_veil_from(inner, src)
+        _ -> false
+end mentions_veil_from
+
+private any_mentions(xs: Buf[Pattern], src: usize) -> bool
+    for i in 0..<xs.len()
+        if mentions_veil_from(xs.at(i), src) then return true
+
+    false
+
+// -- the conversions the checker proved ---------------------------------------------------------------
+
+private conversion_key(at: Span) -> string = s"${at.start}:${at.end}"
+
+// Write one down for the file being checked.
+//
+// Not `private`: the checker's call, binding and answer sites write them.
+record_conversion(at: Span, c: Conversion)
+    val v = current()
+    val src = v.compiling_source
+
+    while v.conversions.len() <= src
+        v.conversions.push(map())
+
+    var table = v.conversions.at(src)
+
+    table.put(conversion_key(at), c)
+    v.conversions.set(src, table)
+end record_conversion
+
+// What file `src` is owed at `at`, if anything.
+//
+// Not `private`: both back ends ask it of every expression in a file that has any.
+conversion_at(src: usize, at: Span) -> Option[Conversion]
+    val v = current()
+
+    if src >= v.conversions.len() then return None
+
+    v.conversions.at(src).get(conversion_key(at))
+
+// Whether file `src` has any conversion at all, which is what spares every other file the lookup.
+converts(src: usize) -> bool
+    val v = current()
+
+    src < v.conversions.len() && !v.conversions.at(src).is_empty()
+
+// Forget one file's, before it is checked again -- a session's next program reusing the index.
+forget_conversions_of(src: usize)
+    val v = current()
+
+    if src < v.conversions.len() then v.conversions.set(src, map())
+
+// Forget all of them, for the next program -- and where every declaration lived, a file index meaning
+// nothing once the unit it indexed is gone. A declaration a later program parses again is given its
+// file back when that file is compiled.
+forget_conversions()
+    val v = current()
+
+    v.conversions.clear()
+    v.veil_exports = map()
+
+    for i in 0..<v.veils.len()
+        val was = v.veils.at(i)
+
+        v.veils.set(i, VeilKind(was.name, was.home, NoHome, was.rep, was.bound))
+end forget_conversions
+
+// Whether file `src` declares an opaque type.
+//
+// Not `private`: `compile_expr.sysl` asks it before writing an `UnveilHome`.
+declares_here(src: usize) -> bool
+    val v = current()
+
+    for i in 0..<v.veils.len()
+        if v.veils.at(i).home_src == src then return true
+
+    false
+end declares_here
+
+// -- the machine's half --------------------------------------------------------------------------------
+//
+// Each of these rewrites the top of the operand stack where it stands, so the value never leaves a
+// root -- `new_veiled` holds the representation across the one allocation besides.
+
+// `Veil`. Not `private`: `run_frames.sysl` is the caller.
+compose_veil(u: *Unit, vm: *Machine, kind: usize, pk: usize)
+    val top = peek(0)
+
+    top match
+        Veiled(p) -> if p.kind == kind then return
+        _ -> ()
+
+    if !match_pattern(u.patterns.at(pk), top, vm.scope, false) then return
+
+    val made = Veiled(new_veiled(kind, top))
+
+    vm.stack.set(vm.stack.len() - 1, made)
+end compose_veil
+
+// `Unveil`.
+compose_unveil(vm: *Machine, kind: usize)
+    peek(0) match
+        Veiled(p) -> if p.kind == kind then vm.stack.set(vm.stack.len() - 1, p.rep)
+        _ -> ()
+
+// `UnveilHome`.
+compose_unveil_home(vm: *Machine, src: usize)
+    peek(0) match
+        Veiled(p) -> if veil_home(p.kind) == src then vm.stack.set(vm.stack.len() - 1, p.rep)
+        _ -> ()

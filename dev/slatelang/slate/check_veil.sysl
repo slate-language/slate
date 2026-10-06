@@ -1,0 +1,189 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// The checker's half of opaque types: where a value of one may be used as its representation, and
+// where a representation may become one -- each answered by WRITING the conversion that makes it so
+// (`veil.sysl` holds the machinery and the argument for it).
+//
+// **Two places ask, and they are the two places a value changes hands.**
+//
+// - **An operand** -- of an operator, a method call, a field read, an index, a `for` -- is
+//   `operand_seen`. In the declaring file the compiler unveils every operand itself, so nothing is
+//   written and the operand is simply read as its representation. Elsewhere only a type with a BOUND
+//   may be used this way, as far as the bound says, and that is written as an `Unveil`.
+// - **A hand-over** -- an argument to a parameter, a binding's value to its annotation, a function's
+//   answer to its `-> type`, an assignment to an annotated `var` -- is `converted`: a representation
+//   handed to the type in its own file is given a `Veil`, and a value of the type handed to something
+//   its representation (or its bound) fits is given an `Unveil`.
+//
+// **Everything else is `fits`, unchanged**, which is what keeps the pass's rule: a value of the type
+// fits the type and nothing else, which is what the machine says too, and the conversions are what
+// make the program the checker is describing the program that runs.
+
+// -- across files ----------------------------------------------------------------------------------
+//
+// **A name imported from another file is `Any` to this pass, and for an opaque type that would leave
+// the boundary unchecked** -- the one place the type exists to guard. So a file's exports whose types
+// NAME an opaque type are written down when the file is checked, and an import of one reads it back.
+// **Only those**: carrying every export's signature across would hold every existing import to a call
+// count and to types it has never been held to, which is a change to the whole language rather than
+// to this feature, and a program that uses no opaque type is checked exactly as it was.
+
+private export_key(src: usize, name: string) -> string = s"${src}:${name}"
+
+// Record this file's exports that name an opaque type, before the file's scope is left.
+//
+// Not `private`: `check_program` is the caller.
+note_veiled_exports(names: Buf[string], env: *TypeEnv)
+    val v = current()
+
+    for i in 0..<names.len()
+        val t = known_type(env, names.at(i))
+
+        if names_veil(t) then v.veil_exports.put(export_key(v.compiling_source, names.at(i)), t)
+end note_veiled_exports
+
+// What an imported name is known to be, where its file wrote it down; `Any` otherwise.
+//
+// Not `private`: `check.sysl`'s import arm asks it of a quoted path.
+imported_veiled(path: string, origin: Origin, name: string) -> Type
+    imported_source(path, origin) match
+        Some(from) -> current().veil_exports.get(export_key(from, name)) match
+            Some(t) -> t
+            None -> type_of(Any)
+        None -> type_of(Any)
+end imported_veiled
+
+// Whether a type says anything about an opaque type, anywhere inside it.
+private names_veil(t: Type) -> bool
+    *t.kind match
+        VeiledType(_) -> true
+        ArrayOf(e) -> names_veil(e)
+        SetOf(e) -> names_veil(e)
+        MapOf(k, e) -> names_veil(k) || names_veil(e)
+        ObjectWith(_, values, _) -> any_names_veil(values)
+        OneOf(alts) -> any_names_veil(alts)
+        FunctionType(params, _, _, result) -> any_names_veil(params) || names_veil(result)
+        _ -> false
+end names_veil
+
+private any_names_veil(ts: Buf[Type]) -> bool
+    for i in 0..<ts.len()
+        if names_veil(ts.at(i)) then return true
+
+    false
+
+// What a value of the type is made of, as a type.
+private rep_type(k: usize) -> Type = type_from_pattern(veil_rep(k))
+
+// What the rest of the program may use it as, if anything.
+private bound_type(k: usize) -> Option[Type] = veil_bound(k) match
+    Some(b) -> Some(type_from_pattern(b))
+    None -> None
+
+// Whether the file being checked declared this one.
+private at_home(k: usize) -> bool = veiled_here(k, current().compiling_source)
+
+// What an operand of this type is read as.
+//
+// **The representation in the declaring file, the bound elsewhere where there is one, and the type
+// itself otherwise** -- which an operator, a method or a field then refuses exactly as the machine
+// does, a value of the type having none of its representation's.
+//
+// Not `private`: `type_of_expr` and the method walk read an operand through it.
+operand_view(t: Type) -> Type
+    *t.kind match
+        VeiledType(k) ->
+            if at_home(k) then return rep_type(k)
+
+            bound_type(k) match
+                Some(b) -> b
+                None -> t
+        _ -> t
+end operand_view
+
+// The same, at an operand the walk is CHECKING, where a bound's reach is written down.
+//
+// **The `Unveil` is written only where the bound is what made the operand usable**, so the machine
+// sees the representation at exactly the spots this pass let the type through; at home the compiler
+// has written `UnveilHome` already and there is nothing to add.
+//
+// Not `private`: `check_expr.sysl` and `calls.sysl` ask it of every operand they check.
+operand_seen(x: Expr, t: Type) -> Type
+    note_operand(x, t)
+    operand_view(t)
+
+// The recording half alone, for a walk that wants nothing back.
+//
+// Not `private`: `check_expr`'s operator, index and comparison arms.
+note_operand(x: Expr, t: Type)
+    *t.kind match
+        VeiledType(k) ->
+            if !at_home(k) && veil_bound(k).is_some() then record_conversion(x.span, Conversion.Unveil(k))
+        _ -> ()
+
+// A compound assignment to a name declared with one of this file's opaque types: its answer is made
+// one again before it is stored, which the operator alone would not do -- its operands having been
+// read as what the type is made of.
+//
+// Not `private`: `check.sysl`'s `Assign` arm.
+note_compound(at: Span, declared: Type)
+    *declared.kind match
+        VeiledType(k) -> if at_home(k) then record_conversion(at, Conversion.Veil(k))
+        _ -> ()
+
+// `note_operand` of an expression the walk has not typed yet.
+note_operand_of(x: Expr, env: *TypeEnv) = note_operand(x, type_of_expr(x, env))
+
+// What a value of `got`, written at `x`, is measured as where `want` is asked for -- writing the
+// conversion the hand-over is owed, if it is owed one.
+//
+// **A representation becomes the type only in the type's own file**, and only where nothing says it
+// is something the representation is not: a value this pass knows nothing about is given a `Veil`
+// too, which leaves it alone at run time unless it fits the representation -- so the check that
+// follows refuses exactly what it would have refused.
+//
+// **A value of the type becomes its representation wherever the representation fits what is
+// wanted** -- at home -- and wherever the BOUND does, elsewhere. Not where `want` is `any` or the type
+// itself (or a union holding it), which take the value as it is.
+//
+// Not `private`: the call, binding, answer and assignment checks ask it.
+converted(x: Expr, got: Type, want: Type) -> Type
+    *want.kind match
+        Any -> return got
+        VeiledType(k) ->
+            *got.kind match
+                VeiledType(g) -> if g == k then return got
+                _ -> ()
+
+            if !at_home(k) then return got
+
+            if !certain(got) || fits(got, rep_type(k))
+                record_conversion(x.span, Conversion.Veil(k))
+
+                return want
+
+            return got
+        _ -> ()
+
+    *got.kind match
+        VeiledType(k) ->
+            if fits(got, want) then return got
+
+            val view = if at_home(k)
+                rep_type(k)
+            else
+                bound_type(k) match
+                    Some(b) -> b
+                    None -> return got
+
+            if fits(view, want)
+                record_conversion(x.span, Conversion.Unveil(k))
+
+                return view
+
+            got
+        _ -> got
+end converted

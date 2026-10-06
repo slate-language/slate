@@ -67,8 +67,12 @@ type_of_expr(x: Expr, env: *TypeEnv) -> Type
         IsPattern(_, _, _) -> type_of(BooleanType)
         Unary(op, rhs) -> op match
             Bang -> type_of(BooleanType)
-            _ -> type_of_expr(rhs, env)
-        Binary(op, lhs, rhs) -> binary_type(op, type_of_expr(lhs, env), type_of_expr(rhs, env))
+            _ -> operand_view(type_of_expr(rhs, env))
+
+        // **An operand is read as what an opaque type lets it be read as** -- its representation in
+        // the declaring file, its bound elsewhere -- which is what the conversions written there
+        // make it at run time (`check_veil.sysl`).
+        Binary(op, lhs, rhs) -> binary_type(op, operand_view(type_of_expr(lhs, env)), operand_view(type_of_expr(rhs, env)))
         Call(callee, args, guarded) ->
             // **A guarded call answers `Any`**, for the reason a guarded field read does: what it
             // answers is either the call's own answer or `null`, and a union this pass invented
@@ -111,7 +115,7 @@ type_of_expr(x: Expr, env: *TypeEnv) -> Type
         Field(target, field, optional) ->
             if optional then return type_of(Any)
 
-            val holder = type_of_expr(target, env)
+            val holder = operand_view(type_of_expr(target, env))
 
             // **A PROPERTY OF A BUILTIN KIND IS WORTH WHAT ITS NATIVE ANSWERS**, so `s.length` is an
             // integer here and a call given it is checked. It is asked before the shape below
@@ -409,7 +413,9 @@ check_expr(x: Expr, env: *TypeEnv)
                 check_expr(rhs, env)
 
             check_binary(op, lhs, rhs, env, at)
-        Unary(_, rhs) -> check_expr(rhs, env)
+        Unary(_, rhs) ->
+            check_expr(rhs, env)
+            note_operand_of(rhs, env)
         Block(stmts) ->
             enter_scope(env)
             check_stmts(stmts, env)
@@ -426,7 +432,10 @@ check_expr(x: Expr, env: *TypeEnv)
         ShapeLit(_, _) -> ()
         ObjectLit(_, _, values) -> for i in 0..<values.len() do check_expr(values.at(i), env)
         Interp(pieces) -> for i in 0..<pieces.len() do check_expr(pieces.at(i), env)
-        Compare(operands, _) -> for i in 0..<operands.len() do check_expr(operands.at(i), env)
+        Compare(operands, _) ->
+            for i in 0..<operands.len()
+                check_expr(operands.at(i), env)
+                note_operand_of(operands.at(i), env)
         Chain(inner) -> check_expr(inner, env)
         Field(target, name, optional) ->
             check_expr(target, env)
@@ -434,6 +443,8 @@ check_expr(x: Expr, env: *TypeEnv)
         Index(target, key, _) ->
             check_expr(target, env)
             check_expr(key, env)
+            note_operand_of(target, env)
+            note_operand_of(key, env)
         WithAll(base, other, _) ->
             check_expr(base, env)
             check_expr(other, env)
@@ -449,8 +460,10 @@ check_expr(x: Expr, env: *TypeEnv)
             // **A body that is one expression is checked against what the definition promised.** A
             // block answers `Any` here and is left alone, which is also what keeps an early `return`
             // out of it: nothing about a block's value is known, so nothing is claimed.
-            val answered = type_of_expr(value, env)
             val promised = type_from_pattern(resolve_pattern(pat, 0))
+
+            // An opaque type may change hands here too, as it may at a call (`check_veil.sysl`).
+            val answered = converted(value, type_of_expr(value, env), promised)
 
             if !fits(answered, promised)
                 complain_here(value.span, s"this was declared to answer ${declared}, and answers ${show_type(answered)}")
@@ -555,7 +568,7 @@ check_expr(x: Expr, env: *TypeEnv)
             // taking the element apart, and what its names catch is the pattern's business.
             val first = env.names.len()
 
-            element_of(type_of_expr(iter, env)) match
+            element_of(operand_seen(iter, type_of_expr(iter, env))) match
                 Some(element) -> *binding.kind match
                     Bind(name) -> note_type(env, name, element)
                     _ -> note_bindings(binding, env)
@@ -746,10 +759,15 @@ private check_otherwise(otherwise: Option[Expr], env: *TypeEnv)
 // **An object is not asked about**, its names being the program's; nor is anything whose type is not
 // certain, which is the ordinary case in unannotated code.
 private check_binary(op: Tok, lhs: Expr, rhs: Expr, env: *TypeEnv, at: Span)
-    if !is_arithmetic(op) && !is_ordering(op) then return
+    // **`&&`, `||` and `??` answer an operand rather than operating on it**, so an opaque value
+    // passes through them as itself; every other operator is handed what its operands may be read
+    // as, which is where a bound's reach is written down.
+    if op == AndAnd || op == OrOr || op == QQ then return
 
-    val a = type_of_expr(lhs, env)
-    val b = type_of_expr(rhs, env)
+    val a = operand_seen(lhs, type_of_expr(lhs, env))
+    val b = operand_seen(rhs, type_of_expr(rhs, env))
+
+    if !is_arithmetic(op) && !is_ordering(op) then return
 
     // **A NUMBER THAT MAY BE NULL IS REFUSED BY EVERY ARITHMETIC AND ORDERING OPERATOR**, because
     // the machine refuses `null < 0` and `null + 1` alike -- *"`<` does not apply to null and an
@@ -861,9 +879,19 @@ private check_field_read(target: Expr, name: string, optional: bool, env: *TypeE
     // second-guess.
     if optional then return
 
-    val t = type_of_expr(target, env)
+    val t = operand_seen(target, type_of_expr(target, env))
 
     if !certain(t) then return
+
+    // **An opaque value read where nothing let it be read as what it is made of has the four
+    // universal methods and no fields at all**, so any other name is the machine's refusal.
+    *t.kind match
+        VeiledType(k) ->
+            if universal_method(name).is_none()
+                complain_here(at, s"`${name}` is not something ${veil_type_name(k)} can do")
+
+            return
+        _ -> ()
 
     val kind = method_kind_word(t)
 
