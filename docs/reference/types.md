@@ -907,9 +907,103 @@ that writes to the name runs at a time the block cannot place at all — so a na
 the three reads as what it was declared, and a call wanting the narrower type is refused there. The
 assignment itself is always measured against the annotation, wherever it is written.
 
-Only a bare name narrows: `o.field is string` says nothing about `o.field`, the next line being free
-to write to the field, and this pass says nothing about an object's fields in any case. And the
-narrowing is a claim that can still be wrong, which is what says it is being checked at all:
+**`assert(c)` narrows the lines below it exactly as an early exit does.** It raises whenever `c` is
+false, so reaching the next line means `c` held — which is `if !c then throw …` written as a call:
+
+```slate
+double(n: integer) = n * 2
+
+val at = indexOf([5, 6, 7], 7)
+
+assert(at != null)
+print(double(at))
+```
+
+```output
+4
+```
+
+That is slate's own `assert`, a statement on its own line; a function a program writes and calls
+`assert` promises nothing, and a condition that says nothing about a name narrows nothing.
+
+**A bare value is a test of its truth**, and slate's truthiness is JavaScript's: `false`, `null`, an
+absence, `0`, `NaN` and `""` are false and everything else is true. So the true side of `if x` takes
+`null` away, and the false side takes away whatever is *never* false — an object, an array, a
+function, a set, a map — which is what makes `if !found then return` the guard it reads as:
+
+```slate
+lookup(name: string) -> object | null = if name == "home" then { path: "/" } else null
+
+describe(name: string)
+    val found = lookup(name)
+
+    if !found then return name + ": none"
+
+    name + ": " + string(keys(found))
+
+print(describe("home"), describe("away"))
+```
+
+```output
+home: ["path"] away: none
+```
+
+**A string or a number tested false may still be one**, the empty string and zero being false too, so
+the false side of a `string | null` says nothing:
+
+```slate
+shout(s: string) = upper(s)
+
+quiet(x: string | null) = if x then "" else shout(x)
+```
+
+```error
+`shout` takes string here, and this is string | null
+```
+
+**A path of fields narrows too** — `o.m`, `a.b.c`, with no index and no `?.` in it — under every test
+above: a comparison with `null`, an `is`, a bare read for its truth, and `assert`:
+
+```slate
+lookup(name: string) -> object | null = if name == "home" then { path: "/" } else null
+
+val entry = { name: "home", target: lookup("home") }
+
+if entry.target != null then print(keys(entry.target))
+```
+
+```output
+["path"]
+```
+
+**Anything that could change the object between the test and the read ends the narrowing**, and
+that is deliberately stricter than TypeScript, which lets a call keep one. A call — a method's
+included — may change any object it can reach, and so may an `await` or a `yield`, which let other
+code run. A write to the root name ends the paths under it; a write to a field or through an index
+ends every path, the object written to being one a path may reach under another name. A function's
+body runs whenever it is called and a loop's next turn runs after its last one, so neither sees a
+path narrowed outside it. A name declared again is another root.
+
+```slate
+lookup(name: string) -> object | null = if name == "home" then { path: "/" } else null
+note(s: string) = s
+
+val entry = { name: "home", target: lookup("home") }
+
+if entry.target != null
+    note("found")
+    print(keys(entry.target))
+```
+
+```error
+`keys` takes object | array here, and this is object | null
+```
+
+Where it errs, it errs toward accepting: a getter is code that runs at every read and may answer
+differently the second time, and an operator a class defined and a `toString` an interpolation asks
+for run code too — none of the three is counted by the rule above.
+
+And the narrowing is a claim that can still be wrong, which is what says it is being checked at all:
 
 ```slate
 double(n: number) = n * 2

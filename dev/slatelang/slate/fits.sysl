@@ -5,9 +5,9 @@ import sysl.buf.{Buf, buf}
 
 // What one type fits, and what is known about a name.
 //
-// **The lattice the check is made of, split out of `check.sysl`, which is the walk over it.** Four
-// names here are not `private` because that walk asks them: `is_kind_of`, `has_name`, `may_narrow`
-// and `narrow_by`.
+// **The lattice the check is made of, split out of `check.sysl`, which is the walk over it.** Three
+// names here are not `private` because that walk asks them: `is_kind_of`, `has_name` and
+// `may_narrow`. What a test does to a name or a path is `narrow.sysl`.
 
 // The static check: what the compiler can say about a program without running it.
 //
@@ -342,9 +342,15 @@ struct TypeEnv
     // ENTRIES rather than a list of names is what lets an inner binding of the same spelling -- a
     // lambda's own parameter -- shadow one, exactly as a read would. `reach.sysl` reads it.
     defaulting: Buf[Defaulting]
+
+    // **WHEN A PATH'S ENTRY WAS MADE**, beside `names` and truncated with it, and zero for every
+    // entry that is not a path. `narrow.sysl` measures it against `clock`, which is what drops a
+    // narrowing of `o.m` at a call or a write that could have changed it.
+    stamps: Buf[usize]
+    clock: PathClock
 end TypeEnv
 
-type_env() -> TypeEnv = TypeEnv(buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf())
+type_env() -> TypeEnv = TypeEnv(buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), path_clock())
 
 enter_scope(e: *TypeEnv)
     e.marks.push(e.names.len())
@@ -380,6 +386,8 @@ private drop_scope(e: *TypeEnv, carry: bool, widen: bool)
             e.tracked.truncate(mark)
             e.shaped.truncate(mark)
             e.bound.truncate(mark)
+            e.stamps.truncate(mark)
+            paths_dropped(e, mark)
 
             for i in 0..<out_names.len()
                 if is_tracked(e, out_names.at(i))
@@ -523,6 +531,7 @@ private push_entry(e: *TypeEnv, name: string, t: Type, declared: Type, settled: 
     e.tracked.push(tracked)
     e.shaped.push(shaped)
     e.bound.push(BoundPlain)
+    e.stamps.push(0)
 
 // What the name just noted was BOUND to, where that is a class or one of its instances.
 //
@@ -637,263 +646,14 @@ may_narrow(e: *TypeEnv, name: string) -> bool
         if e.names.at(i) == name then return e.settled.at(i)
 end may_narrow
 
-// **`x is string` makes `x` a string for as long as the test held.** The feature a reader coming
-// from TypeScript looks for first, and the reason it is safe here is the flag above: a name that may
-// be written to is left alone, so a branch that reassigns what it narrowed cannot leave a stale
-// claim behind.
+// A path's narrowing, as a scope entry, carrying when it was made.
 //
-// **Only a bare name is narrowed.** `o.f is string` would need to say something about `o` that the
-// next line could undo by writing to the field, and this pass says nothing about an object's fields
-// in the first place.
-narrow_by(cond: Expr, want_true: bool, env: *TypeEnv)
-    *cond.kind match
-        IsPattern(subject, pat, negated) ->
-            *subject.kind match
-                Name(name) ->
-                    if !may_narrow(env, name) then return
-
-                    // A pattern that binds tells us nothing; one that tests tells us everything.
-                    val binds = first_binding(pat) match
-                        Some(_) -> true
-                        None -> false
-
-                    if binds then return
-
-                    val narrowed = type_from_pattern(resolve_pattern(pat, 0))
-
-                    // A negated test says on this side what the plain one says on the other, which
-                    // is the same rule read backwards.
-                    if negated != want_true
-                        note_flow(env, name, narrowed)
-                    else
-                        // **THE SIDE THE TEST DID NOT HOLD ON TAKES THE ALTERNATIVE AWAY.** `x is
-                        // string` failing says the value is not a string, so a name declared
-                        // `string | number` holds a number in the else branch -- and until this was
-                        // here the pass refused that call, which is the one mistake it may not make.
-                        without_type(known_type(env, name), narrowed) match
-                            Some(rest) -> note_flow(env, name, rest)
-                            None -> ()
-                _ -> ()
-
-        // **`a && b` narrows by both**, which is what makes `if x is string && x.length > 0` work --
-        // the second operand is already inside the first's narrowing when the machine evaluates it.
-        //
-        // **`x != null` narrows too, and it has to**, because it is how slate asks the question:
-        // `indexOf` answers `integer | null`, `safePath` answers `string | null`, and every one of
-        // those is guarded with a comparison rather than with `is`. Without this a union annotation
-        // could not be written at all -- the pass would refuse the very program the annotation was
-        // describing, which is the one mistake it may not make.
-        Binary(op, lhs, rhs) ->
-            if op == AndAnd && want_true
-                narrow_by(lhs, true, env)
-                narrow_by(rhs, true, env)
-
-            // **`a || b` is that rule on the other side.** Reaching the else means neither operand
-            // held, so both of them narrow by their false side -- which is what makes
-            // `if x == null || done then ... else f(x)` the program it reads as.
-            if op == OrOr && !want_true
-                narrow_by(lhs, false, env)
-                narrow_by(rhs, false, env)
-
-            if op == EqEq || op == BangEq
-                // The name may be written either side of the comparison; only one of the two is a
-                // name and only one is `null`, so this reads both orders without deciding anything.
-                val subject = if is_null_literal(rhs) then lhs elif is_null_literal(lhs) then rhs else lhs
-
-                if is_null_literal(rhs) || is_null_literal(lhs)
-                    *subject.kind match
-                        Name(name) ->
-                            if !may_narrow(env, name) then return
-
-                            // `x == null` on the true side says it IS null, and on the false side
-                            // says it is not; `!=` is the same two answers the other way round.
-                            val says_null = (op == EqEq) == want_true
-
-                            if says_null
-                                note_flow(env, name, type_of(NullType))
-                            else
-                                without_null(known_type(env, name)) match
-                                    Some(rest) -> note_flow(env, name, rest)
-                                    None -> ()
-                        _ -> ()
-
-                // **AND A FIELD COMPARED WITH A LITERAL NARROWS THE NAME THE FIELD IS ON.** Either
-                // order, for the reason the null comparison reads both: only one side of
-                // `r.kind == "err"` is a literal and only one is a field, so asking each way round
-                // decides nothing.
-                val says = (op == EqEq) == want_true
-
-                narrow_field_compare(lhs, rhs, says, env)
-                narrow_field_compare(rhs, lhs, says, env)
-
-        // **A BARE FIELD READ IS A TRUTHINESS TEST**, which is how a result is asked about:
-        // `if r.ok` and `if !r.ok` are what a program writes where the discriminating field is a
-        // boolean, and slate's truthiness is TypeScript's.
-        Field(target, field, optional) ->
-            if !optional then narrow_field_test(target, field, want_true, None, env)
-
-        // **`!c` is `c` with its two sides swapped**, so `if !(x is string) then a else b` narrows
-        // in `b` exactly as `if x is not string` does. Written without this the two spellings of one
-        // test did not mean the same thing.
-        Unary(op, rhs) ->
-            if op == Bang then narrow_by(rhs, !want_true, env)
-        _ -> ()
-end narrow_by
-
-// One side of a comparison read as a field and the other as the literal it is being held against.
-private narrow_field_compare(side: Expr, other: Expr, says: bool, env: *TypeEnv)
-    val text = expr_literal_text(other) match
-        Some(t) -> t
-        None -> return
-
-    *side.kind match
-        Field(target, field, optional) ->
-            if !optional then narrow_field_test(target, field, says, Some(text), env)
-        _ -> ()
-end narrow_field_compare
-
-// **A FIELD TESTED AGAINST A LITERAL NARROWS THE NAME IT IS READ OFF**, which is the discriminated
-// union a reader coming from TypeScript reaches for. Given
-// `{ ok: true, value: string } | { ok: false, error: string }`, `if r.ok` leaves `r` at the first
-// alternative and the else branch at the second -- and `{ ok, value }` results are the shape every
-// `fetch`, `readFile` and `parseJSON` in this language answers with.
-//
-// **IT IS SOUND BECAUSE THE FIELD IS A LITERAL TYPE.** An alternative whose `ok` is the literal
-// `false` cannot be what the value is in a branch that `r.ok` held in: a literal in an annotation is
-// a pattern the machine TESTED where the value arrived, which `{ ok: true, … } = { ok: false, … }`
-// being refused at run time is the proof of. An alternative this cannot judge -- one whose field is
-// an ordinary type, or which does not name the field at all, an object pattern being open -- is
-// KEPT on both sides, that being the direction which says less.
-//
-// `against` is the literal an `==` or `!=` named, or nothing for a bare truthiness test.
-private narrow_field_test(target: Expr, field: string, want: bool, against: Option[string], env: *TypeEnv)
-    val name = *target.kind match
-        Name(n) -> n
-        _ -> return
-
-    if !may_narrow(env, name) then return
-
-    val alts = *known_type(env, name).kind match
-        OneOf(xs) -> xs
-        _ -> return
-
-    var kept: Buf[Type] = buf()
-
-    for i in 0..<alts.len()
-        if field_may_be(alts.at(i), field, want, against) then kept.push(alts.at(i))
-
-    // **Nothing is claimed where nothing was ruled out, and nothing where EVERYTHING was.** The
-    // first is the union the name already had; the second describes a branch no run reaches, where a
-    // claim could only complain about code that never runs.
-    if kept.len() == alts.len() || kept.len() == 0 then return
-
-    note_flow(env, name, if kept.len() == 1 then kept.at(0) else type_of(OneOf(kept)))
-end narrow_field_test
-
-// Whether this alternative could be the value, given what the test said about one of its fields.
-private field_may_be(alt: Type, field: string, want: bool, against: Option[string]) -> bool
-    val lit = field_literal(alt, field) match
-        Some(text) -> text
-        None -> return true
-
-    against match
-        // `r.kind == "err"` keeps the alternatives whose literal IS that text on the true side, and
-        // the ones whose literal is anything else on the false side.
-        Some(text) -> (lit == text) == want
-
-        // A bare `r.ok` is a truthiness test, and slate's rule is TypeScript's: `false`, `0` and
-        // `""` are false, everything else true.
-        None -> literal_is_truthy(lit) == want
-end field_may_be
-
-// The literal a shape says one of its fields is, where it says so at all.
-//
-// **An optional field says nothing**, the value being free not to have it -- and absence is not
-// something this pass may argue from.
-private field_literal(t: Type, field: string) -> Option[string]
-    *t.kind match
-        ObjectWith(keys, values, optional) ->
-            for i in 0..<keys.len()
-                if keys.at(i) == field && !optional.at(i) then return literal_text(values.at(i))
-
-            None
-        _ -> None
-end field_literal
-
-// The canonical spelling of a literal written in the PROGRAM, which is what a field's literal type
-// is compared against. The two spellings are made by one pair of functions in `types.sysl`, so a
-// tested value and an annotated one cannot drift.
-private expr_literal_text(x: Expr) -> Option[string] = *x.kind match
-    BoolLit(v) -> Some(literal_spelling_of_bool(v))
-    IntLit(v) -> Some(literal_spelling_of_int(v))
-    StrLit(v) -> Some(literal_spelling_of_str(v))
-    _ -> None
-
-private is_null_literal(x: Expr) -> bool
-    *x.kind match
-        NullLit -> true
-        _ -> false
-
-// A union with one of its alternatives taken out, or nothing where there was nothing to take.
-//
-// **This is the else branch of a type test**, and the only narrowing that sharpens a type without a
-// test having held: `x is string` failing says as much about a `string | number` as its holding says
-// about the other side.
-//
-// **Nothing where there was nothing to take, and `Any` where taking it leaves nothing.** A name
-// whose type is `Any` stays `Any`, this pass having nothing to sharpen; and a type with every
-// alternative ruled out describes a branch nothing reaches, where a claim could only complain about
-// code that never runs.
-private without_type(t: Type, drop: Type) -> Option[Type]
-    *t.kind match
-        OneOf(alts) ->
-            var kept: Buf[Type] = buf()
-
-            // **`same_type` is already false for `Any` and for a union**, which is exactly the
-            // caution wanted here: taking an alternative away on either would be claiming something
-            // about a value this pass is not sure of, and a claim that is too narrow refuses a
-            // program that runs.
-            for i in 0..<alts.len()
-                if !same_type(alts.at(i), drop) then kept.push(alts.at(i))
-
-            if kept.len() == alts.len() then return None
-
-            // **A UNION WITH EVERYTHING TAKEN OUT OF IT DESCRIBES A BRANCH NOTHING REACHES**, so the
-            // name becomes `Any` there rather than keeping the type the test just ruled out. Keeping
-            // it would leave the pass complaining about code that never runs, which is a complaint
-            // no run could make.
-            if kept.len() == 0 then return Some(type_of(Any))
-            if kept.len() == 1 then return Some(kept.at(0))
-
-            Some(type_of(OneOf(kept)))
-
-        // The same answer where the type was never a union: `x is string` failing on an `x: string`
-        // is the unreachable branch written without one.
-        _ -> if same_type(t, drop) then Some(type_of(Any)) else None
-end without_type
-
-// A union with `null` taken out of it, or nothing where there was no `null` to take.
-//
-// **Nothing where the type is not a union**, because this pass may only sharpen what it already
-// knew: a name whose type is `Any` is still `Any` after a null test, an unannotated value being one
-// this pass has nothing to say about either way.
-private without_null(t: Type) -> Option[Type]
-    *t.kind match
-        OneOf(alts) ->
-            var kept: Buf[Type] = buf()
-
-            for i in 0..<alts.len()
-                *alts.at(i).kind match
-                    NullType -> ()
-                    _ -> kept.push(alts.at(i))
-
-            if kept.len() == alts.len() then return None
-            if kept.len() == 0 then return None
-            if kept.len() == 1 then return Some(kept.at(0))
-
-            Some(type_of(OneOf(kept)))
-        _ -> None
-end without_null
+// Not `private`: `narrow.sysl` makes them. **A path is followed by nothing and joined by nothing** --
+// it is not tracked, so leaving the scope that narrowed it drops it, exactly as a narrowing of a
+// bare name always has been dropped.
+note_path_entry(e: *TypeEnv, key: string, t: Type, stamp: usize)
+    push_entry(e, key, t, t, true, true, false, false)
+    e.stamps.set(e.stamps.len() - 1, stamp)
 
 // -- where two branches meet -----------------------------------------------------------------------
 
