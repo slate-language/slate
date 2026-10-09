@@ -213,6 +213,49 @@ question `.` answers.
 **`=` is for a pattern that binds and `?` is for one that tests**, and each is refused where the other
 belongs.
 
+**`...rest` gathers the fields the pattern did not name into a new object**, TypeScript's object rest.
+It works wherever a pattern does — a binding, a parameter, a `for` head, a `match` arm and `is` — and
+the pattern still matches partially, so with nothing left over `rest` is `{}`:
+
+```slate
+class Point
+    var x
+    var y
+
+val o = { a: 1, b: 2, c: 3 }
+val { b, ...rest } = o
+print(b, rest)
+
+val { title = "Untitled", ...others } = { size: 2 }
+print(title, others)
+
+val { x, ...left } = Point(1, 2)
+print(x, left, left is Point)
+
+describe({ kind, ...details }) = kind + " with " + string(keys(details))
+print(describe({ kind: "box", w: 1, h: 2 }))
+```
+
+```output
+2 {a: 1, c: 3}
+Untitled {size: 2}
+1 {y: 2} false
+box with ["w", "h"]
+```
+
+**What `rest` holds is what [`keys`](objects.md) walks**: the object's own fields, less
+the ones the pattern named — a field a default stood in for included. A class or data value's `proto`
+and its tags are machinery and stay behind, and the copy is a plain object of no class. **A rest is
+a plain name and it comes last**; anything written after it is refused:
+
+```slate
+val { ...rest, a } = { a: 1, b: 2 }
+```
+
+```error
+a rest element must be last in a destructuring pattern
+```
+
 ## Array patterns
 
 **An array pattern says how many elements the array has**, and a `...` is what opens it. So `[a, b]`
