@@ -170,6 +170,9 @@ what the caller asked for.
 **The one thing that replaced them is `main_vm`**, the storage for the *program's own* VM, marked
 process-wide for the plain reason that a process has one and it has to outlive everything, including
 a `main` that has returned into a libuv callback. A second VM is an ordinary local somebody owns.
+It is `@main_thread`, and every thread's copy of `the_vm` starts out pointing at it: only the
+program's own thread reads through that starting value, every actor thread entering a VM of its own
+first, and a debug build traps a touch of it from any other thread.
 
 ### Class A — none owed, and the two shapes the 49 turned out to be
 
