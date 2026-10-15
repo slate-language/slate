@@ -1,75 +1,60 @@
-// `o[k]` reads what `o.k` reads, on both back ends -- JavaScript's rule.
+// A type declared or imported under one of slate's own kind words.
 //
-// **A computed name finds an inherited member**: a method a class shares, a `get`, a field up a
-// hand-built chain, the universal methods, and a key that is not a string up the same chain. What
-// reports what an object HOLDS stays its own -- `has`, `keys`, `entries` and a computed write -- and a
-// string key on a builtin kind reads that kind's property or method. The interpreter's `read_at` and
-// the runtime's `index` are the two halves.
+// **A local wins**: a name in a pattern is shadowed exactly as it is everywhere else, so where this
+// file has a `Set`, `is Set`, `x: Set`, a `match` arm and `Set.test` all mean the declaration. The
+// parser reads a kind word before anything is in scope, so `resolve_pattern` is where the
+// declaration is found -- and both back ends resolve through it.
 
-class Greeter
-    var name
+import { Map, Ledger as array, aBuiltinSet, isTheSetKind } from "./mods/kinds.sl"
 
-    greet(self) = "hi " + self.name
+class Set
+    var n
 
-    get shout(self) = upper(self.name)
+data period
+    Weekly
+    Monthly(day)
 
-at(o, k) = o[k]
+type integer = { count: number }
 
-val g = Greeter.new("ann")
+// -- `is` ----------------------------------------------------------------------------------------
 
-// -- a class instance ------------------------------------------------------------------------------
+print(Set(4) is Set, Map(1) is Map, array(0) is array, Weekly is period, { count: 2 } is integer)
+print(aBuiltinSet() is Set, [1] is array, 3 is integer, Set(4) is Map)
 
-print(at(g, "greet") is function, at(g, "greet") == g.greet, at(g, "greet")(g))
-print(at(g, "shout"), g["nope"] ?? "nothing")
+// -- an annotation -------------------------------------------------------------------------------
 
-// -- a hand-built chain ------------------------------------------------------------------------------
+sizeOf(m: Map) = m.size
+countOf(c: integer) = c.count
+dayOf(p: period) = p match
+    Monthly(d) -> d
+    _ -> 0
 
-val top = { x: 1 }
-val leaf = { proto: { proto: top, y: 2 }, z: 3 }
+print(sizeOf(Map(7)), countOf({ count: 8 }), dayOf(Monthly(9)), dayOf(Weekly))
 
-print(at(leaf, "x"), at(leaf, "y"), at(leaf, "z"), at({ proto: top, x: 9 }, "x"))
+// -- a `match` arm -------------------------------------------------------------------------------
 
-var base = {}
-var child = { proto: base }
+which(v) = v match
+    Set -> "the class"
+    Map -> "the import"
+    array -> "the renamed import"
+    period -> "the data type"
+    integer -> "the alias"
+    _ -> "something else"
 
-base[1] = "one"
-base[[2, 3]] = "pair"
-child[4] = "four"
+print(which(Set(1)), which(Map(1)), which(array(1)), which(Monthly(1)), which({ count: 1 }))
+print(which(aBuiltinSet()), which(5), which([5]))
 
-print(at(child, 1), at(child, [2, 3]), at(child, 4), child[5] ?? "nothing")
+// -- the type as a value -------------------------------------------------------------------------
 
-// -- the universal methods ---------------------------------------------------------------------------
+print(Set.test(Set(1)), Set.test(aBuiltinSet()), Map.test(Map(2)), period.test(Weekly))
+print(Set.mismatch(Set(1)).length, Set.mismatch(aBuiltinSet()).length > 0)
 
-val o = { a: 1 }
+// -- a parameter of the same name shadows the class in its turn ---------------------------------
 
-print(at(o, "toString") is function, at(o, "toString")(o))
+shadowedAgain(Set, v) = v is Set
 
-// -- what stays the object's own ---------------------------------------------------------------------
+print(shadowedAgain(1, Set(1)))
 
-var mine = { proto: { n: 10 }, y: 2 }
+// -- the control: a file that declares no `Set` still means the kind -------------------------------
 
-print(has(mine, "y"), has(mine, "n"), has(g, "greet"), keys(mine), keys(g))
-
-mine["n"] += 1
-mine["m"] = 7
-
-print(mine.n, mine.proto.n, has(mine, "n"), keys(mine))
-print(at(mine with { y: 3 }, "y"), at(without(mine, "n"), "n"))
-
-// -- a builtin kind ----------------------------------------------------------------------------------
-
-val xs = [1, 2, 3]
-
-print(at(xs, "length"), at("héllo", "length"), at(toBytes("ab"), "length"))
-print(at(Set([1, 2]), "size"), at(Map([["a", 1]]), "size"))
-print(at(xs, "map") == xs.map, at(xs, "map")(xs, x -> x * 2), at("abc", "upper")("abc"))
-
-try
-    at(xs, "nope")
-catch e
-    print(e.message)
-
-try
-    at(null, "length")
-catch e
-    print(e.message)
+print(isTheSetKind(aBuiltinSet()), isTheSetKind(Set(1)))

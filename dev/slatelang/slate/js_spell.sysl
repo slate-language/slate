@@ -17,12 +17,18 @@ import sysl.buf.{Buf, buf}
 // which JavaScript then resolves outward exactly as the machine does. A `var` would hoist the local
 // over the read instead, which is the same defect wearing a different hat.
 //
-// **A read inside a function written in the block is DEFERRED, and takes the new spelling wherever
-// it stands.** A lambda runs when it is called, and a lambda written above the declaration is almost
-// always called after it -- two local functions that call each other are the ordinary case -- so it
-// reads the block's own binding, as the interpreter's scope lookup at call time does. That is also
-// why only DIRECT reads decide whether a block needs a new spelling at all: a lambda mentioning a
-// later local was never in its dead zone.
+// **A read inside a function written in the block is DEFERRED, and what it finds is decided when it
+// RUNS** -- the interpreter looks the name up at call time, so before the local's declaration has
+// executed it finds the outer binding and after it the local. Only DIRECT reads decide whether a
+// block needs a new spelling at all; a deferred one decides whether the local is GUARDED:
+//
+// - **A local with an outer binding that a function in the block mentions is declared at the head
+//   of the block**, `let made$7 = $.unbound;`, and its declaration becomes an assignment. A deferred
+//   read is then `(made$7 === $.unbound ? made : made$7)`, which asks the question the machine asks
+//   at the moment the read runs. A lambda called during the local's own initialiser is the case.
+// - **Anything else stays a `const`.** A local with no outer binding has nothing to fall back to --
+//   the read is a fault on both hosts -- and one no function mentions has no deferred read, so
+//   ordinary code is emitted exactly as it always was.
 //
 // **Every binder takes the spelling too, not only the declaration.** A parameter, a pattern or a
 // nested `val` naming `made` below the declaration shadows it; spelling all of them alike keeps
@@ -43,6 +49,13 @@ struct Spelling
 
     // Whether its declaration has been written. Above that line a direct read is the OUTER binding's.
     live: bool
+
+    // Whether it was declared at the head of its block holding `$.unbound`, so that a deferred read
+    // can ask whether the declaration has run.
+    guarded: bool
+
+    // Which open block declared it, counted as `JsSpelling.blocks` counts them.
+    block: usize
 end Spelling
 
 // What the emitter knows about spellings at the point being written.
@@ -61,11 +74,17 @@ struct JsSpelling
 
     // The spellings the file's top level gave, kept for its exports once its block has closed.
     top: Buf[Spelling]
+
+    // Every name the blocks open around this point bind, which is what an outer binding is.
+    visible: Buf[string]
+
+    // The builtins, which are outer bindings everywhere; read once, when first wanted.
+    builtins: Option[Buf[string]]
 end JsSpelling
 
-fresh_spelling() -> JsSpelling = JsSpelling(buf(), buf(), 0, 0, buf())
+fresh_spelling() -> JsSpelling = JsSpelling(buf(), buf(), 0, 0, buf(), buf(), None)
 
-// The JavaScript name a local is written under at this point.
+// The JavaScript name a local is written under at this point, for a binding or a write.
 //
 // Not `private`: every file of the back end that writes a binding or a read of one asks it.
 spelled(j: *Js, name: string) -> string
@@ -82,6 +101,53 @@ spelled(j: *Js, name: string) -> string
     js_name(name)
 end spelled
 
+// The JavaScript expression a READ of a name is written as at this point.
+//
+// **It differs from `spelled` only for a guarded local read from a function**, which may run before
+// the declaration has: the read asks the sentinel, and falls back to whatever the same read would
+// have meant without this local -- itself possibly another guarded one further out.
+//
+// Not `private`: `js_expr.sysl`'s `Name` arm and the patterns in `js_pat.sysl` that look a class up.
+read_spelled(j: *Js, name: string) -> string = read_below(j, name, j.spelling.entries.len())
+
+private read_below(j: *Js, name: string, from: usize) -> string
+    val es = j.spelling.entries
+    var k = from
+
+    while k > 0
+        k -= 1
+
+        val e = es.at(k)
+
+        if e.name != name then continue
+
+        if e.guarded && j.spelling.depth > e.depth
+            return s"(${e.js} === $$.unbound ? ${read_below(j, name, k)} : ${e.js})"
+
+        if e.live || j.spelling.depth > e.depth then return e.js
+
+    js_name(name)
+end read_below
+
+// Whether the block being written declared this name at its head, so its declaration assigns.
+//
+// Not `private`: `js_stmt.sysl`'s `declaring` asks it.
+guarded_here(j: *Js, name: string) -> bool
+    val es = j.spelling.entries
+    var k = es.len()
+
+    while k > 0
+        k -= 1
+
+        val e = es.at(k)
+
+        if e.block != j.spelling.blocks then return false
+
+        if e.name == name then return e.guarded
+
+    false
+end guarded_here
+
 // The same question asked once the file's block has closed, which is where its exports are written.
 //
 // Not `private`: `js.sysl`'s exports and test registrations ask it.
@@ -95,29 +161,75 @@ module_spelled(j: *Js, name: string) -> string
 end module_spelled
 
 // Give a spelling to every name the run of statements reads directly before the statement that
-// declares it. `already` is what the block holds before its first statement -- a function's
-// parameters, a binder's names -- which a read is a read of.
+// declares it, and guard every local a function in the run may read before it is bound. `already`
+// is what the block holds before its first statement -- a function's parameters, a binder's names --
+// which a read is a read of.
+//
+// **The guarded locals are declared here**, at the head of the block and before any statement in it
+// can run a function that reads one.
 //
 // Not `private`: `js_stmt.sysl`'s `open_block` asks it.
 spell_early(j: *Js, stmts: Buf[Stmt], already: Buf[string])
     var declared = already.copy()
     var reads: Buf[string] = buf()
     var early: Buf[string] = buf()
+    var later: Buf[string] = buf()
+    var firsts: Buf[string] = buf()
 
     // **A definition hoists**, so a read above one is a read of it, and it is never respelled.
     hoisted_defs(stmts, &declared)
 
     for i in 0..<stmts.len()
-        scan_early(stmts.at(i), &declared, &reads, &early)
+        scan_early(stmts.at(i), &declared, &reads, &early, &later, &firsts)
+
+    var guarded: Buf[string] = buf()
+
+    for i in 0..<firsts.len()
+        val name = firsts.at(i)
+
+        if holds(later, name) && bound_outside(j, name) then guarded.push(name)
 
     for i in 0..<early.len()
-        val name = early.at(i)
+        give_spelling(j, early.at(i), holds(guarded, early.at(i)))
 
-        j.tmp += 1
-        j.spelling.entries.push(Spelling(name, js_name(name) + "$" + s"${j.tmp}", j.spelling.depth, false))
+    for i in 0..<guarded.len()
+        val name = guarded.at(i)
+
+        if !holds(early, name)
+            give_spelling(j, name, true)
+            early.push(name)
+
+    for i in 0..<guarded.len()
+        line(j, s"let ${spelled_in_block(j, guarded.at(i))} = $$.unbound;")
 
     j.spelling.early = early
 end spell_early
+
+private give_spelling(j: *Js, name: string, guarded: bool)
+    j.tmp += 1
+    j.spelling.entries.push(Spelling(name, js_name(name) + "$" + s"${j.tmp}", j.spelling.depth, false, guarded, j.spelling.blocks))
+
+// What the block being opened calls a name it has just spelled.
+private spelled_in_block(j: *Js, name: string) -> string
+    val es = j.spelling.entries
+    var k = es.len()
+
+    while k > 0
+        k -= 1
+
+        if es.at(k).name == name then return es.at(k).js
+
+    js_name(name)
+end spelled_in_block
+
+// Whether something around the block binds this name: a block open around it, or a builtin.
+private bound_outside(j: *Js, name: string) -> bool
+    if holds(j.spelling.visible, name) then return true
+
+    if j.spelling.builtins.is_none() then j.spelling.builtins = Some(builtin_names())
+
+    holds(j.spelling.builtins.unwrap(), name)
+end bound_outside
 
 // The declaration of `name` is being written: from here on a direct read is the block's own.
 //
@@ -133,7 +245,7 @@ went_live(j: *Js, name: string)
         val e = j.spelling.entries.at(k)
 
         if e.name == name && e.depth == j.spelling.depth
-            if !e.live then j.spelling.entries.set(k, Spelling(e.name, e.js, e.depth, true))
+            if !e.live then j.spelling.entries.set(k, Spelling(e.name, e.js, e.depth, true, e.guarded, e.block))
 
             return
 end went_live
@@ -156,17 +268,19 @@ shape_thunk(j: *Js, name: string, pat: Pattern) -> string
 end shape_thunk
 
 // One statement of the run: what it reads, then what it declares, in the order they happen.
+// `later` gathers every name a function written in it mentions, and `firsts` every name it is the
+// first in the block to declare.
 //
 // **A `Group` is walked statement by statement, because that is the order it binds in.** A `data`
 // line is its shared object and then each variant, every variant reading the object above it; an
 // annotated `val` is the binding and then its check. So a read of the group's name ABOVE the group is
 // a read of the outer binding, and a read inside it after the name is bound is the group's own --
 // exactly what an ordinary statement gets.
-private scan_early(s: Stmt, declared: *Buf[string], reads: *Buf[string], early: *Buf[string])
+private scan_early(s: Stmt, declared: *Buf[string], reads: *Buf[string], early: *Buf[string], later: *Buf[string], firsts: *Buf[string])
     *s.kind match
         Group(stmts) ->
             for m in 0..<stmts.len()
-                scan_early(stmts.at(m), declared, reads, early)
+                scan_early(stmts.at(m), declared, reads, early, later, firsts)
 
             return
         _ -> ()
@@ -174,7 +288,7 @@ private scan_early(s: Stmt, declared: *Buf[string], reads: *Buf[string], early: 
     var here: Buf[string] = buf()
 
     respellable(s, &here)
-    direct_stmt_reads(s, reads)
+    direct_stmt_reads(s, reads, later)
 
     for n in 0..<here.len()
         val name = here.at(n)
@@ -182,6 +296,7 @@ private scan_early(s: Stmt, declared: *Buf[string], reads: *Buf[string], early: 
         if holds(*declared, name) then continue
 
         declared.push(name)
+        firsts.push(name)
 
         if holds(*reads, name) && !holds(*early, name) then early.push(name)
 end scan_early
@@ -203,120 +318,122 @@ private hoisted_defs(stmts: Buf[Stmt], into: *Buf[string])
             Group(inner) -> hoisted_defs(inner, into)
             _ -> ()
 
-// What a statement reads as it runs, leaving out every function body it writes.
-private direct_stmt_reads(s: Stmt, into: *Buf[string])
+// What a statement reads as it runs, leaving out every function body it writes -- whose names go
+// to `later` instead.
+private direct_stmt_reads(s: Stmt, into: *Buf[string], later: *Buf[string])
     *s.kind match
-        Def(_, _, _, _, _) -> ()
+        Def(_, params, defaults, body, _) -> reachable_from(params, defaults, body, later)
         TypeDecl(_, _) -> ()
         ExternalDecl(_, _) -> ()
-        Val(_, init) -> direct_reads(init, into)
-        Var(_, init) -> direct_reads(init, into)
-        Unpack(_, init, _) -> direct_reads(init, into)
-        Using(bind, _) -> direct_stmt_reads(bind, into)
+        Val(_, init) -> direct_reads(init, into, later)
+        Var(_, init) -> direct_reads(init, into, later)
+        Unpack(_, init, _) -> direct_reads(init, into, later)
+        Using(bind, _) -> direct_stmt_reads(bind, into, later)
         Group(stmts) ->
             for i in 0..<stmts.len()
-                direct_stmt_reads(stmts.at(i), into)
+                direct_stmt_reads(stmts.at(i), into, later)
         Assign(_, target, value) ->
-            direct_reads(target, into)
-            direct_reads(value, into)
+            direct_reads(target, into, later)
+            direct_reads(value, into, later)
         MultiAssign(_, targets, values) ->
-            each_direct(targets, into)
-            each_direct(values, into)
-        Eval(e) -> direct_reads(e, into)
-        Return(value) -> maybe_direct(value, into)
-        Throw(value) -> direct_reads(value, into)
-        Break(_, value) -> maybe_direct(value, into)
+            each_direct(targets, into, later)
+            each_direct(values, into, later)
+        Eval(e) -> direct_reads(e, into, later)
+        Return(value) -> maybe_direct(value, into, later)
+        Throw(value) -> direct_reads(value, into, later)
+        Break(_, value) -> maybe_direct(value, into, later)
         Continue(_) -> ()
         ImportNames(_, _, _, _, _) -> ()
         ImportAll(_, _, _, _) -> ()
         ImportAsset(_, _, _) -> ()
         CheckType(name, _, _) -> into.push(name)
-        Clause(_, _, _, _, cond) -> direct_reads(cond, into)
+        Clause(_, _, _, _, cond) -> direct_reads(cond, into, later)
 end direct_stmt_reads
 
 // Every name an expression reads as it is evaluated.
 //
-// **A lambda's body is left out, and that is the whole of the rule** -- see the header. A nested
-// block, branch, loop or `match` is walked into: it runs where it stands, and a name it declares for
-// itself only makes this answer larger, which costs a spelling nobody needed and nothing else.
+// **A lambda's body is left out, and that is the whole of the rule** -- see the header. Its names go
+// to `later`, less its own parameters. A nested block, branch, loop or `match` is walked into: it
+// runs where it stands, and a name it declares for itself only makes this answer larger, which costs
+// a spelling nobody needed and nothing else.
 //
 // **Exhaustive over `ExprKind` on purpose**, for `free_names`' reason in `slots.sysl`: a node added
 // later that quietly reads nothing here is a dead zone node finds and nothing reports.
-private direct_reads(x: Expr, into: *Buf[string])
+private direct_reads(x: Expr, into: *Buf[string], later: *Buf[string])
     *x.kind match
         Name(n) -> into.push(n)
-        Lambda(_, _, _, _) -> ()
+        Lambda(params, defaults, body, _) -> reachable_from(params, defaults, body, later)
 
         // A class's own shape, which the runtime reads lazily.
         ShapeLit(_, _) -> ()
         MatchExpr(subject, arms) ->
-            direct_reads(subject, into)
+            direct_reads(subject, into, later)
 
             for i in 0..<arms.len()
                 val arm = arms.at(i)
 
-                maybe_direct(arm.guard, into)
-                direct_reads(arm.body, into)
+                maybe_direct(arm.guard, into, later)
+                direct_reads(arm.body, into, later)
         For(_, _, iter, body, otherwise, _) ->
-            direct_reads(iter, into)
-            direct_reads(body, into)
-            maybe_direct(otherwise, into)
+            direct_reads(iter, into, later)
+            direct_reads(body, into, later)
+            maybe_direct(otherwise, into, later)
         TryCatch(body, _, handler) ->
-            direct_reads(body, into)
-            direct_reads(handler, into)
-        Spread(inner) -> direct_reads(inner, into)
-        Named(_, value) -> direct_reads(value, into)
-        Unary(_, rhs) -> direct_reads(rhs, into)
+            direct_reads(body, into, later)
+            direct_reads(handler, into, later)
+        Spread(inner) -> direct_reads(inner, into, later)
+        Named(_, value) -> direct_reads(value, into, later)
+        Unary(_, rhs) -> direct_reads(rhs, into, later)
         Binary(_, lhs, rhs) ->
-            direct_reads(lhs, into)
-            direct_reads(rhs, into)
+            direct_reads(lhs, into, later)
+            direct_reads(rhs, into, later)
         Call(callee, args, _) ->
-            direct_reads(callee, into)
-            each_direct(args, into)
+            direct_reads(callee, into, later)
+            each_direct(args, into, later)
         Index(target, key, _) ->
-            direct_reads(target, into)
-            direct_reads(key, into)
-        Field(target, _, _) -> direct_reads(target, into)
-        Chain(inner) -> direct_reads(inner, into)
-        ArrayLit(items) -> each_direct(items, into)
+            direct_reads(target, into, later)
+            direct_reads(key, into, later)
+        Field(target, _, _) -> direct_reads(target, into, later)
+        Chain(inner) -> direct_reads(inner, into, later)
+        ArrayLit(items) -> each_direct(items, into, later)
         ArrayRepeat(value, count) ->
-            direct_reads(value, into)
-            direct_reads(count, into)
-        Interp(pieces) -> each_direct(pieces, into)
+            direct_reads(value, into, later)
+            direct_reads(count, into, later)
+        Interp(pieces) -> each_direct(pieces, into, later)
         WithFields(base, _, values) ->
-            direct_reads(base, into)
-            each_direct(values, into)
+            direct_reads(base, into, later)
+            each_direct(values, into, later)
         WithAll(base, other, _) ->
-            direct_reads(base, into)
-            direct_reads(other, into)
-        ObjectLit(_, _, values) -> each_direct(values, into)
-        DataLit(inner) -> direct_reads(inner, into)
-        Compare(operands, _) -> each_direct(operands, into)
+            direct_reads(base, into, later)
+            direct_reads(other, into, later)
+        ObjectLit(_, _, values) -> each_direct(values, into, later)
+        DataLit(inner) -> direct_reads(inner, into, later)
+        Compare(operands, _) -> each_direct(operands, into, later)
         Range(lo, hi, _, step) ->
-            maybe_direct(lo, into)
-            maybe_direct(hi, into)
-            maybe_direct(step, into)
-        IsPattern(subject, _, _) -> direct_reads(subject, into)
-        IncDec(target, _, _) -> direct_reads(target, into)
-        Await(inner) -> direct_reads(inner, into)
-        Yield(inner) -> direct_reads(inner, into)
+            maybe_direct(lo, into, later)
+            maybe_direct(hi, into, later)
+            maybe_direct(step, into, later)
+        IsPattern(subject, _, _) -> direct_reads(subject, into, later)
+        IncDec(target, _, _) -> direct_reads(target, into, later)
+        Await(inner) -> direct_reads(inner, into, later)
+        Yield(inner) -> direct_reads(inner, into, later)
         IfExpr(cond, then_branch, else_branch) ->
-            direct_reads(cond, into)
-            direct_reads(then_branch, into)
-            maybe_direct(else_branch, into)
+            direct_reads(cond, into, later)
+            direct_reads(then_branch, into, later)
+            maybe_direct(else_branch, into, later)
         While(_, cond, body, otherwise) ->
-            direct_reads(cond, into)
-            direct_reads(body, into)
-            maybe_direct(otherwise, into)
-        Loop(_, body) -> direct_reads(body, into)
+            direct_reads(cond, into, later)
+            direct_reads(body, into, later)
+            maybe_direct(otherwise, into, later)
+        Loop(_, body) -> direct_reads(body, into, later)
         DoWhile(_, body, cond, otherwise) ->
-            direct_reads(body, into)
-            direct_reads(cond, into)
-            maybe_direct(otherwise, into)
+            direct_reads(body, into, later)
+            direct_reads(cond, into, later)
+            maybe_direct(otherwise, into, later)
         Block(stmts) ->
             for i in 0..<stmts.len()
-                direct_stmt_reads(stmts.at(i), into)
-        Ensures(value, _, _, _) -> direct_reads(value, into)
+                direct_stmt_reads(stmts.at(i), into, later)
+        Ensures(value, _, _, _) -> direct_reads(value, into, later)
         IntLit(_) -> ()
         BigLit(_) -> ()
         RealLit(_) -> ()
@@ -327,10 +444,10 @@ private direct_reads(x: Expr, into: *Buf[string])
         Bad -> ()
 end direct_reads
 
-private each_direct(xs: Buf[Expr], into: *Buf[string])
+private each_direct(xs: Buf[Expr], into: *Buf[string], later: *Buf[string])
     for i in 0..<xs.len()
-        direct_reads(xs.at(i), into)
+        direct_reads(xs.at(i), into, later)
 
-private maybe_direct(x: Option[Expr], into: *Buf[string]) = x match
-    Some(e) -> direct_reads(e, into)
+private maybe_direct(x: Option[Expr], into: *Buf[string], later: *Buf[string]) = x match
+    Some(e) -> direct_reads(e, into, later)
     None -> ()

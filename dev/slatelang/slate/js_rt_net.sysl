@@ -15,12 +15,14 @@ module dev.slatelang.slate
 //
 // ## What is here and what is still owed
 //
-// **TLS is not.** `startTls` and a listener told a certificate both refuse, naming TLS, because a
-// handshake in this back end is node's `tls` and not OpenSSL -- a different trust store, a different
-// set of sentences for a certificate that does not verify, and nothing here has been run against
-// either. `alpnProtocol` IS here and answers `null`, which is what a plain socket answers on both
-// back ends and is what `slate:http` reads to tell HTTP/2 from HTTP/1.1: without it every `serve`
-// would fault at its first byte over a question whose answer is *no*.
+// **`startTls` is here, at both ends, over node's `tls`; a listener told a certificate is not**, and
+// refuses naming TLS. The upgrade is node's own STARTTLS -- the open socket handed to `tls`, which
+// wraps the handle it stands on -- and the options and the slate sentences are the interpreter's.
+// What differs is what is not slate's: node's trust store is its bundled roots where the
+// interpreter's is the machine's (`trust` is added to either), and a certificate that does not
+// verify is described in node's words after the same `the TLS handshake failed:`.
+// `tests/js/p43.sl` runs both ends on both hosts. `alpnProtocol` answers `null` on a plain socket,
+// which is what `slate:http` reads to tell HTTP/2 from HTTP/1.1.
 //
 // ## A socket is a SLOT and a GENERATION
 //
@@ -54,6 +56,17 @@ js_runtime_net() -> string = raw"""
             }
         })()
 
+        // node's `tls`, which is there wherever its `net` is.
+        const tlsHost = (() => {
+            if (netHost === null) return null
+
+            try {
+                return $.host.require("node:tls")
+            } catch (e) {
+                return null
+            }
+        })()
+
         const noSockets = (name) =>
             fault("`" + name + "` needs a host with sockets, and this JavaScript host has none")
 
@@ -78,6 +91,10 @@ js_runtime_net() -> string = raw"""
                 asText: true,
                 onError: null,
                 reading: false,
+                listeners: null,
+                secured: false,
+                upgrading: false,
+                plain: null,
                 closed: false
             }
 
@@ -159,12 +176,16 @@ js_runtime_net() -> string = raw"""
         // Start delivering what arrives, once. **A second `onData` swaps the slate callback and does
         // not add a second node listener**, which is what makes a protocol that changes what it
         // expects halfway through writable at all -- and is why the flow is not started twice.
+        //
+        // **A socket in the middle of a TLS handshake is not started here**: the reader is recorded
+        // and `startTls` installs it on the secured socket once the handshake has finished, so a
+        // handshake that fails is reported once and in its own words rather than twice.
         const startReading = (slot) => {
-            if (slot.reading || slot.listening) return
+            if (slot.reading || slot.listening || slot.upgrading) return
 
             slot.reading = true
 
-            slot.handle.on("data", (buf) => {
+            const onChunk = (buf) => {
                 if (slot.asText) {
                     // **A chunk is a chunk and not a message**, so this can split a character in half
                     // where a peer sends one across two packets -- and a chunk that is not text at
@@ -190,10 +211,17 @@ js_runtime_net() -> string = raw"""
                 // `plainly_arrived` carries the reasoning. A copy, because node reuses the `Buffer`
                 // it hands to the listener.
                 deliverChunk(slot, $.bytesOf(new Uint8Array(buf)))
-            })
+            }
 
-            slot.handle.on("end", () => deliverChunk(slot, null))
-            slot.handle.on("error", (e) => failStream(slot, "this connection failed: " + netWhy(e)))
+            const onEnd = () => deliverChunk(slot, null)
+            const onFailed = (e) => failStream(slot, "this connection failed: " + netWhy(e))
+
+            // Kept so that `startTls` can take them off the plain socket it is about to wrap.
+            slot.listeners = { data: onChunk, end: onEnd, error: onFailed }
+
+            slot.handle.on("data", onChunk)
+            slot.handle.on("end", onEnd)
+            slot.handle.on("error", onFailed)
         }
 
         // A listener's own options, which is a port or a record carrying one. Answers the port and
@@ -311,7 +339,7 @@ js_runtime_net() -> string = raw"""
 
             startReading(slot)
 
-            if (!slot.listening) slot.handle.resume()
+            if (!slot.listening && !slot.upgrading) slot.handle.resume()
 
             return null
         }
@@ -378,6 +406,9 @@ js_runtime_net() -> string = raw"""
             try {
                 if (slot.listening) slot.handle.close()
                 else slot.handle.destroy()
+
+                // A secured socket stands on the plain one it wrapped, and both are let go.
+                if (slot.plain !== null) slot.plain.destroy()
             } catch (e) {
                 // **A socket the host has already torn down is nothing to say about**, which is the
                 // same reading closing twice gets below.
@@ -473,9 +504,192 @@ js_runtime_net() -> string = raw"""
             return chosen === null || chosen === undefined || chosen === false ? null : chosen
         }
 
-        B.startTls = (...args) => {
-            if (args.length > 0) socketOf(args[0], "startTls")
+        // A certificate, a key or an authority: PEM text, or its bytes. `tls.sysl`'s `pem_of` and
+        // `trust`, sentence for sentence.
+        const pemOf = (o, name, shape) => {
+            if (!o.hasName(name)) fault("securing this needs `" + name + "`, as PEM text -- `" + shape + "`")
 
-            noTls("startTls")
+            return pemText(o.getName(name), name)
+        }
+
+        const pemText = (v, name) => {
+            if ($.isStr(v)) return v
+            if (v instanceof $.SBytes || Array.isArray(v)) return Buffer.from($.bytesLike(v, name))
+
+            fault("`" + name + "` is PEM text or its bytes, and this is " + typeName(v))
+        }
+
+        // The protocols one end offers, where it named any. Empty is ALPN not offered at all.
+        const alpnOf = (o) => {
+            if (!o.hasName("alpn")) return []
+
+            const names = o.getName("alpn")
+
+            if (!Array.isArray(names)) fault("`alpn` is a list of protocol names, and this is " + typeName(names))
+
+            for (const n of names)
+                if (!$.isStr(n)) fault("`alpn` is a list of protocol names, and one of them is " + typeName(n))
+
+            return names
+        }
+
+        // `startTls`'s second argument -- the interpreter's `start_tls_target`, read in its order:
+        // **`cert` says this end is the server**, and is looked for before `host`.
+        const upgradeTarget = (v) => {
+            if ($.isStr(v)) return { server: false, host: v, trust: null, alpn: [] }
+
+            if (v instanceof $.SObj) {
+                if (v.hasName("cert")) {
+                    const cert = pemOf(v, "cert", "{ cert, key }")
+                    const key = pemOf(v, "key", "{ cert, key }")
+
+                    return { server: true, cert: cert, key: key, alpn: alpnOf(v) }
+                }
+
+                if (!v.hasName("host"))
+                    fault("`startTls` was given an object with no `host` in it -- the name is what the certificate is checked against, and a server upgrading its end says `{ cert, key }` instead")
+
+                const host = v.getName("host")
+
+                if (!$.isStr(host)) fault("`startTls` takes the host as a name, and this is " + typeName(host))
+
+                const trust = v.hasName("trust") ? pemText(v.getName("trust"), "trust") : null
+
+                return { server: false, host: host, trust: trust, alpn: alpnOf(v) }
+            }
+
+            fault("`startTls` takes the host to connect as, or an object saying more about it, and this is " + typeName(v))
+        }
+
+        // A handshake that did not finish, in the interpreter's words where they are slate's own.
+        //
+        // **node reports a peer that hung up mid-handshake as a reset it made up itself**, with a
+        // sentence about "secure TLS connection" -- where the interpreter reads the same event as the
+        // end of the stream. The two are one event and are given the one sentence.
+        const handshakeWhy = (e) => {
+            if (e !== null && e !== undefined && e.code === "ECONNRESET" && String(e.message).includes("before secure TLS"))
+                return "this connection ended before the TLS handshake finished"
+
+            return "the TLS handshake failed: " + netWhy(e)
+        }
+
+        // `startTls(sock, host)` and `startTls(conn, { cert, key })` -- an open socket, upgraded.
+        //
+        // **node's own STARTTLS: the plain socket is handed to `tls`, which wraps the handle it
+        // stands on**, and anything still being written in the clear goes out first -- which is the
+        // one byte a PostgreSQL server answers before its handshake. The slot keeps its number and
+        // its generation and only its handle changes, so the value the program holds is the secured
+        // socket from here on, exactly as in the interpreter.
+        //
+        // **The promise carries a result and never rejects**: `{ ok: true, value: null }` once the
+        // handshake has finished, `{ ok: false, error }` where it did not -- and a socket whose
+        // handshake failed is closed, the reader being told `"this connection could not be secured"`
+        // the way any other failed stream is told.
+        B.startTls = (sock, options) => {
+            if (netHost === null || tlsHost === null) noSockets("startTls")
+
+            const target = upgradeTarget(options)
+            const slot = socketOf(sock, "startTls")
+
+            if (slot.secured) fault("this socket is already secured, and `startTls` upgrades a plain one")
+
+            if (slot.listening) fault("`startTls` upgrades a connection, and this socket is listening for them")
+
+            return new Promise((resolve) => {
+                let context = null
+
+                try {
+                    context = target.server
+                        ? tlsHost.createSecureContext({ cert: target.cert, key: target.key })
+                        : tlsHost.createSecureContext(target.trust === null ? {} : { ca: tlsHost.rootCertificates.concat([target.trust]) })
+                } catch (e) {
+                    const why = target.server
+                        ? "this certificate and key could not be used: "
+                        : "this certificate could not be trusted: "
+
+                    resolve($.obj([["ok", false], ["error", why + netWhy(e)]]))
+
+                    return
+                }
+
+                const plain = slot.handle
+
+                // **The plain socket's reader comes off before `tls` takes its handle**, or it would
+                // be handed the handshake's ciphertext as though it were the program's data.
+                if (slot.listeners !== null) {
+                    plain.removeListener("data", slot.listeners.data)
+                    plain.removeListener("end", slot.listeners.end)
+                    plain.removeListener("error", slot.listeners.error)
+                    slot.listeners = null
+                }
+
+                // What the secured socket reports is the secured socket's, and the plain one under
+                // it must not stop node with an `error` nobody is listening for.
+                plain.on("error", () => null)
+
+                slot.reading = false
+                slot.secured = true
+                slot.upgrading = true
+
+                const opts = { socket: plain, secureContext: context }
+
+                if (target.alpn.length > 0) opts.ALPNProtocols = target.alpn
+
+                let secured = null
+
+                if (target.server) {
+                    opts.isServer = true
+                    secured = new tlsHost.TLSSocket(plain, opts)
+                } else {
+                    // **The name is what the certificate is checked against**, and is offered as SNI
+                    // where it is a name -- an address may not be, by RFC 6066.
+                    opts.host = target.host
+                    if (netHost.isIP(target.host) === 0) opts.servername = target.host
+                    secured = tlsHost.connect(opts)
+                }
+
+                slot.plain = plain
+                slot.handle = secured
+
+                let settled = false
+
+                const finished = () => {
+                    if (settled) return
+
+                    settled = true
+                    slot.upgrading = false
+
+                    resolve($.obj([["ok", true], ["value", null]]))
+
+                    if (slot.closed) return
+
+                    if (slot.reader !== null) {
+                        startReading(slot)
+                        secured.resume()
+                    }
+                }
+
+                const denied = (why) => {
+                    if (settled) return
+
+                    settled = true
+                    slot.upgrading = false
+
+                    resolve($.obj([["ok", false], ["error", why]]))
+
+                    if (slot.closed) return
+
+                    failStream(slot, "this connection could not be secured")
+                    dropSocket(sock.id, sock.gen)
+                }
+
+                secured.once(target.server ? "secure" : "secureConnect", finished)
+
+                // **Kept for the life of the socket and not only the handshake**: an `error` nobody
+                // listens for stops node outright, and the reader's own listener is not on until the
+                // handshake is done.
+                secured.on("error", (e) => denied(handshakeWhy(e)))
+                secured.once("close", () => denied("this connection ended before the TLS handshake finished"))
+            })
         }
 """
