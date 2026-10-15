@@ -1,6 +1,8 @@
 module dev.slatelang.slate
 
 import sh.sysl.gc
+import sh.sysl.kairos
+import sh.sysl.kairos.uv
 import sh.sysl.libuv
 import sh.sysl.miniz
 import sh.sysl.parsing.*
@@ -102,14 +104,21 @@ struct Vm
 
     // -- the event loop (`event.sysl`) ---------------------------------------------------------------
 
-    // The libuv loop this VM's timers, sockets and requests are on.
+    // The kairos `uv` driver over the libuv loop this VM's timers, sockets and requests are on --
+    // `io.on_loop()` is that libuv loop, which `event_loop()` answers.
     //
     // **A field rather than `default_loop()`, because libuv's default loop is the PROCESS's.** A loop
     // may only be turned by one thread, so a VM running on a thread of its own has to be on a loop of
     // its own -- `new_vm(ceiling, libuv.new_loop().unwrap())` is what an actor writes, and the
     // program's own VM keeps the default loop, which is what every handle in the process was already
-    // on.
-    uv_loop: &libuv.Loop
+    // on. **The driver is the VM's and is closed by `dispose_vm`**: it holds a libuv timer of its own on
+    // that loop, which a loop of the VM's own could not be closed past.
+    io: &uv.Uv
+
+    // The kairos loop over `io`, and the ONLY thing that turns the libuv loop on this VM's behalf:
+    // every drain, `settle_call` and the embed pump are `events.pass(…)`. A handle still started with
+    // a raw libuv callback is on the same libuv loop, so a pass runs its callback as `uv_run` did.
+    events: &kairos.Loop[uv.Uv]
 
     // Everything the loop may still call, and the only thing standing between a pending callback and
     // the sweep.
@@ -735,11 +744,13 @@ private vm_over(ceiling: usize, lp: &libuv.Loop, capped: bool) -> Vm
     // built over nothing would write through null objects rather than report anything.
     if block == null then panic("slate could not take a heap of the size this VM asked for")
 
+    val io = uv.uv_on(lp)
+
     Vm(
         fresh_machine(), buf(),
         new_unit(), buf(), buf(), buf(), buf(),
         buf(), no_hooks(), no_hook_names(),
-        lp, buf(), 0, 0, 0, None,
+        io, kairos.event_loop(io), buf(), 0, 0, 0, None,
         buf(), 0, buf(), buf(),
         buf(),
         buf(), 0,
@@ -888,3 +899,9 @@ dispose_vm(v: *Vm)
     // Every finalizer has run, so nothing this VM owned is held outside its heap any more.
     v.payload = 0
     v.payload_marked = 0
+
+    // **The driver's own handles go too**, a timer and perhaps a `uv_async` on the VM's libuv loop:
+    // left open they would keep a loop of the VM's own from closing (`uv_loop_close` answers EBUSY),
+    // which is what an actor's thread and `slate_free` do next. `close` turns that loop once without
+    // waiting, which is when libuv runs the close callbacks.
+    v.io.close()

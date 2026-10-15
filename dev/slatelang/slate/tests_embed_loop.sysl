@@ -1,9 +1,11 @@
 module dev.slatelang.slate
 @tests
 
+import sh.sysl.kairos.{NoWait, Once}
 import sh.sysl.libuv
 import sysl.buf.{Buf, buf}
 import sysl.text.{Search, cstring, from_utf8_unchecked}
+import sysl.time.millis
 
 // The C surface for a host that owns its main loop (`embed_loop.sysl`), driven from sysl with the
 // pointers a C caller would hand it. That the DEFAULT mode is unchanged -- a call's timer has fired by
@@ -225,3 +227,106 @@ A_C_HOST_CANNOT_PUMP_FROM_INSIDE_A_FUNCTION_IT_REGISTERED()
     h.depth = 0
     assert_eq(embed_pump(h), 0)
     embed_free(h)
+
+// The loop under every handle is a kairos loop over its libuv one, and every turn slate takes is a
+// `pass` of it (`event.sysl`). These three pin what a pass answers, which is what each drain, the
+// pump and `slate_loop_timeout` stand on.
+
+// **Nothing alive is false at once**: a pass with nothing to wait for does not wait, which is what
+// lets a drain and `slate_run_until_idle` end -- on a fresh handle, and again once a timer has fired
+// and given its slot back.
+@test
+A_PASS_OVER_A_LOOP_WITH_NOTHING_ALIVE_ANSWERS_FALSE_WITHOUT_WAITING()
+    var out = heard()
+    val h = manual_handle(&out)
+    val began = libuv.hrtime()
+    val was = enter(&h.vm)
+
+    assert(!h.vm.events.pass(Once), "nothing is alive on a fresh handle's loop")
+    assert(!h.vm.events.pass(NoWait), "nor without waiting")
+    leave(was)
+
+    assert_eq(ran(h, "setTimeout(() -> print(\"fired\"), 1)"), 0, said(h))
+    assert_eq(pumped_out(h), 0, said(h))
+    assert_eq(out.lines.at(out.lines.len() - 1), "fired")
+
+    val again = enter(&h.vm)
+
+    assert(!h.vm.events.pass(Once), "the fired timer's slot was given back and nothing is left")
+    leave(again)
+
+    val took = libuv.hrtime() - began
+
+    assert(took < 1000000000u64, s"no pass waited for something that could not come: ${took} ns")
+    embed_free(h)
+end A_PASS_OVER_A_LOOP_WITH_NOTHING_ALIVE_ANSWERS_FALSE_WITHOUT_WAITING
+
+// **A coroutine parked on `sleep` is a pending timer the host is told about**: the wait is no longer
+// than what the timer has left and never zero while it is in the future, then zero once it is due,
+// and the pump that runs it finishes the program.
+//
+// **Straight after `slate_eval` the answer is 0, and that is the C surface as it has always been**:
+// starting the program leaves libuv a turn it has queued but not taken, so its own backend timeout
+// says "now". A host does what it is told -- pumps while the answer is 0 -- and only then is told
+// the time left on the sleep. One pump is what that takes today; the loop here says what a host
+// does rather than how many.
+@test
+THE_C_HOSTS_WAIT_IS_THE_TIME_LEFT_ON_A_SLEEP_A_PARKED_COROUTINE_IS_WAITING_OUT()
+    var out = heard()
+    val h = manual_handle(&out)
+
+    assert_eq(ran(h, "async nap()\n    await sleep(300)\n    print(\"woke\")\n\nnap()"), 0, said(h))
+    assert_eq(out.lines.len(), 0)
+
+    var wait = embed_loop_timeout(h)
+    var pumps = 0
+
+    while wait == 0 && pumps < 10
+        assert_eq(embed_pump(h), 1, said(h))
+        pumps += 1
+        wait = embed_loop_timeout(h)
+
+    assert_eq(out.lines.len(), 0)
+    assert(wait > 0 && wait <= 300, s"the wait is what the sleep has left: ${wait} after ${pumps} pumps")
+    assert_eq(embed_pump(h), 1)
+
+    libuv.sleep(320)
+
+    assert_eq(embed_loop_timeout(h), 0)
+    assert_eq(pumped_out(h), 0, said(h))
+    assert_eq(out.lines.at(0), "woke")
+    assert_eq(embed_loop_timeout(h), 0)
+    embed_free(h)
+end THE_C_HOSTS_WAIT_IS_THE_TIME_LEFT_ON_A_SLEEP_A_PARKED_COROUTINE_IS_WAITING_OUT
+
+// **A `stop` ends a pass loop that a pending timer would keep going for ten seconds**, and is taken
+// back by the pass that answered it -- the next pass says the timer still keeps the loop alive. The
+// stop is asked for from a kairos timer of the loop's own, which is a pass's to run.
+@test
+A_STOP_ENDS_A_PASS_LOOP_AND_THE_NEXT_PASS_IS_ALIVE_AGAIN()
+    var out = heard()
+    val h = manual_handle(&out)
+
+    assert_eq(ran(h, "setTimeout(() -> print(\"never\"), 10000)"), 0, said(h))
+
+    val lp = h.vm.events
+    val began = libuv.hrtime()
+    val was = enter(&h.vm)
+    var passes = 0
+
+    lp.after(millis(5), l -> l.stop())
+
+    while lp.pass(Once)
+        passes += 1
+
+    val took = libuv.hrtime() - began
+
+    assert(lp.pass(NoWait), "the slate timer still keeps the loop alive once the stop is answered")
+    leave(was)
+
+    assert(took < 2000000000u64, s"the stop ended the loop, not the ten-second timer: ${took} ns after ${passes} passes")
+    assert_eq(out.lines.len(), 0)
+
+    // Freed with the ten-second timer still pending, which the free closes.
+    embed_free(h)
+end A_STOP_ENDS_A_PASS_LOOP_AND_THE_NEXT_PASS_IS_ALIVE_AGAIN

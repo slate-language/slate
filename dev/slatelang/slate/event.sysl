@@ -1,6 +1,8 @@
 module dev.slatelang.slate
 
 import sh.sysl.gc
+import sh.sysl.kairos.{Loop, NoWait, Once, PassMode, Until}
+import sh.sysl.kairos.uv.Uv
 import sh.sysl.libuv
 
 // `close` is a `Handle` member, and a trait has to be in scope to reach one. Every handle type in
@@ -8,6 +10,7 @@ import sh.sysl.libuv
 import sh.sysl.libuv.Handle
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
+import sysl.time.micros
 
 // The event loop, and what a slate program does with it.
 //
@@ -36,7 +39,16 @@ import sysl.buf.{Buf, buf}
 // being written in the runtime at all. libuv's default loop belongs to the process and may be turned
 // by one thread only, so a VM on a thread of its own is on a loop of its own and every one of those
 // sites has to ask which.
-event_loop() -> &libuv.Loop = current().uv_loop
+event_loop() -> &libuv.Loop = current().io.on_loop()
+
+// The kairos loop over it, which is what TURNS it.
+//
+// **Every turn slate takes is a `pass`** -- `drain_events_to`, `settle_promise`, `turn_events`, the
+// embed pump and the actors' serve loops -- and never a `uv_run` of its own. A pass runs whatever is
+// due on the libuv loop beneath, a callback a file still starts by hand included, and answers whether
+// anything is left that could run. **It never cancels**, which is what lets a drain stop at a floor
+// and leave a lower scope's listener exactly as it was.
+loop_events() -> &Loop[Uv] = current().events
 
 // One thing the loop is going to call back.
 struct Pending
@@ -675,7 +687,7 @@ end leak_description
 // inside a timer callback moves its awaiting function along before the next timer fires. Running
 // libuv to completion in one go, as this used to, would have batched every callback ahead of every
 // resumption and interleaved them in an order nothing could predict. JavaScript's microtask rule is
-// exactly this, and it is why `RUN_ONCE` is asked for rather than the default.
+// exactly this, and it is why the loop is turned one `pass` at a time rather than run to the end.
 // **AND THE PROGRAM IS THE FIRST ACTOR, so the drain is not over while it has spawned another.** The
 // design's rule is that the program ends when its own loop has drained and every actor it spawned
 // has stopped; what makes that terminate rather than hang is that a drained program has nothing left
@@ -688,13 +700,6 @@ drain_events() -> Result[unit, Signal]
 
         if !finish_actors()? then return Ok(())
 end drain_events
-
-// Close a bounded drain's watchdog timer, where it armed one. Not `pending`-tracked and not
-// counted in `outstanding`, so this is the only thing that ever gives it back.
-private close_watchdog(watchdog: Option[&libuv.Timer])
-    watchdog match
-        Some(t) -> t.close(() -> ())
-        None -> ()
 
 // The same drain, stopping once nothing beyond `floor` is outstanding.
 //
@@ -725,46 +730,25 @@ drain_events_to(floor: usize, bounded: bool) -> Result[unit, Signal]
     // few seconds rather than an unbounded hang.
     val started = libuv.hrtime()
     val backstop_ms: u64 = 5000
+    val backstop_ns = backstop_ms * 1000000
 
-    // **THE BACKSTOP CHECK BELOW IS NOT ENOUGH ON ITS OWN, because `RUN_ONCE` BLOCKS ON WHAT IT IS
-    // ASKED TO.** `uv_run(UV_RUN_ONCE)` waits for the nearest thing that could wake it -- a timer
-    // due, or an fd becoming readable -- and a listening socket that nobody ever connects to offers
-    // neither. With no timer of the PROGRAM's own outstanding, that wait has no upper bound, so the
-    // elapsed-time check a few lines down never gets a turn to run again: the process blocks inside
-    // the poll syscall, at 0% CPU, for as long as the leaked handle stays open. A raw watchdog timer
-    // -- outside `pending`, so it is invisible to `outstanding` and to a leak report -- gives that
-    // wait a ceiling: libuv computes `RUN_ONCE`'s timeout from its OWN nearest timer, so one due at
-    // `backstop_ms` is what makes the poll return on schedule even when nothing else ever will.
-    //
-    // **The due time is counted from the loop's CACHED clock, so the clock is read first.** The cache
-    // was last updated before the test body ran; a body that took a while, or a machine too busy to
-    // run it promptly, leaves it behind, and a watchdog counted from it fires before `started +
-    // backstop_ms`. The check below then says "not yet" and the next turn blocks for ever, a one-shot
-    // watchdog being spent. `update_time` removes that, and the REPEAT is what keeps a watchdog armed
-    // for the millisecond the loop's whole-millisecond clock can still leave between the two: once
-    // due, it wakes the loop every `rewake_ms` until the check below is true.
-    val rewake_ms: u64 = 100
-    var watchdog: Option[&libuv.Timer] = None
-
-    if bounded
-        event_loop().update_time()
-
-        libuv.timer(event_loop()) match
-            Ok(t) ->
-                t.start(backstop_ms, rewake_ms, () -> ()) match
-                    Ok(_) -> watchdog = Some(t)
-                    Err(_) -> t.close(() -> ())
-            Err(_) -> ()
-
+    // **THE BACKSTOP CHECK BELOW IS NOT ENOUGH ON ITS OWN, because A TURN THAT WAITS BLOCKS ON WHAT IT
+    // IS ASKED TO.** A turn waits for the nearest thing that could wake it -- a timer due, or an fd
+    // becoming readable -- and a listening socket that nobody ever connects to offers neither. With no
+    // timer of the PROGRAM's own outstanding, that wait has no upper bound, so the elapsed-time check
+    // a few lines down never gets a turn to run again: the process blocks inside the poll syscall, at
+    // 0% CPU, for as long as the leaked handle stays open. **So a bounded drain's turn is
+    // `Until(what is left of the backstop)`**, which kairos's driver keeps with a libuv timer of its
+    // own -- outside `pending`, so invisible to `outstanding` and to a leak report -- armed from the
+    // clock as it is NOW and rounded UP to libuv's whole milliseconds, so the wait ends on schedule
+    // even when nothing else ever will, and never before the check below can be true.
     loop
         run_microtasks()
 
         // A resumption may have faulted its way out to a promise nobody holds, and a callback may
         // have faulted outright. Either ends the program.
         current().loop_fault match
-            Some(s) ->
-                close_watchdog(watchdog)
-                return Err(s)
+            Some(s) -> return Err(s)
             None -> ()
 
         // **What this drain is owed is the floor plus whatever it took on for somebody else.** A
@@ -775,8 +759,9 @@ drain_events_to(floor: usize, bounded: bool) -> Result[unit, Signal]
 
         if current().outstanding <= owed then break
 
-        if bounded && libuv.hrtime() - started > backstop_ms * 1000000
-            close_watchdog(watchdog)
+        val elapsed = libuv.hrtime() - started
+
+        if bounded && elapsed > backstop_ns
             return Err(failure(point(0), s"the event loop did not drain: ${current().outstanding - owed} handle(s) still open after ${backstop_ms}ms"))
 
         // **A turn reporting nothing active does NOT end the drain, and thinking it did cost a
@@ -797,34 +782,27 @@ drain_events_to(floor: usize, bounded: bool) -> Result[unit, Signal]
         // at the bottom of the loop is a count of work this turn had nothing to do with.
         val before = current().outstanding
 
-        val more = event_loop().run(libuv.RUN_ONCE) match
-            Err(e) ->
-                close_watchdog(watchdog)
-                return Err(failure(point(0), s"the event loop stopped: ${e}"))
-            Ok(alive) -> alive
+        // A whole-program drain waits as long as it takes; a bounded one no longer than the
+        // backstop has left, rounded up so the wait never ends before the check above is true.
+        val wait: PassMode = if bounded then Until(micros(long((backstop_ns - elapsed + 999) / 1000))) else Once
+        val more = loop_events().pass(wait)
 
         idle = if !more && current().outstanding == before then idle + 1 else 0
     end loop
 
-    // The watchdog's job ends with the loop above -- the closing turn below is `RUN_NOWAIT` for a
-    // bounded drain, which never blocks at all, so nothing past this point can hang.
-    close_watchdog(watchdog)
-
     // A handle that was closed needs one more turn for its close callback, and there is nothing left
     // to wait for -- so this returns as soon as those have run.
     //
-    // **`RUN_NOWAIT` FOR A BOUNDED DRAIN, BECAUSE THE DEFAULT MODE RUNS UNTIL THE LOOP IS EMPTY.**
-    // A per-scope drain stopped at a floor that may still have a handle open above it by
-    // construction, and asking the default mode for one more turn there is asking it to wait for
-    // that handle to close -- which is the very wait the floor exists to avoid. **This reads
-    // `bounded` and not `floor`**, for the reason above: a per-test drain's floor can be zero too.
-    val mode = if bounded then libuv.RUN_NOWAIT else libuv.RUN_DEFAULT
-
-    val closed: Result[unit, Signal] = event_loop().run(mode) match
-        Err(e) -> Err(failure(point(0), s"the event loop stopped: ${e}"))
-        Ok(_) -> Ok(())
-
-    closed?
+    // **ONE PASS THAT DOES NOT WAIT FOR A BOUNDED DRAIN, BECAUSE THE WHOLE PROGRAM'S RUNS UNTIL THE
+    // LOOP IS EMPTY.** A per-scope drain stopped at a floor that may still have a handle open above it
+    // by construction, and passing until nothing is alive there is waiting for that handle to close --
+    // which is the very wait the floor exists to avoid. **This reads `bounded` and not `floor`**, for
+    // the reason above: a per-test drain's floor can be zero too.
+    if bounded
+        loop_events().pass(NoWait)
+    else
+        loop
+            if !loop_events().pass(Once) then break
 
     // That last turn may itself have settled something, and a promise settled with nobody handed
     // the answer is a coroutine abandoned mid-statement.
@@ -877,10 +855,7 @@ private settle_promise(pr: *PromiseObj) -> Result[unit, Signal]
         if idle >= 2 then break
 
         val before = current().outstanding
-
-        val more = event_loop().run(libuv.RUN_ONCE) match
-            Err(e) -> return Err(failure(point(0), s"the event loop stopped: ${e}"))
-            Ok(alive) -> alive
+        val more = loop_events().pass(Once)
 
         idle = if !more && current().outstanding == before then idle + 1 else 0
     end loop
@@ -894,8 +869,8 @@ end settle_promise
 //
 // **The order is `drain_events_to`'s, one turn of it**: what suspended calls are owed is handed back
 // before the loop turns, and again after, so a promise a callback settles moves its awaiting function
-// along in the same turn rather than the next. `RUN_NOWAIT` and not `RUN_ONCE` because the host is
-// the one that waits -- on `backend_fd` or a timeout -- and a turn that blocked would block it.
+// along in the same turn rather than the next. A `NoWait` pass because the host is the one that
+// waits -- on `backend_fd` or a timeout -- and a turn that blocked would block it.
 //
 // **Work is outstanding where slate's own count says so or the loop is alive**, the count being the
 // authority for a request that has just been answered and the loop for a handle slate does not count.
@@ -903,9 +878,7 @@ turn_events() -> Result[bool, Signal]
     run_microtasks()
     turn_fault()?
 
-    event_loop().run(libuv.RUN_NOWAIT) match
-        Err(e) -> return Err(failure(point(0), s"the event loop stopped: ${e}"))
-        Ok(_) -> ()
+    loop_events().pass(NoWait)
 
     run_microtasks()
     turn_fault()?
@@ -914,16 +887,14 @@ turn_events() -> Result[bool, Signal]
     // is the next turn -- a fired timer gives its slot back by closing. With nothing of slate's left
     // outstanding that turn is taken now, as `drain_events_to`'s closing turn is, so the host is told
     // the loop is idle at the pump that finished the work rather than one pump later.
-    if current().outstanding == 0 && event_loop().alive()
-        event_loop().run(libuv.RUN_NOWAIT) match
-            Err(e) -> return Err(failure(point(0), s"the event loop stopped: ${e}"))
-            Ok(_) -> ()
+    if current().outstanding == 0 && loop_events().alive()
+        loop_events().pass(NoWait)
 
         run_microtasks()
         turn_fault()?
     end if
 
-    Ok(current().outstanding > 0 || event_loop().alive())
+    Ok(current().outstanding > 0 || loop_events().alive())
 end turn_events
 
 // The fault a callback or a resumption raised during a turn, taken off the VM so the turn after it
