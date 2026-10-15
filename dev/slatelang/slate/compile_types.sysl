@@ -1,0 +1,472 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.str_builder
+
+// Compiling, the types: which declared type a name in a pattern stands for, and a pattern with every
+// such name replaced by what it stands for.
+//
+// **Cut from `compile.sysl`, which holds the entry points and the registering of what a module
+// declares.** This file reads the `current().known_*` and `current().visible_*` buffers and writes
+// nothing but complaints, so what crosses to `compile.sysl` is three names: `declared_in`,
+// `names_one` and `check_type_shapes`.
+
+// Not `private`: reached from `compile.sysl` -- an import is looked up among what each module declared.
+declared_in(src: usize, name: string, want_public: bool) -> Option[Pattern]
+    val v = current()
+
+    for i in 0..<v.known_name.len()
+        if v.known_source.at(i) == src && v.known_name.at(i) == name
+            if want_public && !v.known_public.at(i) then return None
+
+            return Some(v.known_pat.at(i))
+
+    None
+end declared_in
+
+// What `Point` stands for in the file being compiled, if anything does.
+private visible_type(name: string) -> Option[Pattern]
+    val v = current()
+
+    for i in 0..<v.visible_names.len()
+        if v.visible_names.at(i) == name then return Some(v.visible_pats.at(i))
+
+    None
+end visible_type
+
+// Whether a bare name in pattern position stands for a type rather than binding a value, which is
+// exactly the question `resolve_pattern`'s `Bind` arm asks.
+//
+// **Asked without resolving, on purpose.** `resolve_pattern` complains about a generic type used
+// without its arguments, so a second walk over the same pattern would report that twice -- and the
+// caller here wants one bit, not a pattern.
+//
+// Not `private`: `slots.sysl` has to tell the names a pattern BINDS from the names it LOOKS UP, and
+// a bare name is one or the other depending on what this file has registered.
+names_a_type(name: string) -> bool = visible_type(name).is_some()
+
+// The word for one of slate's own kinds, where this file has declared or imported a type under it.
+//
+// **A local wins.** The parser reads `Set`, `string` and the rest as kinds before anything is in
+// scope, so a `class Set`, a `data` variant, a `type string = ...` or an imported name of that
+// spelling is only found here -- and a name in a pattern is shadowed exactly as it is everywhere
+// else, so the declaration answers and the kind does not.
+//
+// Not `private`: `slots.sysl` has to know a shadowed kind word is a lookup.
+shadowed_kind(test: TypeTest) -> Option[string]
+    val word = type_test_text(test)
+
+    if names_a_type(word) then Some(word) else None
+
+// How deep a type may be resolved through other types before slate calls it a circle.
+private const MaxTypeDepth: usize = 32
+
+// Whether `name` is one of `names`.
+//
+// Not `private`: reached from `compile.sysl` -- `export_object` asks it of the names it leaves out.
+names_one(names: Buf[string], name: string) -> bool
+    for i in 0..<names.len()
+        if names.at(i) == name then return true
+
+    false
+end names_one
+
+// `` `x`, `y` and `z` `` -- a declaration's fields, read aloud in a complaint about one of them.
+private field_list(names: Buf[string]) -> string
+    var out = str_builder()
+
+    for i in 0..<names.len()
+        if i != 0 then out.push(if i == names.len() - 1 then " and " else ", ")
+
+        out.push_char('`')
+        out.push(names.at(i))
+        out.push_char('`')
+
+    out.finish()
+end field_list
+
+// A pattern with every name that stands for a type replaced by what that type stands for.
+//
+// **A bare name in pattern position is a BINDING unless it names something**, which is sysl's rule
+// for a nullary variant and is exactly the rule here -- so `p is Point` is a shape test where a
+// `Point` was declared and binds a variable where none was, with no new syntax either way.
+//
+// Not `private`: `check.sysl` reads an annotation back off the check it was desugared into, and
+// needs the same resolution the compiler applies.
+resolve_pattern(pat: Pattern, depth: usize) -> Pattern
+    if depth >= MaxTypeDepth then return pat
+
+    *pat.kind match
+        Bind(name) ->
+            visible_type(name) match
+                Some(found) -> *found.kind match
+                    // **A generic type used without its arguments is refused rather than erased.**
+                    // Erasing would be sound -- every parameter becomes "anything" -- and that is
+                    // exactly what makes it the wrong answer: `p is Pair` would quietly test only
+                    // that the fields are there, which is a check the reader believes and does not
+                    // get.
+                    GenericPat(params, _) ->
+                        complain_here(pat.span, s"`${name}` is generic over ${counted(params.len(), "type")}, so it needs them here -- write `${name}[${erased_args(params)}]`, or the types this one holds")
+                        pat
+                    _ -> resolve_pattern(found, depth + 1)
+                None -> pat
+
+        // **THE DECLARATION ITSELF, ERASED.** This is reached where the pattern a `type` registered
+        // is resolved on its own rather than through a use -- which is what makes the *value* a
+        // generic type binds: `Pair.test(v)` asks about the shape with every parameter standing for
+        // anything, which is all a shape with no arguments could ever ask. A USE of the bare name
+        // goes through the `Bind` arm above and is refused there instead, because a reader who wrote
+        // `p: Pair` meant to say something about the fields and this would quietly not.
+        GenericPat(params, inner) -> resolve_pattern(substituted(inner, params, erased_types(params, pat.span)), depth + 1)
+
+        // `Pair[string, integer]` -- the declaration, with what it is generic over put through it.
+        AppliedPat(name, args) ->
+            var out: Buf[Pattern] = buf()
+
+            for i in 0..<args.len()
+                out.push(resolve_pattern(args.at(i), depth))
+
+            visible_type(name) match
+                Some(found) -> *found.kind match
+                    GenericPat(params, inner) ->
+                        if params.len() != out.len()
+                            complain_here(pat.span, s"`${name}` is generic over ${counted(params.len(), "type")} and this gives it ${out.len()}")
+
+                            return pat
+
+                        // **Substituted and THEN resolved**, so a type given to a generic type may
+                        // name another type -- `Pair[Point, Note]` -- and the shape that comes out
+                        // is the one both declarations describe.
+                        resolve_pattern(substituted(inner, params, out), depth + 1)
+                    _ ->
+                        complain_here(pat.span, s"`${name}` is not generic, so it takes no types in brackets")
+                        pat
+                // **`Set` and `Map` given the wrong count reach here**, the parser having left them for
+                // a declaration of either name to claim.
+                None ->
+                    if name == "Set"
+                        complain_here(pat.span, "`Set` holds one kind of thing, so it takes one type -- `Set[string]`, or the bare word `Set` for a set of anything")
+                    elif name == "Map"
+                        complain_here(pat.span, "`Map` takes a key type and a value type -- `Map[string, integer]`, or the bare word `Map` for a map of anything to anything")
+                    else
+                        complain_here(pat.span, s"nothing here declares a type called `${name}`")
+
+                    pat
+        At(name, inner) -> pattern(pat.span, PatKind.At(name, resolve_pattern(inner, depth)))
+        ArrayPat(items, open, rest, defaults) ->
+            var out: Buf[Pattern] = buf()
+
+            for i in 0..<items.len()
+                out.push(resolve_pattern(items.at(i), depth))
+
+            pattern(pat.span, ArrayPat(out, open, rest, defaults))
+        ObjectPat(keys, values, defaults, optional, rest) ->
+            var out: Buf[Pattern] = buf()
+
+            for i in 0..<values.len()
+                out.push(resolve_pattern(values.at(i), depth))
+
+            pattern(pat.span, ObjectPat(keys, out, defaults, optional, rest))
+        VariantPat(name, items, _, _) ->
+            var out: Buf[Pattern] = buf()
+
+            for i in 0..<items.len()
+                out.push(resolve_pattern(items.at(i), depth))
+
+            visible_type(name) match
+                Some(found) -> *found.kind match
+                    VariantPat(_, _, keys, singleton) ->
+                        // **The arity is checked HERE and nowhere else**, this being the one place
+                        // that has both the pattern a person wrote and the declaration it names. A
+                        // pattern cannot fault, so an unchecked mismatch would simply never match --
+                        // silently, which is the failure mode every pattern defect here has.
+                        //
+                        // **An EMPTY list means the pattern was written bare**, which tests and takes
+                        // nothing apart -- `x is Circle` and `c: Circle`. It is also the shape the
+                        // declaration itself registers, and this function resolves that one too, so
+                        // checking a count against it would refuse every data declaration there is.
+                        // The parser refuses a written `Circle()`, which is what keeps the two apart.
+                        if items.len() != 0 && items.len() != keys.len()
+                            complain_here(pat.span, s"`${name}` carries ${counted(keys.len(), "field")} and this names ${items.len()}")
+
+                        pattern(pat.span, VariantPat(name, out, keys, singleton))
+
+                    // **A class is taken apart by position exactly as a variant is, and by the same
+                    // node.** What its fields are called and what order they come in is the list its
+                    // own constructor was built from, so `Point(a, b)` binds what `Point.new(1, 2)`
+                    // sets -- not by a convention anybody maintains, but because it is that `Buf`.
+                    ProtoPat(_, fields, positional) ->
+                        if !positional
+                            complain_here(pat.span, s"`${name}` cannot be taken apart by position, because what its `new` takes is not the same as what it holds -- write `${name} { ... }`, which names the fields")
+                            pat
+                        else
+                            if items.len() != 0 && items.len() != fields.len()
+                                complain_here(pat.span, s"`${name}` is made from ${counted(fields.len(), "field")} and this names ${items.len()}")
+
+                            pattern(pat.span, VariantPat(name, out, fields, false))
+                    _ ->
+                        complain_here(pat.span, s"`${name}(...)` takes a class or a data variant apart, and `${name}` is neither")
+                        pat
+                None ->
+                    complain_here(pat.span, s"nothing here declares `${name}`, so `${name}(...)` has no fields to take apart")
+                    pat
+        MadeFrom(name, inner) ->
+            val body = resolve_pattern(inner, depth)
+
+            // **What the declaration says it holds, which is what a written field name is checked
+            // against.** An empty list is "not known" rather than "holds nothing" -- a class whose
+            // `new` builds its own object names nothing for slate to check, and a pattern over one
+            // is left to match or not at run time, exactly as a bare `{ ... }` always has.
+            var known: Buf[string] = buf()
+
+            visible_type(name) match
+                Some(found) -> *found.kind match
+                    ProtoPat(_, fields, _) -> known = fields
+                    VariantPat(_, _, keys, singleton) ->
+                        if singleton
+                            complain_here(pat.span, s"`${name}` declared no fields, so there is nothing to take apart -- write `${name}`, which tests for it")
+                        else
+                            known = keys
+                    DataPat(_, _) ->
+                        complain_here(pat.span, s"`${name}` is a data type rather than one of its variants, and the variants are what carry the fields -- name the one this arm is for")
+                    _ -> complain_here(pat.span, s"`${name} { ... }` takes a class or a data variant apart, and `${name}` is neither")
+                None -> complain_here(pat.span, s"nothing here declares `${name}`, so `${name} { ... }` has no fields to take apart")
+
+            if known.len() != 0
+                *body.kind match
+                    ObjectPat(keys, _, _, _, _) ->
+                        for i in 0..<keys.len()
+                            if !names_one(known, keys.at(i))
+                                complain_here(body.span, s"`${name}` has no field `${keys.at(i)}` -- it is made from ${field_list(known)}")
+                    _ -> ()
+
+            pattern(pat.span, PatKind.MadeFrom(name, body))
+        OrPat(alts) ->
+            var out: Buf[Pattern] = buf()
+
+            for i in 0..<alts.len()
+                val one = resolve_pattern(alts.at(i), depth)
+
+                // **The parser deferred this and here is where it can be answered.** A bare name in
+                // an alternative is a type where one was declared -- `Point | null` -- and a binding
+                // otherwise, which would leave a name bound down one path and not the other.
+                if binds(one)
+                    complain_here(alts.at(i).span, "an alternative of a pattern may not bind a name -- write a type where one was meant, or a literal")
+
+                out.push(one)
+
+            pattern(pat.span, OrPat(out))
+
+        // **A part MAY bind, so there is nothing to refuse here** -- every part runs, so what one
+        // binds is bound whenever the pattern matched at all. A bare name that named no type is
+        // still a binding and is still perfectly legal, which is `{ id } & user` naming the whole.
+        AndPat(parts) ->
+            var out: Buf[Pattern] = buf()
+
+            for i in 0..<parts.len()
+                out.push(resolve_pattern(parts.at(i), depth))
+
+            pattern(pat.span, AndPat(out))
+
+        // **The element is resolved like any other pattern, and this is also where a binding in one
+        // is refused.** It cannot be refused while parsing -- a bare name is a type where one was
+        // declared -- and it cannot be left, because an element pattern runs once per element and a
+        // name in it would be bound to whichever element ran last.
+        EveryPat(container, element) ->
+            // **`of` belongs to the kind, and a declaration that took the word did not bring it.**
+            // Testing the kind anyway would be the shadowed name answering after all.
+            shadowed_kind(container) match
+                Some(word) ->
+                    complain_here(pat.span, s"`${word}` here is the type this file declares, which takes no `of` -- write `${word}`, or name the declaration something else to test for slate's own")
+
+                    return pat
+                None -> ()
+
+            val inner = resolve_pattern(element, depth)
+
+            first_binding(inner) match
+                // **The message leads with "is not a type", which is nearly always the cause.** A
+                // reader told only that an element pattern may not bind goes and looks at binding,
+                // where what they wrote was a type name that is not one -- the mechanism is worth
+                // saying second and the mistake first.
+                Some(loose) -> complain_here(pat.span, s"`${loose}` is not a type, so an element pattern naming it would bind it once per element rather than test anything${instead_of(loose)}")
+                None -> ()
+
+            pattern(pat.span, EveryPat(container, inner))
+
+        // **The same rule for `Set[T]` and `Map[K, V]`**, and for the same reason: a member pattern
+        // runs once per member, so a bare name in one would bind rather than test.
+        HoldsPat(container, key, value) ->
+            // **`Set[T]` where this file declared a `Set` is that declaration given `T`**, so a generic
+            // one is applied and any other is refused by the `AppliedPat` arm in its own words. `Set[T]`
+            // carries a wildcard for the value it has no use for, and that is not an argument.
+            shadowed_kind(container) match
+                Some(word) ->
+                    var args: Buf[Pattern] = buf()
+
+                    args.push(key)
+
+                    if container == IsMap then args.push(value)
+
+                    return resolve_pattern(pattern(pat.span, AppliedPat(word, args)), depth)
+                None -> ()
+
+            val k = resolve_pattern(key, depth)
+            val v = resolve_pattern(value, depth)
+
+            first_binding(k) match
+                Some(loose) -> complain_here(pat.span, s"`${loose}` is not a type, so a member pattern naming it would bind it once per member rather than test anything${instead_of(loose)}")
+                None -> ()
+
+            first_binding(v) match
+                Some(loose) -> complain_here(pat.span, s"`${loose}` is not a type, so a member pattern naming it would bind it once per member rather than test anything${instead_of(loose)}")
+                None -> ()
+
+            pattern(pat.span, HoldsPat(container, k, v))
+
+        // **A name inside a function type is resolved like any other**, so `(Point) -> boolean` sees
+        // the declaration and a name that named nothing is refused where it stands rather than being
+        // read as a parameter nobody can supply.
+        FnPat(params, result) ->
+            var out: Buf[Pattern] = buf()
+
+            for i in 0..<params.len()
+                out.push(resolve_pattern(params.at(i), depth))
+
+            pattern(pat.span, FnPat(out, resolve_pattern(result, depth)))
+
+        // **A kind word this file has declared a type under is that type**, which is the `Bind` arm's
+        // rule reached from the other side: the parser could not see the declaration.
+        TypePat(test) ->
+            shadowed_kind(test) match
+                Some(word) -> resolve_pattern(pattern(pat.span, Bind(word)), depth)
+                None -> pat
+        _ -> pat
+end resolve_pattern
+
+// One `any` for each type parameter, which is what a generic type with no arguments describes.
+private erased_types(params: Buf[string], at: Span) -> Buf[Pattern]
+    var out: Buf[Pattern] = buf()
+
+    for i in 0..<params.len()
+        out.push(pattern(at, Wild))
+
+    out
+end erased_types
+
+// What a generic type's parameters would look like written out, for the message above to quote.
+private erased_args(params: Buf[string]) -> string
+    var out = str_builder()
+
+    for i in 0..<params.len()
+        if i > 0 then out.push(", ")
+
+        out.push("any")
+
+    out.finish()
+end erased_args
+
+// One pattern with every type parameter replaced by the type it was given.
+//
+// **A rebuild rather than an environment carried through resolution**, and the reason is that a
+// generic type may be used inside another one: substituting where the use is found means the
+// argument patterns are the ones written at THIS use, and nothing has to be unwound afterwards.
+//
+// **A type parameter cannot appear in a key, a default or a name**, so the walk only has to reach
+// the places a type can stand -- which is what every arm below is.
+private substituted(pat: Pattern, params: Buf[string], args: Buf[Pattern]) -> Pattern
+    *pat.kind match
+        TypeVarPat(name) ->
+            for i in 0..<params.len()
+                if params.at(i) == name then return args.at(i)
+
+            pat
+        At(name, inner) -> pattern(pat.span, PatKind.At(name, substituted(inner, params, args)))
+        ArrayPat(items, open, rest, defaults) ->
+            var out: Buf[Pattern] = buf()
+
+            for i in 0..<items.len()
+                out.push(substituted(items.at(i), params, args))
+
+            pattern(pat.span, ArrayPat(out, open, rest, defaults))
+        ObjectPat(keys, values, defaults, optional, rest) ->
+            var out: Buf[Pattern] = buf()
+
+            for i in 0..<values.len()
+                out.push(substituted(values.at(i), params, args))
+
+            pattern(pat.span, ObjectPat(keys, out, defaults, optional, rest))
+        EveryPat(container, element) -> pattern(pat.span, EveryPat(container, substituted(element, params, args)))
+        HoldsPat(container, key, value) -> pattern(pat.span, HoldsPat(container, substituted(key, params, args), substituted(value, params, args)))
+        OrPat(alts) ->
+            var out: Buf[Pattern] = buf()
+
+            for i in 0..<alts.len()
+                out.push(substituted(alts.at(i), params, args))
+
+            pattern(pat.span, OrPat(out))
+        AndPat(parts) ->
+            var out: Buf[Pattern] = buf()
+
+            for i in 0..<parts.len()
+                out.push(substituted(parts.at(i), params, args))
+
+            pattern(pat.span, AndPat(out))
+        FnPat(takes, result) ->
+            var out: Buf[Pattern] = buf()
+
+            for i in 0..<takes.len()
+                out.push(substituted(takes.at(i), params, args))
+
+            pattern(pat.span, FnPat(out, substituted(result, params, args)))
+        VariantPat(name, items, keys, singleton) ->
+            var out: Buf[Pattern] = buf()
+
+            for i in 0..<items.len()
+                out.push(substituted(items.at(i), params, args))
+
+            pattern(pat.span, VariantPat(name, out, keys, singleton))
+        MadeFrom(name, inner) -> pattern(pat.span, PatKind.MadeFrom(name, substituted(inner, params, args)))
+        AppliedPat(name, inner) ->
+            var out: Buf[Pattern] = buf()
+
+            for i in 0..<inner.len()
+                out.push(substituted(inner.at(i), params, args))
+
+            pattern(pat.span, AppliedPat(name, out))
+        _ -> pat
+end substituted
+
+// A pattern into the unit's table, resolved first.
+//
+// Not `private`: reached from `compile_expr.sysl` -- a pattern in an expression is interned here too.
+intern_resolved(u: *Unit, pat: Pattern) -> usize = intern_pattern(u, resolve_pattern(pat, 0))
+
+// **A DECLARED TYPE IS A SHAPE, NOT A DESTRUCTURING.** A type is a named pattern, so nothing stopped
+// one holding a bare name -- and a bare name binds. `type Tagged = { x: n }` then introduced `n` at
+// every site that used the type, including out of an `is` into the surrounding scope, which is action
+// at a distance from a declaration that reads as a shape.
+//
+// **It is also what the union rule already said.** An alternative may not bind, for the same reason;
+// a whole type being allowed to was the inconsistency.
+//
+// Checked here rather than while parsing for the reason everything about types is: a bare name is a
+// type where one was declared, and which it is cannot be known until they are all registered.
+//
+// Not `private`: reached from `compile.sysl` -- `open_types` runs it once a module's types are in.
+check_type_shapes(prog: Program)
+    for i in 0..<prog.type_names.len()
+        val name = prog.type_names.at(i)
+        val at = prog.type_pats.at(i).span
+
+        first_binding(resolve_pattern(prog.type_pats.at(i), 0)) match
+            Some(loose) ->
+                // A name still standing after resolution that IS a type is one the resolver gave up
+                // on, which happens only when a type is written in terms of itself.
+                if visible_type(loose).is_some() || loose == name
+                    complain_here(at, s"`${name}` is written in terms of itself, and a type is a shape a value is tested against rather than one that nests without end")
+                else
+                    complain_here(at, s"a type is a shape, so `${name}` may not bind `${loose}` -- a name written inside a type is introduced wherever the type is used, which is not what a declaration that reads as a shape should do")
+            None -> ()
+end check_type_shapes
