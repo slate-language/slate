@@ -141,18 +141,113 @@ TWO_HANDLERS_ON_ONE_SIGNAL_AND_ONE_STOPPED_LEAVES_THE_OTHER_RUNNING()
 
 @test
 BOTH_HANDLERS_ON_ONE_SIGNAL_RUN_ONCE_EACH()
-    // **Not in any promised order**: libuv calls the watchers of one signal in the order of its own
-    // tree, which is by address, so the order is the allocator's and nothing pins it.
     val program =
         "val seen = []\n" +
         "onSignal(\"SIGWINCH\", () -> seen.push(\"first\"))\n" +
         "onSignal(\"SIGWINCH\", () -> seen.push(\"second\"))\n" +
         "report() =\n" +
-        "    for x in sorted(seen)\n" +
+        "    for x in seen\n" +
         "        print(x)\n" +
         "setTimeout(report, 300)\n"
 
     assert_eq(raised(libuv.SIGWINCH, 40u64, 0u64, program), "first\nsecond")
+
+// A program that registers three handlers, optionally stops the middle one, and prints what ran.
+private three_handlers(stop_middle: bool) -> string =
+    "val seen = []\n" +
+    "onSignal(\"SIGWINCH\", () -> seen.push(\"a\"))\n" +
+    "val middle = onSignal(\"SIGWINCH\", () -> seen.push(\"b\"))\n" +
+    "onSignal(\"SIGWINCH\", () -> seen.push(\"c\"))\n" +
+    (if stop_middle then "offSignal(middle)\n" else "") +
+    "report() =\n" +
+    "    for x in seen\n" +
+    "        print(x)\n" +
+    "setTimeout(report, 300)\n"
+
+@test
+HANDLERS_OF_ONE_SIGNAL_RUN_IN_THE_ORDER_THEY_WERE_REGISTERED()
+    // **libuv calls the watchers of one signal in the order of its own tree, which is by address**,
+    // so a watcher per handler passes this once in a while and fails the rest -- hence several runs,
+    // each with the allocator in a different state. node calls its listeners in registration order
+    // and the signal has ONE watcher here so that the interpreter does too.
+    for run in 0..<6
+        assert_eq(raised(libuv.SIGWINCH, 40u64, 0u64, three_handlers(false)), "a\nb\nc")
+
+@test
+STOPPING_THE_MIDDLE_HANDLER_KEEPS_THE_ORDER_OF_THE_OTHERS()
+    for run in 0..<4
+        assert_eq(raised(libuv.SIGWINCH, 40u64, 0u64, three_handlers(true)), "a\nc")
+
+@test
+A_SLOT_GIVEN_BACK_AND_TAKEN_AGAIN_DOES_NOT_MOVE_A_HANDLER_IN_THE_ORDER()
+    // The table reuses a spent slot, so a handler registered last can sit before its elders in it.
+    // The order is the registration's and not the table's.
+    val program =
+        "val seen = []\n" +
+        "val a = onSignal(\"SIGWINCH\", () -> seen.push(\"a\"))\n" +
+        "onSignal(\"SIGWINCH\", () -> seen.push(\"b\"))\n" +
+        "offSignal(a)\n" +
+        "onSignal(\"SIGWINCH\", () -> seen.push(\"c\"))\n" +
+        "report() =\n" +
+        "    for x in seen\n" +
+        "        print(x)\n" +
+        "setTimeout(report, 300)\n"
+
+    assert_eq(raised(libuv.SIGWINCH, 40u64, 0u64, program), "b\nc")
+
+// Handlers p and q, then the third delivery's work: while the first delivery runs, `p` stops `q` and
+// adds `late`. Three deliveries are raised; the program stops listening during the third.
+//
+// What node does, which is checked against node below: the list is taken when the signal arrives, so
+// `q` still runs for the delivery in which it was stopped, and `late` is first heard in the next one.
+private changing_during_delivery() -> string =
+    "val seen = []\n" +
+    "var n = 0\n" +
+    "var qid = 0\n" +
+    "var lateid = 0\n" +
+    "var firstid = 0\n" +
+    "var zid = 0\n" +
+    "val t = setTimeout(() -> print(\"gave up\"), 3000)\n" +
+    "report() =\n" +
+    "    for x in seen\n" +
+    "        print(x)\n" +
+    "firstid = onSignal(\"SIGWINCH\", () ->\n" +
+    "    n = n + 1\n" +
+    "    seen.push(s\"p${n}\")\n" +
+    "    if n == 1\n" +
+    "        offSignal(qid)\n" +
+    "        lateid = onSignal(\"SIGWINCH\", () -> seen.push(\"late\")))\n" +
+    "qid = onSignal(\"SIGWINCH\", () -> seen.push(\"q\"))\n" +
+    "zid = onSignal(\"SIGWINCH\", () ->\n" +
+    "    if n == 3\n" +
+    "        offSignal(firstid)\n" +
+    "        offSignal(lateid)\n" +
+    "        offSignal(zid)\n" +
+    "        clearTimeout(t)\n" +
+    "        setTimeout(report, 60))\n"
+
+@test
+A_HANDLER_ADDED_DURING_A_DELIVERY_IS_HEARD_FROM_THE_NEXT_ONE_AND_A_STOPPED_ONE_FINISHES_THIS_ONE()
+    // d1: p1, q (stopped by p1, runs anyway), z.  d2: p2, late, z.  d3: p3, z stops p, late and z,
+    // and `late` -- already on this delivery's list -- still runs.
+    assert_eq(raised(libuv.SIGWINCH, 40u64, 40u64, changing_during_delivery()),
+        "p1\nq\np2\nlate\np3\nlate")
+
+@test
+A_HANDLER_THAT_FAULTS_STOPS_THE_ONES_AFTER_IT()
+    // node's `emit` lets the exception leave the loop over the listeners.
+    val program =
+        "val xs = []\n" +
+        "setTimeout(() -> print(\"gave up\"), 2000)\n" +
+        "onSignal(\"SIGWINCH\", () -> xs.pop())\n" +
+        "onSignal(\"SIGWINCH\", () -> xs.removeAt(0))\n"
+
+    // A program that faults prints only its fault, so the third handler is told apart by being a
+    // fault of its own: had it run, its sentence would have replaced the first one's.
+    val said = raised(libuv.SIGWINCH, 40u64, 0u64, program)
+
+    assert(said.contains("there is nothing to pop off an empty array"), s"the fault is reported: ${said}")
+    assert(!said.contains("there is nothing to remove from an empty array"), s"and the one after it did not run: ${said}")
 
 @test
 A_SIGNAL_SENT_TO_THIS_PROCESS_ONCE_IS_HANDLED_ONCE()
