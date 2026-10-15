@@ -1,0 +1,318 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// How the JavaScript back end spells a local whose block READ the same name before declaring it.
+//
+// **slate binds a name where its declaration stands; JavaScript binds a `let` or `const` for the
+// whole block.** So `val x = made()` and then `val made = x + 1` read the outer `made` on the first
+// line under the interpreter, and under node the first line is inside the second line's temporal dead
+// zone -- `Cannot access 'made' before initialization`. Only a LATER declaration collides in slate,
+// and `val g = g()` (a definition named and then run) is an idiom, so the emitted program has to
+// keep the outer binding reachable above the line that shadows it.
+//
+// **The local is spelled differently, never declared with `var`.** `made` becomes `made$7` from the
+// line that declares it to the end of its block, and every read above that line is left as `made`,
+// which JavaScript then resolves outward exactly as the machine does. A `var` would hoist the local
+// over the read instead, which is the same defect wearing a different hat.
+//
+// **A read inside a function written in the block is DEFERRED, and takes the new spelling wherever
+// it stands.** A lambda runs when it is called, and a lambda written above the declaration is almost
+// always called after it -- two local functions that call each other are the ordinary case -- so it
+// reads the block's own binding, as the interpreter's scope lookup at call time does. That is also
+// why only DIRECT reads decide whether a block needs a new spelling at all: a lambda mentioning a
+// later local was never in its dead zone.
+//
+// **Every binder takes the spelling too, not only the declaration.** A parameter, a pattern or a
+// nested `val` naming `made` below the declaration shadows it; spelling all of them alike keeps
+// JavaScript's scoping the same shape as slate's, so nothing here has to track which binding a read
+// lands on. The one thing that is the slate name throughout is what a message says.
+
+// One local given a spelling of its own.
+struct Spelling
+    // The name the program wrote.
+    name: string
+
+    // What the emitted program calls it.
+    js: string
+
+    // How many functions deep the block declaring it is, which is what tells a deferred read from a
+    // direct one.
+    depth: usize
+
+    // Whether its declaration has been written. Above that line a direct read is the OUTER binding's.
+    live: bool
+end Spelling
+
+// What the emitter knows about spellings at the point being written.
+struct JsSpelling
+    // Every spelling of every block open around this point, innermost last.
+    entries: Buf[Spelling]
+
+    // The names the block being written spells afresh.
+    early: Buf[string]
+
+    // How many function bodies enclose this point.
+    depth: usize
+
+    // How many blocks are open, so the file's own block can be told when it closes.
+    blocks: usize
+
+    // The spellings the file's top level gave, kept for its exports once its block has closed.
+    top: Buf[Spelling]
+end JsSpelling
+
+fresh_spelling() -> JsSpelling = JsSpelling(buf(), buf(), 0, 0, buf())
+
+// The JavaScript name a local is written under at this point.
+//
+// Not `private`: every file of the back end that writes a binding or a read of one asks it.
+spelled(j: *Js, name: string) -> string
+    val es = j.spelling.entries
+    var k = es.len()
+
+    while k > 0
+        k -= 1
+
+        val e = es.at(k)
+
+        if e.name == name && (e.live || j.spelling.depth > e.depth) then return e.js
+
+    js_name(name)
+end spelled
+
+// The same question asked once the file's block has closed, which is where its exports are written.
+//
+// Not `private`: `js.sysl`'s exports and test registrations ask it.
+module_spelled(j: *Js, name: string) -> string
+    val es = j.spelling.top
+
+    for k in 0..<es.len()
+        if es.at(k).name == name then return es.at(k).js
+
+    js_name(name)
+end module_spelled
+
+// Give a spelling to every name the run of statements reads directly before the statement that
+// declares it. `already` is what the block holds before its first statement -- a function's
+// parameters, a binder's names -- which a read is a read of.
+//
+// Not `private`: `js_stmt.sysl`'s `open_block` asks it.
+spell_early(j: *Js, stmts: Buf[Stmt], already: Buf[string])
+    var declared = already.copy()
+    var reads: Buf[string] = buf()
+    var early: Buf[string] = buf()
+
+    // **A definition hoists**, so a read above one is a read of it, and it is never respelled.
+    hoisted_defs(stmts, &declared)
+
+    for i in 0..<stmts.len()
+        val s = stmts.at(i)
+        var here: Buf[string] = buf()
+
+        respellable(s, &here)
+
+        // **A `class` or `data` line is one declaration written as several bindings**, its variants
+        // and its shape naming the type it belongs to -- so its own names are not read before it.
+        // Every other statement's initialiser runs before its name is bound.
+        val grouped = *s.kind match
+            Group(_) -> true
+            _ -> false
+
+        if grouped
+            for n in 0..<here.len()
+                if !holds(declared, here.at(n)) then declared.push(here.at(n))
+
+        direct_stmt_reads(s, &reads)
+
+        for n in 0..<here.len()
+            val name = here.at(n)
+
+            if holds(declared, name) then continue
+
+            declared.push(name)
+
+            if holds(reads, name) && !holds(early, name) then early.push(name)
+
+    for i in 0..<early.len()
+        val name = early.at(i)
+
+        j.tmp += 1
+        j.spelling.entries.push(Spelling(name, js_name(name) + "$" + s"${j.tmp}", j.spelling.depth, false))
+
+    j.spelling.early = early
+end spell_early
+
+// The declaration of `name` is being written: from here on a direct read is the block's own.
+//
+// Not `private`: `js_stmt.sysl`'s `emit_stmt` says so at each declaration it writes.
+went_live(j: *Js, name: string)
+    if !holds(j.spelling.early, name) then return
+
+    var k = j.spelling.entries.len()
+
+    while k > 0
+        k -= 1
+
+        val e = j.spelling.entries.at(k)
+
+        if e.name == name && e.depth == j.spelling.depth
+            if !e.live then j.spelling.entries.set(k, Spelling(e.name, e.js, e.depth, true))
+
+            return
+end went_live
+
+// The names a statement binds that a spelling can be given to: what `val`, `var`, a destructuring
+// binding and a `class` or `data` line declare. A definition hoists and an import stands at the top
+// of a file, so neither can be read before it.
+private respellable(s: Stmt, here: *Buf[string])
+    *s.kind match
+        Val(name, _) -> here.push(name)
+        Var(name, _) -> here.push(name)
+        Unpack(pat, _, _) -> pattern_names(resolve_pattern(pat, 0), here)
+        Group(stmts) ->
+            for m in 0..<stmts.len()
+                *stmts.at(m).kind match
+                    Val(name, _) -> here.push(name)
+                    _ -> ()
+        _ -> ()
+
+private hoisted_defs(stmts: Buf[Stmt], into: *Buf[string])
+    for i in 0..<stmts.len()
+        *stmts.at(i).kind match
+            Def(name, _, _, _, _) -> into.push(name)
+            Group(inner) -> hoisted_defs(inner, into)
+            _ -> ()
+
+// What a statement reads as it runs, leaving out every function body it writes.
+private direct_stmt_reads(s: Stmt, into: *Buf[string])
+    *s.kind match
+        Def(_, _, _, _, _) -> ()
+        TypeDecl(_, _) -> ()
+        ExternalDecl(_, _) -> ()
+        Val(_, init) -> direct_reads(init, into)
+        Var(_, init) -> direct_reads(init, into)
+        Unpack(_, init, _) -> direct_reads(init, into)
+        Using(bind, _) -> direct_stmt_reads(bind, into)
+        Group(stmts) ->
+            for i in 0..<stmts.len()
+                direct_stmt_reads(stmts.at(i), into)
+        Assign(_, target, value) ->
+            direct_reads(target, into)
+            direct_reads(value, into)
+        MultiAssign(_, targets, values) ->
+            each_direct(targets, into)
+            each_direct(values, into)
+        Eval(e) -> direct_reads(e, into)
+        Return(value) -> maybe_direct(value, into)
+        Throw(value) -> direct_reads(value, into)
+        Break(_, value) -> maybe_direct(value, into)
+        Continue(_) -> ()
+        ImportNames(_, _, _, _, _) -> ()
+        ImportAll(_, _, _, _) -> ()
+        ImportAsset(_, _, _) -> ()
+        CheckType(name, _, _) -> into.push(name)
+        Clause(_, _, _, _, cond) -> direct_reads(cond, into)
+end direct_stmt_reads
+
+// Every name an expression reads as it is evaluated.
+//
+// **A lambda's body is left out, and that is the whole of the rule** -- see the header. A nested
+// block, branch, loop or `match` is walked into: it runs where it stands, and a name it declares for
+// itself only makes this answer larger, which costs a spelling nobody needed and nothing else.
+//
+// **Exhaustive over `ExprKind` on purpose**, for `free_names`' reason in `slots.sysl`: a node added
+// later that quietly reads nothing here is a dead zone node finds and nothing reports.
+private direct_reads(x: Expr, into: *Buf[string])
+    *x.kind match
+        Name(n) -> into.push(n)
+        Lambda(_, _, _, _) -> ()
+
+        // A class's own shape, which the runtime reads lazily.
+        ShapeLit(_, _) -> ()
+        MatchExpr(subject, arms) ->
+            direct_reads(subject, into)
+
+            for i in 0..<arms.len()
+                val arm = arms.at(i)
+
+                maybe_direct(arm.guard, into)
+                direct_reads(arm.body, into)
+        For(_, _, iter, body, otherwise, _) ->
+            direct_reads(iter, into)
+            direct_reads(body, into)
+            maybe_direct(otherwise, into)
+        TryCatch(body, _, handler) ->
+            direct_reads(body, into)
+            direct_reads(handler, into)
+        Spread(inner) -> direct_reads(inner, into)
+        Named(_, value) -> direct_reads(value, into)
+        Unary(_, rhs) -> direct_reads(rhs, into)
+        Binary(_, lhs, rhs) ->
+            direct_reads(lhs, into)
+            direct_reads(rhs, into)
+        Call(callee, args, _) ->
+            direct_reads(callee, into)
+            each_direct(args, into)
+        Index(target, key, _) ->
+            direct_reads(target, into)
+            direct_reads(key, into)
+        Field(target, _, _) -> direct_reads(target, into)
+        Chain(inner) -> direct_reads(inner, into)
+        ArrayLit(items) -> each_direct(items, into)
+        ArrayRepeat(value, count) ->
+            direct_reads(value, into)
+            direct_reads(count, into)
+        Interp(pieces) -> each_direct(pieces, into)
+        WithFields(base, _, values) ->
+            direct_reads(base, into)
+            each_direct(values, into)
+        WithAll(base, other, _) ->
+            direct_reads(base, into)
+            direct_reads(other, into)
+        ObjectLit(_, _, values) -> each_direct(values, into)
+        DataLit(inner) -> direct_reads(inner, into)
+        Compare(operands, _) -> each_direct(operands, into)
+        Range(lo, hi, _, step) ->
+            maybe_direct(lo, into)
+            maybe_direct(hi, into)
+            maybe_direct(step, into)
+        IsPattern(subject, _, _) -> direct_reads(subject, into)
+        IncDec(target, _, _) -> direct_reads(target, into)
+        Await(inner) -> direct_reads(inner, into)
+        Yield(inner) -> direct_reads(inner, into)
+        IfExpr(cond, then_branch, else_branch) ->
+            direct_reads(cond, into)
+            direct_reads(then_branch, into)
+            maybe_direct(else_branch, into)
+        While(_, cond, body, otherwise) ->
+            direct_reads(cond, into)
+            direct_reads(body, into)
+            maybe_direct(otherwise, into)
+        Loop(_, body) -> direct_reads(body, into)
+        DoWhile(_, body, cond, otherwise) ->
+            direct_reads(body, into)
+            direct_reads(cond, into)
+            maybe_direct(otherwise, into)
+        Block(stmts) ->
+            for i in 0..<stmts.len()
+                direct_stmt_reads(stmts.at(i), into)
+        Ensures(value, _, _, _) -> direct_reads(value, into)
+        IntLit(_) -> ()
+        BigLit(_) -> ()
+        RealLit(_) -> ()
+        StrLit(_) -> ()
+        BoolLit(_) -> ()
+        NullLit -> ()
+        UndefinedLit -> ()
+        Bad -> ()
+end direct_reads
+
+private each_direct(xs: Buf[Expr], into: *Buf[string])
+    for i in 0..<xs.len()
+        direct_reads(xs.at(i), into)
+
+private maybe_direct(x: Option[Expr], into: *Buf[string]) = x match
+    Some(e) -> direct_reads(e, into)
+    None -> ()
