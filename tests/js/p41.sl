@@ -108,3 +108,48 @@ shadowedAfter()
     [made, f(3), [5].map(made -> made + made)]
 
 print(deferred(), mutual(4), mutual(3), shadowedAfter())
+
+// -- an annotated binding ------------------------------------------------------------------------
+//
+// **`val x: T = e` is a binding and its check travelling together**, so the read above it is still
+// the outer name's and the check below it reads the local.
+
+annotatedVal()
+    val x = made()
+    val made: integer = x + 1
+    made
+
+annotatedVar()
+    val x = made()
+    var made: integer = x + 1
+    made += 10
+    made
+
+annotatedOwnInit()
+    val made: integer = made() + 5
+    made
+
+print(annotatedVal(), annotatedVar(), annotatedOwnInit())
+
+// -- a class and a data type taking a builtin's name, below a read of the builtin ----------------
+//
+// **A class's shape names the class**, so its test is the local class's and not the builtin's. A
+// `data` line binds its shared object and then each variant, every variant reading the object above
+// it.
+
+val sized = Set([1, 2]).size
+
+class Set
+    var n
+
+    doubled(self) = Set(self.n * 2)
+
+print(sized, Set(3).n, Set(4).doubled().n, Set.test(Set(5)), Set.test(7), Set.name())
+
+val counted = Map([[1, 2], [3, 4]]).size
+
+data Map
+    Leaf(v)
+    Empty
+
+print(counted, Leaf(3) is Leaf, Map.test(Empty), Map.test(Leaf(1)), Map.test(3), Map.name())
