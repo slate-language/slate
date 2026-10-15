@@ -1,0 +1,338 @@
+module dev.slatelang.slate
+@tests
+
+import sh.sysl.libuv
+import sh.sysl.libuv.Handle
+import sysl.buf.{Buf, buf}
+import sysl.fs.{read_bytes, write_text}
+import sysl.text.{Search, from_utf8_unchecked, replace_all, str_builder}
+
+// `slate run --watch`: a program started, stopped and started again as its sources change.
+//
+// **The child here is `/bin/sh`, not slate**, and that is the one place these tests stand in for the
+// real thing: a test binary is not a slate executable, so it has nothing to start that would run a
+// `.sl` file (`tests_cluster.sysl` meets the same wall). The program file is `main.sl` all the same,
+// written as a shell script -- so everything the watcher itself decides is exercised for real: the
+// FSEvents watch of a real directory, which names count, the settle timer, SIGTERM then SIGKILL, the
+// restart, the wait after a crash, and the status at the end. What the child does is append a line to
+// a log OUTSIDE the watched tree, which is how a test sees each run.
+//
+// **Every run is bounded by a watchdog**, an unreferenced timer that stops the watch with SIGKILL and
+// records that it had to: a watcher that never ends would otherwise hang the suite with nothing
+// printed.
+
+// How long after the watch starts the first edit is made, and how long a restart is given to show up
+// in the log. Generous, because FSEvents batches what it reports and a test near its margin is a
+// timing test.
+private val EditAt: u64 = 600
+private val Restarted: u64 = 1500
+
+// The bound on any one watch.
+private val WatchdogMs: u64 = 15000
+
+// A watched project and the log its runs write: `<top>/proj` is watched, `<top>/out.log` is not.
+private struct Scene
+    top: string
+    proj: string
+    log: string
+
+// What the watcher said, and whether the watchdog had to end it.
+private struct Notes
+    lines: Buf[string]
+    timed_out: bool
+
+    said(self) -> string
+        var b = str_builder()
+
+        for i in 0..<self.lines.len()
+            b.push(self.lines.at(i))
+            b.push("\n")
+
+        b.finish()
+
+// A fresh project whose `main.sl` is `program`, with `<log>` standing for the log's path.
+private scene(program: string) -> Scene
+    val top = libuv.mkdtemp_sync("/tmp/slate-watch-XXXXXX").unwrap()
+    val sc = Scene(top, s"${top}/proj", s"${top}/out.log")
+
+    libuv.mkdir_sync(sc.proj).unwrap()
+    put(sc, "main.sl", program)
+
+    // **Let the writes above age past the watch's start**, so that nothing made before the watcher
+    // existed can arrive as its first event and be counted as an edit.
+    libuv.sleep(200)
+
+    sc
+end scene
+
+// Write a file in the project, with `<log>` filled in.
+private put(sc: Scene, name: string, text: string)
+    write_text(s"${sc.proj}/${name}", replace_all(text, "<log>", sc.log)).unwrap()
+
+// What the runs wrote.
+private logged(sc: Scene) -> string
+    read_bytes(sc.log) match
+        Ok(b) -> from_utf8_unchecked(b)
+        Err(_) -> ""
+
+// `f`, once, `ms` from now.
+private after(ms: u64, f: &Fn() -> unit)
+    val t = libuv.timer().unwrap()
+
+    t.start(ms, 0, () ->
+        t.close()
+        f()).unwrap()
+
+// A watch of the scene's project, started; `grace` is `--grace`.
+private watching(sc: Scene, grace: u64, signals: bool, notes: &Notes) -> &Watcher
+    var argv: Buf[string] = buf()
+
+    argv.push(s"${sc.proj}/main.sl")
+
+    val plan = WatchPlan("/bin/sh", argv, sc.proj, "", grace, WatchSettleMs, signals)
+
+    begin_watch(plan, (line: string) -> notes.lines.push(line), libuv.default_loop()).unwrap()
+
+// Run the loop until the watch is over, or until the watchdog ends it.
+private ran(w: &Watcher, notes: &Notes)
+    val dog = libuv.timer().unwrap()
+
+    dog.start(WatchdogMs, 0, () ->
+        notes.timed_out = true
+        stop_watch(w, libuv.SIGKILL)).unwrap()
+
+    // **Not a reason to keep running**: the watch ending is what ends the loop, and the watchdog is
+    // only there for when it does not.
+    dog.unref()
+
+    libuv.default_loop().run(libuv.RUN_DEFAULT).unwrap()
+
+    dog.close()
+    libuv.default_loop().run(libuv.RUN_NOWAIT).unwrap()
+
+    assert(!notes.timed_out, s"the watchdog had to end the watch; the watcher said:\n${notes.said()}")
+
+// -- restarting --------------------------------------------------------------------------------------
+
+@test
+A_WATCHED_PROGRAM_STARTS_AGAIN_WHEN_ITS_SOURCE_CHANGES()
+    val sc = scene("echo one >> <log>\nexec sleep 30\n")
+    var notes: &Notes = Notes(buf(), false)
+    val w = watching(sc, 2000, false, notes)
+
+    after(EditAt, () -> put(sc, "main.sl", "echo two >> <log>\nexec sleep 30\n"))
+    after(EditAt + Restarted, () -> stop_watch(w, libuv.SIGTERM))
+    ran(w, notes)
+
+    assert_eq(logged(sc), "one\ntwo\n")
+    assert_eq(w.starts, 2)
+    assert(notes.said().contains("slate: main.sl changed -- restarting"), notes.said())
+
+    // **The status is the child's**, as a shell reports it: `sleep` ended by the SIGTERM the stop
+    // passed on is 128 + 15.
+    assert_eq(w.status, 143)
+
+    scrub(sc.top)
+
+@test
+TWO_QUICK_CHANGES_RESTART_A_WATCHED_PROGRAM_ONCE()
+    // **One save is often several writes**, and a watcher that restarted on each would start a
+    // program and kill it before it had read its first line.
+    val sc = scene("echo run >> <log>\nexec sleep 30\n")
+    var notes: &Notes = Notes(buf(), false)
+    val w = watching(sc, 2000, false, notes)
+
+    // **Forty milliseconds apart, inside the settle time and outside the time a restart takes** --
+    // so a watcher with no settling would have restarted for the first and again for the second.
+    after(EditAt, () -> put(sc, "util.sl", "a helper\n"))
+    after(EditAt + 40, () -> put(sc, "main.sl", "echo run >> <log>\nexec sleep 31\n"))
+    after(EditAt + Restarted, () -> stop_watch(w, libuv.SIGTERM))
+    ran(w, notes)
+
+    assert_eq(logged(sc), "run\nrun\n")
+    assert_eq(w.starts, 2)
+
+    scrub(sc.top)
+
+@test
+A_WATCHED_PROGRAM_THAT_IGNORES_SIGTERM_IS_KILLED_WHEN_ITS_GRACE_IS_UP()
+    // The restart's SIGTERM is ignored, so it is SIGKILL after 300 ms that ends the first run --
+    // and the same again for the stop at the end, whose status says so.
+    val sc = scene("trap '' TERM\necho run >> <log>\nwhile :; do sleep 0.05; done\n")
+    var notes: &Notes = Notes(buf(), false)
+    val w = watching(sc, 300, false, notes)
+
+    after(EditAt, () -> put(sc, "main.sl", "trap '' TERM\necho run >> <log>\nwhile :; do sleep 0.06; done\n"))
+    after(EditAt + Restarted, () -> stop_watch(w, libuv.SIGTERM))
+    ran(w, notes)
+
+    assert_eq(logged(sc), "run\nrun\n")
+    assert_eq(w.starts, 2)
+    assert_eq(w.status, 137)
+
+    scrub(sc.top)
+
+// -- a program that ends on its own -----------------------------------------------------------------
+
+@test
+A_CRASHING_WATCHED_PROGRAM_WAITS_FOR_A_CHANGE_RATHER_THAN_LOOPING()
+    val sc = scene("echo crash >> <log>\nexit 3\n")
+    var notes: &Notes = Notes(buf(), false)
+    val w = watching(sc, 2000, false, notes)
+
+    // Nothing changes for a while: one run, and a note saying how it ended.
+    after(Restarted, () ->
+        assert_eq(logged(sc), "crash\n")
+        assert_eq(w.starts, 1)
+        put(sc, "main.sl", "echo again >> <log>\nexit 4\n"))
+
+    // The edit that "fixes" it is what starts it again.
+    after(Restarted * 2, () -> stop_watch(w, libuv.SIGINT))
+    ran(w, notes)
+
+    assert_eq(logged(sc), "crash\nagain\n")
+    assert_eq(w.starts, 2)
+    assert(notes.said().contains("slate: the program exited with status 3 -- waiting for a change"), notes.said())
+
+    // **Stopped with no child running, the status is the last child's.**
+    assert_eq(w.status, 4)
+
+    scrub(sc.top)
+
+// -- what counts --------------------------------------------------------------------------------------
+
+@test
+FILES_THAT_ARE_NOT_SOURCE_DO_NOT_RESTART_A_WATCHED_PROGRAM_AND_AN_ASSET_DOES()
+    val sc = scene("echo run >> <log>\nexec sleep 30\n")
+
+    libuv.mkdir_sync(s"${sc.proj}/.git").unwrap()
+    libuv.mkdir_sync(s"${sc.proj}/vendor").unwrap()
+    libuv.sleep(200)
+
+    var notes: &Notes = Notes(buf(), false)
+    val w = watching(sc, 2000, false, notes)
+
+    after(EditAt, () ->
+        put(sc, ".git/HEAD", "ref: refs/heads/dev\n")
+        put(sc, "vendor/lib.sl", "vendored\n")
+        put(sc, "main.sl.swp", "vim\n")
+        put(sc, "main.sl~", "emacs\n")
+        put(sc, ".#main.sl", "emacs lock\n")
+        put(sc, "4913", "vim probe\n")
+        put(sc, "server.log", "a program's own output\n")
+        put(sc, "data.db", "a program's own database\n"))
+
+    // **The control**: the same watcher, still live, does restart for a stylesheet -- so the quiet
+    // above was the filter and not a watcher that had stopped hearing anything.
+    after(EditAt + Restarted, () ->
+        assert_eq(w.starts, 1, notes.said())
+        put(sc, "panel.css", "p { color: red }\n"))
+    after(EditAt + Restarted * 2, () -> stop_watch(w, libuv.SIGTERM))
+    ran(w, notes)
+
+    assert_eq(w.starts, 2)
+    assert_eq(notes.said(), "slate: panel.css changed -- restarting\n")
+
+    scrub(sc.top)
+
+@test
+WHICH_NAMES_RESTART_A_WATCHED_PROGRAM()
+    assert(watch_counts("main.sl", "/p", ""))
+    assert(watch_counts("lib/view.slx", "/p", ""))
+    assert(watch_counts("package.sl", "/p", ""))
+    assert(watch_counts("styles/panel.css", "/p", ""))
+    assert(watch_counts("data/seed.json", "/p", ""))
+
+    // A name the platform did not give is counted rather than missed.
+    assert(watch_counts("", "/p", ""))
+
+    assert(!watch_counts(".git/index", "/p", ""))
+    assert(!watch_counts("sub/.git/index", "/p", ""))
+    assert(!watch_counts("vendor/kit/@v1.0.0/panel.sl", "/p", ""))
+    assert(!watch_counts("main.sl~", "/p", ""))
+    assert(!watch_counts("lib/.#main.sl", "/p", ""))
+    assert(!watch_counts(".main.sl.swp", "/p", ""))
+    assert(!watch_counts("4913", "/p", ""))
+    assert(!watch_counts("uploads/photo.png", "/p", ""))
+    assert(!watch_counts("app.db", "/p", ""))
+
+    // The package cache, where it happens to sit inside the project.
+    assert(!watch_counts(".cache/pkg/kit/main.sl", "/p", "/p/.cache/pkg"))
+    assert(watch_counts(".cache/pkgs.sl", "/p", "/p/.cache/pkg"))
+
+// -- Ctrl-C ---------------------------------------------------------------------------------------------
+
+@test
+CTRL_C_STOPS_THE_PROGRAM_AND_THE_WATCH_WITH_THE_PROGRAMS_STATUS()
+    // **A real SIGINT to this process**, caught by the watcher's own handler and passed on to the
+    // child -- which dies of it, so the status is 128 + 2.
+    val sc = scene("echo run >> <log>\nexec sleep 30\n")
+    var notes: &Notes = Notes(buf(), false)
+    val w = watching(sc, 2000, true, notes)
+
+    after(EditAt, () -> libuv.kill(libuv.pid(), libuv.SIGINT).unwrap())
+    ran(w, notes)
+
+    assert_eq(logged(sc), "run\n")
+    assert_eq(w.status, 130)
+
+    scrub(sc.top)
+
+// -- the command line ---------------------------------------------------------------------------------
+
+private watch_cli(argv: []const string) -> (int, string)
+    var command: Buf[string] = buf()
+
+    command.push("slate")
+    command.push("run")
+    command.push("--watch")
+
+    for i in 0..<argv.len
+        command.push(argv[i])
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val status = run_cli(command.view(), (line: string) -> sink.push(line))
+    var said = str_builder()
+
+    for i in 0..<lines.len()
+        said.push(lines.at(i))
+
+    (status, said.finish())
+
+@test
+WATCH_WITH_NO_PROGRAM_SAYS_WHAT_IT_TAKES()
+    val (status, said) = watch_cli([])
+
+    assert_eq(status, 2)
+    assert(said.contains("`run --watch` takes the program to run"), said)
+
+@test
+A_WATCH_GRACE_THAT_IS_NOT_A_NUMBER_IS_REFUSED()
+    val (status, said) = watch_cli(["--grace", "soon", "main.sl"])
+
+    assert_eq(status, 2)
+    assert(said.contains("`--grace` takes a number of milliseconds, and soon is not one"), said)
+
+    val (status2, said2) = watch_cli(["--grace"])
+
+    assert_eq(status2, 2)
+    assert(said2.contains("`--grace` takes a number of milliseconds"), said2)
+
+@test
+A_WATCHED_PROGRAM_THAT_IS_NOT_THERE_IS_REFUSED_BEFORE_ANYTHING_STARTS()
+    val (status, said) = watch_cli(["/tmp/slate-watch-no-such-dir/main.sl"])
+
+    assert_eq(status, 1)
+    assert(said.contains("cannot read /tmp/slate-watch-no-such-dir/main.sl"), said)
+
+@test
+A_LONE_FILE_IS_WATCHED_IN_ITS_OWN_DIRECTORY()
+    // No `package.sl` above it, so its directory is the project.
+    val top = libuv.mkdtemp_sync("/tmp/slate-watch-XXXXXX").unwrap()
+
+    write_text(s"${top}/main.sl", "print(1)\n").unwrap()
+
+    assert_eq(watched_root(s"${top}/main.sl"), top)
+
+    scrub(top)
