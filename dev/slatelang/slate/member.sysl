@@ -1,0 +1,213 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// A member found by a COMPUTED key, which two pieces of JavaScript's grammar ask about: `k in o`,
+// whether `o[k]` would find one, and `o[k](a)`, which calls one with the receiver `o.k(a)` would have
+// passed. `index.sysl` is the read itself; this is the two questions asked of the same walk.
+//
+// The JavaScript runtime's halves are `memberIn` and `methodAt` in `js_rt_ops.sysl`, and the two
+// back ends answer every case below alike.
+
+// -- `k in o` -----------------------------------------------------------------------------------------
+
+// Whether `o[k]` would find a member: own or inherited, a property, a shape method or a universal
+// one on an object; a position or a member name on an array, a string or bytes; a member name on
+// any other kind that has members.
+//
+// **`in` READS NOTHING AND RUNS NOTHING.** A `get` is asked whether it is THERE, never called, which
+// is JavaScript's rule -- and a property that has only a `set` is there too, where reading it is a
+// fault. That is the one place `k in o` is true and `o[k]` does not answer.
+//
+// **A value with no members at all is refused rather than answered `false`**, which is JavaScript's
+// `TypeError` for `k in 5` and is what `o[k]` already does with one: `null`, a boolean and a number.
+// A key of a kind the container is not indexed by is refused for the same reason, in the sentence
+// the read would have used. A position past the end is simply not there.
+//
+// Not `private`: the machine's `MemberIn` is the caller, from `run_frames.sysl`.
+member_in(container: Value, k: Value, at: Span) -> Result[bool, Signal]
+    container match
+        Object(fields) ->
+            k match
+                Str(sv) -> return Ok(object_names(container, fields, text_of(sv), at)?)
+                _ -> return Ok(!is_absent(found_by_key(fields, k, at)?.0))
+        Null -> return Err(failure(at, memberless(container)))
+        Undefined -> return Err(failure(at, memberless(container)))
+        Bool(_) -> return Err(failure(at, memberless(container)))
+        Int(_) -> return Err(failure(at, memberless(container)))
+        Big(_) -> return Err(failure(at, memberless(container)))
+        Real(_) -> return Err(failure(at, memberless(container)))
+        External(_) -> return Err(failure(at, js_host_only("asking `in` of an external")))
+        _ -> ()
+
+    // **A name is asked of the kind's tables, which is exactly what `o[k]` reads**, so
+    // `"length" in xs` is true and `"toUpper" in s` is true.
+    k match
+        Str(sv) ->
+            val name = text_of(sv)
+
+            return Ok(builtin_property(container, name).is_some() || builtin_method(container, name).is_some())
+        _ -> ()
+
+    val n: usize = container match
+        Array(a) -> a.items.len()
+        Str(sv) -> str_count(sv)
+        Bytes(bs) -> bs.data.len()
+        _ -> return Err(failure(at, s"`in` asks ${container.type_name()} about a name, and this is ${k.type_name()}"))
+
+    k match
+        Int(i) -> Ok(i >= 0 && usize(i) < n)
+        _ -> Err(failure(at, s"`in` asks ${container.type_name()} about a position or a name, and this is ${k.type_name()}"))
+end member_in
+
+private memberless(v: Value) -> string =
+    s"${v.type_name()} has no members for `in` to ask about -- `in` asks an object, an array, a string or bytes"
+
+// Whether an object answers to `name` by any of the routes `o.name` takes, without taking one.
+private object_names(target: Value, fields: *ObjectObj, name: string, at: Span) -> Result[bool, Signal]
+    if !is_absent(field_from(fields, name, at)?.0) then return Ok(true)
+
+    // A property is there whichever half was declared -- see `member_in`.
+    if !is_absent(field_from(fields, GetPrefix + name, at)?.0) then return Ok(true)
+
+    if !is_absent(field_from(fields, SetPrefix + name, at)?.0) then return Ok(true)
+
+    Ok(shape_receiver(target, name).is_some() || universal_receiver(name).is_some())
+end object_names
+
+// `o[k]` for a key that is not a string, and whether a `proto` answered: `key_from`'s walk with
+// `field_from`'s second answer, which is what decides a receiver.
+private found_by_key(o: *ObjectObj, k: Value, at: Span) -> Result[(Value, bool), Signal]
+    var up = o
+    var depth: usize = 0
+
+    loop
+        obj_get(up, k, at)? match
+            Some(v) -> return Ok((v, depth > 0))
+            None -> ()
+
+        up = obj_get_name(up, "proto") match
+            Some(Object(p)) -> p
+            _ -> return Ok((Undefined, false))
+
+        depth += 1
+
+        if depth >= MaxProtoDepth
+            return Err(failure(at, s"this object's `proto` chain is more than ${MaxProtoDepth} deep, which means it is a circle -- looking up a key in it would never finish"))
+end found_by_key
+
+// -- `o[k](a)` ----------------------------------------------------------------------------------------
+
+// The function `o[k](a)` calls, and whether `o` goes in front of the arguments.
+//
+// **A STRING KEY IS `o.k(a)` EXACTLY**, the receiver rule included: a method shared through a proto,
+// and every method of a builtin kind, is handed the object; one the object holds itself is not. Any
+// other key is an entry -- of an object, found up its chain by the key itself and handed the object
+// where a proto answered; of an array, which is never a method and is called with what was written.
+//
+// **Where a string names nothing, the sentence is `o.k(a)`'s**, a property included. A missing entry
+// under any other key is handed on as it is, so the call says what it always said about calling
+// nothing.
+indexed_method(target: Value, k: Value, at: Span) -> Result[(Value, bool), Signal]
+    val name = k match
+        Str(sv) -> text_of(sv)
+        _ -> return target match
+            Object(fields) -> found_by_key(fields, k, at)
+            _ -> Ok((read_at(target, k, at)?, false))
+
+    val looked = target match
+        Object(fields) -> field_from(fields, name, at)?
+        _ -> builtin_receiver(target, name, at)?
+
+    if !is_absent(looked.0) then return Ok(looked)
+
+    shape_receiver(target, name) match
+        Some(pair) -> return Ok(pair)
+        None -> ()
+
+    universal_receiver(name) match
+        Some(pair) -> return Ok(pair)
+        None -> ()
+
+    target match
+        Object(o) ->
+            if has_property(o, name, at)?
+                return Err(failure(at, s"`${name}` is a property, not a method -- it is read as `.${name}`, with no brackets after it"))
+        _ -> ()
+
+    Err(failure(at, s"`${name}` is not a field of this object, so there is nothing to call"))
+end indexed_method
+
+// `o`, `k` and `argc` written arguments standing on the stack become the function and the arguments
+// a `CallFn` is handed: with `o` in front of them where the member was delegated to, and the answer
+// is whether it was.
+//
+// **Both stay standing until the member is in hand**, because a key that is an object is hashed by
+// its class's own `hash`, which is slate code -- and a `Value` in a sysl local is no root.
+//
+// Not `private`: `run_frames.sysl`'s `ArrangeIndexed` is the caller.
+arrange_indexed(vm: *Machine, argc: usize, at: Span) -> Result[bool, Signal]
+    val n = vm.stack.len()
+    val t = n - argc - 2
+    val target = vm.stack.at(t)
+    val found = indexed_method(target, vm.stack.at(t + 1), at)?
+
+    vm.stack.set(t, found.0)
+
+    if found.1
+        vm.stack.set(t + 1, target)
+        return Ok(true)
+
+    for i in 0..<argc
+        vm.stack.set(t + 1 + i, vm.stack.at(t + 2 + i))
+
+    vm.stack.truncate(n - 1)
+    Ok(false)
+end arrange_indexed
+
+// `o`, `k` and the array a spread built become the function and the array a `CallSpread` is handed,
+// with `o` put in front where the member was delegated to.
+//
+// Not `private`: `run_frames.sysl`'s `ArrangeIndexedSpread` is the caller.
+arrange_indexed_spread(vm: *Machine, at: Span) -> Result[unit, Signal]
+    val n = vm.stack.len()
+    val target = vm.stack.at(n - 3)
+    val found = indexed_method(target, vm.stack.at(n - 2), at)?
+
+    vm.stack.set(n - 3, found.0)
+
+    if found.1
+        // **Nothing between here and the push allocates on the collected heap but `new_array`
+        // itself**, and an allocation never collects, so `target` in a sysl `Buf` is safe for the
+        // length of it.
+        var items: Buf[Value] = buf()
+
+        items.push(target)
+
+        vm.stack.at(n - 1) match
+            Array(a) ->
+                for i in 0..<a.items.len()
+                    items.push(a.items.at(i))
+            _ -> return Err(failure(at, "unreachable"))
+
+        vm.stack.set(n - 2, Array(new_array(items)))
+    else
+        vm.stack.set(n - 2, vm.stack.at(n - 1))
+
+    vm.stack.truncate(n - 1)
+    Ok(())
+end arrange_indexed_spread
+
+// `k in o`: the key below the object on the stack, answered by `member_in`. Both stay standing
+// across the question for `arrange_indexed`'s reason.
+//
+// Not `private`: `run_frames.sysl`'s `MemberIn` is the caller.
+compose_member_in(vm: *Machine, at: Span) -> Result[unit, Signal]
+    val n = vm.stack.len()
+    val answer = member_in(vm.stack.at(n - 1), vm.stack.at(n - 2), at)?
+
+    vm.stack.truncate(n - 2)
+    vm.stack.push(Bool(answer))
+    Ok(())
+end compose_member_in
