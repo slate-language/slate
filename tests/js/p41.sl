@@ -153,3 +153,54 @@ data Map
     Empty
 
 print(counted, Leaf(3) is Leaf, Map.test(Empty), Map.test(Leaf(1)), Map.test(3), Map.name())
+
+// -- a function written in the block, CALLED before the declaration has run ----------------------
+//
+// **What a deferred read finds is decided when it runs**: the outer binding until the local's
+// declaration has executed, the local after it. So a lambda called during the local's own
+// initialiser reads the outer name, and the same lambda called later reads the local.
+
+val tier = "outer"
+
+initialiser()
+    val down = n -> if n == 0 then made() else down(n - 1)
+    val made = down(3) + 1
+    made
+
+beforeAndAfter()
+    val peek = () -> tier
+    val first = peek()
+    val tier = "inner"
+    [first, peek(), tier]
+
+onlyMention()
+    val tier = (() -> tier + "!")()
+    tier
+
+nestedFunctions()
+    val outerFn = () ->
+        val innerFn = () -> tier
+        innerFn()
+    val tier = outerFn() + "+"
+    [tier, outerFn()]
+
+hoistedDefinition()
+    val got = reader()
+    val tier = "local"
+    reader() = tier
+    [got, reader()]
+
+print(initialiser(), beforeAndAfter(), onlyMention())
+print(nestedFunctions(), hoistedDefinition())
+
+// A class is declared at the top level, so its method's outer binding is a builtin: `abs` below is
+// the builtin while the `val` taking its name is being worked out.
+
+class Probe
+    var n
+
+    measured(self) = abs(self.n)
+
+val abs = Probe(-3).measured() + 10
+
+print(abs)
