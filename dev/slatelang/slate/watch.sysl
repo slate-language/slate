@@ -1,0 +1,472 @@
+module dev.slatelang.slate
+
+import sh.sysl.libuv
+import sh.sysl.libuv.Handle
+import sysl.buf.{Buf, buf}
+import sysl.fs.read_bytes
+import sysl.{os, MacOS}
+import sysl.text.{Search, from_utf8_unchecked, parse_long}
+
+// `slate run --watch <program.sl> [arguments]` -- run a program, and start it again when its sources
+// change.
+//
+// **The program runs in a CHILD, and this process only watches.** A restart has to throw away
+// everything the program built -- its heap, its timers, its sockets, the modules it loaded -- and the
+// one way to be sure all of it is gone is for the process that held it to end. So the watcher spawns
+// `slate <program.sl> [arguments]` as a child with the terminal handed straight through, and its own
+// part is the loop below: a file system watcher, two timers, and the child's exit.
+//
+// **The operating system says what changed; nothing is polled.** `libuv.watch` is FSEvents on macOS,
+// recursive over the whole project. inotify on Linux watches one directory at a time and libuv does
+// not walk the tree, so `--watch` refuses there rather than watching the top directory alone and
+// missing every edit below it.
+//
+// **A program that ends on its own is left ended.** A crash restarted at once would crash again at
+// once, in a loop that buries the first report under every later copy of it; the watcher says how
+// the program ended and waits for the edit that fixes it.
+
+// How long a burst of events is allowed to settle before the program is restarted.
+//
+// **One save is several events**: an editor writes a temporary file and renames it over the old one,
+// a formatter rewrites three files, `git checkout` touches dozens. Each event pushes the restart back
+// by this much, so the burst becomes one restart, after the last of it.
+val WatchSettleMs: u64 = 100
+
+// How long a program asked to stop is given before it is made to.
+//
+// `--grace <ms>` changes it. **SIGTERM first**, so a server can finish the request it is in the middle
+// of and close what it holds; then SIGKILL, because a program that ignores the request would otherwise
+// leave the watcher waiting for ever with the old code still answering.
+val WatchGraceMs: u64 = 2000
+
+// What a watch was asked for: what to start, and where to look.
+struct WatchPlan
+    // The executable, and everything after its own name.
+    exec: string
+    argv: Buf[string]
+
+    // The directory watched, absolute -- the project's root, or the program's own directory.
+    root: string
+
+    // The package cache, which is ignored if it happens to sit inside the root.
+    cache: string
+
+    grace_ms: u64
+    settle_ms: u64
+
+    // Whether Ctrl-C and SIGTERM are this watcher's to handle.
+    signals: bool
+
+// One watch in progress.
+//
+// **A counted box that every callback captures**, because each callback has to read and change the
+// same state: the settle timer starts a restart that the child's exit finishes.
+struct Watcher
+    plan: WatchPlan
+
+    // Where the one-line notes go -- stderr from the command line, a buffer in a test.
+    tell: &Fn(string) -> unit
+
+    lp: &libuv.Loop
+
+    // **Every handle is closed by `shut`**: a libuv handle holds itself until `close`, so dropping
+    // the last name for one stops nothing.
+    files: Option[&libuv.FsEvent]
+    settle: Option[&libuv.Timer]
+    grace: Option[&libuv.Timer]
+    child: Option[&libuv.Process]
+    interrupt: Option[&libuv.Signal]
+    terminate: Option[&libuv.Signal]
+
+    // The file that triggered the restart in progress, for its note.
+    changed: string
+
+    // A restart is under way: the child was asked to stop, and starts again when it has.
+    restarting: bool
+
+    // Ctrl-C was pressed: the child was asked to stop, and the watcher ends when it has.
+    stopping: bool
+
+    // How many times the program has been started.
+    starts: usize
+
+    // What the last child left behind, as a shell would report it.
+    status: int
+
+// -- the command ---------------------------------------------------------------------------------
+
+// `slate run --watch [--grace <ms>] <program.sl> [arguments]`.
+//
+// **Asked before any manifest is looked for**, because a lone file has no project and watching one
+// must not depend on there being a `package.sl` above it.
+watch_command(args: []string, say: string -> unit) -> int
+    val here = os()
+
+    if here != MacOS
+        say("slate: `--watch` needs recursive file watching, which slate has on macOS only so far -- on this system it is not built yet")
+
+        return Failed
+    end if
+
+    var i: usize = 3
+    var grace = WatchGraceMs
+
+    while i < args.len && args[i] == "--grace"
+        if i + 1 >= args.len
+            say("slate: `--grace` takes a number of milliseconds")
+
+            return Misused
+        end if
+
+        parse_long(args[i + 1]) match
+            Ok(n) ->
+                if n < 0
+                    say(s"slate: `--grace` takes a number of milliseconds, and ${args[i + 1]} is not one")
+
+                    return Misused
+                end if
+
+                grace = u64(n)
+            Err(_) ->
+                say(s"slate: `--grace` takes a number of milliseconds, and ${args[i + 1]} is not one")
+
+                return Misused
+
+        i += 2
+
+    if i >= args.len
+        say("slate: `run --watch` takes the program to run: slate run --watch <program.sl> [arguments]")
+
+        return Misused
+    end if
+
+    val file = args[i]
+
+    if read_bytes(file).is_err()
+        say(s"slate: cannot read ${file}")
+
+        return Failed
+    end if
+
+    var argv: Buf[string] = buf()
+
+    for j in i..<args.len
+        argv.push(args[j])
+
+    // **This executable, and not the word the shell was given**: `args[0]` may be a bare `slate`
+    // found on a `PATH` the child would search again, or a relative path that means something else
+    // from another directory.
+    val exec = libuv.exepath() match
+        Ok(p) -> p
+        Err(_) -> args[0]
+
+    val plan = WatchPlan(exec, argv, watched_root(file), package_cache(), grace, WatchSettleMs, true)
+
+    val w = begin_watch(plan, (line: string) -> note_line(line), libuv.default_loop()) match
+        Err(e) ->
+            say(e)
+
+            return Failed
+        Ok(w) -> w
+
+    w.lp.run(libuv.RUN_DEFAULT) match
+        Err(_) -> ()
+        Ok(_) -> ()
+
+    w.status
+end watch_command
+
+// The directory watched for a program: its project's root, or the directory it sits in.
+watched_root(file: string) -> string
+    val root = project_root_of(file)
+
+    if root != "" then return root
+
+    val d = dir_of(file)
+    val dir = if d == "" then "." else d
+
+    if dir.starts_with("/") then return normalize_path(dir)
+
+    libuv.cwd() match
+        Ok(here) -> normalize_path(s"${here}/${dir}")
+        Err(_) -> dir
+end watched_root
+
+// One note on stderr, dimmed where stderr is a terminal so the program's own output stands out.
+private note_line(line: string)
+    if libuv.guess_handle(2) == libuv.HANDLE_TTY
+        eprints(s"\u{1b}[2m${line}\u{1b}[0m\n")
+    else
+        eprints(s"${line}\n")
+
+// -- the watcher -----------------------------------------------------------------------------------
+
+// Start watching and start the program, on `lp`. The caller runs the loop; it drains when the
+// watcher is stopped.
+begin_watch(plan: WatchPlan, tell: &Fn(string) -> unit, lp: &libuv.Loop) -> Result[&Watcher, string]
+    var w: &Watcher = Watcher(plan, tell, lp, None, None, None, None, None, None, "", false, false, 0, 0)
+
+    val settle = libuv.timer(lp) match
+        Err(e) -> return Err(s"slate: a timer for --watch could not be made: ${e}")
+        Ok(t) -> t
+
+    val grace = libuv.timer(lp) match
+        Err(e) ->
+            settle.close()
+            return Err(s"slate: a timer for --watch could not be made: ${e}")
+        Ok(t) -> t
+
+    w.settle = Some(settle)
+    w.grace = Some(grace)
+
+    libuv.watch(plan.root, true, (r) -> heard(w, r), lp) match
+        Err(e) ->
+            shut(w)
+            return Err(s"slate: cannot watch ${plan.root}: ${e}")
+        Ok(f) -> w.files = Some(f)
+
+    if plan.signals
+        w.interrupt = caught(w, libuv.SIGINT)
+        w.terminate = caught(w, libuv.SIGTERM)
+
+    start_child(w)
+
+    Ok(w)
+end begin_watch
+
+// A signal this watcher handles in place of dying of it.
+private caught(w: &Watcher, signum: i32) -> Option[&libuv.Signal]
+    libuv.signal(w.lp) match
+        Err(_) -> None
+        Ok(s) ->
+            s.start(signum, (n: i32) -> stop_watch(w, n)) match
+                Err(_) ->
+                    s.close()
+                    None
+                Ok(_) -> Some(s)
+
+// Stop: what Ctrl-C does, and a test's way of ending a watch.
+//
+// **The signal is passed on to the child**, which is what it would have had without a watcher in
+// between: a `kill -INT` aimed at the watcher alone still reaches the program, and a program with an
+// `onSignal` handler runs it. The grace timer then guarantees an end. A second Ctrl-C does not wait.
+stop_watch(w: &Watcher, signum: i32)
+    val again = w.stopping
+
+    w.stopping = true
+
+    w.settle match
+        Some(t) -> t.stop() match
+            Err(_) -> ()
+            Ok(_) -> ()
+        None -> ()
+
+    w.child match
+        None -> shut(w)
+        Some(c) ->
+            if again
+                signalled(c, libuv.SIGKILL)
+            else
+                signalled(c, signum)
+                overdue_after(w)
+end stop_watch
+
+// An event from the watched tree.
+private heard(w: &Watcher, r: Result[libuv.FsChange, libuv.Error])
+    if w.stopping then return
+
+    r match
+        Err(e) -> (w.tell)(s"slate: watching ${w.plan.root} failed: ${e}")
+        Ok(change) ->
+            // **A rename counts as a change**: on macOS an edit to a file made a moment ago can
+            // arrive as a rename, and an editor's save-by-rename is one anyway.
+            if !change.renamed() && !change.changed() then return
+
+            val name = change.filename.unwrap_or("")
+
+            if !watch_counts(name, w.plan.root, w.plan.cache) then return
+
+            w.changed = name
+
+            w.settle match
+                Some(t) ->
+                    t.stop() match
+                        Err(_) -> ()
+                        Ok(_) -> ()
+
+                    t.start(w.plan.settle_ms, 0, () -> settled(w)) match
+                        Err(_) -> settled(w)
+                        Ok(_) -> ()
+                None -> ()
+end heard
+
+// The burst is over: restart.
+private settled(w: &Watcher)
+    if w.stopping then return
+
+    val what = if w.changed == "" then "a file" else w.changed
+
+    (w.tell)(s"slate: ${what} changed -- restarting")
+
+    w.child match
+        None -> start_child(w)
+        Some(c) ->
+            if !w.restarting
+                w.restarting = true
+                signalled(c, libuv.SIGTERM)
+                overdue_after(w)
+end settled
+
+// SIGKILL, once the grace period is up, for a child that has not stopped yet.
+private overdue_after(w: &Watcher)
+    w.grace match
+        None -> ()
+        Some(t) ->
+            t.stop() match
+                Err(_) -> ()
+                Ok(_) -> ()
+
+            t.start(w.plan.grace_ms, 0, () ->
+                w.child match
+                    Some(c) -> signalled(c, libuv.SIGKILL)
+                    None -> ()) match
+                Err(_) -> ()
+                Ok(_) -> ()
+
+// A signal to the child. **A child that has already gone is not an error** -- its exit is on its way.
+private signalled(c: &libuv.Process, signum: i32)
+    c.kill(signum) match
+        Err(_) -> ()
+        Ok(_) -> ()
+
+// Start the program once more.
+private start_child(w: &Watcher)
+    var stdio: Buf[libuv.Stdio] = buf()
+
+    // **All three inherited**: under a watcher the program is still the one at the terminal.
+    stdio.push(libuv.Inherit)
+    stdio.push(libuv.Inherit)
+    stdio.push(libuv.Inherit)
+
+    val child = libuv.spawn(w.plan.exec, w.plan.argv.view(), (st, sig) -> (), stdio.view(), "", [], 0, w.lp) match
+        Err(e) ->
+            (w.tell)(s"slate: cannot start ${w.plan.exec}: ${e} -- waiting for a change")
+            return
+        Ok(c) -> c
+
+    w.child = Some(child)
+    w.starts += 1
+
+    // Replaced now that there is a handle to close, as `start_program` in `process.sysl` does.
+    child.on_exit((st, sig) ->
+        child.close()
+        ended(w, st, sig))
+end start_child
+
+// The child is gone, for whatever reason.
+private ended(w: &Watcher, st: i64, sig: i32)
+    w.child = None
+
+    w.grace match
+        Some(t) -> t.stop() match
+            Err(_) -> ()
+            Ok(_) -> ()
+        None -> ()
+
+    // **What a shell would say**: a status, or 128 plus the signal that ended it.
+    w.status = if sig != 0 then 128 + int(sig) else int(st)
+
+    if w.stopping
+        shut(w)
+    else if w.restarting
+        w.restarting = false
+        start_child(w)
+    else if sig != 0
+        (w.tell)(s"slate: the program was stopped by signal ${sig} -- waiting for a change")
+    else
+        (w.tell)(s"slate: the program exited with status ${st} -- waiting for a change")
+end ended
+
+// Close every handle, so the loop drains and the watch is over.
+private shut(w: &Watcher)
+    w.files match
+        Some(f) -> f.close()
+        None -> ()
+
+    w.settle match
+        Some(t) -> t.close()
+        None -> ()
+
+    w.grace match
+        Some(t) -> t.close()
+        None -> ()
+
+    w.interrupt match
+        Some(s) -> s.close()
+        None -> ()
+
+    w.terminate match
+        Some(s) -> s.close()
+        None -> ()
+
+    w.files = None
+    w.settle = None
+    w.grace = None
+    w.interrupt = None
+    w.terminate = None
+end shut
+
+// -- what counts as a change -------------------------------------------------------------------------
+
+// Whether a change to `name` -- relative to the watched root, as the watcher reports it -- restarts
+// the program.
+//
+// **Source and the assets an import can load, and nothing the program writes.** An asset import may
+// name any file that is not `.sl`, so an allow-list of text kinds is the line: a server that writes a
+// log, a SQLite database or an upload into its own directory would otherwise restart itself for
+// ever. A name the platform did not give is counted, since the alternative is missing an edit.
+watch_counts(name: string, root: string, cache: string) -> bool
+    if name == "" then return true
+
+    if under(name, ".git") || name.starts_with("vendor/") || name == "vendor" then return false
+
+    if cache != "" && cache.starts_with(s"${root}/")
+        val inside = from_utf8_unchecked(cache.bytes[root.len + 1..<cache.len])
+
+        if name == inside || name.starts_with(s"${inside}/") then return false
+    end if
+
+    val base = base_of(name)
+
+    // Editor droppings: Emacs' backups and locks, vim's swap files and the probe it writes to test
+    // that a directory is writable.
+    if base.ends_with("~") || base.starts_with(".#") || base.ends_with(".swp") || base.ends_with(".swx") || base == "4913"
+        return false
+    end if
+
+    if ends_with_sl(base) then return true
+
+    for i in 0..<WatchedKinds.len
+        if base.ends_with(WatchedKinds[i]) then return true
+
+    false
+end watch_counts
+
+// The asset kinds an import loads in practice: text a program serves or reads at start-up.
+private val WatchedKinds: [17]string = [".css", ".html", ".htm", ".js", ".mjs", ".json", ".txt", ".md",
+    ".svg", ".sql", ".xml", ".csv", ".yaml", ".yml", ".toml", ".hocon", ".env"]
+
+// Whether `name` is `dir` or lies anywhere under a directory called `dir`.
+private under(name: string, dir: string) -> bool =
+    name == dir || name.starts_with(s"${dir}/") || name.contains(s"/${dir}/") || name.ends_with(s"/${dir}")
+
+// The last component of a relative path.
+private base_of(name: string) -> string
+    val b = name.bytes
+    var i = b.len
+
+    while i > 0 && b[i - 1] != u8('/')
+        i -= 1
+
+    from_utf8_unchecked(b[i..<b.len])
+end base_of
