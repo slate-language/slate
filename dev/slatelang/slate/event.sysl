@@ -1,7 +1,7 @@
 module dev.slatelang.slate
 
 import sh.sysl.gc
-import sh.sysl.kairos.{Loop, NoWait, Once, PassMode, Until}
+import sh.sysl.kairos.{Loop, NoWait, Once, PassMode, Timer, Until}
 import sh.sysl.kairos.uv.Uv
 import sh.sysl.libuv
 
@@ -10,7 +10,7 @@ import sh.sysl.libuv
 import sh.sysl.libuv.Handle
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
-import sysl.time.micros
+import sysl.time.{micros, millis}
 
 // The event loop, and what a slate program does with it.
 //
@@ -21,16 +21,16 @@ import sysl.time.micros
 //
 // ## The one thing embedding a loop costs a collected language
 //
-// **A pending callback is a root, and nothing else knows it.** `Timer.start` takes a sysl closure and
-// the binding keeps it alive by reference counting -- but the *slate* closure that sysl closure means
-// to call is a `Value` pointing into the collected heap, and the mark phase cannot see through an ARC
-// box to find it. A timer set and then forgotten by the program is exactly the case: the only
-// reference left is the one libuv holds, the collector frees the closure, and the timer eventually
-// calls into swept memory.
+// **A pending callback is a root, and nothing else knows it.** kairos's `after` takes a sysl closure
+// and keeps it alive by reference counting -- but the *slate* closure that sysl closure means to call
+// is a `Value` pointing into the collected heap, and the mark phase cannot see through an ARC box to
+// find it. A timer set and then forgotten by the program is exactly the case: the only reference left
+// is the one the loop holds, the collector frees the closure, and the timer eventually calls into
+// swept memory.
 //
 // So the slate closure is held **here**, in a table this file roots, and the sysl closure captures a
-// `usize` into it rather than the value. The same table holds the `&Timer`, because a counted box may
-// not live in GC memory at all (see `obj.sysl`) and a slate program only ever sees the integer id.
+// `usize` into it rather than the value. The same table holds the kairos `Timer` that cancels it, and
+// a slate program only ever sees the integer id.
 
 // The libuv loop this line of execution's VM is on.
 //
@@ -64,8 +64,9 @@ struct Pending
     // a program set with `setTimeout`.
     promise: *PromiseObj
 
-    // The handle, kept alive here for as long as the program may still cancel it.
-    timer: Option[&libuv.Timer]
+    // The kairos timer that rings this slot, kept for as long as the program may still cancel it. A
+    // repeating timer is re-armed as a fresh one-shot each time it rings, so this is the CURRENT one.
+    timer: Option[Timer]
 
     // A socket, kept here for the same reason and closed the same way. **A socket differs from a
     // timer in what ends it**: a timer is spent when it fires and a socket lives until the program
@@ -320,13 +321,15 @@ surrender(id: usize)
     slot.callback = Null
     slot.promise = null
 
-    // **The handle is CLOSED and not merely dropped.** A handle holds a reference to itself while it
-    // is open, so letting go of the last name for it stops nothing -- deliberately, since dropping a
-    // `setInterval` in JavaScript does not cancel it either. A handle never closed is also a handle
-    // `run` will wait on forever, so this is what lets a program with a one-shot timer in it exit.
+    // **The timer is CANCELLED and not merely dropped.** The loop holds a timer until it rings or is
+    // cancelled, so letting go of the last name for it stops nothing -- deliberately, since dropping a
+    // `setInterval` in JavaScript does not cancel it either. A timer never cancelled is also one the
+    // loop counts as alive for ever, so this is what lets a program with an interval in it exit.
+    // Cancelling one that has already rung answers false and does nothing, which is what makes a
+    // `clearTimeout` after the callback a no-op.
     slot.timer match
-        Some(t) -> t.close(() -> ())
-        None -> ()
+        Some(t) -> loop_events().cancel(t)
+        None -> false
 
     // A socket is closed for the same reason a timer is, and libuv insists on it for one more:
     // a handle that is never closed is one `run` waits on forever.
@@ -563,23 +566,46 @@ set_timer(cb: Value, ms: long, repeating: bool, at: Span) -> Step
         HostFn(_) -> ()
         other -> return fault(at, s"a timer needs a function to call, and this is ${other.type_name()}")
 
-    val delay = if ms < 0 then 0u64 else u64(ms)
-    val every = if repeating then delay else 0u64
+    val delay = if ms < 0 then 0 else ms
+    val every = if repeating then delay else 0
+    val id = claim(Pending(cb, Null, null, None, None, true, repeating, 0, 0))
 
-    libuv.timer(event_loop()) match
-        Err(e) -> fault(at, s"this timer could not be made: ${e}")
-        Ok(t) ->
-            val id = claim(Pending(cb, Null, null, Some(t), None, true, repeating, 0, 0))
-
-            // **The closure captures the id and not the value**, which is the whole arrangement: the
-            // collector cannot see through this box, so what it holds must be something the collector
-            // does not have to see.
-            t.start(delay, every, () -> fire(id)) match
-                Err(e) ->
-                    surrender(id)
-                    fault(at, s"this timer could not be started: ${e}")
-                Ok(_) -> Ok(Int(long(gen_at(id))))
+    // **The closure captures the id and not the value**, which is the whole arrangement: the
+    // collector cannot see through this box, so what it holds must be something the collector does
+    // not have to see.
+    arm_timer(id, delay, every, () -> fire(id))
+    Ok(Int(long(gen_at(id))))
 end set_timer
+
+// Ring `go` in `delay` milliseconds on the kairos loop, and every `every` after that where `every` is
+// not zero, keeping the current timer in slot `id` so that `surrender` can cancel it.
+//
+// **A repeating timer is a one-shot RE-ARMED AS IT RINGS, and not kairos's `every`**, which is
+// libuv's rule and the one slate's intervals were written against: the next deadline is `every` from
+// the pass that rang it, re-armed BEFORE the callback runs so that a `clearInterval` inside the
+// callback cancels the one just armed. kairos's own `every` keeps exact multiples of its period, so a
+// pass that ran late -- or a machine that slept -- would ring the interval once per pass until it had
+// caught up, which no slate program asked for. **A period of zero rings once and is not re-armed**,
+// libuv's reading of a zero repeat, so `setInterval(f, 0)` is unchanged too.
+//
+// Timers of one deadline ring in the order they were armed, kairos ordering its queue by deadline and
+// then by the order entries were queued -- libuv's rule again. Not `private`: `window.sysl` pumps its
+// windows from one.
+arm_timer(id: usize, delay: long, every: long, go: &Fn() -> unit)
+    val t = loop_events().after(millis(delay), (_) -> rung(id, every, go))
+    var slot = current().pending.at(id)
+
+    slot.timer = Some(t)
+    current().pending.set(id, slot)
+end arm_timer
+
+// A timer in slot `id` has rung. A cancelled timer never rings, so the slot is still the one that
+// armed it.
+private rung(id: usize, every: long, go: &Fn() -> unit)
+    if every > 0 && id < current().pending.len() && current().pending.at(id).live
+        arm_timer(id, every, every, go)
+
+    go()
 
 // `sleep(ms)` -- a promise that settles when the time is up.
 //
@@ -587,25 +613,21 @@ end set_timer
 // can build for itself out of an `async` function; waiting for the clock needs a handle, and a handle
 // needs the table above.
 sleep_promise(ms: long, at: Span) -> Step
-    val delay = if ms < 0 then 0u64 else u64(ms)
+    val delay = if ms < 0 then 0 else ms
+    val pr = new_promise()
+    val mark = root_mark()
 
-    libuv.timer(event_loop()) match
-        Err(e) -> fault(at, s"this timer could not be made: ${e}")
-        Ok(t) ->
-            val pr = new_promise()
-            val mark = root_mark()
+    hold(Promise(pr))
 
-            hold(Promise(pr))
+    val id = claim(Pending(Null, Null, pr, None, None, true, false, 0, 0))
 
-            val id = claim(Pending(Null, Null, pr, Some(t), None, true, false, 0, 0))
+    release(mark)
 
-            release(mark)
-
-            t.start(delay, 0u64, () -> fire(id)) match
-                Err(e) ->
-                    surrender(id)
-                    fault(at, s"this timer could not be started: ${e}")
-                Ok(_) -> Ok(Promise(pr))
+    // **A timer and not a task that sleeps**, so that `sleep(0)` and `setTimeout(f, 0)` written in
+    // either order still ring in that order: a spawned task is first stepped on the NEXT pass and its
+    // `sleep` counts from there, which would put every `sleep` one pass behind a timer set beside it.
+    arm_timer(id, delay, 0, () -> fire(id))
+    Ok(Promise(pr))
 end sleep_promise
 
 // `clearTimeout(id)` and `clearInterval(id)`.
