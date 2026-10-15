@@ -9,7 +9,7 @@
 import { readFile, readBytes, writeFile, readDir, stat, exists, remove, mkdir, rmdir, rename,
     readFileSync, readBytesSync, writeFileSync, readDirSync, statSync, existsSync, removeSync,
     mkdirSync, rmdirSync, renameSync } from slate:fs
-import { env } from slate:process
+import { env, environment as wholeEnvironment } from slate:process
 
 val Dir = "tests/js/scratch"
 
@@ -122,6 +122,19 @@ environment()
     // is the checker's job and not this program's.
     print(env("PATH") != null)
     print(env("SLATE_NO_SUCH_VARIABLE"))
+
+    // `environment()` is the same variables as an object, and a fresh one each call: adding to the
+    // answer changes neither `env` nor what the next call answers.
+    val all = wholeEnvironment()
+
+    print(all["PATH"] == env("PATH"))
+    print(has(all, "SLATE_NO_SUCH_VARIABLE"))
+
+    all.SLATE_NO_SUCH_VARIABLE = "added"
+
+    print(env("SLATE_NO_SUCH_VARIABLE"))
+    print(has(wholeEnvironment(), "SLATE_NO_SUCH_VARIABLE"))
+    print(wholeEnvironment() == wholeEnvironment())
 
 async everything()
     blocking()

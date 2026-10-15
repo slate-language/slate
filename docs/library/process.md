@@ -68,6 +68,33 @@ for name in args
 
 `env(name)` answers `string | null`. `?? ""` is what a program writes.
 
+## `environment`
+
+`environment()` answers every variable in this program's own environment as an object, name to string —
+for a program that has to see the ones it was not told the names of.
+
+```slate
+import { env, environment } from slate:process
+
+val all = environment()
+
+print(all["PATH"] == env("PATH"), has(all, "NO_SUCH_VARIABLE_HERE"))
+
+all.NO_SUCH_VARIABLE_HERE = "added"
+
+print(env("NO_SUCH_VARIABLE_HERE"), has(environment(), "NO_SUCH_VARIABLE_HERE"))
+```
+
+```output
+true false
+null false
+```
+
+- **Every call answers a new object**, so changing it changes nothing: not the environment, not `env`, and
+  not the next call. Like `env`, it is reading only.
+- **A browser has no environment and `environment()` answers an empty object**, as `env` answers every
+  name unset.
+
 ## `pid`
 
 `pid()` answers this process's own process id, the number the operating system knows it by —
