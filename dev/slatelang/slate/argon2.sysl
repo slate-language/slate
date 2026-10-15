@@ -271,8 +271,9 @@ private const MaxPassword: usize = 256
 // that table's reason: the pool thread holds a `*Argon2Job` and a raw pointer keeps nothing alive, so
 // the box has to be held somewhere the loop's thread owns until the completion callback has run.
 // The table is now `current().argon2_jobs` -- see `vm_state.sysl`.
-
-private keep_job(id: usize, j: &Argon2Job)
+//
+// Not `private`, nor is `still_kept`: `tests_argon2.sysl` keeps a job by hand to answer it.
+keep_job(id: usize, j: &Argon2Job)
     val v = current()
 
     while v.argon2_jobs.len() <= id
@@ -312,30 +313,75 @@ private fill_password(j: *Argon2Job, password: string) -> bool
 end fill_password
 
 // Hand the job to the pool and answer the promise it will settle.
+//
+// **The derivation is a kairos task**: `deriving` awaits `io.work` and settles the promise when the
+// pool answers. It is first stepped on the loop's next pass, which is where the job is queued; the
+// request slot `begin_request` claimed is what keeps the program running until then and after.
 private on_the_pool(id: usize, at: Span, what: string, job: &Argon2Job,
-                    done: &Fn(usize, Span) -> unit) -> Step
+                    done: &Fn(usize, &Argon2Job) -> unit) -> Step
     keep_job(id, job)
 
-    val p: *Argon2Job = &*job
+    val promised = awaited_request(id)
 
-    // **The job closure captures the pointer and the completion closure captures the id**, which is
-    // the same division `fs.sysl` keeps: what crosses into another thread is an address, and what
-    // comes back to the loop is an index into a table the loop owns.
-    val started = libuv.queue(() -> p.run(), (r) ->
-        r match
-            Ok(_) -> done(id, at)
-
-            // **A REJECTION RATHER THAN A RESULT, because this promise carries no result to fail
-            // in.** `argon2` answers the record and `argon2Verify` answers a boolean -- see the note
-            // at the head of this file about why neither is `{ ok, value }` -- so the one way a
-            // derivation can end badly has nowhere to be reported but the promise itself. In
-            // practice the pool only refuses a job that was cancelled, and nothing here cancels one.
-            Err(e) ->
-                take_job(id)
-                fail_request(id, s"`${what}` could not be run on the thread pool: ${e}", at))
-
-    request_started(id, at, what, started.map((_) -> ()))
+    loop_events().spawn(deriving(id, at, what, job, done))
+    Ok(promised)
 end on_the_pool
+
+// The task that runs one derivation on the pool and answers its request.
+//
+// **The job closure captures the pointer and the answer is read back by the id**, which is the same
+// division `fs.sysl` keeps: what crosses into another thread is an address, and what comes back to
+// the loop is an index into a table the loop owns.
+//
+// **`job` is held by this task for as long as the pool may be writing into it.** A program that ends
+// while a hash runs gives `argon2_jobs` back, and the task's own reference is then the one that keeps
+// the box from being freed under the pool thread.
+private async deriving(id: usize, at: Span, what: string, job: &Argon2Job,
+                       done: &Fn(usize, &Argon2Job) -> unit)
+    val p: *Argon2Job = &*job
+    val r = await current().io.work(() -> p.run())
+
+    pool_answered(id, at, what, job, r, done)
+end deriving
+
+// The pool has answered for the job in request `id`.
+//
+// **ONLY THE JOB THE REQUEST STILL KEEPS IS ANSWERED.** A program that ended while this derivation
+// ran has given its table back, and the next program may have claimed the same id for a hash of its
+// own -- so a job the table no longer holds belongs to a program that has gone, and answering by the
+// id alone would settle somebody else's promise with this one's digest.
+//
+// Not `private`: `tests_argon2.sysl` hands it a refusal, which the pool gives for nothing a test can
+// arrange.
+pool_answered(id: usize, at: Span, what: string, job: &Argon2Job, r: Result[unit, libuv.Error],
+              done: &Fn(usize, &Argon2Job) -> unit)
+    if !still_kept(id, job) then return
+
+    take_job(id)
+
+    r match
+        Ok(_) -> done(id, job)
+
+        // **A REJECTION RATHER THAN A RESULT, because this promise carries no result to fail in.**
+        // `argon2` answers the record and `argon2Verify` answers a boolean -- see the note at the
+        // head of this file about why neither is `{ ok, value }` -- so the one way a derivation can
+        // end badly has nowhere to be reported but the promise itself. In practice the pool only
+        // refuses a job that was cancelled, and nothing here cancels one.
+        Err(e) -> fail_request(id, s"`${what}` could not be run on the thread pool: ${e}", at)
+end pool_answered
+
+// Whether request `id` still keeps this very job.
+still_kept(id: usize, job: &Argon2Job) -> bool
+    val v = current()
+
+    if id >= v.argon2_jobs.len() then return false
+
+    val mine: *Argon2Job = &*job
+
+    v.argon2_jobs.at(id) match
+        Some(j) -> &*j == mine
+        None -> false
+end still_kept
 
 // `argon2(password)` and `argon2(password, parameters)` -- a promise of the record to store.
 //
@@ -369,13 +415,9 @@ end do_argon2
 
 // Back on the loop's thread, with the digest the pool wrote. **The PHC string is built here**, where
 // a string may be made at all.
-private hash_answered(id: usize, at: Span)
-    take_job(id) match
-        Some(j) ->
-            answer_plain_request(id, str_value(monocypher.encode(j.params, j.salt[0..<j.salt_len],
-                j.digest[0..<j.digest_len])))
-        None -> ()
-end hash_answered
+private hash_answered(id: usize, j: &Argon2Job) =
+    answer_plain_request(id, str_value(monocypher.encode(j.params, j.salt[0..<j.salt_len],
+        j.digest[0..<j.digest_len])))
 
 // `argon2Verify(record, password)` -- a promise of whether that password is the one it was made from.
 //
@@ -425,12 +467,8 @@ end do_argon2_verify
 
 // Back on the loop's thread. **The comparison is constant time**, for the reason a MAC's is: how long
 // it took is a measurement, and one made a byte at a time over many attempts is a password.
-private check_answered(id: usize, at: Span)
-    take_job(id) match
-        Some(j) -> answer_plain_request(id, Bool(same_tag(j.digest[0..<j.digest_len],
-            j.expected[0..<j.digest_len])))
-        None -> ()
-end check_answered
+private check_answered(id: usize, j: &Argon2Job) =
+    answer_plain_request(id, Bool(same_tag(j.digest[0..<j.digest_len], j.expected[0..<j.digest_len])))
 
 // `argon2NeedsRehash(record)` -- whether this record is weaker than what a call writes today.
 //
