@@ -146,6 +146,28 @@ async SENDING_TO_A_CHILD_THAT_HAS_GONE_IS_AN_ERROR_AND_NOT_A_CRASH()
     assert(said.error.length > 0)
 
 @test
+async WRITING_TO_A_CHILD_AS_IT_EXITS_STILL_TELLS_onExit()
+    // **A supervisor answering a worker's first word is writing to a process that may already be
+    // ending**, and the write failing must not cost it the exit: the answer is a result, and the
+    // child's exit is still delivered exactly once. node reports that failed write as an `error`
+    // event on the child, which arrives before the exit does, and treating it as the child not having
+    // run left `onExit` silent for ever.
+    var told = 0
+    val started = spawn("/bin/sh", ["-c", "printf '{\"hello\":1}\\n' >&3"], { ipc: true })
+    val worker = started.value
+
+    worker.onExit(e ->
+        told = told + 1)
+
+    worker.onMessage((m, s) ->
+        worker.send({ id: 1 }))
+
+    val gone = await worker.exited
+
+    assert(gone.ok)
+    assertEq(told, 1)
+
+@test
 async A_SUPERVISOR_SEES_TWO_WORKERS_BY_THEIR_OWN_PIDS()
     // The shape a cluster is: several children of one program, each talked to over its own channel
     // and each watched for its own exit.
