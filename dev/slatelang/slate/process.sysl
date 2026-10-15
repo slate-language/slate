@@ -1,16 +1,18 @@
 module dev.slatelang.slate
 
+import sh.sysl.kairos.Timer
+import sh.sysl.kairos.uv.{Pipe, Process, Stdio}
 import sh.sysl.libuv
-import sh.sysl.libuv.Handle
-import sh.sysl.libuv.Stream
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.env
 import sysl.text.from_utf8
+import sysl.time.millis
 
 // Running another program, and reading what it said.
 //
-// **On libuv, like every other host binding here.** slate is an asynchronous language -- `await`, a
+// **On the event loop, like every other host binding here** -- kairos tasks on its `uv` driver, which
+// turns the libuv loop the rest of slate's I/O is on. slate is an asynchronous language -- `await`, a
 // promise type, an event loop -- and `sysl.process` is blocking throughout, so a `run` written on it
 // would stop the loop dead: every timer, every socket and every coroutine in the program would wait
 // for the child. `fs.sysl`, `net.sysl` and `event.sysl` all reach past the standard library for the
@@ -30,9 +32,9 @@ import sysl.text.from_utf8
 
 // One `run` in flight.
 //
-// **Module storage and a slot, for `event.sysl`'s reason**: a libuv callback is a sysl closure, which
-// the collector cannot see through, so it captures an index into this table and nothing else. Unlike
-// a socket there is no id handed to the program -- a `run` is one call with one answer -- so no
+// **Module storage and a slot, for `event.sysl`'s reason**: a kairos task is a sysl frame, which the
+// collector cannot see through, so it carries an index into this table and nothing else. Unlike a
+// socket there is no id handed to the program -- a `run` is one call with one answer -- so no
 // generation is stamped and the slot is spent when the promise settles.
 struct Run
     live: bool
@@ -44,9 +46,9 @@ struct Run
     what: string
     at: Span
 
-    // The three handles, kept alive here for as long as libuv may still call back.
-    proc: Option[&libuv.Process]
-    watchdog: Option[&libuv.Timer]
+    // The child, which the watchdog kills, and the watchdog, which the answer cancels.
+    proc: Option[&Process]
+    watchdog: Option[Timer]
     out: Buf[u8]
     err: Buf[u8]
 
@@ -92,15 +94,6 @@ start_program(command: string, args: Buf[Value], options: Value, at: Span) -> St
     val cwd = option_text(options, "cwd", at, "run")?
     val environment = option_env(options, at, "run")?
     val limit = option_timeout(options, at)?
-
-    val out_pipe = libuv.pipe(false, event_loop()) match
-        Err(e) -> return fault(at, s"a pipe for the output could not be made: ${e}")
-        Ok(p) -> p
-
-    val err_pipe = libuv.pipe(false, event_loop()) match
-        Err(e) -> return fault(at, s"a pipe for the errors could not be made: ${e}")
-        Ok(p) -> p
-
     val waiting = begin_request()
 
     // Read before anything can refuse it -- `request_started` in `event.sysl` says why, and this is
@@ -108,21 +101,11 @@ start_program(command: string, args: Buf[Value], options: Value, at: Span) -> St
     val promised = awaited_request(waiting)
     val slot = claim_run(waiting, command, at)
 
-    // **`WRITABLE_PIPE` is from the CHILD's point of view**, so a pipe this program reads is one the
-    // child writes. The libuv package's own header warns about this and it is the one thing here
-    // that is easy to get backwards.
-    var stdio: Buf[libuv.Stdio] = buf()
-
-    stdio.push(libuv.Ignore)
-    stdio.push(libuv.ToPipe(out_pipe, libuv.WRITABLE_PIPE))
-    stdio.push(libuv.ToPipe(err_pipe, libuv.WRITABLE_PIPE))
-
-    val child = libuv.spawn(command, argv.view(), (status, signal) ->
-            record_exit(slot, status, signal),
-        stdio.view(), cwd, environment.view(), 0, event_loop()) match
+    // Standard input is nothing, so the child reads the end of it at once; the other two are pipes
+    // this program reads.
+    val child = current().io.spawn(command, argv.view(), env = environment.view(), cwd = cwd,
+            stdin = Stdio.Ignore, stdout = Stdio.Piped, stderr = Stdio.Piped) match
         Err(e) ->
-            out_pipe.close(() -> ())
-            err_pipe.close(() -> ())
             drop_run(slot)
             deny_request(waiting, at, s"cannot run `${command}`: ${e}")
             return Ok(promised)
@@ -133,41 +116,43 @@ start_program(command: string, args: Buf[Value], options: Value, at: Span) -> St
     held.proc = Some(child)
     current().running.set(slot, held)
 
-    // **The exit callback is replaced now that there is a handle to capture**, which is what
-    // `on_exit` exists for: `spawn` takes its callback before the child exists, and a callback that
-    // has to close the handle cannot be written until there is one. Nothing can have run in
-    // between -- a callback only fires on a turn of the loop, and `spawn` returns before it turns.
-    child.on_exit((status, signal) ->
-        record_exit(slot, status, signal)
-        child.close(() -> ()))
+    // **Three tasks, each ending in the call its libuv callback used to make**, so the answer is
+    // still handed back from inside a pass and only once the child has gone and both pipes ended.
+    val events = loop_events()
 
-    read_into(slot, out_pipe, true)
-    read_into(slot, err_pipe, false)
+    events.spawn(exited(slot, child))
+    events.spawn(drained(slot, child.stdout().expect("stdout is piped"), true))
+    events.spawn(drained(slot, child.stderr().expect("stderr is piped"), false))
 
     if limit > 0 then start_watchdog(slot, limit)
 
     Ok(promised)
 end start_program
 
+// Wait for the child to go, and say how it went.
+private async exited(slot: usize, p: &Process)
+    val how = await p.exit()
+
+    record_exit(slot, how.status, how.signal)
+
 // Read one of the child's pipes into the slot until it ends.
 //
 // **A read that fails is an end and not a fault.** The pipe is the child's output, and a child that
 // died mid-sentence has still told us everything it managed to say; refusing the whole call would
 // throw that away along with the status, which is the part the caller asked for.
-private read_into(slot: usize, p: &libuv.Pipe, is_out: bool)
-    p.read_start((r) ->
-        r match
-            Data(bytes) -> collect(slot, bytes, is_out)
-            End ->
-                p.close(() -> ())
-                finished_stream(slot, is_out)
-            Failed(_) ->
-                p.close(() -> ())
-                finished_stream(slot, is_out)) match
-        Err(_) ->
-            p.close(() -> ())
-            finished_stream(slot, is_out)
-        Ok(_) -> ()
+private async drained(slot: usize, p: &Pipe, is_out: bool)
+    loop
+        val got = (await p.read()) match
+            Ok(bytes) -> bytes
+            Err(_) -> break
+
+        if got.len == 0 then break
+
+        collect(slot, got, is_out)
+
+    p.close()
+    finished_stream(slot, is_out)
+end drained
 
 // A chunk of the child's output.
 private collect(slot: usize, bytes: []const u8, is_out: bool)
@@ -218,17 +203,11 @@ private record_exit(slot: usize, status: i64, signal: i32)
 // program that wants to ask nicely has the status of a child it started itself and can send its own
 // signal -- which is a streaming `spawn` and is not built.
 private start_watchdog(slot: usize, ms: long)
-    libuv.timer(event_loop()) match
-        Err(_) -> ()
-        Ok(t) ->
-            var r = current().running.at(slot)
+    val t = loop_events().after(millis(ms), (_) -> kill_run(slot))
+    var r = current().running.at(slot)
 
-            r.watchdog = Some(t)
-            current().running.set(slot, r)
-
-            t.start(u64(ms), 0, () -> kill_run(slot)) match
-                Err(_) -> ()
-                Ok(_) -> ()
+    r.watchdog = Some(t)
+    current().running.set(slot, r)
 
 private kill_run(slot: usize)
     if slot >= current().running.len() then return
@@ -240,6 +219,8 @@ private kill_run(slot: usize)
     r.timed_out = true
     current().running.set(slot, r)
 
+    // A child that has already exited -- its output still held open by something it started --
+    // answers `ESRCH`, and there is nothing left to stop.
     r.proc match
         Some(p) ->
             p.kill(libuv.SIGKILL) match
@@ -311,8 +292,8 @@ private drop_run(slot: usize)
     var r = current().running.at(slot)
 
     r.watchdog match
-        Some(t) -> t.close(() -> ())
-        None -> ()
+        Some(t) -> loop_events().cancel(t)
+        None -> false
 
     r.live = false
     r.proc = None
