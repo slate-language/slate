@@ -321,9 +321,12 @@ async a_bytes_buffer_referenced_twice_in_one_message_arrives_shared() =
 
 // -- identity, addressing and `me` --------------------------------------------------------------
 
+// `introduce` asks rather than sends, and the test asks `introduce` in turn, so the enrolment has been
+// served before the test asks the boss anything. A `send` and a `sleep` would race: the worker's message
+// to the boss and the test's are from two senders, and two senders have no order between them.
 actor Worker
-    on introduce(self, boss)
-        send(boss.enrol, me())
+    async on introduce(self, boss)
+        await ask(boss.enrol, me())
 
 actor Boss
     var seen = []
@@ -340,11 +343,10 @@ async an_actor_hands_its_own_address_to_somebody_with_me() =
     val b = spawn(Boss)
     val w = spawn(Worker)
 
-    send(w.introduce, b)
-
-    await sleep(80)
+    await ask(w.introduce, b)
 
     assertEq(await ask(b.count), 1)
+    assert(await ask(b.knows, w))
 
 @test
 async a_handle_compares_by_identity_and_crosses_as_the_actor_it_names() =
