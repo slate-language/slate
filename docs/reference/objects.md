@@ -203,8 +203,9 @@ down to whichever object it started from. That is dispatch, and it needed no key
 closures *per instance*; on a proto they cost three once.
 
 An [object pattern](patterns.md) counts a field a proto supplies, a pattern asking whether the value
-*has* the field — which is the question `.` answers. (JavaScript splits the same seam and puts `in` on
-this side of it.)
+*has* the field — which is the question `.` answers. **`k in o` asks it too**, as in JavaScript:
+whether `o[k]` would find a member there, own or inherited, without reading it. `has` is the other
+side of the seam and asks about the object's own fields only.
 
 **`o[k]` reads what `o.k` reads**, so a name worked out at run time finds an inherited member exactly as
 a written one does — JavaScript's rule. **Everything that reports what an object HOLDS stays its own**:
@@ -230,6 +231,19 @@ triangle shape true
 
 A string key on a builtin kind reads that kind's property or method the same way, so `xs["length"]` is
 the length; a name the kind does not have is still the fault an index into it gives.
+
+`in` and `has` split along the same line — `in` follows the chain and `has` does not:
+
+```slate
+val Shape = { kind: "shape" }
+val tri = { proto: Shape, sides: 3 }
+
+print("kind" in tri, has(tri, "kind"), "sides" in tri, "toString" in tri, "colour" in tri)
+```
+
+```output
+true false true true false
+```
 
 ## The receiver rule
 
@@ -261,9 +275,28 @@ print(c.bump(), c.bump())
 
 That is not two rules but one: **captured methods take no receiver, shared ones must.**
 
-**Only `o.m(...)` passes a receiver.** `o.m` on its own hands back the bare function, so taking a method
-off an object and calling it later is allowed and gives you what you took — and `o["m"]` is the same
-bare function.
+**Only a call passes a receiver: `o.m(...)`, and `o[k](...)` exactly where `o.k(...)` would**, which is
+JavaScript's rule. `o.m` on its own hands back the bare function, so taking a method off an object and
+calling it later is allowed and gives you what you took — and `o["m"]` is the same bare function:
+
+```slate
+val Shape = { describe: (self) -> "a shape with " + string(self.sides) + " sides" }
+val tri = { proto: Shape, sides: 3 }
+val word = "describe"
+
+val bare = tri[word]
+
+print(tri[word]())
+print(bare(tri))            // read out and called later, it is handed what it is given
+```
+
+```output
+a shape with 3 sides
+a shape with 3 sides
+```
+
+A function the object holds itself takes no receiver whichever way it is reached, and an array's
+element is called with exactly what was written.
 
 ## Operator methods
 

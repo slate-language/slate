@@ -18,6 +18,7 @@ Loosest at the top. Everything is left-associative except the lambda arrow.
 | 20 | `&&` | |
 | 25 | `is` | |
 | 30 | `==` `!=` `<` `<=` `>` `>=` | one level, because a chain of them is one comparison |
+| 30 | `in` | on the comparisons' level and not in their chain |
 | 35 | `..` `..<` | non-associative |
 | 35 | `by` | the step of the range on its left |
 | 40 | `\|` | |
@@ -70,6 +71,43 @@ true
 ```
 
 `==` and `!=` compare by value; see [Values](values.md).
+
+## `in`
+
+**`k in o` is JavaScript's `in`: whether `o[k]` would find a member.** On an object that is a field
+of its own or one up its `proto` chain, a property, or one of the universal methods; on an array, a
+string or bytes it is a position inside it or a name the kind has; on any other kind, a name the kind
+has. It reads nothing to answer, so a `get` is never called. [Objects](objects.md) has `has`, which
+asks about the object's own fields only.
+
+```slate
+val base = { x: 1 }
+val child = { proto: base, y: 2 }
+
+print("y" in child, "x" in child, has(child, "x"), "z" in child)
+print(0 in [7], 1 in [7], "length" in [7], 2 in "abc")
+```
+
+```output
+true true false false
+true false true true
+```
+
+`in` sits with the comparisons, so `"a" + b in o` asks about the sum and `k in o && ok` is two
+tests, but it does not join their chain: `k in o == true` compares the answer. **`null`, a boolean
+and a number have no members, and `in` refuses them** where JavaScript throws a `TypeError`:
+
+```slate
+print("a" in 5)
+```
+
+```error
+integer has no members for `in` to ask about
+```
+
+A key of a kind the container is not indexed by is refused in the same way, and a position past the
+end is simply not there. In a `for` head the first `in` is the loop's own; one inside the iterable
+is the operator.
 
 ## Logic
 
