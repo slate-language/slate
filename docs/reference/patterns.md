@@ -55,7 +55,9 @@ null  boolean  integer  real  number  string  array  object  function
 plus `promise`, `generator`, `regex`, `shape`, and the eight [temporal](../library/time.md) words —
 `instant`, `duration`, `date`, `time`, `dateTime`, `zone`, `zoned`, `period`. That is the whole list:
 twenty-one words. Every [type](types.md), [class](classes.md) and [data variant](data-types.md)
-declared in the file adds its own name to it.
+declared in the file adds its own name to it — and **one declared or imported under a kind word
+shadows the kind**, exactly as a local shadows any other name: with a `class Set` in the file,
+`is Set`, `x: Set` and a `Set` arm all mean the class.
 
 **None of them is a keyword.** `val int = 3` and `val date = readIt()` are ordinary bindings; the words
 are read this way in pattern position and nowhere else. What it costs is real: a `match` arm may no
