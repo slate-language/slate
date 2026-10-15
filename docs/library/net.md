@@ -47,8 +47,8 @@ main()
 | `alpnProtocol(conn)` | which application protocol was agreed, or `null` |
 
 **Under [`slate js`](../reference/javascript.md) this is node's own TCP**, and everything above is the
-same. TLS is the exception: `startTls`, and a `listen` given a `cert` and a `key`, both refuse there
-naming TLS. A browser has no sockets at all and says so.
+same, `startTls` included at both ends. The one exception is a `listen` given a `cert` and a `key`,
+which refuses there naming TLS. A browser has no sockets at all and says so.
 
 ## Promises and callbacks
 
