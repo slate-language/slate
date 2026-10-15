@@ -48,6 +48,102 @@ js_runtime_host_io() -> string = raw"""
         const timers = new Map()
         let nextTimer = 0n
 
+        // **THE ORDER TIMERS FIRE IN IS SLATE'S RULE AND THE HOST IS ONLY ASKED TO WAKE US.**
+        // A timer fires when it comes due, and two that come due together fire in the order they
+        // were set -- the interpreter's rule, since libuv orders by (due, start). Handing each timer
+        // to the host's own `setTimeout` broke it under node: node reads the clock afresh for every
+        // `setTimeout` call, so a stall of ten milliseconds between `setTimeout(c, 30)` and
+        // `setTimeout(b, 20)` made `c` due first, where the interpreter, whose clock is the one
+        // reading taken when its turn of the loop began, fires `b` first. So the queue is slate's:
+        // ordered by (due, seq), with ONE host timer armed for the earliest entry.
+        //
+        // **A deadline is measured from the clock reading of the synchronous run that set the
+        // timer.** `base` is read once per run and dropped when the run's microtask returns, so
+        // timers set one after another share a reading however long the code between them took.
+        const clock = () => $.host.monotonic !== null ? $.host.monotonic() : Date.now()
+        const queue = []
+        let nextSeq = 0
+        let turnBase = null
+        let wake = null
+        let wakeDue = 0
+
+        const base = () => {
+            if (turnBase === null) {
+                turnBase = clock()
+                Promise.resolve().then(() => { turnBase = null })
+            }
+
+            return turnBase
+        }
+
+        const disarm = () => {
+            if (wake === null) return
+
+            wake.stop(wake.handle)
+            wake = null
+        }
+
+        // One host wake for the earliest entry. One already due is woken through `setImmediate`
+        // where the host has it, since a host's `setTimeout(f, 0)` waits a millisecond and a
+        // thousand timers due together would cost a second.
+        const arm = () => {
+            disarm()
+
+            if (queue.length === 0) return
+
+            wakeDue = queue[0].due
+
+            const wait = wakeDue - clock()
+
+            if (wait <= 0 && $.host.setImmediate !== null && $.host.clearImmediate !== null)
+                wake = { handle: $.host.setImmediate(fire), stop: $.host.clearImmediate }
+            else
+                wake = { handle: $.host.setTimeout(fire, wait <= 0 ? 0 : Math.ceil(wait)), stop: $.host.clearTimeout }
+        }
+
+        // One entry per wake, so that the host's microtasks run between two timers as they do
+        // between two `setTimeout` callbacks of its own.
+        function fire() {
+            wake = null
+
+            if (queue.length === 0) return
+
+            // Woken a fraction early, which a host's whole-millisecond timers do.
+            if (queue[0].due > clock()) {
+                arm()
+
+                return
+            }
+
+            const entry = queue.shift()
+
+            try {
+                entry.run()
+            } finally {
+                arm()
+            }
+        }
+
+        const enqueue = (entry) => {
+            let at = queue.length
+
+            while (at > 0 && queue[at - 1].due > entry.due) at--
+
+            queue.splice(at, 0, entry)
+
+            if (at === 0) arm()
+        }
+
+        const dequeue = (entry) => {
+            const at = queue.indexOf(entry)
+
+            if (at < 0) return
+
+            queue.splice(at, 1)
+
+            if (at === 0) arm()
+        }
+
         const startTimer = (args, repeating) => {
             if (args.length === 0 || args.length > 2)
                 fault("a timer takes a function and a delay, and was given " + args.length +
@@ -59,46 +155,44 @@ js_runtime_host_io() -> string = raw"""
 
             const ms = args.length === 2 ? wantDelay(args[1]) : 0
             const id = ++nextTimer
-            const held = { handle: null, stop: null }
-
-            timers.set(id, held)
-
-            if (repeating && $.host.setInterval !== null) {
-                held.stop = $.host.clearInterval
-                held.handle = $.host.setInterval(() => $.callback(f, [], "setInterval"), ms)
-
-                return id
-            }
+            const held = { entry: null }
 
             if ($.host.setTimeout === null) noLoop(repeating ? "setInterval" : "setTimeout")
 
-            held.stop = $.host.clearTimeout
+            timers.set(id, held)
 
             if (repeating) {
-                // **An interval built out of one-shots, for a host that has only those** -- quickjs
-                // keeps `setTimeout` on `os` and has no `setInterval` at all. Re-armed after the
+                // **An interval is a chain of one-shots**, on every host. Re-armed after the
                 // callback rather than on a schedule, so it drifts by however long the callback took;
-                // node's own does the same, and a program that cares uses a deadline rather than a
-                // count of ticks.
+                // a program that cares uses a deadline rather than a count of ticks.
                 const again = () => {
                     $.callback(f, [], "setInterval")
 
                     // Cancelled by its own callback, which is how an interval in a program that means
                     // to end is usually stopped.
-                    if (timers.get(id) === held) held.handle = $.host.setTimeout(again, ms)
+                    if (timers.get(id) === held) {
+                        held.entry = { due: clock() + ms, seq: nextSeq++, run: again }
+                        enqueue(held.entry)
+                    }
                 }
 
-                held.handle = $.host.setTimeout(again, ms)
+                held.entry = { due: base() + ms, seq: nextSeq++, run: again }
+                enqueue(held.entry)
 
                 return id
             }
 
             // **A one-shot forgets itself before the body runs**, so that a callback cancelling its
             // own timer is not left holding an id that names nothing.
-            held.handle = $.host.setTimeout(() => {
-                timers.delete(id)
-                $.callback(f, [], "setTimeout")
-            }, ms)
+            held.entry = {
+                due: base() + ms,
+                seq: nextSeq++,
+                run: () => {
+                    timers.delete(id)
+                    $.callback(f, [], "setTimeout")
+                },
+            }
+            enqueue(held.entry)
 
             return id
         }
@@ -115,7 +209,7 @@ js_runtime_host_io() -> string = raw"""
             if (held === undefined) return null
 
             timers.delete(v)
-            held.stop(held.handle)
+            dequeue(held.entry)
 
             return null
         }
@@ -138,7 +232,8 @@ js_runtime_host_io() -> string = raw"""
 
             if ($.host.setTimeout === null) noLoop("sleep")
 
-            return new Promise((answer) => $.host.setTimeout(() => answer(null), ms))
+            return new Promise((answer) =>
+                enqueue({ due: base() + ms, seq: nextSeq++, run: () => answer(null) }))
         }
 
         // `resolve(v)` and `reject(message)` -- a promise that has already settled.
