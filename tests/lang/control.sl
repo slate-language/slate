@@ -1,5 +1,7 @@
 // Control flow, closures, generators, faults and `async`.
 
+import { monotonic, millis } from slate:time
+
 @test
 every_loop_is_an_expression_and_break_gives_it_a_value() =
     var i = 0
@@ -620,6 +622,41 @@ async two_timers_due_at_once_fire_in_the_order_they_were_set() =
     await sleep(20)
 
     assertEq(seen, ["first", "second"])
+
+stall(ms) =
+    val began = millis(monotonic())
+
+    while millis(monotonic()) - began < ms
+        null
+
+@test
+async timers_set_in_one_run_are_ordered_by_delay_however_long_the_run_takes() =
+    var seen = []
+
+    setTimeout(() -> push(seen, "c"), 30)
+    stall(15)
+    setTimeout(() -> push(seen, "a"), 10)
+    stall(15)
+    setTimeout(() -> push(seen, "b"), 20)
+
+    await sleep(80)
+
+    assertEq(seen, ["a", "b", "c"])
+
+@test
+async timers_all_overdue_before_the_loop_turns_fire_in_the_order_they_come_due() =
+    var seen = []
+
+    setTimeout(() -> push(seen, "c"), 30)
+    setTimeout(() -> push(seen, "a"), 10)
+    setTimeout(() -> push(seen, "b"), 20)
+    setTimeout(() -> push(seen, "a2"), 10)
+
+    stall(60)
+
+    await sleep(40)
+
+    assertEq(seen, ["a", "a2", "b", "c"])
 
 @test
 async a_cancelled_timer_never_fires() =
