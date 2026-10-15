@@ -1,0 +1,203 @@
+module dev.slatelang.slate
+@tests
+
+// The native `fetch` as a kairos task: what it answers when more than one is out, and the sentence
+// each way of failing carries.
+//
+// **Every expectation here is what slate 0.1.24 printed for the same program**, the release whose
+// `fetch` was a libuv callback chain -- so a sentence that changes when the transport moves is a
+// failure here and not a quiet difference. The servers are `slate:net` listeners written to answer
+// exactly the way each test needs, which a `serve` handler could not: hold an answer back, send a
+// body in two hundred chunks, or never answer at all.
+
+@test
+TWO_FETCHES_ARE_IN_FLIGHT_AT_ONCE_AND_EACH_GETS_ITS_OWN_ANSWER()
+    // **The server answers neither until it has heard both**, and then answers the second first -- so
+    // a client that ran one fetch at a time would never see the second request, and the watchdog would
+    // name the hang.
+    assert_eq(out(watched(raw"""
+        import { listen, onData, send, close, localPort } from slate:net
+
+        var held = []
+
+        async answer(c, body)
+            await send(c, "HTTP/1.1 200 OK\r\nContent-Length: " + string(body.length) + "\r\n\r\n" + body)
+            close(c)
+
+        val server = listen(0, conn ->
+            onData(conn, chunk ->
+                if chunk != null
+                    held.push({ conn: conn, path: chunk.split(" ")[1] })
+                    if held.length == 2
+                        answer(held[1].conn, held[1].path)
+                        answer(held[0].conn, held[0].path)))
+
+        async main()
+            val base = "http://127.0.0.1:" + string(localPort(server))
+            val a = fetch(base + "/a")
+            val b = fetch(base + "/b")
+            val ra = await a
+            val rb = await b
+            print(ra.value.status, ra.value.body, rb.value.status, rb.value.body)
+            close(server)
+            done()
+
+        main()
+        """)), "200 /a 200 /b")
+end TWO_FETCHES_ARE_IN_FLIGHT_AT_ONCE_AND_EACH_GETS_ITS_OWN_ANSWER
+
+@test
+A_REFUSED_CONNECTION_IS_AN_ANSWER_NAMING_THE_HOST_AND_THE_REASON()
+    // The port was just given back by a listener, so nothing is there to answer.
+    assert_eq(out(watched(raw"""
+        import { listen, close, localPort } from slate:net
+
+        val probe = listen(0, c -> c)
+        val port = localPort(probe)
+
+        close(probe)
+
+        async main()
+            val r = await fetch("http://127.0.0.1:" + string(port) + "/")
+            print(r.ok, r.error)
+            done()
+
+        main()
+        """)), "false cannot connect to 127.0.0.1: ECONNREFUSED: connection refused")
+end A_REFUSED_CONNECTION_IS_AN_ANSWER_NAMING_THE_HOST_AND_THE_REASON
+
+@test
+A_NAME_NOTHING_RESOLVES_IS_AN_ANSWER_FROM_THE_RESOLVER()
+    // `.invalid` is reserved (RFC 2606), so no resolver anywhere answers it with an address.
+    assert_eq(out(watched(raw"""
+        async main()
+            val r = await fetch("http://no-such-host.invalid/")
+            print(r.ok, r.error)
+            done()
+
+        main()
+        """)), "false cannot find no-such-host.invalid: EAI_NONAME: unknown node or service")
+end A_NAME_NOTHING_RESOLVES_IS_AN_ANSWER_FROM_THE_RESOLVER
+
+@test
+A_CERTIFICATE_THE_CLIENT_DOES_NOT_TRUST_IS_REFUSED_IN_OPENSSLS_OWN_WORDS()
+    // `tests_tls.sysl` asserts the refusal; this asserts what the program is told about it.
+    assert_eq(out(watched(raw"""
+        import { serve, close } from slate:http
+        import { localPort } from slate:net
+        import { readFileSync } from slate:fs
+
+        val cert = readFileSync("tests/tls/cert.pem").value
+        val key = readFileSync("tests/tls/key.pem").value
+
+        val server = serve({ port: 0, cert: cert, key: key }, (req) -> "never read")
+
+        async main()
+            val r = await fetch("https://localhost:" + string(localPort(server)) + "/", {})
+
+            print(r.ok, r.error)
+            close(server)
+            done()
+
+        main()
+        """)), "false the TLS handshake failed: TLS failed: error:0A000086:SSL routines::certificate verify failed")
+end A_CERTIFICATE_THE_CLIENT_DOES_NOT_TRUST_IS_REFUSED_IN_OPENSSLS_OWN_WORDS
+
+@test
+A_MEGABYTE_SENT_IN_TWO_HUNDRED_CHUNKS_ARRIVES_WHOLE()
+    // **Each chunk is its own `send`**, so the body reaches the client over many reads and the answer
+    // is only whole at the terminating chunk -- which is what a reader that took the first read as the
+    // answer would get wrong.
+    assert_eq(out(watched(raw"""
+        import { listen, onData, send, close, localPort } from slate:net
+
+        val piece = "x".repeat(5000)
+
+        async answer(c)
+            await send(c, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+
+            for i in 0..<200
+                await send(c, "1388\r\n" + piece + "\r\n")
+
+            await send(c, "0\r\n\r\n")
+            close(c)
+
+        val server = listen(0, conn ->
+            onData(conn, chunk ->
+                if chunk != null then answer(conn)))
+
+        async main()
+            val r = await fetch("http://127.0.0.1:" + string(localPort(server)) + "/")
+            print(r.ok, r.value.status, r.value.body.length, r.value.body == piece.repeat(200))
+            close(server)
+            done()
+
+        main()
+        """)), "true 200 1000000 true")
+end A_MEGABYTE_SENT_IN_TWO_HUNDRED_CHUNKS_ARRIVES_WHOLE
+
+@test
+A_PROGRAM_GIVES_UP_ON_A_SILENT_SERVER_WITH_race_AND_THE_FETCH_STILL_SETTLES()
+    // **`fetch` takes no timeout of its own**, so a program that will not wait races it against a
+    // timer. The race is answered while the fetch is still waiting, which is what says a fetch in
+    // flight does not hold the loop; then the server hangs up and the fetch settles with the
+    // sentence for a server that said nothing.
+    assert_eq(out(watched(raw"""
+        import { listen, onData, close, localPort } from slate:net
+
+        var held = []
+
+        val server = listen(0, conn ->
+            onData(conn, chunk ->
+                if chunk != null then held.push(conn)))
+
+        async gaveUp(ms)
+            await sleep(ms)
+            "timed out"
+
+        async main()
+            val asked = fetch("http://127.0.0.1:" + string(localPort(server)) + "/")
+
+            print(await race([asked, gaveUp(100)]))
+
+            for c in held
+                close(c)
+
+            val r = await asked
+            print(r.ok, r.error)
+            close(server)
+            done()
+
+        main()
+        """)), "timed out\nfalse 127.0.0.1 closed the connection without answering")
+end A_PROGRAM_GIVES_UP_ON_A_SILENT_SERVER_WITH_race_AND_THE_FETCH_STILL_SETTLES
+
+@test
+A_FETCH_LEFT_IN_FLIGHT_BY_A_FAULT_IS_CLOSED_BEFORE_THE_NEXT_PROGRAM_RUNS()
+    // **The fetch's connection is not in `event.sysl`'s table**, so `reset_events` closes it through
+    // `forget_fetches`. Left open, its read would hold the next program's drain, and the end of it --
+    // the silent server's socket being closed by that same reset -- would settle a request slot the
+    // next program had already been handed.
+    val first = out(watched(raw"""
+        import { listen, onData, localPort } from slate:net
+
+        val server = listen(0, conn -> conn)
+
+        async main()
+            fetch("http://127.0.0.1:" + string(localPort(server)) + "/")
+            await sleep(50)
+            anything(1).theProgramStoppedWithAFetchOut()
+
+        main()
+        """))
+
+    assert(first.contains("theProgramStoppedWithAFetchOut"), first)
+    assert_eq(out(watched(raw"""
+        async main()
+            await sleep(20)
+            print("the next program ran to its end")
+            done()
+
+        main()
+        """)), "the next program ran to its end")
+end A_FETCH_LEFT_IN_FLIGHT_BY_A_FAULT_IS_CLOSED_BEFORE_THE_NEXT_PROGRAM_RUNS
