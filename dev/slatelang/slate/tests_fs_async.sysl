@@ -1,0 +1,82 @@
+module dev.slatelang.slate
+@tests
+
+import sh.sysl.libuv
+import sysl.text.replace_all
+
+// `slate:fs`'s asynchronous half, which runs as kairos tasks on the `uv` driver.
+//
+// **What these pin is that nothing a program can see moved when the I/O did**: every failure still
+// carries libuv's own sentence behind slate's, word for word; requests in flight together each get
+// their own answer; and a whole-file read that kairos takes in pieces comes back whole.
+
+// A directory holding one of each thing a call can trip over: a file, a file nobody may read, a
+// directory nobody may write into, one nobody may enter, one that is not empty, and an empty one.
+private hazards() -> string
+    val dir = libuv.mkdtemp_sync("/tmp/slate-fsa-XXXXXX").unwrap()
+
+    libuv.write_file_sync(s"${dir}/f", "hi".bytes).unwrap()
+    libuv.write_file_sync(s"${dir}/locked", "x".bytes).unwrap()
+    libuv.chmod_sync(s"${dir}/locked", 0).unwrap()
+    libuv.mkdir_sync(s"${dir}/sub").unwrap()
+    libuv.mkdir_sync(s"${dir}/full").unwrap()
+    libuv.write_file_sync(s"${dir}/full/x", "x".bytes).unwrap()
+    libuv.mkdir_sync(s"${dir}/ro", 365).unwrap()
+    libuv.mkdir_sync(s"${dir}/shut", 0).unwrap()
+    dir
+end hazards
+
+// Give back what `hazards` made, the locks taken off first so that `scrub` can reach inside.
+private clear_hazards(dir: string)
+    libuv.chmod_sync(s"${dir}/shut", 493).unwrap()
+    libuv.chmod_sync(s"${dir}/ro", 493).unwrap()
+    libuv.chmod_sync(s"${dir}/locked", 420).unwrap()
+    scrub(dir)
+
+// One line per call: what `.error` said.
+private val Failures: string = "async main()\n    print((await readFile(\"<dir>/nope\")).error)\n    print((await readFile(\"<dir>/locked\")).error)\n    print((await readFile(\"<dir>/f/x\")).error)\n    print((await readFile(\"<dir>\")).error)\n    print((await readBytes(\"<dir>/locked\")).error)\n    print((await writeFile(\"<dir>/nope/x\", \"a\")).error)\n    print((await writeFile(\"<dir>/ro/x\", \"a\")).error)\n    print((await writeFile(\"<dir>/f/x\", \"a\")).error)\n    print((await writeFile(\"<dir>/locked\", \"a\")).error)\n    print((await appendFile(\"<dir>/nope/x\", \"a\")).error)\n    print((await appendFile(\"<dir>/ro/x\", \"a\")).error)\n    print((await appendFile(\"<dir>/f/x\", \"a\")).error)\n    print((await writeBytes(\"<dir>/ro/x\", [1])).error)\n    print((await appendBytes(\"<dir>/f/x\", [1])).error)\n    print((await readDir(\"<dir>/nope\")).error)\n    print((await readDir(\"<dir>/f\")).error)\n    print((await readDir(\"<dir>/shut\")).error)\n    print((await stat(\"<dir>/nope\")).error)\n    print((await stat(\"<dir>/f/x\")).error)\n    print((await stat(\"<dir>/shut/x\")).error)\n    print(await exists(\"<dir>/shut/x\"), await exists(\"<dir>/f/x\"))\n    print((await remove(\"<dir>/nope\")).error)\n    print((await remove(\"<dir>/f/x\")).error)\n    print((await remove(\"<dir>/sub\")).error)\n    print((await mkdir(\"<dir>/nope/x\")).error)\n    print((await mkdir(\"<dir>/sub\")).error)\n    print((await mkdir(\"<dir>/ro/new\")).error)\n    print((await mkdir(\"<dir>/f/x\")).error)\n    print((await rmdir(\"<dir>/nope\")).error)\n    print((await rmdir(\"<dir>/full\")).error)\n    print((await rmdir(\"<dir>/f\")).error)\n    print((await rename(\"<dir>/nope\", \"<dir>/x\")).error)\n    print((await rename(\"<dir>/f\", \"<dir>/ro/x\")).error)\n    print((await rename(\"<dir>/f\", \"<dir>/f/x\")).error)\nmain()"
+
+// What `Failures` printed under slate 0.1.23, the last release whose file system was libuv callbacks.
+private val Said: string = "cannot read <dir>/nope: ENOENT: no such file or directory\ncannot read <dir>/locked: EACCES: permission denied\ncannot read <dir>/f/x: ENOTDIR: not a directory\ncannot read <dir>: EISDIR: illegal operation on a directory\ncannot read <dir>/locked: EACCES: permission denied\ncannot write <dir>/nope/x: ENOENT: no such file or directory\ncannot write <dir>/ro/x: EACCES: permission denied\ncannot write <dir>/f/x: ENOTDIR: not a directory\ncannot write <dir>/locked: EACCES: permission denied\ncannot write <dir>/nope/x: ENOENT: no such file or directory\ncannot write <dir>/ro/x: EACCES: permission denied\ncannot write <dir>/f/x: ENOTDIR: not a directory\ncannot write <dir>/ro/x: EACCES: permission denied\ncannot write <dir>/f/x: ENOTDIR: not a directory\ncannot list <dir>/nope: ENOENT: no such file or directory\ncannot list <dir>/f: ENOTDIR: not a directory\ncannot list <dir>/shut: EACCES: permission denied\ncannot stat <dir>/nope: ENOENT: no such file or directory\ncannot stat <dir>/f/x: ENOTDIR: not a directory\ncannot stat <dir>/shut/x: EACCES: permission denied\nfalse false\ncannot remove <dir>/nope: ENOENT: no such file or directory\ncannot remove <dir>/f/x: ENOTDIR: not a directory\ncannot remove <dir>/sub: EPERM: operation not permitted\ncannot make <dir>/nope/x: ENOENT: no such file or directory\ncannot make <dir>/sub: EEXIST: file already exists\ncannot make <dir>/ro/new: EACCES: permission denied\ncannot make <dir>/f/x: ENOTDIR: not a directory\ncannot remove <dir>/nope: ENOENT: no such file or directory\ncannot remove <dir>/full: ENOTEMPTY: directory not empty\ncannot remove <dir>/f: ENOTDIR: not a directory\ncannot rename <dir>/nope: ENOENT: no such file or directory\ncannot rename <dir>/f: EACCES: permission denied\ncannot rename <dir>/f: ENOTDIR: not a directory"
+
+@test
+EVERY_ASYNCHRONOUS_FILE_SYSTEM_FAILURE_SAYS_EXACTLY_WHAT_IT_SAID_BEFORE_THE_MOVE_TO_KAIROS()
+    // A missing path, a permission refused and a path running through a file, for every call that
+    // has each -- plus the ones only some calls have: a directory read as a file, a directory
+    // removed as a file, one made twice, and one removed with something in it.
+    val dir = hazards()
+    val said = fs_out(replace_all(Failures, "<dir>", dir))
+
+    clear_hazards(dir)
+    assert_eq(said, replace_all(Said, "<dir>", dir))
+
+@test
+TWO_REQUESTS_IN_FLIGHT_TOGETHER_EACH_GET_THEIR_OWN_ANSWER()
+    // Started before either is awaited, and awaited in the opposite order: a read and a write of
+    // different files, a failure beside a success, and two reads of one file.
+    val prog = "async main()\n    val w = writeFile(\"<dir>/b.txt\", \"bee\")\n    val r = readFile(\"<dir>/a.txt\")\n    val gone = readFile(\"<dir>/nope\")\n    val again = readFile(\"<dir>/a.txt\")\n    print((await gone).ok, (await r).value, (await again).value, (await w).ok)\n    print((await readFile(\"<dir>/b.txt\")).value)\nmain()"
+    val dir = libuv.mkdtemp_sync("/tmp/slate-fsa-XXXXXX").unwrap()
+
+    libuv.write_file_sync(s"${dir}/a.txt", "ay".bytes).unwrap()
+
+    val said = fs_out(replace_all(prog, "<dir>", dir))
+
+    scrub(dir)
+    assert_eq(said, "false ay ay true\nbee")
+
+@test
+A_FILE_LARGER_THAN_ONE_READ_COMES_BACK_WHOLE()
+    // kairos reads a whole file sixty-four kilobytes at a time, so a megabyte and three bytes is
+    // sixteen full pieces and a short one -- the boundary a chunked read gets wrong if it gets any.
+    // The last byte and the length are what a lost or doubled piece would change.
+    val prog = "async main()\n    val text = \"abcdefgh\".repeat(131072) + \"xyz\"\n    await writeFile(\"<dir>/big.txt\", text)\n    val back = (await readFile(\"<dir>/big.txt\")).value\n    val bytes = (await readBytes(\"<dir>/big.txt\")).value\n    print(back.length, back == text, bytes.length, bytes[bytes.length - 1], bytes[65536])\n    await appendFile(\"<dir>/big.txt\", \"!\")\n    print((await readFile(\"<dir>/big.txt\")).value.length)\nmain()"
+
+    assert_eq(in_scratch(prog), "1048579 true 1048579 122 97\n1048580")
+
+@test
+AN_EMPTY_WRITE_STILL_MAKES_THE_FILE_AND_AN_APPEND_STILL_CREATES_ONE()
+    // Zero bytes is no writes at all inside kairos's loop, so the open and the close are the whole
+    // of it -- which must still leave an empty file there, and an append to nothing must make one.
+    val prog = "async main()\n    print((await writeFile(\"<dir>/e.txt\", \"\")).ok, (await stat(\"<dir>/e.txt\")).value.size)\n    print((await appendFile(\"<dir>/n.txt\", \"one\")).ok, (await appendBytes(\"<dir>/n.txt\", [33])).ok)\n    print((await readFile(\"<dir>/n.txt\")).value)\nmain()"
+
+    assert_eq(in_scratch(prog), "true 0\ntrue true\none!")
