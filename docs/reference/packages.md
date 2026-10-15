@@ -163,6 +163,38 @@ import { run } from slate:process
 `slate deps` and `slate install` still see only `dependencies` here, an import above the object being a
 statement the restriction pass skips rather than a second kind of dependency.
 
+## Watching a program
+
+`slate run --watch` runs a program and starts it again whenever one of its sources changes — the
+development server that picks up an edit without being told:
+
+```
+slate run --watch server.sl
+slate run --watch server.sl --port 3000
+slate run --watch --grace 500 server.sl
+```
+
+**Everything after the program's name is the program's**, exactly as for `slate <program.sl>`. The
+program needs no `package.sl`: the directory watched is its project's, where there is one, and the
+program's own directory where there is not, and everything under it is watched.
+
+**What restarts it is source and the files an import reads**: `.sl` and `.slx`, `package.sl`, and the
+text an [asset import](modules.md) usually names — `.css`, `.html`, `.js`, `.json`, `.txt`, `.md`,
+`.svg`, `.sql` and the like. **What the program writes for itself does not**, so a log, a SQLite
+database or an upload saved under the project leaves it running. Neither does `.git`, `vendor/`, the
+package cache, or an editor's temporary files (`*~`, `.#*`, `*.swp`, vim's `4913`).
+
+**One save restarts it once.** Changes are allowed 100 ms to settle, so an editor's write-and-rename
+or a formatter touching three files is a single restart. The program is sent `SIGTERM`, and `SIGKILL`
+if it has not stopped two seconds later (`--grace <ms>` changes that); then it starts again, and one
+dimmed line on stderr says which file did it.
+
+**A program that ends on its own is left ended.** A crash is reported once, and the watcher waits for
+the edit that fixes it rather than starting the same crash again in a loop. **Ctrl-C stops both**, and
+`slate` exits with the program's status.
+
+Recursive watching is macOS's for now; on another system `--watch` says so and runs nothing.
+
 ## What a package exposes
 
 **Its `main`, and whatever its own manifest lists under `modules`** — which is what the slash names.
