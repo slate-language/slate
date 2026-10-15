@@ -88,7 +88,8 @@ b 2
 
 **`has` is the presence test, and it is the only one.** A field holding `null` and a field that is not
 there both answer true to `== null` — [the one special case in `==`](values.md) — so where the
-difference matters, `has` is what draws it.
+difference matters, `has` is what draws it. It asks about the object's **own** fields; one reached
+through a [`proto`](#proto) is not counted.
 
 `o with { f: v }` answers a **copy** with `f` changed. There is no spread in a literal — `with` is it.
 
@@ -205,6 +206,31 @@ An [object pattern](patterns.md) counts a field a proto supplies, a pattern aski
 *has* the field — which is the question `.` answers. (JavaScript splits the same seam and puts `in` on
 this side of it.)
 
+**`o[k]` reads what `o.k` reads**, so a name worked out at run time finds an inherited member exactly as
+a written one does — JavaScript's rule. **Everything that reports what an object HOLDS stays its own**:
+`has` is JavaScript's `Object.hasOwn`, `keys` and `entries` list the object's own fields, and `o[k] = v`
+writes to the object itself, even where the value it replaces was inherited:
+
+```slate
+val Shape = { kind: "shape", sides: 0 }
+var tri = { proto: Shape, sides: 3 }
+val name = "kind"
+
+print(tri[name], tri["sides"], has(tri, name), keys(tri))
+
+tri[name] = "triangle"
+
+print(tri.kind, Shape.kind, has(tri, name))
+```
+
+```output
+shape 3 false ["proto", "sides"]
+triangle shape true
+```
+
+A string key on a builtin kind reads that kind's property or method the same way, so `xs["length"]` is
+the length; a name the kind does not have is still the fault an index into it gives.
+
 ## The receiver rule
 
 **A method reached through a proto is handed the object it was found on.** One `describe` serves every
@@ -236,7 +262,8 @@ print(c.bump(), c.bump())
 That is not two rules but one: **captured methods take no receiver, shared ones must.**
 
 **Only `o.m(...)` passes a receiver.** `o.m` on its own hands back the bare function, so taking a method
-off an object and calling it later is allowed and gives you what you took.
+off an object and calling it later is allowed and gives you what you took — and `o["m"]` is the same
+bare function.
 
 ## Operator methods
 

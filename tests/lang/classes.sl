@@ -142,11 +142,11 @@ a_class_pattern_takes_apart_fields_and_not_properties() =
     assertEq(said, "3 by 4")
 
 @test
-ONLY_A_DOT_READS_A_PROPERTY_BECAUSE_AN_INDEX_READS_THE_OBJECTS_OWN_TABLE() =
+A_COMPUTED_NAME_READS_A_PROPERTY_AS_THE_DOT_DOES_AND_has_STILL_SAYS_IT_IS_NOT_HELD() =
     val r = Rect.new(3, 4)
 
     assert(!has(r, "area"))
-    assertEq(r["area"] ?? "nothing", "nothing")
+    assertEq(r["area"], 12)
 
 @test
 a_property_with_only_a_get_is_read_only_and_the_fault_names_it() =

@@ -398,8 +398,9 @@ print(tell(r), (r with { w: 10 }).area)
 A class that wants `area` in its JSON writes a `toJSON` saying so, which is
 [what that hook is for](objects.md).
 
-**Only `.` reads a property.** `r["area"]` is the object's own table, which has never walked the
-`proto` chain either — so it answers nothing here, exactly as it does for a method.
+**`r["area"]` reads the property too**, a computed name reading exactly what `.` reads — JavaScript's
+rule, and the one [objects](objects.md) gives for every inherited member. `has(r, "area")` is still
+false, `has` asking only about what the object holds.
 
 **A property and a field of one name are refused**, being one name to a reader and to the `.` that
 reaches both:
