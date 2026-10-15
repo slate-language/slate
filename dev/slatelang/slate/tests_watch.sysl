@@ -1,11 +1,13 @@
 module dev.slatelang.slate
 @tests
 
+import sh.sysl.kairos.Once
+import sh.sysl.kairos.uv
 import sh.sysl.libuv
-import sh.sysl.libuv.Handle
 import sysl.buf.{Buf, buf}
 import sysl.fs.{read_bytes, write_text}
 import sysl.text.{Search, from_utf8_unchecked, replace_all, str_builder}
+import sysl.time.millis
 
 // `slate run --watch`: a program started, stopped and started again as its sources change.
 //
@@ -17,9 +19,8 @@ import sysl.text.{Search, from_utf8_unchecked, replace_all, str_builder}
 // restart, the wait after a crash, and the status at the end. What the child does is append a line to
 // a log OUTSIDE the watched tree, which is how a test sees each run.
 //
-// **Every run is bounded by a watchdog**, an unreferenced timer that stops the watch with SIGKILL and
-// records that it had to: a watcher that never ends would otherwise hang the suite with nothing
-// printed.
+// **Every run is bounded by a watchdog**, a timer that stops the watch with SIGKILL and records that
+// it had to: a watcher that never ends would otherwise hang the suite with nothing printed.
 
 // How long after the watch starts the first edit is made, and how long a restart is given to show up
 // in the log. Generous, because FSEvents batches what it reports and a test near its margin is a
@@ -75,13 +76,9 @@ private logged(sc: Scene) -> string
         Ok(b) -> from_utf8_unchecked(b)
         Err(_) -> ""
 
-// `f`, once, `ms` from now.
-private after(ms: u64, f: &Fn() -> unit)
-    val t = libuv.timer().unwrap()
-
-    t.start(ms, 0, () ->
-        t.close()
-        f()).unwrap()
+// `f`, once, `ms` from now, on the watch's own loop.
+private after(w: &Watcher, ms: u64, f: &Fn() -> unit)
+    w.events.after(millis(long(ms)), (_) -> f())
 
 // A watch of the scene's project, started; `grace` is `--grace`.
 private watching(sc: Scene, grace: u64, signals: bool, notes: &Notes) -> &Watcher
@@ -91,24 +88,22 @@ private watching(sc: Scene, grace: u64, signals: bool, notes: &Notes) -> &Watche
 
     val plan = WatchPlan("/bin/sh", argv, sc.proj, "", grace, WatchSettleMs, signals)
 
-    begin_watch(plan, (line: string) -> notes.lines.push(line), libuv.default_loop()).unwrap()
+    begin_watch(plan, (line: string) -> notes.lines.push(line), uv.uv()).unwrap()
 
-// Run the loop until the watch is over, or until the watchdog ends it.
+// Run the watch's loop until the watch is over, or until the watchdog ends it.
 private ran(w: &Watcher, notes: &Notes)
-    val dog = libuv.timer().unwrap()
-
-    dog.start(WatchdogMs, 0, () ->
+    val dog = w.events.after(millis(long(WatchdogMs)), (_) ->
         notes.timed_out = true
-        stop_watch(w, libuv.SIGKILL)).unwrap()
+        stop_watch(w, libuv.SIGKILL))
 
-    // **Not a reason to keep running**: the watch ending is what ends the loop, and the watchdog is
-    // only there for when it does not.
-    dog.unref()
+    // **Not a reason to keep running**: the watch ending is what ends the run, and the watchdog is
+    // only there for when it does not -- so it is cancelled the moment the watch is over, and what
+    // is left drains.
+    while w.files.is_some()
+        if !w.events.pass(Once) then break
 
-    libuv.default_loop().run(libuv.RUN_DEFAULT).unwrap()
-
-    dog.close()
-    libuv.default_loop().run(libuv.RUN_NOWAIT).unwrap()
+    w.events.cancel(dog)
+    w.events.run()
 
     assert(!notes.timed_out, s"the watchdog had to end the watch; the watcher said:\n${notes.said()}")
 
@@ -120,8 +115,8 @@ A_WATCHED_PROGRAM_STARTS_AGAIN_WHEN_ITS_SOURCE_CHANGES()
     var notes: &Notes = Notes(buf(), false)
     val w = watching(sc, 2000, false, notes)
 
-    after(EditAt, () -> put(sc, "main.sl", "echo two >> <log>\nexec sleep 30\n"))
-    after(EditAt + Restarted, () -> stop_watch(w, libuv.SIGTERM))
+    after(w, EditAt, () -> put(sc, "main.sl", "echo two >> <log>\nexec sleep 30\n"))
+    after(w, EditAt + Restarted, () -> stop_watch(w, libuv.SIGTERM))
     ran(w, notes)
 
     assert_eq(logged(sc), "one\ntwo\n")
@@ -144,9 +139,28 @@ TWO_QUICK_CHANGES_RESTART_A_WATCHED_PROGRAM_ONCE()
 
     // **Forty milliseconds apart, inside the settle time and outside the time a restart takes** --
     // so a watcher with no settling would have restarted for the first and again for the second.
-    after(EditAt, () -> put(sc, "util.sl", "a helper\n"))
-    after(EditAt + 40, () -> put(sc, "main.sl", "echo run >> <log>\nexec sleep 31\n"))
-    after(EditAt + Restarted, () -> stop_watch(w, libuv.SIGTERM))
+    after(w, EditAt, () -> put(sc, "util.sl", "a helper\n"))
+    after(w, EditAt + 40, () -> put(sc, "main.sl", "echo run >> <log>\nexec sleep 31\n"))
+    after(w, EditAt + Restarted, () -> stop_watch(w, libuv.SIGTERM))
+    ran(w, notes)
+
+    assert_eq(logged(sc), "run\nrun\n")
+    assert_eq(w.starts, 2)
+
+    scrub(sc.top)
+
+@test
+A_BURST_OF_TWENTY_WRITES_RESTARTS_A_WATCHED_PROGRAM_ONCE()
+    // **What a formatter or a `git checkout` does**: twenty files written five milliseconds apart,
+    // every gap inside the settle time, so the whole burst is one restart after the last of it.
+    val sc = scene("echo run >> <log>\nexec sleep 30\n")
+    var notes: &Notes = Notes(buf(), false)
+    val w = watching(sc, 2000, false, notes)
+
+    for i in 0..<20
+        after(w, EditAt + u64(i) * 5, () -> put(sc, s"part${i}.sl", s"part ${i}\n"))
+
+    after(w, EditAt + Restarted, () -> stop_watch(w, libuv.SIGTERM))
     ran(w, notes)
 
     assert_eq(logged(sc), "run\nrun\n")
@@ -162,8 +176,8 @@ A_WATCHED_PROGRAM_THAT_IGNORES_SIGTERM_IS_KILLED_WHEN_ITS_GRACE_IS_UP()
     var notes: &Notes = Notes(buf(), false)
     val w = watching(sc, 300, false, notes)
 
-    after(EditAt, () -> put(sc, "main.sl", "trap '' TERM\necho run >> <log>\nwhile :; do sleep 0.06; done\n"))
-    after(EditAt + Restarted, () -> stop_watch(w, libuv.SIGTERM))
+    after(w, EditAt, () -> put(sc, "main.sl", "trap '' TERM\necho run >> <log>\nwhile :; do sleep 0.06; done\n"))
+    after(w, EditAt + Restarted, () -> stop_watch(w, libuv.SIGTERM))
     ran(w, notes)
 
     assert_eq(logged(sc), "run\nrun\n")
@@ -181,13 +195,13 @@ A_CRASHING_WATCHED_PROGRAM_WAITS_FOR_A_CHANGE_RATHER_THAN_LOOPING()
     val w = watching(sc, 2000, false, notes)
 
     // Nothing changes for a while: one run, and a note saying how it ended.
-    after(Restarted, () ->
+    after(w, Restarted, () ->
         assert_eq(logged(sc), "crash\n")
         assert_eq(w.starts, 1)
         put(sc, "main.sl", "echo again >> <log>\nexit 4\n"))
 
     // The edit that "fixes" it is what starts it again.
-    after(Restarted * 2, () -> stop_watch(w, libuv.SIGINT))
+    after(w, Restarted * 2, () -> stop_watch(w, libuv.SIGINT))
     ran(w, notes)
 
     assert_eq(logged(sc), "crash\nagain\n")
@@ -212,7 +226,7 @@ FILES_THAT_ARE_NOT_SOURCE_DO_NOT_RESTART_A_WATCHED_PROGRAM_AND_AN_ASSET_DOES()
     var notes: &Notes = Notes(buf(), false)
     val w = watching(sc, 2000, false, notes)
 
-    after(EditAt, () ->
+    after(w, EditAt, () ->
         put(sc, ".git/HEAD", "ref: refs/heads/dev\n")
         put(sc, "vendor/lib.sl", "vendored\n")
         put(sc, "main.sl.swp", "vim\n")
@@ -224,10 +238,10 @@ FILES_THAT_ARE_NOT_SOURCE_DO_NOT_RESTART_A_WATCHED_PROGRAM_AND_AN_ASSET_DOES()
 
     // **The control**: the same watcher, still live, does restart for a stylesheet -- so the quiet
     // above was the filter and not a watcher that had stopped hearing anything.
-    after(EditAt + Restarted, () ->
+    after(w, EditAt + Restarted, () ->
         assert_eq(w.starts, 1, notes.said())
         put(sc, "panel.css", "p { color: red }\n"))
-    after(EditAt + Restarted * 2, () -> stop_watch(w, libuv.SIGTERM))
+    after(w, EditAt + Restarted * 2, () -> stop_watch(w, libuv.SIGTERM))
     ran(w, notes)
 
     assert_eq(w.starts, 2)
@@ -270,7 +284,7 @@ CTRL_C_STOPS_THE_PROGRAM_AND_THE_WATCH_WITH_THE_PROGRAMS_STATUS()
     var notes: &Notes = Notes(buf(), false)
     val w = watching(sc, 2000, true, notes)
 
-    after(EditAt, () -> libuv.kill(libuv.pid(), libuv.SIGINT).unwrap())
+    after(w, EditAt, () -> libuv.kill(libuv.pid(), libuv.SIGINT).unwrap())
     ran(w, notes)
 
     assert_eq(logged(sc), "run\n")
