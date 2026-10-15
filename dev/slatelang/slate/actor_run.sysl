@@ -1,9 +1,8 @@
 module dev.slatelang.slate
 
 import sh.sysl.gc
-import sh.sysl.kairos.Once
+import sh.sysl.kairos.{Job, Notifier, Once}
 import sh.sysl.libuv
-import sh.sysl.libuv.Handle
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 
@@ -22,11 +21,12 @@ import sysl.buf.{Buf, buf}
 // cross: the receiver looks the class up by the name it was declared under, and it is there because
 // the file that declared it was loaded.
 //
-// **The end-of-life rule is `tests_actor_probe.sysl`'s and it is exact.** A mailbox's `Async` is an
-// ACTIVE handle, so the receiving thread's `uv_run` never returns on its own -- and a `join` on that
-// thread waits for a loop that waits for a handle nobody closes. The order this file keeps is: the
-// drain stops taking messages, the serve loop ends, the handle is CLOSED, the loop is turned once
-// more so the close callback fires, and only then does the thread leave its VM and exit.
+// **The end-of-life rule is exact.** A task waiting on an actor's mailbox keeps its kairos loop
+// alive, so a pass never ends the loop on its own -- and a `join` on that thread waits for a loop
+// that waits for a mailbox nobody shuts. The order this file keeps is: the drain stops taking
+// messages, the serve loop ends, the waker is taken back under the box's lock and the mailbox's task
+// aborted, the loop is passed until nothing is left, and only then does the thread leave its VM,
+// close the kairos driver (`dispose_vm`) and close the libuv loop.
 
 // -- the table every actor is reached through ---------------------------------------------------------
 
@@ -121,19 +121,18 @@ post_note(target: &sync ActorBox, note: &sync ActorNote, always: bool) -> u8
         target.head = Some(note)
         target.queued += 1
 
-    val wake = target.wake
+        // **Woken UNDER the lock**, because the owner clears `wake` under it before its loop goes:
+        // read here and called after the unlock, a wake could land on a driver already closed.
+        // `wake` neither blocks nor allocates, so holding the lock across it costs nothing.
+        target.wake match
+            Some(w) -> w.wake()
+            None -> ()
 
     target.lock.unlock()
 
     if refused != PostOk
         drop_block(note.data)
         return refused
-
-    wake match
-        Some(w) -> w.send() match
-            Ok(_) -> ()
-            Err(_) -> ()
-        None -> ()
 
     PostOk
 end post_note
@@ -208,18 +207,16 @@ private actor_body(box: &sync ActorBox, lp: &libuv.Loop)
     v.actor_value = made
 
     // The waker is the one thing another thread may hold, and it is published only once there is
-    // something behind it.
-    val note = libuv.notifier(() -> drain_inbox_now(), lp) match
-        Err(e) ->
-            failed_to_start(box, s"an actor's mailbox could not be made: ${e}")
-            return
-        Ok(n) -> n
+    // something behind it. **An actor's own mailbox is NOT in the background**: a task waiting on it
+    // is what keeps the actor's loop alive, and with nothing else to do a pass blocks in the kernel
+    // until a wake comes.
+    val mail = open_mailbox()
 
     v.inbox = Some(box)
-    v.inbox_note = Some(note)
+    v.inbox_note = Some(mail)
 
     box.lock.lock()
-    box.wake = Some(note.waker())
+    box.wake = Some(mail.note.waker())
     box.started = true
     box.running = true
     box.lock.unlock()
@@ -231,10 +228,12 @@ private actor_body(box: &sync ActorBox, lp: &libuv.Loop)
     // nobody joins is a body leaked, and a grandchild's is nobody else's to wait for.
     stop_spawned_actors()
 
-    // **The handle is CLOSED and not merely dropped, and the loop is passed until it is empty so the
-    // close callback fires** -- without which `loop_close` answers EBUSY and the next run would block.
+    // **The waker is taken back under the lock and the draining task is aborted**, and then the loop
+    // is passed until nothing is left: no sender can reach this loop again, and nothing of the
+    // mailbox counts towards it. `dispose_vm` closes the driver's own handles and `actor_thread` the
+    // libuv loop -- in that order, or `loop_close` answers EBUSY.
     v.inbox_note = None
-    note.close(() -> ())
+    shut_mailbox(box, mail)
 
     loop
         if !loop_events().pass(Once) then break
@@ -403,10 +402,51 @@ end announce_death
 
 // -- the drain both sides share -------------------------------------------------------------------
 
-// Called from the `Async` callback, which runs on the loop of whichever VM owns the mailbox.
+// A VM's mailbox on its own loop: the kairos notifier another thread wakes, and the task that drains
+// the mailbox at each wake.
 //
-// **`Async.send` coalesces**, so the callback's job is to drain whatever is there rather than to be
-// counted: one wake-up, one drain, however many messages arrived.
+// Not `private`: `vm_state.sysl` names it in `Vm`, and `actor.sysl` makes the program's own.
+struct Mailbox
+    note: &Notifier
+    job: Job
+end Mailbox
+
+// A notifier on this VM's loop and the task that waits on it. **The task is first stepped on the
+// next pass**, and a wake that comes before it waits is kept rather than lost, so a sender that is
+// quicker than the task loses nothing.
+//
+// Not `private`: `actor.sysl` makes the program's own mailbox with it.
+open_mailbox() -> Mailbox
+    val n = loop_events().notifier()
+
+    Mailbox(n, loop_events().spawn(mailbox_wakes(n)))
+end open_mailbox
+
+// Take the waker back and stop the task. **The waker goes under the box's lock**, which is the lock
+// every sender wakes under, so once this returns no thread can reach this loop through the box again
+// -- and that is what makes it safe to close the loop's driver afterwards. Aborting the task ends its
+// wait, so the notifier stops counting towards the loop.
+//
+// Not `private`: `actor.sysl` gives the program's own back in `forget_actors`.
+shut_mailbox(box: &sync ActorBox, m: Mailbox)
+    box.lock.lock()
+    box.wake = None
+    box.lock.unlock()
+
+    loop_events().abort(m.job)
+end shut_mailbox
+
+// The mailbox's task: one drain per wake, for as long as the mailbox is open.
+//
+// **Wakes coalesce**, so the job is to drain whatever is there rather than to be counted: one wake,
+// one drain, however many messages arrived. It ends only by being aborted.
+private async mailbox_wakes(n: &Notifier)
+    loop
+        await n.next()
+        drain_inbox_now()
+end mailbox_wakes
+
+// What the mailbox's task does at a wake, on the loop of whichever VM owns the mailbox.
 drain_inbox_now()
     current().inbox match
         Some(box) -> drain_inbox(box)

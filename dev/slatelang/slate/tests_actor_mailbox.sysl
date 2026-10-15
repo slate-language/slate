@@ -1,0 +1,231 @@
+module dev.slatelang.slate
+@tests
+
+import sh.sysl.kairos.{NoWait, Once}
+import sh.sysl.libuv
+import sh.sysl.parsing.point
+
+// The mailbox an actor is woken through: a kairos notifier on the VM's own loop, the task that
+// drains at each wake, and the order a loop of its own is taken down in.
+//
+// **Every name here carries the word ACTOR**, so `sysl test . --filter ACTOR` runs this file beside
+// `tests_actor.sysl`.
+
+private val MailImport: string = "import { spawn, send, ask, done, stop, detach } from slate:actor\n"
+
+// Room for a small program and the objects its declarations make.
+private const MailCeiling: usize = 16777216
+
+// -- the seam: one VM, one loop of its own, one mailbox --------------------------------------------
+
+// **The loop of an actor's own is closed at the end, and `uv_loop_close` answers EBUSY for any handle
+// still on it** -- so a mailbox, or a kairos driver, that left something behind is what this catches.
+// The order is `actor_body`'s and `actor_thread`'s: the mailbox is shut, the loop passed until nothing
+// is left, the VM disposed (which closes the driver), and the loop closed.
+@test
+AN_ACTOR_LOOP_WOKEN_FROM_ANOTHER_THREAD_CLOSES_WITH_NOTHING_LEFT_ON_IT()
+    val lp = libuv.new_loop().expect("a loop of its own")
+    var mine = new_vm(MailCeiling, lp)
+    val was = enter(&mine)
+
+    val tasks_before = loop_events().running()
+
+    ensure_inbox(point(0)).expect("a mailbox")
+
+    val box = current().inbox.expect("the mailbox just made")
+
+    // The wake comes from another thread, as every wake does in a real program.
+    val t = libuv.thread(() -> sender(box, 1)).expect("a thread")
+
+    t.join().expect("joined")
+
+    // **The wake is already in when the passes start**, so they need not wait for anything: the first
+    // steps the mailbox's task and the wake ends its first `next` at once.
+    var drained = false
+
+    for _ in 0..<8
+        loop_events().pass(NoWait)
+
+        box.lock.lock()
+        drained = box.head.is_none()
+        box.lock.unlock()
+
+        if drained then break
+
+    forget_actors()
+
+    loop
+        if !loop_events().pass(Once) then break
+
+    val tasks_after = loop_events().running()
+    val alive = loop_events().alive()
+
+    leave(was)
+    dispose_vm(&mine)
+
+    val closed = lp.close()
+
+    assert(drained, "the wake ran the drain")
+    assert_eq(tasks_after, tasks_before, "the mailbox's task is gone with it")
+    assert(!alive, "and nothing of the mailbox counts towards the loop")
+    assert(closed.is_ok(), "the loop closed with no handle left on it")
+end AN_ACTOR_LOOP_WOKEN_FROM_ANOTHER_THREAD_CLOSES_WITH_NOTHING_LEFT_ON_IT
+
+// **A wake racing the mailbox being shut is the case the lock is for.** A sender that read the waker
+// and called it after the owner had closed its loop would wake a driver that is not there; waking
+// under the box's lock, which is the lock the waker is taken back under, makes that impossible. So a
+// thread posts as fast as it can while this one shuts the mailbox and closes the loop, and the run has
+// to reach its end.
+@test
+AN_ACTOR_MAILBOX_SHUT_WHILE_ANOTHER_THREAD_WAKES_IT_CLOSES_CLEANLY()
+    for _ in 0..<20
+        val lp = libuv.new_loop().expect("a loop of its own")
+        var mine = new_vm(MailCeiling, lp)
+        val was = enter(&mine)
+
+        ensure_inbox(point(0)).expect("a mailbox")
+
+        val box = current().inbox.expect("the mailbox just made")
+        val t = libuv.thread(() -> sender(box, 2000)).expect("a thread")
+
+        loop_events().pass(Once)
+        forget_actors()
+
+        t.join().expect("joined")
+
+        loop
+            if !loop_events().pass(Once) then break
+
+        leave(was)
+        dispose_vm(&mine)
+
+        assert(lp.close().is_ok(), "the loop closed with no handle left on it")
+end AN_ACTOR_MAILBOX_SHUT_WHILE_ANOTHER_THREAD_WAKES_IT_CLOSES_CLEANLY
+
+// `n` posts to `box`, each of which wakes it. A stop is the one note that carries nothing.
+private sender(box: &sync ActorBox, n: usize)
+    for _ in 0..<n
+        post_note(box, note_of(NoteStop, null, 0), true)
+
+// -- the same, as a program writes it --------------------------------------------------------------
+
+// **1,024 mailboxes, which is as many as one process holds**: the program's own and 1,023 actors.
+// Each actor is asked alone and answers alone, so every wake goes to exactly one loop and every answer
+// to the program's -- a wake that reached the wrong mailbox, or two that shared a flag, shows as a
+// wrong sum or a program that never ends. The 1,025th is refused in the limit's own sentence.
+@test
+A_THOUSAND_AND_TWENTY_FOUR_ACTOR_MAILBOXES_ARE_EACH_WOKEN_ALONE()
+    assert_eq(out(MailImport + raw"""
+        actor Echo
+            var id
+
+            on who(self) = self.id
+
+        var made = []
+
+        for i in 0..<1023
+            made.push(spawn(Echo, i, { heap: 8388608 }))
+
+        try
+            spawn(Echo, 1023, { heap: 8388608 })
+        catch e
+            print(e.message)
+
+        var sum = 0
+
+        for a in made
+            sum += await ask(a.who)
+
+        print(sum)
+        """), "this program has 1024 actors at once, which is as many as one process holds\n522753")
+end A_THOUSAND_AND_TWENTY_FOUR_ACTOR_MAILBOXES_ARE_EACH_WOKEN_ALONE
+
+// **The program's mailbox counts while an answer is owed and not otherwise.** Nothing at the top
+// level waits here -- the ask is in a function nobody awaits -- so the only thing keeping the program
+// alive until the answer arrives is the mailbox being kept while it is owed.
+@test
+AN_ACTOR_ANSWER_NOBODY_AWAITS_AT_THE_TOP_LEVEL_STILL_KEEPS_THE_PROGRAM_ALIVE()
+    assert_eq(out(MailImport + raw"""
+        actor Waiter
+            async on later(self, n)
+                await sleep(20)
+                n * 10
+
+        val w = spawn(Waiter)
+
+        async report()
+            print(await ask(w.later, 4))
+
+        report()
+        print("first")
+        """), "first\n40")
+end AN_ACTOR_ANSWER_NOBODY_AWAITS_AT_THE_TOP_LEVEL_STILL_KEEPS_THE_PROGRAM_ALIVE
+
+// **Detaching takes the actor out of what the program waits for, and not its answers**: an `ask` of a
+// detached actor still holds the program open until it is answered, and the idle mailbox after it does
+// not.
+@test
+A_DETACHED_ACTOR_IS_STILL_WAITED_FOR_WHERE_IT_OWES_AN_ANSWER()
+    assert_eq(out(MailImport + raw"""
+        actor Logger
+            var lines = 0
+
+            on note(self)
+                self.lines += 1
+
+            on count(self) = self.lines
+
+        val l = spawn(Logger)
+
+        detach(l)
+        send(l.note)
+        send(l.note)
+
+        async report()
+            print(await ask(l.count))
+
+        report()
+        print("first")
+        """), "first\n2")
+end A_DETACHED_ACTOR_IS_STILL_WAITED_FOR_WHERE_IT_OWES_AN_ANSWER
+
+// **Sends racing a stop, and deaths racing teardowns.** Sixteen actors write into one that is stopped
+// while they write -- a send to an actor that has stopped is dropped -- and when the program ends all
+// sixteen stop at once, each one's death being posted to every other while they are taking their own
+// loops down. Five rounds, because a race is a matter of chances.
+@test
+AN_ACTOR_WOKEN_WHILE_IT_STOPS_LOSES_NOTHING_IT_OWED_AND_CRASHES_NOTHING()
+    assert_eq(out(MailImport + raw"""
+        actor Sink
+            on take(self, n) = n
+
+        actor Writer
+            on write(self, target, k)
+                for i in 0..<k
+                    send(target.take, i)
+
+                k
+
+        var total = 0
+
+        for round in 0..<5
+            val sink = spawn(Sink)
+            var writers = []
+
+            for i in 0..<16
+                writers.push(spawn(Writer))
+
+            val asked = writers.map(w -> ask(w.write, sink, 500))
+
+            stop(sink)
+            await done(sink)
+
+            for n in await all(asked)
+                total += n
+
+            for w in writers
+                stop(w)
+
+        print(total)
+        """), "40000")
+end AN_ACTOR_WOKEN_WHILE_IT_STOPS_LOSES_NOTHING_IT_OWED_AND_CRASHES_NOTHING
