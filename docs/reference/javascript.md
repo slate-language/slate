@@ -64,15 +64,20 @@ way.
 
 ## What is not there yet
 
-**`slate:process`'s `run`, `slate:redis`, `slate:nghttp2`, and TLS.** Each is a
+**`slate:process`'s `run`, `slate:redis`, `slate:nghttp2`, and a TLS listener.** Each is a
 name that says *"not in the JavaScript back end yet"* when a program reaches it, rather than a name
 that is not there — so a program is told which half of the world it is in. **No global is on that
 list any more**; `fetch` was the last and has its own section below.
 
 **`slate:net` and `slate:llhttp` came OFF that list in 0.0.31**, and they are what everything above
-a socket stands on — see the section below. What is still owed of the transport is TLS: `startTls`
-refuses naming it, and `listen` given a `cert` and a `key` refuses in the same words, so an HTTPS
-server is the interpreter's for now.
+a socket stands on — see the section below. **`startTls` is here at both ends, over node's `tls`**,
+so a protocol that upgrades an open socket — PostgreSQL's, SMTP's — runs on node as it does in the
+interpreter, with the same options and the same sentences where they are slate's own. Two things
+are the host's: node checks a certificate against its own bundled roots rather than the machine's
+store (`trust` is added to either), and a certificate that does not verify is described in node's
+words after the same `the TLS handshake failed:`. What is still owed of the transport is `listen`
+given a `cert` and a `key`, which refuses naming TLS, so an HTTPS server is the interpreter's for
+now.
 
 **`slate:zstd` is WHOLE here on node and absent in a browser, which is the same rule read twice.** node
 has carried Zstandard in `zlib` since 22.15, so `zstd` and `unzstd` are the host's own there; no browser
