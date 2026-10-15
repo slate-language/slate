@@ -47,19 +47,34 @@ end after
 // around it declared is neither here nor there -- a name declared again inside a nested one is
 // shadowing, which JavaScript is happy with -- so the outer block's answer is put aside and given
 // back when this one ends.
+//
+// **What it reads above a declaration of the same name is worked out here too** (`spell_early`),
+// since that is a question about the whole run of statements, asked before the first is written.
 private open_block(j: *Js, stmts: Buf[Stmt]) -> JsBlock
-    val outer = JsBlock(j.rebound, j.bound)
+    val outer = JsBlock(j.rebound, j.bound, j.spelling.early, j.spelling.entries.len())
 
     j.rebound = declared_twice(stmts, j.pending)
     j.bound = j.pending
+    j.spelling.blocks += 1
+    spell_early(j, stmts, j.pending)
     j.pending = buf()
     outer
 end open_block
 
+// **The file's own block keeps its spellings once it closes**, the exports being written below it.
 private close_block(j: *Js, outer: JsBlock)
     j.rebound = outer.rebound
     j.bound = outer.bound
     j.pending = buf()
+    j.spelling.blocks -= 1
+
+    if j.spelling.blocks == 0 && j.spelling.depth == 0
+        for k in outer.spelled..<j.spelling.entries.len()
+            j.spelling.top.push(j.spelling.entries.at(k))
+
+    j.spelling.entries.truncate(outer.spelled)
+    j.spelling.early = outer.early
+end close_block
 
 // The names the declaration inside a `using` brings in.
 //
@@ -336,7 +351,7 @@ end emit_using
 // the word adds a release and changes nothing about what the names are or what they hold.
 private emit_using_bind(j: *Js, bind: Stmt, held: string, at: Span)
     *bind.kind match
-        Val(name, _) -> line(j, s"${declaring(j, name, true)}${js_name(name)} = ${held};")
+        Val(name, _) -> line(j, s"${declaring(j, name, true)}${spelled(j, name)} = ${held};")
         Unpack(pat, _, immutable) -> emit_binding(j, pat, held, immutable, at)
         Group(stmts) ->
             if stmts.is_empty() then return
@@ -363,17 +378,29 @@ emit_stmt(j: *Js, s: Stmt)
         // Each is emitted where the group stands, for the reason the machine compiles it there: the
         // names belong to the scope around it and not to one of its own.
         Group(stmts) -> for i in 0..<stmts.len() do emit_stmt(j, stmts.at(i))
+        // **The initialiser is written BEFORE the name goes live**, so `val g = g()` calls the `g`
+        // outside -- `js_spell.sysl`.
         Val(name, init) ->
             val v = kept_binding(j, name, Some(init), emit_expr(j, init))
+            val how = declaring(j, name, true)
 
-            line(j, s"${declaring(j, name, true)}${js_name(name)} = ${v};")
+            went_live(j, name)
+            line(j, s"${how}${spelled(j, name)} = ${v};")
         Var(name, init) ->
             val v = kept_binding(j, name, Some(init), emit_expr(j, init))
+            val how = declaring(j, name, false)
 
-            line(j, s"${declaring(j, name, false)}${js_name(name)} = ${v};")
+            went_live(j, name)
+            line(j, s"${how}${spelled(j, name)} = ${v};")
         Unpack(pat, init, immutable) ->
             val v = emit_expr(j, init)
             val subject = fresh(j)
+            var names: Buf[string] = buf()
+
+            pattern_names(resolve_pattern(pat, 0), &names)
+
+            for i in 0..<names.len()
+                went_live(j, names.at(i))
 
             line(j, s"const ${subject} = ${v};")
             emit_binding(j, pat, subject, immutable, at)
@@ -386,10 +413,12 @@ emit_stmt(j: *Js, s: Stmt)
             // mean the wrong thing, the second winning even for a call written between them.
             val how = declaring(j, name, true)
 
+            val called = spelled(j, name)
+
             if how == "const "
-                emit_function(j, "", js_name(name), js_name(name), name, params, defaults, body, is_async, "", at)
+                emit_function(j, "", called, called, name, params, defaults, body, is_async, "", at)
             else
-                emit_function(j, s"${how}${js_name(name)} = ", "", js_name(name), name, params, defaults, body, is_async, ";", at)
+                emit_function(j, s"${how}${called} = ", "", called, name, params, defaults, body, is_async, ";", at)
         Eval(e) ->
             val v = emit_expr(j, e)
 
@@ -446,23 +475,23 @@ emit_stmt(j: *Js, s: Stmt)
         // inside it captures the class lexically. That is the declaring scope the interpreter has to
         // hold a pointer to, arriving here for nothing.
         TypeDecl(name, pat) ->
-            line(j, s"${declaring(j, name, true)}${js_name(name)} = $$.shape(${emit_shape(j, pat)}, ${quoted_js(name)});")
+            line(j, s"${declaring(j, name, true)}${spelled(j, name)} = $$.shape(${emit_shape(j, pat)}, ${quoted_js(name)});")
 
         // **The path is read where the declaration stands, and `$.external` is what reads it.** A
         // global that is not there is a fault naming the path, which is nearly always a program in
         // the wrong host -- a node build reaching for `document`, a page reaching for `process` --
         // and this line is the earliest place that can be said.
         ExternalDecl(name, path) ->
-            line(j, s"${declaring(j, name, true)}${js_name(name)} = $$.external(${quoted_js(path)});")
+            line(j, s"${declaring(j, name, true)}${spelled(j, name)} = $$.external(${quoted_js(path)});")
 
         // `p: Point` -- what the parser leaves behind an annotated parameter, and the machine's
         // `CheckType`. **The complaint names all three things a reader needs**: the parameter, the
         // type it was declared as, and what arrived -- which is why it is written out here rather
         // than left to `$.matches` to say something general.
         CheckType(name, declared, pat) ->
-            val test = emit_test(j, pat, js_name(name))
+            val test = emit_test(j, pat, spelled(j, name))
 
-            line(j, s"if (!(${test})) $$.fault(\"`${name}` was declared ${declared}, and was given \" + $$.plainShow(${js_name(name)}));")
+            line(j, s"if (!(${test})) $$.fault(\"`${name}` was declared ${declared}, and was given \" + $$.plainShow(${spelled(j, name)}));")
 
         // **A precondition is written where it stands and a postcondition's declaration is not.**
         // The head clause tells the ways out what to check; the parser has already put a copy
@@ -483,11 +512,11 @@ emit_stmt(j: *Js, s: Stmt)
                     for i in 0..<names.len()
                         val local = locals.at(i)
 
-                        line(j, s"${declaring(j, local, true)}${js_name(local)} = $$.field($$m${m}, ${quoted_js(names.at(i))});")
+                        line(j, s"${declaring(j, local, true)}${spelled(j, local)} = $$.field($$m${m}, ${quoted_js(names.at(i))});")
                 None -> complain(j, path_at, s"the module `${path}` was never loaded")
         ImportAll(path, path_at, origin, alias) ->
             module_of(j, path, origin) match
-                Some(m) -> line(j, s"${declaring(j, alias, true)}${js_name(alias)} = $$m${m};")
+                Some(m) -> line(j, s"${declaring(j, alias, true)}${spelled(j, alias)} = $$m${m};")
                 None -> complain(j, path_at, s"the module `${path}` was never loaded")
 
         // **A string literal, which is what it is on the other back end too.** The bytes arrive here
@@ -498,7 +527,7 @@ emit_stmt(j: *Js, s: Stmt)
                 Some(t) -> t
                 None -> ""
 
-            line(j, s"${declaring(j, name, true)}${js_name(name)} = ${quoted_js(text)};")
+            line(j, s"${declaring(j, name, true)}${spelled(j, name)} = ${quoted_js(text)};")
 end emit_stmt
 
 // Which file an import written in this one names.
@@ -588,6 +617,10 @@ emit_function(j: *Js, before: string, name: string, bound: string, shown: string
     j.in_gen = gen
 
     var prologue: Buf[string] = buf()
+
+    // **Everything from the parameter list to the closing brace runs when the function is called**,
+    // which is what makes a read in here deferred -- `js_spell.sysl`.
+    j.spelling.depth += 1
 
     line(j, s"${before}${prefix}function${star}${called}(${params_text(j, params, defaults, &prologue)}) {")
     open(j)
@@ -683,6 +716,7 @@ emit_function(j: *Js, before: string, name: string, bound: string, shown: string
         line(j, s"return ${returned_value(fall_out_expr(body_at(body)), answer)};")
     close(j)
     line(j, "}" + after)
+    j.spelling.depth -= 1
     j.in_async = outer_async
     j.in_gen = outer_gen
 
@@ -755,9 +789,9 @@ private params_text(j: *Js, params: Buf[string], defaults: Buf[Expr], prologue: 
         rest_param(params.at(i)) match
             Some(name) ->
                 out.push("...")
-                out.push(js_name(name))
+                out.push(spelled(j, name))
             None ->
-                val jn = js_name(params.at(i))
+                val jn = spelled(j, params.at(i))
 
                 out.push(jn)
 
