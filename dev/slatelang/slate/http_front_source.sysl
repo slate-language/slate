@@ -1,0 +1,290 @@
+module dev.slatelang.slate
+
+// The first piece of `slate:http`: what a handler is given, what it may answer, and the entry points
+// that start a server -- `serve`, `serveStream`, `adopt` and `close`, with the table of connections
+// that `close` ends. `http_source.sysl` says how the pieces are joined and holds the next one, the
+// `server` they all call.
+//
+// **The text is what it was when it was one block.** It is cut at the blank line before `server`.
+// `http_source()` joins the pieces with nothing between them, so this one ends on that blank line and
+// what slate's lexer is given is byte for byte what it was.
+http_front_source() -> string = raw"""
+    // An HTTP server, written in slate on the sockets slate already has.
+    //
+    // This module is slate, not the machine: `serve` is a function over `listen`, `onBytes`, `send` and
+    // `close`, the way node's `http` is JavaScript over its own C sockets. **The parse is not slate**,
+    // and that is node's layering too -- `httpParser` is llhttp, the state machine node itself is built
+    // on. What each side owns is the whole of the split: this module decides everything a *server*
+    // decides, and llhttp decides only what the bytes are.
+    //
+    // ## Keep-alive, and who decides it
+    //
+    // **A connection carries as many requests as the client wants.** The handshake and the socket are
+    // paid for once rather than once per request, which is what a browser and every HTTP library already
+    // expect. **The client decides, by HTTP's own rule**: `HTTP/1.1` keeps the connection unless the
+    // request says `Connection: close`, `HTTP/1.0` closes it unless the request asks for `keep-alive`.
+    // That reading is llhttp's now rather than this module's, and it arrives as `req.keepAlive`. Every
+    // response says which of the two happened, so a client is never left to guess.
+    //
+    // **Requests on one connection are answered one at a time, in order.** A second request that arrives
+    // while the first is still being answered waits in the parser until the first has been written --
+    // which is what a client that pipelined them is owed, HTTP having no request ids: answers are
+    // matched to requests by their order and by nothing else.
+    //
+    // **A connection with nothing outstanding is closed after `IdleMillis`.** A client may keep a
+    // connection and then simply go away, and without a clock that socket is held forever. This is the
+    // decision keep-alive costs and there is no avoiding it: a server that keeps connections has to say
+    // when a quiet one has ended.
+    //
+    // ## Why the parse is not written here
+    //
+    // **Recognising a well-formed request is not the hard part.** The hard part is the request that is
+    // malformed on purpose: two `Content-Length` headers, or one beside a `Transfer-Encoding`, is a
+    // request-smuggling primitive -- one hop reads a body where the next reads a second request, and
+    // that is how a cache is poisoned and an authorization check is walked past. llhttp is generated
+    // from a state machine and refuses those by construction.
+    //
+    // **And a byte-at-a-time scan is the worst thing an interpreted language can be asked to do.** It
+    // runs over every byte of every request, and the scan restarted from the front of the buffer on each
+    // arrival, so a large body cost the interpreter time proportional to its square.
+    //
+    // ## A request that is too big is refused rather than held
+    //
+    // **`HeadBytes` and `BodyBytes` are the limits, and they are the reason for the tier of the parser
+    // this module uses.** A server that grows a buffer for as long as bytes keep arriving is one
+    // connection away from being over, and it does not take an attacker -- a file upload sent to a JSON
+    // endpoint does it. Over the head is `431`, over the body is `413`, and neither is `400`: the
+    // request was HTTP, this server has simply decided not to hold it, which is something a client can
+    // act on.
+    //
+    // ## What the request carries, and what a router adds
+    //
+    // A handler is a function from a request to a response. The request has `method`, `path`, `search`
+    // (the raw text after the `?`), `query` and `cookies` (both parsed), `headers` (names lowercased),
+    // `params` (what a route's `:name` bound, and `{}` where no router is in use), `body` where the
+    // server read one, `keepAlive` and `upgrade`.
+    //
+    // **`router()` is an object holding functions and the server takes one because it has a `handle`**
+    // -- so `serve(3000, app)` works and nothing in the server knows what routing is. What it buys
+    // over a chain of `if req.path == ...` is the parameters, the order, and a `405` with an `Allow`
+    // for a path that is there under another method: that last one is four lines nobody writes by
+    // hand and it is the difference between a client being told what to send and being told to go
+    // away.
+    //
+    // ## What is deliberately not here
+    //
+    // **No middleware**, and that is a decision rather than a gap. A chain that each link may
+    // short-circuit is a control flow of its own to learn, and in a language with first-class
+    // functions the same thing is a function calling a function -- `app.get("/x", authed(handler))`
+    // says what it does at the site that needs it, where a `use` several screens away does not.
+    //
+    // **No multipart body**, so a file upload is `serveStream` and the parsing is the program's.
+    //
+    // ## Two servers, and which one a program wants
+    //
+    // **`serve` reads each body whole**, so `req.body` is a string. That is the right shape for the
+    // requests a program written in slate actually gets, and it is bounded by `BodyBytes`.
+    //
+    // **`req.bytes` is beside it and is what actually arrived.** A body that is not UTF-8 -- a PNG,
+    // a zip, a binary part of a `multipart/form-data` upload -- decodes to nothing, so `body` is the
+    // empty string and `bytes` is exact. Both are there on every request `serve` answers, so a
+    // program reaching for one never has to ask which it got.
+    //
+    // **`serveStream` calls the handler as soon as the head is complete** and hands it the body as it
+    // arrives, so the memory a request costs stops depending on how big the request is. It is the same
+    // server otherwise: the same keep-alive rule, the same order, the same clock.
+    //
+    import { listen, onBytes, send, close as shutSocket, alpnProtocol, localPort,
+        remoteAddress } from slate:net
+    import { stat, readBytes } from slate:fs
+
+    // **HTTP/2's framing, which this module drives and does not implement.** `slate:nghttp2` is bytes
+    // in and bytes out and knows nothing of sockets; the socket stays here, exactly as llhttp's
+    // state machine leaves it here.
+#if feature_http2
+    import { h2Server, h2Receive, h2Send, h2Next, h2Respond, h2RespondStream, h2Push, h2Finish,
+        h2Consume, h2Goaway, h2Close } from slate:nghttp2
+#endif
+
+    // **The percent-coder and the `name=value` grammar are `slate:url`'s**, and the four names this
+    // module exports over them are forwarders in `http_parts_source.sysl`. They were written here and
+    // moved out because the JavaScript back end emits the whole of an imported module: a browser page
+    // importing `slate:http` to reach two of them grew by 239 KB, which is a file server and an
+    // HTTP/2 speaker downloaded to read a query string.
+    //
+    // **The aliases are what let the exports keep their names.** A definition may not take a name its
+    // own block has already declared, so importing `percentDecode` and exporting a `percentDecode`
+    // would be that collision.
+    import { percentDecode as urlDecode, encodeComponent as urlEncode, parseQuery as urlQuery,
+        parsePairs as urlPairs } from slate:url
+
+    // -- what a handler is given and what it may answer -------------------------------------------------
+
+    // The request. **`body` and `each` are the one difference between the two servers** and are
+    // therefore the optional fields: `serve` reads a body whole and puts it under `body` and `bytes`,
+    // and `serveStream` hands it over a chunk at a time through `each` and has neither. A field
+    // holding the empty string would say the upload was empty, which is a different thing.
+    //
+    // **`bytes` travels with `body` and never without it**, the two being one body read two ways.
+    //
+    // **`address` is optional for a different reason: a request a PROGRAM built has no socket.** Every
+    // request either server delivers carries one -- `null` where the socket cannot say -- and a test
+    // driving a handler directly builds a request out of nothing, so requiring it would refuse a
+    // perfectly good `Request` that never came off a wire.
+    //
+    // Everything else is always there. `params` and `cookies` are `{}` rather than absent for the
+    // same reason: a field that is there only sometimes is one every handler has to test for, and
+    // `undefined` may not be passed anywhere in slate.
+    export type Request = { method: string, path: string, search: string, headers: object, query: object, cookies: object, params: object, keepAlive: boolean, upgrade: boolean, address?: string | null, body?: string, bytes?: bytes, each?: function, next?: function }
+
+    // What a handler may answer as an object. **Every part is optional** -- a handler that says only
+    // `{ status: 204 }` is saying everything it meant to. A handler may also answer a string, a byte
+    // array, or anything at all, which is why this describes one of the shapes rather than all of
+    // them.
+    export type Response = { status?: integer, headers?: object, body?: any }
+
+    // A router. **Every member is a function**, which is the whole of what `serve` needs to know: it
+    // asks an object for its `handle` and calls that.
+    export type Router = { get: function, post: function, put: function, patch: function, delete: function, head: function, options: function, any: function, notFound: function, handle: function }
+
+    // Every connection each server has accepted and has not finished with, so that closing a server
+    // can close them.
+    //
+    // **Keyed by the server's PORT, because that is what `close` has in its hand.** A listening socket
+    // is not an object key, and no two servers in one program can be listening on one port -- so the
+    // port names the table exactly.
+    var connsOf = {}
+
+    var nextConn = 0
+
+    // What an adopting server is filed under, which is a counter rather than a port because it has
+    // none.
+    var nextAdopted = 0
+
+    // Take a connection into a server's table. The key is made by the caller, since the slot it puts
+    // in the table has to be able to take itself back out.
+    enrol(portKey: string, key: string, slot: object)
+        var table = if has(connsOf, portKey) then connsOf[portKey] else {}
+
+        table[key] = slot
+        connsOf[portKey] = table
+
+    retire(portKey: string, key: string)
+        if has(connsOf, portKey) then connsOf[portKey] = forgotten(connsOf[portKey], key)
+
+    // `close(server)` -- and with it the program's last reason to stay alive.
+    //
+    // **A server is a socket, so this is the network's `close` under another name.** It is exported here
+    // so that a program serving HTTP needs one import rather than two, and so that a later server that
+    // is more than a socket can change what closing means without changing what programs write.
+    //
+    // **CLOSING A SERVER CLOSES THE CONNECTIONS IT ACCEPTED, WHICH IS THE WHOLE OF WHY THIS IS NOT ONE
+    // LINE ANY MORE.** Closing the listening socket stops new connections arriving and does nothing at
+    // all to the ones already here, and a connection is a handle the loop waits on -- so a program that
+    // had closed everything it owned still could not exit, and waited on a connection whose client had
+    // gone and which nothing was ever going to read again. That is not a rare shape: it is what every
+    // server does at shutdown.
+    //
+    // **An IDLE connection is closed at once and one with a request in flight finishes that response
+    // and is then closed**, which is node's rule since v19 and is the one a shutdown needs: a client
+    // mid-request is answered rather than cut off, and nothing is kept alive for a request that has not
+    // arrived. There is no keep-alive after `close`, so a second request on a connection that was busy
+    // is not served -- the connection ends with the response it was writing.
+    export close(server)
+        // **The port is read BEFORE the socket is closed**, a closed socket having no address -- and
+        // closing a server twice has to stay the no-op that closing a socket twice is.
+        var portKey = null
+
+        try
+            portKey = string(localPort(server))
+        catch gone
+            portKey = null
+
+        shutSocket(server)
+
+        if portKey == null then return
+
+        shutConns(portKey)
+
+    // Close every connection filed under a key, which is the half of `close` an adopting server has
+    // as well -- it has no listening socket to shut, and everything else about closing is the same.
+    shutConns(portKey)
+        if !has(connsOf, portKey) then return
+
+        val live = connsOf[portKey]
+
+        connsOf = forgotten(connsOf, portKey)
+
+        for [k, slot] in entries(live)
+            slot.finish()
+
+    // `serve(port, handler)` -- listen, and call `handler` with each request.
+    //
+    // The answer is the listening socket, which is what a program closes -- and closing it is the only
+    // way a program with a server in it ever exits.
+    export serve(port, handler, onUpgrade = null) = server(port, handler, false, onUpgrade)
+
+    // `serveStream(port, handler)` -- the same server, calling `handler` as soon as a request's head is
+    // complete and handing it the body as it arrives.
+    //
+    // A streamed request has no `body`. What it has instead is `each`:
+    //
+    //     serveStream(3000, async (req) ->
+    //         var total = 0
+    //
+    //         await req.each((chunk) -> total = total + chunk.length)
+    //
+    //         "that was " + string(total) + " bytes")
+    //
+    // **`each` answers a promise for the number of bytes the body turned out to be**, and it is not a
+    // generator: slate's generators are pulled and are synchronous, so a chunk that has not arrived
+    // cannot be pulled. The chunk it hands over is a byte array, which is what `slate:net` delivers and
+    // what `toBytes` and `fromBytes` convert.
+    //
+    // **Call `each` before the handler's first `await`.** Chunks arriving before it is called are held
+    // for it, so nothing is ever lost -- but a handler that holds them is a handler accumulating the
+    // body, which is the thing it asked not to do. One that never calls `each` at all accumulates the
+    // whole of it and is stopped by `BodyBytes`, exactly as `serve` is.
+    //
+    // **Two exports rather than one with an option, and that is settled.** `serve(port, handler,
+    // options = {})` is writable and would break nothing -- but the two differ by what the HANDLER IS
+    // GIVEN rather than by what the server was told: a streamed request has no `body`, and answers
+    // `each` instead. Under one name the shape of the function being written would be decided by a
+    // flag several lines above it, where the name being called says it outright.
+    export serveStream(port, handler, onUpgrade = null) = server(port, handler, true, onUpgrade)
+
+    // `adopt(handler)` -- the same server with no port, answering connections somebody else accepted.
+    //
+    // **This is what a worker in a cluster runs.** macOS refuses `reusePort`, so the portable way to
+    // spread one port over several processes is for a supervisor to accept every connection itself
+    // and hand each one to a worker over the channel it spawned that worker with -- and the worker
+    // then has a connection and no listener. Everything else about the server is unchanged: the same
+    // handler, the same keep-alive, the same upgrade, the same `h2`.
+    //
+    //     val app = adopt((req) -> "hello")
+    //
+    //     channel().onMessage((m, conn) ->
+    //         if conn != null then app.handle(conn))
+    //
+    // **`handle` and `close` rather than a socket**, because there is no socket: what `serve` answers
+    // is the listening handle a program closes, and this server never listened. `close()` here does
+    // what `close(server)` does to the half that is left -- it ends the connections this server
+    // accepted and is what lets a worker exit.
+    //
+    // **`heard()` answers a promise that settles once every connection handed over so far has had its
+    // first request put to the handler, or has ended without one.** It is what a worker being retired
+    // waits on before it runs the program's `onShutdown`: a connection the supervisor handed it a
+    // moment before the retirement has crossed the channel, but its request is still in the socket,
+    // and an application that marks itself as draining in `onShutdown` would otherwise answer that
+    // request as a server that is going away -- a request the client sent in good time, refused.
+    //
+    // **A NAME OF ITS OWN RATHER THAN AN OPTION ON `serve`.** `serve(handler, { adopt: true })` would
+    // make the first argument sometimes a port and sometimes a function, which is exactly the
+    // overload `serveStream` was split out to avoid; and `handle(conn, handler)` as a bare function
+    // would build a fresh server for every connection, losing the table that `close` needs and the
+    // keep-alive that makes a second request on one connection cheap. node draws the line in the same
+    // place: `http.createServer(handler)` is made once and `server.emit("connection", socket)` is
+    // what a cluster worker feeds it, one socket at a time.
+    export adopt(handler, onUpgrade = null) = server(null, handler, false, onUpgrade)
+
+    """
