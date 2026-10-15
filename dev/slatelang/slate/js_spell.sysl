@@ -56,6 +56,10 @@ struct Spelling
 
     // Which open block declared it, counted as `JsSpelling.blocks` counts them.
     block: usize
+
+    // Whether the outer binding it falls back to cannot be written -- a `val`, a `class`, a `data`
+    // type or a builtin -- so that a deferred write reaching it is refused as the machine refuses it.
+    fixed: bool
 end Spelling
 
 // What the emitter knows about spellings at the point being written.
@@ -78,11 +82,14 @@ struct JsSpelling
     // Every name the blocks open around this point bind, which is what an outer binding is.
     visible: Buf[string]
 
+    // For each name in `visible`, whether it cannot be written: the same length, and truncated with it.
+    fixed: Buf[bool]
+
     // The builtins, which are outer bindings everywhere; read once, when first wanted.
     builtins: Option[Buf[string]]
 end JsSpelling
 
-fresh_spelling() -> JsSpelling = JsSpelling(buf(), buf(), 0, 0, buf(), buf(), None)
+fresh_spelling() -> JsSpelling = JsSpelling(buf(), buf(), 0, 0, buf(), buf(), buf(), None)
 
 // The JavaScript name a local is written under at this point, for a binding or a write.
 //
@@ -128,6 +135,84 @@ private read_below(j: *Js, name: string, from: usize) -> string
 
     js_name(name)
 end read_below
+
+// A WRITE to a name, as the statement that makes it.
+//
+// **It differs from a plain assignment only for a guarded local written from a function**, which may
+// run before the declaration has: the write asks the sentinel as a read does, and falls back to
+// whatever the same write would have meant without this local -- itself possibly another guarded one
+// further out. The value is worked out FIRST, into a temporary, so that it is worked out once and
+// before the question is asked, as the machine orders them.
+//
+// Not `private`: `js_assign.sysl` and `js_expr.sysl` write through it.
+write_name(j: *Js, name: string, v: string)
+    if !writes_deferred(j, name)
+        line(j, s"${spelled(j, name)} = ${v};")
+        return
+
+    val held = fresh(j)
+
+    line(j, s"const ${held} = ${v};")
+    line(j, s"${write_below(j, name, j.spelling.entries.len(), held, false)};")
+end write_name
+
+// Whether a write of this name from here is one that asks the sentinel.
+private writes_deferred(j: *Js, name: string) -> bool
+    val es = j.spelling.entries
+    var k = es.len()
+
+    while k > 0
+        k -= 1
+
+        val e = es.at(k)
+
+        if e.name != name then continue
+
+        if e.guarded && j.spelling.depth > e.depth then return true
+
+        if e.live || j.spelling.depth > e.depth then return false
+
+    false
+end writes_deferred
+
+// `read_below` for a write. Where nothing local is left to fall back to, the outer binding is written
+// -- or, when it cannot be, refused with the machine's own sentence.
+private write_below(j: *Js, name: string, from: usize, held: string, fixed: bool) -> string
+    val es = j.spelling.entries
+    var k = from
+
+    while k > 0
+        k -= 1
+
+        val e = es.at(k)
+
+        if e.name != name then continue
+
+        if e.guarded && j.spelling.depth > e.depth
+            return s"(${e.js} === $$.unbound ? ${write_below(j, name, k, held, e.fixed)} : (${e.js} = ${held}))"
+
+        if e.live || j.spelling.depth > e.depth then return s"(${e.js} = ${held})"
+
+    if fixed then return s"$$.fault(${quoted_js(s"`${name}` is a `val`, so it is written once")})"
+
+    s"(${js_name(name)} = ${held})"
+end write_below
+
+// Whether the binding of this name that is visible around the block about to open cannot be written:
+// the nearest of the blocks open around it if one binds it, the builtins otherwise.
+private outer_fixed(j: *Js, name: string) -> bool
+    val seen = j.spelling.visible
+    var k = seen.len()
+
+    while k > 0
+        k -= 1
+
+        if seen.at(k) == name then return j.spelling.fixed.at(k)
+
+    if j.spelling.builtins.is_none() then j.spelling.builtins = Some(builtin_names())
+
+    holds(j.spelling.builtins.unwrap(), name)
+end outer_fixed
 
 // Whether the block being written declared this name at its head, so its declaration assigns.
 //
@@ -207,7 +292,7 @@ end spell_early
 
 private give_spelling(j: *Js, name: string, guarded: bool)
     j.tmp += 1
-    j.spelling.entries.push(Spelling(name, js_name(name) + "$" + s"${j.tmp}", j.spelling.depth, false, guarded, j.spelling.blocks))
+    j.spelling.entries.push(Spelling(name, js_name(name) + "$" + s"${j.tmp}", j.spelling.depth, false, guarded, j.spelling.blocks, guarded && outer_fixed(j, name)))
 
 // What the block being opened calls a name it has just spelled.
 private spelled_in_block(j: *Js, name: string) -> string
@@ -245,7 +330,7 @@ went_live(j: *Js, name: string)
         val e = j.spelling.entries.at(k)
 
         if e.name == name && e.depth == j.spelling.depth
-            if !e.live then j.spelling.entries.set(k, Spelling(e.name, e.js, e.depth, true, e.guarded, e.block))
+            if !e.live then j.spelling.entries.set(k, Spelling(e.name, e.js, e.depth, true, e.guarded, e.block, e.fixed))
 
             return
 end went_live

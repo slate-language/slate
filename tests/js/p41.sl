@@ -204,3 +204,83 @@ class Probe
 val abs = Probe(-3).measured() + 10
 
 print(abs)
+
+// -- a function written in the block that WRITES the name ----------------------------------------
+//
+// **A deferred write asks the same question a deferred read does**: until the local's declaration
+// has executed, the write is the OUTER variable's, and after it the local's. A write that took the
+// local's spelling unconditionally changed the local early and left the outer variable alone, which
+// is a silent wrong answer. The compound forms and `++` read and write the same binding.
+
+var tally = 1
+var total = 1
+var count = 1
+val fixed = 7
+
+writeBefore()
+    val bump = () ->
+        tally = tally + 10
+    bump()
+    var tally = 100
+    bump()
+    tally
+
+print(writeBefore(), tally)
+
+writeAfter()
+    var tally = 100
+    val bump = () ->
+        tally = tally + 10
+    bump()
+    tally
+
+print(writeAfter(), tally)
+
+writeCompound()
+    val bump = () ->
+        total += 5
+        total *= 2
+    bump()
+    var total = 100
+    bump()
+    total
+
+print(writeCompound(), total)
+
+writeStep()
+    val bump = () ->
+        count++
+        ++count
+    bump()
+    var count = 100
+    bump()
+    count
+
+print(writeStep(), count)
+
+// **The outer binding that cannot be written is refused, with the machine's sentence**, a `val` and a
+// builtin alike, at the first write and not after the declaration has run.
+
+writeToVal()
+    val poke = () ->
+        fixed = 9
+    try
+        poke()
+    catch e
+        print(e.message)
+    var fixed = 1
+    poke()
+    fixed
+
+writeToBuiltin()
+    val poke = () ->
+        floor = 9
+    try
+        poke()
+    catch e
+        print(e.message)
+    var floor = 1
+    poke()
+    floor
+
+print(writeToVal(), fixed, writeToBuiltin())
