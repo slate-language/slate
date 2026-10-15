@@ -1,8 +1,7 @@
 module dev.slatelang.slate
 
+import sh.sysl.kairos.uv.{ByteStream, Connection}
 import sh.sysl.libuv
-import sh.sysl.libuv.Handle
-import sh.sysl.libuv.Stream
 import sh.sysl.openssl
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
@@ -14,8 +13,14 @@ import sysl.text.{Search, from_utf8, str_builder}
 // separate. `http.sysl` is *blocking* and belongs to the package manager: `slate fetch` runs before
 // any program starts, with no loop turning and nothing to yield to, and a blocking read there is the
 // simple right answer. A program's `fetch` may not block for a second and a half in the middle of a
-// server answering requests, so this one is a state machine over libuv's resolver, libuv's sockets,
-// and OpenSSL driven as a byte-stream transformer.
+// server answering requests, so this one is a kairos task on the `uv` driver -- resolve, connect,
+// then read until the answer is whole -- with OpenSSL driven as a byte-stream transformer between
+// the connection and the answer.
+//
+// **A task carries an index and an EPOCH and nothing else.** A kairos task is a sysl frame the
+// collector cannot see through, so it holds no `Value`; and a slot is reused, and a redirect dials
+// again from the same slot, so a task that wakes after its dial was given up -- a read ended by the
+// `close` that finished or redirected the fetch -- finds the epoch moved and does nothing.
 //
 // **The parsing is shared and only the transport differs**: `parse_url`, `parse_response` and
 // `absolute` are `http.sysl`'s, so a header this understands and one the fetcher understands cannot
@@ -53,10 +58,10 @@ struct Fetch
     body: string
     extra: Buf[string]
 
-    // The connection. `id` is a slot in `event.sysl`'s table, as every other socket here is.
-    id: usize
-    gen: usize
-    connected: bool
+    // The connection, once one has been made, and which dial of this slot is the current one. The
+    // epoch only ever goes up, so a task of an earlier dial can tell it has been left behind.
+    conn: Option[&Connection]
+    epoch: usize
 
     // The TLS stream, for an `https` request and nothing else.
     tls: Option[&openssl.Stream]
@@ -76,8 +81,15 @@ struct Fetch
 
 // The table is now `current().fetches` -- see `vm_state.sysl`.
 
-reset_fetches()
-    current().fetches = buf()
+// Give every fetch back between runs. **Each connection is CLOSED and the slot is kept**: a read
+// parked on a connection holds the loop open, so one left behind by a program stopped by a fault would
+// be a wait in whichever program ran next -- `reset_events`' reason -- and keeping the slot keeps its
+// epoch, so the task that wakes from that close knows it was left behind.
+//
+// Not `private`: `event.sysl`'s `reset_events` calls it.
+forget_fetches()
+    for i in 0..<current().fetches.len()
+        if current().fetches.at(i).live then finish_fetch(i)
 
 // `fetch(url)` and `fetch(url, options)` -- a promise of what the server said.
 //
@@ -104,12 +116,15 @@ end do_fetch
 
 private claim_fetch(request: usize, at: Span, method: string, body: string, extra: Buf[string],
                     trust: string) -> usize
-    val f = Fetch(true, request, at, "", "", 80, "/", false, method, body, extra, 0, 0, false, None,
+    var f = Fetch(true, request, at, "", "", 80, "/", false, method, body, extra, None, 0, None,
                   trust,
                   false, buf(), 0)
 
+    // A reused slot carries its epoch on, so that a task of the fetch that had it last still finds
+    // the number moved.
     for i in 0..<current().fetches.len()
         if !current().fetches.at(i).live
+            f.epoch = current().fetches.at(i).epoch
             current().fetches.set(i, f)
             return i
 
@@ -140,76 +155,92 @@ private start_fetch(fi: usize, url: string)
             f.port = u.port
             f.target = u.path
             f.secure = u.secure
-            f.connected = false
+            f.conn = None
+            f.epoch += 1
             f.ready = false
             f.tls = None
             f.got = buf()
             current().fetches.set(fi, f)
 
+    loop_events().spawn(dialled(fi, current().fetches.at(fi).epoch))
+
+// One dial of a fetch, from the name to the end of the answer: resolve, connect, send, then read
+// until the connection ends or the answer is whole. **Each step ends in the call its libuv callback
+// used to make**, so the decisions -- what failed, what was answered, where a redirect goes -- are
+// the same functions they were.
+private async dialled(fi: usize, epoch: usize)
     val host = current().fetches.at(fi).host
+    val port = current().fetches.at(fi).port
 
     // **A HOST THAT IS ALREADY AN ADDRESS SKIPS THE RESOLVER**, which `net.sysl` says at length and
     // for the same reason: `getaddrinfo` is a call onto a system service whose latency nothing here
     // bounds, and `http://127.0.0.1:8080/` was never a question for it to answer.
-    libuv.ip(host, current().fetches.at(fi).port) match
-        Ok(written) ->
-            fetch_dial(fi, written)
+    val address = libuv.ip(host, port) match
+        Ok(written) -> written
+        Err(_) ->
+            // **The port is asked for as the SERVICE**, which is what puts it in the address the
+            // resolver answers with -- there is no way to set one on an `Address` after the fact.
+            val found = (await current().io.resolve(host, s"${port}")) match
+                Err(e) ->
+                    if owns(fi, epoch) then fetch_failed(fi, s"cannot find ${host}: ${e}")
+                    return
+                Ok(answers) -> answers
+
+            if !owns(fi, epoch) then return
+
+            // **The first answer is taken and the rest are not tried**, which is what a browser does
+            // not do -- it walks the list on a refused connection. A retry loop is the next thing to
+            // add here and would change nothing else.
+            if found.len == 0
+                fetch_failed(fi, s"there is no address for ${host}")
+                return
+
+            found[0].address
+
+    val conn = (await current().io.connect(address)) match
+        Err(e) ->
+            if owns(fi, epoch) then fetch_failed(fi, s"cannot connect to ${host}: ${e}")
             return
-        Err(_) -> ()
+        Ok(c) -> c
 
-    // **The port is asked for as the SERVICE**, which is what puts it in the address libuv answers
-    // with -- there is no way to set one on an `Address` after the fact, and this is how the C
-    // interface expects to be told anyway.
-    libuv.resolve(host, s"${current().fetches.at(fi).port}", (r) ->
-        r match
-            Ok(found) -> fetch_resolved(fi, found)
-            Err(e) -> fetch_failed(fi, s"cannot find ${host}: ${e}")) match
-        Err(e) -> fetch_failed(fi, s"cannot find ${host}: ${e}")
-        Ok(_) -> ()
-
-// The name resolved. **The first answer is taken and the rest are not tried**, which is what a
-// browser does not do -- it walks the list on a refused connection. A retry loop is the next thing to
-// add here and would change nothing else.
-private fetch_resolved(fi: usize, found: []libuv.AddrInfo)
-    if !fetch_live(fi) then return
-
-    if found.len == 0
-        fetch_failed(fi, s"there is no address for ${current().fetches.at(fi).host}")
+    if !owns(fi, epoch)
+        conn.close()
         return
 
-    fetch_dial(fi, found[0].address)
-
-// There is an address, however it was arrived at. **Everything from the socket onwards is the same
-// whether a name was looked up or an address was written out**, which is what lets a literal skip the
-// resolver without a second copy of any of it.
-private fetch_dial(fi: usize, address: libuv.Address)
-    val sock = libuv.tcp(event_loop()) match
-        Err(e) ->
-            fetch_failed(fi, s"this socket could not be made: ${e}")
-            return
-        Ok(t) -> t
-
     var f = current().fetches.at(fi)
-    val (id, gen) = socket_slot(hold_socket(sock, Value.Null))
 
-    f.id = id
-    f.gen = gen
+    f.conn = Some(conn)
     current().fetches.set(fi, f)
+    fetch_connected(fi)
 
-    sock.connect(address, (r) ->
-        r match
-            Ok(_) -> fetch_connected(fi)
-            Err(e) -> fetch_failed(fi, s"cannot connect to ${current().fetches.at(fi).host}: ${e}")) match
-        Err(e) -> fetch_failed(fi, s"cannot connect to ${current().fetches.at(fi).host}: ${e}")
-        Ok(_) -> ()
+    // **The end of the socket is the end of the answer**, since this asks for `Connection: close` --
+    // so what has arrived is what there is, and it is parsed rather than complained about.
+    loop
+        if !owns(fi, epoch) then return
+
+        val got = (await conn.read()) match
+            Err(e) ->
+                if owns(fi, epoch) then fetch_failed(fi, s"this connection failed: ${e}")
+                return
+            Ok(bytes) -> bytes
+
+        if !owns(fi, epoch) then return
+
+        if got.len == 0
+            fetch_ended(fi)
+            return
+
+        fetch_read(fi, got)
+end dialled
+
+// Whether the dial a task belongs to is still the fetch's current one.
+private owns(fi: usize, epoch: usize) -> bool = fetch_live(fi) && current().fetches.at(fi).epoch == epoch
 
 // The socket is up. A plain request goes now; a secure one starts a handshake and goes when it ends.
 private fetch_connected(fi: usize)
     if !fetch_live(fi) then return
 
     var f = current().fetches.at(fi)
-
-    f.connected = true
 
     if f.secure
         openssl.client() match
@@ -238,22 +269,7 @@ private fetch_connected(fi: usize)
 
     current().fetches.set(fi, f)
 
-    socket_at(f.id, f.gen) match
-        None -> fetch_failed(fi, "this connection was closed")
-        Some(sock) ->
-            sock.read_start((r) ->
-                r match
-                    Data(bytes) -> fetch_read(fi, bytes)
-
-                    // **The end of the socket is the end of the answer**, since this asks for
-                    // `Connection: close` -- so what has arrived is what there is, and it is parsed
-                    // rather than complained about.
-                    End -> fetch_ended(fi)
-                    Failed(e) -> fetch_failed(fi, s"this connection failed: ${e}")) match
-                Err(e) -> fetch_failed(fi, s"cannot read the answer: ${e}")
-                Ok(_) -> ()
-
-            if f.secure then step_handshake(fi) else send_request(fi)
+    if f.secure then step_handshake(fi) else send_request(fi)
 
 // One turn of the handshake: **ask, then drain**. See the header.
 private step_handshake(fi: usize)
@@ -328,19 +344,21 @@ private send_request(fi: usize)
                 Err(e) -> fetch_failed(fi, s"the request could not be encrypted: ${e}")
                 Ok(_) -> push_tls(fi, stream)
 
-// Bytes onto the wire, whatever they are.
+// Bytes onto the wire, whatever they are. **The write is issued at the call**, so a handshake
+// record, the request and its body leave in the order they were written whenever their tasks are
+// stepped; the task spawned beside it only hears how the write ended.
 private write_wire(fi: usize, bytes: []const u8)
     val f = current().fetches.at(fi)
 
-    socket_at(f.id, f.gen) match
+    f.conn match
         None -> ()
-        Some(sock) ->
-            sock.write(bytes, (r) ->
-                r match
-                    Ok(_) -> ()
-                    Err(e) -> fetch_failed(fi, s"the request could not be sent: ${e}")) match
-                Err(e) -> fetch_failed(fi, s"the request could not be sent: ${e}")
-                Ok(_) -> ()
+        Some(c) -> loop_events().spawn(sent(fi, f.epoch, c.write(bytes)))
+
+// How one write ended. A write the fetch's own `close` cut short belongs to a dial that is over.
+private async sent(fi: usize, epoch: usize, t: Task[Result[unit, libuv.Error]])
+    (await t) match
+        Ok(_) -> ()
+        Err(e) -> if owns(fi, epoch) then fetch_failed(fi, s"the request could not be sent: ${e}")
 
 // Bytes off the wire. **Plaintext goes straight into the answer and ciphertext goes through
 // OpenSSL**, which is the only place in this file that knows which kind of connection it is on.
@@ -525,12 +543,16 @@ private fetch_live(fi: usize) -> bool
 private close_fetch_socket(fi: usize)
     var f = current().fetches.at(fi)
 
-    if f.connected || f.id != 0
-        surrender(f.id)
+    // **`close` is immediate**, which is right here: the request has gone and the answer is in, or
+    // the fetch failed, or a redirect is about to dial somewhere else. A read still parked on it ends
+    // with `ECANCELED` and finds the epoch moved.
+    f.conn match
+        Some(c) -> c.close()
+        None -> ()
 
-    f.connected = false
+    f.conn = None
+    f.epoch += 1
     f.tls = None
-    f.id = 0
     current().fetches.set(fi, f)
 
 private finish_fetch(fi: usize)
