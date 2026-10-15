@@ -1,6 +1,10 @@
 module dev.slatelang.slate
 @tests
 
+import sh.sysl.libuv
+import sh.sysl.monocypher
+import sh.sysl.parsing.*
+import sysl.buf.buf_with_capacity
 import sysl.text.Search
 
 // `slate:crypto`'s Argon2id -- the one hash in that module meant to be slow.
@@ -209,3 +213,59 @@ A_SERVER_ANSWERS_SOMEBODY_ELSE_WHILE_IT_IS_HASHING()
 
     assert_eq(ticking_out(body), "true")
 end A_SERVER_ANSWERS_SOMEBODY_ELSE_WHILE_IT_IS_HASHING
+
+@test
+TWO_HASHES_IN_FLIGHT_AT_ONCE_EACH_ANSWER_THEIR_OWN_PROMISE()
+    // **Both derivations are on the pool before either is awaited**, and the second is awaited
+    // first. Each task answers by its own request, so a record verifies against its own password
+    // and not the other's, whichever order the pool finished them in.
+    val text = "val first = argon2(\"one\")\nval second = argon2(\"two\")\nval two = await second\nval one = await first\nprint(await argon2Verify(one, \"one\"), await argon2Verify(two, \"two\"))\nprint(await argon2Verify(one, \"two\"), one == two)\n"
+
+    assert_eq(pw_out(text), "true true\nfalse false")
+
+@test
+A_HASH_NOBODY_AWAITS_STILL_KEEPS_THE_PROGRAM_RUNNING_UNTIL_IT_IS_DONE()
+    // **The program's own statements are over before the pool answers**, and nothing at the top
+    // level waits: what prints the record is a coroutine resumed after the derivation, so its line
+    // appearing at all is the request keeping the loop turning until the job settled.
+    val text = Argon2Import + "async later()\n    val stored = await argon2(\"x\")\n    print(\"hashed\", await argon2Verify(stored, \"x\"))\nlater()\nprint(\"started\")\n"
+
+    assert_eq(out(text), "started\nhashed true")
+
+@test
+A_JOB_THE_POOL_REFUSES_REJECTS_ITS_PROMISE_WITH_THE_SENTENCE_IT_ALWAYS_HAD()
+    // **The pool refuses only a job that was cancelled, which nothing a program does can arrange**,
+    // so the refusal is handed to the completion directly. What a program would see is a rejection
+    // naming the builtin and libuv's own words, and the success half never runs.
+    out("")
+
+    var answered = false
+    val job: &Argon2Job = Argon2Job([0; 256], 0, [0; 32], 0, monocypher.interactive(), buf_with_capacity(0, u8(0)), [0; 64], 0, [0; 64])
+    val id = begin_request()
+    val pr = current().pending.at(id).promise
+
+    keep_job(id, job)
+    pool_answered(id, point(0), "argon2", job, Err(libuv.Error(libuv.ECANCELED)), (_, _) -> answered = true)
+
+    assert(pr.settled && pr.failed)
+    assert(pr.message.contains("`argon2` could not be run on the thread pool: ECANCELED"))
+    assert(!answered)
+    assert(!still_kept(id, job))
+
+    reset_events()
+end A_JOB_THE_POOL_REFUSES_REJECTS_ITS_PROMISE_WITH_THE_SENTENCE_IT_ALWAYS_HAD
+
+@test
+A_PROGRAM_THAT_EXITS_WHILE_A_HASH_RUNS_LEAVES_THE_NEXT_PROGRAM_ITS_OWN_ANSWERS()
+    // **The abandoned derivation is still on the pool when the next program starts**, and that
+    // program's first request takes the same id. The old job's answer has to land nowhere: the
+    // table it was kept in was given back, so the later hash is answered by its own job alone.
+    //
+    // **The later hash is made twice as long**, so the abandoned one finishes while the later one
+    // still holds the id. Answered by the id alone, the later promise would settle with an
+    // unfinished job's record and the verify would answer `false`.
+    val gone = out(Argon2Import + "import { exit } from slate:process\nargon2(\"abandoned\", { memoryCost: 65536, timeCost: 12 })\nprint(\"leaving\")\nexit(0)\n")
+
+    assert_eq(gone, "leaving")
+    assert_eq(pw_out("val stored = await argon2(\"kept\", { memoryCost: 65536, timeCost: 24 })\nprint(await argon2Verify(stored, \"kept\"))\n"), "true")
+end A_PROGRAM_THAT_EXITS_WHILE_A_HASH_RUNS_LEAVES_THE_NEXT_PROGRAM_ITS_OWN_ANSWERS
