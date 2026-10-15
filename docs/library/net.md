@@ -119,6 +119,12 @@ Left out, `reusePort` is `false`, which is a port belonging to one listener — 
 the one every program already written keeps. `reusePort` is `true` or `false` and nothing else;
 anything else is refused by name, the way every other option here is.
 
+**`listen(socket, fn)` accepts on a listening socket another program passed over a channel** — the
+other way for a supervisor to share a port, handing each worker the listener rather than each
+connection (`slate:process` has the channel). The socket arrives already bound and listening, so there
+is no port to choose and nothing to secure; `localPort` answers the port it is on, `close` stops this
+program accepting on it, and a socket that is not a passed listener is refused.
+
 ## Lifetime
 
 **A socket keeps the program alive, exactly as a timer does**, so `close` is not optional; a program that

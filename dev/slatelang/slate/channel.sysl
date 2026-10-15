@@ -2,9 +2,8 @@ module dev.slatelang.slate
 
 import sh.sysl.gc
 import sh.sysl.json
+import sh.sysl.kairos.uv.{ByteStream, PassConnection, PassListener, Passed, PassedPipe, PassedSocket, Passing, Pipe}
 import sh.sysl.libuv
-import sh.sysl.libuv.Handle
-import sh.sysl.libuv.Stream
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.env
@@ -46,7 +45,7 @@ import sysl.text.from_utf8
 // and nothing that hands the slot back, so unlike a child it needs no generation.
 struct Channel
     live: bool
-    pipe: Option[&libuv.Pipe]
+    pipe: Option[&Pipe]
     open: bool
     inbox: Buf[u8]
 
@@ -115,7 +114,7 @@ forget_channels()
 
         if ch.live
             ch.pipe match
-                Some(p) -> p.close(() -> ())
+                Some(p) -> p.close()
                 None -> ()
 
         ch.live = false
@@ -144,54 +143,52 @@ mark_channels(h: *gc.Heap)
 // here for a better reason: a channel fails when the peer goes, and the peer going is the ordinary
 // end of a conversation rather than a defect in either program.
 // Not `private`: `spawn.sysl` reads a child's end of the channel with this one.
-read_channel(p: &libuv.Pipe, on_bytes: &Fn([]const u8) -> unit,
-                     on_socket: &Fn(Value) -> unit, on_end: &Fn() -> unit)
-    p.read_start((r) ->
-        r match
-            Data(bytes) ->
-                // **The handles come out before the bytes go in**, and there is no other place they
-                // could: a pending handle is there for the length of this callback and is gone by
-                // the next turn of the loop. Queuing it here and pairing it with a message below is
-                // what makes `onMessage(value, socket)` the same call on both back ends.
-                take_pending(p, on_socket)
-                on_bytes(bytes)
-            End ->
-                p.close(() -> ())
-                on_end()
-            Failed(_) ->
-                p.close(() -> ())
-                on_end()) match
-        Err(_) ->
-            p.close(() -> ())
-            on_end()
-        Ok(_) -> ()
+read_channel(p: &Pipe, on_bytes: &Fn([]const u8) -> unit, on_socket: &Fn(Value) -> unit,
+             on_end: &Fn() -> unit)
+    loop_events().spawn(channel_reads(p, run_stamp(), on_bytes, on_socket, on_end))
 
-// Take every handle waiting on a channel, as a socket the program can use.
+// The task `read_channel` spawns: one read at a time, each with the handles that came with it.
 //
-// **Only ever called from inside the read callback**, which is the only place `pending_count` is
-// anything but zero. A handle that is not a socket stops the program: nothing sends one, so it is a
-// defect somewhere rather than news about the world, and quietly closing it would leave a supervisor
-// waiting for a worker that was never given the connection.
-private take_pending(p: &libuv.Pipe, on_socket: &Fn(Value) -> unit)
-    while p.pending_count() > 0
-        if p.pending_type() != libuv.HANDLE_TCP
-            current().loop_fault = Some(failure(point(0), "something that is not a socket arrived on the channel"))
+// **The handles come out before the bytes go in**, and there is no other place they could: a pending
+// handle is there for the length of libuv's read callback, which is where kairos takes it, and is
+// handed over beside the bytes it arrived with. Queuing it here and pairing it with a message below
+// is what makes `onMessage(value, socket)` the same call on both back ends.
+//
+// **A handle that is not a socket stops the program**: nothing sends one, so it is a defect somewhere
+// rather than news about the world, and quietly closing it would leave a supervisor waiting for a
+// worker that was never given the connection.
+//
+// **A reset gives the channel back by closing it**, and the read that ends with is the next
+// program's to ignore -- the stamp has moved, and the slot numbers it would report against are
+// someone else's by then.
+private async channel_reads(p: &Pipe, stamp: usize, on_bytes: &Fn([]const u8) -> unit,
+                            on_socket: &Fn(Value) -> unit, on_end: &Fn() -> unit)
+    loop
+        val got = await p.read_handles()
+
+        if !same_run(stamp) then return
+
+        val m = got match
+            Err(_) ->
+                p.close()
+                on_end()
+                return
+            Ok(it) -> it
+
+        for h in m.handles
+            h match
+                PassedSocket(s) -> on_socket(hold_socket(Unclaimed(s), Null))
+                PassedPipe(q) ->
+                    q.close()
+                    current().loop_fault = Some(failure(point(0), "something that is not a socket arrived on the channel"))
+
+        if m.bytes.len == 0
+            p.close()
+            on_end()
             return
 
-        val taken = libuv.tcp(event_loop()) match
-            Err(e) ->
-                current().loop_fault = Some(failure(point(0), s"a socket arriving on the channel could not be taken: ${e}"))
-                return
-            Ok(t) -> t
-
-        p.accept_pending(taken) match
-            Err(e) ->
-                taken.close(() -> ())
-                current().loop_fault = Some(failure(point(0), s"a socket arriving on the channel could not be taken: ${e}"))
-                return
-            Ok(_) -> ()
-
-        on_socket(hold_socket(taken, Null))
+        on_bytes(m.bytes)
+end channel_reads
 
 // A socket that arrived with nothing to carry it, which nothing this program can go on doing.
 //
@@ -264,15 +261,9 @@ do_channel(args: Args, at: Span) -> Step
         None -> return fault(at, s"`${ChannelVariable}` names the channel's descriptor and holds `${named}`, which is not one")
 
     // **An ipc pipe, for `start_child`'s reason**: this is the end a socket arrives on.
-    val p = libuv.pipe(true, event_loop()) match
+    val p = current().io.channel(i32(fd)) match
         Err(e) -> return fault(at, s"the channel on descriptor ${fd} could not be opened: ${e}")
         Ok(p) -> p
-
-    p.open(fd) match
-        Err(e) ->
-            p.close(() -> ())
-            return fault(at, s"the channel on descriptor ${fd} could not be opened: ${e}")
-        Ok(_) -> ()
 
     // **The slot is claimed so that the loop has work**, which is what keeps a worker running
     // between one message and the next. `repeating` is true for `hold_socket`'s reason: nothing
@@ -301,9 +292,9 @@ do_channel(args: Args, at: Span) -> Step
 
     for i in 0..<greeting.bytes.len do hello.push(greeting.bytes[i])
 
-    p.write(hello.view()) match
-        Err(_) -> ()
-        Ok(_) -> ()
+    // Issued here and left to go: a parent that has already gone is the channel ending, which the
+    // reader says, and nothing waits on the answer.
+    p.write(hello.view())
 
     Ok(ChannelVal(id))
 end do_channel
@@ -546,15 +537,17 @@ framed(v: Value, at: Span) -> Result[Buf[u8], Signal]
 // supervisor nobody would write. What faults is a value that is not a message at all -- that is a
 // defect in the program rather than news about the world, and it is `toJSON`'s own split.
 // Not `private`: `child.send` writes through it.
-write_message(p: Option[&libuv.Pipe], open: bool, bytes: Buf[u8], why: string) -> Step
+//
+// **The write is issued here and its end is not waited for**, as libuv's was: a peer that has gone
+// is the channel ending, which the reader hears and `channel_open` then says.
+write_message(p: Option[&Pipe], open: bool, bytes: Buf[u8], why: string) -> Step
     if !open then return Ok(err_value(why))
 
     p match
         None -> Ok(err_value(why))
         Some(pipe) ->
-            pipe.write(bytes.view()) match
-                Err(e) -> Ok(err_value(s"this message could not be sent: ${e}"))
-                Ok(_) -> Ok(ok_value(Null))
+            pipe.write(bytes.view())
+            Ok(ok_value(Null))
 
 // Why a socket may not be passed to a peer, and `None` where it may.
 //
@@ -581,13 +574,16 @@ private handles_refused(peer: string, is_child: bool) -> Option[string]
 
 // Write one message with a socket attached, and give this program's own copy of it up.
 //
-// **The copy is given up in the write callback and not before**, because the descriptor is
+// **The copy is given up once the write has ended and not before**, because the descriptor is
 // duplicated when libuv reaches the `sendmsg` rather than when the write is queued -- closing it any
 // earlier sends the peer a socket that is already gone. It IS given up, though, and that is node's
 // rule too: what crossed is a duplicate, so leaving both open would have two programs reading one
 // connection and each seeing half of it.
+//
+// **A listener crosses as a listener and anything else as a connection**: a socket that arrived over
+// a channel and was never used is passed on as it came, a duplicate of whatever it was.
 // Not `private`: `child.send(value, socket)` writes through it.
-write_with_socket(p: Option[&libuv.Pipe], open: bool, bytes: Buf[u8], sock: Value,
+write_with_socket(p: Option[&Pipe], open: bool, bytes: Buf[u8], sock: Value,
                           peer: string, is_child: bool, at: Span, why: string) -> Step
     val (id, gen) = sock match
         Socket(i, g) -> (usize(i), usize(g))
@@ -597,25 +593,33 @@ write_with_socket(p: Option[&libuv.Pipe], open: bool, bytes: Buf[u8], sock: Valu
         Some(sentence) -> return fault(at, sentence)
         None -> ()
 
-    val handle = socket_at(id, gen) match
+    val s = socket_at(id, gen) match
         None -> return fault(at, "this socket is closed, and `send` needs an open one to pass on")
         Some(h) -> h
 
     if !open then return Ok(err_value(why))
 
+    val passing: Passing = s.handle match
+        Listening(l) -> PassListener(l)
+        _ -> connection_at(id, gen) match
+            Some(c) -> PassConnection(c)
+            None -> return fault(at, "this socket is closed, and `send` needs an open one to pass on")
+
     p match
         None -> Ok(err_value(why))
         Some(pipe) ->
-            pipe.write_handle(bytes.view(), handle, (r) ->
-                r match
-                    Err(_) -> ()
-                    Ok(_) -> ()
+            loop_events().spawn(passed_on(id, gen, run_stamp(), pipe.write_handle(bytes.view(), passing)))
+            Ok(ok_value(Null))
 
-                close_socket(sock, point(0)) match
-                    Err(_) -> ()
-                    Ok(_) -> ()) match
-                Err(e) -> Ok(err_value(s"this message could not be sent: ${e}"))
-                Ok(_) -> Ok(ok_value(Null))
+// The write carrying a socket has ended, however it ended, so this program's copy goes.
+private async passed_on(id: usize, gen: usize, stamp: usize, t: Task[Result[unit, libuv.Error]])
+    await t
+
+    if !same_run(stamp) then return
+
+    close_socket(Socket(u32(id), u32(gen)), point(0)) match
+        Err(_) -> ()
+        Ok(_) -> ()
 
 // The channel a builtin was handed.
 private channel_of(v: Value, at: Span, name: string) -> Result[usize, Signal]

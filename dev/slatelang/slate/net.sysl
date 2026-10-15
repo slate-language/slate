@@ -1,8 +1,8 @@
 module dev.slatelang.slate
 
+import sh.sysl.kairos.uv
+import sh.sysl.kairos.uv.{ByteStream, Connection, Listener}
 import sh.sysl.libuv
-import sh.sysl.libuv.Handle
-import sh.sysl.libuv.Stream
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.text.{from_utf8, from_utf8_unchecked}
@@ -25,20 +25,105 @@ import sysl.text.{from_utf8, from_utf8_unchecked}
 // counted in `outstanding`, so a program that starts a server and reaches the end of its last
 // statement does not exit. node's rule, and the reason `close` is not optional.
 //
+// ## kairos tasks, one per thing that waits
+//
+// **A socket is a kairos `Connection` or `Listener` on the `uv` driver**, and every wait is a task:
+// a listener's accept loop, a connection's reader once `onData` is called, a dial, and a small one
+// per write that only hears how the write ended. Each ends in the call its libuv callback used to
+// make, so every decision -- what a chunk is, what a failure tells the program, when a handshake has
+// finished -- is the same code it was. **A write is issued at the call** (kairos's rule), so
+// `send(a); send(b); close(c)` in one turn still puts a and b on the wire in that order.
+//
+// **A task carries the slot, its generation and the run's stamp, and nothing else.** It is a sysl
+// frame the collector cannot see through, so it holds no `Value`; it does nothing once its slot no
+// longer `holds` that generation -- the program closed the socket -- or once the stamp has moved,
+// which is a reset having given the whole table back under it (`Vm.resets`).
+//
 // ## What a callback may capture, which is the rule `event.sysl` and `fs.sysl` also keep
 //
 // **A `usize` and a `Span`.** The collector cannot see through an ARC box, so a sysl closure holding
 // a `Value` would hold it where the mark phase cannot find it. An id indexes the table this program
 // roots; a `Span` is two integers. The slate closure a program passed lives in the slot.
 
+// What a socket's slot holds.
+//
+// **`Dialling` is a slot claimed before there is a connection**, where `connect` used to make its
+// socket: the generation a program is shown is the order slots were claimed in, so a connection is
+// claimed where it always was and filled in when the dial answers. **`Unclaimed` is a socket that
+// arrived over a channel**, which libuv cannot say was listening or connected -- so it is taken as
+// whichever the program first uses it as: read from, written to or asked its address, a connection;
+// handed to `listen`, a listener.
+enum SockHandle
+    Dialling
+    Connected(c: &Connection)
+    Listening(l: &Listener)
+    Unclaimed(s: &uv.Socket)
+
+// One socket, as `event.sysl`'s table holds it.
+//
+// Not `private`: `Pending.socket` names it.
+struct Sock
+    handle: SockHandle
+
+    // Whether a task is reading it. `onData` starts one, and a second `onData` only replaces the
+    // function the first one calls.
+    reading: bool
+
+    // What the reader hands over: text for `onData`, a buffer for `onBytes`. Read at each chunk, so
+    // the second call decides from the next chunk on.
+    as_text: bool
+end Sock
+
+// Close whatever a slot's socket holds. **Immediate**, as libuv's own close always was: a write the
+// kernel has not taken yet is dropped, and a task waiting on the socket ends with `ECANCELED`.
+//
+// Not `private`: `surrender` in `event.sysl` closes a socket's slot with it.
+close_sock(s: &Sock)
+    s.handle match
+        Dialling -> ()
+        Connected(c) -> c.close()
+        Listening(l) -> l.close()
+        Unclaimed(u) -> u.close()
+
+// What a leaked socket was, for the sentence `leaked_since` reports.
+//
+// Not `private`: `leak_description` in `event.sysl` asks it.
+sock_description(s: &Sock) -> string = s.handle match
+    Connected(c) -> c.local() match
+        Ok(a) -> s"a TCP connection on :${a.port()}"
+        Err(_) -> "a socket"
+    Listening(l) -> l.port() match
+        Ok(p) -> s"a TCP server on :${p}"
+        Err(_) -> "a socket"
+    _ -> "a socket"
+
 // The socket in a slot, or nothing where the id names no live socket.
 //
-// Not `private`: `builtin.sysl` checks an argument is a socket before doing anything with it.
-socket_at(id: usize, gen: usize) -> Option[&libuv.Tcp]
+// Not `private`: `channel.sysl` passes one on.
+socket_at(id: usize, gen: usize) -> Option[&Sock]
     if !holds(id, gen) then return None
 
     current().pending.at(id).socket
 end socket_at
+
+// The connection in a slot. **A socket that arrived over a channel is taken as one here**, which is
+// how it is used nearly always -- a supervisor hands its workers the connections it accepted.
+//
+// Not `private`: `channel.sysl` passes a connection on.
+connection_at(id: usize, gen: usize) -> Option[&Connection]
+    val s = socket_at(id, gen) match
+        None -> return None
+        Some(it) -> it
+
+    s.handle match
+        Connected(c) -> Some(c)
+        Unclaimed(u) -> u.connection() match
+            Ok(c) ->
+                s.handle = Connected(c)
+                Some(c)
+            Err(_) -> None
+        _ -> None
+end connection_at
 
 // The socket a builtin was handed, as the slot and generation that name it -- or the complaint about
 // what it was handed instead.
@@ -57,10 +142,11 @@ private socket_of(v: Value, at: Span, name: string) -> Result[(usize, usize), Si
 // slot when its callback runs, and a socket's slot is spent by `close` alone -- so the value that
 // means "not one-shot" is the right one here even though this is not a timer.
 //
-// Not `private`: `server.sysl` holds its listening and accepted sockets in the same table, which is
-// what keeps the loop alive while a server is listening and closes the handle when the slot goes.
-hold_socket(sock: &libuv.Tcp, cb: Value) -> Value
-    val id = claim(Pending(cb, Null, null, None, Some(sock), true, true, 0, 0))
+// Not `private`: `channel.sysl` holds a socket that arrived over a channel in the same table, which
+// is what keeps the loop alive while one is open and closes it when the slot goes.
+hold_socket(h: SockHandle, cb: Value) -> Value
+    val s: &Sock = Sock(h, false, false)
+    val id = claim(Pending(cb, Null, null, None, Some(s), true, true, 0, 0))
 
     socket_value(id, gen_at(id))
 end hold_socket
@@ -68,6 +154,9 @@ end hold_socket
 // A socket's value, from the slot and generation `event.sysl` hands out. **Every socket a program
 // sees is made here**, the two halves being 32 bits each in a `Value` (see `Value.Socket`).
 private socket_value(id: usize, gen: usize) -> Value = Socket(u32(id), u32(gen))
+
+// Whether a task spawned for this slot is still about the socket in it. See the header.
+private owns(id: usize, gen: usize, stamp: usize) -> bool = same_run(stamp) && holds(id, gen)
 
 // The slate callback a socket's slot is holding.
 private callback_of(id: usize, gen: usize) -> Value
@@ -189,8 +278,12 @@ loop_fails(message: string)
 // **`reuse_port` is `SO_REUSEPORT`**, asking the kernel to spread accepted connections across every
 // process that binds the same port with it set, rather than giving the port to one listener alone --
 // the foundation of a worker cluster. It is refused rather than silently doing something else on a
-// kernel that does not distribute this way, `libuv`'s own doc comment on `TCP_REUSEPORT` saying which
-// those are; the failure below is that refusal in the ordinary "cannot listen" sentence.
+// kernel that does not distribute this way -- `ENOTSUP`, macOS included -- and the failure below is
+// that refusal in the ordinary "cannot listen" sentence.
+//
+// **kairos binds and listens in one call**, so the probe below asks about a port this server is
+// already listening on, and a TLS setup that fails closes a listener that is already open. Nothing
+// is accepted before the loop turns, so neither is anything a program can see.
 listen_socket(port: long, secure: Option[Secure], reuse_port: bool, cb: Value, at: Span) -> Step
     cb match
         Fn(_) -> ()
@@ -200,21 +293,7 @@ listen_socket(port: long, secure: Option[Secure], reuse_port: bool, cb: Value, a
 
     if port < 0 || port > 65535 then return fault(at, s"a port is between 0 and 65535, and this is ${port}")
 
-    var server = libuv.tcp(event_loop()) match
-        Err(e) -> return fault(at, s"this socket could not be made: ${e}")
-        Ok(t) -> t
-
-    val flags: u32 = if reuse_port then libuv.TCP_REUSEPORT else 0
-
-    // **`::` RATHER THAN `0.0.0.0`, WHICH IS WHAT MAKES `localhost` REACH THIS SERVER.** A dual-stack
-    // socket accepts IPv4 connections as mapped addresses, so `127.0.0.1` still arrives -- and
-    // `localhost` resolves to `::1` first on every machine that follows RFC 6724, which is all of
-    // them. Bound to IPv4 alone, a slate server was simply not there for a client that asked for it
-    // by name, and the failure was `ECONNREFUSED` -- which reads as nothing listening.
-    //
-    // **A host with no IPv6 at all falls back**, since the bind is what says so and there is nothing
-    // to be gained by refusing to serve.
-    var bound = bind_any6(server, port, flags)
+    var server = listen_any(port, reuse_port)
 
     // **A port of `0` is a promise of a FREE port, and on macOS the dual-stack bind does not keep
     // it.** The kernel's choice for `::` does not avoid a port some other process holds on
@@ -226,26 +305,62 @@ listen_socket(port: long, secure: Option[Secure], reuse_port: bool, cb: Value, a
     // PROGRAM named is its own business, and is left exactly as it was.
     var tries = 0
 
-    while bound && port == 0 && tries < PortTries && !loopback_free(server)
+    while port == 0 && tries < PortTries
+        val l = server match
+            Ok(it) -> it
+            Err(_) -> break
+
+        val chosen = l.port() match
+            Ok(p) -> p
+            Err(_) -> break
+
+        if loopback_free(chosen) then break
+
         tries += 1
-        server.close()
+        l.close()
+        server = listen_any(port, reuse_port)
 
-        server = libuv.tcp(event_loop()) match
-            Err(e) -> return fault(at, s"this socket could not be made: ${e}")
-            Ok(t) -> t
+    val listener = server match
+        Err(e) -> return fault(at, e)
+        Ok(l) -> l
 
-        bound = bind_any6(server, port, flags)
+    serving(listener, secure, cb, at)
+end listen_socket
 
-    if !bound
-        val addr = libuv.ip4("0.0.0.0", int(port)) match
-            Err(e) -> return fault(at, s"this address could not be read: ${e}")
-            Ok(a) -> a
+// `listen(socket, onConnection)` -- accept on a listening socket another program passed over a
+// channel. **The socket is already bound and listening**, so there is no port to choose and nothing
+// to secure: a supervisor that wants TLS hands out the connections, which is the default anyway.
+listen_passed(v: Value, cb: Value, at: Span) -> Step
+    cb match
+        Fn(_) -> ()
+        Native(_) -> ()
+        HostFn(_) -> ()
+        other -> return fault(at, s"`listen` needs a function to call with each connection, and this is ${other.type_name()}")
 
-        server.bind(addr, flags) match
-            Err(e) -> return fault(at, s"cannot listen on port ${port}: ${e}")
-            Ok(_) -> ()
+    val (id, gen) = socket_of(v, at, "listen")?
+    val s = socket_at(id, gen).unwrap()
 
-    val held = hold_socket(server, cb)
+    val passed = s.handle match
+        Unclaimed(u) -> u
+        Listening(_) -> return fault(at, "this socket is already listening")
+        _ -> return fault(at, "`listen` takes a socket another program was listening on, and this one is a connection")
+
+    val l = passed.listen() match
+        Err(e) -> return fault(at, s"cannot listen on this socket: ${e}")
+        Ok(it) -> it
+
+    // **The socket keeps its slot and its value**, so the program goes on holding the one it was
+    // handed -- `close` on it stops the listening, and `localPort` answers the port it is on.
+    s.handle = Listening(l)
+    set_callback(id, gen, cb)
+    loop_events().spawn(accepting(id, gen, run_stamp(), l))
+
+    Ok(v)
+end listen_passed
+
+// A listener that is open, put in a slot and accepting.
+private serving(l: &Listener, secure: Option[Secure], cb: Value, at: Span) -> Step
+    val held = hold_socket(Listening(l), cb)
     val (id, gen) = socket_slot(held)
 
     secure match
@@ -257,91 +372,118 @@ listen_socket(port: long, secure: Option[Secure], reuse_port: bool, cb: Value, a
                     return fault(at, e)
                 Ok(_) -> ()
 
-    server.listen(128, () -> accepted(id, gen)) match
-        Err(e) ->
-            surrender(id)
-            fault(at, s"cannot listen on port ${port}: ${e}")
-        Ok(_) -> Ok(held)
-end listen_socket
+    loop_events().spawn(accepting(id, gen, run_stamp(), l))
+    Ok(held)
+end serving
 
 // How many kernel choices `listen(0)` hands back before settling for one. Another process holding the
 // chosen port on the IPv4 loopback is rare, so a second choice is nearly always the last.
 private const PortTries: int = 16
 
-// Bind a server to every address, both families, at this port; whether it took.
-private bind_any6(server: &libuv.Tcp, port: long, flags: u32) -> bool = libuv.ip6("::", int(port)) match
-    Err(_) -> false
-    Ok(a) -> server.bind(a, flags).is_ok()
+// A listener on every address, both families, at this port -- or the sentence for why there is none.
+//
+// **`::` RATHER THAN `0.0.0.0`, WHICH IS WHAT MAKES `localhost` REACH THIS SERVER.** A dual-stack
+// socket accepts IPv4 connections as mapped addresses, so `127.0.0.1` still arrives -- and
+// `localhost` resolves to `::1` first on every machine that follows RFC 6724, which is all of them.
+// Bound to IPv4 alone, a slate server was simply not there for a client that asked for it by name,
+// and the failure was `ECONNREFUSED` -- which reads as nothing listening.
+//
+// **A host with no IPv6 at all falls back**, since the listen is what says so and there is nothing to
+// be gained by refusing to serve. The sentence is the fallback's, which says the same thing about a
+// port that is taken or a kernel that refuses `reusePort`.
+private listen_any(port: long, reuse_port: bool) -> Result[&Listener, string]
+    libuv.ip6("::", int(port)) match
+        Err(_) -> ()
+        Ok(a) -> current().io.listen(a, reuse_port = reuse_port) match
+            Ok(l) -> return Ok(l)
+            Err(_) -> ()
 
-// Whether nothing else is listening on `127.0.0.1` at the port this server was given.
+    val addr = libuv.ip4("0.0.0.0", int(port)) match
+        Err(e) -> return Err(s"this address could not be read: ${e}")
+        Ok(a) -> a
+
+    current().io.listen(addr, reuse_port = reuse_port) match
+        Err(e) -> Err(s"cannot listen on port ${port}: ${e}")
+        Ok(l) -> Ok(l)
+end listen_any
+
+// Whether nothing else is listening on `127.0.0.1` at `port`.
 //
 // **The probe is a bind AND a listen**, because libuv defers `EADDRINUSE` from the bind to whichever
-// of `listen` or `connect` comes next. libuv sets `SO_REUSEADDR` on every socket, which is what lets
-// the probe take the specific address beside this server's wildcard while still being refused by a
-// listener that holds that exact address -- measured on macOS both ways before this was written.
+// of `listen` or `connect` comes next -- and `io.listen` is both. libuv sets `SO_REUSEADDR` on every
+// socket, which is what lets the probe take the specific address beside this server's wildcard -- a
+// wildcard that is already listening -- while still being refused by a listener that holds that
+// exact address.
 //
 // Not `private`: `tests_io.sysl` asks it with a squatter standing on the port, the kernel's own
 // choice of port being something no test can arrange.
-loopback_free(server: &libuv.Tcp) -> bool
-    val port = server.sockname() match
-        Err(_) -> return true
-        Ok(a) -> a.port()
-
+loopback_free(port: int) -> bool
     val addr = libuv.ip4("127.0.0.1", port) match
         Err(_) -> return true
         Ok(a) -> a
 
-    val probe = libuv.tcp(event_loop()) match
-        Err(_) -> return true
-        Ok(t) -> t
-
-    val free = probe.bind(addr).is_ok() && probe.listen(1, () -> ()).is_ok()
-
-    probe.close()
-    free
+    current().io.listen(addr, 1) match
+        Err(_) -> false
+        Ok(probe) ->
+            probe.close()
+            true
 end loopback_free
 
-// The slot and generation inside a socket value, for the two places here that made one and know it
-// is a socket.
+// The slot and generation inside a socket value, for the places here that made one and know it is a
+// socket.
 // Not `private`, for `hold_socket`'s reason.
 socket_slot(v: Value) -> (usize, usize) = v match
     Socket(id, gen) -> (usize(id), usize(gen))
     _ -> (0, 0)
 
-// One connection has arrived, and libuv guarantees exactly one per call of this.
-private accepted(id: usize, gen: usize)
-    socket_at(id, gen) match
-        None -> ()
-        Some(server) ->
-            server.accept() match
-                Err(e) -> loop_fails(s"a connection could not be accepted: ${e}")
-                Ok(conn) ->
-                    // **The connection gets a slot of its own with no callback yet.** It is the
-                    // program's to read from, write to and close, and until it calls `onData` there
-                    // is nothing to deliver anything to.
-                    val made = hold_socket(conn, Null)
-                    val (cid, cgen) = socket_slot(made)
+// A listener's accept loop, one connection at a time for as long as its slot holds it. **Closing the
+// listener is what ends it**: the accept waiting at the time ends with `ECANCELED`, and the slot has
+// already gone.
+private async accepting(id: usize, gen: usize, stamp: usize, l: &Listener)
+    loop
+        val got = await l.accept()
 
-                    // **The connection belongs to whoever opened the LISTENER, and not to whatever
-                    // is running when it arrives.** A client dials when it likes, so the slot is
-                    // claimed inside whichever of `slate test`'s scopes the loop happened to be
-                    // turning in -- and a server a `@setupAll` opened goes on accepting for the whole
-                    // file. Without this a test waits for a connection it never asked for, reports it
-                    // as its own leak, and closes it under the tests still to come.
-                    inherit_scope(id, cid)
+        if !owns(id, gen, stamp)
+            got match
+                Ok(c) -> c.close()
+                Err(_) -> ()
 
-                    // **The handshake is not driven here**, and could not be: nothing has been read
-                    // yet and nothing will be until the program calls `onData`. This only gives the
-                    // connection a stream; `arrived` is where the two ends talk.
-                    if tls_listener(id)
-                        tls_accepted(id, cid) match
-                            Err(e) ->
-                                surrender(cid)
-                                loop_fails(e)
-                                return
-                            Ok(_) -> ()
+            return
 
-                    deliver(id, gen, made)
+        got match
+            Err(e) ->
+                loop_fails(s"a connection could not be accepted: ${e}")
+                return
+            Ok(c) -> accepted(id, gen, c)
+end accepting
+
+// One connection has arrived.
+private accepted(id: usize, gen: usize, conn: &Connection)
+    // **The connection gets a slot of its own with no callback yet.** It is the program's to read
+    // from, write to and close, and until it calls `onData` there is nothing to deliver anything to.
+    val made = hold_socket(Connected(conn), Null)
+    val (cid, _) = socket_slot(made)
+
+    // **The connection belongs to whoever opened the LISTENER, and not to whatever is running when it
+    // arrives.** A client dials when it likes, so the slot is claimed inside whichever of `slate
+    // test`'s scopes the loop happened to be turning in -- and a server a `@setupAll` opened goes on
+    // accepting for the whole file. Without this a test waits for a connection it never asked for,
+    // reports it as its own leak, and closes it under the tests still to come.
+    inherit_scope(id, cid)
+
+    // **The handshake is not driven here**, and could not be: nothing has been read yet and nothing
+    // will be until the program calls `onData`. This only gives the connection a stream; `arrived` is
+    // where the two ends talk.
+    if tls_listener(id)
+        tls_accepted(id, cid) match
+            Err(e) ->
+                surrender(cid)
+                loop_fails(e)
+                return
+            Ok(_) -> ()
+
+    deliver(id, gen, made)
+end accepted
 
 // `connect(host, port)` -- a promise of a connected socket.
 //
@@ -373,26 +515,37 @@ connect_socket(host: string, port: long, at: Span) -> Step
     val waiting = begin_request()
     val promised = awaited_request(waiting)
     val what = s"cannot connect to ${host}:${port}"
+    val ask = Asked(waiting, gen_at(waiting), run_stamp(), at)
 
     libuv.ip(host, int(port)) match
         Ok(written) ->
-            connect_address(waiting, written, what, at)
-            return Ok(promised)
-        Err(_) -> ()
+            // **Two slots, and they are not the same thing.** One holds the socket for as long as the
+            // program has it; the other roots the promise for the length of the attempt and is given
+            // back when the attempt finishes. Settling the promise would otherwise take the socket
+            // with it.
+            val (id, gen) = socket_slot(hold_socket(Dialling, Null))
 
-    // **The port goes in as the SERVICE**, which is what puts it in the address libuv answers with;
-    // there is no way to set one on an `Address` afterwards. `client.sysl` says the same thing.
-    libuv.resolve(host, s"${port}", (r) ->
-        r match
-            Ok(found) -> connect_resolved(waiting, found, host, what, at)
-            Err(e) -> refuse_request(waiting, at, s"cannot find ${host}", e)) match
-        Err(e) ->
-            refuse_request(waiting, at, s"cannot find ${host}", e)
-            Ok(promised)
-        Ok(_) -> Ok(promised)
+            loop_events().spawn(dialled(ask, id, gen, written, what))
+        Err(_) -> loop_events().spawn(resolving(ask, host, port, what))
+
+    Ok(promised)
 end connect_socket
 
-// The name resolved, so there is somewhere to connect to.
+// The request a task answers: its slot, the generation it was claimed with, the run it belongs to,
+// and where the call that made it was written.
+private struct Asked
+    id: usize
+    gen: usize
+    stamp: usize
+    at: Span
+
+// Whether the request a task was spawned for is still waiting on it.
+private still_asked(a: Asked) -> bool = same_run(a.stamp) && holds(a.id, a.gen)
+
+// Look the name up, then dial what it answered.
+//
+// **The port goes in as the SERVICE**, which is what puts it in the address the resolver answers
+// with; there is no way to set one on an `Address` afterwards. `client.sysl` says the same thing.
 //
 // **The first IPv4 answer is preferred, and any answer will do where there is none.** A resolver
 // hands back every way it found and the ordering is the system's, so `localhost` on this machine
@@ -401,9 +554,19 @@ end connect_socket
 // the smallest thing that keeps those two agreeing, and it costs nothing on a host that has only
 // the other. **Walking the whole list on a refusal is what a browser does** and is what this should
 // grow into; it would change nothing above.
-private connect_resolved(waiting: usize, found: []libuv.AddrInfo, host: string, what: string, at: Span)
+private async resolving(ask: Asked, host: string, port: long, what: string)
+    val got = await current().io.resolve(host, s"${port}")
+
+    if !still_asked(ask) then return
+
+    val found = got match
+        Err(e) ->
+            refuse_request(ask.id, ask.at, s"cannot find ${host}", e)
+            return
+        Ok(answers) -> answers
+
     if found.len == 0
-        deny_request(waiting, at, s"there is no address for ${host}")
+        deny_request(ask.id, ask.at, s"there is no address for ${host}")
         return
 
     var pick: usize = 0
@@ -413,36 +576,36 @@ private connect_resolved(waiting: usize, found: []libuv.AddrInfo, host: string, 
             pick = i
             break
 
-    connect_address(waiting, found[pick].address, what, at)
-end connect_resolved
+    val (id, gen) = socket_slot(hold_socket(Dialling, Null))
+
+    await dialled(ask, id, gen, found[pick].address, what)
+end resolving
 
 // There is somewhere to connect to, however it was arrived at -- a name the resolver answered for, or
 // an address the program wrote out. **Everything from the socket onwards is the same either way**,
 // which is what lets the literal skip the resolver without a second copy of any of it.
-private connect_address(waiting: usize, address: libuv.Address, what: string, at: Span)
-    val client = libuv.tcp(event_loop()) match
-        Err(e) ->
-            refuse_request(waiting, at, "this socket could not be made", e)
-            return
-        Ok(t) -> t
+private async dialled(ask: Asked, id: usize, gen: usize, address: libuv.Address, what: string)
+    val got = await current().io.connect(address)
 
-    // **Two slots, and they are not the same thing.** One holds the socket for as long as the
-    // program has it; the other roots the promise for the length of the attempt and is given back
-    // when the attempt finishes. Settling the promise would otherwise take the socket with it.
-    val held = hold_socket(client, Null)
-    val (id, gen) = socket_slot(held)
+    // A socket whose slot was given back while it dialled -- a reset, or a program that ended -- is
+    // nobody's, so a connection that turns up anyway is closed rather than left open.
+    if !owns(id, gen, ask.stamp)
+        got match
+            Ok(c) -> c.close()
+            Err(_) -> ()
 
-    client.connect(address, (r) ->
-        r match
-            Ok(_) -> answer_request(waiting, socket_value(id, gen))
-            Err(e) ->
-                surrender(id)
-                refuse_request(waiting, at, what, e)) match
+        return
+
+    got match
         Err(e) ->
             surrender(id)
-            refuse_request(waiting, at, what, e)
-        Ok(_) -> ()
-end connect_address
+            if still_asked(ask) then refuse_request(ask.id, ask.at, what, e)
+        Ok(c) ->
+            val s = socket_at(id, gen).unwrap()
+
+            s.handle = Connected(c)
+            if still_asked(ask) then answer_request(ask.id, socket_value(id, gen))
+end dialled
 
 // `startTls(sock, host)` -- an open socket, upgraded, answering a promise that settles when the
 // handshake has finished.
@@ -552,7 +715,8 @@ private handshake_denied(id: usize, message: string)
 //
 // `fn` is called with each chunk as it arrives and with `null` once the peer has finished sending.
 // **A second call replaces the first's function**, which is what makes a protocol that changes what
-// it expects halfway through writable at all.
+// it expects halfway through writable at all: the reader already running is left running, and reads
+// the slot's function and kind afresh at every chunk.
 read_socket(v: Value, cb: Value, as_text: bool, at: Span) -> Step
     val name = if as_text then "onData" else "onBytes"
 
@@ -563,20 +727,62 @@ read_socket(v: Value, cb: Value, as_text: bool, at: Span) -> Step
         other -> return fault(at, s"`${name}` needs a function to call with each chunk, and this is ${other.type_name()}")
 
     val (id, gen) = socket_of(v, at, name)?
-    val sock = socket_at(id, gen).unwrap()
+    val s = socket_at(id, gen).unwrap()
+
+    // A listening socket has no bytes to read, which libuv answered with `ENOTCONN` and kairos with a
+    // type that has no `read`.
+    val conn = connection_at(id, gen) match
+        None -> return fault(at, "cannot read from this socket: socket is not connected")
+        Some(c) -> c
 
     set_callback(id, gen, cb)
+    s.as_text = as_text
 
-    // **Stopped before started, because libuv refuses `read_start` on a stream already reading** --
-    // `EALREADY`, which would make a second `onData` a failure rather than the replacement it is
-    // meant to be. Stopping keeps the callback and the buffer, so this costs nothing and a socket
-    // that was not reading does not mind being told to stop.
-    sock.read_stop()
+    if !s.reading
+        s.reading = true
+        loop_events().spawn(reading(id, gen, run_stamp(), conn))
 
-    sock.read_start((r) -> arrived(id, gen, r, as_text)) match
-        Err(e) -> fault(at, s"cannot read from this socket: ${e}")
-        Ok(_) -> Ok(Null)
+    Ok(Null)
 end read_socket
+
+// A connection's reader: one chunk at a time, until the stream ends or fails or the program closes
+// it. **A chunk nobody asked for stays in the kernel**, kairos stopping libuv's reading inside the
+// callback that took one -- so a socket the program has stopped reading by closing it leaves nothing
+// half-delivered.
+private async reading(id: usize, gen: usize, stamp: usize, conn: &Connection)
+    loop
+        val got = await conn.read()
+
+        if !owns(id, gen, stamp) then return
+
+        got match
+            // **The end of the stream is `null` and not a failure**, which is libuv's own distinction
+            // and the right one: a peer closing its half is how a request ordinarily ends.
+            Ok(bytes) if bytes.len == 0 ->
+                read_ended(id, gen)
+                handshake_denied(id, "this connection ended before the TLS handshake finished")
+                deliver(id, gen, Null)
+                return
+            Ok(bytes) ->
+                val as_text = socket_at(id, gen).unwrap().as_text
+
+                if tls_here(id)
+                    secured(id, gen, bytes, as_text)
+                else
+                    plainly_arrived(id, gen, bytes, as_text)
+            Err(e) ->
+                read_ended(id, gen)
+                handshake_denied(id, s"this connection failed before the TLS handshake finished: ${e}")
+                stream_failed(id, gen, s"this connection failed: ${e}")
+                return
+end reading
+
+// The reader has stopped, so the next `onData` starts another -- which is what a second `onData`
+// after the end of the stream did with libuv too, reading the end again.
+private read_ended(id: usize, gen: usize)
+    socket_at(id, gen) match
+        Some(s) -> s.reading = false
+        None -> ()
 
 // `onError(sock, fn)` -- what to call if this socket fails.
 //
@@ -607,24 +813,6 @@ error_socket(v: Value, cb: Value, at: Span) -> Step
 
     Ok(Null)
 end error_socket
-
-// Something came off the wire.
-//
-// **The end of the stream is `null` and not a failure**, which is libuv's own distinction and the
-// right one: a peer closing its half is how a request ordinarily ends.
-private arrived(id: usize, gen: usize, r: libuv.Read, as_text: bool)
-    r match
-        End ->
-            handshake_denied(id, "this connection ended before the TLS handshake finished")
-            deliver(id, gen, Null)
-        Failed(e) ->
-            handshake_denied(id, s"this connection failed before the TLS handshake finished: ${e}")
-            stream_failed(id, gen, s"this connection failed: ${e}")
-        Data(bytes) ->
-            if tls_here(id)
-                secured(id, gen, bytes, as_text)
-            else
-                plainly_arrived(id, gen, bytes, as_text)
 
 // What arrived on a TLS connection: fed to OpenSSL, whatever it wants sent written back, and
 // whatever it decrypted handed on. **A handshake turn produces no plaintext and is not nothing** --
@@ -665,21 +853,16 @@ private secured(id: usize, gen: usize, cipher: []const u8, as_text: bool)
     if plain.len() > 0 then plainly_arrived(id, gen, plain.view(), as_text)
 
 // Everything OpenSSL wants sent, written to the socket. **Nothing awaits it**: the program's own
-// `send` answers a promise for its own bytes, and a handshake record belongs to nobody.
+// `send` answers a promise for its own bytes, and a handshake record belongs to nobody -- the task
+// beside the write only hears whether it failed.
 private push_wire(id: usize, gen: usize)
     val out = tls_pull(id)
 
     if out.len() == 0 then return
 
-    socket_at(id, gen) match
+    connection_at(id, gen) match
         None -> ()
-        Some(sock) ->
-            sock.write(out.view(), (r) ->
-                r match
-                    Ok(_) -> ()
-                    Err(e) -> stream_failed(id, gen, s"this connection could not be written to: ${e}")) match
-                Err(e) -> stream_failed(id, gen, s"this connection could not be written to: ${e}")
-                Ok(_) -> ()
+        Some(c) -> loop_events().spawn(wired(id, gen, run_stamp(), c.write(out.view())))
 
     // **Read once**: taking the list is what clears it, so asking twice would answer the second
     // question with nothing and leave those promises pending forever.
@@ -687,6 +870,12 @@ private push_wire(id: usize, gen: usize)
 
     for i in 0..<settled.len()
         answer_request(settled.at(i), Null)
+
+// How a write of TLS records ended.
+private async wired(id: usize, gen: usize, stamp: usize, t: Task[Result[unit, libuv.Error]])
+    (await t) match
+        Ok(_) -> ()
+        Err(e) -> if owns(id, gen, stamp) then stream_failed(id, gen, s"this connection could not be written to: ${e}")
 
 private plainly_arrived(id: usize, gen: usize, bytes: []const u8, as_text: bool)
     if as_text
@@ -714,7 +903,7 @@ private plainly_arrived(id: usize, gen: usize, bytes: []const u8, as_text: bool)
 
 // `send(sock, data)` -- a promise that settles when the bytes have gone.
 //
-// `Ok` from libuv means the write was queued; the promise is what says it happened.
+// The write is issued here; the promise is what says it happened.
 send_socket(v: Value, text: string, at: Span) -> Step = send_bytes(v, text.bytes, at)
 
 // The same write, given the bytes rather than a string.
@@ -724,9 +913,16 @@ send_socket(v: Value, text: string, at: Span) -> Step = send_bytes(v, text.bytes
 // encoding.
 send_bytes(v: Value, payload: []const u8, at: Span) -> Step
     val (id, gen) = socket_of(v, at, "send")?
-    val sock = socket_at(id, gen).unwrap()
     val waiting = begin_request()
     val promised = awaited_request(waiting)
+    val ask = Asked(waiting, gen_at(waiting), run_stamp(), at)
+
+    // A listening socket cannot be written to, which libuv answered with `EPIPE` at the call.
+    val conn = connection_at(id, gen) match
+        None ->
+            refuse_request(waiting, at, "cannot send", libuv.Error(libuv.EPIPE))
+            return Ok(promised)
+        Some(c) -> c
 
     // **On a TLS connection the bytes that reach the socket are not the bytes the program wrote**,
     // so the write below is of the ciphertext OpenSSL produced. Where the handshake has not finished
@@ -742,24 +938,22 @@ send_bytes(v: Value, payload: []const u8, at: Span) -> Step
 
         val cipher = tls_pull(id)
 
-        sock.write(cipher.view(), (r) ->
-            r match
-                Ok(_) -> answer_request(waiting, Null)
-                Err(e) -> refuse_request(waiting, at, "cannot send", e)) match
-            Err(e) -> refuse_request(waiting, at, "cannot send", e)
-            Ok(_) -> ()
-
+        loop_events().spawn(sent(ask, conn.write(cipher.view())))
         return Ok(promised)
 
-    sock.write(payload, (r) ->
-        r match
-            Ok(_) -> answer_request(waiting, Null)
-            Err(e) -> refuse_request(waiting, at, "cannot send", e)) match
-        Err(e) ->
-            refuse_request(waiting, at, "cannot send", e)
-            Ok(promised)
-        Ok(_) -> Ok(promised)
+    loop_events().spawn(sent(ask, conn.write(payload)))
+    Ok(promised)
 end send_bytes
+
+// How one `send` ended, which is what its promise says.
+private async sent(ask: Asked, t: Task[Result[unit, libuv.Error]])
+    val r = await t
+
+    if !still_asked(ask) then return
+
+    r match
+        Ok(_) -> answer_request(ask.id, Null)
+        Err(e) -> refuse_request(ask.id, ask.at, "cannot send", e)
 
 // `close(sock)` -- and with it the slot, which is what lets the program exit.
 close_socket(v: Value, at: Span) -> Step
@@ -786,9 +980,17 @@ close_socket(v: Value, at: Span) -> Step
 local_port(v: Value, at: Span) -> Step
     val (id, gen) = socket_of(v, at, "localPort")?
 
-    socket_at(id, gen).unwrap().sockname() match
+    val port: Result[int, libuv.Error] = socket_at(id, gen).unwrap().handle match
+        Listening(l) -> l.port()
+        _ -> connection_at(id, gen) match
+            Some(c) -> c.local() match
+                Ok(a) -> Ok(a.port())
+                Err(e) -> Err(e)
+            None -> Err(libuv.Error(libuv.EINVAL))
+
+    port match
         Err(e) -> fault(at, s"this socket has no address: ${e}")
-        Ok(a) -> Ok(Int(long(a.port())))
+        Ok(p) -> Ok(Int(long(p)))
 
 // `remoteAddress(conn)` -- the IP the other end of this connection is at, as text.
 //
@@ -805,7 +1007,11 @@ local_port(v: Value, at: Span) -> Step
 remote_address(v: Value, at: Span) -> Step
     val (id, gen) = socket_of(v, at, "remoteAddress")?
 
-    socket_at(id, gen).unwrap().peername() match
+    val conn = connection_at(id, gen) match
+        None -> return Ok(Null)
+        Some(c) -> c
+
+    conn.peer() match
         Err(_) -> Ok(Null)
         Ok(a) -> Ok(Str(new_str_scanned(unmapped(a.ip()))))
 

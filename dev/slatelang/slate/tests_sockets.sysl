@@ -1,0 +1,216 @@
+module dev.slatelang.slate
+@tests
+
+import sh.sysl.libuv
+import sh.sysl.libuv.Handle
+import sh.sysl.libuv.Stream
+import sysl.buf.{Buf, buf}
+
+// `slate:net` under load and at its edges: many connections at once, a reader slower than the
+// writer, a peer that resets, clients that hang up before they are served, and a listening socket
+// handed to another program. **Each is a place a socket's tasks could disagree with the libuv
+// callbacks they replaced** -- an accept loop one connection behind, a write cut off by the close
+// after it, a failure that stopped the server -- so each pins what a program sees.
+
+@test
+A_HUNDRED_AND_TWENTY_CONNECTIONS_AT_ONCE_ARE_EACH_ANSWERED_ON_THEIR_OWN_SOCKET()
+    val body =
+        "serve(conn) = onData(conn, chunk -> if chunk == null then close(conn) else send(conn, \"echo \" + chunk))\n" +
+        "val server = listen(0, serve)\n" +
+        "val total = 120\n" +
+        "var answered = 0\n" +
+        "var ended = 0\n" +
+        "async dial(i)\n" +
+        "    val c = (await connect(\"127.0.0.1\", localPort(server))).value\n" +
+        "    onData(c, chunk ->\n" +
+        "        if chunk == \"echo \" + string(i) then answered = answered + 1\n" +
+        "        close(c)\n" +
+        "        ended = ended + 1\n" +
+        "        if ended == total\n" +
+        "            print(answered)\n" +
+        "            close(server)\n" +
+        "            done())\n" +
+        "    await send(c, string(i))\n" +
+        "for i in 0..<total\n" +
+        "    dial(i)\n"
+
+    assert_eq(out(netted(body)), "120")
+
+@test
+A_SLOW_READER_GETS_EVERY_BYTE_OF_A_LARGE_ANSWER_THE_SERVER_CLOSED_AFTER_SENDING()
+    // **The send is awaited and then the socket closed**, which is the order a server writes: the
+    // promise settles once the kernel has every byte, so the close after it cuts nothing off -- while
+    // the reader has not read a byte for the first 300 ms and the kernel's buffers filled long before.
+    val body =
+        "val Size = 4194304\n" +
+        "async deliver(conn)\n" +
+        "    val sent = await send(conn, bytes(Size))\n" +
+        "    print(sent.ok)\n" +
+        "    close(conn)\n" +
+        "val server = listen(0, conn -> deliver(conn))\n" +
+        "async main()\n" +
+        "    val c = (await connect(\"127.0.0.1\", localPort(server))).value\n" +
+        "    var got = 0\n" +
+        "    begin() =\n" +
+        "        onBytes(c, chunk ->\n" +
+        "            if chunk == null\n" +
+        "                print(got)\n" +
+        "                close(c)\n" +
+        "                close(server)\n" +
+        "                done()\n" +
+        "            else\n" +
+        "                got = got + chunk.length)\n" +
+        "    setTimeout(begin, 300)\n" +
+        "main()\n"
+
+    assert_eq(out(netted(body)), "true\n4194304")
+
+@test
+A_PEER_THAT_RESETS_MID_REQUEST_IS_TOLD_TO_ON_ERROR_AND_THE_SERVER_GOES_ON_SERVING()
+    // **The reset is a close with bytes still unread**, which TCP answers with RST rather than FIN:
+    // the server's answer to half a request lands in a client that never reads it. The server is told
+    // why through `onError`, and the next client is answered as if nothing had happened.
+    val body =
+        "var served = 0\n" +
+        "serve(conn)\n" +
+        "    served = served + 1\n" +
+        "    onError(conn, why ->\n" +
+        "        print(why)\n" +
+        "        close(conn)\n" +
+        "        second())\n" +
+        "    onData(conn, chunk ->\n" +
+        "        if chunk == null\n" +
+        "            close(conn)\n" +
+        "        elif served == 1\n" +
+        "            send(conn, bytes(65536))\n" +
+        "        else\n" +
+        "            send(conn, \"still here\"))\n" +
+        "val server = listen(0, serve)\n" +
+        "async first()\n" +
+        "    val c = (await connect(\"127.0.0.1\", localPort(server))).value\n" +
+        "    await send(c, \"GET / HTT\")\n" +
+        "    setTimeout(() -> close(c), 100)\n" +
+        "async second()\n" +
+        "    val c = (await connect(\"127.0.0.1\", localPort(server))).value\n" +
+        "    onData(c, chunk ->\n" +
+        "        if chunk != null\n" +
+        "            print(chunk)\n" +
+        "            close(c)\n" +
+        "            close(server)\n" +
+        "            done())\n" +
+        "    await send(c, \"again\")\n" +
+        "first()\n"
+
+    assert_eq(out(netted(body)), "this connection failed: ECONNRESET: connection reset by peer\nstill here")
+
+@test
+A_PEER_THAT_RESETS_MID_REQUEST_DOES_NOT_STOP_AN_HTTP_SERVER()
+    // The same reset under `slate:http`, which has no `onError` of its own: the connection ends and
+    // the next request is answered.
+    val body =
+        "val server = serve(0, req -> \"answered \" + req.path)\n" +
+        "async main()\n" +
+        "    val c = (await connect(\"127.0.0.1\", localPort(server))).value\n" +
+        "    await send(c, \"GET /first HTTP/1.1\\r\\nHost: x\\r\\n\\r\\nGET /second HTT\")\n" +
+        "    setTimeout(after, 100)\n" +
+        "    after()\n" +
+        "        shutSocket(c)\n" +
+        "        setTimeout(again, 50)\n" +
+        "async again()\n" +
+        "    val r = await fetch(\"http://127.0.0.1:\" + string(localPort(server)) + \"/third\")\n" +
+        "    print(r.value.body)\n" +
+        "    close(server)\n" +
+        "    done()\n" +
+        "main()\n"
+
+    assert_eq(out(HttpImport + WireImport + watched(body)), "answered /third")
+
+@test
+AN_ACCEPT_LOOP_SURVIVES_CLIENTS_THAT_HANG_UP_BEFORE_THEY_ARE_SERVED()
+    // Fifty clients connect and close in the same breath, before the server has turned its loop to
+    // accept them; the fifty-first is answered. **Nothing a client does before it is accepted may stop
+    // the accept loop**, which an error out of the accept would.
+    val body =
+        "var seen = 0\n" +
+        "serve(conn)\n" +
+        "    seen = seen + 1\n" +
+        "    onData(conn, chunk -> if chunk == null then close(conn) else send(conn, \"served\"))\n" +
+        "val server = listen(0, serve)\n" +
+        "async quitter()\n" +
+        "    val c = (await connect(\"127.0.0.1\", localPort(server))).value\n" +
+        "    close(c)\n" +
+        "async quitters()\n" +
+        "    for i in 0..<50\n" +
+        "        await quitter()\n" +
+        "    val c = (await connect(\"127.0.0.1\", localPort(server))).value\n" +
+        "    onData(c, chunk ->\n" +
+        "        if chunk != null\n" +
+        "            print(chunk)\n" +
+        "            print(seen)\n" +
+        "            close(c)\n" +
+        "            close(server)\n" +
+        "            done())\n" +
+        "    await send(c, \"hello\")\n" +
+        "quitters()\n"
+
+    assert_eq(out(netted(body)), "served\n51")
+
+@test
+A_LISTENING_SOCKET_PASSED_DOWN_A_CHANNEL_IS_ONE_THE_PROGRAM_CAN_ACCEPT_ON()
+    // The supervisor's other way of sharing a port: rather than handing over each connection, it hands
+    // over the listener, and the worker accepts on it. **The program dials its own listener** --
+    // anything else connecting before this side's copy is closed could be taken by that copy.
+    val (ours, theirs) = ipc_end()
+    val server = libuv.tcp().expect("a listening socket")
+
+    server.bind(libuv.ip4("127.0.0.1", 0).expect("an address"), 0).expect("bound")
+    server.listen(4, () -> ()).expect("listening")
+    server.unref()
+
+    // **This side's copy goes once the write has gone**, the rule `send` keeps for a program.
+    ours.write_handle("{\"take\": \"this\"}\n".bytes, server, (r) ->
+        r.expect("the handle was sent")
+        server.close()).expect("the message is queued")
+
+    ours.shutdown().expect("this side says it has finished")
+    libuv.set_env(ChannelVariable, s"${theirs}").expect("the descriptor is named")
+
+    val said = out("import { channel } from slate:process\n" +
+        "import { listen, connect, onData, send, close, localPort } from slate:net\n" +
+        "val ch = channel()\n" +
+        "ch.onMessage((m, l) ->\n" +
+        "    print(m.take)\n" +
+        "    listen(l, conn -> onData(conn, chunk ->\n" +
+        "        if chunk != null\n" +
+        "            send(conn, \"accepted by the program\")\n" +
+        "            close(conn)))\n" +
+        "    dial(l))\n" +
+        "async dial(l)\n" +
+        "    val c = (await connect(\"127.0.0.1\", localPort(l))).value\n" +
+        "    onData(c, chunk ->\n" +
+        "        if chunk != null\n" +
+        "            print(chunk)\n" +
+        "            close(c)\n" +
+        "            close(l))\n" +
+        "    await send(c, \"hello\")\n")
+
+    libuv.unset_env(ChannelVariable).expect("the name is taken back")
+    ours.close(() -> ())
+    libuv.default_loop().run(libuv.RUN_NOWAIT).expect("the closes finish")
+
+    assert_eq(said, "this\naccepted by the program")
+
+@test
+A_SOCKET_THAT_IS_NOT_A_PASSED_LISTENER_IS_REFUSED_BY_LISTEN()
+    // `listen(socket, fn)` takes a socket another program was listening on and nothing else -- a
+    // listener of this program's own is already accepting.
+    val said = out(netted(
+        "val server = listen(0, c -> null)\n" +
+        "try\n" +
+        "    listen(server, c -> null)\n" +
+        "catch e\n" +
+        "    print(e.message)\n" +
+        "close(server)\n" +
+        "done()\n"))
+
+    assert_eq(said, "this socket is already listening")

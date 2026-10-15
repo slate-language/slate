@@ -2,9 +2,8 @@ module dev.slatelang.slate
 
 import sh.sysl.gc
 import sh.sysl.json
+import sh.sysl.kairos.uv.{ByteStream, Pipe, Process, Stdio}
 import sh.sysl.libuv
-import sh.sysl.libuv.Handle
-import sh.sysl.libuv.Stream
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.env
@@ -60,9 +59,11 @@ struct Child
     // program: it is what `ps` and `kill` are written with.
     pid: long
 
-    // The handles, kept alive here for as long as libuv may still call back.
-    proc: Option[&libuv.Process]
-    channel: Option[&libuv.Pipe]
+    // The child and its channel, as kairos holds them. **Dropping the process does not kill the
+    // child**, and its handle stays on the loop until the child exits -- which is what a running child
+    // keeping the loop busy has always meant.
+    proc: Option[&Process]
+    channel: Option[&Pipe]
 
     // Whether this child was started with a channel at all, which is a question about the `spawn`
     // and stays answerable for ever -- where the handle goes when the channel ends.
@@ -111,13 +112,11 @@ forget_children()
     for i in 0..<v.children.len()
         var c = v.children.at(i)
 
+        // **The process is let go of and not closed**: kairos closes its handle when the child exits,
+        // and the task waiting for that exit finds the stamp moved and reports nothing.
         if c.live
-            c.proc match
-                Some(p) -> p.close(() -> ())
-                None -> ()
-
             c.channel match
-                Some(p) -> p.close(() -> ())
+                Some(p) -> p.close()
                 None -> ()
 
         c.live = false
@@ -187,16 +186,6 @@ private child_of(v: Value, at: Span, name: string) -> Result[usize, Signal]
             Ok(id)
         other -> Err(failure(at, s"`${name}` is something a child process does, and this is ${other.type_name()}"))
 
-// Take the two channel variables off THIS process again, after a spawn that inherited them.
-private clear_channel_env()
-    libuv.unset_env(ChannelVariable) match
-        Err(_) -> ()
-        Ok(_) -> ()
-
-    libuv.unset_env(HostVariable) match
-        Err(_) -> ()
-        Ok(_) -> ()
-
 // -- starting one -----------------------------------------------------------------------------
 
 // `spawn(command, args)` and `spawn(command, args, options)` -- a child, at once.
@@ -208,77 +197,38 @@ private clear_channel_env()
 start_child(command: string, args: Buf[Value], options: Value, at: Span) -> Step
     val argv = string_list(args, at, "spawn")?
     val cwd = option_text(options, "cwd", at, "spawn")?
-    var environment = option_env(options, at, "spawn")?
+    val environment = option_env(options, at, "spawn")?
     val ipc = option_flag(options, "ipc", at, "spawn")?
 
-    var stdio: Buf[libuv.Stdio] = buf()
+    // **The channel is an ipc pipe on descriptor 3 and not an ordinary one, so that a socket can
+    // cross it.** A handle travels as ancillary data on a Unix domain socket, which libuv only reads
+    // for a pipe made for it -- kairos's `Channel` slot -- and nothing about an ordinary message
+    // changes. It goes both ways, the channel being a conversation.
+    val extra: []Stdio = if ipc then [Stdio.Channel] else []
 
-    // **stdin is closed and the other two are inherited**, which is the pair of decisions a worker
-    // wants. A child waiting on input nobody will type is a hang with nothing on screen, and a
-    // worker's own complaints belong wherever its supervisor's do -- a log a deployment already
-    // collects, rather than a pipe the supervisor has to remember to drain.
-    stdio.push(libuv.Ignore)
-    stdio.push(libuv.Inherit)
-    stdio.push(libuv.Inherit)
-
-    var channel_pipe: Option[&libuv.Pipe] = None
-
-    if ipc
-        // **An ipc pipe and not an ordinary one, so that a socket can cross it.** A handle travels
-        // as ancillary data on a Unix domain socket, which libuv only reads for a pipe that was made
-        // with this flag -- and on a pipe without it `write_handle` is refused outright. Nothing
-        // about an ordinary message changes.
-        val p = libuv.pipe(true, event_loop()) match
-            Err(e) -> return Ok(err_value(s"a channel to `${command}` could not be made: ${e}"))
-            Ok(p) -> p
-
-        // **Both flags, because the channel is a conversation.** One flag makes a pipe; the two
-        // together make a connected pair of sockets, which is what a descriptor that is written at
-        // both ends has to be. They are named from the CHILD's point of view, as `run`'s are.
-        stdio.push(libuv.ToPipe(p, libuv.READABLE_PIPE | libuv.WRITABLE_PIPE))
-        channel_pipe = Some(p)
-
-        // **The descriptor is passed in the environment, which is the only place it can go.** A
-        // replaced environment gets the entry added to it; an inherited one is reached by setting
-        // the variable on THIS process across the spawn and taking it off again. `uv_spawn` has
-        // done the fork and the exec by the time it returns, and nothing else in this program runs
-        // in between, so the window is the call itself.
-        if environment.len() > 0
-            environment.push(s"${ChannelVariable}=${ChannelFd}")
-            environment.push(s"${HostVariable}=${HostName}")
-
-    val added_to_own = ipc && environment.len() == 0
-
-    if added_to_own
-        libuv.set_env(ChannelVariable, s"${ChannelFd}") match
-            Err(e) -> return Ok(err_value(s"the channel could not be named to `${command}`: ${e}"))
-            Ok(_) -> ()
-
-        libuv.set_env(HostVariable, HostName) match
-            Err(e) -> return Ok(err_value(s"the channel could not be named to `${command}`: ${e}"))
-            Ok(_) -> ()
+    // **The descriptor is passed in the environment, which is the only place it can go**, added on
+    // top of whichever environment the child is given: this program's own, or the one `env`
+    // replaced it with. Nothing is set on THIS process to get it there.
+    val named: []string = if ipc then [s"${ChannelVariable}=${ChannelFd}", s"${HostVariable}=${HostName}"] else []
 
     val waiting = begin_request()
     val promised = awaited_request(waiting)
     val slot = claim_child(waiting, promised, at)
 
-    val child = libuv.spawn(command, argv.view(), (status, signal) ->
-            record_child_exit(slot, status, signal),
-        stdio.view(), cwd, environment.view(), 0, event_loop()) match
+    // **stdin is closed and the other two are inherited**, which is the pair of decisions a worker
+    // wants. A child waiting on input nobody will type is a hang with nothing on screen, and a
+    // worker's own complaints belong wherever its supervisor's do -- a log a deployment already
+    // collects, rather than a pipe the supervisor has to remember to drain.
+    val child = current().io.spawn(command, argv.view(), env = environment.view(), cwd = cwd,
+            stdin = Stdio.Ignore, stdout = Stdio.Inherit, stderr = Stdio.Inherit, env_add = named,
+            extra = extra) match
         Err(e) ->
-            if added_to_own then clear_channel_env()
-
-            channel_pipe match
-                Some(p) -> p.close(() -> ())
-                None -> ()
-
             drop_child(slot)
             surrender(waiting)
             return Ok(err_value(s"cannot run `${command}`: ${e}"))
         Ok(c) -> c
 
-    if added_to_own then clear_channel_env()
-
+    val channel_pipe = if ipc then child.pipe(ChannelFd) else None
     var held = current().children.at(slot)
 
     held.proc = Some(child)
@@ -288,12 +238,7 @@ start_child(command: string, args: Buf[Value], options: Value, at: Span) -> Step
     held.channel_open = ipc
     current().children.set(slot, held)
 
-    // **The exit callback is replaced now that there is a handle to capture**, exactly as `run`
-    // does it: `spawn` takes its callback before the child exists, and a callback that has to close
-    // the handle cannot be written until there is one. Nothing can have run in between.
-    child.on_exit((status, signal) ->
-        record_child_exit(slot, status, signal)
-        child.close(() -> ()))
+    loop_events().spawn(child_exits(slot, run_stamp(), child))
 
     channel_pipe match
         Some(p) -> read_channel(p, (bytes) -> child_bytes(slot, bytes), (v) -> child_socket(slot, v),
@@ -302,6 +247,13 @@ start_child(command: string, args: Buf[Value], options: Value, at: Span) -> Step
 
     Ok(ok_value(ChildVal(u32(slot), u32(current().children.at(slot).gen))))
 end start_child
+
+// Wait for the child to go, and say how it went -- unless a reset has given its slot to another
+// program's child since.
+private async child_exits(slot: usize, stamp: usize, p: &Process)
+    val how = await p.exit()
+
+    if same_run(stamp) then record_child_exit(slot, how.status, how.signal)
 
 // One boolean option out of the options object, and `false` where it was not given.
 //
