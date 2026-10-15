@@ -1,12 +1,12 @@
 ---
 title: The packages
 weight: 50
-summary: What is written in slate today — an API server, a PostgreSQL client, a logger, a UI framework and a component library.
+summary: What is written in slate today — an API server, a PostgreSQL client, a logger, configuration, a UI framework and a component library.
 ---
 
 # The packages
 
-Five packages, all in the [slate-language](https://github.com/slate-language) organisation, all
+Six packages, all in the [slate-language](https://github.com/slate-language) organisation, all
 written in slate. Each is installed the same way:
 
 ```
@@ -76,6 +76,34 @@ import { info, warn, setLevel, setSink, json } from logger
 ```
 
 <https://github.com/slate-language/logger>
+
+### env — configuration from the environment
+
+```
+slate install github.com/slate-language/env
+```
+
+**The configuration is read once, converted, and checked against a type the program declares — and a
+program with a bad one is told every problem at once, before it starts.** `env(Shape, { defaults,
+source, file })` answers `{ ok: true, value }` or `{ ok: false, error }`: it reads the whole
+environment and an optional dotenv file, converts each value to the kind the shape declares, and lists
+every problem without ever printing a value. `dotenv(text)` is exported too. It needs slate 0.1.22 or
+later.
+
+```slate
+import { env } from env
+import { stderr, exit } from slate:process
+
+type Config = { PORT: integer, DATABASE_URL: string, DEBUG?: boolean }
+
+val config = env(Config, { defaults: { PORT: "8080" }, file: ".env" }) match
+    { ok: true, value } -> value
+    { error } ->
+        stderr(error + "\n")
+        exit(1)
+```
+
+<https://github.com/slate-language/env>
 
 ## A page
 
