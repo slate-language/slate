@@ -73,3 +73,52 @@ try
     at(null, "length")
 catch e
     print(e.message)
+
+// -- `k in o`: true where `o[k]` finds a member, own or inherited --------------------------------------
+
+isIn(k, o) = k in o
+
+print(isIn("greet", g), isIn("shout", g), isIn("name", g), isIn("nope", g), has(g, "greet"))
+print(isIn("x", leaf), isIn("y", leaf), isIn("w", leaf), isIn(1, child), isIn([2, 3], child), isIn(9, child))
+print(isIn("toString", {}), isIn("test", Greeter), isIn("v", { v: null }))
+print(isIn(0, xs), isIn(3, xs), isIn(-1, xs), isIn("length", xs), isIn("nope", xs))
+print(isIn(4, "héllo"), isIn(5, "héllo"), isIn("upper", "abc"), isIn(1, toBytes("ab")), isIn("size", Set([1])))
+print("a" in { a: 1 } && !("b" in { a: 1 }), "a" + "" in { a: 1 }, "a" in { a: 1 } == true)
+
+for v in [null, 5, true, 2.5]
+    try
+        isIn("a", v)
+    catch e
+        print(e.message)
+
+for pair in [[1.5, xs], [1, Set([1])]]
+    try
+        isIn(pair[0], pair[1])
+    catch e
+        print(e.message)
+
+// -- `o[k](a)` passes the receiver `o.k(a)` would ---------------------------------------------------
+
+callAt(o, k, x) = o[k](x)
+
+print(callAt(g, "greet", 0) ?? "", g["greet"](), g[at({ m: "greet" }, "m")]())
+print(callAt({ f: x -> x * 3 }, "f", 2), callAt([x -> x + 1], 0, 1))
+
+var ys = [1]
+
+ys["push"](2)
+print(ys, ys["map"](x -> x * 10), "abc"["upper"](), g?.["greet"]())
+
+var shared = {}
+var holder = { proto: shared, tag: "t" }
+
+shared[1] = (self, x) -> self.tag + x
+holder[2] = x -> x + "!"
+
+print(holder[1]("a"), holder[2]("b"), holder["greet"] ?? "none")
+
+for k in ["nope", "shout"]
+    try
+        g[k]()
+    catch e
+        print(e.message)
