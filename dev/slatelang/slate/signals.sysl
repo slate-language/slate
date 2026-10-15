@@ -1,10 +1,8 @@
 module dev.slatelang.slate
 
 import sh.sysl.gc
+import sh.sysl.kairos.uv.Signals
 import sh.sysl.libuv
-
-// `close` and `unref` are `Handle` members, and a trait has to be in scope to reach one.
-import sh.sysl.libuv.Handle
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 
@@ -22,8 +20,9 @@ import sysl.buf.{Buf, buf}
 // dropped where it stood.
 //
 // **It is not a signal handler**, in the sense that word has in C. libuv catches the signal in
-// whatever way the platform allows and delivers it to the loop, so what runs here is an ordinary
-// slate function at an ordinary time, between one turn of the loop and the next. Nothing about it is
+// whatever way the platform allows and delivers it to the loop, where a kairos task waiting on the
+// watcher wakes in the same pass, so what runs here is an ordinary slate function at an ordinary
+// time, between one turn of the loop and the next. Nothing about it is
 // restricted to what is async-signal-safe: it may print, allocate, close a socket and start a timer,
 // which is exactly what a program shutting down needs to do.
 //
@@ -41,7 +40,9 @@ import sysl.buf.{Buf, buf}
 // the same. The alternative is worse than it looks: a script that installs a `SIGTERM` handler out
 // of habit would never end, and the reason would be invisible in the source.
 //
-// So a watcher is `unref`ed and its slot is **not** counted in `outstanding`. What keeps a server
+// So a watcher is put in kairos's **background** and its slot is **not** counted in `outstanding`.
+// A background watcher is not counted by the loop even while its task waits in `next`, and the task
+// is left parked rather than cancelled when nothing else is alive. What keeps a server
 // running is the server -- the listening socket's slot, exactly as before -- and the handler is
 // something that happens to be armed while it does.
 //
@@ -55,8 +56,10 @@ import sysl.buf.{Buf, buf}
 // Everything else about the arrangement is the same, and for the same reasons: the collector cannot
 // see through an ARC box, so a callback captures a `usize` into this table rather than the slate
 // closure it means to call, and the closure itself lives in the slot where the mark phase can reach
-// it. A `&libuv.Signal` is a counted box and may not live in the collected heap at all, so it lives
-// here too.
+// it. A `&Signals` is a counted box and may not live in the collected heap at all, so it lives here
+// too. The task that waits on it carries the slot, its generation and `run_stamp()` -- the
+// arrangement `net.sysl` uses for a reader -- so a task woken after its handler was stopped, or
+// after the program that armed it has ended, does nothing.
 
 // One signal being watched.
 //
@@ -71,7 +74,7 @@ struct Watch
     callback: Value
 
     // The watcher itself, kept alive here for as long as the program may still be sent the signal.
-    watcher: Option[&libuv.Signal]
+    watcher: Option[&Signals]
 
     // The signal's number, which `stop_watch` needs for the one signal whose default is put back.
     number: i32
@@ -133,9 +136,8 @@ end claim_watch
 
 // Stop watching, and give the slot back.
 //
-// **Closing is what stops it.** libuv takes a handle off the signal as it closes, so there is no
-// second call to make -- and a handle never closed is one the loop would wait on forever if it were
-// counted, which is the rule `event.sysl`'s `surrender` keeps for a timer and a socket.
+// **Closing is what stops it.** libuv takes a handle off the signal as it closes, and the task
+// waiting in `next` ends with `ECANCELED` and returns, so there is no second call to make.
 private stop_watch(id: usize)
     val v = current()
 
@@ -149,7 +151,7 @@ private stop_watch(id: usize)
     w.callback = Null
 
     w.watcher match
-        Some(s) -> s.close(() -> ())
+        Some(s) -> s.close()
         None -> ()
 
     w.watcher = None
@@ -265,25 +267,46 @@ end do_on_signal
 
 // Arm one watcher, and put the slate function that goes with it in the same slot.
 private watch_signal(number: i32, cb: Value, at: Span) -> Step
-    libuv.signal(event_loop()) match
+    current().io.signals(number) match
         Err(e) -> fault(at, s"this signal could not be watched: ${e}")
         Ok(s) ->
+            // **Armed, and not a reason to keep running.** See the header: a program with nothing
+            // but a handler in it ends, exactly as node's does.
+            s.background()
+
             val id = claim_watch(Watch(true, cb, Some(s), number, 0))
+            val gen = current().watches.at(id).gen
 
-            // **The closure captures the id and not the value**, which is the arrangement the
-            // collector needs: it cannot see through this box, so what the box holds must be
-            // something it does not have to see through.
-            s.start(number, (n: i32) -> fire_watch(id)) match
-                Err(e) ->
-                    stop_watch(id)
-                    fault(at, s"this signal could not be watched: ${e}")
-                Ok(_) ->
-                    // **Armed, and not a reason to keep running.** See the header: a program with
-                    // nothing but a handler in it ends, exactly as node's does.
-                    s.unref()
+            // **The task carries the id and not the value**, which is the arrangement the collector
+            // needs: it cannot see through a task, so what the task holds must be something it does
+            // not have to see through.
+            loop_events().spawn(signal_arrivals(s, id, gen, run_stamp()))
 
-                    Ok(Int(long(current().watches.at(id).gen)))
+            Ok(Int(long(gen)))
 end watch_signal
+
+// The task `watch_signal` spawns: one handler call per arrival, for as long as the slot is this one.
+//
+// **It ends three ways and each is a `return`**: the watcher closed under it (`offSignal`, or a
+// reset's `forget_watches`), which `next` answers with `ECANCELED`; the program that armed it having
+// been given back, which the stamp says; and the slot having been spent and taken by somebody else,
+// which the generation says.
+private async signal_arrivals(s: &Signals, id: usize, gen: usize, stamp: usize)
+    loop
+        val got = await s.next()
+
+        if !same_run(stamp) then return
+
+        got match
+            Err(_) -> return
+            Ok(_) -> ()
+
+        val watches = current().watches
+
+        if id >= watches.len() || !watches.at(id).live || watches.at(id).gen != gen then return
+
+        fire_watch(id)
+end signal_arrivals
 
 // `offSignal(id)` -- stop the handler that id names, and go back to whatever the signal did before.
 //
