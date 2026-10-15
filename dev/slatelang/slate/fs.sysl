@@ -8,9 +8,14 @@ import sysl.text.from_utf8
 // The file system, as promises.
 //
 // **Nothing here is new machinery, which is the point.** A file read is `sleep`'s shape with a
-// different handle: claim a slot that roots a promise, hand libuv a closure capturing the slot's id,
-// and settle the promise when the answer comes back. `await` was what needed the machine; this needed
-// only the promises the machine already made possible.
+// different handle: claim a slot that roots a promise, hand the loop a kairos task whose last step
+// calls a closure capturing the slot's id, and settle the promise when the answer comes back.
+// `await` was what needed the machine; this needed only the promises the machine already made
+// possible.
+//
+// **The asynchronous half is kairos's `uv` driver and the blocking half is still libuv's own `*_sync`
+// calls**, kairos being asynchronous only. Both report a `libuv.Error` -- kairos's `Error` is that
+// type -- so a failure reads the same sentence whichever half met it.
 //
 // **Both forms are here, and the asynchronous one is the default.** Every call has a promise-shaped
 // version under its plain name and a blocking one under a `Sync` suffix, which is node's arrangement
@@ -44,20 +49,20 @@ import sysl.text.from_utf8
 read_file_promise(path: string, at: Span) -> Step
     val id = begin_request()
 
-    request_started(id, at, s"cannot read ${path}", libuv.read_file(path, (r) ->
+    on_fs(id, current().io.read_file(path), (r) ->
         r match
             Err(e) -> refuse_request(id, at, s"cannot read ${path}", e)
             Ok(bytes) ->
                 from_utf8(bytes) match
                     Ok(text) -> answer_request(id, str_value(text))
-                    Err(_) -> deny_request(id, at, s"${path} is not text -- `readBytes` reads a file that is not")))
+                    Err(_) -> deny_request(id, at, s"${path} is not text -- `readBytes` reads a file that is not"))
 end read_file_promise
 
 // `readBytes(path)` -- the whole of a file, as an array of numbers.
 read_bytes_promise(path: string, at: Span) -> Step
     val id = begin_request()
 
-    request_started(id, at, s"cannot read ${path}", libuv.read_file(path, (r) ->
+    on_fs(id, current().io.read_file(path), (r) ->
         r match
             Err(e) -> refuse_request(id, at, s"cannot read ${path}", e)
             Ok(bytes) ->
@@ -68,16 +73,17 @@ read_bytes_promise(path: string, at: Span) -> Step
                 var payload: Buf[u8] = buf()
 
                 payload.extend(bytes)
-                answer_request(id, bytes_value(payload))))
+                answer_request(id, bytes_value(payload)))
 end read_bytes_promise
 
 // `writeFile(path, text)` -- the whole of a file, replaced.
 //
-// **Composed here from open, write and close rather than taken from the binding**, which has a
-// `write_file_sync` and no asynchronous whole-file write. Each step's callback carries only the id
-// and the span, so the chain needs nothing rooted that the slot does not already root.
+// **kairos's `write_file` is the open, the writes and the close in one task**, and it writes until
+// every byte is taken, so a short write is carried on from rather than reported. The closure it ends
+// in carries only the id and the span, so the chain needs nothing rooted that the slot does not
+// already root.
 write_file_promise(path: string, text: string, at: Span) -> Step =
-    put_file_promise(path, held_bytes(text.bytes), libuv.O_TRUNC, at)
+    put_file_promise(path, held_bytes(text.bytes), false, at)
 
 // `appendFile(path, text)` -- the same, with the text added to what is there.
 //
@@ -86,7 +92,7 @@ write_file_promise(path: string, text: string, at: Span) -> Step =
 // overwrite one another and nothing has to hold the whole file to add a line to it. A log is what
 // this is for.
 append_file_promise(path: string, text: string, at: Span) -> Step =
-    put_file_promise(path, held_bytes(text.bytes), libuv.O_APPEND, at)
+    put_file_promise(path, held_bytes(text.bytes), true, at)
 
 // `writeBytes(path, bytes)` -- the whole of a file, replaced, given the bytes themselves.
 //
@@ -96,18 +102,18 @@ append_file_promise(path: string, text: string, at: Span) -> Step =
 // as text or could not write it at all. `send` already read an array as bytes and this is the same
 // reading on the other side of the machine.
 write_bytes_promise(path: string, payload: Buf[u8], at: Span) -> Step =
-    put_file_promise(path, payload, libuv.O_TRUNC, at)
+    put_file_promise(path, payload, false, at)
 
 // `appendBytes(path, bytes)` -- the same bytes at the end of a file.
 append_bytes_promise(path: string, payload: Buf[u8], at: Span) -> Step =
-    put_file_promise(path, payload, libuv.O_APPEND, at)
+    put_file_promise(path, payload, true, at)
 
 // A slice copied into a buffer the chain below can hold on to.
 //
 // **A `Buf` is what the closure captures, and a slice would not do.** A capture is by value, and a
 // `Buf` copied that way carries the `[]u8` it is over -- which is counted, so the storage outlives
 // the frame that made it. A bare `[]const u8` read off a string would go the moment the caller
-// returned, and the write happens inside a callback that runs long afterwards.
+// returned, and the write happens inside a task that runs long afterwards.
 private held_bytes(xs: []const u8) -> Buf[u8]
     var out: Buf[u8] = buf()
 
@@ -115,43 +121,36 @@ private held_bytes(xs: []const u8) -> Buf[u8]
     out
 end held_bytes
 
-// The four of them, differing in one flag and in where the bytes came from.
-private put_file_promise(path: string, payload: Buf[u8], mode: int, at: Span) -> Step
+// The four of them, differing in whether the bytes go at the end and in where they came from.
+//
+// The file is closed either way, and the answer waits for the close: a program that writes and then
+// reads back would otherwise race its own close. kairos's two whole-file writes both do that.
+private put_file_promise(path: string, payload: Buf[u8], appending: bool, at: Span) -> Step
     val id = begin_request()
-    val what = s"cannot write ${path}"
-    val flags = libuv.O_WRONLY | libuv.O_CREAT | mode
-    val wanted = payload.len()
 
-    request_started(id, at, what, libuv.open(path, (opened) ->
-        opened match
-            Err(e) -> refuse_request(id, at, what, e)
-            Ok(f) ->
-                request_continued(id, at, what, libuv.write(f, payload.view(), (written) ->
-                    written match
-                        Err(e) ->
-                            libuv.close(f)
-                            refuse_request(id, at, what, e)
-                        Ok(n) ->
-                            if n != wanted
-                                libuv.close(f)
-                                deny_request(id, at, s"${what}: only ${n} of ${wanted} bytes were taken")
-                            else
-                                // The file is closed either way, and the answer waits for it: a
-                                // program that writes and then reads back would otherwise race its
-                                // own close.
-                                request_continued(id, at, what, libuv.close(f, (shut) ->
-                                    shut match
-                                        Err(e) -> refuse_request(id, at, what, e)
-                                        Ok(_) -> answer_request(id, Null)))))
-        , flags))
+    on_fs(id, put_file(path, payload, appending), (r) ->
+        r match
+            Err(e) -> refuse_request(id, at, s"cannot write ${path}", e)
+            Ok(_) -> answer_request(id, Null))
 end put_file_promise
+
+// The write itself, as a task that OWNS the buffer.
+//
+// **The `Buf` is a parameter of the task and not a slice handed to kairos**, because a task is a
+// frame that outlives the call that made it: the frame holds the buffer, the buffer holds its counted
+// storage, and the slice kairos writes from is read off it only once the task is running.
+private async put_file(path: string, payload: Buf[u8], appending: bool) -> Result[unit, libuv.Error]
+    if appending
+        await current().io.append_file(path, payload.view())
+    else
+        await current().io.write_file(path, payload.view())
 
 // `readDir(path)` -- the names in a directory, without `.` and `..`.
 read_dir_promise(path: string, at: Span) -> Step
     val id = begin_request()
     val what = s"cannot list ${path}"
 
-    request_started(id, at, what, libuv.scandir(path, (r) ->
+    on_fs(id, current().io.scandir(path), (r) ->
         r match
             Err(e) -> refuse_request(id, at, what, e)
             Ok(entries) ->
@@ -160,7 +159,7 @@ read_dir_promise(path: string, at: Span) -> Step
                 for i in 0..<entries.len
                     items.push(str_value(entries[i].name))
 
-                answer_request(id, Array(new_array(items)))))
+                answer_request(id, Array(new_array(items))))
 end read_dir_promise
 
 // `stat(path)` -- what the file system knows about a path.
@@ -171,7 +170,7 @@ stat_promise(path: string, at: Span) -> Step
     val id = begin_request()
     val what = s"cannot stat ${path}"
 
-    request_started(id, at, what, libuv.stat(path, (r) ->
+    on_fs(id, current().io.stat(path), (r) ->
         r match
             Err(e) -> refuse_request(id, at, what, e)
             Ok(st) ->
@@ -189,7 +188,7 @@ stat_promise(path: string, at: Span) -> Step
                 // it, and neither would work on a count of seconds.
                 obj_put_name(o, "modified", InstantVal(st.mtime.seconds * 1000000 + st.mtime.nanos / 1000))
                 release(mark)
-                answer_request(id, Object(o))))
+                answer_request(id, Object(o)))
 end stat_promise
 
 // `exists(path)` -- whether a path is there at all.
@@ -200,10 +199,10 @@ end stat_promise
 exists_promise(path: string, at: Span) -> Step
     val id = begin_request()
 
-    request_started(id, at, s"cannot reach ${path}", libuv.stat(path, (r) ->
+    on_fs(id, current().io.stat(path), (r) ->
         r match
             Err(_) -> answer_plain_request(id, Bool(false))
-            Ok(_) -> answer_plain_request(id, Bool(true))))
+            Ok(_) -> answer_plain_request(id, Bool(true)))
 end exists_promise
 
 // `remove(path)` -- a file, not a directory.
@@ -211,10 +210,10 @@ remove_promise(path: string, at: Span) -> Step
     val id = begin_request()
     val what = s"cannot remove ${path}"
 
-    request_started(id, at, what, libuv.unlink(path, (r) ->
+    on_fs(id, current().io.unlink(path), (r) ->
         r match
             Err(e) -> refuse_request(id, at, what, e)
-            Ok(_) -> answer_request(id, Null)))
+            Ok(_) -> answer_request(id, Null))
 end remove_promise
 
 // `mkdir(path)` -- one directory, whose parent must be there.
@@ -222,10 +221,10 @@ mkdir_promise(path: string, at: Span) -> Step
     val id = begin_request()
     val what = s"cannot make ${path}"
 
-    request_started(id, at, what, libuv.mkdir(path, (r) ->
+    on_fs(id, current().io.mkdir(path), (r) ->
         r match
             Err(e) -> refuse_request(id, at, what, e)
-            Ok(_) -> answer_request(id, Null)))
+            Ok(_) -> answer_request(id, Null))
 end mkdir_promise
 
 // `rmdir(path)` -- one directory, which must be empty.
@@ -233,10 +232,10 @@ rmdir_promise(path: string, at: Span) -> Step
     val id = begin_request()
     val what = s"cannot remove ${path}"
 
-    request_started(id, at, what, libuv.rmdir(path, (r) ->
+    on_fs(id, current().io.rmdir(path), (r) ->
         r match
             Err(e) -> refuse_request(id, at, what, e)
-            Ok(_) -> answer_request(id, Null)))
+            Ok(_) -> answer_request(id, Null))
 end rmdir_promise
 
 // `rename(from, to)`.
@@ -244,11 +243,28 @@ rename_promise(from: string, to: string, at: Span) -> Step
     val id = begin_request()
     val what = s"cannot rename ${from}"
 
-    request_started(id, at, what, libuv.rename(from, to, (r) ->
+    on_fs(id, current().io.rename(from, to), (r) ->
         r match
             Err(e) -> refuse_request(id, at, what, e)
-            Ok(_) -> answer_request(id, Null)))
+            Ok(_) -> answer_request(id, Null))
 end rename_promise
+
+// Hand `t` to the kairos loop and its answer to `done`, and answer the promise slot `id` roots.
+//
+// **`done` is called from the task's last step, on this thread, inside a pass** -- where the libuv
+// callback used to be -- so a promise settles in the same place relative to the microtasks it always
+// did: never during the call that started it, always between two passes of the drain.
+//
+// **A request kairos refuses to start is reported through the task like any other failure**, rather
+// than on the spot as `request_started` did, so its promise settles a pass later and with the same
+// sentence. Nothing a program can observe depends on which pass that is.
+private on_fs[T](id: usize, t: Task[Result[T, libuv.Error]], done: &Fn(Result[T, libuv.Error]) -> unit) -> Step
+    loop_events().spawn(answered(t, done))
+    Ok(awaited_request(id))
+
+// The task `on_fs` spawns: wait for the file-system task, then hand its answer over.
+private async answered[T](t: Task[Result[T, libuv.Error]], done: &Fn(Result[T, libuv.Error]) -> unit)
+    done(await t)
 
 // -- the same ten, blocking -------------------------------------------------------------------------
 
