@@ -257,14 +257,17 @@ dead actor's handle is still a value** — it prints, it compares, it can be sto
 deliver.
 
 **Per sender, in order. Between senders, no order at all.** Two `send`s from one actor arrive in the
-order they were written; a `send` from A and a `send` from B race.
+order they were written; a `send` from A and a `send` from B race. So a program that wants one actor's
+message to have landed before its own asks for it to: below, the worker `ask`s the boss and the program
+`ask`s the worker, so by the time the program asks for the count the enrolment has been served. A
+`send` and a `sleep` in their place would be a guess about how long a thread takes to start.
 
 ```slate
-import { spawn, send, ask, me } from slate:actor
+import { spawn, ask, me } from slate:actor
 
 actor Worker
-    on introduce(self, boss)
-        send(boss.enrol, me())
+    async on introduce(self, boss)
+        await ask(boss.enrol, me())
 
 actor Boss
     var seen = []
@@ -277,9 +280,7 @@ actor Boss
 val b = spawn(Boss)
 val w = spawn(Worker)
 
-send(w.introduce, b)
-
-await sleep(50)
+await ask(w.introduce, b)
 print(await ask(b.count))
 ```
 
