@@ -630,6 +630,16 @@ no JavaScript host letting a program add a certificate authority for one request
 rule is the host's** — the interpreter follows at most five and refuses one that leaves `https` for
 `http`, where a browser follows them itself and gives a page no way in.
 
+**An `https` fetch speaks HTTP/2 where the server offers it**, the client offering `h2` and
+`http/1.1` in the TLS handshake and the server choosing; a server that chooses `http/1.1`, or names
+nothing, is spoken to in HTTP/1.1 exactly as before. Plain `http` is always HTTP/1.1, there being no
+HTTP/2 in the clear, which is what browsers do too. **Nothing about the answer says which was
+spoken**: the status, the headers, `timeout`, `stream`, the decoding and the redirects are the same
+on both. A stream the server resets, a GOAWAY that leaves the request unanswered and a frame that
+breaks the protocol each answer `{ ok: false, error }` with a sentence that says which —
+*"the server reset the request for https://example.com/ (INTERNAL_ERROR)"*. Under `slate js` the
+version is the host's choice. A build without the `http2` feature speaks HTTP/1.1 alone.
+
 **A response header that repeats is joined with `", "`**, on both. An object has one value per name
 and HTTP does not: `Link`, `Vary` and `Via` all repeat, and combining them is what RFC 9110 allows
 and what a browser's `Headers` hands over already done.

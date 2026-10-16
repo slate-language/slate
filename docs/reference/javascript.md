@@ -517,6 +517,11 @@ URL specification says they mean rather than what a second reading of it written
 node and the interpreter the same call answers *"`/signup` is not an http or https URL, and there is
 no page to resolve it against"* — the same sentence with the missing half named.
 
+**Which HTTP version a request goes over is the host's choice here**: a browser speaks HTTP/2 or
+HTTP/3 wherever the server offers it, and node's `fetch` speaks HTTP/1.1. The interpreter offers
+`h2` over TLS and falls back to HTTP/1.1. The answer has the same shape whichever was spoken, and
+no host says which it was.
+
 **`timeout` is the same option on both**, an `AbortController` here and the loop's own timer in the
 interpreter, cancelled the moment the answer is whole on either, with one sentence for a fetch it
 stopped. `AbortSignal.timeout` is not what is under it: its timer cannot be cancelled.
