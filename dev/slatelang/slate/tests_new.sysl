@@ -1,0 +1,184 @@
+module dev.slatelang.slate
+@tests
+
+import sh.sysl.libuv
+import sh.sysl.parsing.{source_of}
+import sysl.buf.{Buf, buf}
+import sysl.fs.{entries, exists, make_dir_all, read_bytes, write_text}
+import sysl.text.{Search, from_utf8_unchecked}
+
+// `slate new --template <template> <directory>`: what it writes, and the three ways it refuses.
+
+// A directory of its own under `/tmp`, empty, for one test to make a project in.
+fresh_base() -> string = libuv.mkdtemp_sync("/tmp/slate-new-XXXXXX").unwrap()
+
+text_at(path: string) -> string =
+    read_bytes(path) match
+        Ok(b) -> from_utf8_unchecked(b)
+        Err(_) -> "(missing)"
+
+// Every file the template writes, by its path inside the project.
+sluice_files() -> []string =
+    ["package.sl", ".env", ".gitignore", "README.md", "main.sl", "wiring.sl", "routes.sl", "store.sl",
+     "migrate.sl", "migrations/0001_users_and_notes.up.sql", "migrations/0001_users_and_notes.down.sql",
+     "tests/routes.sl", "tests/memory.sl"]
+
+@test
+slate_new_WRITES_THE_SLUICE_TEMPLATE_AND_SAYS_WHAT_TO_DO_NEXT()
+    val base = fresh_base()
+    val dir = s"${base}/shop"
+    val said = cli_said(["slate", "new", "--template", "sluice", dir])
+    val status = cli_status(["slate", "new", "--template", "sluice", s"${base}/other"])
+    val files = sluice_files()
+    var missing = ""
+    var unnamed = ""
+    var unparsed = ""
+
+    for i in 0..<files.len
+        val path = s"${dir}/${files[i]}"
+        val text = text_at(path)
+
+        if text == "(missing)" || text == "" || !text.ends_with("\n") then missing = missing + " " + files[i]
+        if text.contains("@NAME@") then unnamed = unnamed + " " + files[i]
+
+        // **Every program in the template is read as slate reads it**, so a template that would not
+        // parse is caught here rather than by the first person to run `slate new`.
+        if files[i].ends_with(".sl") && files[i] != "package.sl" && !parse(source_of(path, text)).ok()
+            unparsed = unparsed + " " + files[i]
+
+    val manifest = read_project_text("package.sl", text_at(s"${dir}/package.sl"))
+    val written = entries(dir).unwrap().len()
+
+    scrub(base)
+
+    assert_eq(status, 0)
+    assert_eq(missing, "")
+    assert_eq(unnamed, "")
+    assert_eq(unparsed, "")
+
+    // Nothing but the template: the files above, two of them in directories.
+    assert_eq(written, files.len - 4 + 2)
+
+    // **The manifest is one slate reads cleanly, named after the directory**, with the three
+    // packages the starter is built on.
+    assert(manifest.ok())
+    assert_eq(manifest.project.name, "shop")
+    assert_eq(manifest.project.dependencies.len(), 3)
+    assert_eq(manifest.project.dependencies.at(0).name, "sluice")
+    assert_eq(manifest.project.dependencies.at(1).name, "env")
+    assert_eq(manifest.project.dependencies.at(2).name, "pg")
+
+    // **What to do next is said in the order it has to be done.**
+    assert(said.starts_with(s"made ${dir} from the `sluice` template"))
+    assert(said.contains(s"cd ${dir}"))
+
+    val install = said.index_of("slate install").unwrap_or(9999)
+    val createdb = said.index_of("createdb shop").unwrap_or(9999)
+    val migrate = said.index_of("slate run migrate").unwrap_or(9999)
+    val watch = said.index_of("slate run --watch main.sl").unwrap_or(9999)
+
+    assert(install < createdb && createdb < migrate && migrate < watch && watch < 9999)
+    assert(said.contains("slate test tests"))
+
+@test
+THE_DATABASE_THE_TEMPLATE_NAMES_IS_THE_PROJECT_S_OWN()
+    val base = fresh_base()
+    val dir = s"${base}/my_app"
+    val status = cli_status(["slate", "new", "--template", "sluice", dir])
+    val env = text_at(s"${dir}/.env")
+    val readme = text_at(s"${dir}/README.md")
+
+    scrub(base)
+
+    assert_eq(status, 0)
+    assert(env.contains("DATABASE_URL=postgres://localhost/my_app\n"))
+    assert(readme.starts_with("# my_app\n"))
+    assert(readme.contains("createdb my_app\n"))
+
+@test
+AN_EMPTY_DIRECTORY_IS_WRITTEN_INTO()
+    val base = fresh_base()
+    val status = cli_status(["slate", "new", "--template", "sluice", base])
+    val there = exists(s"${base}/main.sl")
+
+    scrub(base)
+
+    assert_eq(status, 0)
+    assert(there)
+
+@test
+AN_UNKNOWN_TEMPLATE_IS_REFUSED_NAMING_THE_TEMPLATES_THERE_ARE()
+    val base = fresh_base()
+    val dir = s"${base}/shop"
+    val args: []string = ["slate", "new", "--template", "rails", dir]
+    val said = cli_said(args)
+    val status = cli_status(args)
+    val made = exists(dir)
+
+    scrub(base)
+
+    assert_eq(status, 2)
+    assert_eq(said, "slate: there is no template called `rails` -- the templates are `sluice`")
+    assert(!made)
+
+@test
+A_DIRECTORY_THAT_IS_THERE_AND_NOT_EMPTY_IS_REFUSED_AND_LEFT_ALONE()
+    val base = fresh_base()
+    val dir = s"${base}/shop"
+
+    make_dir_all(dir).unwrap()
+    write_text(s"${dir}/main.sl", "print(\"mine\")\n").unwrap()
+
+    val args: []string = ["slate", "new", "--template", "sluice", dir]
+    val said = cli_said(args)
+    val status = cli_status(args)
+    val kept = text_at(s"${dir}/main.sl")
+    val written = exists(s"${dir}/package.sl")
+
+    scrub(base)
+
+    assert_eq(status, 1)
+    assert_eq(said, s"slate: `${dir}` is already there and is not empty, and `slate new` writes only into a new or empty directory")
+    assert_eq(kept, "print(\"mine\")\n")
+    assert(!written)
+
+@test
+A_FILE_WHERE_THE_DIRECTORY_WOULD_GO_IS_REFUSED()
+    val base = fresh_base()
+    val dir = s"${base}/shop"
+
+    write_text(dir, "a file\n").unwrap()
+
+    val status = cli_status(["slate", "new", "--template", "sluice", dir])
+    val kept = text_at(dir)
+
+    scrub(base)
+
+    assert_eq(status, 1)
+    assert_eq(kept, "a file\n")
+
+@test
+THE_COMMAND_LINE_IS_CHECKED_BEFORE_ANYTHING_IS_WRITTEN()
+    val base = fresh_base()
+    val dir = s"${base}/shop"
+    val untemplated = cli_said(["slate", "new", dir])
+    val untemplated_status = cli_status(["slate", "new", dir])
+    val nowhere = cli_status(["slate", "new", "--template", "sluice"])
+    val twice = cli_status(["slate", "new", "--template", "sluice", dir, s"${base}/again"])
+    val flag = cli_status(["slate", "new", "--force", "--template", "sluice", dir])
+    val dangling = cli_said(["slate", "new", dir, "--template"])
+    val badly = cli_said(["slate", "new", "--template", "sluice", s"${base}/9lives"])
+    val badly_status = cli_status(["slate", "new", "--template", "sluice", s"${base}/no way"])
+    val made = entries(base).unwrap().len()
+
+    scrub(base)
+
+    assert_eq(untemplated_status, 2)
+    assert(untemplated.starts_with("slate: `slate new` takes a template: the templates are `sluice`"))
+    assert_eq(nowhere, 2)
+    assert_eq(twice, 2)
+    assert_eq(flag, 2)
+    assert_eq(dangling, "slate: `--template` takes the name of one: the templates are `sluice`")
+    assert(badly.starts_with("slate: `9lives` is not a name a project can have"))
+    assert_eq(badly_status, 2)
+    assert_eq(made, 0)

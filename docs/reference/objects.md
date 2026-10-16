@@ -276,7 +276,8 @@ print(c.bump(), c.bump())
 That is not two rules but one: **captured methods take no receiver, shared ones must.**
 
 **Only a call passes a receiver: `o.m(...)`, and `o[k](...)` exactly where `o.k(...)` would**, which is
-JavaScript's rule. `o.m` on its own hands back the bare function, so taking a method off an object and
+JavaScript's rule — guarded or not, so `o.m?.(...)` and `o[k]?.(...)` pass it too
+([expressions](expressions.md)). `o.m` on its own hands back the bare function, so taking a method off an object and
 calling it later is allowed and gives you what you took — and `o["m"]` is the same bare function:
 
 ```slate

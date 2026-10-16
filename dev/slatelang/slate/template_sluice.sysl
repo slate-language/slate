@@ -1,0 +1,553 @@
+module dev.slatelang.slate
+
+import sysl.buf.{Buf, buf}
+
+// The `sluice` template: a JSON API on sluice over PostgreSQL, in a dozen small files.
+//
+// **The files are text carried in the binary**, as the built-in modules written in slate are, so
+// `slate new` needs no network and no file beside the executable, and a template is always the one
+// that matches the slate that wrote it. `new.sysl` writes them; `@NAME@` is the project's name.
+//
+// **What it shows is the arrangement, not a domain**: `wiring.sl` composes the pieces by calling
+// functions, `routes.sl` is written against a store of plain functions and knows no database, and
+// `tests/` drives every route over a store made of arrays -- so the generated project's own
+// `slate test tests` passes before a database exists. The notes are there only to have something
+// for `app.resource` to serve.
+//
+// **The three versions below are what the template was last checked against**, with that project's
+// own `slate test tests` and a live run; a new release of any of them is a change made here.
+
+// Not `private`: `new.sysl` names the template's files through it.
+sluice_template() -> Buf[Planted]
+    var out: Buf[Planted] = buf()
+
+    out.push(Planted("package.sl", sluice_manifest()))
+    out.push(Planted(".env", sluice_env()))
+    out.push(Planted(".gitignore", ".env\nvendor/\n"))
+    out.push(Planted("README.md", sluice_readme()))
+    out.push(Planted("main.sl", sluice_main()))
+    out.push(Planted("wiring.sl", sluice_wiring()))
+    out.push(Planted("routes.sl", sluice_routes()))
+    out.push(Planted("store.sl", sluice_store()))
+    out.push(Planted("migrate.sl", sluice_migrate()))
+    out.push(Planted("migrations/0001_users_and_notes.up.sql", sluice_up()))
+    out.push(Planted("migrations/0001_users_and_notes.down.sql", "drop table notes;\ndrop table users;\n"))
+    out.push(Planted("tests/routes.sl", sluice_tests()))
+    out.push(Planted("tests/memory.sl", sluice_memory()))
+
+    out
+end sluice_template
+
+private sluice_manifest() -> string = raw"""
+    {
+        name: "@NAME@",
+        version: "0.1.0",
+
+        dependencies: {
+            // The API server: routes, groups, resources, sessions and signing in.
+            sluice: { git: "github.com/slate-language/sluice", version: "0.8.0" },
+            // The configuration, read from the environment and `.env` and checked against a type.
+            env: { git: "github.com/slate-language/env", version: "0.1.0" },
+            // PostgreSQL, on the same loop that answers HTTP, and the migrations.
+            pg: { git: "github.com/slate-language/pg", version: "0.8.0" },
+        },
+
+        // `slate run <name>`.
+        scripts: {
+            migrate: "migrate.sl up",
+            rollback: "migrate.sl down",
+            dev: "slate run --watch main.sl",
+            test: "slate test tests",
+        },
+    }
+    """
+
+private sluice_env() -> string = raw"""
+    # The settings `wiring.sl` reads while developing. The environment wins over this file, so a
+    # deployment sets the same names and ships no file. Add SECRET=... to keep sessions across restarts.
+    PORT=3000
+    DATABASE_URL=postgres://localhost/@NAME@
+    """
+
+private sluice_readme() -> string = raw"""
+    # @NAME@
+
+    A JSON API on [sluice](https://github.com/slate-language/sluice), over PostgreSQL.
+
+    ```
+    slate install
+    createdb @NAME@
+    slate run migrate
+    slate run --watch main.sl
+    ```
+
+    `slate test tests` runs the tests, which need no database.
+
+    | | |
+    |---|---|
+    | `main.sl` | starts the server, and drains it on `SIGTERM` |
+    | `wiring.sl` | what the application is made of: the configuration, the database, the app |
+    | `routes.sl` | the application as HTTP: signing up, in and out, and the notes |
+    | `store.sl` | the SQL, and the only file that knows a statement |
+    | `migrations/` | the tables, applied by `slate run migrate` (`migrate.sl`) |
+    | `.env` | the settings while developing; the environment wins over it |
+    | `tests/` | every route, over a store made of arrays |
+
+    Try it:
+
+    ```
+    curl -c jar -b jar -d '{"name":"ada","password":"secret"}' localhost:3000/signup
+    curl -c jar -b jar -d '{"title":"first","text":"hello"}' localhost:3000/api/notes
+    curl -c jar -b jar localhost:3000/api/notes
+    ```
+    """
+
+private sluice_main() -> string = raw"""
+    // The server.
+    //
+    //     slate run --watch main.sl
+    //
+    // This file only starts things: `wiring.sl` says what the application is made of, `routes.sl` is
+    // the application as HTTP, and `store.sl` is the SQL.
+
+    import { onShutdown } from sluice
+    import { serve } from slate:http
+    import { localPort } from slate:net
+    import { exit, stderr } from slate:process
+
+    import { assembled, configured, opened } from "./wiring.sl"
+
+    async main()
+        val config = configured() match
+            { ok: true, value } -> value
+            { error } ->
+                stderr(error + "\n")
+                exit(1)
+
+        val got = await opened(config)
+
+        if !got.ok
+            stderr("no database: " + got.error + "\n")
+            stderr("make it with `createdb`, then `slate run migrate`\n")
+            exit(1)
+
+        val store = got.value
+        val app = assembled(store, config)
+        val server = serve(config.PORT, app)
+
+        // **A stop is a drain**: new requests are refused, what is in hand finishes, and only then are
+        // the socket and the database let go. `slate run --watch` stops it this way on every save.
+        onShutdown(() -> stopping(app, server, store))
+
+        print("listening on http://localhost:" + string(localPort(server)))
+
+        for r in app.routes()
+            print(" ", r.method, r.path)
+
+    async stopping(app: object, server, store: object)
+        await app.drain(server, { grace: 5000 })
+        await store.close()
+
+    main()
+    """
+
+private sluice_wiring() -> string = raw"""
+    // What the application is made of: the configuration, the database, and the app over them.
+    //
+    // **There is no container and nothing is looked up by name.** Each piece is made by calling a
+    // function with the pieces it needs, so what depends on what is written down here and nowhere else
+    // -- and a test builds the same application over a store of its own by calling `application` itself.
+
+    import { env } from env
+    import { pool } from pg
+    import { memoryStore } from sluice
+    import { randomBytes } from slate:crypto
+    import { stderr } from slate:process
+    import { base64urlEncode } from slate:url
+
+    import { application } from "./routes.sl"
+    import { postgres } from "./store.sl"
+
+    // The configuration. **Its keys are the variable names**: `.env` sets them while developing and the
+    // environment wins over it, so a deployment sets the same names and ships no file.
+    type Config = { PORT: 0..65535, DATABASE_URL: string, SECRET?: string }
+
+    export configured() -> object = env(Config, { defaults: { PORT: "3000" }, file: ".env" })
+
+    // The database, as the store `routes.sl` is written against.
+    export async opened(config: object) -> object
+        val made = await pool(config.DATABASE_URL)
+
+        if !made.ok then return made
+
+        { ok: true, value: postgres(made.value) }
+
+    // The application over a store.
+    export assembled(store: object, config: object) -> object
+        application(store, { secret: config.SECRET ?? madeUp(), sessions: memoryStore() })
+
+    // **A key made up per run signs everybody out on every restart**, which is fine on the machine you
+    // are developing on and nowhere else -- so it is said, and a deployment sets `SECRET`.
+    madeUp() -> string
+        stderr("no SECRET: signing sessions with a key this run made up\n")
+
+        base64urlEncode(randomBytes(32))
+    """
+
+private sluice_routes() -> string = raw"""
+    // The application as HTTP.
+    //
+    // **It is written against a store -- an object of functions, each answering a result -- and knows
+    // no database**, so `tests/` drives every route here over arrays, with no server and no port.
+
+    import { api, body, json, login, logout, problem, session, signedIn } from sluice
+    import { argon2, argon2Verify } from slate:crypto
+
+    type Credentials = { name: string, password: string }
+    type NewNote = { title: string, text: string }
+
+    // `options` is `{ secret, sessions }`: the key a session cookie is signed with, and where sessions
+    // are kept.
+    export application(store: object, options: object) -> object
+        val app = api()
+        val known = session(options.secret, { store: options.sessions })
+
+        app.get("/", (req) -> json({ ok: true }))
+
+        app.post("/signup", known(body(Credentials, (req) -> signingUp(store, req))))
+        app.post("/signin", known(body(Credentials, (req) -> signingIn(store, req))))
+        app.post("/signout", known((req) -> signingOut(req)))
+
+        // **Everything under `/api` needs somebody signed in**: the group's guards are outside every
+        // route it adds, and `signedIn` answers a `401` for a request with nobody behind it.
+        val signed = signedIn((id) -> userOf(store, id))
+
+        app.group("/api", [known, signed], (r) -> r.resource("/notes", notes(store), { apiOnly: true }),
+                  { name: "api" })
+
+        app
+
+    // The notes resource: `GET /api/notes`, `POST /api/notes`, `GET /api/notes/:id` and
+    // `DELETE /api/notes/:id`, each answering for the signed-in user's own notes only.
+    notes(store: object) -> object
+        async index(req)
+            json(answer(await store.notesOf(req.user.id)))
+
+        async show(req)
+            val note = answer(await store.noteOf(req.user.id, req.params.id))
+
+            if note == null then missing(req) else json(note)
+
+        async create(req)
+            json(answer(await store.addNote(req.user.id, req.body.title, req.body.text)), 201)
+
+        async destroy(req)
+            if answer(await store.removeNote(req.user.id, req.params.id)) then { status: 204 } else missing(req)
+
+        { index: index, show: show, store: body(NewNote, create), destroy: destroy }
+
+    async signingUp(store: object, req)
+        val made = await store.addUser(req.body.name, await argon2(req.body.password))
+
+        if !made.ok && made.code == "23505" then return problem(409, "Conflict", "that name is taken")
+
+        val user = answer(made)
+
+        login(req, user)
+
+        json(user, 201)
+
+    async signingIn(store: object, req)
+        val found = answer(await store.userNamed(req.body.name))
+
+        if found == null || !(await argon2Verify(found.hash, req.body.password))
+            return problem(401, "Unauthorized", "that name and password do not go together")
+
+        login(req, found)
+
+        json({ id: found.id, name: found.name })
+
+    signingOut(req)
+        logout(req)
+
+        { status: 204 }
+
+    // The user a session names, or `null` for one who is gone.
+    async userOf(store: object, id)
+        answer(await store.userById(id))
+
+    missing(req) = problem(404, "Not Found", "there is no note " + req.params.id)
+
+    // **A store that cannot answer is a defect and not a client's mistake**, so it is a fault, which
+    // sluice answers with a `500`. The one refusal a route reads -- a name already taken -- is read
+    // before this is asked.
+    answer(r: object)
+        if !r.ok then throw r.error
+
+        r.value
+    """
+
+private sluice_store() -> string = raw"""
+    // The store `routes.sl` is written against, over PostgreSQL. **This is the only file that knows a
+    // statement.** Every function answers `{ ok: true, value }` or `pg`'s own `{ ok: false, error, code }`.
+    //
+    // The tables are in `migrations/`, applied with `slate run migrate`.
+
+    export postgres(db: object) -> object
+        async one(sql: string, ...values) -> object
+            val r = await db.query(sql, ...values)
+
+            if r.ok then { ok: true, value: r.value.rows[0] ?? null } else r
+
+        async all(sql: string, ...values) -> object
+            val r = await db.query(sql, ...values)
+
+            if r.ok then { ok: true, value: r.value.rows } else r
+
+        async userNamed(name: string) = await one("select id, name, hash from users where name = $1", name)
+
+        async userById(id) = await one("select id, name from users where id = $1", id)
+
+        async addUser(name: string, hash: string) =
+            await one("insert into users (name, hash) values ($1, $2) returning id, name", name, hash)
+
+        async notesOf(user) =
+            await all("select id, title, text from notes where owner = $1 order by id", user)
+
+        async noteOf(user, id) =
+            await one("select id, title, text from notes where owner = $1 and id = $2", user, number(id))
+
+        async addNote(user, title: string, text: string) =
+            await one("insert into notes (owner, title, text) values ($1, $2, $3) returning id, title, text",
+                      user, title, text)
+
+        async removeNote(user, id) -> object
+            val r = await db.query("delete from notes where owner = $1 and id = $2", user, number(id))
+
+            if r.ok then { ok: true, value: r.value.count > 0 } else r
+
+        { userNamed: userNamed, userById: userById, addUser: addUser, notesOf: notesOf, noteOf: noteOf,
+          addNote: addNote, removeNote: removeNote, close: () -> db.close() }
+    """
+
+private sluice_migrate() -> string = raw"""
+    // The migrations in `migrations/`, applied to the database the configuration names.
+    //
+    //     slate migrate.sl up            (or `slate run migrate`)
+    //     slate migrate.sl down [steps]  (or `slate run rollback`)
+    //     slate migrate.sl status
+    //
+    // Each `NNNN_name.up.sql` runs once, in order, in its own transaction; what ran is recorded in the
+    // database's `schema_migrations` table.
+
+    import { migrate, migrationStatus, pg, rollback } from pg
+    import { args, exit, stderr } from slate:process
+
+    import { configured } from "./wiring.sl"
+
+    usage()
+        stderr("usage: slate migrate.sl up | down [steps] | status\n")
+        exit(2)
+
+    async ran(db: object, command: string, steps: integer) -> object
+        if command == "up" then return await migrate(db, "migrations")
+        if command == "down" then return await rollback(db, "migrations", { steps: steps })
+
+        await migrationStatus(db, "migrations")
+
+    listed(what: string, ms)
+        for m in ms
+            print("  " + what + "  " + m.file)
+
+    async main()
+        val command = if args.length > 0 then args[0] else ""
+        val steps = number(if args.length > 1 then args[1] else "1")
+
+        if command != "up" && command != "down" && command != "status" then usage()
+        if !(steps is integer) || steps < 1 then usage()
+
+        val config = configured() match
+            { ok: true, value } -> value
+            { error } ->
+                stderr(error + "\n")
+                exit(1)
+
+        val made = await pg(config.DATABASE_URL)
+
+        if !made.ok
+            stderr("could not connect: " + made.error + "\n")
+            exit(1)
+
+        val db = made.value
+        val r = await ran(db, command, steps)
+
+        await db.close()
+
+        if !r.ok
+            stderr(r.error + "\n")
+            exit(1)
+
+        listed("applied ", r.value.applied ?? [])
+        listed("reverted", r.value.reverted ?? [])
+        listed("pending ", r.value.pending ?? [])
+
+    main()
+    """
+
+private sluice_up() -> string = raw"""
+    create table users (
+        id bigserial primary key,
+        name text not null unique,
+        hash text not null
+    );
+
+    create table notes (
+        id bigserial primary key,
+        owner bigint not null references users (id) on delete cascade,
+        title text not null,
+        text text not null
+    );
+    """
+
+private sluice_tests() -> string = raw"""
+    // The application, driven through `app.handle` over the store in `memory.sl` -- no server, no port
+    // and no database. `slate test tests` runs it.
+
+    import { memoryStore, request, response } from sluice
+    import { percentDecode } from slate:url
+
+    import { application } from "../routes.sl"
+    import { memory } from "./memory.sl"
+
+    // A browser: the application, and the cookies it has been given so far.
+    browser() -> object
+        { app: application(memory(), { secret: "a key for the tests", sessions: memoryStore() }), jar: {} }
+
+    // Send a request as this browser, keep whatever cookies come back, and answer the response.
+    async sent(b: object, method: string, path: string, body = null) -> object
+        val options = if body == null then { cookies: b.jar } else { cookies: b.jar, body: body }
+        val reply = response(await b.app.handle(request(method, path, options)))
+
+        for [k, v] in entries(reply.headers)
+            if lower(k) == "set-cookie"
+                for line in (if v is array then v else [v])
+                    kept(b, line)
+
+        reply
+
+    kept(b: object, line: string)
+        val pair = split(line, ";")[0]
+        val at = indexOf(pair, "=") ?? 0
+        val name = pair[0..<at]
+        val value = percentDecode(pair[(at + 1)..], false)
+
+        if value == "" then b.jar = without(b.jar, name) else b.jar[name] = value
+
+    said(reply: object) = parseJSON(reply.body).value
+
+    async signedUp(name: string) -> object
+        val b = browser()
+
+        assertEq((await sent(b, "POST", "/signup", { name: name, password: "correct horse" })).status, 201)
+
+        b
+
+    @test
+    async NOBODY_SIGNED_IN_IS_REFUSED_THE_NOTES()
+        assertEq((await sent(browser(), "GET", "/api/notes")).status, 401)
+
+    @test
+    async A_NOTE_ADDED_IS_LISTED_SHOWN_AND_DELETED()
+        val b = await signedUp("ada")
+        val made = await sent(b, "POST", "/api/notes", { title: "first", text: "hello" })
+
+        assertEq(made.status, 201)
+
+        val id = said(made).id
+
+        assertEq(said(await sent(b, "GET", "/api/notes")).map((n) -> n.title), ["first"])
+        assertEq(said(await sent(b, "GET", "/api/notes/" + string(id))).text, "hello")
+        assertEq((await sent(b, "DELETE", "/api/notes/" + string(id))).status, 204)
+        assertEq((await sent(b, "GET", "/api/notes/" + string(id))).status, 404)
+
+    @test
+    async A_NOTE_WITHOUT_A_TITLE_IS_A_400()
+        val b = await signedUp("ada")
+
+        assertEq((await sent(b, "POST", "/api/notes", { text: "no title" })).status, 400)
+
+    @test
+    async ONE_USER_CANNOT_SEE_ANOTHER_S_NOTES()
+        val ada = await signedUp("ada")
+        val id = said(await sent(ada, "POST", "/api/notes", { title: "mine", text: "private" })).id
+        val bob = browser()
+
+        bob.app = ada.app
+        assertEq((await sent(bob, "POST", "/signup", { name: "bob", password: "battery staple" })).status, 201)
+        assertEq(said(await sent(bob, "GET", "/api/notes")), [])
+        assertEq((await sent(bob, "GET", "/api/notes/" + string(id))).status, 404)
+
+    @test
+    async A_TAKEN_NAME_IS_A_409()
+        val b = await signedUp("ada")
+
+        assertEq((await sent(b, "POST", "/signup", { name: "ada", password: "again" })).status, 409)
+
+    @test
+    async SIGNING_OUT_ENDS_THE_SESSION_AND_SIGNING_IN_STARTS_ONE()
+        val b = await signedUp("ada")
+
+        assertEq((await sent(b, "POST", "/signout")).status, 204)
+        assertEq((await sent(b, "GET", "/api/notes")).status, 401)
+        assertEq((await sent(b, "POST", "/signin", { name: "ada", password: "wrong" })).status, 401)
+        assertEq((await sent(b, "POST", "/signin", { name: "ada", password: "correct horse" })).status, 200)
+        assertEq((await sent(b, "GET", "/api/notes")).status, 200)
+    """
+
+private sluice_memory() -> string = raw"""
+    // The store `routes.sl` is written against, over arrays -- what the tests run the application on.
+    // It answers what `store.sl` answers, including the `23505` PostgreSQL refuses a taken name with.
+
+    export memory() -> object
+        val users = []
+        val notes = []
+        var next = 1
+
+        found(xs, f) = { ok: true, value: xs.find(f) ?? null }
+
+        addUser(name: string, hash: string) -> object
+            if users.some((u) -> u.name == name) then return { ok: false, error: "taken", code: "23505" }
+
+            val user = { id: next, name: name, hash: hash }
+
+            next += 1
+            users.push(user)
+
+            { ok: true, value: { id: user.id, name: name } }
+
+        addNote(owner, title: string, text: string) -> object
+            val note = { id: next, owner: owner, title: title, text: text }
+
+            next += 1
+            notes.push(note)
+
+            { ok: true, value: shown(note) }
+
+        removeNote(owner, id) -> object
+            val at = notes.findIndex((n) -> n.owner == owner && n.id == number(id))
+
+            if at != null then notes.removeAt(at)
+
+            { ok: true, value: at != null }
+
+        shown(n) = { id: n.id, title: n.title, text: n.text }
+
+        { userNamed: (name) -> found(users, (u) -> u.name == name),
+          userById: (id) -> found(users.map((u) -> { id: u.id, name: u.name }), (u) -> u.id == id),
+          addUser: addUser,
+          notesOf: (owner) -> { ok: true, value: notes.filter((n) -> n.owner == owner).map(shown) },
+          noteOf: (owner, id) -> found(notes.filter((n) -> n.owner == owner).map(shown), (n) -> n.id == number(id)),
+          addNote: addNote,
+          removeNote: removeNote,
+          close: () -> null }
+    """

@@ -64,7 +64,7 @@ way.
 
 ## What is not there yet
 
-**`slate:process`'s `run`, `slate:redis`, `slate:nghttp2`, and a TLS listener.** Each is a
+**`slate:process`'s `run`, `slate:redis` and `slate:nghttp2`.** Each is a
 name that says *"not in the JavaScript back end yet"* when a program reaches it, rather than a name
 that is not there — so a program is told which half of the world it is in. **No global is on that
 list any more**; `fetch` was the last and has its own section below.
@@ -75,9 +75,18 @@ so a protocol that upgrades an open socket — PostgreSQL's, SMTP's — runs on 
 interpreter, with the same options and the same sentences where they are slate's own. Two things
 are the host's: node checks a certificate against its own bundled roots rather than the machine's
 store (`trust` is added to either), and a certificate that does not verify is described in node's
-words after the same `the TLS handshake failed:`. What is still owed of the transport is `listen`
-given a `cert` and a `key`, which refuses naming TLS, so an HTTPS server is the interpreter's for
-now.
+words after the same `the TLS handshake failed:`.
+
+**`listen` given a `cert` and a `key` is here on node too**, over `tls.createServer`, so an HTTPS
+server runs under `slate js` with the interpreter's options (`port`, `cert`, `key`, `alpn`,
+`reusePort`) and the same sentences for a certificate that cannot be used. **One thing is the host's:
+the function is called once a connection's handshake has finished**, where the interpreter hands the
+connection over first and handshakes at its first read — a client that fails its handshake is never
+seen by the program. In a browser it refuses like every other `listen`, there being no socket.
+
+**`listen(socket, fn)` is here as well**: a listener passed over a channel to a node worker arrives
+as the host's own server, and the worker accepts on it with the interpreter's sentences. A listener
+crosses between two programs on one host only, exactly as a connection does.
 
 **`slate:zstd` is WHOLE here on node and absent in a browser, which is the same rule read twice.** node
 has carried Zstandard in `zlib` since 22.15, so `zstd` and `unzstd` are the host's own there; no browser

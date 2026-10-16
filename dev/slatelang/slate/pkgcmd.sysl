@@ -1,0 +1,331 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.{source, source_of}
+import sysl.buf.{Buf, buf}
+import sysl.fs.{read_bytes, write_text}
+import sysl.text.{from_utf8_unchecked}
+
+// The commands about a project's packages: `slate deps`, `fetch`, `install`, `add` and `vendor`.
+//
+// **Cut out of `main.sysl` at its own section heading**, and nothing but the five commands crosses
+// back: `run_cli` calls them, and `say_lines` is the one helper both files use. Resolving, fetching
+// and rewriting a manifest are `packages.sysl`'s, `fetch.sysl`'s and `add.sysl`'s; what is here is
+// what each command reads, in what order, and what it tells the person who typed it.
+
+// -- slate deps ------------------------------------------------------------------------------------
+
+// `slate deps [directory]` -- read a `package.sl` and say what it declares.
+//
+// **The smallest command that makes the manifest live, and deliberately no more.** It fetches
+// nothing, resolves nothing and writes nothing. What it is for is that a manifest which is wrong
+// should be answered by a caret now rather than discovered by a resolver later, and that a person
+// can see what slate thinks their file says.
+//
+// Not `private`, and nor are the four commands below it: `run_cli` in `main.sysl` calls them.
+deps_command(dir: string, say: string -> unit) -> int
+    val path = if dir == "." then ManifestFile else s"${dir}/${ManifestFile}"
+
+    read_bytes(path) match
+        Err(e) ->
+            say(s"slate: cannot read ${path}: ${e}")
+
+            Failed
+        Ok(bytes) ->
+            val src = source(path, bytes)
+            val f = read_project(src)
+
+            // **The whole report, not only the errors.** A warning about a key nothing knows is the
+            // one thing this command exists to say about a file that is otherwise fine.
+            if !f.report.is_empty() then say_lines(f.report.render(src), "", say)
+
+            if !f.ok() then return Failed
+
+            val p = f.project
+
+            say(s"${p.name} ${p.version}")
+
+            if p.main != "" then say(s"  main: ${p.main}")
+
+            // **The RESOLVED set, not the manifest's own list.** What a program actually gets
+            // includes everything its dependencies drag in, and where two of them disagree it
+            // includes one version rather than both -- so printing the manifest back would be
+            // printing the question rather than the answer.
+            val packages = resolve_packages(dir, p)
+
+            if packages.found.len() == 0
+                say("  no dependencies")
+            else
+                for i in 0..<packages.found.len()
+                    val d = packages.found.at(i)
+                    val where = if is_fetched(d) then "" else " -- not fetched"
+
+                    // **A DEV DEPENDENCY IS SAID TO BE ONE.** The resolved set holds both kinds and
+                    // read alike they are the same thing, which is exactly what a person running
+                    // this wants to know they are not: one of these travels to a consumer and the
+                    // other does not.
+                    val kind = if names_dev(p, d.name) then " -- dev" else ""
+
+                    say(s"  ${d.name} ${d.version} (${d.git})${kind}${where}")
+
+            // **This is the only place a version conflict is ever said out loud.** A program that
+            // runs does not report one, because the choice was made when the manifests were written
+            // and repeating it on every run would be noise -- so `slate deps` is where a person
+            // finds out that something is not getting the version it asked for.
+            for i in 0..<packages.notes.len()
+                say(s"note: ${packages.notes.at(i)}")
+
+            check_sums(dir, packages, say)
+end deps_command
+
+// Whether the project declared this package under `devDependencies`. **Asked of the PROJECT and not
+// of the resolved package**, a dependency of a dependency being an ordinary one however it was
+// reached -- and a manifest naming one in both sections is refused when it is read.
+private names_dev(p: Project, name: string) -> bool
+    for i in 0..<p.dev.len()
+        if p.dev.at(i).name == name then return true
+
+    false
+
+// Check what is in the cache against what `slate.sum` recorded.
+//
+// **A hash that has CHANGED is the one failure this whole file exists for**, and it is the only
+// thing here that fails a command. A package not yet recorded is what every package looks like
+// before anything has recorded it, and one not yet fetched has nothing to hash -- neither is wrong.
+private check_sums(root: string, packages: Packages, say: string -> unit) -> int
+    val sums = read_sums(root)
+    var changed = false
+
+    for i in 0..<packages.found.len()
+        val pkg = packages.found.at(i)
+        val verdict = check_package(sums, pkg)
+        val note = check_note(pkg, verdict)
+
+        if note == "" then continue
+
+        verdict match
+            Changed(_, _) ->
+                changed = true
+                say(s"error: ${note}")
+            other -> say(s"note: ${note}")
+
+    if changed then Failed else Fine
+end check_sums
+
+// `slate fetch [directory]` -- download whatever the project depends on and is missing.
+fetch_command(dir: string, say: string -> unit) -> int
+    val path = if dir == "." then ManifestFile else s"${dir}/${ManifestFile}"
+
+    read_bytes(path) match
+        Err(e) ->
+            say(s"slate: cannot read ${path}: ${e}")
+
+            Failed
+        Ok(bytes) ->
+            val src = source(path, bytes)
+            val f = read_project(src)
+
+            if !f.report.is_empty() then say_lines(f.report.render(src), "", say)
+            if !f.ok() then return Failed
+
+            // **The resolution is repeated until it stops growing**, a package's own manifest
+            // arriving with the package -- so a cold cache learns what its dependencies want only
+            // after they are on the disk. `fetch_graph` answers the resolution it finished with.
+            val (packages, done) = fetch_graph(dir, f.project)
+
+            for i in 0..<packages.notes.len()
+                say(s"note: ${packages.notes.at(i)}")
+
+            for i in 0..<done.notes.len()
+                say(done.notes.at(i))
+
+            if done.failed then return Failed
+
+            say(s"${done.got} fetched, ${done.already} already there")
+
+            Fine
+end fetch_command
+
+// `slate install [<package>[@<version>] [directory]]` -- npm's shape for one verb covering two
+// commands. With nothing after it, install is `fetch`: bring the manifest and the lock up to date.
+// With a package named, install is `add`: write the dependency and fetch the graph it now names.
+// **`slate add` stays as an alias with unchanged behaviour** -- this is the one place the choice
+// between the two is made.
+install_command(args: []string, dir: string, say: string -> unit) -> int
+    if args.len <= 2 then fetch_command(dir, say) else add_command(args, say)
+end install_command
+
+// `slate add <package>[@<version>] [directory]` -- write a dependency into `package.sl`.
+//
+// **The manifest is written last, and only where everything else worked.** A version that does not
+// exist is a 404 from GitHub, and a manifest edited before that answer arrives names a dependency
+// the project cannot have -- so the rewrite is held in memory, read back, resolved and fetched, and
+// put on the disk only once all of that has succeeded.
+// **`--dev` writes into `devDependencies`**, which a consumer of this package will not resolve. It
+// is read wherever it stands, `slate add --dev <package>` and `slate add <package> --dev` being the
+// same instruction and neither being the one somebody remembers.
+add_command(args: []string, say: string -> unit) -> int
+    var rest: Buf[string] = buf()
+    var dev = false
+
+    for i in 2..<args.len
+        if args[i] == "--dev" then dev = true else rest.push(args[i])
+
+    if rest.len() < 1
+        say("usage: slate add [--dev] <package>[@<version>] [directory]")
+        say("       slate add github.com/sysl-lang/parsing")
+        say("       slate add github.com/sysl-lang/parsing@0.5.0")
+        say("       slate add --dev github.com/slate-language/logger")
+
+        return Misused
+    end if
+
+    val dir = if rest.len() > 1 then rest.at(1) else "."
+    val path = if dir == "." then ManifestFile else s"${dir}/${ManifestFile}"
+
+    val c = read_coordinate(rest.at(0)) match
+        Err(e) ->
+            say(s"slate: ${e}")
+
+            return Misused
+        Ok(v) -> v
+
+    read_bytes(path) match
+        Err(e) ->
+            say(s"slate: cannot read ${path}: ${e}")
+
+            Failed
+        Ok(bytes) -> added_to(dir, path, bytes, c, if dev then "devDependencies" else "dependencies", say)
+end add_command
+
+// The whole of `slate add` once the manifest has been read off the disk.
+private added_to(dir: string, path: string, bytes: []u8, c: Coordinate, section: string, say: string -> unit) -> int
+    val src = source(path, bytes)
+    val f = read_project(src)
+
+    if !f.report.is_empty() then say_lines(f.report.render(src), "", say)
+    if !f.ok() then return Failed
+
+    val version = wanted_version(c) match
+        Err(e) ->
+            say(s"slate: ${e}")
+
+            return Failed
+        Ok(v) -> v
+
+    val text = from_utf8_unchecked(bytes)
+
+    val rewrite = plan_addition(text, read_manifest(src), c, version, section) match
+        Err(e) ->
+            say(s"slate: ${e}")
+
+            return Failed
+        Ok(r) -> r
+
+    // Nothing to change: the dependency is already written at the version asked for.
+    //
+    // **THE GRAPH IS STILL FETCHED AND STILL RECORDED**, which is what makes `slate add` mean one
+    // thing whatever the manifest already said. `slate.sum` is a record of what a build compiles
+    // rather than of what this command edited, so an add that changed no byte used to leave the sum
+    // file exactly as incomplete as it found it -- and `slate deps` then reported for ever that a
+    // package the project depends on *is not recorded*, printing the very hash nobody had written.
+    if rewrite.patches.is_empty()
+        val settled = settled_graph(dir, f.project, say)
+
+        if settled != Fine then return settled
+
+        say(rewrite.news)
+
+        return Fine
+    end if
+
+    val updated = patched_text(text, rewrite.patches)
+    val again = source_of(path, updated)
+    val after = read_project(again)
+
+    // **The rewritten manifest is read back before it is written.** A surgical edit is only as good
+    // as the spans it trusted, and a file this tool has broken is a file the reader did not break --
+    // so the check is here, where the original is still on the disk untouched.
+    if !after.ok()
+        say(s"slate: rewriting ${path} produced something slate cannot read, so it has been left alone")
+        say_lines(after.report.render(again), "", say)
+
+        return Failed
+    end if
+
+    // **The whole graph and not the one line that was added**, which is what makes `slate.sum`
+    // cover what a build actually compiles: the package being added brings its own dependencies,
+    // and they are not knowable until it is on the disk.
+    val settled = settled_graph(dir, after.project, say)
+
+    if settled != Fine then return settled
+
+    write_text(path, updated) match
+        Err(e) ->
+            say(s"slate: cannot write ${path}: ${e}")
+
+            Failed
+        Ok(_) ->
+            say(rewrite.news)
+
+            Fine
+end added_to
+
+// Fetch what the project needs and record every hash, saying what happened.
+//
+// **`slate add` runs this whether or not the manifest changed**, which is the whole of what makes
+// the sum file cover the graph: a version another project had already fetched is in the cache, so
+// the add has nothing to download and still owes the record of what it found.
+private settled_graph(dir: string, project: Project, say: string -> unit) -> int
+    val (packages, done) = fetch_graph(dir, project)
+
+    for i in 0..<packages.notes.len()
+        say(s"note: ${packages.notes.at(i)}")
+
+    for i in 0..<done.notes.len()
+        say(done.notes.at(i))
+
+    if done.failed then return Failed
+
+    Fine
+end settled_graph
+
+// The version to write: the one that was asked for, or the newest tag GitHub has.
+private wanted_version(c: Coordinate) -> Result[string, string] =
+    if c.version != "" then Ok(c.version) else latest_version(c.git)
+
+// `slate vendor [directory]` -- keep a copy of everything the project depends on inside it.
+//
+// **The whole graph, not the direct dependencies**, since what a program compiles against is the
+// resolved set -- vendoring the manifest's own list would leave every transitive package still
+// coming from the cache, which is a project that only builds on a machine that has one.
+vendor_command(dir: string, say: string -> unit) -> int
+    val path = if dir == "." then ManifestFile else s"${dir}/${ManifestFile}"
+
+    read_bytes(path) match
+        Err(e) ->
+            say(s"slate: cannot read ${path}: ${e}")
+
+            Failed
+        Ok(bytes) ->
+            val src = source(path, bytes)
+            val f = read_project(src)
+
+            if !f.report.is_empty() then say_lines(f.report.render(src), "", say)
+            if !f.ok() then return Failed
+
+            val packages = resolve_packages(dir, f.project)
+
+            for i in 0..<packages.notes.len()
+                say(s"note: ${packages.notes.at(i)}")
+
+            val v = vendor_packages(dir, packages)
+
+            for i in 0..<v.notes.len()
+                say(v.notes.at(i))
+
+            if v.failed then return Failed
+
+            say(s"${v.copied} vendored, ${v.already} already there")
+
+            Fine
+end vendor_command
