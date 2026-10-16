@@ -203,7 +203,13 @@ private resume_sent(vm: *Machine, started: bool, sent: Value) -> Step
         // The frame's view of its code is unchecked, so the bound is asked here.
         if back.pc >= back.code.len then return resume_chunk(running_unit())
 
-        val ins = back.code.ins[back.pc]
+        var ins = back.code.ins[back.pc]
+
+        // **Every `yield` is followed by the jump `return(v)` falls through** (`yield_return`), so
+        // the instruction that takes the answer is the one that jump lands on.
+        ins.op match
+            JumpIfNotReturning(to) -> if to < back.code.len then ins = back.code.ins[to]
+            _ -> ()
 
         if keeps_outright(ins.op)
             val msg = "this generator was resumed with nothing, and `undefined` cannot be kept -- give the `yield` a value with `??`, or call `next(v)`"
@@ -236,7 +242,10 @@ private keeps_outright(op: Op) -> bool
 // **`sent` is written over the yielded value's slot**, which is the other half of the bargain `Yield`
 // makes by not popping: the value stayed reachable while the machine was aside, and the slot it sat
 // in is where the answer to `yield` belongs.
-gen_step(id: usize, gen: usize, sent: Value, at: Span) -> Result[Step2, Signal]
+//
+// **`returning` is `return(v)`'s step**: the machine is told so, and the jump written after the
+// `yield` it stands at leaves the body with `v` instead of carrying on (`yield_return`).
+gen_step(id: usize, gen: usize, sent: Value, returning: bool, at: Span) -> Result[Step2, Signal]
     if !gen_holds(id, gen)
         return Err(failure(at, "this generator has finished, and a finished one has nothing left to give"))
 
@@ -254,6 +263,8 @@ gen_step(id: usize, gen: usize, sent: Value, at: Span) -> Result[Step2, Signal]
 
     if slot.started
         vm.stack.set(vm.stack.len() - 1, sent)
+
+    vm.returning = returning
 
     val outcome = resume_sent(vm, slot.started, sent)
 
@@ -304,7 +315,7 @@ end gen_step
 // code of its own: `Op.Await` reads `vm.promise` and parks, the scheduler resumes the machine when
 // what it waited for settles, and `finish` -- reading the `Machine.gen` `start_generator` wrote --
 // settles this promise at the `yield` the body eventually reaches.
-private gen_step_async(id: usize, gen: usize, sent: Value, at: Span) -> Step
+private gen_step_async(id: usize, gen: usize, sent: Value, returning: bool, at: Span) -> Step
     var slot = current().generators.at(id)
 
     // **ONE `next` AT A TIME, AND IT IS REFUSED RATHER THAN QUEUED.** A second asked while the first
@@ -335,6 +346,7 @@ private gen_step_async(id: usize, gen: usize, sent: Value, at: Span) -> Step
     if slot.started
         vm.stack.set(vm.stack.len() - 1, sent)
 
+    vm.returning = returning
     vm.promise = pr
 
     // **`finish` does the parking and the settling**, exactly as it does for the resumption the
@@ -443,7 +455,7 @@ gen_iter_next(id: usize, gen: usize, at: Span) -> Result[Option[Value], Signal]
     if current().generators.at(id).asynchronous
         return Err(failure(at, AsyncGenWalk))
 
-    gen_step(id, gen, Value.Undefined, at)? match
+    gen_step(id, gen, Value.Undefined, false, at)? match
         Yielded(v) -> Ok(Some(v))
 
         // **What the body returned is not an element.** `for x in g` walks what a generator yields;
@@ -474,13 +486,56 @@ do_gen_next(args: Args, at: Span) -> Step
 
                 return if asynchronous then settled_step(ended) else Ok(ended)
 
-            if asynchronous then return gen_step_async(id, gen, sent, at)
+            if asynchronous then return gen_step_async(id, gen, sent, false, at)
 
-            gen_step(id, gen, sent, at)? match
+            gen_step(id, gen, sent, false, at)? match
                 Yielded(v) -> Ok(step_value(v, false))
                 Ended(v) -> Ok(step_value(v, true))
         other -> fault(at, s"`next` takes a generator, and this is ${other.type_name()}")
 end do_gen_next
+
+// `g.return()` and `g.return(v)` -- leave the body from the `yield` it stands at, as a `return v`
+// written there would, and answer `{ value: v, done: true }`. JavaScript's `return`, and what a
+// `for` that is left early calls (`iter_close.sysl`).
+//
+// **A generator that never started runs nothing** and one that has finished answers the same pair;
+// neither has a `yield` to leave from. **Only a method**, never a free function: `return` is a word
+// no program could call by name, and a builtin of the emitted program is a parameter of it.
+do_gen_return(args: Args, at: Span) -> Step
+    if args.len() != 1 && args.len() != 2
+        return fault(at, s"`return` takes a generator and optionally the value it answers with, and was given ${counted(args.len(), "argument")}")
+
+    val v = if args.len() == 2 then args.at(1) else Value.Null
+
+    args.at(0) match
+        Gen(id32, gen32) ->
+            val id = usize(id32)
+            val gen = usize(gen32)
+            val asynchronous = gen_is_async(id)
+
+            if gen_holds(id, gen) && !current().generators.at(id).started then abandon(id)
+
+            if !gen_holds(id, gen)
+                val ended = step_value(v, true)
+
+                return if asynchronous then settled_step(ended) else Ok(ended)
+
+            if asynchronous then return gen_step_async(id, gen, v, true, at)
+
+            gen_step(id, gen, v, true, at)? match
+                Yielded(x) -> Ok(step_value(x, false))
+                Ended(x) -> Ok(step_value(x, true))
+        other -> fault(at, s"`return` takes a generator, and this is ${other.type_name()}")
+end do_gen_return
+
+// Give back a generator that was never entered: its machine comes out of `parked` and is dropped
+// when the caller's is put back over it, which is `retire`'s arrangement.
+private abandon(id: usize)
+    val here = park()
+
+    unpark(current().generators.at(id).machine)
+    retire(id)
+    unpark(here)
 
 // `{ value, done }`, held while it is built.
 private step_value(v: Value, done: bool) -> Value
@@ -500,9 +555,13 @@ private step_value(v: Value, done: bool) -> Value
 // one call. Nothing else is needed to drive a generator: `for x in g` is the loop, and this is the
 // step -- `IterNext` asks the same question the loop already asks of an array.
 var n_gen_next: NativeFn = 0
+var n_gen_return: NativeFn = 0
 
 install_generator(env: *EnvObj)
     n_gen_next = register("next", do_gen_next)
+
+    // **`$`-prefixed and declared nowhere**, so it is a generator's method and not a global.
+    n_gen_return = register("$genReturn", do_gen_return)
 
     declare(env, "next", Native(n_gen_next), false)
 end install_generator

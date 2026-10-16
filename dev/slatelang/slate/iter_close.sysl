@@ -1,0 +1,104 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+
+// Closing the iterator a `for` or a `for await` was walking, when the loop is left before the
+// iterator said it was done.
+//
+// **JavaScript's IteratorClose, and the rule is the same on both hosts.** Leaving early -- a
+// `break`, a `continue` or `break` to an outer loop, a `return`, a fault on its way past -- calls the
+// iterator's `return()` where it has one; running out calls nothing. A generator's `return()` leaves
+// its body from the `yield` it stood at, so the generator's own `using` blocks are released and its
+// own loops close what THEY were walking: a pipeline of generators is shut from the end that stopped
+// reading.
+//
+// **The mechanism is `using`'s, with `return()` where `dispose()` was.** A loop over an iterator
+// registers a `DisposeSite` whose `release` is `Close`, so every way out `using.sysl` already handles
+// -- the jumps place the call in front of themselves, a fault reaches it through `PushDispose` --
+// handles this too, in the same order: a `using` inside the body is released before the loop's
+// iterator is closed, being the more recent of the two.
+//
+// - **A `break` of the loop ITSELF is closed at the loop's own landing**, not by the jump: the loop's
+//   handler is the innermost thing the `break` keeps, which is what lets a `continue` of the same
+//   loop leave the iterator alone.
+// - **A fault cannot wait**, the release running inside `guarded` on a machine that is being taken
+//   apart -- so on that path a `for await`'s `return()` is called and its answer is NOT awaited.
+//   Every other way out awaits it.
+// - **A `for await` keeps a second copy of its subject that is `null` while `next()` is being
+//   asked**, so a `next()` that faults closes nothing: an iterator that failed to step is not one
+//   to be told it was abandoned, which is JavaScript's rule.
+
+// What leaving a guarded stretch does to the value it guards.
+enum Release
+    // `using`: call `dispose()`.
+    Dispose
+
+    // A `for`: call `return()`, where there is one.
+    Close
+
+    // A `for await`: call `return()` and await what it answers -- except on a fault, where nothing can.
+    CloseAwaited
+
+// The instructions that close ONE iterator, given where its copy sits on the stack.
+//
+// Not `private`: `using.sysl`'s `emit_disposes_above` and the loops in `compile_loop.sysl` reach it.
+emit_close(u: *Unit, e: *Emit, slot: usize, awaited: bool, at: Span)
+    push_n(e, TakeAt(e.sp - 1 - slot), at, 0, 1)
+
+    // Where there is nothing to close the value is popped as the jump is taken, so both ways out
+    // of this arrive at the height the code began at.
+    val skip = put(e, JumpIfNothingToClose(0), at)
+
+    push_n(e, CallMethod(0, intern_wide(u, intern_str(u, "return"), 0, fresh_site(u))), at, 1, 1)
+
+    if awaited && e.is_async then push_n(e, Op.Await, at, 1, 1)
+
+    push_n(e, Pop, at, 1, 0)
+    patch(e, skip, here(e))
+end emit_close
+
+// What follows every `yield`: where the generator was resumed by `return(v)`, leave the body from
+// here with `v` -- which `gen_step` wrote over the yielded value's slot, exactly as `next(v)` does.
+//
+// **It is a `return` written at the `yield`, compiled where the `yield` stands**, so it releases
+// what a `return` there would: every `using` the `yield` is inside, and every loop's iterator. A
+// `try` around the `yield` does not catch it, `Ret` taking the handlers off as it always does --
+// which is JavaScript's rule, a `return()` running `finally` and never `catch`.
+//
+// Not `private`: `compile_expr.sysl`'s `Yield` arm is the caller.
+yield_return(u: *Unit, e: *Emit, at: Span)
+    val over = put(e, JumpIfNotReturning(0), at)
+
+    emit_disposes_above(u, e, 0, at)
+    put(e, Ret, at)
+    patch(e, over, here(e))
+end yield_return
+
+// `TakeAt(n)`: the copy goes to the top and `null` is left in the slot it came out of.
+//
+// Not `private`: the instruction loop in `run_frames.sysl` is the caller.
+compose_take_at(vm: *Machine, n: usize)
+    val i = vm.stack.len() - 1 - n
+
+    vm.stack.push(vm.stack.at(i))
+    vm.stack.set(i, Null)
+
+// `JumpIfNothingToClose`: whether the value on top has a `return()` worth calling, popping it where
+// it has not.
+//
+// **A generator that has finished has nothing to close**, and neither has anything a plain `for`
+// walks by position -- an array, a string, a range, bytes, a set or a map. An object is asked for a
+// `return` field, own or inherited, the way a source is asked for `next`; `null` there is JavaScript's
+// "no method", and anything else is called and left to fault if it cannot be.
+//
+// Not `private`: the instruction loop in `run_frames.sysl` is the caller.
+compose_closable(vm: *Machine, at: Span) -> Result[bool, Signal]
+    val closes = peek_on(vm, 0) match
+        Gen(id, gen) -> gen_holds(usize(id), usize(gen))
+        Object(o) -> !is_nullish(field_from(o, "return", at)?.0)
+        _ -> false
+
+    if !closes then vm.stack.truncate(vm.stack.len() - 1)
+
+    Ok(closes)
+end compose_closable

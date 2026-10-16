@@ -235,6 +235,17 @@ compile_for(u: *Unit, e: *Emit, label: string, binding: Pattern, iter: Expr, bod
     // thousand turns of a loop containing one was a SIGSEGV with no output.
     push_n(e, IterInit, at, 0, 1)
 
+    // **The iterator is closed on every way out but running out** (`iter_close.sysl`), so the loop
+    // guards itself the way a `using` guards its block -- and the guard goes up BEFORE the loop
+    // frame, which is what makes a `continue` of this loop leave it standing and a `break` of an
+    // outer one release it.
+    val subject = e.sp - 2
+    val guard = push_n(e, PushDispose(0), at, 0, 0)
+    val scopes = e.scopes
+
+    e.handlers += 1
+    e.disposes.push(DisposeSite(e.handlers, subject, Close))
+
     val top = here(e)
 
     // The walk's own two values are standing on the stack here, which is a root the collector
@@ -264,6 +275,11 @@ compile_for(u: *Unit, e: *Emit, label: string, binding: Pattern, iter: Expr, bod
     put(e, Jump(top), at)
     patch(e, out, here(e))
 
+    // **Running out closes nothing**, the iterator having said itself that it was done.
+    e.disposes.truncate(e.disposes.len() - 1)
+    push_n(e, PopHandler, at, 0, 0)
+    e.handlers -= 1
+
     // The counter and the subject both go -- two values, which is what `IterInit` left -- and they go
     // *before* the answer is built, so that the two Pops cannot take it.
     push_n(e, Pop, at, 1, 0)
@@ -274,9 +290,17 @@ compile_for(u: *Unit, e: *Emit, label: string, binding: Pattern, iter: Expr, bod
 
     // **A `break` arrives with the walk still on the stack under its value**, having unwound only to
     // the frame's own height -- so the value is slid beneath them and they are dropped from above it.
+    // The guard is taken down BEFORE the iterator is closed, so a `return()` that faults is not
+    // called a second time by it.
     val brk = here(e)
     val after = e.sp
 
+    // **The counter is told what the machine has here**, the walk's two values and the `break`'s
+    // own -- which is two more than the way out above left -- since the close reaches its copy by
+    // counting down from the top.
+    e.sp = subject + 3
+    put(e, PopHandler, at)
+    emit_close(u, e, subject, false, at)
     push_n(e, RotUp(2), at, 0, 0)
     push_n(e, Pop, at, 1, 0)
     push_n(e, Pop, at, 1, 0)
@@ -284,8 +308,29 @@ compile_for(u: *Unit, e: *Emit, label: string, binding: Pattern, iter: Expr, bod
     // The two paths meet, so the counter follows the one that fell through rather than this one.
     e.sp = after
     close_loop(e, top, brk)
+    closing_guard(u, e, guard, subject + 2, scopes, subject, at)
     patch(e, done, here(e))
 end compile_for
+
+// The loop's guard, reached only by a fault: close the iterator and let the fault carry on.
+//
+// **The counters are set to what the MACHINE has at the release** -- `guarded` cuts the stack back
+// to where `PushDispose` stood and the scope chain with it -- which is `compile_using`'s arrangement.
+// **Nothing is awaited here, a `for await`'s `return()` included**: the release runs inside the
+// unwind, where a machine cannot park.
+private closing_guard(u: *Unit, e: *Emit, guard: usize, height: usize, scopes: usize, slot: usize, at: Span)
+    val over = put(e, Jump(0), at)
+    val fell_through = e.sp
+
+    patch(e, guard, here(e))
+    e.sp = height
+    e.scopes = scopes
+    emit_close(u, e, slot, false, at)
+    push_n(e, DisposeDone, at, 0, 0)
+    e.sp = fell_through
+    e.scopes = scopes
+    patch(e, over, here(e))
+end closing_guard
 
 // `for await x in source` -- ask the subject for its next value, await the answer, and stop when it
 // says it is done.
@@ -300,8 +345,22 @@ end compile_for
 // **The shape is a `while` and not the counted walk above.** There is no counter, because what says
 // whether another value is coming is the subject; and there is one value on the stack through the
 // loop -- the subject -- where the ordinary `for` keeps two.
+//
+// **Two values stand through the loop, the subject and a second copy of it that is `null` while
+// `next()` is being asked.** The second is what the loop's guard closes (`iter_close.sysl`), so a
+// `next()` that faults closes nothing -- JavaScript's rule -- while a fault in the body does. The
+// subject never changes, so it is checked once, before the loop rather than every turn.
 private compile_for_await(u: *Unit, e: *Emit, label: string, binding: Pattern, iter: Expr, body: Expr, otherwise: Option[Expr], at: Span)
     compile_expr(u, e, iter)
+    push_n(e, IterAwaitCheck, at, 0, 0)
+    push_n(e, PushNull, at, 0, 1)
+
+    val live = e.sp - 1
+    val guard = push_n(e, PushDispose(0), at, 0, 0)
+    val scopes = e.scopes
+
+    e.handlers += 1
+    e.disposes.push(DisposeSite(e.handlers, live, CloseAwaited))
 
     val top = here(e)
 
@@ -309,10 +368,14 @@ private compile_for_await(u: *Unit, e: *Emit, label: string, binding: Pattern, i
     safe_point(e, at)
     open_loop(e, label)
 
-    // **The subject is kept and copied**, `CallMethod` taking its receiver: the loop asks the same
-    // object every turn, so what is duplicated is the thing being walked rather than the answer.
-    push_n(e, IterAwaitCheck, at, 0, 0)
-    push_n(e, Dup, at, 0, 1)
+    // **The second copy is emptied first**, taken out and dropped -- never popped from under the
+    // guard's height, which a fault arriving in between would cut the stack back to.
+    push_n(e, TakeAt(0), at, 0, 1)
+    push_n(e, Pop, at, 1, 0)
+
+    // **The subject is copied**, `CallMethod` taking its receiver: the loop asks the same object
+    // every turn, so what is duplicated is the thing being walked rather than the answer.
+    push_n(e, DupAt(1), at, 0, 1)
     push_n(e, CallMethod(0, intern_wide(u, intern_str(u, "next"), 0, fresh_site(u))), at, 1, 1)
 
     // **Refused here rather than at the head**, so the complaint points at the line the awaiting
@@ -332,15 +395,22 @@ private compile_for_await(u: *Unit, e: *Emit, label: string, binding: Pattern, i
     val into = push_n(e, JumpIfFalse(0), at, 1, 0)
     val out = put(e, Jump(0), at)
 
-    // **The way out leaves the subject AND the step standing, and the body's path does not**: the
-    // body binds the step's `value`, so control falling back to the top carries one value where the
-    // jump out carries two. The counter is put back to the jump's own height where the two meet, or
-    // it believes the stack one shallower than it is for the rest of the chunk -- and a `using`
-    // after the loop reaches for its resource one slot off, releasing the wrong value or none.
+    // **The way out leaves the subject, the empty copy AND the step standing, and the body's path
+    // does not**: the body binds the step's `value`, so control falling back to the top carries two
+    // values where the jump out carries three. The counter is put back to the jump's own height
+    // where the two meet, or it believes the stack one shallower than it is for the rest of the
+    // chunk -- and a `using` after the loop reaches for its resource one slot off.
     val leaving = e.sp
 
     patch(e, into, here(e))
     push_n(e, GetField(u32(intern_str(u, "value")), u32(fresh_site(u))), at, 1, 1)
+
+    // The step came back, so the iterator is one to close from here on: the empty copy goes from
+    // under the value and the subject is copied into its place.
+    push_n(e, RotUp(1), at, 0, 0)
+    push_n(e, Pop, at, 1, 0)
+    push_n(e, DupAt(1), at, 0, 1)
+    push_n(e, RotUp(1), at, 0, 0)
     open_scope(e, at, scoped_loop(e, binding, body))
 
     *binding.kind match
@@ -359,24 +429,34 @@ private compile_for_await(u: *Unit, e: *Emit, label: string, binding: Pattern, i
     patch(e, out, here(e))
     e.sp = leaving
 
-    // The step that said `done` is still standing, and the subject under it. Both go before the
-    // answer is built, so that neither Pop can take it.
+    // **Running out closes nothing.** The step that said `done` is still standing, with the empty
+    // copy and the subject under it; all three go before the answer is built, so no Pop can take it.
+    e.disposes.truncate(e.disposes.len() - 1)
+    push_n(e, PopHandler, at, 0, 0)
+    e.handlers -= 1
+    push_n(e, Pop, at, 1, 0)
     push_n(e, Pop, at, 1, 0)
     push_n(e, Pop, at, 1, 0)
     compile_else(u, e, otherwise, at)
 
     val done = put(e, Jump(0), at)
 
-    // A `break` arrives with the subject still under its value, having unwound only to the frame's
-    // own height -- one value here where the counted walk leaves two.
+    // A `break` arrives with the subject and its copy still under its value, having unwound only to
+    // the frame's own height. The guard comes down, the copy is closed and its answer awaited, and
+    // both go from under the value.
     val brk = here(e)
     val after = e.sp
 
-    push_n(e, RotUp(1), at, 0, 0)
+    e.sp = live + 2
+    put(e, PopHandler, at)
+    emit_close(u, e, live, true, at)
+    push_n(e, RotUp(2), at, 0, 0)
+    push_n(e, Pop, at, 1, 0)
     push_n(e, Pop, at, 1, 0)
 
     e.sp = after
     close_loop(e, top, brk)
+    closing_guard(u, e, guard, live + 1, scopes, live, at)
     patch(e, done, here(e))
 end compile_for_await
 
