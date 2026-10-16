@@ -329,9 +329,34 @@ there is nothing here to read `c` from
 - **A guard answers for an ABSENCE and never for a wrong kind.** `f?.()` where `f` holds a `3`
   faults exactly as `f()` would; the character says *this may not be here*, not *this may be
   anything*.
-- `o.m?.()` reads `o.m` as the value it is and calls that, which is what `o.m` means everywhere
-  else in the language. **`o?.m()` is the spelling that guards the object** and calls `m` as its
-  method.
+- **A guarded call of a member keeps its receiver**, as JavaScript's does. `o.m?.(a)` and
+  `o[k]?.(a)` guard the *member*: where it is missing they answer `null` with the arguments not
+  worked out, and where it is there they call exactly what `o.m(a)` and `o[k](a)` call, `o` handed
+  over by the same rule. **`o?.m(a)` and `o?.[k](a)` are the spellings that guard the object.** Only
+  a method taken off on its own, `val f = o.m`, is the bare function:
+
+```slate
+class Tally
+    var n
+
+    add(self, by) = self.n + by
+
+val t = Tally.new(10)
+
+print(t.add?.(1), t["add"]?.(2), t?.add(3), t?.["add"](4))
+print(t.nope?.(1) ?? "none", null?.add(1) ?? "none")
+
+val f = t.add
+
+print(f(t, 5))
+```
+
+```output
+11 12 13 14
+none none
+15
+```
+
 - **Nothing in the skipped part runs** — not a key, not an argument, not a call:
 
 ```slate
