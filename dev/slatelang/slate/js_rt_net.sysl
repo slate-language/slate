@@ -15,9 +15,12 @@ module dev.slatelang.slate
 //
 // ## What is here and what is still owed
 //
-// **`startTls` is here, at both ends, over node's `tls`; a listener told a certificate is not**, and
-// refuses naming TLS. The upgrade is node's own STARTTLS -- the open socket handed to `tls`, which
-// wraps the handle it stands on -- and the options and the slate sentences are the interpreter's.
+// **`startTls` is here, at both ends, over node's `tls`, and so is a listener told a certificate**
+// (`listen({ port, cert, key, alpn }, fn)` is node's `tls.createServer`, and `fn` is called once a
+// connection's handshake has finished). The upgrade is node's own STARTTLS -- the open socket handed
+// to `tls`, which wraps the handle it stands on -- and the options and the slate sentences are the
+// interpreter's. **`listen(socket, fn)` is here too**: a listener another program passed over a
+// channel arrives as a node `net.Server` and is accepted on from `listen`.
 // What differs is what is not slate's: node's trust store is its bundled roots where the
 // interpreter's is the machine's (`trust` is added to either), and a certificate that does not
 // verify is described in node's words after the same `the TLS handshake failed:`.
@@ -70,9 +73,6 @@ js_runtime_net() -> string = raw"""
         const noSockets = (name) =>
             fault("`" + name + "` needs a host with sockets, and this JavaScript host has none")
 
-        const noTls = (name) =>
-            fault("`" + name + "` needs TLS, which is not in the JavaScript back end yet")
-
         // One slot per socket, and a slot is given back by `close` and reused. **The generation is
         // what stops the value a program still holds from coming to mean its successor**, which is
         // the same arrangement the timers' ids run on.
@@ -95,6 +95,9 @@ js_runtime_net() -> string = raw"""
                 secured: false,
                 upgrading: false,
                 plain: null,
+                unclaimed: false,
+                backlog: null,
+                accept: null,
                 closed: false
             }
 
@@ -228,11 +231,9 @@ js_runtime_net() -> string = raw"""
         // whether `reusePort` was asked for -- `false` where the record left it out, which is the
         // ordinary case and the one every existing program keeps.
         const listenTarget = (v) => {
-            if ($.isInt(v)) return { port: Number(v), reusePort: false }
+            if ($.isInt(v)) return { port: Number(v), reusePort: false, secure: null }
 
             if (v instanceof $.SObj) {
-                if (v.hasName("cert") || v.hasName("key")) noTls("listen")
-
                 const port = v.getName("port")
 
                 if (!$.isInt(port)) fault("`listen` takes a port, and this is " + typeName(port))
@@ -241,7 +242,16 @@ js_runtime_net() -> string = raw"""
 
                 if (typeof reusePort !== "boolean") fault("`reusePort` is true or false, and this is " + typeName(reusePort))
 
-                return { port: Number(port), reusePort: reusePort }
+                // **`cert` is what says the listener is to be secured**, as it is in the
+                // interpreter: a `key` with no `cert` beside it is not looked at.
+                if (v.hasName("cert")) {
+                    const cert = pemOf(v, "cert", "{ port, cert, key }")
+                    const key = pemOf(v, "key", "{ port, cert, key }")
+
+                    return { port: Number(port), reusePort: reusePort, secure: { cert: cert, key: key, alpn: alpnOf(v) } }
+                }
+
+                return { port: Number(port), reusePort: reusePort, secure: null }
             }
 
             fault("`listen` takes a port or a record of options, and this is " + typeName(v))
@@ -252,10 +262,30 @@ js_runtime_net() -> string = raw"""
 
             wantHandler(f, "`listen` needs a function to call with each connection, and this is ")
 
+            // `listen(socket, fn)`: a listener another program passed over a channel.
+            if (where instanceof $.SSocket) return listenPassed(where, f)
+
             const target = listenTarget(where)
             const port = target.port
 
             if (port < 0 || port > 65535) fault("a port is between 0 and 65535, and this is " + port)
+
+            // **A secured listener is node's `tls.createServer`, and `f` is called once a
+            // connection's handshake has finished** -- where the interpreter hands the connection
+            // over first and handshakes at its first read. What the program is given is the same:
+            // a connection whose bytes are already decrypted. The certificate and key are checked
+            // here, before anything binds, with the interpreter's sentence.
+            let secure = null
+
+            if (target.secure !== null) {
+                if (tlsHost === null) noSockets("listen")
+
+                try {
+                    secure = tlsHost.createSecureContext({ cert: target.secure.cert, key: target.secure.key })
+                } catch (e) {
+                    fault("this certificate and key could not be used: " + netWhy(e))
+                }
+            }
 
             // **`pauseOnConnect` and not only the `pause()` below**: a paused node socket is a
             // paused *stream*, and its handle goes on reading into a buffer until the high-water
@@ -263,13 +293,37 @@ js_runtime_net() -> string = raw"""
             // program over a channel lost whatever had arrived before the handover, and the worker
             // waited for a request that had already been eaten. Not reading at all until `onData`
             // is also exactly what the interpreter does.
-            const server = netHost.createServer({ pauseOnConnect: true })
+            //
+            // **A secured listener cannot say it**: `tls` reads from the raw socket to run the
+            // handshake, so a paused one never finishes it. The secured connection is paused once
+            // the handshake is over instead, and what a program reads is held for it by the stream.
+            let server = null
+
+            if (secure === null) {
+                server = netHost.createServer({ pauseOnConnect: true })
+            } else {
+                // **The certificate and key go in as themselves and not as the context checked
+                // above**: node's `tls.Server` ignores a `secureContext` for the certificate it
+                // offers and answers every handshake with `no suitable signature algorithm`.
+                const opts = { cert: target.secure.cert, key: target.secure.key }
+
+                if (target.secure.alpn.length > 0) opts.ALPNProtocols = target.secure.alpn
+
+                server = tlsHost.createServer(opts)
+
+                // A client that fails its handshake is nothing the program is told about, as it
+                // never had the connection; node would otherwise leave the event unhandled.
+                server.on("tlsClientError", () => null)
+            }
+
             const value = takeSocket(server, true)
 
-            server.on("connection", (conn) => {
+            server.on(secure === null ? "connection" : "secureConnection", (conn) => {
                 // **The connection gets a slot of its own and no reader**, exactly as it does in the
                 // interpreter: it is the program's to read from, write to and close.
                 const held = takeSocket(conn, false)
+
+                if (secure !== null) socks[held.id].secured = true
 
                 conn.pause()
                 $.callback(f, [held], "listen")
@@ -286,6 +340,39 @@ js_runtime_net() -> string = raw"""
             server.listen({ port: port, reusePort: target.reusePort })
 
             return value
+        }
+
+        // `listen(socket, fn)` -- accept on a listening socket another program passed over a channel.
+        //
+        // **The socket is already bound and listening**, so there is no port to choose and nothing
+        // to secure, and the sentences are the interpreter's. The program goes on holding the value
+        // it was handed: `close` on it stops the listening and `localPort` answers the port.
+        const listenPassed = (where, f) => {
+            const slot = socketOf(where, "listen")
+
+            if (slot.listening) fault("this socket is already listening")
+
+            if (!slot.unclaimed)
+                fault("`listen` takes a socket another program was listening on, and this one is a connection")
+
+            const queued = slot.backlog
+
+            slot.unclaimed = false
+            slot.listening = true
+            slot.backlog = null
+
+            const deliver = (conn) => {
+                const held = takeSocket(conn, false)
+
+                conn.pause()
+                $.callback(f, [held], "listen")
+            }
+
+            slot.accept = deliver
+
+            for (const conn of queued) deliver(conn)
+
+            return where
         }
 
         B.connect = (host, port) => {
@@ -404,7 +491,7 @@ js_runtime_net() -> string = raw"""
             spareSocks.push(id)
 
             try {
-                if (slot.listening) slot.handle.close()
+                if (slot.listening || slot.unclaimed) slot.handle.close()
                 else slot.handle.destroy()
 
                 // A secured socket stands on the plain one it wrapped, and both are let go.
@@ -421,7 +508,29 @@ js_runtime_net() -> string = raw"""
         // from when it calls `onData`, and node would otherwise start delivering data to nobody. Not
         // a builtin -- `js_rt_process.sysl` calls it for a socket that arrived over a channel, and it
         // is here because this is the file that owns the table.
+        //
+        // **A listener arrives as a node `net.Server` and is `Unclaimed`**, the interpreter's word
+        // for a passed socket nobody has used yet: connections that come before `listen(socket, fn)`
+        // are held, unread, and handed to `fn` when it is called.
         const adoptSocket = (conn) => {
+            if (netHost !== null && conn instanceof netHost.Server) {
+                const held = takeSocket(conn, false)
+                const slot = socks[held.id]
+
+                slot.unclaimed = true
+                slot.backlog = []
+                conn.pauseOnConnect = true
+                conn.on("connection", (c) => {
+                    c.pause()
+
+                    if (slot.accept === null) slot.backlog.push(c)
+                    else slot.accept(c)
+                })
+                conn.on("error", (e) => fault("a connection could not be accepted: " + netWhy(e)))
+
+                return held
+            }
+
             conn.pause()
 
             return takeSocket(conn, false)

@@ -227,3 +227,122 @@ A_COMPUTED_CALL_TO_NOTHING_SAYS_SO()
 
     assertFaults(() -> c[anything("nope")](), "`nope` is not a field of this object, so there is nothing to call")
     assertFaults(() -> c[anything("doubled")](), "`doubled` is a property, not a method")
+
+// -- `o.m?.(a)` and `o[k]?.(a)` ------------------------------------------------------------------------
+
+class Ledger
+    var total
+
+    add(self, by) = self.total + by
+
+    // `self` reached through a guarded call: the receiver has to be the ledger, not nothing.
+    report(self) = self.add?.(0)
+
+    get adder(self) = x -> x + 100
+
+class Branch from Ledger
+    new(total) = { total: total }
+
+    twice(self, by) = self["add"]?.(by) * 2
+
+@test
+A_GUARDED_MEMBER_CALL_PASSES_THE_RECEIVER_ITS_PLAIN_CALL_DOES()
+    val l = Ledger.new(10)
+    val k = anything("add")
+
+    assertEq(l.add?.(1), l.add(1))
+    assertEq(l[k]?.(2), l[k](2))
+    assertEq(l?.add(3), 13)
+    assertEq(l?.[k](4), 14)
+    assertEq(l?.add?.(5), 15)
+
+@test
+self_IN_A_METHOD_REACHED_THROUGH_A_GUARD_IS_THE_OBJECT()
+    val b = Branch.new(3)
+
+    assertEq(b.report?.(), 3)
+    assertEq(b["report"]?.(), 3)
+    assertEq(b.twice?.(1), 8)
+    assertEq(b?.["twice"](2), 10)
+
+@test
+A_GUARDED_CALL_OF_WHAT_THE_OBJECT_HOLDS_PASSES_NO_RECEIVER()
+    val o = { f: x -> x * 3 }
+
+    assertEq(o.f?.(2), 6)
+    assertEq(o[anything("f")]?.(3), 9)
+
+    // A `get` is read once and what it answers is called with what was written.
+    assertEq(Ledger.new(0).adder?.(1), 101)
+
+@test
+A_GUARDED_CALL_ON_A_BUILTIN_KIND_IS_ITS_METHOD()
+    var xs = [1, 2]
+
+    xs.push?.(3)
+    xs["push"]?.(4)
+
+    assertEq(xs, [1, 2, 3, 4])
+    assertEq("abc".upper?.(), "ABC")
+    assertEq({ a: 1 }.toString?.(), { a: 1 }.toString())
+
+@test
+A_GUARDED_MEMBER_CALL_NAMES_AND_SPREADS_ITS_ARGUMENTS()
+    val c = Counter.new(5)
+
+    assertEq(c.bump?.(by = 4), 9)
+    assertEq(c[anything("bump")]?.(by = 2), 7)
+    assertEq(c.bump?.(...[3]), 8)
+    assertEq(c["bump"]?.(...[1]), 6)
+    assertEq(c.nope?.(...[1]) ?? "none", "none")
+
+@test
+A_MISSING_MEMBER_ANSWERS_NULL_AND_WORKS_OUT_NOTHING_TO_ITS_RIGHT()
+    var worked = 0
+
+    arg() =
+        worked += 1
+        1
+
+    val c = Counter.new(1)
+    val gone = anything(null)
+
+    assertEq(c.nope?.(arg()), null)
+    assertEq(c[anything("nope")]?.(arg()), null)
+    assertEq({ f: null }.f?.(arg()), null)
+    assertEq(c.nope?.(arg()).x.y, null)
+    assertEq(gone?.bump(arg()), null)
+    assertEq(gone?.["bump"](arg()), null)
+    assertEq(gone?.bump?.(arg()), null)
+    assertEq(worked, 0)
+
+@test
+A_GUARDED_MEMBER_CALL_WORKS_OUT_ITS_OBJECT_AND_KEY_ONCE()
+    var keys = 0
+    var made = 0
+
+    key() =
+        keys += 1
+        "bump"
+
+    make() =
+        made += 1
+        Counter.new(1)
+
+    assertEq(make()[key()]?.(1), 2)
+    assertEq(make().bump?.(1), 2)
+    assertEq([keys, made], [1, 2])
+
+@test
+A_METHOD_TAKEN_OFF_ON_ITS_OWN_STAYS_UNBOUND()
+    val f = Ledger.new(10).add
+
+    assertEq(f(Ledger.new(1), 2), 3)
+
+@test
+A_GUARD_ANSWERS_FOR_AN_ABSENCE_AND_NOT_FOR_A_WRONG_KIND()
+    val c = Counter.new(1)
+
+    assertFaults(() -> anything(null).bump?.(1), "there is nothing here to read `bump` from")
+    assertFaults(() -> { f: 3 }.f?.(), "not something that can be called")
+    assertFaults(() -> anything([1]).nope?.(), "`nope` is not something an array can do")
