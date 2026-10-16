@@ -620,10 +620,12 @@ A_DATA_VARIANTS_MAKER_IS_A_CONSTRUCTION_TOO()
     assertEq([Solid(2) is Tint, Plain is Tint], [true, true])
 
 @test
-A_SUBCLASS_IS_MADE_BY_ITS_OWN_new_AND_IS_STILL_THE_PARENT()
+A_SUBCLASS_HANDS_ITS_ARGUMENTS_TO_THE_PARENTS_new_AND_IS_STILL_THE_PARENT()
+    // JavaScript's rule: a subclass with no `new` of its own is built by its parent's, and its own
+    // initialised field is not a parameter.
     val c = Child(4)
 
-    assertEq(c.side, 4)
+    assertEq([c.kind, c.side, Child().kind], [4, 1, "parent"])
     assertEq([c is Child, c is Parent], [true, true])
 
 @test
