@@ -28,7 +28,8 @@ import sysl.text.{from_utf8, from_utf8_unchecked}
 // ## kairos tasks, one per thing that waits
 //
 // **A socket is a kairos `Connection` or `Listener` on the `uv` driver**, and every wait is a task:
-// a listener's accept loop, a connection's reader once `onData` is called, a dial, and a small one
+// a listener's accept loop, a connection's reader once `onData` is called (or, for a secured
+// socket, once it is secured -- `net_tls.sysl`), a dial, and a small one
 // per write that only hears how the write ended. Each ends in the call its libuv callback used to
 // make, so every decision -- what a chunk is, what a failure tells the program, when a handshake has
 // finished -- is the same code it was. **A write is issued at the call** (kairos's rule), so
@@ -72,6 +73,13 @@ struct Sock
     // What the reader hands over: text for `onData`, a buffer for `onBytes`. Read at each chunk, so
     // the second call decides from the next chunk on.
     as_text: bool
+
+    // **What a secured socket decrypted before the program had a reader to hand it to**, and whether
+    // its stream ended in that time. A TLS socket is read from the moment it is secured -- the
+    // handshake is a conversation, and its answers arrive as reads -- so the program's own bytes can
+    // arrive first. They wait here, as bytes, and go to whichever of `onData` or `onBytes` comes.
+    held: Buf[u8]
+    held_end: bool
 end Sock
 
 // Close whatever a slot's socket holds. **Immediate**, as libuv's own close always was: a write the
@@ -127,7 +135,9 @@ end connection_at
 
 // The socket a builtin was handed, as the slot and generation that name it -- or the complaint about
 // what it was handed instead.
-private socket_of(v: Value, at: Span, name: string) -> Result[(usize, usize), Signal]
+//
+// Not `private`: `net_tls.sysl` reads the socket `startTls` and `alpnProtocol` were handed.
+socket_of(v: Value, at: Span, name: string) -> Result[(usize, usize), Signal]
     v match
         Socket(i, g) ->
             val id = usize(i)
@@ -145,7 +155,7 @@ private socket_of(v: Value, at: Span, name: string) -> Result[(usize, usize), Si
 // Not `private`: `channel.sysl` holds a socket that arrived over a channel in the same table, which
 // is what keeps the loop alive while one is open and closes it when the slot goes.
 hold_socket(h: SockHandle, cb: Value) -> Value
-    val s: &Sock = Sock(h, false, false)
+    val s: &Sock = Sock(h, false, false, buf(), false)
     val id = claim(Pending(cb, Null, null, None, Some(s), true, true, 0, 0))
 
     socket_value(id, gen_at(id))
@@ -192,9 +202,46 @@ private set_error_callback(id: usize, gen: usize, cb: Value)
     current().pending.set(id, slot)
 end set_error_callback
 
-// Call a socket's slate callback with one argument.
+// Call a socket's slate callback with one argument. **The end of a stream nobody is reading yet is
+// held rather than dropped**, so the reader a program registers later is still told it.
 private deliver(id: usize, gen: usize, v: Value)
+    v match
+        Null -> if holding(id, gen)
+            socket_at(id, gen).unwrap().held_end = true
+            return
+        _ -> ()
+
     call_slate(callback_of(id, gen), v)
+end deliver
+
+// Whether what arrives on this socket is to be held rather than handed over: there is no reader yet,
+// or there is one and what arrived before it has not reached it yet -- the order is the stream's.
+private holding(id: usize, gen: usize) -> bool
+    val s = socket_at(id, gen) match
+        None -> return false
+        Some(it) -> it
+
+    callback_of(id, gen) match
+        Null -> true
+        _ -> s.held.len() > 0 || s.held_end
+end holding
+
+// Hand a newly registered reader what was held for it, on the next turn rather than inside the
+// `onData` call -- so the statements after that call run first, as they would for any arrival.
+private async release_held(id: usize, gen: usize, stamp: usize)
+    if !owns(id, gen, stamp) then return
+
+    val s = socket_at(id, gen).unwrap()
+    val bytes = s.held
+
+    s.held = buf()
+
+    if bytes.len() > 0 then handed_over(id, gen, bytes.view(), s.as_text)
+
+    if s.held_end && owns(id, gen, stamp)
+        s.held_end = false
+        deliver(id, gen, Null)
+end release_held
 
 // The same call, given the function rather than the slot it came out of. `Null` is nobody to call
 // and not an error: a socket the program has not read from yet has no callback in it.
@@ -253,7 +300,9 @@ end failure_told
 // what the ordinary reader already copes with: `if chunk == null then close(c)` is right whether the
 // peer finished or vanished. What such a program cannot do is tell the two apart -- which is what
 // `onError` is for, and why not registering one has to mean something rather than being refused.
-private stream_failed(id: usize, gen: usize, message: string)
+//
+// Not `private`: `secured` in `net_tls.sysl` ends a stream whose handshake failed with it.
+stream_failed(id: usize, gen: usize, message: string)
     if !failure_told(id, gen, message) then deliver(id, gen, Null)
 
 // Stop the program with a sentence of slate's own, from inside a callback.
@@ -471,9 +520,9 @@ private accepted(id: usize, gen: usize, conn: &Connection)
     // reports it as its own leak, and closes it under the tests still to come.
     inherit_scope(id, cid)
 
-    // **The handshake is not driven here**, and could not be: nothing has been read yet and nothing
-    // will be until the program calls `onData`. This only gives the connection a stream; `arrived` is
-    // where the two ends talk.
+    // **The handshake drives itself from here**: the connection is read at once, so a program that
+    // registers its reader late -- after an `await` in the connection callback, say -- still has its
+    // handshake finished, and whatever the client sent it in the meantime is held for that reader.
     if tls_listener(id)
         tls_accepted(id, cid) match
             Err(e) ->
@@ -481,6 +530,8 @@ private accepted(id: usize, gen: usize, conn: &Connection)
                 loop_fails(e)
                 return
             Ok(_) -> ()
+
+        read_for_tls(cid, gen_at(cid))
 
     deliver(id, gen, made)
 end accepted
@@ -607,109 +658,7 @@ private async dialled(ask: Asked, id: usize, gen: usize, address: libuv.Address,
             if still_asked(ask) then answer_request(ask.id, socket_value(id, gen))
 end dialled
 
-// `startTls(sock, host)` -- an open socket, upgraded, answering a promise that settles when the
-// handshake has finished.
-//
-// **AN UPGRADE RATHER THAN A FLAG ON `connect`, BECAUSE THAT IS WHAT PROTOCOLS ACTUALLY DO.** TLS
-// from byte zero is one case and not the general one: PostgreSQL sends an eight-byte request in the
-// clear and reads a single byte back before any handshake, SMTP has `STARTTLS`, IMAP and FTP have
-// their own, and a WebSocket over TLS is HTTPS first. An upgrade is also the weaker primitive, so
-// `connect` with TLS from the start is this plus `connect` and needs nothing else -- where a flag on
-// `connect` would have left every one of those protocols with nothing to call.
-//
-// **The socket must be one somebody is reading**, since a handshake is a conversation and the
-// answers arrive as ordinary reads. A program that has not called `onData` or `onBytes` yet may call
-// either after this -- what arrives before then is the kernel's to hold -- but a program that never
-// does is one whose handshake never finishes.
-start_tls_socket(v: Value, host: string, trust: []const u8, alpn: []const string, at: Span) -> Step
-    val (id, gen) = upgradable(v, at)?
-    val waiting = begin_request()
-    val promised = awaited_request(waiting)
-
-    tls_connect(id, host, trust, alpn, waiting) match
-        Err(e) ->
-            deny_request(waiting, at, e)
-            return Ok(promised)
-        Ok(_) -> ()
-
-    // **The ClientHello is produced HERE and not on the next read**, which is the one place a client
-    // differs from a server: a server is spoken to first and this end is not, so nothing would ever
-    // arrive to drive a handshake that had not already started.
-    tls_kick(id) match
-        Err(e) ->
-            tls_drop(id)
-            deny_request(waiting, at, e)
-            return Ok(promised)
-        Ok(_) -> ()
-
-    push_wire(id, gen)
-    Ok(promised)
-end start_tls_socket
-
-// `alpnProtocol(conn)` -- which application protocol this connection settled on, or `null`.
-//
-// **A SERVER CANNOT ASK ANYTHING ELSE.** `h2` and `http/1.1` arrive on one port over one socket and
-// differ in nothing a program could sniff -- HTTP/2's own preface is bytes a malformed HTTP/1.1
-// request could also begin with. ALPN is the answer, and this is where a program reads it.
-//
-// **`null` covers three ordinary cases and no failure**: a plain socket, a peer that offered nothing,
-// and a handshake that has not finished.
-//
-// **THE THIRD OF THOSE IS THE ONE THAT BITES: A CONNECTION CALLBACK RUNS BEFORE THE HANDSHAKE.** It
-// fires when TCP accepts, which is several round trips before ALPN has been settled, so a server
-// that asks there is told `null` about a connection that is about to be `h2`. **Ask at the first
-// arrival instead** -- by then the handshake is long finished, and the bytes in hand are the ones
-// the protocol it chose is waiting to be given. `slate:http` decides exactly this way.
-alpn_protocol(v: Value, at: Span) -> Step
-    val (id, _) = socket_of(v, at, "alpnProtocol")?
-
-    tls_protocol(id) match
-        Some(name) -> Ok(Str(new_str_scanned(name)))
-        None -> Ok(Null)
-end alpn_protocol
-
-// `startTls(conn, { cert, key })` -- the same upgrade asked for from the other end.
-//
-// **A SERVER HAS NOTHING TO SAY UNTIL IT HAS BEEN SPOKEN TO, so there is no kick and nothing to
-// push.** That is the one asymmetry between the two ends, and it is why this is four lines where the
-// client is a dozen: the handshake begins on the next read, exactly as it does for a connection
-// handed out by a secured `listen`, and the promise is answered from the same place.
-//
-// **The connection must be one somebody is reading, and here that is not a caution but the whole
-// mechanism** -- a server that never calls `onData` or `onBytes` will never see the ClientHello and
-// its handshake will never start.
-present_tls_socket(v: Value, certificate: []const u8, key: []const u8, alpn: []const string, at: Span) -> Step
-    val (id, _) = upgradable(v, at)?
-    val waiting = begin_request()
-    val promised = awaited_request(waiting)
-
-    tls_present(id, certificate, key, alpn, waiting) match
-        Err(e) ->
-            deny_request(waiting, at, e)
-            return Ok(promised)
-        Ok(_) -> ()
-
-    Ok(promised)
-end present_tls_socket
-
-// The socket an upgrade was asked for, or the complaint about why it cannot be one.
-private upgradable(v: Value, at: Span) -> Result[(usize, usize), Signal]
-    val (id, gen) = socket_of(v, at, "startTls")?
-
-    if tls_here(id) then return Err(failure(at, "this socket is already secured, and `startTls` upgrades a plain one"))
-
-    Ok((id, gen))
-end upgradable
-
-// A handshake this socket will never finish.
-//
-// **A PROMISE THAT NEVER SETTLES IS A PROGRAM THAT NEVER ENDS**, so every way a socket can stop --
-// the peer hanging up, a read failing, the program closing it -- answers the one `startTls` handed
-// out. Nothing where there is none, which is every server connection and every plain socket.
-private handshake_denied(id: usize, message: string)
-    tls_awaited(id) match
-        None -> ()
-        Some(r) -> deny_request(r, point(0), message)
+// `startTls`, `alpnProtocol` and what a secured socket does with a read are `net_tls.sysl`'s.
 
 // `onData(sock, fn)` and `onBytes(sock, fn)` -- start reading.
 //
@@ -738,6 +687,13 @@ read_socket(v: Value, cb: Value, as_text: bool, at: Span) -> Step
     set_callback(id, gen, cb)
     s.as_text = as_text
 
+    // A secured socket was already being read, and may have something waiting for this reader --
+    // including the end of its stream, after which there is nothing left to start a reader for.
+    if s.held.len() > 0 || s.held_end
+        loop_events().spawn(release_held(id, gen, run_stamp()))
+
+        if s.held_end then return Ok(Null)
+
     if !s.reading
         s.reading = true
         loop_events().spawn(reading(id, gen, run_stamp(), conn))
@@ -748,8 +704,11 @@ end read_socket
 // A connection's reader: one chunk at a time, until the stream ends or fails or the program closes
 // it. **A chunk nobody asked for stays in the kernel**, kairos stopping libuv's reading inside the
 // callback that took one -- so a socket the program has stopped reading by closing it leaves nothing
-// half-delivered.
-private async reading(id: usize, gen: usize, stamp: usize, conn: &Connection)
+// half-delivered. **A secured socket is the exception**: it is read from the moment it is secured,
+// reader or none, and what it decrypts for nobody is held in its slot.
+//
+// Not `private`: `read_for_tls` in `net_tls.sysl` starts one for a socket being secured.
+async reading(id: usize, gen: usize, stamp: usize, conn: &Connection)
     loop
         val got = await conn.read()
 
@@ -814,48 +773,12 @@ error_socket(v: Value, cb: Value, at: Span) -> Step
     Ok(Null)
 end error_socket
 
-// What arrived on a TLS connection: fed to OpenSSL, whatever it wants sent written back, and
-// whatever it decrypted handed on. **A handshake turn produces no plaintext and is not nothing** --
-// it is the whole of the first few round trips, and the program sees none of them.
-private secured(id: usize, gen: usize, cipher: []const u8, as_text: bool)
-    val plain = tls_took(id, cipher) match
-        // **A HANDSHAKE THAT FAILS ENDS THE CONNECTION AND NOTHING ELSE.** It is the ordinary answer
-        // to a client that is not speaking TLS -- a browser sent to `http://` on this port, a probe,
-        // a scanner -- and stopping the program over one would make any server trivially killable
-        // from outside. The program is told what it would be told for any other end of stream, which
-        // is what lets `slate:http` close its side without knowing why -- or told the reason, where
-        // it registered an `onError` and wants to know how many of these it is getting.
-        //
-        // **A CLIENT THAT ASKED FOR THE HANDSHAKE IS TOLD WHY**, which is the other half of the same
-        // argument: the reason a server discards -- because it is about the peer and there are many
-        // peers -- is exactly what a program awaiting `startTls` needs, since a certificate that does
-        // not check out is its own problem and not a stranger's.
-        Err(e) ->
-            handshake_denied(id, e)
-            stream_failed(id, gen, "this connection could not be secured")
-            tls_drop(id)
-
-            if socket_at(id, gen).is_some() then surrender(id)
-
-            return
-        Ok(p) -> p
-
-    push_wire(id, gen)
-
-    // **Settled after the wire is pushed**, so the last flight of the handshake is on its way before
-    // the program is told it may write -- and after `push_queued`, so anything it wrote while the
-    // handshake was running went first.
-    if tls_ready(id)
-        tls_awaited(id) match
-            None -> ()
-            Some(r) -> answer_request(r, Null)
-
-    if plain.len() > 0 then plainly_arrived(id, gen, plain.view(), as_text)
-
 // Everything OpenSSL wants sent, written to the socket. **Nothing awaits it**: the program's own
 // `send` answers a promise for its own bytes, and a handshake record belongs to nobody -- the task
 // beside the write only hears whether it failed.
-private push_wire(id: usize, gen: usize)
+//
+// Not `private`: `net_tls.sysl` pushes the ClientHello and every handshake turn with it.
+push_wire(id: usize, gen: usize)
     val out = tls_pull(id)
 
     if out.len() == 0 then return
@@ -877,7 +800,18 @@ private async wired(id: usize, gen: usize, stamp: usize, t: Task[Result[unit, li
         Ok(_) -> ()
         Err(e) -> if owns(id, gen, stamp) then stream_failed(id, gen, s"this connection could not be written to: ${e}")
 
-private plainly_arrived(id: usize, gen: usize, bytes: []const u8, as_text: bool)
+// What arrived for the program, held where nobody is reading yet and handed over otherwise.
+//
+// Not `private`: `secured` in `net_tls.sysl` hands on what it decrypted.
+plainly_arrived(id: usize, gen: usize, bytes: []const u8, as_text: bool)
+    if holding(id, gen)
+        socket_at(id, gen).unwrap().held.extend(bytes)
+        return
+
+    handed_over(id, gen, bytes, as_text)
+
+// What arrived, handed to the reader as the kind it asked for.
+private handed_over(id: usize, gen: usize, bytes: []const u8, as_text: bool)
     if as_text
         // **A chunk is a chunk and not a message**, so this can split a character in half
         // where a peer sends one across two packets. `onBytes` is the reader that cannot.
