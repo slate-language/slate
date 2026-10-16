@@ -290,3 +290,29 @@ a_generator_releases_when_its_body_ends() =
     assertEq(log, [])
     assert(g.next().done)
     assertEq(log, ["a"])
+
+// **A release that faults in front of a `break` or a `return` is made once.** It runs while the
+// block's own disposal handler is still standing, and that handler used to release the same value a
+// second time on the way past.
+@test
+a_release_that_faults_on_a_break_or_a_return_is_made_once() =
+    var count = 0
+
+    release() =
+        count = count + 1
+        fails("dispose failed")
+
+    counting() = { dispose: release }
+
+    broken() =
+        for i in [1, 2]
+            using r = counting()
+            break
+
+    returned() =
+        using r = counting()
+        return 1
+
+    assertEq(broken() catch e -> e.message, "dispose failed")
+    assertEq(returned() catch e -> e.message, "dispose failed")
+    assertEq(count, 2)
