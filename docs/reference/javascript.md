@@ -508,6 +508,18 @@ URL specification says they mean rather than what a second reading of it written
 node and the interpreter the same call answers *"`/signup` is not an http or https URL, and there is
 no page to resolve it against"* — the same sentence with the missing half named.
 
+**`timeout` is the same option on both**, an `AbortController` here and the loop's own timer in the
+interpreter, cancelled the moment the answer is whole on either, with one sentence for a fetch it
+stopped. `AbortSignal.timeout` is not what is under it: its timer cannot be cancelled.
+
+**A compressed body is decoded on both, and a caller's own `Accept-Encoding` is where they part.**
+The interpreter takes a caller who names one as having taken the decoding over and hands back the
+body as it was sent; a JavaScript host decodes whatever arrives whatever was asked, and a browser
+refuses to let a page set `Accept-Encoding` at all. So the same call answers `""` for a gzip body in
+the interpreter and the text here. Everything else matches: the request asks for `gzip, deflate`,
+`content-encoding` stays in the headers, and a body that will not decompress answers the
+interpreter's sentence rather than the host's `TypeError`.
+
 **`trust` refuses**, and it is the shape case rather than a missing feature. It names a certificate to
 trust as well as the machine's own, and no JavaScript host lets a program add a trust anchor for one
 request. A refusal is the only safe answer: a program that believes it pinned a certificate and did

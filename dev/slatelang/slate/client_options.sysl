@@ -1,0 +1,176 @@
+module dev.slatelang.slate
+
+import sh.sysl.miniz
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{from_utf8, str_builder}
+
+// What a caller asks of `fetch`, read out of the options object once, and what a response's body
+// becomes on the way back.
+//
+// **Every option is read HERE and in one pass, before anything is dialled**, so a call that is wrong
+// faults at the call and a call that is right is a `FetchOptions` the rest of `client.sysl` reads
+// fields from. A new option is a field below and a line in `fetch_options` -- nothing in the dial
+// changes to carry it.
+struct FetchOptions
+    method: string
+    body: string
+    extra: Buf[string]
+    trust: string
+
+    // How long the whole fetch may take, redirects and body included, in milliseconds; zero for no
+    // limit, which is `run`'s reading of the same option.
+    timeout_ms: long
+
+    // Whether this client asks for a compressed body and decodes one. **A caller who names their own
+    // `Accept-Encoding` has taken that over**, and gets what the server sent exactly as it was sent.
+    decode: bool
+
+// Everything a call's options say, or the fault that says which one is wrong.
+fetch_options(options: Value, at: Span) -> Result[FetchOptions, Signal]
+    val method = fetch_option(options, "method", at)?
+    val body = fetch_option(options, "body", at)?
+    val extra = fetch_headers(options, at)?
+    val trust = fetch_option(options, "trust", at)?
+    val timeout_ms = fetch_timeout(options, at)?
+    var decode = true
+
+    for i in 0..<extra.len()
+        if header_is(extra.at(i), "accept-encoding") then decode = false
+
+    Ok(FetchOptions(if method == "" then "GET" else method, body, extra, trust, timeout_ms, decode))
+
+// One option out of the object a caller passed.
+private fetch_option(options: Value, key: string, at: Span) -> Result[string, Signal]
+    options match
+        Value.Null -> Ok("")
+        Object(o) ->
+            val (v, _) = field_from(o, key, at)?
+
+            v match
+                Undefined -> Ok("")
+                Str(p) -> Ok(p.s)
+                other -> Err(failure(at, s"`${key}` is a string, and this is ${other.type_name()}"))
+        other -> Err(failure(at, s"`fetch` takes its options as an object, and this is ${other.type_name()}"))
+
+// The headers a caller wants sent, as the lines they will be written as.
+private fetch_headers(options: Value, at: Span) -> Result[Buf[string], Signal]
+    var out: Buf[string] = buf()
+
+    options match
+        Value.Null -> return Ok(out)
+        Object(o) ->
+            val (v, _) = field_from(o, "headers", at)?
+
+            v match
+                Undefined -> return Ok(out)
+                Object(h) ->
+                    for i in 0..<entry_count(h)
+                        val e = entry_at(h, i)
+
+                        if !e.dead
+                            e.key match
+                                Str(k) -> out.push(s"${k.s}: ${value_text(e.value)}")
+                                other -> return Err(failure(at, s"a header is named by a string, and this is ${other.type_name()}"))
+
+                    return Ok(out)
+                other -> return Err(failure(at, s"`headers` is an object of names and values, and this is ${other.type_name()}"))
+        other -> return Err(failure(at, s"`fetch` takes its options as an object, and this is ${other.type_name()}"))
+
+// The timeout, in milliseconds, or zero for none.
+//
+// **A duration or a number of milliseconds**, exactly as `run`, `sleep` and `setTimeout` take one.
+// **A negative one is a fault and not "no limit"**: it is a number the program worked out, and a
+// subtraction that went the wrong way is a defect to be told about rather than a request to wait for
+// ever.
+private fetch_timeout(options: Value, at: Span) -> Result[long, Signal]
+    options match
+        Value.Null -> return Ok(0)
+        Object(o) ->
+            val (v, _) = field_from(o, "timeout", at)?
+            val ms = v match
+                Undefined -> return Ok(0)
+                Int(n) -> n
+                DurationVal(us) -> us / 1000
+                other -> return Err(failure(at, s"`timeout` is a duration or a number of milliseconds, and this is ${other.type_name()}"))
+
+            if ms < 0 then return Err(failure(at, s"`timeout` cannot be negative, and this is ${ms} milliseconds"))
+
+            return Ok(ms)
+        other -> return Err(failure(at, s"`fetch` takes its options as an object, and this is ${other.type_name()}"))
+
+// What a fetch that ran out of time answers. **The same sentence on both hosts**, which is why it is
+// built from the two things a program can see -- the URL it asked for and the number it gave -- and
+// nothing a host's own abort machinery says.
+fetch_timeout_sentence(url: string, ms: long) -> string =
+    s"${url} did not answer within ${ms} milliseconds"
+
+// -- the body on the way back ------------------------------------------------------------------
+
+// What this client says it accepts, unless the caller has said it for themselves. **gzip and deflate
+// and nothing else**: they are the two `slate:gzip` reads, and they are what node's own `fetch` sends,
+// so a server sees one request whichever host made it.
+val FetchAcceptEncoding: string = "gzip, deflate"
+
+// The most a compressed body may become. **A bomb defence and nothing else**: a few kilobytes of
+// deflate can claim gigabytes, and the destination has to hold all of it at once.
+private val MaxDecoded: usize = 512 * 1024 * 1024
+
+// The body as text, decoded first where the server compressed it.
+//
+// **A body that will not decompress is an ANSWER and not a fault** -- they are bytes from outside
+// the program, the two-channels rule's own case -- and the sentence is one a JavaScript host can say
+// too, which is why miniz's account of what was wrong is not in it: the host's decompressor throws
+// one `TypeError` for every way a stream can be damaged.
+//
+// **An encoding this client did not ask for is left as it came**, which for the bytes of `br` means
+// a body that is not UTF-8 and is therefore `""`. Guessing at a decoder for something nobody
+// advertised would be a second reading of the header.
+fetch_body_text(bytes: []const u8, encoding: string) -> Result[string, string]
+    if bytes.len == 0 then return Ok("")
+
+    val e = lowered(encoding).trim()
+
+    if e == "gzip" || e == "x-gzip"
+        gz_member(bytes, MaxDecoded) match
+            Ok(out) -> return Ok(text_or_empty(out))
+            Err(_) -> return Err(undecodable("gzip"))
+
+    if e == "deflate"
+        // **`deflate` means zlib, and a server that sends the bare stream anyway is common enough
+        // that every browser reads both.** zlib's two header bytes are a checksum of themselves, so
+        // a raw stream is told apart without guessing.
+        val format = if zlib_wrapped(bytes) then miniz.Format.Zlib else miniz.Format.Raw
+
+        stretched(bytes, format, MaxDecoded) match
+            Ok(out) -> return Ok(text_or_empty(out.view()))
+            Err(_) -> return Err(undecodable("deflate"))
+
+    Ok(text_or_empty(bytes))
+
+// The sentence for a compressed body that did not decompress, the same on both hosts.
+undecodable(encoding: string) -> string =
+    s"the server said the body was compressed with ${encoding}, and it could not be decompressed"
+
+// **A body that is not text is empty rather than mangled**, which is the same answer `run` gives and
+// for the same reason: slate has no byte value for it to be.
+private text_or_empty(bytes: []const u8) -> string
+    from_utf8(bytes) match
+        Ok(t) -> t
+        Err(_) -> ""
+
+// Whether a `deflate` body opens with zlib's header: compression method 8 in the low nibble, and the
+// two bytes together a multiple of 31 (RFC 1950).
+private zlib_wrapped(bytes: []const u8) -> bool
+    if bytes.len < 2 then return false
+
+    (bytes[0] & 0x0f) == 8 && (usize(bytes[0]) * 256 + usize(bytes[1])) % 31 == 0
+
+// ASCII lower case, which is all a header name or an encoding token is.
+private lowered(text: string) -> string
+    var out = str_builder()
+
+    for c in text.bytes
+        out.push_char(char(u32(if c >= u8('A') && c <= u8('Z') then c + 32 else c)))
+
+    out.finish()

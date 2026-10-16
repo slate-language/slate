@@ -643,6 +643,36 @@ forbidden response-header name, so a page never reads one. The browser still app
 **A body that is not UTF-8 is `""`** rather than a string of replacement characters, which is the same
 answer `run` gives and for the same reason: slate has no byte value for it to be.
 
+**The options** are `method`, `body`, `headers`, `trust` and `timeout`, all optional.
+
+**`timeout` limits the whole fetch** — redirects and the body included — to a duration or a number of
+milliseconds, exactly as `run`'s does; `0` or leaving it out means no limit. When it runs out the
+request is abandoned, its connection closed, and the answer is a result like any other unreachable
+server: *"`http://example.com/` did not answer within 100 milliseconds"*. A fetch that answers first
+cancels its limit, so a generous one never holds a program open. The sentence is the same on both back
+ends. A negative limit is a mistake in the program, so it faults at the call:
+
+```slate
+print(fetch("http://127.0.0.1:1/", { timeout: -5 }))
+```
+
+```error
+`timeout` cannot be negative, and this is -5 milliseconds
+```
+
+**A compressed body arrives decoded.** The interpreter asks for `Accept-Encoding: gzip, deflate` —
+what node's own `fetch` sends — and decodes a `Content-Encoding: gzip` or `deflate` body with the same
+reader as [`slate:gzip`](gzip.md), taking `deflate` as zlib or as the bare stream, as a browser does.
+`content-encoding` stays in the headers, as it does in a JavaScript host's: it is what the server said.
+A body that will not decompress is an answer and not a fault — *"the server said the body was
+compressed with gzip, and it could not be decompressed"*, on both back ends.
+
+**A caller who sets `Accept-Encoding` themselves has taken that over**, and in the interpreter gets
+the body exactly as the server sent it — which, compressed bytes not being text, is `""`. That is the
+one difference between the hosts here: a JavaScript host decodes whatever arrives and gives a program
+no way to stop it, and a browser does not let a page set `Accept-Encoding` at all.
+[JavaScript](../reference/javascript.md) says so too.
+
 **In a browser a relative URL is resolved against the page's own address**, so `fetch("/signup")`,
 `fetch("./next")` and `fetch("../up")` all reach the origin the page was served from — the resolving is
 `new URL(url, location.href)`, which is what the platform's own `fetch` does with one. **Under node and

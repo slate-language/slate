@@ -75,6 +75,35 @@ js_runtime_fetch() -> string = raw"""
             return out
         }
 
+        // `fetch_timeout`'s reading: a duration or a whole number of milliseconds, zero for none,
+        // and a negative one a fault.
+        const fetchTimeout = (opts) => {
+            if (opts === null) return 0n
+
+            const v = opts.lookup("timeout")[0]
+
+            if (v === undefined) return 0n
+
+            let ms
+
+            if ($.isInt(v)) ms = BigInt(v)
+            else if (v instanceof SDuration) ms = BigInt(v.us) / 1000n
+            else fault("`timeout` is a duration or a number of milliseconds, and this is " + typeName(v))
+
+            if (ms < 0n) fault("`timeout` cannot be negative, and this is " + ms + " milliseconds")
+
+            return ms
+        }
+
+        // **The host decodes a compressed body itself**, so all that is written here is the answer
+        // for one that will not decode: a host's body read rejects with one `TypeError` however the
+        // stream was damaged, and in one of these encodings that is `undecodable`'s sentence in
+        // `client_options.sysl` rather than a failed connection.
+        const fetchEncodings = ["gzip", "x-gzip", "deflate"]
+
+        const fetchWhy = (e) =>
+            String(e !== null && e !== undefined && e.message !== undefined ? e.message : e)
+
         // -- the url, read as `parse_url` reads it -----------------------------------------------
 
         // Whether a URL names no scheme, and is therefore a reference waiting for a base. RFC 3986's
@@ -132,7 +161,7 @@ js_runtime_fetch() -> string = raw"""
         // `from_utf8`'s answer in `client.sysl` and is why `text()` is not used: a host's `text()`
         // replaces every bad byte with U+FFFD, so a response of arbitrary bytes would come back as a
         // string of replacement characters here and as `""` there.
-        const fetchAnswer = (r) => r.arrayBuffer().then((bytes) => {
+        const fetchAnswer = (r, fail) => r.arrayBuffer().then((bytes) => {
             const pairs = []
 
             // **`Set-Cookie` is skipped here and taken from `getSetCookie` below**, a `Headers`
@@ -159,6 +188,14 @@ js_runtime_fetch() -> string = raw"""
 
             return fetchOk($.obj([["status", BigInt(r.status)], ["headers", $.obj(pairs)],
                 ["body", body]]))
+        }, (e) => {
+            const coding = (r.headers.get("content-encoding") ?? "").trim().toLowerCase()
+
+            if (fetchEncodings.includes(coding))
+                return fail("the server said the body was compressed with " +
+                    (coding === "x-gzip" ? "gzip" : coding) + ", and it could not be decompressed")
+
+            return fail("this connection failed: " + fetchWhy(e))
         })
 
         // `fetch(url)` and `fetch(url, options)` -- a promise of what the server said.
@@ -174,6 +211,7 @@ js_runtime_fetch() -> string = raw"""
             const body = fetchText(opts, "body")
             const heads = fetchHeaders(opts)
             const trust = fetchText(opts, "trust")
+            const limit = fetchTimeout(opts)
 
             if ($.host.fetch === null)
                 fault("`fetch` needs the host's own `fetch`, and this JavaScript host has none")
@@ -193,12 +231,45 @@ js_runtime_fetch() -> string = raw"""
 
             if (body !== "") init.body = body
 
+            // **A timeout is an `AbortController` and the engine's own timer, and not
+            // `AbortSignal.timeout`**: that one's timer cannot be cancelled, and a host that keeps a
+            // process alive for a pending timer would wait out a thirty-second limit on a fetch that
+            // answered in ten milliseconds. This one is cleared the moment the answer is whole,
+            // which is `finish_fetch` cancelling the interpreter's.
+            //
+            // **The abort reaches the body read as well as the request**, so the limit covers the
+            // whole fetch on both hosts, and a fetch it stopped answers the interpreter's sentence
+            // rather than the host's `AbortError`.
+            let timer = null
+            let timedOut = false
+
+            if (limit > 0n) {
+                if ($.host.abortController === null || $.host.setTimeout === null)
+                    fault("`timeout` needs the host's own `AbortController` and timers, and this " +
+                        "JavaScript host has none")
+
+                const ctl = new $.host.abortController()
+
+                init.signal = ctl.signal
+                timer = $.host.setTimeout(() => { timedOut = true; ctl.abort() },
+                    Math.min(Number(limit), 2147483647))
+            }
+
+            const fail = (message) => timedOut
+                ? fetchBad(url + " did not answer within " + limit + " milliseconds")
+                : fetchBad(message)
+
+            const done = (answer) => {
+                if (timer !== null) $.host.clearTimeout(timer)
+
+                return answer
+            }
+
             // **The failure is a result and never a rejection**, which is `fetch`'s rule in slate
             // whichever host answers: a server that cannot be reached is the ordinary thing a client
             // deals with. The host's own words are quoted rather than replaced, being the only
             // account of what went wrong that exists here.
-            return $.host.fetch(url, init).then(fetchAnswer,
-                (e) => fetchBad("cannot reach " + url + ": " +
-                    String(e !== null && e !== undefined && e.message !== undefined ? e.message : e)))
+            return $.host.fetch(url, init).then((r) => fetchAnswer(r, fail),
+                (e) => fail("cannot reach " + url + ": " + fetchWhy(e))).then(done)
         }
     """

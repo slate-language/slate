@@ -1,11 +1,13 @@
 module dev.slatelang.slate
 
+import sh.sysl.kairos.Timer
 import sh.sysl.kairos.uv.{ByteStream, Connection}
 import sh.sysl.libuv
 import sh.sysl.openssl
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
-import sysl.text.{Search, from_utf8, str_builder}
+import sysl.text.{Search, str_builder}
+import sysl.time.millis
 
 // `fetch(url)` -- an HTTP request a program makes, on the loop.
 //
@@ -79,6 +81,13 @@ struct Fetch
 
     redirects: usize
 
+    // Whether this client asked for a compressed body, and so decodes one -- false where the caller
+    // named their own `Accept-Encoding`.
+    decode: bool
+
+    // The whole-fetch time limit, where the caller set one. Cancelled by `finish_fetch`.
+    limit: Option[Timer]
+
 // The table is now `current().fetches` -- see `vm_state.sysl`.
 
 // Give every fetch back between runs. **Each connection is CLOSED and the slot is kept**: a read
@@ -101,24 +110,23 @@ do_fetch(args: Args, at: Span) -> Step
         return fault(at, s"`fetch` takes a URL and optionally some options, and was given ${counted(args.len(), "argument")}")
 
     val url = text_argument(args.at(0), at, "fetch", "a URL")?
-    val options = if args.len() == 2 then args.at(1) else Value.Null
-    val method = fetch_option(options, "method", at)?
-    val body = fetch_option(options, "body", at)?
-    val extra = fetch_headers(options, at)?
-    val trust = fetch_option(options, "trust", at)?
+    val asked = fetch_options(if args.len() == 2 then args.at(1) else Value.Null, at)?
     val waiting = begin_request()
     val promised = awaited_request(waiting)
-    val fi = claim_fetch(waiting, at, if method == "" then "GET" else method, body, extra, trust)
+    val fi = claim_fetch(waiting, at, asked)
+
+    // **The limit is armed BEFORE the first dial**, since a URL refused on the spot finishes the
+    // fetch inside `start_fetch` -- and `finish_fetch` is what disarms it, so a timer armed after
+    // would outlive its fetch and fire on whichever fetch took the slot next.
+    if asked.timeout_ms > 0 then arm_fetch_limit(fi, url, asked.timeout_ms)
 
     start_fetch(fi, url)
     Ok(promised)
 end do_fetch
 
-private claim_fetch(request: usize, at: Span, method: string, body: string, extra: Buf[string],
-                    trust: string) -> usize
-    var f = Fetch(true, request, at, "", "", 80, "/", false, method, body, extra, None, 0, None,
-                  trust,
-                  false, buf(), 0)
+private claim_fetch(request: usize, at: Span, asked: FetchOptions) -> usize
+    var f = Fetch(true, request, at, "", "", 80, "/", false, asked.method, asked.body, asked.extra,
+                  None, 0, None, asked.trust, false, buf(), 0, asked.decode, None)
 
     // A reused slot carries its epoch on, so that a task of the fetch that had it last still finds
     // the number moved.
@@ -130,6 +138,29 @@ private claim_fetch(request: usize, at: Span, method: string, body: string, extr
 
     current().fetches.push(f)
     current().fetches.len() - 1
+
+// A whole-fetch limit: when it fires the fetch is abandoned -- its socket closed by `fetch_failed`,
+// whose `close` ends any read still parked on it -- and the caller is answered a result.
+//
+// **The timer is the loop's, so it holds the program open exactly as long as the fetch would**, and
+// `finish_fetch` cancels it the moment the fetch ends any other way: a fetch that answers in ten
+// milliseconds with a thirty-second limit does not keep the program alive for thirty seconds.
+private arm_fetch_limit(fi: usize, url: string, ms: long)
+    val t = loop_events().after(millis(ms), (_) -> fetch_out_of_time(fi, url, ms))
+    var f = current().fetches.at(fi)
+
+    f.limit = Some(t)
+    current().fetches.set(fi, f)
+
+private fetch_out_of_time(fi: usize, url: string, ms: long)
+    if !fetch_live(fi) then return
+
+    // The timer has fired, so there is nothing left for `finish_fetch` to cancel.
+    var f = current().fetches.at(fi)
+
+    f.limit = None
+    current().fetches.set(fi, f)
+    fetch_failed(fi, fetch_timeout_sentence(url, ms))
 
 // Point a fetch at a URL and set it going. Called again for each redirect, which is what makes a
 // redirect the same code as the first request rather than a copy of it.
@@ -330,6 +361,8 @@ private send_request(fi: usize)
     out.push("Connection: close\r\n")
     out.push("Accept: */*\r\n")
 
+    if f.decode then out.push(s"Accept-Encoding: ${FetchAcceptEncoding}\r\n")
+
     if f.body != "" then out.push(s"Content-Length: ${f.body.bytes.len}\r\n")
 
     out.push("\r\n")
@@ -471,6 +504,16 @@ private deliver_response(fi: usize, r: Response)
                     start_fetch(fi, next)
                     return
 
+    // **Decoded before anything is built**, so a body that will not decompress answers a result
+    // with no half-made object left on the roots. `content-encoding` stays in the headers below, as
+    // it does in a JavaScript host's `Headers`: it is what the server said, and the body says what
+    // it became.
+    val text = fetch_body_text(r.body, if f.decode then header_named(r.headers, "content-encoding") else "") match
+        Ok(t) -> t
+        Err(why) ->
+            fetch_failed(fi, why)
+            return
+
     val mark = root_mark()
     val o = new_object()
 
@@ -518,13 +561,6 @@ private deliver_response(fi: usize, r: Response)
                     other -> obj_put_name(headers, name, str_value(value))
 
     obj_put_name(o, "headers", Object(headers))
-
-    // **A body that is not text is empty rather than mangled**, which is the same answer `run` gives
-    // and for the same reason: slate has no byte value for it to be.
-    val text = from_utf8(r.body) match
-        Ok(t) -> t
-        Err(_) -> ""
-
     obj_put_name(o, "body", str_value(text))
     release(mark)
 
@@ -560,9 +596,14 @@ private finish_fetch(fi: usize)
 
     var f = current().fetches.at(fi)
 
+    f.limit match
+        Some(t) -> loop_events().cancel(t)
+        None -> false
+
     f.live = false
     f.got = buf()
     f.extra = buf()
+    f.limit = None
     current().fetches.set(fi, f)
 
 // Give the failure back as a result, and stop.
@@ -575,43 +616,6 @@ private fetch_failed(fi: usize, why: string)
 
     finish_fetch(fi)
     deny_request(request, at, why)
-
-// One option out of the object a caller passed.
-private fetch_option(options: Value, key: string, at: Span) -> Result[string, Signal]
-    options match
-        Value.Null -> Ok("")
-        Object(o) ->
-            val (v, _) = field_from(o, key, at)?
-
-            v match
-                Undefined -> Ok("")
-                Str(p) -> Ok(p.s)
-                other -> Err(failure(at, s"`${key}` is a string, and this is ${other.type_name()}"))
-        other -> Err(failure(at, s"`fetch` takes its options as an object, and this is ${other.type_name()}"))
-
-// The headers a caller wants sent, as the lines they will be written as.
-private fetch_headers(options: Value, at: Span) -> Result[Buf[string], Signal]
-    var out: Buf[string] = buf()
-
-    options match
-        Value.Null -> return Ok(out)
-        Object(o) ->
-            val (v, _) = field_from(o, "headers", at)?
-
-            v match
-                Undefined -> return Ok(out)
-                Object(h) ->
-                    for i in 0..<entry_count(h)
-                        val e = entry_at(h, i)
-
-                        if !e.dead
-                            e.key match
-                                Str(k) -> out.push(s"${k.s}: ${value_text(e.value)}")
-                                other -> return Err(failure(at, s"a header is named by a string, and this is ${other.type_name()}"))
-
-                    return Ok(out)
-                other -> return Err(failure(at, s"`headers` is an object of names and values, and this is ${other.type_name()}"))
-        other -> return Err(failure(at, s"`fetch` takes its options as an object, and this is ${other.type_name()}"))
 
 private colon_at(line: string) -> usize
     val b = line.bytes
