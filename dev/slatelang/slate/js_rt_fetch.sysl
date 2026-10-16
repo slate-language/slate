@@ -75,6 +75,18 @@ js_runtime_fetch() -> string = raw"""
             return out
         }
 
+        // `fetch_flag`'s reading: true or false, and false where it is left out.
+        const fetchFlag = (opts, key) => {
+            if (opts === null) return false
+
+            const v = opts.lookup(key)[0]
+
+            if (v === undefined) return false
+            if (typeof v !== "boolean") fault("`" + key + "` is true or false, and this is " + typeName(v))
+
+            return v
+        }
+
         // `fetch_timeout`'s reading: a duration or a whole number of milliseconds, zero for none,
         // and a negative one a fault.
         const fetchTimeout = (opts) => {
@@ -161,7 +173,8 @@ js_runtime_fetch() -> string = raw"""
         // `from_utf8`'s answer in `client.sysl` and is why `text()` is not used: a host's `text()`
         // replaces every bad byte with U+FFFD, so a response of arbitrary bytes would come back as a
         // string of replacement characters here and as `""` there.
-        const fetchAnswer = (r, fail) => r.arrayBuffer().then((bytes) => {
+        // The headers as `header_lines_into` builds them.
+        const fetchPairs = (r) => {
             const pairs = []
 
             // **`Set-Cookie` is skipped here and taken from `getSetCookie` below**, a `Headers`
@@ -178,6 +191,10 @@ js_runtime_fetch() -> string = raw"""
 
             if (cookies.length > 0) pairs.push(["set-cookie", cookies])
 
+            return $.obj(pairs)
+        }
+
+        const fetchAnswer = (r, fail) => r.arrayBuffer().then((bytes) => {
             let body = ""
 
             try {
@@ -186,17 +203,115 @@ js_runtime_fetch() -> string = raw"""
                 body = ""
             }
 
-            return fetchOk($.obj([["status", BigInt(r.status)], ["headers", $.obj(pairs)],
+            return fetchOk($.obj([["status", BigInt(r.status)], ["headers", fetchPairs(r)],
                 ["body", body]]))
         }, (e) => {
-            const coding = (r.headers.get("content-encoding") ?? "").trim().toLowerCase()
+            const coding = fetchCoding(r)
 
-            if (fetchEncodings.includes(coding))
-                return fail("the server said the body was compressed with " +
-                    (coding === "x-gzip" ? "gzip" : coding) + ", and it could not be decompressed")
+            if (fetchEncodings.includes(coding)) return fail(fetchUndecodable(coding))
 
             return fail("this connection failed: " + fetchWhy(e))
         })
+
+        const fetchCoding = (r) => (r.headers.get("content-encoding") ?? "").trim().toLowerCase()
+
+        const fetchUndecodable = (coding) => "the server said the body was compressed with " +
+            (coding === "x-gzip" ? "gzip" : coding) + ", and it could not be decompressed"
+
+        // `{ status, headers, body }` with the body a source, which is `body_head` and `body_object`
+        // in `client_stream.sysl` -- read through the host's own `getReader()`.
+        //
+        // **The host decodes as it reads**, which is the one thing it does that the interpreter does
+        // not: a compressed body arrives here as the text it stands for, where the interpreter asked
+        // for `identity` and refuses a server that ignored it. A body that will not decode, a
+        // connection that goes and a limit that runs out each reject the read with the host's own
+        // error, so the sentence is chosen here from what is known -- `late()` says whether the limit
+        // fired -- and is the interpreter's word for word.
+        //
+        // **`over` is called exactly once, however the body ends**, and is what clears the limit;
+        // `abort` is what `dispose` adds to cancelling the reader, so the connection goes whichever of
+        // the two a host listens to.
+        const fetchStreamed = (r, url, over, late, abort) => {
+            const coding = fetchCoding(r)
+            const reader = r.body === null ? null : r.body.getReader()
+            let finished = false
+            let busy = false
+
+            const step = (done, value) => $.obj([["done", done], ["value", value]])
+
+            const end = () => {
+                if (finished) return
+
+                finished = true
+                over()
+            }
+
+            const broke = () => {
+                const t = late()
+
+                if (t !== null) return t
+                if (fetchEncodings.includes(coding)) return fetchUndecodable(coding)
+
+                return url + " stopped sending in the middle of the body"
+            }
+
+            // An empty chunk is read past, there being nothing in it to hand over.
+            const pull = () => reader.read().then((got) => {
+                if (finished) return step(true, null)
+
+                if (got.done) {
+                    end()
+                    return step(true, null)
+                }
+
+                if (got.value.length === 0) return pull()
+
+                return step(false, $.bytesOf(got.value))
+            }, (e) => {
+                if (finished) return step(true, null)
+
+                const why = broke()
+
+                end()
+                return step(false, fetchBad(why))
+            })
+
+            const next = () => {
+                if (busy)
+                    fault("this streamed body is already working on a `next` -- await that promise " +
+                        "before asking it for another value")
+
+                if (finished || reader === null) {
+                    end()
+                    return Promise.resolve(step(true, null))
+                }
+
+                busy = true
+
+                return pull().then((s) => {
+                    busy = false
+                    return s
+                })
+            }
+
+            const dispose = () => {
+                if (!finished) {
+                    end()
+
+                    if (reader !== null) reader.cancel().catch(() => null)
+
+                    abort()
+                }
+
+                return null
+            }
+
+            const body = $.obj([["proto", $.obj([["next", next], ["dispose", dispose],
+                ["close", dispose]])]])
+
+            return fetchOk($.obj([["status", BigInt(r.status)], ["headers", fetchPairs(r)],
+                ["body", body]]))
+        }
 
         // `fetch(url)` and `fetch(url, options)` -- a promise of what the server said.
         B.fetch = (...args) => {
@@ -212,6 +327,7 @@ js_runtime_fetch() -> string = raw"""
             const heads = fetchHeaders(opts)
             const trust = fetchText(opts, "trust")
             const limit = fetchTimeout(opts)
+            const stream = fetchFlag(opts, "stream")
 
             if ($.host.fetch === null)
                 fault("`fetch` needs the host's own `fetch`, and this JavaScript host has none")
@@ -242,34 +358,54 @@ js_runtime_fetch() -> string = raw"""
             // rather than the host's `AbortError`.
             let timer = null
             let timedOut = false
+            let ctl = null
 
             if (limit > 0n) {
                 if ($.host.abortController === null || $.host.setTimeout === null)
                     fault("`timeout` needs the host's own `AbortController` and timers, and this " +
                         "JavaScript host has none")
 
-                const ctl = new $.host.abortController()
-
+                ctl = new $.host.abortController()
                 init.signal = ctl.signal
                 timer = $.host.setTimeout(() => { timedOut = true; ctl.abort() },
                     Math.min(Number(limit), 2147483647))
+            } else if (stream && $.host.abortController !== null) {
+                // **A streamed body is given a controller even with no limit**, so that `dispose`
+                // can end the request as well as the read.
+                ctl = new $.host.abortController()
+                init.signal = ctl.signal
             }
 
-            const fail = (message) => timedOut
-                ? fetchBad(url + " did not answer within " + limit + " milliseconds")
-                : fetchBad(message)
+            const lateSentence = () => timedOut
+                ? url + " did not answer within " + limit + " milliseconds"
+                : null
 
-            const done = (answer) => {
+            const fail = (message) => fetchBad(lateSentence() ?? message)
+
+            const clear = () => {
                 if (timer !== null) $.host.clearTimeout(timer)
 
+                timer = null
+            }
+
+            const done = (answer) => {
+                clear()
                 return answer
             }
+
+            // **A streamed answer keeps the limit running**, the body being part of the exchange it
+            // covers; the body clears it when it ends. A fetch that failed before a body existed
+            // clears it here, as a buffered one does.
+            const answered = stream
+                ? (r) => fetchStreamed(r, url, clear, lateSentence,
+                    () => { if (ctl !== null) ctl.abort() })
+                : (r) => fetchAnswer(r, fail).then(done)
 
             // **The failure is a result and never a rejection**, which is `fetch`'s rule in slate
             // whichever host answers: a server that cannot be reached is the ordinary thing a client
             // deals with. The host's own words are quoted rather than replaced, being the only
             // account of what went wrong that exists here.
-            return $.host.fetch(url, init).then((r) => fetchAnswer(r, fail),
-                (e) => fail("cannot reach " + url + ": " + fetchWhy(e))).then(done)
+            return $.host.fetch(url, init).then(answered,
+                (e) => done(fail("cannot reach " + url + ": " + fetchWhy(e))))
         }
     """

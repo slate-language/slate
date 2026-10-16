@@ -1,0 +1,504 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{from_utf8_unchecked, split, Search}
+
+// `fetch(url, { stream: true })` -- the body handed over as it arrives.
+//
+// **The answer is the one a buffered fetch gives, settled at the HEAD rather than at the end**: a
+// status, the headers, and a `body` that is an asynchronous source -- an object answering `next()`
+// with a promise of `{ value, done }`, so `for await chunk in body` reads it, each chunk a `bytes`.
+// `client.sysl` dials, reads and follows redirects exactly as it does for any fetch; what is here is
+// where the body ends, what is held between one `next()` and the next, and the object a program reads
+// it through.
+//
+// ## Three things a reader of this file has to know
+//
+// **A BODY THAT BREAKS OFF IS AN ANSWER, NOT A FAULT.** The bytes came from outside the program, so
+// a dropped connection, a timeout or a damaged chunk is the last value the source hands over --
+// `{ ok: false, error }` -- and the source is done after it. That is the two-channels rule read for a
+// stream: `for await` sees an ordinary value and the program decides what it means.
+//
+// **ONE READ AHEAD, AND NO MORE.** The task reading the socket stops while bytes are held that
+// nobody has asked for (`held_back`) and `next()` starts it again (`resume_reading`). A slow reader
+// therefore costs the server's own send buffer rather than this process's memory, and an abandoned
+// body costs nothing but its slot.
+//
+// **THE SOCKET IS CLOSED THE MOMENT THE BODY IS OVER, and `dispose` closes it before then.** A body
+// is a resource with a `dispose`, so `using body = r.value.body` releases the connection on every way
+// out of the block -- the `break` that stops reading early, a `return`, a fault. `close` is the same
+// function under the name `slate:http` asks a streamed response's source for, so a fetched body can be
+// handed straight back out as one.
+
+// How a body says where it ends.
+enum Framing
+    // A `HEAD`, a `204`, a `304` or a `1xx`: there is no body whatever the headers say.
+    Bodiless
+
+    // `Content-Length`.
+    Counted
+
+    // `Transfer-Encoding: chunked`.
+    Chunked
+
+    // Neither, so the end of the socket is the end of the body -- which `Connection: close` allows.
+    ToClose
+
+// Where a chunked body's reader is between one read and the next.
+enum ChunkAt
+    SizeLine
+    InChunk
+    ChunkEnd
+    Trailers
+
+// A body's framing, and how far through it the bytes so far have come.
+struct BodyFrame
+    framing: Framing
+
+    // The bytes still owed: of the whole body where it is counted, of the current chunk where it is
+    // chunked.
+    left: usize
+    at: ChunkAt
+
+    // A size line or a trailer line, gathered until its newline arrives.
+    line: Buf[u8]
+    done: bool
+
+// The frame a fetch carries before its head has arrived.
+//
+// Not `private`: `claim_fetch` in `client.sysl` makes every slot with one.
+no_frame() -> BodyFrame = BodyFrame(Framing.ToClose, 0, ChunkAt.SizeLine, buf(), false)
+
+// A reply's status and header lines, read without its body.
+struct ReplyHead
+    status: int
+    lines: []const string
+
+// The head of what has arrived, where its blank line has.
+//
+// Not `private`: `client.sysl` reads a streamed head that never finished with it, for the sentence.
+parse_head(raw: []const u8) -> Result[ReplyHead, string]
+    val split_at = header_end(raw)
+
+    if split_at == 0 then return Err("the reply has no end to its headers, so it is not HTTP")
+
+    val head = from_utf8_unchecked(raw[0..<(split_at - 4)])
+    val lines = split(head, "\r\n")
+
+    if lines.len == 0 then return Err("the reply is empty")
+
+    val status = status_of(lines[0])?
+
+    Ok(ReplyHead(status, lines[1..<lines.len]))
+end parse_head
+
+// Where this reply's body ends.
+private frame_for(status: int, lines: []const string, method: string) -> Result[BodyFrame, string]
+    var fr = no_frame()
+
+    if method == "HEAD" || (status >= 100 && status < 200) || status == 204 || status == 304
+        fr.framing = Framing.Bodiless
+        fr.done = true
+        return Ok(fr)
+
+    if header_named(lines, "transfer-encoding").contains("chunked")
+        fr.framing = Framing.Chunked
+        return Ok(fr)
+
+    val length = header_named(lines, "content-length").trim()
+
+    if length != ""
+        var n: usize = 0
+
+        for c in length.bytes
+            if c < u8('0') || c > u8('9') then return Err(s"the reply's Content-Length is `${length}`, which is not a number")
+
+            n = n * 10 + usize(c - u8('0'))
+
+        fr.framing = Framing.Counted
+        fr.left = n
+        fr.done = n == 0
+
+    Ok(fr)
+end frame_for
+
+// Whether a buffered reply is whole yet: a counted body once that many bytes are in, a chunked one
+// once `parse_response` can read every chunk, and an unframed one only when the socket ends.
+//
+// Not `private`: `try_answer` in `client.sysl` asks it after every read.
+whole_yet(raw: []const u8, split_at: usize, method: string) -> bool
+    val h = parse_head(raw) match
+        Err(_) -> return true
+        Ok(h) -> h
+
+    val fr = frame_for(h.status, h.lines, method) match
+        Err(_) -> return true
+        Ok(fr) -> fr
+
+    if fr.framing == Framing.Counted then return raw.len - split_at >= fr.left
+
+    fr.framing != Framing.ToClose
+
+// The sentence a streamed body ends with when its connection goes before it is whole -- the same on
+// both hosts, which is why it names nothing but the URL the program asked for.
+//
+// Not `private`: `read_on` in `client.sysl` says it for a read that failed mid-body.
+broke_off(url: string) -> string = s"${url} stopped sending in the middle of the body"
+
+// -- the head, and the bytes after it ------------------------------------------------------------
+
+// A streamed fetch's head is in: follow it if it redirects, refuse it if it is compressed, and
+// otherwise answer the fetch with the head and a body to read the rest through.
+//
+// Not `private`: `try_answer` in `client.sysl` hands a streamed fetch over here once its head is in.
+body_head(fi: usize, split_at: usize)
+    val f = current().fetches.at(fi)
+
+    val h = parse_head(f.got.view()) match
+        Err(why) ->
+            fetch_failed(fi, why)
+            return
+        Ok(h) -> h
+
+    if redirected(fi, h.status, h.lines) then return
+
+    if f.decode
+        val refused = streamed_compression(header_named(h.lines, "content-encoding"))
+
+        if refused != ""
+            fetch_failed(fi, refused)
+            return
+
+    val fr = frame_for(h.status, h.lines, f.method) match
+        Err(why) ->
+            fetch_failed(fi, why)
+            return
+        Ok(fr) -> fr
+
+    var g = current().fetches.at(fi)
+    var rest: Buf[u8] = buf()
+
+    rest.extend(g.got.view()[split_at..])
+    g.got = rest
+    g.frame = fr
+    g.streaming = true
+    current().fetches.set(fi, g)
+
+    val mark = root_mark()
+    val body = body_object(fi, g.stamp)
+
+    hold(body)
+
+    val o = response_object(h.status, h.lines, body)
+
+    hold(o)
+    answer_request(g.request, o)
+    release(mark)
+    body_feed(fi)
+end body_head
+
+// Everything that has arrived since the last read, through the framing and into what is held.
+//
+// Not `private`: `try_answer` in `client.sysl` calls it after every read once a body is flowing.
+body_feed(fi: usize)
+    var f = current().fetches.at(fi)
+    val came = f.got
+    val bytes = came.view()
+    val n = bytes.len
+    var i: usize = 0
+    var bad = false
+
+    while i < n && !f.frame.done && !bad
+        if f.frame.framing == Framing.Counted
+            val take = if f.frame.left < n - i then f.frame.left else n - i
+
+            f.held.extend(bytes[i..<(i + take)])
+            i += take
+            f.frame.left -= take
+
+            if f.frame.left == 0 then f.frame.done = true
+        elif f.frame.framing == Framing.ToClose
+            f.held.extend(bytes[i..])
+            i = n
+        elif f.frame.framing == Framing.Bodiless
+            f.frame.done = true
+        elif f.frame.at == ChunkAt.InChunk
+            val take = if f.frame.left < n - i then f.frame.left else n - i
+
+            f.held.extend(bytes[i..<(i + take)])
+            i += take
+            f.frame.left -= take
+
+            if f.frame.left == 0 then f.frame.at = ChunkAt.ChunkEnd
+        else
+            val c = bytes[i]
+
+            i += 1
+
+            if f.frame.at == ChunkAt.ChunkEnd
+                // The `\r\n` a chunk's data ends with, and nothing else may stand there.
+                if c == u8('\n') then f.frame.at = ChunkAt.SizeLine
+                elif c != u8('\r') then bad = true
+            elif c != u8('\n')
+                // **A line has a ceiling**, or a server sending a size line with no end would grow
+                // it for as long as it liked.
+                if f.frame.line.len() >= 4096 then bad = true else f.frame.line.push(c)
+            else
+                val whole = f.frame.line.view()
+                val line = if whole.len > 0 && whole[whole.len - 1] == u8('\r') then whole[0..<(whole.len - 1)] else whole
+
+                if f.frame.at == ChunkAt.SizeLine
+                    hex_of(line) match
+                        Err(_) -> bad = true
+                        Ok(size) ->
+                            if size == 0
+                                f.frame.at = ChunkAt.Trailers
+                            else
+                                f.frame.left = size
+                                f.frame.at = ChunkAt.InChunk
+                elif line.len == 0
+                    f.frame.done = true
+
+                f.frame.line = buf()
+
+    f.got = buf()
+    current().fetches.set(fi, f)
+
+    if bad
+        body_failed(fi, broke_off(f.url))
+        return
+
+    if f.frame.done then body_over(fi)
+
+    body_deliver(fi)
+end body_feed
+
+// The socket ended while a body was flowing: the end of an unframed body, and a break in any other.
+//
+// Not `private`: `fetch_ended` in `client.sysl` hands a streamed body's end over here.
+body_ended(fi: usize)
+    val f = current().fetches.at(fi)
+
+    if f.ended then return
+
+    if f.frame.done || f.frame.framing == Framing.ToClose
+        body_over(fi)
+        body_deliver(fi)
+        return
+
+    body_failed(fi, broke_off(f.url))
+
+// The body broke off -- the connection went, the limit ran out, a chunk was damaged. What is held
+// is still handed over, and then this sentence, and then the source is done.
+//
+// Not `private`: `fetch_failed` and `read_on` in `client.sysl` fail a flowing body through it.
+body_failed(fi: usize, why: string)
+    var f = current().fetches.at(fi)
+
+    if f.ended then return
+
+    f.ended = true
+    f.failure = why
+    current().fetches.set(fi, f)
+    hang_up(fi)
+    body_deliver(fi)
+
+// The body is whole. The connection goes now; the slot waits for the program to read what is held.
+private body_over(fi: usize)
+    var f = current().fetches.at(fi)
+
+    f.ended = true
+    current().fetches.set(fi, f)
+    hang_up(fi)
+
+// Whether the reader should stop: bytes are held and nobody has asked for them.
+//
+// Not `private`: `read_on` in `client.sysl` asks it before every read.
+held_back(fi: usize) -> bool
+    val f = current().fetches.at(fi)
+
+    if !f.streaming then return false
+
+    f.waiting match
+        Some(_) -> false
+        None -> f.held.len() > 0
+
+// Answer the `next()` the program is waiting on, where there is now something to answer it with.
+private body_deliver(fi: usize)
+    val id = current().fetches.at(fi).waiting match
+        Some(id) -> id
+        None -> return
+
+    take_step(fi) match
+        None -> ()
+        Some(v) ->
+            var f = current().fetches.at(fi)
+
+            // `take_step` may have given the slot back, and a slot given back waits for nobody.
+            f.waiting = None
+            current().fetches.set(fi, f)
+            answer_plain_request(id, v)
+
+// The step a `next()` gets now, where there is one: everything held as one chunk, then the sentence
+// a broken body ends with, then `done` -- at which the slot is given back.
+private take_step(fi: usize) -> Option[Value]
+    var f = current().fetches.at(fi)
+
+    if f.held.len() > 0
+        val chunk = bytes_from(f.held.view())
+
+        f.held = buf()
+        current().fetches.set(fi, f)
+
+        return Some(step(false, chunk))
+
+    if f.failure != ""
+        val mark = root_mark()
+        val e = err_value(f.failure)
+
+        hold(e)
+        f.failure = ""
+        current().fetches.set(fi, f)
+
+        val s = step(false, e)
+
+        release(mark)
+
+        return Some(s)
+
+    if f.ended
+        finish_fetch(fi)
+
+        return Some(step(true, Value.Null))
+
+    None
+end take_step
+
+// `{ done, value }`, which is what a source's `next()` answers.
+private step(done: bool, v: Value) -> Value
+    val mark = root_mark()
+
+    hold(v)
+
+    val o = new_object()
+
+    hold(Object(o))
+    obj_put_name(o, "done", Bool(done))
+    obj_put_name(o, "value", v)
+    release(mark)
+    Object(o)
+
+// -- the body a program holds ---------------------------------------------------------------------
+
+// The object a streamed body is read through.
+//
+// **Its three methods are on a PROTO, and that is what hands them the body.** A method an object
+// carries itself is called with no receiver, the function having captured what it needs -- and a
+// builtin captures nothing -- while one found up the chain is handed the object it was found on. The
+// slot travels under `StreamTag`, unspellable and hidden, with the stamp that says the slot is still
+// this fetch's.
+private body_object(fi: usize, stamp: usize) -> Value
+    val mark = root_mark()
+    val proto = new_object()
+
+    hold(Object(proto))
+    obj_put_name(proto, "next", Native(n_body_next))
+    obj_put_name(proto, "dispose", Native(n_body_dispose))
+    obj_put_name(proto, "close", Native(n_body_close))
+
+    val o = new_object()
+
+    hold(Object(o))
+    obj_put_name(o, "proto", Object(proto))
+    obj_put_name(o, StreamTag, Int(long(fi) * SlotScale + long(stamp)))
+    release(mark)
+    Object(o)
+end body_object
+
+// How a slot and its stamp share one integer.
+private val SlotScale: long = 4294967296
+
+// The fetch a body's method was called on: `Some(slot)` while it is that fetch's, `None` once the
+// fetch is over and the slot given back -- a body read to the end, or disposed of, has nothing left
+// to say. A call that is not on a body at all is a fault.
+private body_slot(args: Args, at: Span, name: string) -> Result[Option[usize], Signal]
+    if args.len() != 1
+        return Err(failure(at, s"`${name}` is a streamed body's own and takes nothing -- it is called as `body.${name}()`"))
+
+    val packed = args.at(0) match
+        Object(o) -> obj_get_name(o, StreamTag) match
+            Some(Int(k)) -> k
+            _ -> return Err(failure(at, s"`${name}` is a streamed body's own, and this is not one"))
+        other -> return Err(failure(at, s"`${name}` is a streamed body's own, and this is ${other.type_name()}"))
+
+    val fi = usize(packed / SlotScale)
+    val stamp = usize(packed % SlotScale)
+
+    if !fetch_live(fi) then return Ok(None)
+
+    val f = current().fetches.at(fi)
+
+    if !f.streaming || f.stamp != stamp then return Ok(None)
+
+    Ok(Some(fi))
+end body_slot
+
+// `body.next()` -- a promise of the next chunk, of the sentence the body broke off with, or of `done`.
+//
+// **One at a time, refused rather than queued**, which is an `async` generator's rule and for its
+// reason: `for await` never asks twice, and a program that does has two readers of one stream.
+private do_body_next(args: Args, at: Span) -> Step
+    val fi = body_slot(args, at, "next")? match
+        None -> return gz_settled(step(true, Value.Null))
+        Some(fi) -> fi
+
+    current().fetches.at(fi).waiting match
+        Some(_) -> return fault(at, "this streamed body is already working on a `next` -- await that promise before asking it for another value")
+        None -> ()
+
+    take_step(fi) match
+        Some(v) -> return gz_settled(v)
+        None -> ()
+
+    val id = begin_request()
+    var f = current().fetches.at(fi)
+
+    f.waiting = Some(id)
+    current().fetches.set(fi, f)
+    resume_reading(fi)
+    Ok(awaited_request(id))
+end do_body_next
+
+// `body.dispose()` and `body.close()` -- stop reading, close the connection, give the slot back. A
+// `next()` still waiting is told `done`. Nothing at all for a body that is already over.
+private do_body_dispose(args: Args, at: Span) -> Step = let_go(args, at, "dispose")
+
+private do_body_close(args: Args, at: Span) -> Step = let_go(args, at, "close")
+
+private let_go(args: Args, at: Span, name: string) -> Step
+    val fi = body_slot(args, at, name)? match
+        None -> return Ok(Value.Null)
+        Some(fi) -> fi
+
+    current().fetches.at(fi).waiting match
+        Some(id) -> answer_plain_request(id, step(true, Value.Null))
+        None -> ()
+
+    finish_fetch(fi)
+    Ok(Value.Null)
+
+// -- what this file registers -----------------------------------------------------------------------
+
+// **Registered and not declared**: a program reaches these only through a body's proto, so none of
+// them is a name in any scope. The names are distinct from every builtin's because the registry is
+// keyed by name -- `next` is a generator's already.
+var n_body_next: NativeFn = 0
+var n_body_dispose: NativeFn = 0
+var n_body_close: NativeFn = 0
+
+// Not `private`: `install_fetch` in `client.sysl` calls it.
+install_fetch_body()
+    n_body_next = register("fetchBodyNext", do_body_next)
+    n_body_dispose = register("fetchBodyDispose", do_body_dispose)
+    n_body_close = register("fetchBodyClose", do_body_close)

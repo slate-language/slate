@@ -85,8 +85,34 @@ struct Fetch
     // named their own `Accept-Encoding`.
     decode: bool
 
-    // The whole-fetch time limit, where the caller set one. Cancelled by `finish_fetch`.
+    // The whole-fetch time limit, where the caller set one. Cancelled by `hang_up`.
     limit: Option[Timer]
+
+    // Whether the caller asked for the body as it arrives, and whether the head has been answered
+    // and the body is now flowing. `client_stream.sysl` owns everything below.
+    stream: bool
+    streaming: bool
+
+    // Where the body ends: a length, chunks, or the end of the socket.
+    frame: BodyFrame
+
+    // Body bytes that have arrived and that nobody has asked for yet.
+    held: Buf[u8]
+
+    // The request slot of a `next()` the program is awaiting, where nothing was held to answer it.
+    waiting: Option[usize]
+
+    // Whether a task is reading the socket. A streamed body stops reading while it holds bytes nobody
+    // has asked for, which is what keeps a slow reader from buffering a fast server's whole answer.
+    reading: bool
+
+    // Whether the body is over -- whole, or broken off -- and why it broke off, until that is told.
+    ended: bool
+    failure: string
+
+    // Goes up every time the slot is claimed, so a body still held after its fetch was given back can
+    // tell the slot is somebody else's now.
+    stamp: usize
 
 // The table is now `current().fetches` -- see `vm_state.sysl`.
 
@@ -126,13 +152,15 @@ end do_fetch
 
 private claim_fetch(request: usize, at: Span, asked: FetchOptions) -> usize
     var f = Fetch(true, request, at, "", "", 80, "/", false, asked.method, asked.body, asked.extra,
-                  None, 0, None, asked.trust, false, buf(), 0, asked.decode, None)
+                  None, 0, None, asked.trust, false, buf(), 0, asked.decode, None,
+                  asked.stream, false, no_frame(), buf(), None, false, false, "", 0)
 
-    // A reused slot carries its epoch on, so that a task of the fetch that had it last still finds
-    // the number moved.
+    // A reused slot carries its epoch and its stamp on, so that a task of the fetch that had it last
+    // still finds the number moved, and so does a body that fetch handed out.
     for i in 0..<current().fetches.len()
         if !current().fetches.at(i).live
             f.epoch = current().fetches.at(i).epoch
+            f.stamp = current().fetches.at(i).stamp + 1
             current().fetches.set(i, f)
             return i
 
@@ -191,6 +219,7 @@ private start_fetch(fi: usize, url: string)
             f.ready = false
             f.tls = None
             f.got = buf()
+            f.reading = true
             current().fetches.set(fi, f)
 
     loop_events().spawn(dialled(fi, current().fetches.at(fi).epoch))
@@ -243,15 +272,41 @@ private async dialled(fi: usize, epoch: usize)
     f.conn = Some(conn)
     current().fetches.set(fi, f)
     fetch_connected(fi)
+    await read_on(fi, epoch)
+end dialled
 
-    // **The end of the socket is the end of the answer**, since this asks for `Connection: close` --
-    // so what has arrived is what there is, and it is parsed rather than complained about.
+// Read the socket until the answer is whole, the connection ends -- or, for a streamed body, until
+// bytes are held that nobody has asked for yet, when the task ends and `resume_reading` starts
+// another at the next `next()`.
+//
+// **The end of the socket is the end of the answer**, since this asks for `Connection: close` -- so
+// what has arrived is what there is, and it is parsed rather than complained about.
+private async read_on(fi: usize, epoch: usize)
     loop
         if !owns(fi, epoch) then return
 
+        if held_back(fi)
+            var f = current().fetches.at(fi)
+
+            f.reading = false
+            current().fetches.set(fi, f)
+            return
+
+        val conn = current().fetches.at(fi).conn match
+            Some(c) -> c
+            None -> return
+
+        // **A body already flowing that loses its connection says the one sentence a JavaScript
+        // host can say too** -- its reader rejects with a host-specific error for every way a
+        // connection can go -- so libuv's account is kept for the fetch that never answered.
         val got = (await conn.read()) match
             Err(e) ->
-                if owns(fi, epoch) then fetch_failed(fi, s"this connection failed: ${e}")
+                if owns(fi, epoch)
+                    if current().fetches.at(fi).streaming
+                        body_failed(fi, broke_off(current().fetches.at(fi).url))
+                    else
+                        fetch_failed(fi, s"this connection failed: ${e}")
+
                 return
             Ok(bytes) -> bytes
 
@@ -262,7 +317,24 @@ private async dialled(fi: usize, epoch: usize)
             return
 
         fetch_read(fi, got)
-end dialled
+end read_on
+
+// Start reading again for a streamed body whose reader stopped. Nothing where one is still reading
+// or the connection is gone.
+//
+// Not `private`: `client_stream.sysl`'s `next` asks for more with it when nothing is held.
+resume_reading(fi: usize)
+    var f = current().fetches.at(fi)
+
+    if f.reading then return
+
+    f.conn match
+        None -> return
+        Some(_) -> ()
+
+    f.reading = true
+    current().fetches.set(fi, f)
+    loop_events().spawn(read_on(fi, f.epoch))
 
 // Whether the dial a task belongs to is still the fetch's current one.
 private owns(fi: usize, epoch: usize) -> bool = fetch_live(fi) && current().fetches.at(fi).epoch == epoch
@@ -361,7 +433,9 @@ private send_request(fi: usize)
     out.push("Connection: close\r\n")
     out.push("Accept: */*\r\n")
 
-    if f.decode then out.push(s"Accept-Encoding: ${FetchAcceptEncoding}\r\n")
+    // **A streamed body asks for none**, there being no inflater here that runs as the bytes arrive
+    // (`streamed_compression` says why).
+    if f.decode then out.push(s"Accept-Encoding: ${if f.stream then "identity" else FetchAcceptEncoding}\r\n")
 
     if f.body != "" then out.push(s"Content-Length: ${f.body.bytes.len}\r\n")
 
@@ -448,10 +522,26 @@ private drain_tls(fi: usize, stream: &openssl.Stream)
 //
 // **Asked after every chunk, because there is no other way to know**: a response may be split
 // anywhere, and a server that answers and keeps the socket open is answered before it closes.
+//
+// **A body with a `Content-Length` is whole when that many bytes have come, and one with no framing
+// at all when the socket ends** -- `whole_yet` -- and not at the first read that finishes the head,
+// which is what this used to do: a body split across reads was answered with its first piece.
 private try_answer(fi: usize)
     val f = current().fetches.at(fi)
 
-    if header_end(f.got.view()) == 0 then return
+    if f.streaming
+        body_feed(fi)
+        return
+
+    val split_at = header_end(f.got.view())
+
+    if split_at == 0 then return
+
+    if f.stream
+        body_head(fi, split_at)
+        return
+
+    if !whole_yet(f.got.view(), split_at, f.method) then return
 
     parse_response(f.got.view()) match
         Err(_) -> ()
@@ -464,45 +554,70 @@ private fetch_ended(fi: usize)
 
     val f = current().fetches.at(fi)
 
+    if f.streaming
+        body_ended(fi)
+        return
+
     if f.got.len() == 0
         fetch_failed(fi, s"${f.host} closed the connection without answering")
+        return
+
+    // A streamed fetch whose head never finished: `parse_head` has the sentence for what is wrong
+    // with it, and the body is nobody's business yet.
+    if f.stream
+        parse_head(f.got.view()) match
+            Err(why) -> fetch_failed(fi, why)
+            Ok(_) -> fetch_failed(fi, s"${f.host} closed the connection without answering")
+
         return
 
     parse_response(f.got.view()) match
         Err(why) -> fetch_failed(fi, why)
         Ok(r) -> deliver_response(fi, r)
 
+// Follow a redirect, where the head is one, answering whether it was -- or whether the redirect
+// failed, which ends the fetch just as surely. Either way the caller stops.
+//
+// Not `private`: `client_stream.sysl` asks it of a streamed head before a body is handed over.
+redirected(fi: usize, status: int, headers: []const string) -> bool
+    var f = current().fetches.at(fi)
+
+    if status < 300 || status >= 400 then return false
+
+    val location = header_named(headers, "location")
+
+    if location == "" then return false
+
+    if f.redirects >= MaxRedirects
+        fetch_failed(fi, s"${f.url} redirected more than ${MaxRedirects} times")
+        return true
+
+    absolute(f.url, location) match
+        Err(why) ->
+            fetch_failed(fi, why)
+            return true
+        Ok(next) ->
+            // **A redirect from `https` to `http` is refused rather than followed.** The attacker
+            // who can redirect you is the one who wanted the connection in the clear; `http.sysl`
+            // refuses it for the same reason.
+            if f.secure && !next.starts_with("https:")
+                fetch_failed(fi, s"${f.url} redirected to ${next}, which is not encrypted")
+                return true
+
+            f.redirects += 1
+            current().fetches.set(fi, f)
+            close_fetch_socket(fi)
+            start_fetch(fi, next)
+            return true
+end redirected
+
 // A whole response: either the answer, or one more request where it is a redirect.
 private deliver_response(fi: usize, r: Response)
-    var f = current().fetches.at(fi)
+    val f = current().fetches.at(fi)
 
     if !f.live then return
 
-    if r.status >= 300 && r.status < 400
-        val location = header_named(r.headers, "location")
-
-        if location != ""
-            if f.redirects >= MaxRedirects
-                fetch_failed(fi, s"${f.url} redirected more than ${MaxRedirects} times")
-                return
-
-            absolute(f.url, location) match
-                Err(why) ->
-                    fetch_failed(fi, why)
-                    return
-                Ok(next) ->
-                    // **A redirect from `https` to `http` is refused rather than followed.** The
-                    // attacker who can redirect you is the one who wanted the connection in the
-                    // clear; `http.sysl` refuses it for the same reason.
-                    if f.secure && !next.starts_with("https:")
-                        fetch_failed(fi, s"${f.url} redirected to ${next}, which is not encrypted")
-                        return
-
-                    f.redirects += 1
-                    current().fetches.set(fi, f)
-                    close_fetch_socket(fi)
-                    start_fetch(fi, next)
-                    return
+    if redirected(fi, r.status, r.headers) then return
 
     // **Decoded before anything is built**, so a body that will not decompress answers a result
     // with no half-made object left on the roots. `content-encoding` stays in the headers below, as
@@ -515,15 +630,41 @@ private deliver_response(fi: usize, r: Response)
             return
 
     val mark = root_mark()
+    val body = str_value(text)
+
+    hold(body)
+
+    val o = response_object(r.status, r.headers, body)
+
+    release(mark)
+
+    val request = f.request
+
+    finish_fetch(fi)
+    answer_request(request, o)
+
+// `{ status, headers, body }`, the body already made. The caller holds what it passes in.
+//
+// Not `private`: `client_stream.sysl` builds a streamed head's answer with it, its body a source.
+response_object(status: int, lines: []const string, body: Value) -> Value
+    val mark = root_mark()
     val o = new_object()
 
     hold(Object(o))
-    obj_put_name(o, "status", Int(long(r.status)))
+    obj_put_name(o, "status", Int(long(status)))
 
     val headers = new_object()
 
     hold(Object(headers))
+    header_lines_into(headers, lines)
+    obj_put_name(o, "headers", Object(headers))
+    obj_put_name(o, "body", body)
+    release(mark)
+    Object(o)
+end response_object
 
+// The header lines as the object a program reads them from.
+private header_lines_into(headers: *ObjectObj, lines: []const string)
     // **A NAME THAT REPEATS IS JOINED WITH `", "`, AND `Set-Cookie` IS THE ONE EXCEPTION.** An
     // object has one value per name and HTTP does not -- `Link`, `Vary` and `Via` all repeat -- so
     // something has to happen, and keeping the last silently threw one away. RFC 9110 lets a
@@ -535,8 +676,8 @@ private deliver_response(fi: usize, r: Response)
     // so two cookies joined with `", "` cannot be taken apart again by anything, and a program that
     // split on commas would hand a cookie jar four fragments of two cookies. It is a LIST here for
     // that reason, of the lines exactly as they arrived, and it is absent where none arrived.
-    for i in 0..<r.headers.len
-        val line = r.headers[i]
+    for i in 0..<lines.len
+        val line = lines[i]
         val colon = colon_at(line)
 
         if colon > 0
@@ -559,19 +700,12 @@ private deliver_response(fi: usize, r: Response)
                 obj_get_name(headers, name) match
                     Some(Str(had)) -> obj_put_name(headers, name, str_value(s"${had.s}, ${value}"))
                     other -> obj_put_name(headers, name, str_value(value))
-
-    obj_put_name(o, "headers", Object(headers))
-    obj_put_name(o, "body", str_value(text))
-    release(mark)
-
-    val request = f.request
-
-    finish_fetch(fi)
-    answer_request(request, Object(o))
+end header_lines_into
 
 // -- the small parts -----------------------------------------------------------------------------
 
-private fetch_live(fi: usize) -> bool
+// Not `private`: `client_stream.sysl` asks it of a body's slot.
+fetch_live(fi: usize) -> bool
     if fi >= current().fetches.len() then return false
 
     current().fetches.at(fi).live
@@ -591,7 +725,12 @@ private close_fetch_socket(fi: usize)
     f.tls = None
     current().fetches.set(fi, f)
 
-private finish_fetch(fi: usize)
+// Close the connection and cancel the limit, keeping the slot. **A streamed body hangs up the moment
+// it is over and gives the slot back only once the program has read what is held**, so the socket
+// and the timer never wait on a slow reader.
+//
+// Not `private`: `client_stream.sysl` hangs up at the end of a body.
+hang_up(fi: usize)
     close_fetch_socket(fi)
 
     var f = current().fetches.at(fi)
@@ -600,15 +739,34 @@ private finish_fetch(fi: usize)
         Some(t) -> loop_events().cancel(t)
         None -> false
 
-    f.live = false
-    f.got = buf()
-    f.extra = buf()
     f.limit = None
+    f.reading = false
     current().fetches.set(fi, f)
 
-// Give the failure back as a result, and stop.
-private fetch_failed(fi: usize, why: string)
+// Not `private`: `client_stream.sysl` gives a body's slot back when it has been read or disposed of.
+finish_fetch(fi: usize)
+    hang_up(fi)
+
+    var f = current().fetches.at(fi)
+
+    f.live = false
+    f.streaming = false
+    f.got = buf()
+    f.extra = buf()
+    f.held = buf()
+    f.waiting = None
+    current().fetches.set(fi, f)
+
+// Give the failure back as a result, and stop. **Once a streamed body is flowing the answer has
+// already been given**, so the failure is the body's to report, at its next `next()`.
+//
+// Not `private`: `client_stream.sysl` fails a fetch whose streamed head is wrong.
+fetch_failed(fi: usize, why: string)
     if !fetch_live(fi) then return
+
+    if current().fetches.at(fi).streaming
+        body_failed(fi, why)
+        return
 
     val f = current().fetches.at(fi)
     val request = f.request
@@ -639,7 +797,9 @@ private header_name_of(line: string, colon: usize) -> string
     out.finish()
 
 // The value of the first header with this name, or `""`.
-private header_named(headers: []const string, name: string) -> string
+//
+// Not `private`: `client_stream.sysl` reads a streamed head's framing and encoding with it.
+header_named(headers: []const string, name: string) -> string
     for i in 0..<headers.len
         if header_is(headers[i], name) then return header_value(headers[i])
 
@@ -659,4 +819,5 @@ install_fetch(env: *EnvObj)
     n_fetch = register("fetch", do_fetch)
 
     declare(env, "fetch", Native(n_fetch), false)
+    install_fetch_body()
 end install_fetch
