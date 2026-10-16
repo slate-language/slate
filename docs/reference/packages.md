@@ -195,6 +195,46 @@ the edit that fixes it rather than starting the same crash again in a loop. **Ct
 
 Recursive watching is macOS's for now; on another system `--watch` says so and runs nothing.
 
+## Starting a project
+
+`slate new --template <template> <directory>` writes a project to start from:
+
+```
+$ slate new --template sluice shop
+made shop from the `sluice` template
+
+next:
+  cd shop
+  slate install               fetch what package.sl depends on
+  createdb shop               make the database .env names
+  slate run migrate           make its tables
+  slate run --watch main.sl   serve it, and start it again on every save
+
+`slate test tests` runs its tests, which need no database.
+```
+
+**`sluice` is the one template so far**: a JSON API on
+[sluice](https://github.com/slate-language/sluice) over PostgreSQL, in a dozen small files.
+
+| | |
+|---|---|
+| `main.sl` | starts the server, and drains it on `SIGTERM` |
+| `wiring.sl` | what the application is made of — the configuration, the database and the app — composed by calling functions, with no container |
+| `routes.sl` | the application as HTTP: `/signup`, `/signin` and `/signout` with `login` and `logout`, and an `/api` group behind `signedIn` holding one `app.resource` |
+| `store.sl` | the SQL, over a `pg` pool, and the only file that knows a statement |
+| `migrations/`, `migrate.sl` | the tables, applied by `slate run migrate` and undone by `slate run rollback` |
+| `.env` | `PORT` and `DATABASE_URL` while developing, read by the [`env`](https://github.com/slate-language/env) package against a declared type; the environment wins over it |
+| `tests/` | every route through `app.handle`, over a store made of arrays |
+
+**The directory is new or empty, or nothing is written.** One that holds anything at all is refused,
+so a template can never replace a file somebody wrote; a name that is not a template is refused with
+the names of the ones there are. The directory's last part names the package and its database, so it
+is letters, digits, `-` and `_`, beginning with a letter.
+
+**A template is carried in the `slate` binary**, so `slate new` needs no network and writes the
+template that matches the slate that wrote it. The packages it names are fetched by `slate install`,
+which is the first thing it says to run.
+
 ## What a package exposes
 
 **Its `main`, and whatever its own manifest lists under `modules`** — which is what the slash names.
