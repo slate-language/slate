@@ -1,0 +1,416 @@
+module dev.slatelang.slate
+
+#if feature_http2
+import sh.sysl.nghttp2.*
+import sysl.buf.{Buf, buf}
+import sysl.text.str_builder
+#endif
+
+// `fetch` over HTTP/2: what `client.sysl` hands an `https` connection to when ALPN settled on `h2`.
+//
+// **The choice is ALPN's and nothing else's.** The client offers `h2, http/1.1` in its ClientHello
+// and the server picks; a server that picks `http/1.1`, or that names nothing at all, gets exactly the
+// request it always got. There is no `h2c` -- HTTP/2 in the clear -- because no browser speaks it,
+// and a `fetch` that did would answer differently here than on a JavaScript host.
+//
+// **The bytes go through OpenSSL as they always did and through nghttp2 as well**: what OpenSSL
+// decrypts is handed to the session, and what the session wants written is encrypted and sent. The
+// dial, the handshake, the limit, the redirects and the streamed body are `client.sysl`'s and
+// `client_stream.sysl`'s, unchanged -- an `h2` response is turned into a status and `Name: value`
+// lines, which is the shape every one of them already reads.
+//
+// **A CONNECTION AND A REQUEST ARE TWO RECORDS, AND THAT IS FOR THE POOL.** One fetch dials one
+// connection for now, so an `H2Conn` carries exactly one `H2Req`. A pool that keeps a connection per
+// origin owns the `H2Conn` and multiplexes many requests on it; what a request needs -- which fetch it
+// answers, its stream, its head and body so far -- is already apart from what the connection needs.
+//
+// **A streamed body is held back by not reading the socket**, which is `client_stream.sysl`'s one
+// read ahead, and nghttp2 extends the windows by itself as bytes are taken in. That is right for one
+// stream per connection. A shared connection cannot stop reading for one slow stream, so the pool
+// will take the windows over -- `no_auto_window_update` and `consume` as the program reads.
+
+#if feature_http2
+
+// One request on a connection.
+struct H2Req
+    // The stream nghttp2 gave it, and the fetch slot it answers.
+    stream: i32
+    fetch: usize
+
+    // The final status, once the response's head has come; zero before.
+    status: int
+
+    // The response's head as `name: value` lines, which is the shape `client.sysl` reads a head in.
+    lines: Buf[string]
+
+    // The body so far, where it is not streamed.
+    body: Buf[u8]
+
+    // Whether the server has ended the stream, so that hanging up has nothing to reset.
+    done: bool
+
+// One HTTP/2 connection, and the requests open on it.
+struct H2Conn
+    live: bool
+    session: Option[&Session]
+    reqs: Buf[H2Req]
+
+    // What the server said when it went away, where it did -- the sentence a request it will now
+    // never answer is given.
+    gone: string
+
+// Whether a secure `fetch` offers `h2`, which is whether this build has the `http2` feature.
+fetch_speaks_h2() -> bool = true
+
+// Whether a fetch is running over HTTP/2.
+on_h2(fi: usize) -> bool
+    current().fetches.at(fi).h2 match
+        Some(_) -> true
+        None -> false
+
+// The handshake is done. Where the server chose `h2`, a session is made, the request goes out on it
+// and this answers true; otherwise nothing changes and the HTTP/1.1 request is the caller's to send.
+h2_begin(fi: usize) -> bool
+    val f = current().fetches.at(fi)
+
+    val stream = f.tls match
+        Some(s) -> s
+        None -> return false
+
+    stream.protocol() match
+        Some(p) -> if p != "h2" then return false
+        None -> return false
+
+    var session = client() match
+        Ok(s) -> s
+        Err(e) ->
+            fetch_failed(fi, s"HTTP/2 could not be set up: ${e.message}")
+            return true
+
+    val head = request_headers(fi)
+
+    val sent = if f.body != "" then session.request(head.view(), Some(f.body.bytes)) else session.request(head.view())
+
+    val id = sent match
+        Ok(id) -> id
+        Err(e) ->
+            fetch_failed(fi, s"the request could not be framed for HTTP/2: ${e.message}")
+            return true
+
+    var reqs: Buf[H2Req] = buf()
+
+    reqs.push(H2Req(id, fi, 0, buf(), buf(), false))
+
+    val ci = claim_h2_conn(H2Conn(true, Some(session), reqs, ""))
+    var g = current().fetches.at(fi)
+
+    g.h2 = Some(ci)
+    current().fetches.set(fi, g)
+    h2_flush(fi)
+    true
+end h2_begin
+
+private claim_h2_conn(c: H2Conn) -> usize
+    for i in 0..<current().h2_conns.len()
+        if !current().h2_conns.at(i).live
+            current().h2_conns.set(i, c)
+            return i
+
+    current().h2_conns.push(c)
+    current().h2_conns.len() - 1
+
+// The request's head, in HTTP/2's spelling: the four pseudo-headers, then the caller's own names
+// lower-cased, as HTTP/2 requires.
+//
+// **The headers that describe a connection are left out**, since HTTP/2 forbids them and a server
+// is entitled to reset a stream that carries one -- `Connection` and the rest are HTTP/1.1's way of
+// saying what the framing now says. `Host` becomes `:authority`.
+private request_headers(fi: usize) -> Buf[Header]
+    val f = current().fetches.at(fi)
+    var hs: Buf[Header] = buf()
+
+    hs.push(header(":method", f.method))
+    hs.push(header(":scheme", "https"))
+    hs.push(header(":authority", if f.port == 443 then f.host else s"${f.host}:${f.port}"))
+    hs.push(header(":path", f.target))
+
+    for i in 0..<f.extra.len()
+        val line = f.extra.at(i)
+        val colon = colon_at(line)
+
+        if colon > 0
+            val name = header_name_of(line, colon)
+
+            if !connection_specific(name) then hs.push(header(name, header_value(line)))
+
+    hs.push(header("accept", "*/*"))
+
+    if f.decode then hs.push(header("accept-encoding", if f.stream then "identity" else FetchAcceptEncoding))
+
+    if f.body != "" then hs.push(header("content-length", s"${f.body.bytes.len}"))
+
+    hs
+end request_headers
+
+private connection_specific(name: string) -> bool =
+    name == "connection" || name == "keep-alive" || name == "proxy-connection" ||
+        name == "transfer-encoding" || name == "upgrade" || name == "host" || name == "te"
+
+// Everything the session wants written, encrypted and onto the wire.
+private h2_flush(fi: usize)
+    val ci = current().fetches.at(fi).h2 match
+        Some(ci) -> ci
+        None -> return
+
+    current().h2_conns.at(ci).session match
+        Some(s) ->
+            val why = h2_write(fi, s)
+
+            if why != "" then fetch_failed(fi, why)
+        None -> ()
+
+// The writing half of `h2_flush`, answering what went wrong rather than failing the fetch -- so the
+// hang-up, which is already ending it, can write a reset without coming back round.
+private h2_write(fi: usize, s: &Session) -> string
+    var session = s
+    var out: Buf[u8] = buf()
+
+    session.send(&out) match
+        Ok(_) -> ()
+        Err(e) -> return s"HTTP/2 could not frame the request: ${e.message}"
+
+    if out.len() == 0 then return ""
+
+    current().fetches.at(fi).tls match
+        None -> ""
+        Some(stream) ->
+            stream.send(out.view()) match
+                Err(e) -> s"the request could not be encrypted: ${e}"
+                Ok(_) ->
+                    push_tls(fi, stream)
+                    ""
+
+// Decrypted bytes from the server, into the session, and whatever they made happen.
+h2_incoming(fi: usize, bytes: []const u8)
+    val ci = current().fetches.at(fi).h2 match
+        Some(ci) -> ci
+        None -> return
+
+    var session = current().h2_conns.at(ci).session match
+        Some(s) -> s
+        None -> return
+
+    session.receive(bytes) match
+        Ok(_) -> ()
+        Err(e) ->
+            fetch_failed(fi, s"the server's HTTP/2 could not be read: ${e.message}")
+            return
+
+    // **Every event is checked against the connection still being this fetch's**: one may finish
+    // the fetch -- an answer, a reset, a redirect that dials again -- and what follows it is then
+    // about a connection that has been hung up.
+    loop
+        if !still_on(fi, ci) then return
+
+        val e = session.next_event() match
+            Some(e) -> e
+            None -> break
+
+        h2_event(fi, ci, e)
+
+    // **The session answers as well as hears**: a SETTINGS acknowledgement, a PING's answer and the
+    // window updates for what was just taken in are all queued by `receive`.
+    if !still_on(fi, ci) then return
+
+    h2_flush(fi)
+
+    // **A frame that breaks the protocol ends the session without an error from `receive`**:
+    // nghttp2 queues its own GOAWAY, just written, and then wants neither to read nor to write. Left
+    // there, the fetch would wait on a server that is waiting on it.
+    if still_on(fi, ci) && !session.wants_read() && !session.wants_write()
+        fetch_failed(fi, s"${current().fetches.at(fi).host} sent HTTP/2 that breaks the protocol, so the connection was ended")
+end h2_incoming
+
+private still_on(fi: usize, ci: usize) -> bool
+    if !fetch_live(fi) then return false
+
+    current().fetches.at(fi).h2 match
+        Some(c) -> c == ci
+        None -> false
+
+// The one request on a connection that is this fetch's, by its index.
+private req_of(ci: usize, stream: i32) -> Option[usize]
+    val reqs = current().h2_conns.at(ci).reqs
+
+    for i in 0..<reqs.len()
+        if reqs.at(i).stream == stream then return Some(i)
+
+    None
+
+private h2_event(fi: usize, ci: usize, e: Event)
+    e match
+        Headers(stream, headers, kind) ->
+            if kind == HeaderKind.Response then h2_head(fi, ci, stream, headers.view())
+        Data(stream, bytes) -> h2_data(fi, ci, stream, bytes.view())
+        StreamEnd(stream) -> h2_end(fi, ci, stream)
+        RstStream(stream, code) -> h2_reset(fi, ci, stream, code)
+        StreamClose(stream, code) -> if code != NO_ERROR then h2_reset(fi, ci, stream, code)
+        Goaway(last_stream, code) -> h2_goaway(fi, ci, last_stream, code)
+        other -> ()
+
+// A response's head. **A `1xx` is an interim answer** and the final one is still to come, so it is
+// passed over. A streamed fetch is answered here, as `client_stream.sysl` answers an HTTP/1.1 head.
+private h2_head(fi: usize, ci: usize, stream: i32, headers: []const Header)
+    val ri = req_of(ci, stream) match
+        Some(ri) -> ri
+        None -> return
+
+    var status = 0
+    var lines: Buf[string] = buf()
+
+    for i in 0..<headers.len
+        val h = headers[i]
+
+        if h.name == ":status"
+            status = number_or(h.value, 0)
+        elif !h.name.starts_with(":")
+            lines.push(s"${h.name}: ${h.value}")
+
+    if status >= 100 && status < 200 then return
+
+    var conn = current().h2_conns.at(ci)
+    var r = conn.reqs.at(ri)
+
+    r.status = status
+    r.lines = lines
+    conn.reqs.set(ri, r)
+    current().h2_conns.set(ci, conn)
+
+    if current().fetches.at(fi).stream then stream_head(fi, status, lines.view(), Ok(no_frame()))
+
+private h2_data(fi: usize, ci: usize, stream: i32, bytes: []const u8)
+    val ri = req_of(ci, stream) match
+        Some(ri) -> ri
+        None -> return
+
+    if current().fetches.at(fi).streaming
+        var f = current().fetches.at(fi)
+
+        f.got.extend(bytes)
+        current().fetches.set(fi, f)
+        body_feed(fi)
+        return
+
+    var conn = current().h2_conns.at(ci)
+    var r = conn.reqs.at(ri)
+
+    r.body.extend(bytes)
+    conn.reqs.set(ri, r)
+    current().h2_conns.set(ci, conn)
+
+// The server has sent all of it. **The end of the stream is the end of the body**, which is the
+// framing HTTP/2 gives every response, so a streamed one ends here and a buffered one is answered.
+private h2_end(fi: usize, ci: usize, stream: i32)
+    val ri = req_of(ci, stream) match
+        Some(ri) -> ri
+        None -> return
+
+    var conn = current().h2_conns.at(ci)
+    var r = conn.reqs.at(ri)
+
+    r.done = true
+    conn.reqs.set(ri, r)
+    current().h2_conns.set(ci, conn)
+
+    if current().fetches.at(fi).streaming
+        body_ended(fi)
+        return
+
+    if r.status == 0
+        fetch_failed(fi, s"${current().fetches.at(fi).host} ended the stream without answering")
+        return
+
+    deliver_response(fi, Response(r.status, r.body.view(), header_named(r.lines.view(), "location"), r.lines.view()))
+
+private h2_reset(fi: usize, ci: usize, stream: i32, code: u32)
+    req_of(ci, stream) match
+        Some(_) -> fetch_failed(fi, s"the server reset the request for ${current().fetches.at(fi).url} (${error_name(code)})")
+        None -> ()
+
+// The server is going away. **A request at or below the last stream it names will still be
+// answered**, which is what a graceful shutdown is; one above it never will be, and is told so now.
+private h2_goaway(fi: usize, ci: usize, last_stream: i32, code: u32)
+    val why = s"the server closed the HTTP/2 connection before answering ${current().fetches.at(fi).url} (${error_name(code)})"
+    var conn = current().h2_conns.at(ci)
+
+    conn.gone = why
+    current().h2_conns.set(ci, conn)
+
+    val reqs = conn.reqs
+
+    for i in 0..<reqs.len()
+        if reqs.at(i).stream > last_stream
+            fetch_failed(fi, why)
+            return
+
+// The socket ended on an HTTP/2 connection. **Its end is never the end of a body here**, every
+// HTTP/2 body ending with its stream -- so a body still flowing broke off, and a fetch still
+// unanswered was not answered.
+h2_ended(fi: usize)
+    val f = current().fetches.at(fi)
+
+    if f.streaming
+        body_failed(fi, broke_off(f.url))
+        return
+
+    val gone = f.h2 match
+        Some(ci) -> current().h2_conns.at(ci).gone
+        None -> ""
+
+    fetch_failed(fi, if gone != "" then gone else s"${f.host} closed the connection without answering")
+
+// The fetch is letting its connection go. **A request still open is reset with `CANCEL` first**,
+// which is what tells the server to stop sending -- an early `break` out of a streamed body, a limit
+// that ran out -- and the session is then dropped, which frees nghttp2's memory.
+h2_hang_up(fi: usize)
+    val ci = current().fetches.at(fi).h2 match
+        Some(ci) -> ci
+        None -> return
+
+    var conn = current().h2_conns.at(ci)
+
+    conn.session match
+        None -> ()
+        Some(s) ->
+            var session = s
+            var open = false
+
+            for i in 0..<conn.reqs.len()
+                if !conn.reqs.at(i).done
+                    open = true
+
+                    session.reset(conn.reqs.at(i).stream, CANCEL) match
+                        Ok(_) -> ()
+                        Err(_) -> ()
+
+            // **Best effort, and nothing is said where it fails**: the connection is closing either
+            // way, and a reset that never arrives is a server that learns from the close instead.
+            if open
+                val _ = h2_write(fi, s)
+
+    conn.live = false
+    conn.session = None
+    conn.reqs = buf()
+    current().h2_conns.set(ci, conn)
+
+#else
+
+// A build without the `http2` feature offers nothing, so every server answers in HTTP/1.1.
+fetch_speaks_h2() -> bool = false
+on_h2(fi: usize) -> bool = false
+h2_begin(fi: usize) -> bool = false
+h2_incoming(fi: usize, bytes: []const u8) = ()
+h2_ended(fi: usize) = ()
+h2_hang_up(fi: usize) = ()
+
+#endif

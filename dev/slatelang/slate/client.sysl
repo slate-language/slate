@@ -114,6 +114,10 @@ struct Fetch
     // tell the slot is somebody else's now.
     stamp: usize
 
+    // The HTTP/2 connection this fetch is on, as an index into `current().h2_conns`, where ALPN
+    // settled on `h2`. `client_h2.sysl` owns everything about it.
+    h2: Option[usize]
+
 // The table is now `current().fetches` -- see `vm_state.sysl`.
 
 // Give every fetch back between runs. **Each connection is CLOSED and the slot is kept**: a read
@@ -153,7 +157,7 @@ end do_fetch
 private claim_fetch(request: usize, at: Span, asked: FetchOptions) -> usize
     var f = Fetch(true, request, at, "", "", 80, "/", false, asked.method, asked.body, asked.extra,
                   None, 0, None, asked.trust, false, buf(), 0, asked.decode, None,
-                  asked.stream, false, no_frame(), buf(), None, false, false, "", 0)
+                  asked.stream, false, no_frame(), buf(), None, false, false, "", 0, None)
 
     // A reused slot carries its epoch and its stamp on, so that a task of the fetch that had it last
     // still finds the number moved, and so does a body that fetch handed out.
@@ -363,6 +367,16 @@ private fetch_connected(fi: usize)
                             return
                         Ok(_) -> ()
 
+                // **`h2` is offered first and `http/1.1` beside it, and the server chooses.** One
+                // that names `http/1.1`, or nothing, gets the request this file always sent.
+                if fetch_speaks_h2()
+                    c.offer(["h2", "http/1.1"]) match
+                        Err(e) ->
+                            current().fetches.set(fi, f)
+                            fetch_failed(fi, s"TLS could not be set up: ${e}")
+                            return
+                        Ok(_) -> ()
+
                 openssl.connect(c, f.host) match
                     Err(e) ->
                         current().fetches.set(fi, f)
@@ -396,11 +410,19 @@ private step_handshake(fi: usize)
 
                             g.ready = true
                             current().fetches.set(fi, g)
-                            send_request(fi)
+
+                            // **Whatever came with the end of the handshake is read at once** on
+                            // HTTP/2, the server's SETTINGS being able to share its last flight.
+                            if h2_begin(fi)
+                                if on_h2(fi) then drain_tls(fi, stream)
+                            else
+                                send_request(fi)
                         More -> ()
 
 // Everything OpenSSL wants sent, written to the socket.
-private push_tls(fi: usize, stream: &openssl.Stream)
+//
+// Not `private`: `client_h2.sysl` writes a session's frames through it.
+push_tls(fi: usize, stream: &openssl.Stream)
     val f = current().fetches.at(fi)
 
     loop
@@ -496,25 +518,35 @@ private fetch_read(fi: usize, bytes: []const u8)
 
             drain_tls(fi, stream)
 
+            // An HTTP/2 answer is the session's to recognise, and `h2_incoming` has.
+            if fetch_live(fi) && on_h2(fi) then return
+
     try_answer(fi)
 
-// Everything OpenSSL has decrypted, into the answer.
+// Everything OpenSSL has decrypted, into the answer -- or into the HTTP/2 session, which may answer,
+// fail or redirect the fetch, after which what is left belongs to a connection that has gone.
 private drain_tls(fi: usize, stream: &openssl.Stream)
     var plain: []u8 = [u8(0); 16384]
+    val epoch = current().fetches.at(fi).epoch
 
     loop
+        if !owns(fi, epoch) then return
+
         stream.receive(plain) match
             Err(e) ->
                 fetch_failed(fi, s"the answer could not be decrypted: ${e}")
                 return
             Ok(got) -> got match
                 Data(n) ->
-                    var f = current().fetches.at(fi)
+                    if on_h2(fi)
+                        h2_incoming(fi, plain[0..<n])
+                    else
+                        var f = current().fetches.at(fi)
 
-                    for i in 0..<n
-                        f.got.push(plain[i])
+                        for i in 0..<n
+                            f.got.push(plain[i])
 
-                    current().fetches.set(fi, f)
+                        current().fetches.set(fi, f)
                 Closed -> return
                 Wants -> return
 
@@ -553,6 +585,10 @@ private fetch_ended(fi: usize)
     if !fetch_live(fi) then return
 
     val f = current().fetches.at(fi)
+
+    if on_h2(fi)
+        h2_ended(fi)
+        return
 
     if f.streaming
         body_ended(fi)
@@ -612,7 +648,9 @@ redirected(fi: usize, status: int, headers: []const string) -> bool
 end redirected
 
 // A whole response: either the answer, or one more request where it is a redirect.
-private deliver_response(fi: usize, r: Response)
+//
+// Not `private`: `client_h2.sysl` answers an HTTP/2 response through it.
+deliver_response(fi: usize, r: Response)
     val f = current().fetches.at(fi)
 
     if !f.live then return
@@ -711,7 +749,13 @@ fetch_live(fi: usize) -> bool
     current().fetches.at(fi).live
 
 private close_fetch_socket(fi: usize)
+    // **An HTTP/2 session lets go first**, while the TLS stream it writes its reset through is still
+    // there to write it.
+    h2_hang_up(fi)
+
     var f = current().fetches.at(fi)
+
+    f.h2 = None
 
     // **`close` is immediate**, which is right here: the request has gone and the answer is in, or
     // the fetch failed, or a redirect is about to dial somewhere else. A read still parked on it ends
@@ -775,7 +819,9 @@ fetch_failed(fi: usize, why: string)
     finish_fetch(fi)
     deny_request(request, at, why)
 
-private colon_at(line: string) -> usize
+// Not `private`, and neither is `header_name_of`: `client_h2.sysl` reads a caller's header lines
+// into HTTP/2's lower-case names with them.
+colon_at(line: string) -> usize
     val b = line.bytes
 
     for i in 0..<b.len
@@ -785,7 +831,7 @@ private colon_at(line: string) -> usize
 
 // A header's name, lower-cased for the reason a request's are: HTTP names are case-insensitive and a
 // program reading one should not have to guess which spelling the server chose.
-private header_name_of(line: string, colon: usize) -> string
+header_name_of(line: string, colon: usize) -> string
     val b = line.bytes
     var out = str_builder()
 
