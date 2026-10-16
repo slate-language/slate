@@ -157,6 +157,14 @@ A_POSITIONAL_PATTERN_SEES_THE_SUBCLASS_S_OWN_FIELDS_ONLY() =
     assertEq(told, "p")
 
 @test
+A_NAMED_PATTERN_OVER_A_SUBCLASS_TAKES_A_BASE_FIELD_APART() =
+    val told = Named(1, 2) match
+        Named { x, y, label } -> s"${label}${x + y}"
+        _ -> "no"
+
+    assertEq(told, "p3")
+
+@test
 A_SUBCLASS_WITH_ITS_OWN_new_STARTS_FROM_THE_BASE_INITIALISERS() =
     val o = Own(10)
 

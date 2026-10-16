@@ -565,6 +565,140 @@ promise several types (`is Drawable, Named`) and descend from one.
 A promise is kept by a method a base supplies, because an [object pattern](patterns.md) counts a field a
 proto supplies.
 
+## Inheritance and construction
+
+`from` takes an expression — a class in the same file, an imported one, a module's member, or one a
+function chose while the program ran — so a subclass is built **through its base at run time**, which
+is JavaScript's rule.
+
+**A subclass that writes no `new` of its own takes its base's.** It is called with the same arguments,
+the base's defaults and hand-written body run, and `self` in that body is already the subclass's
+instance. Then the subclass's own initialised fields are set, and the object's proto is the subclass:
+
+```slate
+class Notes
+    var served = 0
+    var log = []
+
+    new(var owner)
+        self.log.push(s"opened by ${owner}, archive: ${self is Archive}")
+
+    show(self) = 2
+
+    serve(self)
+        self.served += 1
+
+class Archive from Notes
+    var shelf = "A"
+
+    show(self) = 4
+
+class Vault from Archive
+    sealed(self) = true
+
+val v = Vault("ed")
+
+v.serve()
+v.serve()
+print(v.show(), v.served, v.shelf, v.log)
+print(v is Vault, v is Archive, v is Notes, Notes("jo") is Archive)
+print("sealed" in v, "sealed" in Archive("jo"))
+```
+
+```output
+4 2 A ["opened by ed, archive: true"]
+true true true false
+true false
+```
+
+The inherited `serve` changes `served` on the `Vault`, and each instance has its own `served` and its
+own `log`, exactly as if the class had declared them itself.
+
+**A field the subclass gives an initialiser is not a parameter** — TypeScript's reading — so
+`Archive("ed", "B")` still gives `shelf` its `"A"`. Set it in the body of a `new` of your own, or after
+the object is made.
+
+**A base whose `new` is the plain form works the same way**, and what its body answers becomes an
+instance of the subclass:
+
+```slate
+class Plain
+    new(v) = { v: v }
+
+class Doubled from Plain
+    twice(self) = self.v * 2
+
+print(Doubled(5).twice(), Doubled(5) is Doubled, Doubled(5) is Plain)
+```
+
+```output
+10 true true
+```
+
+**A subclass that writes its own `new` does not call the base's.** It starts from what every base's
+initialisers make — each base `var` with an initialiser has its value, one with none is absent — and
+then its own `new` runs:
+
+```slate
+class Holder
+    var count = 5
+    var name
+
+class Own from Holder
+    new(var tag)
+        self.count += 1
+
+val o = Own("x")
+
+print(o.count, o.tag, has(o, "name"), o is Own, o is Holder)
+```
+
+```output
+6 x false true true
+```
+
+**A positional class pattern sees the subclass's own fields and none of its bases'.** The base's
+fields are the base's to destructure; name them with the object form:
+
+```slate
+class Point
+    var x
+    var y
+
+class Labelled from Point
+    var label = "p"
+
+tell(v) = v match
+    Labelled(l) -> s"labelled ${l}"
+    _ -> "something else"
+
+val q = Labelled(1, 2)
+
+print(tell(q), q match
+    Labelled { x, y } -> x + y
+    _ -> 0)
+```
+
+```output
+labelled p 3
+```
+
+A subclass that declares no fields over a base that has no `new` has nothing to make, and says so when
+it is called:
+
+```slate
+class Shape
+    describe(self) = "a shape"
+
+class Hollow from Shape
+
+print(Hollow())
+```
+
+```error
+class `Hollow` has nothing to make
+```
+
 ## There is no `super`
 
 And none is needed. A base class is an ordinary value in scope, and a method stored on it directly is
