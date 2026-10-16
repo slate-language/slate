@@ -488,6 +488,47 @@ print(found)
 
 `continue` starts the next turn, and takes a label the same way.
 
+### Leaving early closes what the loop walked
+
+**A loop that stops before its iterator is done calls the iterator's `return()`**, which is
+JavaScript's rule. A `break`, a `return`, a `break` or `continue` to an outer loop and a fault on its
+way past all close it; a loop that runs out closes nothing, the iterator having ended itself. A
+generator's `return()` leaves its body from the `yield` it stood at, so what the generator holds in a
+[`using`](#using--a-binding-that-releases-what-it-held) is released there — `using` is what slate
+has where JavaScript writes `finally`:
+
+```slate
+lines() =
+    using f = { dispose: () -> print("closed") }
+
+    yield "one"
+    yield "two"
+    yield "three"
+
+for line in lines()
+    print(line)
+    if line == "two" then break
+
+print("after")
+```
+
+```output
+one
+two
+closed
+after
+```
+
+- **A `using` inside the loop's body is released first**, then the iterator is closed.
+- **`for await` closes the same way**, asking an object with a `return` field to close and awaiting
+  what it answers. A `next()` that faults closes nothing: an iterator that could not step is not one
+  to tell it was abandoned. On a fault the answer `return()` gives is not awaited, a fault's unwind
+  being somewhere nothing can wait — the one place this differs from JavaScript.
+- **If `return()` faults**, that is the fault a `break` or a `return` raises; where a fault was already
+  leaving, the first one wins.
+- **A generator's `return(v)` can be called directly**, and answers `{ value: v, done: true }`. A
+  `catch` around the `yield` does not catch it.
+
 ## Blocks
 
 A block's value is its trailing expression. `return` is for leaving a function early and nothing else,

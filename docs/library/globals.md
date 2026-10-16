@@ -672,9 +672,13 @@ if r.ok
   and a `for await` sees an ordinary value.
 - **`timeout` still covers the whole exchange**, the body included: a limit that runs out while the body
   is flowing ends it with the same sentence a fetch that never answered gets.
-- **`using` is how to stop early.** A body is a resource with a `dispose`, so `using body = …` closes
-  the connection on every way out of the block, a `break` included. A body read to its end has already
-  closed it. One left unread and not disposed holds its connection open, as a socket does. `close` is
+- **Stopping early closes the connection.** A body has a `return`, so a `for await` over it that is
+  left before the end — a `break`, a `return`, a fault — closes it, as
+  [a loop left early](../reference/statements.md#leaving-early-closes-what-the-loop-walked) closes
+  whatever it walked. A body is also a resource with a `dispose`, so `using body = …` closes it on every
+  way out of a block, which is what covers a body that is never looped over at all. A body read to its
+  end has already closed it. One left unread, never looped over and not disposed holds its connection
+  open, as a socket does. `close` is
   the same call under the name `slate:http` asks a streamed response's source for, so a fetched body can
   be handed straight back out as one.
 - **A compressed body is not decoded as it arrives in the interpreter.** A streamed request asks for

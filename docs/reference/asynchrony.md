@@ -330,7 +330,10 @@ for x in counter(1)
 - **`next(g)` and `g.next()` are the one call**, `next` being a free function like every other method.
 - **`next` answers `{ value, done }`**, and a generator whose body has finished answers
   `{ value: null, done: true }` from then on.
-- `for x in g` is an ordinary loop over one, and stops when the generator does.
+- `for x in g` is an ordinary loop over one, and stops when the generator does. **A loop that stops
+  first calls `g.return()`**, which leaves the body from its `yield` and releases what its `using`
+  blocks held — see [leaving early](statements.md#leaving-early-closes-what-the-loop-walked).
+  `return` is a method only, answering `{ value, done: true }` with the value it was given.
 - **A generator does not touch the event loop**, so generators work in a program with no loop running.
 - **`val got = yield x`** is how a value is sent in: the driver's value is written over the slot the
   yielded one left.
