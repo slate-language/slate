@@ -232,6 +232,44 @@ async an_await_does_not_release() =
     await run()
     assertEq(log, ["after the wait", "a"])
 
+// **A `for await` leaves the stack as it found it**, so a `using` around one releases the value it
+// acquired -- the loop's way out once left the compiler a slot short, and the release after it reached
+// for the wrong value or for none. The resource is the source being walked, which is the shape a
+// streamed `fetch` body is read in, and both an ending loop and a `break` are asked.
+@test
+async a_for_await_inside_a_using_releases_the_source_it_walked() =
+    var log = []
+
+    source(name, n) =
+        var left = n
+
+        tick() =
+            left = left - 1
+            return { done: left < 0, value: left }
+
+        return { next: tick, dispose: () -> push(log, name) }
+
+    async walk() =
+        using s = source("whole", 2)
+        var seen = []
+
+        for await v in s
+            push(seen, v)
+
+        push(log, string(seen))
+
+    async stop() =
+        using s = source("broken off", 5)
+
+        for await v in s
+            if v == 3 then break
+
+        push(log, "stopped")
+
+    await walk()
+    await stop()
+    assertEq(log, ["[1, 0]", "whole", "stopped", "broken off"])
+
 // **A `yield` is not a way out either**, and an abandoned generator is never left: the release runs
 // when the body finally ends.
 @test

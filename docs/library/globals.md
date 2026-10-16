@@ -643,7 +643,48 @@ forbidden response-header name, so a page never reads one. The browser still app
 **A body that is not UTF-8 is `""`** rather than a string of replacement characters, which is the same
 answer `run` gives and for the same reason: slate has no byte value for it to be.
 
-**The options** are `method`, `body`, `headers`, `trust` and `timeout`, all optional.
+**The options** are `method`, `body`, `headers`, `trust`, `timeout` and `stream`, all optional.
+
+**`stream: true` hands the body over as it arrives.** The answer is the same `{ ok, value }`, settled
+once the head is in, and `value.body` is an asynchronous source of [`bytes`](bytes.md) — the same kind
+[`slate:gzip`](gzip.md) takes — read with `for await`:
+
+```slate
+val r = await fetch(url, { stream: true })
+
+if r.ok
+    using body = r.value.body
+
+    for await chunk in body
+        chunk match
+            { ok: false, error } -> print("broke off: " + error)
+            _ -> save(chunk)
+```
+
+- **A chunk is whatever has arrived** since the last one was asked for, whether the server framed the
+  body with `Content-Length`, with chunks, or by closing the connection. Nothing is read ahead of the
+  program by more than one read, so a slow reader costs the server's send buffer and not this process's
+  memory.
+- **A body that breaks off is an answer, not a fault.** A connection dropped in the middle of the body,
+  a limit running out, or a damaged chunk hands over what had arrived and then one last value,
+  `{ ok: false, error }` — *"`http://example.com/big` stopped sending in the middle of the body"* —
+  after which the source is done. The bytes came from outside the program, so this is the result channel
+  and a `for await` sees an ordinary value.
+- **`timeout` still covers the whole exchange**, the body included: a limit that runs out while the body
+  is flowing ends it with the same sentence a fetch that never answered gets.
+- **`using` is how to stop early.** A body is a resource with a `dispose`, so `using body = …` closes
+  the connection on every way out of the block, a `break` included. A body read to its end has already
+  closed it. One left unread and not disposed holds its connection open, as a socket does. `close` is
+  the same call under the name `slate:http` asks a streamed response's source for, so a fetched body can
+  be handed straight back out as one.
+- **A compressed body is not decoded as it arrives in the interpreter.** A streamed request asks for
+  `Accept-Encoding: identity`, and a server that compresses anyway is refused at the head — *"the server
+  compressed a streamed body with gzip although it was asked not to, and a streamed body is not
+  decompressed as it arrives"* — rather than buffered whole behind the program's back. A JavaScript host
+  decodes as it reads, so there the same body arrives decoded; that is the one difference between the
+  hosts here.
+- **Leaving `stream` out, or `stream: false`, is the buffered fetch above, unchanged.** Anything but
+  `true` or `false` is a mistake in the program and faults at the call.
 
 **`timeout` limits the whole fetch** — redirects and the body included — to a duration or a number of
 milliseconds, exactly as `run`'s does; `0` or leaving it out means no limit. When it runs out the
