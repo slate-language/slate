@@ -47,8 +47,10 @@ main()
 | `alpnProtocol(conn)` | which application protocol was agreed, or `null` |
 
 **Under [`slate js`](../reference/javascript.md) this is node's own TCP**, and everything above is the
-same, `startTls` included at both ends. The one exception is a `listen` given a `cert` and a `key`,
-which refuses there naming TLS. A browser has no sockets at all and says so.
+same, `startTls` included at both ends, `listen` given a `cert` and a `key` and `listen(socket, fn)`
+too. The one difference is that a secured listener there calls `fn` once a connection's handshake
+has finished, where the interpreter hands the connection over first. A browser has no sockets at all
+and says so.
 
 ## Promises and callbacks
 
