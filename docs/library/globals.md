@@ -653,7 +653,34 @@ forbidden response-header name, so a page never reads one. The browser still app
 **A body that is not UTF-8 is `""`** rather than a string of replacement characters, which is the same
 answer `run` gives and for the same reason: slate has no byte value for it to be.
 
-**The options** are `method`, `body`, `headers`, `trust`, `timeout` and `stream`, all optional.
+**The options** are `method`, `body`, `headers`, `trust`, `timeout`, `stream` and `reuse`, all
+optional.
+
+**Connections are pooled and reused, per origin.** Over HTTP/1.1 a connection whose answer was read
+to its last byte — a `Content-Length` met, a chunked body read through its trailers, or a reply with
+no body — goes back to the pool unless either side said `Connection: close`, and the next request to
+the same scheme, host and port takes it instead of dialling. An origin keeps at most six idle
+connections, and one left idle for about four seconds is closed. **An idle connection never keeps a
+program running**: nothing reads it and its timer is in the background, so a program that fetched
+once ends when its own work does. A request that finds its pooled connection closed by the server —
+refused on the write, or ended before a byte of the answer — is sent again once on a fresh one when
+its method is idempotent (`GET`, `HEAD`, `OPTIONS`, `TRACE`, `PUT`, `DELETE`); a `POST` is told the
+connection went, since the server may have acted on it.
+
+**Over HTTP/2 an origin has ONE connection and every concurrent fetch to it is a stream on it.**
+Fetches made while the first dial is still finding out whether the server speaks `h2` wait for that
+answer rather than each dialling their own. Streams past the server's `MAX_CONCURRENT_STREAMS` wait
+their turn on the same connection. After a GOAWAY the streams the server said it will answer finish
+there, and the next fetch dials a new connection. A streamed body nobody is reading holds back only
+its own stream: the server stops sending it at its window while every other stream keeps flowing.
+
+**`reuse: false` opts one request out**: it dials a connection of its own, asks for
+`Connection: close` over HTTP/1.1, and closes it when it is done — for a request that must not ride on
+state another left behind. It is not called `keepalive` because a browser's `fetch` already has that
+name for something else: a request allowed to outlive the page that made it. **Under `slate js` it is
+read and then left to the host**, whose pool is its own and which offers a request no way out of it;
+anything but `true` or `false` is refused on both. **`Host` carries the port** wherever it is not the
+scheme's own, as RFC 9110 says.
 
 **`stream: true` hands the body over as it arrives.** The answer is the same `{ ok, value }`, settled
 once the head is in, and `value.body` is an asynchronous source of [`bytes`](bytes.md) — the same kind

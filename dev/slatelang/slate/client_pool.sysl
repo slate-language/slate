@@ -1,0 +1,217 @@
+module dev.slatelang.slate
+
+import sh.sysl.kairos.Timer
+import sh.sysl.kairos.uv.Connection
+import sh.sysl.openssl
+import sysl.buf.{Buf, buf}
+import sysl.text.to_lower
+import sysl.time.millis
+
+// `fetch`'s connection pool: the HTTP/1.1 connections a finished request left open, kept for the
+// next request to the same origin, and the HTTP/2 dials other fetches are waiting on.
+//
+// **A connection goes back only when its answer was read to the last byte.** HTTP/1.1 has no way to
+// say where one reply ends but the reply's own framing, so a connection is kept only where that
+// framing said exactly where it ended and nothing arrived after it -- a `Content-Length` met, a
+// chunked body read through its trailers, or a reply that has no body at all -- and where neither
+// side said `Connection: close`. A body framed by the end of the socket is never kept: its end IS the
+// close.
+//
+// **An idle connection holds nothing open.** No read is parked on it -- `read_on` ends with the
+// answer -- so libuv counts nothing, and the timer that closes it after `IdleMillis` is a kairos
+// BACKGROUND timer, node's `unref`: it fires if the program is still running, and it never keeps one
+// running. A program that fetched once ends when its own work does.
+//
+// **What an idle connection cannot know is whether the server has closed it**, since nothing is
+// reading. So a request that finds a pooled connection dead -- refused on the write, or ended before
+// a byte of the answer came -- is sent again ONCE on a fresh one, where that is safe: an idempotent
+// method (RFC 9110 9.2.2), which every request here is that is not a `POST` or a `PATCH`. A `POST`
+// is told the connection went, because the server may have acted on it.
+//
+// **HTTP/2 multiplexes, so it pools differently and the record is `H2Conn`**, in `client_h2.sysl`:
+// one connection per origin, carrying every concurrent fetch to it as a stream. What is here for it is
+// the wait list -- the fetches that asked for an `https` origin while another fetch's dial to it was
+// still deciding, in its TLS handshake, whether the server speaks `h2`. They wait for that answer
+// rather than each dialling a connection of their own that the first one would have made redundant.
+
+// How many idle connections one origin keeps, which is what browsers allow per host. A seventh is
+// closed rather than kept.
+private const IdleCap: usize = 6
+
+// How long an idle connection is kept before it is closed, in milliseconds. A little under the five
+// seconds node's own server closes an idle keep-alive connection after, so that a slate client talking
+// to one closes first rather than finding the connection gone.
+private const IdleMillis: long = 4000
+
+// One idle connection, and the timer that will close it.
+struct IdleConn
+    key: string
+    conn: &Connection
+    tls: Option[&openssl.Stream]
+    timer: Timer
+    gen: usize
+
+// The dial a fetch made to an `https` origin while nobody knew yet whether it speaks HTTP/2, and the
+// fetches waiting to hear -- each a slot and the dial of it that is waiting, so one given up or sent
+// elsewhere in the meantime is passed over.
+struct Probe
+    key: string
+    fetch: usize
+    epoch: usize
+    waiters: Buf[usize]
+    epochs: Buf[usize]
+
+struct FetchPool
+    idle: Buf[IdleConn]
+    probes: Buf[Probe]
+    gen: usize
+    cap: usize
+    idle_ms: long
+
+// Not `private`: `vm_over` in `vm_state.sysl` makes every VM's with it.
+new_pool() -> FetchPool = FetchPool(buf(), buf(), 0, IdleCap, IdleMillis)
+
+// What a connection is kept for: the scheme, the host, the port, and the certificate a caller trusts
+// as well as the machine's own -- a connection verified against one trust is not the one a request
+// naming another should be handed.
+//
+// Not `private`: `client.sysl` and `client_h2.sysl` both key their connections with it.
+pool_key(secure: bool, host: string, port: int, trust: string) -> string =
+    s"${if secure then "https" else "http"}://${host}:${port} ${trust}"
+
+// The pool's two limits, for a test that cannot wait four seconds or open seven connections. Zero
+// puts a default back.
+//
+// Not `private`: `tests_fetch_pool.sysl` sets them and puts them back.
+set_pool_limits(cap: usize, idle_ms: long)
+    current().pool.cap = if cap == 0 then IdleCap else cap
+    current().pool.idle_ms = if idle_ms == 0 then IdleMillis else idle_ms
+
+// How many idle connections are kept, for the tests.
+pooled_count() -> usize = current().pool.idle.len()
+
+// -- idle HTTP/1.1 connections ----------------------------------------------------------------------
+
+// Keep a connection whose answer was read whole, or close it where its origin already has as many as
+// it may keep.
+//
+// Not `private`: `close_fetch_socket` in `client.sysl` hands one back instead of closing it.
+park_idle(key: string, conn: &Connection, tls: Option[&openssl.Stream])
+    var kept: usize = 0
+
+    for i in 0..<current().pool.idle.len()
+        if current().pool.idle.at(i).key == key then kept += 1
+
+    if kept >= current().pool.cap
+        conn.close()
+        return
+
+    current().pool.gen += 1
+
+    val gen = current().pool.gen
+    val t = loop_events().after(millis(current().pool.idle_ms), (_) -> idle_expired(gen))
+
+    t.background()
+    current().pool.idle.push(IdleConn(key, conn, tls, t, gen))
+
+// The most recently kept connection to this origin, taken out of the pool, or nothing. **The newest
+// rather than the oldest**, being the one least likely to have been closed by the server meanwhile.
+//
+// Not `private`: `start_fetch` in `client.sysl` asks it before dialling.
+take_idle(key: string) -> Option[IdleConn]
+    var i = current().pool.idle.len()
+
+    while i > 0
+        i -= 1
+
+        val c = current().pool.idle.at(i)
+
+        if c.key == key
+            loop_events().cancel(c.timer)
+
+            val _ = current().pool.idle.remove(i)
+
+            return Some(c)
+
+    None
+
+private idle_expired(gen: usize)
+    for i in 0..<current().pool.idle.len()
+        val c = current().pool.idle.at(i)
+
+        if c.gen == gen
+            c.conn.close()
+
+            val _ = current().pool.idle.remove(i)
+
+            return
+
+// Every idle connection closed and every wait forgotten, between runs -- `forget_fetches`' reason.
+//
+// Not `private`: `forget_fetches` in `client.sysl` calls it.
+forget_pool()
+    for i in 0..<current().pool.idle.len()
+        val c = current().pool.idle.at(i)
+
+        loop_events().cancel(c.timer)
+        c.conn.close()
+
+    current().pool.idle = buf()
+    current().pool.probes = buf()
+
+// -- what a reply and a request say about the connection -------------------------------------------
+
+// Whether a request may be sent again on a fresh connection after a pooled one turned out dead.
+//
+// Not `private`: `retry_once` in `client.sysl` asks it.
+idempotent(method: string) -> bool =
+    method == "GET" || method == "HEAD" || method == "OPTIONS" || method == "TRACE" ||
+        method == "PUT" || method == "DELETE"
+
+// Whether either side has said this connection ends with the reply: the request's own
+// `Connection: close`, a reply's, or a reply in HTTP/1.0, whose default that is.
+//
+// Not `private`: `client.sysl` and `client_stream.sysl` ask it once a head is in.
+stays_open(status_line: string, reply: []const string, request: []const string) -> bool
+    if status_line.starts_with("HTTP/1.0") then return false
+
+    if to_lower(header_named(reply, "connection")).contains("close") then return false
+
+    !to_lower(header_named(request, "connection")).contains("close")
+
+// -- the HTTP/2 wait list ---------------------------------------------------------------------------
+
+// Whether a dial to this origin is deciding its protocol, and if so this fetch is put on its list.
+//
+// Not `private`: `start_fetch` in `client.sysl` asks it before dialling an `https` origin.
+wait_on_probe(key: string, fi: usize, epoch: usize) -> bool
+    for i in 0..<current().pool.probes.len()
+        var p = current().pool.probes.at(i)
+
+        if p.key == key
+            p.waiters.push(fi)
+            p.epochs.push(epoch)
+            current().pool.probes.set(i, p)
+            return true
+
+    false
+
+// This fetch's dial is the one that will decide.
+//
+// Not `private`: `start_fetch` in `client.sysl` registers a dial with it.
+start_probe(key: string, fi: usize, epoch: usize) = current().pool.probes.push(Probe(key, fi, epoch, buf(), buf()))
+
+// The dial this fetch made has decided, or will not: its probe is taken off the list and answered
+// with, so the caller can send each waiter on.
+//
+// Not `private`: `client.sysl` ends a probe when the handshake settles and when the dial is given up.
+end_probe(fi: usize) -> Option[Probe]
+    for i in 0..<current().pool.probes.len()
+        val p = current().pool.probes.at(i)
+
+        if p.fetch == fi
+            val _ = current().pool.probes.remove(i)
+
+            return Some(p)
+
+    None

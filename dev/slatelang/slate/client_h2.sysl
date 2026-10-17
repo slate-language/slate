@@ -1,9 +1,13 @@
 module dev.slatelang.slate
 
 #if feature_http2
+import sh.sysl.kairos.Timer
+import sh.sysl.kairos.uv.Connection
 import sh.sysl.nghttp2.*
+import sh.sysl.libuv
+import sh.sysl.openssl
 import sysl.buf.{Buf, buf}
-import sysl.text.str_builder
+import sysl.time.millis
 #endif
 
 // `fetch` over HTTP/2: what `client.sysl` hands an `https` connection to when ALPN settled on `h2`.
@@ -13,29 +17,41 @@ import sysl.text.str_builder
 // request it always got. There is no `h2c` -- HTTP/2 in the clear -- because no browser speaks it,
 // and a `fetch` that did would answer differently here than on a JavaScript host.
 //
-// **The bytes go through OpenSSL as they always did and through nghttp2 as well**: what OpenSSL
-// decrypts is handed to the session, and what the session wants written is encrypted and sent. The
-// dial, the handshake, the limit, the redirects and the streamed body are `client.sysl`'s and
-// `client_stream.sysl`'s, unchanged -- an `h2` response is turned into a status and `Name: value`
-// lines, which is the shape every one of them already reads.
+// **ONE CONNECTION PER ORIGIN, AND EVERY FETCH TO IT IS A STREAM ON IT.** The fetch whose dial found
+// `h2` gives its socket and its TLS stream to an `H2Conn` here, and from then on the connection is the
+// session's: one task reads it for every stream, and every concurrent fetch to the origin -- the ones
+// that waited on that dial (`client_pool.sysl`) and any that come later -- is a request on the
+// session. nghttp2 holds back the ones past the server's `MAX_CONCURRENT_STREAMS` and sends each when
+// a stream closes, which is why nothing here counts them. What a fetch keeps is only which connection
+// it is on; the dial, the limit, the redirects and the streamed body stay `client.sysl`'s and
+// `client_stream.sysl`'s, an `h2` response being turned into a status and `Name: value` lines, which is
+// the shape every one of them already reads.
 //
-// **A CONNECTION AND A REQUEST ARE TWO RECORDS, AND THAT IS FOR THE POOL.** One fetch dials one
-// connection for now, so an `H2Conn` carries exactly one `H2Req`. A pool that keeps a connection per
-// origin owns the `H2Conn` and multiplexes many requests on it; what a request needs -- which fetch it
-// answers, its stream, its head and body so far -- is already apart from what the connection needs.
+// **A SLOW STREAMED READER MUST NOT STALL THE STREAMS BESIDE IT, SO THE WINDOWS ARE TAKEN OVER.** The
+// session is made with no automatic window updates: a buffered body gives its credit back as it
+// arrives, and a streamed one only as the program reads it (`h2_taken`), so the server stops sending
+// THAT stream at its window while the socket stays read for the others. The connection's window is
+// opened by `ConnWindow` once at the start, as Chrome does, because nghttp2's `consume` gives credit to
+// the stream and the connection together -- a stream sitting on its unread window would otherwise sit
+// on the connection's sixty-four kilobytes too.
 //
-// **A streamed body is held back by not reading the socket**, which is `client_stream.sysl`'s one
-// read ahead, and nghttp2 extends the windows by itself as bytes are taken in. That is right for one
-// stream per connection. A shared connection cannot stop reading for one slow stream, so the pool
-// will take the windows over -- `no_auto_window_update` and `consume` as the program reads.
+// **AN IDLE CONNECTION HOLDS NOTHING OPEN.** The reader stops when no stream wants bytes, and a
+// connection with no streams waits on a background timer to close, as an idle HTTP/1.1 one does.
+// After a GOAWAY the streams the server said it will answer finish, and a fetch that comes later dials
+// a connection of its own.
 
 #if feature_http2
 
+// How much the connection's own window is opened by at the start, on top of the sixty-four kilobytes
+// every connection begins with.
+private const ConnWindow: i32 = 16 * 1024 * 1024
+
 // One request on a connection.
 struct H2Req
-    // The stream nghttp2 gave it, and the fetch slot it answers.
+    // The stream nghttp2 gave it, the fetch slot it answers, and which dial of that slot it is.
     stream: i32
     fetch: usize
+    epoch: usize
 
     // The final status, once the response's head has come; zero before.
     status: int
@@ -49,15 +65,45 @@ struct H2Req
     // Whether the server has ended the stream, so that hanging up has nothing to reset.
     done: bool
 
+    // Body bytes taken in that the program has not read yet, so not yet given back to the window.
+    owed: usize
+
+    // Whether it was put on a connection that had already answered somebody -- which may have been
+    // closed by the server while it sat idle, so a request that gets nothing back is sent again.
+    reused: bool
+
 // One HTTP/2 connection, and the requests open on it.
 struct H2Conn
     live: bool
     session: Option[&Session]
     reqs: Buf[H2Req]
 
-    // What the server said when it went away, where it did -- the sentence a request it will now
-    // never answer is given.
+    // The error the server named when it went away, where it did, for the sentence a request it will
+    // now never answer is given.
     gone: string
+
+    // The socket and the TLS stream, taken from the fetch that dialled them, and which incarnation of
+    // the slot this is -- so the reader of one closed connection does nothing to the next.
+    conn: Option[&Connection]
+    tls: Option[&openssl.Stream]
+    epoch: usize
+
+    // The origin, and whether other fetches may share it -- not where the fetch that dialled it asked
+    // for a connection of its own.
+    key: string
+    shared: bool
+
+    // Whether the server has sent a GOAWAY, after which nothing new goes onto it.
+    draining: bool
+
+    // Whether a task is reading the socket, and whether it is waiting in a read right now.
+    reading: bool
+    parked: bool
+
+    // How many requests it has answered, and the timer that closes it while it has none.
+    served: usize
+    idle: Option[Timer]
+    host: string
 
 // Whether a secure `fetch` offers `h2`, which is whether this build has the `http2` feature.
 fetch_speaks_h2() -> bool = true
@@ -68,56 +114,122 @@ on_h2(fi: usize) -> bool
         Some(_) -> true
         None -> false
 
-// The handshake is done. Where the server chose `h2`, a session is made, the request goes out on it
-// and this answers true; otherwise nothing changes and the HTTP/1.1 request is the caller's to send.
+// The handshake is done. Where the server chose `h2`, the connection becomes a session's, the request
+// goes out on it and this answers true; otherwise nothing changes and the HTTP/1.1 request is the
+// caller's to send.
 h2_begin(fi: usize) -> bool
-    val f = current().fetches.at(fi)
+    var f = current().fetches.at(fi)
 
-    val stream = f.tls match
+    val tls = f.tls match
         Some(s) -> s
         None -> return false
 
-    stream.protocol() match
+    tls.protocol() match
         Some(p) -> if p != "h2" then return false
         None -> return false
 
-    var session = client() match
+    val conn = f.conn match
+        Some(c) -> c
+        None -> return false
+
+    var session = client_with(no_auto_window_update()) match
         Ok(s) -> s
         Err(e) ->
             fetch_failed(fi, s"HTTP/2 could not be set up: ${e.message}")
             return true
 
-    val head = request_headers(fi)
+    session.window_update(0, ConnWindow) match
+        Ok(_) -> ()
+        Err(_) -> ()
 
+    // **The socket leaves the fetch here**, so that closing the fetch no longer closes it: it is the
+    // connection's, and the fetch's own reader finds nothing to read and ends.
+    f.conn = None
+    f.tls = None
+    current().fetches.set(fi, f)
+
+    val ci = claim_h2_conn(H2Conn(true, Some(session), buf(), "", Some(conn), Some(tls), 0, pool_key(f.secure, f.host, f.port, f.trust),
+                                   f.reuse, false, false, false, 0, None, f.host))
+
+    if !put_on(fi, ci, false)
+        h2_close(ci)
+        return true
+
+    // **Whatever came with the end of the handshake is read at once**, the server's SETTINGS being
+    // able to share its last flight -- and then the fetches that were waiting to hear join it.
+    h2_drain(ci)
+    probe_settled(fi)
+    true
+end h2_begin
+
+// A stream on the open HTTP/2 connection to this origin, where there is one that will take another.
+//
+// Not `private`: `start_fetch` in `client.sysl` asks it before dialling.
+h2_attach(fi: usize, key: string) -> bool
+    for ci in 0..<current().h2_conns.len()
+        val c = current().h2_conns.at(ci)
+
+        if c.live && c.shared && !c.draining && c.key == key
+            c.idle match
+                Some(t) -> loop_events().cancel(t)
+                None -> false
+
+            var d = c
+
+            d.idle = None
+            current().h2_conns.set(ci, d)
+
+            // A request that could not be framed has been failed, which is an answer too.
+            val _ = put_on(fi, ci, c.served > 0)
+
+            return true
+
+    false
+
+private claim_h2_conn(c: H2Conn) -> usize
+    for i in 0..<current().h2_conns.len()
+        if !current().h2_conns.at(i).live
+            var d = c
+
+            // The incarnation goes on from the last connection in the slot, as a fetch's epoch does.
+            d.epoch = current().h2_conns.at(i).epoch + 1
+            current().h2_conns.set(i, d)
+            return i
+
+    current().h2_conns.push(c)
+    current().h2_conns.len() - 1
+
+// The fetch's request, framed onto the connection's session and sent, answering whether it went --
+// a fetch whose request could not be framed has been failed.
+private put_on(fi: usize, ci: usize, reused: bool) -> bool
+    val f = current().fetches.at(fi)
+
+    var session = current().h2_conns.at(ci).session match
+        Some(s) -> s
+        None -> return false
+
+    val head = request_headers(fi)
     val sent = if f.body != "" then session.request(head.view(), Some(f.body.bytes)) else session.request(head.view())
 
     val id = sent match
         Ok(id) -> id
         Err(e) ->
             fetch_failed(fi, s"the request could not be framed for HTTP/2: ${e.message}")
-            return true
+            return false
 
-    var reqs: Buf[H2Req] = buf()
+    var conn = current().h2_conns.at(ci)
 
-    reqs.push(H2Req(id, fi, 0, buf(), buf(), false))
+    conn.reqs.push(H2Req(id, fi, f.epoch, 0, buf(), buf(), false, 0, reused))
+    current().h2_conns.set(ci, conn)
 
-    val ci = claim_h2_conn(H2Conn(true, Some(session), reqs, ""))
     var g = current().fetches.at(fi)
 
     g.h2 = Some(ci)
     current().fetches.set(fi, g)
-    h2_flush(fi)
+    h2_flush(ci)
+    read_conn(ci)
     true
-end h2_begin
-
-private claim_h2_conn(c: H2Conn) -> usize
-    for i in 0..<current().h2_conns.len()
-        if !current().h2_conns.at(i).live
-            current().h2_conns.set(i, c)
-            return i
-
-    current().h2_conns.push(c)
-    current().h2_conns.len() - 1
+end put_on
 
 // The request's head, in HTTP/2's spelling: the four pseudo-headers, then the caller's own names
 // lower-cased, as HTTP/2 requires.
@@ -156,23 +268,24 @@ private connection_specific(name: string) -> bool =
     name == "connection" || name == "keep-alive" || name == "proxy-connection" ||
         name == "transfer-encoding" || name == "upgrade" || name == "host" || name == "te"
 
-// Everything the session wants written, encrypted and onto the wire.
-private h2_flush(fi: usize)
-    val ci = current().fetches.at(fi).h2 match
-        Some(ci) -> ci
-        None -> return
+// -- the socket ---------------------------------------------------------------------------------------
 
-    current().h2_conns.at(ci).session match
-        Some(s) ->
-            val why = h2_write(fi, s)
+// Everything the session wants written, encrypted and onto the wire. A connection that cannot be
+// written to is over for every stream on it.
+private h2_flush(ci: usize)
+    val why = h2_write(ci)
 
-            if why != "" then fetch_failed(fi, why)
-        None -> ()
+    if why != "" then h2_broken(ci, why)
 
-// The writing half of `h2_flush`, answering what went wrong rather than failing the fetch -- so the
-// hang-up, which is already ending it, can write a reset without coming back round.
-private h2_write(fi: usize, s: &Session) -> string
-    var session = s
+// The writing half of `h2_flush`, answering what went wrong rather than ending the connection -- so a
+// hang-up, which may be ending it already, can write a reset without coming back round.
+private h2_write(ci: usize) -> string
+    val c = current().h2_conns.at(ci)
+
+    var session = c.session match
+        Some(s) -> s
+        None -> return ""
+
     var out: Buf[u8] = buf()
 
     session.send(&out) match
@@ -181,20 +294,147 @@ private h2_write(fi: usize, s: &Session) -> string
 
     if out.len() == 0 then return ""
 
-    current().fetches.at(fi).tls match
-        None -> ""
-        Some(stream) ->
-            stream.send(out.view()) match
-                Err(e) -> s"the request could not be encrypted: ${e}"
-                Ok(_) ->
-                    push_tls(fi, stream)
-                    ""
+    val tls = c.tls match
+        Some(t) -> t
+        None -> return ""
+
+    val sock = c.conn match
+        Some(s) -> s
+        None -> return ""
+
+    tls.send(out.view()) match
+        Err(e) -> return s"the request could not be encrypted: ${e}"
+        Ok(_) -> ()
+
+    loop
+        val n = tls.waiting()
+
+        if n == 0 then break
+
+        var wire: []u8 = [u8(0); n]
+        val took = tls.outgoing(wire)
+
+        if took == 0 then break
+
+        loop_events().spawn(h2_sent(ci, c.epoch, sock.write(wire[0..<took])))
+
+    ""
+end h2_write
+
+private async h2_sent(ci: usize, epoch: usize, t: Task[Result[unit, libuv.Error]])
+    (await t) match
+        Ok(_) -> ()
+        Err(e) -> if h2_owns(ci, epoch) then h2_broken(ci, s"the request could not be sent: ${e}")
+
+private h2_owns(ci: usize, epoch: usize) -> bool =
+    ci < current().h2_conns.len() && current().h2_conns.at(ci).live && current().h2_conns.at(ci).epoch == epoch
+
+// Start the connection's reader, where it is not running and a stream wants bytes.
+private read_conn(ci: usize)
+    var c = current().h2_conns.at(ci)
+
+    if !c.live || c.reading || !wants_bytes(ci) then return
+
+    c.reading = true
+    current().h2_conns.set(ci, c)
+    loop_events().spawn(h2_read_on(ci, c.epoch))
+
+// A streamed body's reader asked for more, so the connection it is on may have to be read again.
+//
+// Not `private`: `resume_reading` in `client.sysl` asks it for a fetch on HTTP/2.
+h2_resume(fi: usize)
+    current().fetches.at(fi).h2 match
+        Some(ci) -> read_conn(ci)
+        None -> ()
+
+// Whether any stream on the connection is waiting for bytes: one not yet ended whose body is not
+// sitting unread. **A connection where none is stops reading**, which is what lets an idle one hold
+// nothing open, and what keeps an abandoned streamed body from being read for ever.
+private wants_bytes(ci: usize) -> bool
+    val reqs = current().h2_conns.at(ci).reqs
+
+    for i in 0..<reqs.len()
+        val r = reqs.at(i)
+
+        if !r.done && !held_back(r.fetch) then return true
+
+    false
+
+// Read the connection for every stream on it, until none wants bytes or the connection ends.
+private async h2_read_on(ci: usize, epoch: usize)
+    loop
+        if !h2_owns(ci, epoch) then return
+
+        if !wants_bytes(ci)
+            var c = current().h2_conns.at(ci)
+
+            c.reading = false
+            current().h2_conns.set(ci, c)
+            return
+
+        val sock = current().h2_conns.at(ci).conn match
+            Some(s) -> s
+            None -> return
+
+        mark_parked(ci, true)
+
+        val got = (await sock.read()) match
+            Err(e) ->
+                if h2_owns(ci, epoch) then h2_broken(ci, s"this connection failed: ${e}")
+                return
+            Ok(bytes) -> bytes
+
+        if !h2_owns(ci, epoch) then return
+
+        mark_parked(ci, false)
+
+        if got.len == 0
+            h2_broken(ci, "")
+            return
+
+        val tls = current().h2_conns.at(ci).tls match
+            Some(t) -> t
+            None -> return
+
+        tls.incoming(got) match
+            Err(e) ->
+                h2_broken(ci, s"the answer could not be decrypted: ${e}")
+                return
+            Ok(_) -> ()
+
+        h2_drain(ci)
+end h2_read_on
+
+private mark_parked(ci: usize, parked: bool)
+    var c = current().h2_conns.at(ci)
+
+    c.parked = parked
+    current().h2_conns.set(ci, c)
+
+// Everything OpenSSL has decrypted, into the session.
+private h2_drain(ci: usize)
+    val tls = current().h2_conns.at(ci).tls match
+        Some(t) -> t
+        None -> return
+
+    val epoch = current().h2_conns.at(ci).epoch
+    var plain: []u8 = [u8(0); 16384]
+
+    loop
+        if !h2_owns(ci, epoch) then return
+
+        tls.receive(plain) match
+            Err(e) ->
+                h2_broken(ci, s"the answer could not be decrypted: ${e}")
+                return
+            Ok(got) -> got match
+                Data(n) -> h2_incoming(ci, plain[0..<n])
+                Closed -> return
+                Wants -> return
 
 // Decrypted bytes from the server, into the session, and whatever they made happen.
-h2_incoming(fi: usize, bytes: []const u8)
-    val ci = current().fetches.at(fi).h2 match
-        Some(ci) -> ci
-        None -> return
+private h2_incoming(ci: usize, bytes: []const u8)
+    val epoch = current().h2_conns.at(ci).epoch
 
     var session = current().h2_conns.at(ci).session match
         Some(s) -> s
@@ -203,64 +443,62 @@ h2_incoming(fi: usize, bytes: []const u8)
     session.receive(bytes) match
         Ok(_) -> ()
         Err(e) ->
-            fetch_failed(fi, s"the server's HTTP/2 could not be read: ${e.message}")
+            h2_broken(ci, s"the server's HTTP/2 could not be read: ${e.message}")
             return
 
-    // **Every event is checked against the connection still being this fetch's**: one may finish
-    // the fetch -- an answer, a reset, a redirect that dials again -- and what follows it is then
-    // about a connection that has been hung up.
+    // **Every event is checked against the connection still being this one**: an event may end it.
     loop
-        if !still_on(fi, ci) then return
+        if !h2_owns(ci, epoch) then return
 
         val e = session.next_event() match
             Some(e) -> e
             None -> break
 
-        h2_event(fi, ci, e)
+        h2_event(ci, e)
 
     // **The session answers as well as hears**: a SETTINGS acknowledgement, a PING's answer and the
-    // window updates for what was just taken in are all queued by `receive`.
-    if !still_on(fi, ci) then return
+    // window updates for what was just taken in are all queued by now.
+    if !h2_owns(ci, epoch) then return
 
-    h2_flush(fi)
+    h2_flush(ci)
 
     // **A frame that breaks the protocol ends the session without an error from `receive`**:
     // nghttp2 queues its own GOAWAY, just written, and then wants neither to read nor to write. Left
-    // there, the fetch would wait on a server that is waiting on it.
-    if still_on(fi, ci) && !session.wants_read() && !session.wants_write()
-        fetch_failed(fi, s"${current().fetches.at(fi).host} sent HTTP/2 that breaks the protocol, so the connection was ended")
+    // there, a fetch would wait on a server that is waiting on it.
+    if h2_owns(ci, epoch) && !session.wants_read() && !session.wants_write()
+        h2_broken(ci, s"${current().h2_conns.at(ci).host} sent HTTP/2 that breaks the protocol, so the connection was ended")
 end h2_incoming
 
-private still_on(fi: usize, ci: usize) -> bool
-    if !fetch_live(fi) then return false
+// -- the streams ------------------------------------------------------------------------------------
 
-    current().fetches.at(fi).h2 match
-        Some(c) -> c == ci
-        None -> false
-
-// The one request on a connection that is this fetch's, by its index.
+// The request on this connection for a stream, by its index, where its fetch still wants it.
 private req_of(ci: usize, stream: i32) -> Option[usize]
     val reqs = current().h2_conns.at(ci).reqs
 
     for i in 0..<reqs.len()
-        if reqs.at(i).stream == stream then return Some(i)
+        val r = reqs.at(i)
+
+        if r.stream == stream
+            if !fetch_live(r.fetch) || current().fetches.at(r.fetch).epoch != r.epoch then return None
+
+            return Some(i)
 
     None
 
-private h2_event(fi: usize, ci: usize, e: Event)
+private h2_event(ci: usize, e: Event)
     e match
         Headers(stream, headers, kind) ->
-            if kind == HeaderKind.Response then h2_head(fi, ci, stream, headers.view())
-        Data(stream, bytes) -> h2_data(fi, ci, stream, bytes.view())
-        StreamEnd(stream) -> h2_end(fi, ci, stream)
-        RstStream(stream, code) -> h2_reset(fi, ci, stream, code)
-        StreamClose(stream, code) -> if code != NO_ERROR then h2_reset(fi, ci, stream, code)
-        Goaway(last_stream, code) -> h2_goaway(fi, ci, last_stream, code)
+            if kind == HeaderKind.Response then h2_head(ci, stream, headers.view())
+        Data(stream, bytes) -> h2_data(ci, stream, bytes.view())
+        StreamEnd(stream) -> h2_end(ci, stream)
+        RstStream(stream, code) -> h2_reset(ci, stream, code)
+        StreamClose(stream, code) -> if code != NO_ERROR then h2_reset(ci, stream, code)
+        Goaway(last_stream, code) -> h2_goaway(ci, last_stream, code)
         other -> ()
 
 // A response's head. **A `1xx` is an interim answer** and the final one is still to come, so it is
 // passed over. A streamed fetch is answered here, as `client_stream.sysl` answers an HTTP/1.1 head.
-private h2_head(fi: usize, ci: usize, stream: i32, headers: []const Header)
+private h2_head(ci: usize, stream: i32, headers: []const Header)
     val ri = req_of(ci, stream) match
         Some(ri) -> ri
         None -> return
@@ -286,14 +524,28 @@ private h2_head(fi: usize, ci: usize, stream: i32, headers: []const Header)
     conn.reqs.set(ri, r)
     current().h2_conns.set(ci, conn)
 
-    if current().fetches.at(fi).stream then stream_head(fi, status, lines.view(), Ok(no_frame()))
+    if current().fetches.at(r.fetch).stream then stream_head(r.fetch, status, lines.view(), Ok(no_frame()))
 
-private h2_data(fi: usize, ci: usize, stream: i32, bytes: []const u8)
+// A piece of a body. **A buffered body gives its credit back as it arrives, and a streamed one when it
+// is read** -- and a stream nobody wants any more gives it back at once, or its bytes would hold the
+// connection's window for ever.
+private h2_data(ci: usize, stream: i32, bytes: []const u8)
     val ri = req_of(ci, stream) match
         Some(ri) -> ri
-        None -> return
+        None ->
+            give_back(ci, stream, bytes.len)
+            return
+
+    val fi = current().h2_conns.at(ci).reqs.at(ri).fetch
 
     if current().fetches.at(fi).streaming
+        var conn = current().h2_conns.at(ci)
+        var r = conn.reqs.at(ri)
+
+        r.owed += bytes.len
+        conn.reqs.set(ri, r)
+        current().h2_conns.set(ci, conn)
+
         var f = current().fetches.at(fi)
 
         f.got.extend(bytes)
@@ -307,10 +559,48 @@ private h2_data(fi: usize, ci: usize, stream: i32, bytes: []const u8)
     r.body.extend(bytes)
     conn.reqs.set(ri, r)
     current().h2_conns.set(ci, conn)
+    give_back(ci, stream, bytes.len)
+
+// Credit for bytes dealt with, back to the server. **Best effort**: a stream that has closed has no
+// window to extend, and nghttp2 saying so changes nothing.
+private give_back(ci: usize, stream: i32, n: usize)
+    if n == 0 then return
+
+    current().h2_conns.at(ci).session match
+        Some(s) ->
+            var session = s
+
+            session.consume(stream, n) match
+                Ok(_) -> ()
+                Err(_) -> ()
+        None -> ()
+
+// The program has read `n` bytes of a streamed body, so the server may send that many more.
+//
+// Not `private`: `take_step` in `client_stream.sysl` reports what it handed over.
+h2_taken(fi: usize, n: usize)
+    val ci = current().fetches.at(fi).h2 match
+        Some(ci) -> ci
+        None -> return
+
+    var conn = current().h2_conns.at(ci)
+
+    for i in 0..<conn.reqs.len()
+        var r = conn.reqs.at(i)
+
+        if r.fetch == fi && r.epoch == current().fetches.at(fi).epoch
+            val k = if n < r.owed then n else r.owed
+
+            r.owed -= k
+            conn.reqs.set(i, r)
+            current().h2_conns.set(ci, conn)
+            give_back(ci, r.stream, k)
+            h2_flush(ci)
+            return
 
 // The server has sent all of it. **The end of the stream is the end of the body**, which is the
 // framing HTTP/2 gives every response, so a streamed one ends here and a buffered one is answered.
-private h2_end(fi: usize, ci: usize, stream: i32)
+private h2_end(ci: usize, stream: i32)
     val ri = req_of(ci, stream) match
         Some(ri) -> ri
         None -> return
@@ -322,6 +612,8 @@ private h2_end(fi: usize, ci: usize, stream: i32)
     conn.reqs.set(ri, r)
     current().h2_conns.set(ci, conn)
 
+    val fi = r.fetch
+
     if current().fetches.at(fi).streaming
         body_ended(fi)
         return
@@ -332,46 +624,97 @@ private h2_end(fi: usize, ci: usize, stream: i32)
 
     deliver_response(fi, Response(r.status, r.body.view(), header_named(r.lines.view(), "location"), r.lines.view()))
 
-private h2_reset(fi: usize, ci: usize, stream: i32, code: u32)
+private h2_reset(ci: usize, stream: i32, code: u32)
     req_of(ci, stream) match
-        Some(_) -> fetch_failed(fi, s"the server reset the request for ${current().fetches.at(fi).url} (${error_name(code)})")
+        Some(ri) ->
+            val fi = current().h2_conns.at(ci).reqs.at(ri).fetch
+
+            fetch_failed(fi, s"the server reset the request for ${current().fetches.at(fi).url} (${error_name(code)})")
         None -> ()
 
 // The server is going away. **A request at or below the last stream it names will still be
 // answered**, which is what a graceful shutdown is; one above it never will be, and is told so now.
-private h2_goaway(fi: usize, ci: usize, last_stream: i32, code: u32)
-    val why = s"the server closed the HTTP/2 connection before answering ${current().fetches.at(fi).url} (${error_name(code)})"
+// Nothing new goes onto the connection, and it closes once the last stream it will answer has.
+private h2_goaway(ci: usize, last_stream: i32, code: u32)
     var conn = current().h2_conns.at(ci)
 
-    conn.gone = why
+    conn.gone = error_name(code)
+    conn.draining = true
     current().h2_conns.set(ci, conn)
 
     val reqs = conn.reqs
 
     for i in 0..<reqs.len()
-        if reqs.at(i).stream > last_stream
-            fetch_failed(fi, why)
-            return
+        val r = reqs.at(i)
 
-// The socket ended on an HTTP/2 connection. **Its end is never the end of a body here**, every
-// HTTP/2 body ending with its stream -- so a body still flowing broke off, and a fetch still
-// unanswered was not answered.
-h2_ended(fi: usize)
-    val f = current().fetches.at(fi)
+        if r.stream > last_stream && fetch_live(r.fetch) && current().fetches.at(r.fetch).epoch == r.epoch
+            fetch_failed(r.fetch, gone_sentence(ci, r.fetch))
 
-    if f.streaming
-        body_failed(fi, broke_off(f.url))
-        return
+    if current().h2_conns.at(ci).live && current().h2_conns.at(ci).reqs.len() == 0 then h2_close(ci)
 
-    val gone = f.h2 match
-        Some(ci) -> current().h2_conns.at(ci).gone
-        None -> ""
+private gone_sentence(ci: usize, fi: usize) -> string =
+    s"the server closed the HTTP/2 connection before answering ${current().fetches.at(fi).url} (${current().h2_conns.at(ci).gone})"
 
-    fetch_failed(fi, if gone != "" then gone else s"${f.host} closed the connection without answering")
+// The connection is over: the socket ended, a write failed, or the server broke the protocol. **Every
+// stream still on it is told**, and one that got nothing back on a connection that had already
+// answered somebody is sent again once, where that is safe -- the server may have closed it while it
+// sat idle.
+private h2_broken(ci: usize, why: string)
+    val reqs = current().h2_conns.at(ci).reqs
 
-// The fetch is letting its connection go. **A request still open is reset with `CANCEL` first**,
-// which is what tells the server to stop sending -- an early `break` out of a streamed body, a limit
-// that ran out -- and the session is then dropped, which frees nghttp2's memory.
+    // **Closed before anybody is told**, so that a fetch failed below finds no connection to hang up
+    // and nothing it does can come back round to this one.
+    h2_close(ci)
+
+    for i in 0..<reqs.len()
+        val r = reqs.at(i)
+        val fi = r.fetch
+
+        if fetch_live(fi) && current().fetches.at(fi).epoch == r.epoch
+            val f = current().fetches.at(fi)
+
+            if f.streaming
+                body_failed(fi, broke_off(f.url))
+            elif !(r.reused && r.status == 0 && r.body.len() == 0 && retry_once(fi))
+                fetch_failed(fi, if current().h2_conns.at(ci).gone != "" then gone_sentence(ci, fi)
+                    elif why != "" then why
+                    else s"${f.host} closed the connection without answering")
+end h2_broken
+
+// Close the connection, and let go of the session and every stream.
+private h2_close(ci: usize)
+    var conn = current().h2_conns.at(ci)
+
+    if !conn.live then return
+
+    conn.conn match
+        Some(c) -> c.close()
+        None -> ()
+
+    conn.idle match
+        Some(t) -> loop_events().cancel(t)
+        None -> false
+
+    conn.live = false
+    conn.session = None
+    conn.conn = None
+    conn.tls = None
+    conn.idle = None
+    conn.reqs = buf()
+    conn.reading = false
+    conn.parked = false
+    current().h2_conns.set(ci, conn)
+
+private idle_h2_expired(ci: usize, epoch: usize)
+    if h2_owns(ci, epoch) && current().h2_conns.at(ci).reqs.len() == 0 then h2_close(ci)
+
+// The fetch is letting its stream go. **A stream still open is reset with `CANCEL`**, which is what
+// tells the server to stop sending -- an early `break` out of a streamed body, a limit that ran out --
+// and what it had taken in and not read is given back to the connection's window.
+//
+// **The connection stays for the next fetch when this was its last stream**, closing on a background
+// timer if nobody comes -- unless it is not to be shared, the server is going away, or a read is
+// waiting on it, which nothing would ever end.
 h2_hang_up(fi: usize)
     val ci = current().fetches.at(fi).h2 match
         Some(ci) -> ci
@@ -379,29 +722,61 @@ h2_hang_up(fi: usize)
 
     var conn = current().h2_conns.at(ci)
 
-    conn.session match
-        None -> ()
-        Some(s) ->
-            var session = s
-            var open = false
+    if !conn.live then return
 
-            for i in 0..<conn.reqs.len()
-                if !conn.reqs.at(i).done
-                    open = true
+    val epoch = current().fetches.at(fi).epoch
 
-                    session.reset(conn.reqs.at(i).stream, CANCEL) match
-                        Ok(_) -> ()
-                        Err(_) -> ()
+    for i in 0..<conn.reqs.len()
+        val r = conn.reqs.at(i)
 
-            // **Best effort, and nothing is said where it fails**: the connection is closing either
-            // way, and a reset that never arrives is a server that learns from the close instead.
-            if open
-                val _ = h2_write(fi, s)
+        if r.fetch == fi && r.epoch == epoch
+            // Given back while the stream is still there to give it to.
+            give_back(ci, r.stream, r.owed)
 
-    conn.live = false
-    conn.session = None
-    conn.reqs = buf()
-    current().h2_conns.set(ci, conn)
+            conn.session match
+                Some(s) ->
+                    var session = s
+
+                    if !r.done
+                        session.reset(r.stream, CANCEL) match
+                            Ok(_) -> ()
+                            Err(_) -> ()
+                None -> ()
+
+            val _ = conn.reqs.remove(i)
+
+            conn.served += 1
+            current().h2_conns.set(ci, conn)
+
+            // **Best effort, and nothing is said where it fails**: the stream is over either way.
+            val _ = h2_write(ci)
+
+            break
+
+    val c = current().h2_conns.at(ci)
+
+    if !c.live || c.reqs.len() > 0 then return
+
+    if !c.shared || c.draining || c.parked
+        h2_close(ci)
+        return
+
+    val t = loop_events().after(millis(current().pool.idle_ms), (_) -> idle_h2_expired(ci, c.epoch))
+
+    t.background()
+
+    var d = c
+
+    d.idle = Some(t)
+    current().h2_conns.set(ci, d)
+end h2_hang_up
+
+// Every connection closed, between runs.
+//
+// Not `private`: `forget_fetches` in `client.sysl` calls it.
+forget_h2_conns()
+    for ci in 0..<current().h2_conns.len()
+        h2_close(ci)
 
 #else
 
@@ -409,8 +784,10 @@ h2_hang_up(fi: usize)
 fetch_speaks_h2() -> bool = false
 on_h2(fi: usize) -> bool = false
 h2_begin(fi: usize) -> bool = false
-h2_incoming(fi: usize, bytes: []const u8) = ()
-h2_ended(fi: usize) = ()
+h2_attach(fi: usize, key: string) -> bool = false
+h2_resume(fi: usize) = ()
+h2_taken(fi: usize, n: usize) = ()
 h2_hang_up(fi: usize) = ()
+forget_h2_conns() = ()
 
 #endif
