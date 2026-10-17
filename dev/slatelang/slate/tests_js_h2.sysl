@@ -647,15 +647,16 @@ JS_H2_A_SESSION_UNDER_NODE_ANSWERS_NONSENSE_WITH_AN_ERROR_AND_REFUSES_A_CLOSED_O
 // acknowledges the server's SETTINGS (which is what puts them in force), opens a hundred streams that
 // stay open, and the 101st is refused; a stream that is closed gives its place back.
 //
-// **nghttp2 announces the header-list limit and does not enforce it on what it reads**: a list of
-// 80,000 bytes, of 130,000, and one that indexes a 4,000-byte field 20,000 times are all delivered
-// whole. The session on both hosts does the same, and the `431` is `slate:http`'s
-// (`HeaderListBytes`), so it is the same on both -- see `A_SERVER_ANSWERS_431_...` in
-// `tests_http2_streams.sysl`.
+// **The header list is held on what arrives, in `sh.sysl.nghttp2` 0.5.0 and in the JavaScript
+// session alike**: a list past 64 KiB (RFC 9113's count, each field plus 32) is decoded to its end and
+// kept by neither, and the event is `headerListTooLarge` in place of `headers`, with the stream left
+// open. 65,536 bytes exactly is kept and one more is not; a trailer block is held the same way; and
+// a client, which announces nothing, is held to the same 64 KiB. `slate:http` answers the request
+// case `431` -- see `A_SERVER_ANSWERS_431_...` in `tests_http2_streams.sysl`.
 //
 // **Every line was first read off the interpreter**, so it is nghttp2's answer.
 private val ServerLimitsSource: string = raw"""
-import { h2Server, h2Receive, h2Send, h2Next, h2Reset } from slate:nghttp2
+import { h2Server, h2Client, h2Request, h2Receive, h2Send, h2Next, h2Reset } from slate:nghttp2
 
 frame(t, f, s, p) = [p.length >> 16, (p.length >> 8) & 255, p.length & 255, t, f, (s >> 24) & 255, (s >> 16) & 255, (s >> 8) & 255, s & 255, ...p]
 
@@ -684,6 +685,8 @@ told(sess)
     while e != null
         if e.kind == "headers" && e.headers.length > 5
             seen.push("headers:" + string(e.stream) + ":" + string(e.headers.length) + " fields")
+        else if e.kind == "headerListTooLarge"
+            seen.push("tooLarge:" + string(e.stream) + ":" + e.of)
         else if e.kind != "beginHeaders" && e.kind != "headers" && e.kind != "streamEnd"
             seen.push(e.kind + ":" + string(e.stream ?? "-") + ":" + string(e.code ?? "-"))
 
@@ -734,17 +737,40 @@ step("a header list of 80,000 bytes", opened(), framed([...req, ...field(), ...f
 step("a header list of 40,000 bytes", opened(), framed([...req, ...field(), ...field(), ...field(), ...field()]))
 step("a header list of 130,000 bytes", opened(), framed([...req, ...field(), ...field(), ...field(), ...field(), ...field(), ...field(), ...field(), ...field(), ...field(), ...field(), ...field(), ...field(), ...field()]))
 
+// A field `x` whose value is `n` bytes, for 127 <= n < 16511: `n + 33` bytes of header list. The
+// request's four fields are 176, six of `field()` are 60,198, so `sized(5129)` makes the list exactly
+// 65,536 -- the limit, which is kept -- and `sized(5130)` one byte past it.
+sized(n) = [0, 1, 120, 127, ((n - 127) & 127) | 128, (n - 127) >> 7, ...toBytes("v".repeat(n)).toArray()]
+
+step("a header list of exactly 65,536 bytes", opened(), framed([...req, ...field(), ...field(), ...field(), ...field(), ...field(), ...field(), ...sized(5129)]))
+step("a header list of 65,537 bytes", opened(), framed([...req, ...field(), ...field(), ...field(), ...field(), ...field(), ...field(), ...sized(5130)]))
+
+// Trailers past the limit: the request's head, then a trailer block of 80,000 bytes.
+val trailed = opened()
+
+h2Receive(trailed, frame(1, 4, 1, req))
+told(trailed)
+step("trailers of 80,000 bytes", trailed, framed([...field(), ...field(), ...field(), ...field(), ...field(), ...field(), ...field(), ...field()]))
+
 // One entry of 4,000 bytes added to the table and then indexed 20,000 times: 20 KiB on the wire that
 // names 80 MB of header list.
-amplified()
+amplified(head)
     var refs = []
 
     for i in 0..<20000
         refs.push(190)
 
-    [...req, 64, 1, 121, 127, 161, 30, ...toBytes("w".repeat(4000)).toArray(), ...refs]
+    [...head, 64, 1, 121, 127, 161, 30, ...toBytes("w".repeat(4000)).toArray(), ...refs]
 
-step("a block that indexes one field 20,000 times", opened(), framed(amplified()))
+step("a block that indexes one field 20,000 times", opened(), framed(amplified(req)))
+
+// A CLIENT holds the same 64 KiB without announcing it: a response head that indexes one field
+// 20,000 times arrives as `headerListTooLarge` of the response.
+val asking = h2Client()
+val asked = h2Request(asking, { ":method": "GET", ":scheme": "https", ":authority": "localhost", ":path": "/" })
+
+h2Send(asking)
+step("a response head that indexes one field 20,000 times", asking, [...frame(4, 0, 0, []), ...framed(amplified([136]))])
 """
 
 private val ServerLimitsAnswered: string =
@@ -753,10 +779,14 @@ private val ServerLimitsAnswered: string =
     "the 102nd stream: null | rst(203,7) | \n" +
     "a stream closed: null |  | rstStream:1:8 streamClose:1:8\n" +
     "then the next: null |  | \n" +
-    "a header list of 80,000 bytes: null |  | headers:1:12 fields\n" +
+    "a header list of 80,000 bytes: null |  | tooLarge:1:request\n" +
     "a header list of 40,000 bytes: null |  | headers:1:8 fields\n" +
-    "a header list of 130,000 bytes: null |  | headers:1:17 fields\n" +
-    "a block that indexes one field 20,000 times: null |  | headers:1:20005 fields"
+    "a header list of 130,000 bytes: null |  | tooLarge:1:request\n" +
+    "a header list of exactly 65,536 bytes: null |  | headers:1:11 fields\n" +
+    "a header list of 65,537 bytes: null |  | tooLarge:1:request\n" +
+    "trailers of 80,000 bytes: null |  | tooLarge:1:trailer\n" +
+    "a block that indexes one field 20,000 times: null |  | tooLarge:1:request\n" +
+    "a response head that indexes one field 20,000 times: null |  | settings:-:- tooLarge:1:response streamClose:1:0"
 
 @test
 JS_H2_A_SERVER_HOLDS_ITS_PEER_TO_100_STREAMS_AND_A_64_KIB_HEADER_LIST_ON_BOTH_HOSTS()

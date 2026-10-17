@@ -136,6 +136,7 @@ event has a `kind`, and the rest of its fields depend on it:
 |---|---|
 | `beginHeaders` | `stream`, and the `of` its `headers` will carry — a header block has begun and its fields have not arrived |
 | `headers` | `stream`, `headers`, and `of` — `"request"`, `"response"` or `"trailer"` |
+| `headerListTooLarge` | `stream`, `of` — **in place of** `headers`: the block was past the header list this end accepts, and its fields were not kept |
 | `data` | `stream`, `bytes` — **one event per DATA frame**, not one per stream |
 | `streamEnd` | `stream` — the peer will send no more, and may still be reading |
 | `streamClose` | `stream`, `code` — finished at both ends |
@@ -156,6 +157,45 @@ the stream, or the end of the session. A server starts a clock there and stops i
 a peer dribbling one block's CONTINUATION frames costs that stream (an `h2Reset`) rather than the
 connection; `slate:http` does exactly that with its `headMillis`. A request refused before it is read
 — past the hundred streams a session allows at once — gets no `beginHeaders`.
+
+**A header list is held to 64 KiB as it ARRIVES, and `headerListTooLarge` is what is left of one
+past it.** The size is RFC 9113's — each field's name and value in bytes, plus 32 — and 64 KiB is
+what a server announces (SETTINGS_MAX_HEADER_LIST_SIZE) and what a client, which announces nothing,
+is held to as well. The block is still decoded to its end, since the compression table has to stay
+in step with the peer's, but no field past the limit is kept: a peer can name a 4,000-byte field
+again in one byte, so twenty kilobytes on the wire can spell eighty megabytes of headers, and none of
+it is held. **The stream stays open** — the answer is the program's. `slate:http` answers a request
+`431` without calling the handler, and `fetch` fails with a result.
+
+```slate
+import { h2Server, h2Receive, h2Next } from slate:nghttp2
+
+frame(t, f, p) = [p.length >> 16, (p.length >> 8) & 255, p.length & 255, t, f, 0, 0, 0, 1, ...p]
+
+val s = h2Server()
+
+h2Receive(s, [...toBytes("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").toArray(), 0, 0, 0, 4, 0, 0, 0, 0, 0])
+
+// A request whose one field is added to the table, then named again 20,000 times in a byte each.
+var block = [131, 135, 132, 1, 9, ...toBytes("localhost").toArray(), 64, 1, 120, 127, 161, 30, ...toBytes("v".repeat(4000)).toArray()]
+
+for i in 0..<20000
+    block.push(190)
+
+h2Receive(s, [...frame(1, 1, block[0..<16384]), ...frame(9, 4, block[16384..<block.length])])
+
+var e = h2Next(s)
+
+while e != null
+    if e.kind != "settings" then print(e.kind, e.of ?? "-")
+    e = h2Next(s)
+```
+
+```output
+beginHeaders request
+headerListTooLarge request
+streamEnd -
+```
 
 ## Headers
 

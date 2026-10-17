@@ -166,3 +166,20 @@ session does, and `slate:http` answers `431` on both hosts to a header list past
 | slate | h2abuse | resets=2000 streams=500 settings=1000 zeroWindow=1 served=10/10 |
 
 Unchanged in what the client saw, and peak RSS is 18 MB against 24 MB.
+
+## Re-taken with the header list held as it arrives (`h2cap`, sh.sysl.nghttp2 0.5.0)
+
+`run.sh --only slate --mode h2abuse ./slate`, a plain `sysl build .` binary: the session now drops
+the fields of a header list past 64 KiB while decoding it and says `headerListTooLarge`, which
+`slate:http` answers `431` without building the list.
+
+| server | mode | verdict | rss before | rss peak | rss after | fd before | fd peak | fd after |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| slate | h2abuse | PASS | 14 | 18 | 18 | 13 | 13 | 13 |
+
+| server | mode | what the client saw |
+|---|---|---|
+| slate | h2abuse | resets=2000 streams=500 settings=1000 zeroWindow=1 served=10/10 |
+
+Identical to the `h2limits` run: h2abuse sends no oversized header list, so what it measures is that
+the cap costs the ordinary path nothing.

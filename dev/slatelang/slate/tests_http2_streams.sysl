@@ -485,9 +485,9 @@ AN_HTTP_2_HEADER_BLOCK_DRIBBLED_ONE_BYTE_AT_A_TIME_IS_CUT_AT_THE_HEAD_DEADLINE()
 
 @test
 A_SERVER_ANSWERS_431_TO_A_HEADER_LIST_PAST_THE_64_KIB_IT_ANNOUNCED_AND_THE_HANDLER_NEVER_SEES_IT()
-    // **nghttp2 announces SETTINGS_MAX_HEADER_LIST_SIZE and enforces nothing on what it reads**, so
-    // the `431` is `slate:http`'s. Stream 1 carries eight fields of 10,000 bytes (80,000 of header
-    // list, in five frames) and is answered `431` without the handler being called; stream 3, an
+    // **The session holds the 64 KiB it announces and says `headerListTooLarge`**, having kept none
+    // of the fields, and `slate:http` answers that `431`. Stream 1 carries eight fields of 10,000 bytes
+    // (80,000 of header list, in five frames) and is answered without the handler being called; stream 3, an
     // ordinary request on the same connection, is served. The server's first SETTINGS frames carry
     // 3=100 and 6=65536. The same programs run against the JavaScript session in `tests_js_h2.sysl`.
     val prog = raw"""
@@ -555,7 +555,15 @@ A_SERVER_ANSWERS_431_TO_A_HEADER_LIST_PAST_THE_64_KIB_IT_ANNOUNCED_AND_THE_HANDL
 
                 seen.push("settings " + pairs.join(" "))
 
-            if t == 1 then seen.push("head " + string(got[at + 8]))
+            // nghttp2 writes a `431` status as a literal (`0x48 3 "431"`), so the digits are on the wire.
+            if t == 1
+                val head = got[at + 9..<at + 9 + n]
+                var status = ""
+
+                for i in 0..<head.length - 2
+                    if head[i] == 52 && head[i + 1] == 51 && head[i + 2] == 49 then status = " 431"
+
+                seen.push("head " + string(got[at + 8]) + status)
 
             at = at + 9 + n
 
@@ -569,5 +577,61 @@ A_SERVER_ANSWERS_431_TO_A_HEADER_LIST_PAST_THE_64_KIB_IT_ANNOUNCED_AND_THE_HANDL
     main()
     """
 
-    assert_eq(net_out(prog), "settings , settings 3=100 6=65536, head 1, head 3\nhandler called 1")
+    assert_eq(net_out(prog), "settings , settings 3=100 6=65536, head 1 431, head 3\nhandler called 1")
+
+// A block of about 24 KB that DECODES to 80 MB: one 4,000-byte field added to the table, then indexed
+// 20,000 times. Every event is kept in `kept` and the session is never closed, so whatever the run
+// was made to hold is still held when `out` returns -- the heap is rebuilt on the way INTO a run.
+private val AmplifiedSource: string =
+    "import { h2Server, h2Receive, h2Send, h2Next } from slate:nghttp2\n" +
+    "frame(t, f, s, p) = [p.length >> 16, (p.length >> 8) & 255, p.length & 255, t, f, 0, 0, 0, s, ...p]\n" +
+    "val s = h2Server({ autoWindowUpdate: false })\n" +
+    "val kept = []\n" +
+    "drain()\n" +
+    "    var e = h2Next(s)\n" +
+    "    while e != null\n" +
+    "        kept.push(e)\n" +
+    "        e = h2Next(s)\n" +
+    "h2Receive(s, [...toBytes(\"PRI * HTTP/2.0\\r\\n\\r\\nSM\\r\\n\\r\\n\").toArray(), ...frame(4, 0, 0, []), ...frame(4, 1, 0, [])])\n" +
+    "h2Send(s)\n" +
+    "drain()\n" +
+    "var block = [131, 135, 132, 1, 9, ...toBytes(\"localhost\").toArray(), 64, 1, 121, 127, 161, 30, ...toBytes(\"w\".repeat(4000)).toArray()]\n" +
+    "for i in 0..<20000\n" +
+    "    block.push(190)\n" +
+    "var frames = frame(1, 1, 1, block[0..<16384])\n" +
+    "frames = [...frames, ...frame(9, 4, 1, block[16384..<block.length])]\n" +
+    "print(block.length, string(h2Receive(s, frames)))\n" +
+    "drain()\n" +
+    "for e in kept\n" +
+    "    if e.kind == \"headerListTooLarge\" || e.kind == \"headers\" then print(e.kind, e.of)\n"
+
+@test
+A_HEADER_BLOCK_THAT_DECODES_TO_80_MB_IS_RECEIVED_WITHOUT_THE_HEAP_HOLDING_IT()
+    // A run that keeps almost nothing first, so `before` is not the previous run's heap.
+    assert_eq(out("print(1)"), "1")
+
+    val before = malloc_bytes_in_use()
+
+    assert_eq(out(AmplifiedSource), "24020 null\nheaderListTooLarge request", "the block was received and refused")
+
+    val after = malloc_bytes_in_use()
+    val grew = if after > before then after - before else 0
+
+    // **The control: the same instrument sees what a run DOES keep**, a 40 MB string held in a `val`
+    // until the next run -- or the bound below would pass on a measure that cannot see a run at all.
+    assert_eq(out("print(1)"), "1")
+
+    val quiet = malloc_bytes_in_use()
+
+    assert_eq(out("val big = \"x\".repeat(40000000)\nprint(big.length)"), "40000000", "the control ran")
+
+    val loud = malloc_bytes_in_use()
+    val held = if loud > quiet then loud - quiet else 0
+
+    assert(held > 30000000, s"the control kept 40 MB and malloc saw ${held} bytes more")
+
+    // Delivered whole, the fields would be 80 MB in the binding's event and as much again as slate
+    // strings. What is left is the run's own bookkeeping.
+    assert(grew < 16000000, s"malloc holds ${grew} more bytes after receiving the block")
+end A_HEADER_BLOCK_THAT_DECODES_TO_80_MB_IS_RECEIVED_WITHOUT_THE_HEAP_HOLDING_IT
 #endif
