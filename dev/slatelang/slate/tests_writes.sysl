@@ -1,0 +1,112 @@
+module dev.slatelang.slate
+@tests
+
+// How many socket writes an HTTP/1.1 response costs, read off `socket_writes()`.
+//
+// **A whole-body response is ONE write**: `reply` and `replyBytes` in `http_write_source.sysl` join
+// the status line, the headers and the body into one value before `send`, and one `send` is one libuv
+// write -- one `write` syscall where the kernel takes the bytes at once, which a small response on an
+// idle connection always is. A benchmark can say a server got slower and cannot say a response
+// started going out in pieces; this can.
+//
+// **Every count is exact**, so it is a lower bound as well as an upper one, and each program's own
+// output is asserted, a count of nothing looking exactly like a count of zero. The client in each
+// program is in the same process, so its requests are counted too: one write per `send` it makes.
+
+// How many writes `program` issued, its output asserted to be `said`.
+private writes_of(program: string, said: string) -> usize
+    val before = socket_writes()
+    val printed = wire_out(program)
+
+    assert_eq(printed, said)
+    socket_writes() - before
+end writes_of
+
+// A keep-alive client asking `wanted` times on one connection, each request sent once the answer to
+// the one before has arrived -- which is how a load generator without pipelining drives a server.
+private asked_in_turn(answer: string, wanted: int) -> string =
+    "val server = serve(0, req -> (" + answer + "))\n" +
+    s"val wanted = ${wanted}\n" +
+    "val ask = \"GET /plain HTTP/1.1\\r\\nHost: h\\r\\n\\r\\n\"\n" +
+    "async main()\n" +
+    "    val c = (await connect(\"127.0.0.1\", localPort(server))).value\n" +
+    "    var got = \"\"\n" +
+    "    var answered = 0\n" +
+    "    heard(chunk)\n" +
+    "        got = got + chunk\n" +
+    "        val now = split(got, \"hello\").length - 1\n" +
+    "        if now > answered\n" +
+    "            answered = now\n" +
+    "            if answered < wanted\n" +
+    "                send(c, ask)\n" +
+    "            else\n" +
+    "                print(string(answered) + \" answered\")\n" +
+    "                shutSocket(c)\n" +
+    "                close(server)\n" +
+    "                done()\n" +
+    "    onData(c, heard)\n" +
+    "    await send(c, ask)\n" +
+    "main()\n"
+
+private const Plain: string = "{ status: 200, headers: { \"Content-Type\": \"text/plain\" }, body: \"hello\" }"
+
+@test
+A_TEXT_RESPONSE_IS_ONE_WRITE()
+    // Five requests and five responses on one kept connection: ten writes, five of them the client's.
+    // A response whose head and body went out separately would read fifteen.
+    assert_eq(writes_of(asked_in_turn(Plain, 5), "5 answered"), 10)
+
+@test
+A_BYTE_RESPONSE_IS_ONE_WRITE_TOO()
+    // `replyBytes` is the other whole-body path: the head is made bytes and joined to the body.
+    val bytes_answer = "{ status: 200, body: toBytes(\"hello\") }"
+
+    assert_eq(writes_of(asked_in_turn(bytes_answer, 3), "3 answered"), 6)
+
+@test
+TWO_PIPELINED_REQUESTS_ARE_ANSWERED_WITH_ONE_WRITE_EACH()
+    // Both requests go in one `send`, so the client writes once. **The server writes once per
+    // response and does not join the two**: it answers the second only after the first's write has
+    // been reported, so they are never in hand in the same turn. One write each is the claim; three
+    // in all is what it adds up to.
+    val program =
+        "val server = serve(0, req -> (" + Plain + "))\n" +
+        "val ask = \"GET /plain HTTP/1.1\\r\\nHost: h\\r\\n\\r\\n\"\n" +
+        "async main()\n" +
+        "    val c = (await connect(\"127.0.0.1\", localPort(server))).value\n" +
+        "    var got = \"\"\n" +
+        "    heard(chunk)\n" +
+        "        got = got + chunk\n" +
+        "        if split(got, \"hello\").length - 1 == 2\n" +
+        "            print(\"both answered\")\n" +
+        "            shutSocket(c)\n" +
+        "            close(server)\n" +
+        "            done()\n" +
+        "    onData(c, heard)\n" +
+        "    await send(c, ask + ask)\n" +
+        "main()\n"
+
+    assert_eq(writes_of(program, "both answered"), 3)
+
+@test
+A_REQUEST_THE_SERVER_REFUSES_IS_ANSWERED_WITH_ONE_WRITE()
+    // The error path: a request line that is not HTTP is answered `400` by `refuse`, through the same
+    // `reply`, and the connection is ended. One write from the client and one from the server.
+    val program =
+        "val server = serve(0, req -> \"never\")\n" +
+        "async main()\n" +
+        "    val c = (await connect(\"127.0.0.1\", localPort(server))).value\n" +
+        "    var got = \"\"\n" +
+        "    heard(chunk)\n" +
+        "        if chunk == null\n" +
+        "            print(split(got, \"\\r\\n\")[0])\n" +
+        "            shutSocket(c)\n" +
+        "            close(server)\n" +
+        "            done()\n" +
+        "        else\n" +
+        "            got = got + chunk\n" +
+        "    onData(c, heard)\n" +
+        "    await send(c, \"NONSENSE\\r\\n\\r\\n\")\n" +
+        "main()\n"
+
+    assert_eq(writes_of(program, "HTTP/1.1 400 Bad Request"), 2)
