@@ -101,6 +101,22 @@ http_server_source() -> string = raw"""
         if onUpgrade != null && !(onUpgrade is function)
             throw "`serve` needs a function to call with an upgrade, and this is not one"
 
+        // The two deadlines, read off the listening record where it names them. **Checked here
+        // for the handler's reason**: a wrong value would otherwise surface at the first slow
+        // client, which may be days away.
+        deadline(name, otherwise)
+            if !(port is object) || !has(port, name) then return otherwise
+
+            val ms = port[name]
+
+            if !(ms is integer) || ms <= 0
+                throw "`" + name + "` is a number of milliseconds above nought, and this is " + string(ms)
+
+            ms
+
+        val headMillis = deadline("headMillis", HeadMillis)
+        val requestMillis = deadline("requestMillis", RequestMillis)
+
         // **WHICH VERSION A CONNECTION IS, ASKED ONCE AND NOWHERE ELSE.** `h2` and `http/1.1` arrive
         // on one port over one socket and differ in nothing that can be sniffed -- HTTP/2's preface
         // is bytes a malformed HTTP/1.1 request could also begin with -- so ALPN is the answer and
@@ -193,7 +209,7 @@ http_server_source() -> string = raw"""
 
 #if feature_http2
                 if alpnProtocol(conn) == "h2"
-                    speakH2(conn, called, streaming, chunk, slot)
+                    speakH2(conn, called, streaming, chunk, slot, headMillis)
                 else
                     speak11(conn, chunk, slot)
 #else
@@ -234,6 +250,21 @@ http_server_source() -> string = raw"""
             // The clock that closes a connection nobody is using, or null while it is not running.
             var idle = null
 
+            // The two deadlines on the request being read, each null while it is not running. Both
+            // start at a request's first byte; `headClock` stops when its head is whole and
+            // `requestClock` when its body is.
+            var headClock = null
+            var requestClock = null
+
+            // Whether this connection has started writing an answer. **A deadline that expires after
+            // a response has begun cannot be answered `408`**, there being no way to take back the
+            // status already sent, so it ends the connection instead.
+            var replying = false
+
+            // Whether bytes of a following request arrived while this one was in flight, which is
+            // what `resume` reads to give that request its deadlines when its turn comes.
+            var early = false
+
             // How to cut the streamed response being written, or null where none is. **The writer
             // hands this over when it starts and takes it back when it ends**, because a streamed
             // body lives entirely inside `streamed`'s own locals and a shutdown had no handle on it
@@ -267,12 +298,71 @@ http_server_source() -> string = raw"""
 
                     idle = null
 
+            // Stop the head's deadline, the blank line that ends it having arrived.
+            headDone()
+                if headClock != null
+                    clearTimeout(headClock)
+
+                    headClock = null
+
+            // Stop both deadlines, the request having arrived whole or the connection having ended.
+            requestDone()
+                headDone()
+
+                if requestClock != null
+                    clearTimeout(requestClock)
+
+                    requestClock = null
+
+            // Start both deadlines at a request's first byte. **Started once and never moved**, which
+            // is the whole difference from the idle clock: a byte arriving says nothing about whether
+            // the request will ever be finished.
+            begin()
+                if shut || headClock != null || requestClock != null then return
+
+                replying = false
+                early = false
+                headClock = setTimeout(timedOut, headMillis)
+                requestClock = setTimeout(timedOut, requestMillis)
+
+            // A deadline expired. **`408` where nothing has been written for this request**, which
+            // is what tells a real client that was merely slow why it was cut; where an answer has
+            // begun, the status is already on the wire and the connection simply ends.
+            timedOut()
+                if shut then return
+
+                requestDone()
+
+                if replying
+                    stop()
+
+                    return
+
+                reading = false
+
+                refuse(408, "the request did not arrive in time")
+
+            // Start the next request's deadlines once this connection has nothing in flight, where
+            // that request has already begun.
+            //
+            // **A pipelined request gets its own deadlines here**, rather than none: its bytes
+            // arrived while the previous request was in flight, which starts no clock, so its clocks
+            // start when its turn comes. `early` says bytes came in after the previous request was
+            // whole, and `httpHeading` catches a head begun in the very feed that finished it. One
+            // case is left to the idle clock: a pipelined request whose head ALSO finished in that
+            // feed, which no parser call can see, and which still cannot hold more than `BodyBytes`.
+            resume()
+                if shut || busy then return
+
+                if early || (!streaming && httpHeading(parser)) then begin()
+
             stop()
                 if shut then return
 
                 shut = true
 
                 awake()
+                requestDone()
                 release()
                 httpClose(parser)
                 slot.retire()
@@ -354,6 +444,7 @@ http_server_source() -> string = raw"""
                 shut = true
 
                 awake()
+                requestDone()
                 release()
                 httpClose(parser)
                 slot.retire()
@@ -446,6 +537,7 @@ http_server_source() -> string = raw"""
                 holding = false
                 held = []
                 heldBytes = 0
+                replying = true
 
                 try
                     await write(conn, req, reply, again, watched)
@@ -460,6 +552,7 @@ http_server_source() -> string = raw"""
                 if again && !closing
                     quiet()
                     next()
+                    resume()
                 else
                     stop()
 
@@ -493,6 +586,7 @@ http_server_source() -> string = raw"""
                 busy = true
 
                 awake()
+                requestDone()
 
                 // **A connection the client has already closed is not kept**, whatever the request asked
                 // for -- there is nobody left to send the next one.
@@ -522,6 +616,7 @@ http_server_source() -> string = raw"""
                         ending = pending()
 
                         awake()
+                        headDone()
 
                         // **A connection the client has already closed is not kept**, whatever the
                         // request asked for -- there is nobody left to send the next one.
@@ -559,6 +654,8 @@ http_server_source() -> string = raw"""
                     else
                         reading = false
 
+                        requestDone()
+                        resume()
                         settle(ending, got)
 
                         ending = null
@@ -704,6 +801,14 @@ http_server_source() -> string = raw"""
 
                 awake()
 
+                // **A request's first byte starts its deadlines**, and a byte arriving while one is
+                // in flight is part of that one or of a pipelined request, whose clocks start when
+                // its turn comes.
+                if !busy
+                    begin()
+                elif !streaming || !reading
+                    early = true
+
                 // **A refusal is an answer rather than a fault.** The bytes were not a request this
                 // server will act on, so the status goes back and the connection ends -- taking the
                 // program down over a bad client would be the wrong trade entirely.
@@ -712,6 +817,11 @@ http_server_source() -> string = raw"""
                 if bad != null
                     refuse(bad.status, bad.message)
                     return
+
+                // **The head's blank line stops the head's deadline and leaves the request's
+                // running**, which is the case the two clocks exist for: a large upload is slow and
+                // legitimate, and only its head is held to the short deadline.
+                if !streaming && !httpHeading(parser) then headDone()
 
                 // **A request that asked to stop being HTTP ends this module's interest in the socket.**
                 // `httpUpgraded` answers where the HTTP stopped, and everything after that offset belongs

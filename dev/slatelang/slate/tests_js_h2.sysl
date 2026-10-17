@@ -85,9 +85,9 @@ JS_H2_A_SLATE_SERVER_UNDER_NODE_ANSWERS_HTTP_2_NEGOTIATED_BY_ALPN()
         "after streams hello\n" +
         "header flood 431\n" +
         "after header flood hello\n" +
-        "continuation flood goaway 11 closed\n" +
+        "continuation flood goaway 0 closed\n" +
         "after continuation flood hello\n" +
-        "rapid reset goaway 11 closed\n" +
+        "rapid reset goaway 2 still open\n" +
         "after rapid reset hello")
 
 // A peer that overruns a window, at the session itself, because `serve` consumes every frame as it
@@ -138,12 +138,19 @@ events(sess)
 said(sess)
 print(h2Receive(sess, data(3, 5)))
 events(sess)
-print(h2Receive(sess, data(3, 9995)).error)
+print(h2Receive(sess, data(3, 9995)))
 said(sess)
 """
 
 @test
 JS_H2_A_PEER_PAST_A_STREAMS_WINDOW_IS_RESET_AND_PAST_THE_CONNECTIONS_IS_SENT_AWAY()
+    // **This scenario is JavaScript's alone, and that is a difference between the hosts rather than
+    // an accident of the test**: it works out where a stream's window ends and the connection's does
+    // not, which depends on when credit goes back to the peer. This session returns it in lumps of
+    // 16 KiB as the program consumes; nghttp2 waits until half a window has been consumed, so the
+    // same bytes overrun the CONNECTION first under the interpreter. What the two agree on is the
+    // answer to an overrun of the connection's window, which is the last step here and which
+    // `JS_H2_A_CONNECTION_ERROR_IS_ANSWERED_AS_NGHTTP2_ANSWERS_IT` runs on both.
     assert_eq(node_said(WindowSource), "null\n" +
         "data 1 10000\n" +
         "data 3 10000\n" +
@@ -155,8 +162,164 @@ JS_H2_A_PEER_PAST_A_STREAMS_WINDOW_IS_RESET_AND_PAST_THE_CONNECTIONS_IS_SENT_AWA
         "rst 1 3\n" +
         "null\n" +
         "data 3 5\n" +
-        "the peer sent 9995 bytes of DATA past the connection's window of 9994\n" +
+        "null\n" +
         "goaway 3")
+
+// Every way a peer can commit a connection error, and what the session answers, on both hosts from one
+// program. The shape is `h2Receive`'s answer, then what the session queued to send (frame types; a
+// GOAWAY as `goaway(last stream, code)`), then what `h2Next` reported (the first five, and how many).
+// Each case is followed by a PING, which a session that has said goodbye does not read.
+//
+// **Every line was first read off the interpreter**, so it is nghttp2's answer and the JavaScript host
+// is held to it. What that showed, and the JavaScript host had not done:
+//
+// - a connection error answers `null` with the GOAWAY queued, not `{ error }`;
+// - nothing is reported after it, and nothing more is read once the GOAWAY has gone out;
+// - a header block of more than eight CONTINUATIONs is not a connection error but the library's own
+//   failure: `{ error }`, no GOAWAY, and the same answer to every later call;
+// - the rapid-reset GOAWAY is INTERNAL_ERROR, not ENHANCE_YOUR_CALM, and the bytes already in hand
+//   are still read, the reset that emptied the bucket included;
+// - a header block's size is not bounded on its own, and HPACK that is not valid is COMPRESSION_ERROR;
+// - a GOAWAY that goes out closes the peer's streams past its last as REFUSED_STREAM, a header block
+//   still being read among them.
+private val ConnectionErrorSource: string = raw"""
+import { h2Server, h2Receive, h2Send, h2Next, h2Goaway } from slate:nghttp2
+
+frame(t, f, s, p) = [p.length >> 16, (p.length >> 8) & 255, p.length & 255, t, f, 0, 0, (s >> 8) & 255, s & 255, ...p]
+
+data(s, n) = frame(0, 0, s, toBytes("x".repeat(n)).toArray())
+
+val req = [131, 135, 132, 1, 9, ...toBytes("localhost").toArray()]
+
+val ping = frame(6, 0, 0, [1, 2, 3, 4, 5, 6, 7, 8])
+
+sent(sess)
+    val bs = h2Send(sess).toArray()
+    var at = 0
+    var seen = []
+
+    while at + 9 <= bs.length
+        val t = bs[at + 3]
+
+        seen.push(if t == 7 then "goaway(" + string(bs[at + 11] * 256 + bs[at + 12]) + "," + string(bs[at + 16]) + ")" else "t" + string(t))
+
+        at = at + 9 + bs[at] * 65536 + bs[at + 1] * 256 + bs[at + 2]
+
+    seen.join(" ")
+
+told(sess)
+    var seen = []
+    var n = 0
+    var e = h2Next(sess)
+
+    while e != null
+        n = n + 1
+
+        if n <= 5 then seen.push(e.kind + ":" + string(e.stream ?? "-") + ":" + string(e.code ?? "-"))
+
+        e = h2Next(sess)
+
+    seen.join(" ") + " (" + string(n) + ")"
+
+opened()
+    val sess = h2Server({ autoWindowUpdate: false })
+
+    h2Receive(sess, [...toBytes("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").toArray(), ...frame(4, 0, 0, [])])
+    sent(sess)
+    told(sess)
+
+    sess
+
+case(name, sess, bytes)
+    print(name + ": " + string(h2Receive(sess, bytes)) + " | " + sent(sess) + " | " + told(sess))
+    print(name + " then ping: " + string(h2Receive(sess, ping)) + " | " + sent(sess) + " | " + told(sess))
+
+continuations(n, ends)
+    var bs = frame(1, 0, 1, req)
+    var i = 0
+
+    while i < n
+        bs = [...bs, ...frame(9, if ends && i == n - 1 then 4 else 0, 1, [])]
+        i = i + 1
+
+    bs
+
+resets(n)
+    var bs = []
+    var i = 0
+
+    while i < n
+        bs = [...bs, ...frame(1, 5, 1 + 2 * i, req), ...frame(3, 0, 1 + 2 * i, [0, 0, 0, 8])]
+        i = i + 1
+
+    bs
+
+val overrun = [...data(1, 16384), ...data(1, 16384), ...data(1, 16384), ...data(1, 16383), ...data(1, 5)]
+
+start()
+    val s = opened()
+
+    h2Receive(s, frame(1, 4, 1, req))
+    told(s)
+
+    s
+
+case("connection window", start(), overrun)
+case("oversized frame", opened(), [0, 128, 1, 0, 0, 0, 0, 0, 1])
+case("eight CONTINUATIONs", opened(), continuations(8, true))
+case("nine CONTINUATIONs", opened(), continuations(9, true))
+case("bad HPACK", opened(), frame(1, 4, 1, [128]))
+case("PING of three bytes", opened(), frame(6, 0, 0, [1, 2, 3]))
+case("a frame inside a header block", opened(), [...frame(1, 0, 1, req), ...ping])
+case("a thousand resets", opened(), resets(1000))
+case("eleven hundred resets", opened(), resets(1100))
+
+val garbage = h2Server()
+
+print("garbage: " + string(h2Receive(garbage, toBytes("GET / HTTP/1.1\r\n\r\n").toArray())) + " | " + sent(garbage))
+print("garbage again: " + string(h2Receive(garbage, ping)))
+
+val flood = opened()
+
+print("flood: " + string(h2Receive(flood, continuations(9, false))))
+print("then goaway: " + string(h2Goaway(flood, 0)) + " | " + sent(flood) + " | " + told(flood))
+
+val overrun_goaway = start()
+
+h2Receive(overrun_goaway, overrun)
+print("overrun then goaway: " + string(h2Goaway(overrun_goaway, 0)) + " | " + sent(overrun_goaway) + " | " + told(overrun_goaway))
+"""
+
+private val ConnectionErrorsAnswered: string =
+    "connection window: null | goaway(1,3) | data:1:- data:1:- data:1:- data:1:- (4)\n" +
+    "connection window then ping: null |  |  (0)\n" +
+    "oversized frame: null | goaway(0,6) |  (0)\n" +
+    "oversized frame then ping: null |  |  (0)\n" +
+    "eight CONTINUATIONs: null |  | headers:1:- (1)\n" +
+    "eight CONTINUATIONs then ping: null | t6 | ping:-:- (1)\n" +
+    "nine CONTINUATIONs: {error: \"reading what the peer sent: Too many CONTINUATION frames following a HEADER frame\"} |  |  (0)\n" +
+    "nine CONTINUATIONs then ping: {error: \"reading what the peer sent: Too many CONTINUATION frames following a HEADER frame\"} |  |  (0)\n" +
+    "bad HPACK: null | goaway(1,9) |  (0)\n" +
+    "bad HPACK then ping: null |  |  (0)\n" +
+    "PING of three bytes: null | goaway(0,6) |  (0)\n" +
+    "PING of three bytes then ping: null |  |  (0)\n" +
+    "a frame inside a header block: null | goaway(1,1) |  (0)\n" +
+    "a frame inside a header block then ping: null |  |  (0)\n" +
+    "a thousand resets: null |  | headers:1:- streamEnd:1:- rstStream:1:8 streamClose:1:8 headers:3:- (4000)\n" +
+    "a thousand resets then ping: null | t6 | ping:-:- (1)\n" +
+    "eleven hundred resets: null | goaway(2001,2) | headers:1:- streamEnd:1:- rstStream:1:8 streamClose:1:8 headers:3:- (4400)\n" +
+    "eleven hundred resets then ping: null |  |  (0)\n" +
+    "garbage: {error: \"reading what the peer sent: Received bad client magic byte string\"} | t4\n" +
+    "garbage again: {error: \"reading what the peer sent: Received bad client magic byte string\"}\n" +
+    "flood: {error: \"reading what the peer sent: Too many CONTINUATION frames following a HEADER frame\"}\n" +
+    "then goaway: null | goaway(0,0) | streamClose:1:7 (1)\n" +
+    "overrun then goaway: null | goaway(1,3) | data:1:- data:1:- data:1:- data:1:- (4)"
+
+@test
+JS_H2_A_CONNECTION_ERROR_IS_ANSWERED_AS_NGHTTP2_ANSWERS_IT()
+    // The interpreter first, so that what the JavaScript host is held to is shown to be nghttp2's.
+    assert_eq(out(ConnectionErrorSource), ConnectionErrorsAnswered)
+    assert_eq(node_said(ConnectionErrorSource), ConnectionErrorsAnswered)
 
 // The half of `slate:nghttp2` that was not written out still says so, in the words every name that
 // is owed uses -- rather than being a JavaScript sentence about a name that is not defined.
