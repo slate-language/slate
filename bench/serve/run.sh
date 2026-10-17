@@ -9,6 +9,8 @@
 #   -d  seconds each load run lasts                       (default 8)
 #   -c  connections each load run holds open              (default 64)
 #   -w  warm-up seconds per server, spread over endpoints (default 3)
+#   -n  repeat every oha load N times and report median and min-max (default 1, which keeps the
+#       original tables with wrk, h2load and the fixed-rate run; above 1 only the oha table is made)
 #   -q  requests per second for the fixed-rate latency run (default 5000)
 #   -o  also write the tables to this file
 #   --only  one of slate, slatejs (slate's `slate js` output under node), node, bun, go (repeatable)
@@ -33,6 +35,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 DUR=8
 CONNS=64
+N=1
 WARM=3
 RATE=5000
 OUT=""
@@ -44,6 +47,7 @@ while [ $# -gt 0 ]; do
     -d) DUR=$2; shift 2 ;;
     -c) CONNS=$2; shift 2 ;;
     -w) WARM=$2; shift 2 ;;
+    -n) N=$2; shift 2 ;;
     -q) RATE=$2; shift 2 ;;
     -o) OUT=$2; shift 2 ;;
     --only) ONLY="$ONLY $2"; shift 2 ;;
@@ -174,7 +178,25 @@ if selected slatejs; then
   "$SLATE" js "$here/server.sl" -o "$tmp/server-slatejs.js" || { echo "slate js failed" >&2; exit 1; }
 fi
 
-: > "$tmp/t1"; : > "$tmp/t2"; : > "$tmp/t3"; : > "$tmp/t4"
+: > "$tmp/t1"; : > "$tmp/t2"; : > "$tmp/t3"; : > "$tmp/t4"; : > "$tmp/raw"; : > "$tmp/gatewaits"
+
+# sample <key> <load function> <args...>: N runs of one load, each appended to the raw table as
+# "key | rps | p50 | p99 | p99.9".
+sample() {
+  skey=$1; shift
+  i=0
+  while [ $i -lt $N ]; do
+    i=$((i + 1))
+    # A `sysl test` gate on the box skews every figure: wait it out before each repeat, and
+    # count the waits so the report can say whether every repeat ran with no gate running.
+    while ps -eo command | grep -q '[s]ysl test'; do
+      echo "gate running; waiting before $skey repeat $i" >&2
+      echo x >> "$tmp/gatewaits"
+      sleep 30
+    done
+    echo "$skey | $("$@")" >> "$tmp/raw"
+  done
+}
 status=0
 base_port=18100
 idx=0
@@ -196,7 +218,13 @@ for name in slate slatejs node bun go; do
     echo "| $name | FAILED CHECK: $reason | | | |" >> "$tmp/t1"
     stop_server; continue
   fi
-  if [ $CHECK = 0 ]; then
+  if [ $CHECK = 0 ] && [ $N -gt 1 ]; then
+    echo "== $name: plain HTTP/1.1, $N repeats ==" >&2
+    warm "$url"
+    sample "$name h1 /plain" oha_row "$url/plain"
+    sample "$name h1 /json" oha_row "$url/json"
+    sample "$name h1 /echo" oha_row -m POST -d 'ping body' "$url/echo"
+  elif [ $CHECK = 0 ]; then
     echo "== $name: plain HTTP/1.1 ==" >&2
     warm "$url"
     echo "| $name | /plain | $(oha_row "$url/plain") | $(wrk_row "$url/plain") |" >> "$tmp/t1"
@@ -230,7 +258,12 @@ for name in slate slatejs node bun go; do
     echo "| $name | $h1rss | - |" >> "$tmp/t4"
     continue
   fi
-  if [ $CHECK = 0 ]; then
+  if [ $CHECK = 0 ] && [ $N -gt 1 ]; then
+    echo "== $name: HTTPS + h2, $N repeats ==" >&2
+    warm "$turl" --http2 --insecure
+    sample "$name h2 /plain" oha_row --http2 --insecure "$turl/plain"
+    sample "$name h2 /json" oha_row --http2 --insecure "$turl/json"
+  elif [ $CHECK = 0 ]; then
     echo "== $name: HTTPS + h2 ==" >&2
     warm "$turl" --http2 --insecure
     echo "| $name | /plain | $(oha_row --http2 --insecure "$turl/plain") | $(h2load_row "$turl/plain") |" >> "$tmp/t3"
@@ -278,7 +311,56 @@ report() {
   cat "$tmp/t4"
 }
 
-report > "$tmp/report"
+# report_repeats: with -n above 1, the oha figures as median (min-max) over the repeats. The
+# req/s column is the median with the range beside it; latencies are medians. A trailing ! on any
+# sample marks the row, since a repeat in which some request failed is not a clean figure.
+report_repeats() {
+  echo "Machine: $(sysctl -n machdep.cpu.brand_string), $(sysctl -n hw.ncpu) cores, $(sw_vers -productName) $(sw_vers -productVersion), $(date +%Y-%m-%d)."
+  echo
+  echo "Settings: ${N} repeats of ${DUR} s each, ${CONNS} connections, ${WARM} s warm-up per server. Servers and load generators share this machine, on loopback."
+  echo
+  echo "Tools: $(oha --version), node $(node --version), bun $(bun --version), $(go version | cut -d' ' -f3), slate $("$SLATE" --version 2>&1 | head -1)."
+  echo
+  echo "Gate check: no \`sysl test\` was running at the start of any repeat ($(wc -l < "$tmp/gatewaits" | tr -d ' ') waits for one were needed)."
+  echo
+  echo "### oha: median (min-max) over ${N} repeats"
+  echo
+  echo "| server | proto | endpoint | req/s median | req/s min-max | p50 ms | p99 ms | p99.9 ms |"
+  echo "|---|---|---|---:|---:|---:|---:|---:|"
+  awk -F' [|] ' '
+    function med(a, n,   i, j, t) {
+      for (i = 2; i <= n; i++) { t = a[i]; for (j = i - 1; j >= 1 && a[j] + 0 > t + 0; j--) a[j + 1] = a[j]; a[j + 1] = t }
+      return (n % 2) ? a[(n + 1) / 2] : (a[n / 2] + a[n / 2 + 1]) / 2
+    }
+    {
+      key = $1; if (!(key in seen)) { seen[key] = 1; order[++k] = key }
+      n[key]++
+      r = $2; if (r ~ /!$/) { bad[key] = "!"; sub(/!$/, "", r) }
+      rps[key, n[key]] = r; p50[key, n[key]] = $3; p99[key, n[key]] = $4; p999[key, n[key]] = $5
+    }
+    END {
+      for (q = 1; q <= k; q++) {
+        key = order[q]; c = n[key]
+        for (i = 1; i <= c; i++) { a1[i] = rps[key, i]; a2[i] = p50[key, i]; a3[i] = p99[key, i]; a4[i] = p999[key, i] }
+        lo = a1[1]; hi = a1[1]
+        for (i = 2; i <= c; i++) { if (a1[i] + 0 < lo + 0) lo = a1[i]; if (a1[i] + 0 > hi + 0) hi = a1[i] }
+        split(key, f, " ")
+        printf "| %s | %s | %s | %d%s | %d-%d | %.3f | %.3f | %.3f |\n", f[1], f[2], f[3], med(a1, c), bad[key], lo, hi, med(a2, c), med(a3, c), med(a4, c)
+      }
+    }' "$tmp/raw"
+  echo
+  echo "### Peak RSS of the server over its runs (MB)"
+  echo
+  echo "| server | plain HTTP/1.1 | HTTPS + h2 |"
+  echo "|---|---:|---:|"
+  cat "$tmp/t4"
+}
+
+if [ $N -gt 1 ]; then
+  report_repeats > "$tmp/report"
+else
+  report > "$tmp/report"
+fi
 cat "$tmp/report"
 [ -n "$OUT" ] && cp "$tmp/report" "$OUT"
 exit $status
