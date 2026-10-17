@@ -365,6 +365,7 @@ dev/slatelang/slate/
     runtime.sysl    equality, arithmetic, indexing, matching and calling
     shape.sysl      a declared type, as a value: `test`, `mismatch` and `name`
     builtin.sysl    the functions a program has without writing them
+    builtin_io.sysl the sockets and the file system among them
     stdlib.sysl     the modules slate brings with it, and what each one exports
     js.sysl         the same tree read a second time, as JavaScript
     tests_*.sysl    what all of it claims, run by `sysl test .`
