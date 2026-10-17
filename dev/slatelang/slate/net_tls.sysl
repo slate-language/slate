@@ -1,0 +1,187 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+
+// `slate:net`'s TLS half: `startTls` at either end, `alpnProtocol`, and what a secured socket does
+// with each read. `tls.sysl` is the OpenSSL side of the same thing and holds no socket; this file is
+// where a socket and that state meet.
+//
+// **Cut from `net.sysl` at the upgrade**, which is the one seam that file had where little crosses:
+// `socket_of`, `reading`, `stream_failed`, `plainly_arrived` and `push_wire` come this way, and
+// `secured`, `handshake_denied` and `read_for_tls` go back. Each says so where it is written.
+//
+// **A SECURED SOCKET IS READ FROM THE MOMENT IT IS SECURED, READER OR NONE.** A handshake is a
+// conversation whose answers arrive as ordinary reads, and those bytes are TLS's and not the
+// program's -- so a handshake that waited for the program's `onData` was a `startTls` that never
+// settled when the reader came after the `await`. What the program is sent before it has a reader is
+// held in the socket's slot (`Sock.held`) and handed over on the turn after `onData` registers one.
+// **The hold is bounded by the handshake**: once it is over a socket with no reader stops being read
+// (`settled_unread` in `net.sysl`), so a client cannot fill a server's memory by sending to a
+// connection nobody has started reading -- the kernel's backpressure is the plain socket's again.
+
+// Start reading a socket that is being secured, where nothing is reading it yet. **The handshake
+// drives itself**: its bytes are TLS's, and a program that registers its reader after `startTls`, or
+// after a secured `listen` handed it the connection, has its own bytes held until it does.
+//
+// Not `private`: `accepted` in `net.sysl` starts one for every connection a secured listener takes.
+read_for_tls(id: usize, gen: usize)
+    val s = socket_at(id, gen) match
+        None -> return
+        Some(it) -> it
+
+    if s.reading then return
+
+    connection_at(id, gen) match
+        None -> ()
+        Some(conn) ->
+            s.reading = true
+            loop_events().spawn(reading(id, gen, run_stamp(), conn))
+end read_for_tls
+
+// `startTls(sock, host)` -- an open socket, upgraded, answering a promise that settles when the
+// handshake has finished.
+//
+// **AN UPGRADE RATHER THAN A FLAG ON `connect`, BECAUSE THAT IS WHAT PROTOCOLS ACTUALLY DO.** TLS
+// from byte zero is one case and not the general one: PostgreSQL sends an eight-byte request in the
+// clear and reads a single byte back before any handshake, SMTP has `STARTTLS`, IMAP and FTP have
+// their own, and a WebSocket over TLS is HTTPS first. An upgrade is also the weaker primitive, so
+// `connect` with TLS from the start is this plus `connect` and needs nothing else -- where a flag on
+// `connect` would have left every one of those protocols with nothing to call.
+//
+// **The socket is read from here on whether or not the program has a reader**, since a handshake is
+// a conversation and the answers arrive as ordinary reads -- bytes that are TLS's and not the
+// program's. A program may call `onData` or `onBytes` before this or after it: what it is sent
+// before it has a reader is held, and handed over once it does.
+start_tls_socket(v: Value, host: string, trust: []const u8, alpn: []const string, at: Span) -> Step
+    val (id, gen) = upgradable(v, at)?
+    val waiting = begin_request()
+    val promised = awaited_request(waiting)
+
+    tls_connect(id, host, trust, alpn, waiting) match
+        Err(e) ->
+            deny_request(waiting, at, e)
+            return Ok(promised)
+        Ok(_) -> ()
+
+    // **The ClientHello is produced HERE and not on the next read**, which is the one place a client
+    // differs from a server: a server is spoken to first and this end is not, so nothing would ever
+    // arrive to drive a handshake that had not already started.
+    tls_kick(id) match
+        Err(e) ->
+            tls_drop(id)
+            deny_request(waiting, at, e)
+            return Ok(promised)
+        Ok(_) -> ()
+
+    push_wire(id, gen)
+    read_for_tls(id, gen)
+    Ok(promised)
+end start_tls_socket
+
+// `alpnProtocol(conn)` -- which application protocol this connection settled on, or `null`.
+//
+// **A SERVER CANNOT ASK ANYTHING ELSE.** `h2` and `http/1.1` arrive on one port over one socket and
+// differ in nothing a program could sniff -- HTTP/2's own preface is bytes a malformed HTTP/1.1
+// request could also begin with. ALPN is the answer, and this is where a program reads it.
+//
+// **`null` covers three ordinary cases and no failure**: a plain socket, a peer that offered nothing,
+// and a handshake that has not finished.
+//
+// **THE THIRD OF THOSE IS THE ONE THAT BITES: A CONNECTION CALLBACK RUNS BEFORE THE HANDSHAKE.** It
+// fires when TCP accepts, which is several round trips before ALPN has been settled, so a server
+// that asks there is told `null` about a connection that is about to be `h2`. **Ask at the first
+// arrival instead** -- by then the handshake is long finished, and the bytes in hand are the ones
+// the protocol it chose is waiting to be given. `slate:http` decides exactly this way.
+alpn_protocol(v: Value, at: Span) -> Step
+    val (id, _) = socket_of(v, at, "alpnProtocol")?
+
+    tls_protocol(id) match
+        Some(name) -> Ok(Str(new_str_scanned(name)))
+        None -> Ok(Null)
+end alpn_protocol
+
+// `startTls(conn, { cert, key })` -- the same upgrade asked for from the other end.
+//
+// **A SERVER HAS NOTHING TO SAY UNTIL IT HAS BEEN SPOKEN TO, so there is no kick and nothing to
+// push.** That is the one asymmetry between the two ends, and it is why this is four lines where the
+// client is a dozen: the handshake begins on the next read, exactly as it does for a connection
+// handed out by a secured `listen`, and the promise is answered from the same place.
+//
+// **The connection is read from here on, reader or none**, which for this end is the whole
+// mechanism: the ClientHello is what starts the handshake, and it arrives as a read.
+present_tls_socket(v: Value, certificate: []const u8, key: []const u8, alpn: []const string, at: Span) -> Step
+    val (id, gen) = upgradable(v, at)?
+    val waiting = begin_request()
+    val promised = awaited_request(waiting)
+
+    tls_present(id, certificate, key, alpn, waiting) match
+        Err(e) ->
+            deny_request(waiting, at, e)
+            return Ok(promised)
+        Ok(_) -> ()
+
+    read_for_tls(id, gen)
+    Ok(promised)
+end present_tls_socket
+
+// The socket an upgrade was asked for, or the complaint about why it cannot be one.
+private upgradable(v: Value, at: Span) -> Result[(usize, usize), Signal]
+    val (id, gen) = socket_of(v, at, "startTls")?
+
+    if tls_here(id) then return Err(failure(at, "this socket is already secured, and `startTls` upgrades a plain one"))
+
+    Ok((id, gen))
+end upgradable
+
+// A handshake this socket will never finish.
+//
+// **A PROMISE THAT NEVER SETTLES IS A PROGRAM THAT NEVER ENDS**, so every way a socket can stop --
+// the peer hanging up, a read failing, the program closing it -- answers the one `startTls` handed
+// out. Nothing where there is none, which is every server connection and every plain socket.
+//
+// Not `private`: `reading` in `net.sysl` answers it when the stream ends or fails.
+handshake_denied(id: usize, message: string)
+    tls_awaited(id) match
+        None -> ()
+        Some(r) -> deny_request(r, point(0), message)
+
+// What arrived on a TLS connection: fed to OpenSSL, whatever it wants sent written back, and
+// whatever it decrypted handed on. **A handshake turn produces no plaintext and is not nothing** --
+// it is the whole of the first few round trips, and the program sees none of them.
+//
+// Not `private`: `reading` in `net.sysl` hands every chunk of a secured socket here.
+secured(id: usize, gen: usize, cipher: []const u8, as_text: bool)
+    val plain = tls_took(id, cipher) match
+        // **A HANDSHAKE THAT FAILS ENDS THE CONNECTION AND NOTHING ELSE.** It is the ordinary answer
+        // to a client that is not speaking TLS -- a browser sent to `http://` on this port, a probe,
+        // a scanner -- and stopping the program over one would make any server trivially killable
+        // from outside. The program is told what it would be told for any other end of stream, which
+        // is what lets `slate:http` close its side without knowing why -- or told the reason, where
+        // it registered an `onError` and wants to know how many of these it is getting.
+        //
+        // **A CLIENT THAT ASKED FOR THE HANDSHAKE IS TOLD WHY**, which is the other half of the same
+        // argument: the reason a server discards -- because it is about the peer and there are many
+        // peers -- is exactly what a program awaiting `startTls` needs, since a certificate that does
+        // not check out is its own problem and not a stranger's.
+        Err(e) ->
+            handshake_denied(id, e)
+            stream_failed(id, gen, "this connection could not be secured")
+            tls_drop(id)
+
+            if socket_at(id, gen).is_some() then surrender(id)
+
+            return
+        Ok(p) -> p
+
+    push_wire(id, gen)
+
+    // **Settled after the wire is pushed**, so the last flight of the handshake is on its way before
+    // the program is told it may write -- and after `push_queued`, so anything it wrote while the
+    // handshake was running went first.
+    if tls_ready(id)
+        tls_awaited(id) match
+            None -> ()
+            Some(r) -> answer_request(r, Null)
+
+    if plain.len() > 0 then plainly_arrived(id, gen, plain.view(), as_text)
+end secured
