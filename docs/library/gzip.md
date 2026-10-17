@@ -56,12 +56,12 @@ means in practice and what every HTTP client expects under that name, despite wh
 Neither is the bare deflate stream that sits inside both. A program that needs *that* is writing a
 container of its own, and has to say so byte by byte anyway.
 
-**`gunzip` reads ONE member, and bytes after the end of a stream are refused rather than ignored.**
-`cat a.gz b.gz` is a valid gzip file of two members; `gunzip` refuses it on both hosts rather than
-handing back the first member's bytes as though they were all of it — the interpreter saying the
-stream ends before the bytes do, a JavaScript host that the checksum does not match. The same goes for
-`inflate` and anything after the zlib stream's checksum. node's own `zlib.gunzipSync` reads every
-member, so this is slate's answer and not a host's.
+**`gunzip` reads every member, and bytes after the last one are refused rather than ignored.**
+`cat a.gz b.gz` is a valid gzip file of two members and `gunzip` answers the two outputs joined, as
+node's `zlib.gunzipSync` and `gzip -d` do; the limit is the most the whole may become. Bytes after the
+last member — junk, or zero padding, which `gzip -d` tolerates — are refused on both hosts, as *this
+compressed stream ends before the bytes do*. `inflate` has no members, so anything after the zlib
+stream's checksum is refused the same way.
 
 ## Every one of them answers a promise
 

@@ -1,0 +1,67 @@
+module dev.slatelang.slate
+
+import sh.sysl.libuv
+import sh.sysl.parsing.*
+
+// `shutdown(sock)`, the write-side half-close of `slate:net`: the FIN goes out and the socket is
+// still read until the peer ends too. `net.sysl` has the rest of the socket calls; this is cut out
+// of it to keep that file under a thousand lines, and what crosses is `Asked`, `still_asked` and the
+// `finished` flag `send` reads.
+
+// `shutdown(sock)` -- a promise that settles once this end has said it will write no more.
+//
+// **Everything a program wrote before it goes out first**, libuv queueing a shutdown behind the
+// writes already issued. **A second `shutdown` is harmless and answers the same `{ ok: true }`**:
+// a program ending its side from two places should not have to know which one got there first.
+//
+// **On a secured socket a close-notify is written before the FIN**, so the peer reads a clean end of
+// TLS and not a truncated stream. Reading goes on exactly as it did.
+shutdown_socket(v: Value, at: Span) -> Step
+    val (id, gen) = socket_of(v, at, "shutdown")?
+    val waiting = begin_request()
+    val promised = awaited_request(waiting)
+    val ask = Asked(waiting, gen_at(waiting), run_stamp(), at)
+
+    // A listening socket has no writing side to end, which `send` answers with `EPIPE` too.
+    val conn = connection_at(id, gen) match
+        None ->
+            refuse_request(waiting, at, "cannot shut down", libuv.Error(libuv.EPIPE))
+            return Ok(promised)
+        Some(c) -> c
+
+    val sock = socket_at(id, gen).unwrap()
+
+    if sock.finished
+        answer_request(waiting, Null)
+        return Ok(promised)
+
+    if tls_here(id)
+        if !tls_ready(id)
+            deny_request(waiting, at, "cannot shut down: the TLS handshake has not finished")
+            return Ok(promised)
+
+        tls_goodbye(id)
+
+        val cipher = tls_pull(id)
+
+        loop_events().spawn(written(conn.write(cipher.view())))
+
+    sock.finished = true
+    loop_events().spawn(shut(ask, conn.shutdown()))
+    Ok(promised)
+end shutdown_socket
+
+// How the close-notify's write ended. Nothing waits on it: the shutdown queued behind it is what the
+// program's promise follows, and a failed write fails that too.
+private async written(t: Task[Result[unit, libuv.Error]])
+    val r = await t
+
+// How one `shutdown` ended, which is what its promise says.
+private async shut(ask: Asked, t: Task[Result[unit, libuv.Error]])
+    val r = await t
+
+    if !still_asked(ask) then return
+
+    r match
+        Ok(_) -> answer_request(ask.id, Null)
+        Err(e) -> refuse_request(ask.id, ask.at, "cannot shut down", e)

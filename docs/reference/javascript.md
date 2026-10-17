@@ -216,18 +216,21 @@ the module is new — so it was written promise-shaped everywhere rather than sy
 and refusing in the other. The interpreter compresses with miniz and answers a promise it has already
 settled.
 
-**The gzip header and trailer are parsed by slate on both back ends**, and only the deflate body goes
-to the host's stream. That is what makes the refusals the same sentence wherever a program runs: the
-magic bytes, the compression method, a header that ends early, the limit, the stated length and the
-CRC-32 are all slate's own checks, and the CRC is computed here rather than taken from anybody.
+**`gunzip` reads every member of a gzip stream on both back ends**, `cat a.gz b.gz` answering the two
+outputs joined as node's `zlib.gunzipSync` does. A host's own stream reads a good one; when it refuses,
+slate walks the stream itself, header, deflate data and trailer of each member, and answers the
+interpreter's sentence — so the refusals read the same wherever a program runs: a header that is not
+gzip's, a stream that ends in the middle, bad deflate data, a checksum or length that does not match,
+the limit, and bytes after the last member. **Those last are refused even when they are zero padding**,
+which gzip(1) and node's `gunzipSync` allow and a `DecompressionStream` refuses; slate follows the
+interpreter's decoder rather than choose between two hosts.
 
-**One sentence is not shared, and it is the body itself.** miniz says whether a stream that would not
-inflate was truncated or corrupt; a host's decompressor throws one `TypeError` for both, and for a
-wrong checksum too. So where the interpreter says *this compressed stream ends in the middle* or
-*this is not a compressed stream at all*, a JavaScript host says *this compressed stream could not be
-read* — a plain statement rather than a guess dressed as a finding. **zlib's own two-byte header is
-checked here as well**, so the common case — something that is not a zlib stream at all — does read
-the same on both.
+**One sentence is not shared, and it is the body of a zlib stream.** miniz says whether a stream that
+would not `inflate` was truncated or corrupt; a host's decompressor throws one `TypeError` for both.
+So where the interpreter says *this compressed stream ends in the middle* or *this is not a compressed
+stream at all*, a JavaScript host says *this compressed stream could not be read* — a plain statement
+rather than a guess dressed as a finding. **zlib's own two-byte header is checked here**, so the
+common case — something that is not a zlib stream at all — does read the same on both.
 
 ### `slate:crypto` is whole here, and WebCrypto is not how
 

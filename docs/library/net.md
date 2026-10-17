@@ -39,6 +39,7 @@ main()
 | `onBytes(sock, fn)` | each chunk as [`bytes`](bytes.md), for something that is not text |
 | `onError(sock, fn)` | a sentence, *instead of* that `null` |
 | `send(sock, v)` | a promise of a result; **bytes or an array of numbers go as bytes** |
+| `shutdown(sock)` | a promise of a result, once this end has said it will write no more |
 | `close(sock)` | |
 | `sock.dispose()` | `close` under the name [`using`](../reference/statements.md) looks for |
 | `localPort(server)` | |
@@ -132,6 +133,14 @@ program accepting on it, and a socket that is not a passed listener is refused.
 **A socket keeps the program alive, exactly as a timer does**, so `close` is not optional; a program that
 leaves one open never exits. **Closing twice is fine**, which is what lets a server close its connections
 while a read callback closes its own.
+
+**`shutdown` is a half-close**: the write side ends (a TCP FIN, node's `socket.end()`) and the socket is
+still read until the peer ends too, so a client can send a request, `shutdown`, and wait for an answer
+from a server that reads to the end of the stream. Whatever was sent before it goes out first. **After
+it, `send` refuses** with a result whose `error` says this end has shut down its writing; **a second
+`shutdown` answers `ok` again**; and `close` is still how the socket is let go. On a secured socket the
+TLS close-notify is written before the FIN. A listener has no writing side and `shutdown` answers an
+error for one.
 
 **A closed socket is not whatever opens next.** The value a program holds carries the generation that
 claimed its slot, so a socket held across a `close` never comes to mean its successor.
