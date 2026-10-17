@@ -103,3 +103,15 @@ macOS: RSS counts pages malloc has marked reusable.
 | go | malformed | handled=4/5 served=10/10 [bad-request-line=closed oversized-header=2xx?! too-many-headers=closed bad-chunked=closed huge-content-length=waiting] |
 | go | soak | secs=30 ok=1500/1500 [server plateau rss 41->44 MB, fds 9->10] |
 | go | h2abuse | resets=2000 streams=500 settings=1000 zeroWindow=1 served=10/10  |
+
+## Re-taken with kairos 0.1.9 and libuv 0.1.15 (shared read slab)
+
+`run.sh --only slate --mode slowloris` on the slab build: an armed idle reader no longer holds a
+buffer, so the storm's footprint drops.
+
+| server | mode | verdict | rss before | rss peak | rss after | fd before | fd peak | fd after |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| slate | slowloris | FAIL | 11 | 50 | 50 | 13 | 1014 | 13 |
+
+Peak RSS 11 -> 50 MB, against 11 -> 124 MB before. The verdict is still FAIL for the unchanged
+reason (`cutOff=0/1000 hasHeaderTimeout=false`): the header-read deadline is a separate item.
