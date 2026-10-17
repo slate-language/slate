@@ -1,34 +1,101 @@
-// The client half of tests_js_h2.sysl: node's own HTTP/2 against a slate server running under node.
+// The other half of tests_js_h2.sysl and tests_js_h2_client.sysl: node's own HTTP/2, as a client
+// against a slate server running under node, or as a server for a slate client running under node.
 //
 //     node tests/tls/h2_probe.js <server.js>
+//     node tests/tls/h2_probe.js --client <client.js>
 //
-// It starts the server, waits for the line it prints naming its port, makes the requests below and
-// prints one line for each. A line is what a test compares, so everything printed is a fact about
-// what came back and never about timing.
+// As a client it starts the server, waits for the line it prints naming its port, makes the requests
+// below and prints one line for each. As a server it listens on a port of its own, starts the slate
+// client with that port as its argument, and prints what the client printed and then one line per
+// request it was asked, sorted. A line is what a test compares, so everything
+// printed is a fact about what was said and never about timing.
 
 const http2 = require("http2")
 const tls = require("tls")
+const fs = require("fs")
 const { spawn } = require("child_process")
 
-const child = spawn("node", [process.argv[2]], { stdio: ["ignore", "pipe", "inherit"] })
+// node's http2 server, answering by path: `/hello` a body, `/echo` what it was sent and a header
+// saying what arrived, `/trailers` a body with trailers after it, `/big` more than any window, and
+// anything else a 404.
+const serveForClient = (file) => {
+    const asked = []
+    const server = http2.createSecureServer({ cert: fs.readFileSync("tests/tls/cert.pem"), key: fs.readFileSync("tests/tls/key.pem") })
 
-let said = ""
-let started = false
+    server.on("stream", (stream, headers) => {
+        let body = ""
 
-child.stdout.on("data", (chunk) => {
-    said += chunk
+        stream.setEncoding("latin1")
+        stream.on("data", (d) => { body += d })
+        stream.on("end", () => {
+            const path = headers[":path"]
 
-    const found = /listening (\d+)/.exec(said)
+            // A stream the client reset is never answered, and is not counted as asked.
+            if (stream.closed || stream.destroyed) return
 
-    if (found && !started) {
-        started = true
+            asked.push(headers[":method"] + " " + path + " " + body.length + " " + (headers["x-custom"] || "-"))
 
-        run(Number(found[1])).then(() => child.kill(), (e) => {
-            console.log("probe failed: " + (e && e.message))
-            child.kill()
+            if (path === "/hello") {
+                stream.respond({ ":status": 200, "content-type": "text/plain" })
+                stream.end("hello from node")
+            } else if (path === "/echo") {
+                stream.respond({ ":status": 200, "x-seen": String(body.length) })
+                stream.end(body)
+            } else if (path === "/trailers") {
+                stream.respond({ ":status": 200 }, { waitForTrailers: true })
+                stream.on("wantTrailers", () => stream.sendTrailers({ "x-done": "yes" }))
+                stream.end("with trailers")
+            } else if (path === "/big") {
+                stream.respond({ ":status": 200 })
+                stream.end("b".repeat(200000))
+            } else {
+                stream.respond({ ":status": 404 })
+                stream.end()
+            }
         })
-    }
-})
+    })
+
+    server.listen(0, () => {
+        const child = spawn("node", [file, String(server.address().port)], { stdio: ["ignore", "pipe", "inherit"] })
+        let out = ""
+
+        child.stdout.on("data", (chunk) => { out += chunk })
+        child.on("exit", () => {
+            process.stdout.write(out)
+
+            // Concurrent streams end in whatever order the network gives, so the list is sorted.
+            for (const line of asked.sort()) console.log("asked " + line)
+
+            server.close()
+            process.exit(0)
+        })
+    })
+}
+
+if (process.argv[2] === "--client") serveForClient(process.argv[3])
+else startServer(process.argv[2])
+
+function startServer(file) {
+    const child = spawn("node", [file], { stdio: ["ignore", "pipe", "inherit"] })
+
+    let said = ""
+    let started = false
+
+    child.stdout.on("data", (chunk) => {
+        said += chunk
+
+        const found = /listening (\d+)/.exec(said)
+
+        if (found && !started) {
+            started = true
+
+            run(Number(found[1])).then(() => child.kill(), (e) => {
+                console.log("probe failed: " + (e && e.message))
+                child.kill()
+            })
+        }
+    })
+}
 
 const request = (client, method, path, body, headers) => new Promise((resolve, reject) => {
     const r = client.request(Object.assign({ ":method": method, ":path": path, "user-agent": "probe/1", "accept-encoding": "gzip, deflate" }, headers || {}))

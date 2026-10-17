@@ -1,0 +1,198 @@
+module dev.slatelang.slate
+
+#if feature_http2
+
+// `slate:nghttp2`'s client half in the JavaScript back end: the session of `js_rt_h2.sysl`, opening
+// streams instead of answering them.
+//
+// **A subclass, because what differs is a short list and everything else is the same session**:
+// frames, windows, credit, SETTINGS, PING and GOAWAY are read and written exactly as the server's are.
+// What a client adds is that it writes the connection preface and an empty SETTINGS before anything,
+// hangs up on a server whose first frame is not SETTINGS (a GOAWAY saying "SETTINGS expected", as
+// nghttp2 does), numbers its own streams from one by twos, reads a `response` and then perhaps a
+// `trailer` on each, and encodes its header blocks with nghttp2's own indexing encoder -- which is
+// what makes the bytes a JavaScript client writes the bytes the interpreter's writes.
+//
+// **Three things happen when the frames go out and not when they are asked for**, nghttp2's timing
+// and so the interpreter's: a request with no body is half closed once its HEADERS has gone, a reset
+// closes its stream once its RST_STREAM has gone, and a request made after the server's GOAWAY
+// arrived is closed REFUSED_STREAM, unsent, at the next `h2Send`.
+//
+// **This block closes the `h2` scope `js_rt_h2_hpack.sysl` opened**, so `js_runtime` puts it directly
+// after the session's.
+
+js_runtime_h2_client() -> string = raw"""
+            class Client extends Session {
+                constructor(auto) {
+                    super(auto)
+
+                    this.isClient = true
+                    this.prefaced = true
+                    this.heardSettings = false
+                    this.nextStream = 1
+                    this.enc = new Deflater(4096)
+                    this.out = []
+                    this.unacked = []
+
+                    this.put(URGENT, Buffer.from(PREFACE))
+                    this.settings([])
+                }
+
+                neverOpened(stream) {
+                    return stream % 2 === 0 || stream >= this.nextStream
+                }
+
+                block(fields) {
+                    return () => this.enc.deflate(fields)
+                }
+
+                // A request, and the number of the stream it opens. With a whole body it is queued now;
+                // without one the body is written afterwards with `push` and `finish`.
+                request(fields, body, whole) {
+                    const id = this.nextStream
+                    const ends = whole && body.length === 0
+                    const s = {
+                        id: id,
+                        localWin: this.localInitial,
+                        recvWin: this.localInitial,
+                        recvEnded: false,
+                        sentEnded: false,
+                        headSent: true,
+                        gotHead: false,
+                        finishing: false,
+                        trailers: null,
+                        queue: [],
+                        sendWin: this.peerWin,
+                        credit: 0,
+                        closed: false
+                    }
+
+                    this.nextStream += 2
+                    this.streams.set(id, s)
+
+                    this.headFrames(id, this.block(fields), ends, OPENING, ends ? () => {
+                        s.sentEnded = true
+                        this.settle(s)
+                    } : undefined)
+
+                    if (whole && !ends) {
+                        s.queue.push(body)
+                        s.finishing = true
+                        this.pending.add(s)
+                    }
+
+                    return id
+                }
+
+                respond(stream, fields, body, whole) {
+                    fault("`" + (whole ? "h2Respond" : "h2RespondStream") + "` could not be sent: submitting a response: Protocol error")
+                }
+
+                push(stream, piece) {
+                    const s = this.streams.get(stream)
+
+                    if (s !== undefined && s.resetting) return "there is no body open on stream " + stream
+
+                    return super.push(stream, piece)
+                }
+
+                finish(stream, trailers) {
+                    const s = this.streams.get(stream)
+
+                    if (s !== undefined && s.resetting) return "there is no body open on stream " + stream
+
+                    return super.finish(stream, trailers)
+                }
+
+                // The program's own RST_STREAM, which closes the stream once it has gone out.
+                reset(stream, code) {
+                    const s = this.streams.get(stream)
+
+                    if (s === undefined || s.closed || s.resetting) return
+
+                    s.resetting = true
+                    s.queue = []
+                    this.pending.delete(s)
+                    this.put(REGULAR, frame(RST_STREAM, 0, stream, u32(code)), () => this.drop(s, code))
+                }
+
+                // A response's head, or its trailers -- or a block on a stream this side has finished
+                // with, which is read for the table's sake and dropped.
+                takeHeaders(flags, stream, payload) {
+                    if (stream === 0) refuse("HEADERS on stream zero")
+
+                    let [block] = this.unpadded(flags, payload)
+
+                    if ((flags & PRIORITY_FLAG) !== 0) {
+                        if (block.length < 5) refuse("a HEADERS frame is too short for its priority")
+
+                        block = block.subarray(5)
+                    }
+
+                    const s = this.streams.get(stream)
+
+                    if (s === undefined) {
+                        if (this.neverOpened(stream)) refuse("a server opened stream " + stream + ", which only a client may")
+                    } else {
+                        if (s.recvEnded) coded(STREAM_CLOSED, "HEADERS on a stream the peer had ended")
+
+                        this.events.push({ kind: "beginHeaders", stream: stream, of: s.gotHead ? "trailer" : "response" })
+                    }
+
+                    if ((flags & END_HEADERS) === 0) {
+                        this.continuing = { stream: stream, flags: flags, parts: [block], count: 0, dropped: s === undefined }
+
+                        return
+                    }
+
+                    this.headed(stream, flags, block, s === undefined)
+                }
+
+                headed(stream, flags, block, dropped) {
+                    let fields
+
+                    try {
+                        fields = this.dec.decode(block, MAX_HEADER_LIST)
+                    } catch (e) {
+                        if (e instanceof H2Error) this.fatal(COMPRESSION_ERROR)
+
+                        throw e
+                    }
+
+                    const s = this.streams.get(stream)
+
+                    if (dropped || s === undefined) return
+
+                    if (fields === null) return this.resetStream(stream, ENHANCE_YOUR_CALM)
+
+                    this.events.push({ kind: "headers", stream: stream, headers: fields, of: s.gotHead ? "trailer" : "response" })
+                    s.gotHead = true
+
+                    if ((flags & END_STREAM) !== 0) this.ended(s)
+                }
+
+                // A request that has not gone out by the time the server has said GOAWAY never will.
+                send() {
+                    if (this.goawayRecv)
+                        this.out = this.out.filter((f) => {
+                            if (f.rank !== OPENING) return true
+
+                            const s = this.streams.get(f.stream)
+
+                            if (s !== undefined) this.drop(s, REFUSED_STREAM)
+
+                            return false
+                        })
+
+                    return super.send()
+                }
+            }
+
+            return { Session, Client, H2Error, Deflater, Decoder }
+        })()
+
+"""
+
+#else
+js_runtime_h2_client() -> string = ""
+#endif

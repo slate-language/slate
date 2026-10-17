@@ -385,6 +385,175 @@ js_runtime_h2_hpack() -> string = raw"""
 
                 return Buffer.from(out)
             }
+
+            // -- the encoder a client and `hpackDeflate` use, which is nghttp2's -----------------------
+
+            // A string as Huffman, the codes written most significant bit first and the last byte
+            // padded with ones, which is the start of the end-of-string code.
+            const huffEncode = (bytes) => {
+                const out = []
+                let acc = 0
+                let bits = 0
+
+                for (const b of bytes) {
+                    let len = HUFF_LENS[b]
+                    const code = HUFF_CODES[b]
+
+                    while (len > 0) {
+                        const take = Math.min(len, 8 - bits)
+
+                        acc = (acc << take) | ((code >>> (len - take)) & ((1 << take) - 1))
+                        bits += take
+                        len -= take
+
+                        if (bits === 8) {
+                            out.push(acc)
+                            acc = 0
+                            bits = 0
+                        }
+                    }
+                }
+
+                if (bits > 0) out.push((acc << (8 - bits)) | ((1 << (8 - bits)) - 1))
+
+                return out
+            }
+
+            const huffLength = (bytes) => {
+                let n = 0
+
+                for (const b of bytes) n += HUFF_LENS[b]
+
+                return (n + 7) >> 3
+            }
+
+            // A string literal: Huffman where that is strictly shorter, its own bytes where it is not.
+            const putString = (out, bytes) => {
+                const huffed = huffLength(bytes)
+
+                if (huffed < bytes.length) {
+                    putInt(out, 0x80, 7, huffed)
+
+                    for (const b of huffEncode(bytes)) out.push(b)
+                } else {
+                    putInt(out, 0, 7, bytes.length)
+
+                    for (const b of bytes) out.push(b)
+                }
+            }
+
+            // Where a name first appears in the static table, counted from zero: nghttp2's token.
+            const staticToken = new Map()
+
+            STATIC.forEach((e, i) => { if (!staticToken.has(e[0])) staticToken.set(e[0], i) })
+
+            // **The fields nghttp2 never adds to its table**, because their values rarely repeat: a
+            // path, the three validators, a length, an age, a location and a cookie being set.
+            const UNINDEXED = new Set([":path", "age", "content-length", "etag", "if-modified-since", "if-none-match", "location", "set-cookie"])
+
+            const WITH = 0, WITHOUT = 1, NEVER = 2
+
+            // **nghttp2's encoder, decision for decision**, so a block it makes is the block this makes,
+            // byte for byte: what it indexes, what it never indexes (a field marked so, `authorization`,
+            // and a `cookie` under twenty bytes), what is too big to index (more than three quarters of
+            // the table), which entry it names, when it uses Huffman, and the size update a table smaller
+            // than the default announces at the front of its first block.
+            class Deflater {
+                constructor(limit) {
+                    this.table = []
+                    this.size = 0
+                    this.max = Math.min(limit, 4096)
+                    this.notify = limit < 4096
+                }
+
+                // The newest entry naming `name` -- with `value` too where `exact` -- as its index.
+                find(name, value, exact) {
+                    for (let i = 0; i < this.table.length; i++) {
+                        const e = this.table[i]
+
+                        if (e[0] === name && (!exact || e[1] === value)) return i + STATIC.length + 1
+                    }
+
+                    return -1
+                }
+
+                add(name, value, room) {
+                    while (this.size + room > this.max && this.table.length > 0) {
+                        const old = this.table.pop()
+
+                        this.size -= old[2]
+                    }
+
+                    if (room > this.max) return
+
+                    this.table.unshift([name, value, room])
+                    this.size += room
+                }
+
+                deflate(fields) {
+                    const out = []
+
+                    if (this.notify) {
+                        this.notify = false
+                        putInt(out, 0x20, 5, this.max)
+                    }
+
+                    for (const [name, value, sensitive] of fields) {
+                        const nameBytes = Buffer.from(name, "utf8")
+                        const valueBytes = Buffer.from(value, "utf8")
+                        const room = nameBytes.length + valueBytes.length + 32
+                        const never = sensitive || name === "authorization" || (name === "cookie" && valueBytes.length < 20)
+                        const mode = never ? NEVER : room > this.max * 3 / 4 || UNINDEXED.has(name) ? WITHOUT : WITH
+                        const token = staticToken.get(name)
+
+                        // The whole field in the table is one index. A field never indexed is looked
+                        // for by name alone, and a static name is preferred to a dynamic one.
+                        let index = -1
+
+                        if (mode !== NEVER) {
+                            const whole = this.find(name, value, true)
+
+                            if (whole !== -1) {
+                                putInt(out, 0x80, 7, whole)
+
+                                continue
+                            }
+                        }
+
+                        if (token !== undefined) {
+                            if (mode !== NEVER)
+                                for (let i = token; i < STATIC.length && STATIC[i][0] === name; i++)
+                                    if (STATIC[i][1] === value) index = i + 1
+
+                            if (index !== -1) {
+                                putInt(out, 0x80, 7, index)
+
+                                continue
+                            }
+
+                            index = token + 1
+                        } else {
+                            index = this.find(name, value, false)
+                        }
+
+                        if (mode === WITH) this.add(name, value, room)
+
+                        const flags = mode === WITH ? 0x40 : mode === NEVER ? 0x10 : 0x00
+                        const prefix = mode === WITH ? 6 : 4
+
+                        if (index === -1) {
+                            out.push(flags)
+                            putString(out, nameBytes)
+                        } else {
+                            putInt(out, flags, prefix, index)
+                        }
+
+                        putString(out, valueBytes)
+                    }
+
+                    return Buffer.from(out)
+                }
+            }
 """
 
 #else

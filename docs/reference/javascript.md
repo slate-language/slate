@@ -64,21 +64,29 @@ way.
 
 ## What is not there yet
 
-**`slate:redis` and the client half of `slate:nghttp2`.** (`slate:process`'s `run` is built on node,
+**`slate:redis`.** (`slate:process`'s `run` is built on node,
 answering the interpreter's shape word for word; a browser has no processes and refuses naming the
 host, as `spawn` does.) Each is a
 name that says *"not in the JavaScript back end yet"* when a program reaches it, rather than a name
 that is not there — so a program is told which half of the world it is in. **No global is on that
 list any more**; `fetch` was the last and has its own section below.
 
-**`slate:nghttp2`'s server half is here on node**, which is what lets `slate:http`'s `serve` answer
-HTTP/2 under `slate js` when `listen` was given a certificate, a key and `alpn: ["h2", "http/1.1"]`.
-`h2Server`, `h2Receive`, `h2Send`, `h2Next`, `h2Respond`, `h2RespondStream`, `h2Push`, `h2Finish`,
-`h2Goaway`, `h2Consume` and `h2Close` behave as they do in the interpreter. **The session is written
-out in the runtime rather than being node's `http2`**, because `slate:http`'s speaker hands a session
-bytes and reads what they said at once, and node's HTTP/2 only answers later. `h2Client`, `h2Request`,
-`h2RequestStream`, `h2Settings`, `h2Reset`, `h2WindowUpdate`, `h2Ping`, `h2Wants` and the `hpack*`
-calls are still on the list. In a browser `listen` refuses, so nothing there reaches a session.
+**`slate:nghttp2` is here on node, both halves and HPACK**, which is what lets `slate:http`'s `serve`
+answer HTTP/2 under `slate js` when `listen` was given a certificate, a key and
+`alpn: ["h2", "http/1.1"]`, and what lets a program be an HTTP/2 client over `connect` and `startTls`.
+Every name behaves as it does in the interpreter, refusals worded alike. **The session is written
+out in the runtime rather than being node's `http2`**, because a program hands a session bytes and
+reads what they said at once, and node's HTTP/2 only answers later. In a browser `listen` refuses
+and there are no sockets, so nothing there reaches a session; `hpack*` needs neither and works.
+
+**A client writes the bytes the interpreter's writes.** Its header blocks come from nghttp2's own
+encoder decisions — what is indexed, what is never indexed (`authorization`, a short `cookie`, a
+field marked so), Huffman only where it is shorter — so `hpackDeflate` answers the same bytes on
+both hosts, and frames go out in nghttp2's order: SETTINGS and PING first, then frames about open
+streams, then new requests, then DATA. **The server's encoder is the one difference left**: it
+never indexes, so a response's header block is a few bytes longer than nghttp2's and decodes to the
+same fields.
+
 The session holds a peer to nghttp2's limits — both flow-control windows, at most 100 streams open
 at once, a 64 KiB header list, eight CONTINUATION frames to a header block, and nghttp2's
 rapid-reset bucket — and advertises the stream and header-list limits in its SETTINGS, which an nghttp2

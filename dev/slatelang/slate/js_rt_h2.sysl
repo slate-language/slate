@@ -13,11 +13,11 @@ module dev.slatelang.slate
 //
 // ## What is here, and what is not
 //
-// **The server's half, which is what `serve` needs**: `h2Server`, `h2Receive`, `h2Send`, `h2Next`,
-// `h2Respond`, `h2RespondStream`, `h2Push`, `h2Finish`, `h2Goaway`, `h2Reset`, `h2Consume` and
-// `h2Close`. The client's half, `h2Settings`, `h2WindowUpdate`, `h2Ping`, `h2Wants` and the stand-alone
-// HPACK calls stay on the `OWED` list and say so. HPACK itself is `js_rt_h2_hpack.sysl`, whose block
-// opens the `h2` scope that this one closes.
+// **The session both halves share, and the server's half of it**, which is what `serve` needs. What
+// only a client does -- opening streams, reading responses, being refused once the server has gone
+// away -- is `js_rt_h2_client.sysl`'s subclass, whose block closes the `h2` scope; HPACK is
+// `js_rt_h2_hpack.sysl`, whose block opens it. The control frames (`h2Settings`, `h2Ping`,
+// `h2WindowUpdate`) and `h2Wants` are here, being the same on both ends.
 //
 // **The encoder never indexes.** Every field goes out as an indexed static entry or a literal
 // without indexing, so the peer's table is never touched and a `SETTINGS_HEADER_TABLE_SIZE` it
@@ -51,16 +51,15 @@ js_runtime_h2() -> string = raw"""
 
             const PREFACE = Buffer.from("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", "latin1")
 
-            // The size of a frame this side accepts: the protocol's default, which it never raises.
+            // The size of a frame this side accepts until its own SETTINGS raise it, and of the largest
+            // DATA frame it sends.
             const MAX_FRAME = 16384
 
-            // The window this side opens for every stream and for the connection: the protocol's
-            // default, which it never raises, so a peer may have this much unacknowledged at most.
+            // The window this side opens for every stream and for the connection until the program
+            // widens one, so a peer may have this much unacknowledged at most. Flow-control credit
+            // goes back as nghttp2 returns it: once HALF a window has been consumed, counted
+            // separately for the connection and for each stream.
             const INITIAL_WINDOW = 65535
-
-            // Flow-control credit goes back as nghttp2 returns it: once HALF a window has been consumed,
-            // counted separately for the connection and for each stream.
-            const CREDIT_AT = INITIAL_WINDOW >> 1
 
             // **The limits a peer is held to, which are nghttp2's in substance.** The first two are
             // advertised in this side's SETTINGS; the CONTINUATION cap is nghttp2's default since the
@@ -80,6 +79,13 @@ js_runtime_h2() -> string = raw"""
 
             // What nghttp2 puts in front of a failure it reports, which is what `h2Receive` answers.
             const PEER = "reading what the peer sent: "
+
+            // **What goes out first is nghttp2's order, not the order things were asked for**: SETTINGS
+            // and PING ahead of everything, then the frames about streams already open, then the HEADERS
+            // that open new ones, then DATA. Each queued frame carries its rank and `send` sorts on it.
+            const URGENT = 0, REGULAR = 1, OPENING = 2, BODY = 3
+
+            const MAX_WINDOW = 0x7fffffff
 
             const frame = (type, flags, stream, payload) => {
                 const head = Buffer.alloc(9)
@@ -124,23 +130,131 @@ js_runtime_h2() -> string = raw"""
                     this.goaways = []
                     this.resetTokens = RESET_BURST
                     this.resetAt = Date.now()
+                    this.isClient = false
+                    this.localWin = INITIAL_WINDOW
+                    this.localInitial = INITIAL_WINDOW
+                    this.localFrame = MAX_FRAME
+                    this.localStreams = MAX_STREAMS
+                    this.unacked = []
+                    this.goawaySent = false
+                    this.goawayRecv = false
+                    this.termSent = false
 
                     // The server's own SETTINGS go first: every default but the two limits it holds
                     // the peer to, so that a client which reads them never meets the refusal.
-                    const limits = Buffer.alloc(12)
+                    this.settings([[3, MAX_STREAMS], [6, MAX_HEADER_LIST]])
+                }
 
-                    limits.writeUInt16BE(3, 0)
-                    limits.writeUInt32BE(MAX_STREAMS, 2)
-                    limits.writeUInt16BE(6, 6)
-                    limits.writeUInt32BE(MAX_HEADER_LIST, 8)
-                    this.out.push(frame(SETTINGS, 0, 0, limits))
+                // A frame to go out, ranked; `after` runs once it has gone, which is when nghttp2
+                // counts a stream as closed by what this side wrote.
+                put(rank, bytes, after, stream) {
+                    this.out.push({ rank: rank, bytes: bytes, after: after, stream: stream })
+                }
+
+                // This side's SETTINGS, which are in force once the peer acknowledges them.
+                settings(entries) {
+                    const body = Buffer.alloc(entries.length * 6)
+
+                    entries.forEach(([id, value], i) => {
+                        body.writeUInt16BE(id, i * 6)
+                        body.writeUInt32BE(value, i * 6 + 2)
+                    })
+
+                    this.put(URGENT, frame(SETTINGS, 0, 0, body))
+                    this.unacked.push(entries)
+                }
+
+                // The peer has acknowledged the oldest SETTINGS this side sent. A new initial window
+                // moves every open stream's window by the difference, as nghttp2 moves it.
+                acknowledged() {
+                    const entries = this.unacked.shift()
+
+                    if (entries === undefined) return
+
+                    for (const [id, value] of entries) {
+                        if (id === 1) {
+                            this.dec.limit = value
+
+                            if (this.dec.max > value) {
+                                this.dec.max = value
+                                this.dec.evict(value)
+                            }
+                        } else if (id === 3) {
+                            this.localStreams = value
+                        } else if (id === 4) {
+                            const delta = value - this.localInitial
+
+                            this.localInitial = value
+
+                            for (const s of this.streams.values()) {
+                                s.localWin += delta
+                                s.recvWin += delta
+                            }
+                        } else if (id === 5) {
+                            this.localFrame = value
+                        }
+                    }
+                }
+
+                ping() {
+                    this.put(URGENT, frame(PING, 0, 0, Buffer.alloc(8)))
+                }
+
+                // **The program's own WINDOW_UPDATE is nghttp2's arithmetic**: an increment pays off
+                // what has arrived and not been credited first, and only what is left over widens the
+                // window itself -- which is why a window can never pass the protocol's limit without
+                // the call refusing. Credit the session owed is reduced by the same amount.
+                windowUpdate(stream, by) {
+                    if (by === 0) return null
+
+                    const s = stream === 0 ? this : this.streams.get(stream)
+
+                    if (s === undefined) return null
+
+                    const owed = Math.max(0, s.localWin - s.recvWin)
+
+                    if (by > owed) {
+                        if (s.localWin > MAX_WINDOW - (by - owed)) return "submitting WINDOW_UPDATE: Flow control error"
+
+                        s.localWin += by - owed
+                    }
+
+                    s.recvWin += by
+
+                    if (stream === 0) this.connCredit = Math.max(0, this.connCredit - by)
+                    else s.credit = Math.max(0, s.credit - by)
+
+                    this.put(REGULAR, frame(WINDOW_UPDATE, 0, stream, u32(by)))
+
+                    return null
+                }
+
+                // `{ read, write }`, nghttp2's two answers: nothing at all once a GOAWAY that ends the
+                // connection has gone out; reading while a stream is open or no GOAWAY has passed
+                // either way; writing while anything is queued that the windows let out.
+                wants() {
+                    if (this.termSent) return [false, false]
+
+                    const read = this.streams.size > 0 || !(this.goawaySent || this.goawayRecv)
+                    let write = this.out.length > 0
+
+                    if (this.sendWin > 0)
+                        for (const s of this.pending)
+                            if ((s.queue.length > 0 && s.sendWin > 0) || (s.queue.length === 0 && s.finishing && !s.sentEnded)) write = true
+
+                    return [read, write]
+                }
+
+                // Whether a stream the peer named was never opened by anybody.
+                neverOpened(stream) {
+                    return stream > this.lastStream
                 }
 
                 // A connection error that is not worth reading past: its GOAWAY is queued, the session
                 // reads nothing more, and `h2Receive` answers `null`. The program's own `h2Goaway`
                 // after it is not sent, the peer having been told why already.
-                fatal(code) {
-                    this.terminate(code)
+                fatal(code, why) {
+                    this.terminate(code, why)
                     this.ignoring = true
 
                     throw new Halt()
@@ -148,26 +262,29 @@ js_runtime_h2() -> string = raw"""
 
                 // A connection error that only queues its GOAWAY, so the bytes already in hand are still
                 // read -- the rapid-reset bucket's, as nghttp2 does it. Said once however often it recurs.
-                terminate(code) {
+                terminate(code, why) {
                     if (this.terminated) return
 
                     this.terminated = true
-                    this.queueGoaway(this.lastStream, code)
+                    this.queueGoaway(this.lastStream, code, why)
                 }
 
-                queueGoaway(last, code) {
-                    const body = Buffer.alloc(8)
+                // A GOAWAY, with the reason nghttp2 gives in its debug data where it gives one.
+                queueGoaway(last, code, why) {
+                    const debug = why === undefined ? Buffer.alloc(0) : Buffer.from(why, "latin1")
+                    const body = Buffer.alloc(8 + debug.length)
 
                     body.writeUInt32BE(last, 0)
                     body.writeUInt32BE(code, 4)
-                    this.out.push(frame(GOAWAY, 0, 0, body))
+                    debug.copy(body, 8)
+                    this.put(REGULAR, frame(GOAWAY, 0, 0, body))
                     this.goaways.push(last)
                 }
 
                 // A stream error: RST_STREAM with its code, and the stream gone as though the peer had
                 // reset it, so the program is told `streamClose` and forgets what it held for it.
                 resetStream(stream, code) {
-                    this.out.push(frame(RST_STREAM, 0, stream, u32(code)))
+                    this.put(REGULAR, frame(RST_STREAM, 0, stream, u32(code)))
 
                     const s = this.streams.get(stream)
 
@@ -219,7 +336,7 @@ js_runtime_h2() -> string = raw"""
 
                         const len = this.inbuf.readUIntBE(0, 3)
 
-                        if (len > MAX_FRAME) this.fatal(FRAME_SIZE_ERROR)
+                        if (len > this.localFrame) this.fatal(FRAME_SIZE_ERROR)
 
                         if (this.inbuf.length < 9 + len) return
 
@@ -243,6 +360,13 @@ js_runtime_h2() -> string = raw"""
                 }
 
                 take(type, flags, stream, payload) {
+                    // A client hears the server's SETTINGS before anything else, or hangs up.
+                    if (this.isClient && !this.heardSettings) {
+                        if (type !== SETTINGS || (flags & ACK) !== 0) this.fatal(PROTOCOL_ERROR, "SETTINGS expected")
+
+                        this.heardSettings = true
+                    }
+
                     if (this.continuing !== null && (type !== CONTINUATION || stream !== this.continuing.stream))
                         refuse("a header block was interrupted by another frame")
 
@@ -292,7 +416,7 @@ js_runtime_h2() -> string = raw"""
                     const s = this.streams.get(stream)
 
                     if (s === undefined) {
-                        if (stream > this.lastStream) refuse("DATA on a stream that was never opened")
+                        if (this.neverOpened(stream)) refuse("DATA on a stream that was never opened")
 
                         this.credit(undefined, payload.length)
 
@@ -351,7 +475,7 @@ js_runtime_h2() -> string = raw"""
                         if (known.recvEnded) coded(STREAM_CLOSED, "HEADERS on a stream the peer had ended")
 
                         this.events.push({ kind: "beginHeaders", stream: stream, of: "trailer" })
-                    } else if (this.streams.size < MAX_STREAMS) {
+                    } else if (this.streams.size < this.localStreams) {
                         this.events.push({ kind: "beginHeaders", stream: stream, of: "request" })
                     }
 
@@ -422,8 +546,8 @@ js_runtime_h2() -> string = raw"""
                     // it may try again; a header list past the size this side advertised is answered
                     // `431` here, the program having nothing it could do with a request it was never
                     // given -- and a reset after it where the client meant to send a body.
-                    if (this.streams.size >= MAX_STREAMS) {
-                        this.out.push(frame(RST_STREAM, 0, stream, u32(REFUSED_STREAM)))
+                    if (this.streams.size >= this.localStreams) {
+                        this.put(REGULAR, frame(RST_STREAM, 0, stream, u32(REFUSED_STREAM)))
 
                         return
                     }
@@ -431,16 +555,17 @@ js_runtime_h2() -> string = raw"""
                     if (fields === null) {
                         const ends = (flags & END_STREAM) !== 0
 
-                        this.headFrames(stream, encodeFields([[":status", "431", false]]), true)
+                        this.headFrames(stream, encodeFields([[":status", "431", false]]), true, REGULAR)
 
-                        if (!ends) this.out.push(frame(RST_STREAM, 0, stream, u32(NO_ERROR)))
+                        if (!ends) this.put(REGULAR, frame(RST_STREAM, 0, stream, u32(NO_ERROR)))
 
                         return
                     }
 
                     const s = {
                         id: stream,
-                        recvWin: INITIAL_WINDOW,
+                        localWin: this.localInitial,
+                        recvWin: this.localInitial,
                         recvEnded: false,
                         sentEnded: false,
                         headSent: false,
@@ -495,13 +620,16 @@ js_runtime_h2() -> string = raw"""
                     // bucket, and a client that empties it is hung up on. **The code is INTERNAL_ERROR,
                     // which is what nghttp2 sends for it** -- not ENHANCE_YOUR_CALM, though that is the
                     // code RFC 9113 suggests -- and the reset that emptied it is still delivered.
-                    const now = Date.now()
+                    // A client is not held to it: the streams being reset are its own.
+                    if (!this.isClient) {
+                        const now = Date.now()
 
-                    this.resetTokens = Math.min(RESET_BURST, this.resetTokens + (now - this.resetAt) * RESET_RATE / 1000)
-                    this.resetAt = now
+                        this.resetTokens = Math.min(RESET_BURST, this.resetTokens + (now - this.resetAt) * RESET_RATE / 1000)
+                        this.resetAt = now
 
-                    if (this.resetTokens < 1) this.terminate(INTERNAL_ERROR)
-                    else this.resetTokens -= 1
+                        if (this.resetTokens < 1) this.terminate(INTERNAL_ERROR)
+                        else this.resetTokens -= 1
+                    }
 
                     this.events.push({ kind: "rstStream", stream: stream, code: payload.readUInt32BE(0) })
                     this.drop(s, payload.readUInt32BE(0))
@@ -512,6 +640,8 @@ js_runtime_h2() -> string = raw"""
 
                     if ((flags & ACK) !== 0) {
                         if (payload.length !== 0) coded(FRAME_SIZE_ERROR, "a SETTINGS acknowledgement with a payload")
+
+                        this.acknowledged()
 
                         return
                     }
@@ -537,7 +667,7 @@ js_runtime_h2() -> string = raw"""
                         }
                     }
 
-                    this.out.push(frame(SETTINGS, ACK, 0, Buffer.alloc(0)))
+                    this.put(URGENT, frame(SETTINGS, ACK, 0, Buffer.alloc(0)))
                     this.events.push({ kind: "settings" })
                 }
 
@@ -547,7 +677,7 @@ js_runtime_h2() -> string = raw"""
 
                     const ack = (flags & ACK) !== 0
 
-                    if (!ack) this.out.push(frame(PING, ACK, 0, Buffer.from(payload)))
+                    if (!ack) this.put(URGENT, frame(PING, ACK, 0, Buffer.from(payload)))
 
                     this.events.push({ kind: "ping", ack: ack })
                 }
@@ -556,11 +686,15 @@ js_runtime_h2() -> string = raw"""
                     if (stream !== 0) refuse("GOAWAY on a stream")
                     if (payload.length < 8) coded(FRAME_SIZE_ERROR, "a GOAWAY that is too short")
 
-                    this.events.push({
-                        kind: "goaway",
-                        lastStream: payload.readUInt32BE(0) & 0x7fffffff,
-                        code: payload.readUInt32BE(4)
-                    })
+                    const last = payload.readUInt32BE(0) & 0x7fffffff
+
+                    this.goawayRecv = true
+                    this.events.push({ kind: "goaway", lastStream: last, code: payload.readUInt32BE(4) })
+
+                    // This side's own streams past the last the peer processed were never seen, and
+                    // close as REFUSED_STREAM -- a client's, a server opening none of its own.
+                    for (const s of [...this.streams.values()])
+                        if (s.id % 2 === (this.isClient ? 1 : 0) && s.id > last) this.drop(s, REFUSED_STREAM)
                 }
 
                 takeWindow(stream, payload) {
@@ -582,7 +716,7 @@ js_runtime_h2() -> string = raw"""
                         s.sendWin += by
 
                         if (s.sendWin > 0x7fffffff) {
-                            this.out.push(frame(RST_STREAM, 0, stream, u32(3)))
+                            this.put(REGULAR, frame(RST_STREAM, 0, stream, u32(3)))
                             this.drop(s, 3)
 
                             return
@@ -603,8 +737,8 @@ js_runtime_h2() -> string = raw"""
 
                     this.connCredit += n
 
-                    if (this.connCredit >= CREDIT_AT) {
-                        this.out.push(frame(WINDOW_UPDATE, 0, 0, u32(this.connCredit)))
+                    if (this.connCredit >= this.localWin >> 1) {
+                        this.put(REGULAR, frame(WINDOW_UPDATE, 0, 0, u32(this.connCredit)))
                         this.recvWin += this.connCredit
                         this.connCredit = 0
                     }
@@ -613,8 +747,8 @@ js_runtime_h2() -> string = raw"""
 
                     s.credit += n
 
-                    if (s.credit >= CREDIT_AT) {
-                        this.out.push(frame(WINDOW_UPDATE, 0, s.id, u32(s.credit)))
+                    if (s.credit >= s.localWin >> 1) {
+                        this.put(REGULAR, frame(WINDOW_UPDATE, 0, s.id, u32(s.credit)))
                         s.recvWin += s.credit
                         s.credit = 0
                     }
@@ -629,21 +763,31 @@ js_runtime_h2() -> string = raw"""
                 // -- writing -------------------------------------------------------------------------------
 
                 // A header block as a HEADERS frame and the CONTINUATIONs it needs.
-                headFrames(stream, block, endStream) {
-                    const size = this.peerFrame
-                    let first = true
+                //
+                // **A block may be a function, called when the frames are written**: an encoder that
+                // indexes has to see the blocks in the order the peer will, which is the order they go
+                // out and not the order they were asked for.
+                headFrames(stream, block, endStream, rank, after) {
+                    this.put(rank, () => {
+                        const whole = typeof block === "function" ? block() : block
+                        const size = this.peerFrame
+                        const parts = []
 
-                    for (let at = 0; first || at < block.length; at += size) {
-                        const part = block.subarray(at, at + size)
-                        const last = at + size >= block.length
+                        for (let at = 0; at === 0 || at < whole.length; at += size) {
+                            const part = whole.subarray(at, at + size)
+                            const last = at + size >= whole.length
 
-                        if (first) {
-                            this.out.push(frame(HEADERS, (last ? END_HEADERS : 0) | (endStream ? END_STREAM : 0), stream, part))
-                            first = false
-                        } else {
-                            this.out.push(frame(CONTINUATION, last ? END_HEADERS : 0, stream, part))
+                            if (at === 0) parts.push(frame(HEADERS, (last ? END_HEADERS : 0) | (endStream ? END_STREAM : 0), stream, part))
+                            else parts.push(frame(CONTINUATION, last ? END_HEADERS : 0, stream, part))
                         }
-                    }
+
+                        return Buffer.concat(parts)
+                    }, after, stream)
+                }
+
+                // A header block this side sends, as `headFrames` takes it.
+                block(fields) {
+                    return encodeFields(fields)
                 }
 
                 open(stream, name) {
@@ -663,7 +807,7 @@ js_runtime_h2() -> string = raw"""
 
                     const ends = whole && body.length === 0
 
-                    this.headFrames(stream, encodeFields(fields), ends)
+                    this.headFrames(stream, encodeFields(fields), ends, REGULAR)
 
                     if (ends) {
                         s.sentEnded = true
@@ -679,12 +823,12 @@ js_runtime_h2() -> string = raw"""
                     }
                 }
 
+                // A piece of a body that is still open. The two refusals are the interpreter's binding's.
                 push(stream, piece) {
                     const s = this.streams.get(stream)
 
-                    if (s === undefined || s.closed) return "stream " + stream + " is closed"
-                    if (!s.headSent) return "stream " + stream + " has no head yet"
-                    if (s.finishing) return "stream " + stream + " has already been finished"
+                    if (s === undefined || s.closed || !s.headSent) return "there is no body open on stream " + stream
+                    if (s.finishing) return "the body on stream " + stream + " has been finished, so there is nothing to add to"
 
                     if (piece.length > 0) {
                         s.queue.push(piece)
@@ -697,12 +841,11 @@ js_runtime_h2() -> string = raw"""
                 finish(stream, trailers) {
                     const s = this.streams.get(stream)
 
-                    if (s === undefined || s.closed) return "stream " + stream + " is closed"
-                    if (!s.headSent) return "stream " + stream + " has no head yet"
-                    if (s.finishing) return "stream " + stream + " has already been finished"
+                    if (s === undefined || s.closed || !s.headSent) return "there is no body open on stream " + stream
+                    if (s.finishing) return null
 
                     s.finishing = true
-                    s.trailers = trailers === null ? null : encodeFields(trailers)
+                    s.trailers = trailers === null ? null : this.block(trailers)
                     this.pending.add(s)
 
                     return null
@@ -714,7 +857,7 @@ js_runtime_h2() -> string = raw"""
                 // dropped.
                 reset(stream, code) {
                     if (this.continuing !== null && this.continuing.stream === stream) {
-                        this.out.push(frame(RST_STREAM, 0, stream, u32(code)))
+                        this.put(REGULAR, frame(RST_STREAM, 0, stream, u32(code)))
                         this.continuing.dropped = true
                         this.events.push({ kind: "streamClose", stream: stream, code: code })
 
@@ -738,7 +881,7 @@ js_runtime_h2() -> string = raw"""
                 // still being read is such a stream: it has been counted since its first frame.
                 closeBeyond(last) {
                     for (const s of [...this.streams.values()])
-                        if (s.id % 2 === 1 && s.id > last) this.drop(s, REFUSED_STREAM)
+                        if (s.id % 2 === (this.isClient ? 0 : 1) && s.id > last) this.drop(s, REFUSED_STREAM)
 
                     if (this.continuing !== null && this.continuing.stream > last && this.continuing.dropped !== true) {
                         this.events.push({ kind: "streamClose", stream: this.continuing.stream, code: REFUSED_STREAM })
@@ -749,9 +892,11 @@ js_runtime_h2() -> string = raw"""
                 // Every queued body that the windows allow, as DATA frames.
                 flush() {
                     for (const s of this.pending) {
+                        // A DATA frame is sixteen kilobytes at most whatever the peer allows, which is
+                        // nghttp2's own buffer.
                         while (s.queue.length > 0 && s.sendWin > 0 && this.sendWin > 0) {
                             const head = s.queue[0]
-                            const n = Math.min(head.length, s.sendWin, this.sendWin, this.peerFrame)
+                            const n = Math.min(head.length, s.sendWin, this.sendWin, MAX_FRAME)
                             const piece = n === head.length ? head : head.subarray(0, n)
 
                             if (n === head.length) s.queue.shift()
@@ -762,7 +907,7 @@ js_runtime_h2() -> string = raw"""
 
                             const last = s.queue.length === 0 && s.finishing && s.trailers === null
 
-                            this.out.push(frame(DATA, last ? END_STREAM : 0, s.id, Buffer.from(piece)))
+                            this.put(BODY, frame(DATA, last ? END_STREAM : 0, s.id, Buffer.from(piece)))
 
                             if (last) {
                                 s.sentEnded = true
@@ -772,8 +917,8 @@ js_runtime_h2() -> string = raw"""
                         }
 
                         if (s.queue.length === 0 && s.finishing && !s.sentEnded) {
-                            if (s.trailers !== null) this.headFrames(s.id, s.trailers, true)
-                            else this.out.push(frame(DATA, END_STREAM, s.id, Buffer.alloc(0)))
+                            if (s.trailers !== null) this.headFrames(s.id, s.trailers, true, BODY)
+                            else this.put(BODY, frame(DATA, END_STREAM, s.id, Buffer.alloc(0)))
 
                             s.sentEnded = true
                         }
@@ -788,12 +933,22 @@ js_runtime_h2() -> string = raw"""
                 send() {
                     this.flush()
 
-                    const out = this.out.length === 0 ? Buffer.alloc(0) : Buffer.concat(this.out)
+                    const queued = this.out
 
+                    queued.sort((a, b) => a.rank - b.rank)
                     this.out = []
 
+                    const out = Buffer.concat(queued.map((f) => typeof f.bytes === "function" ? f.bytes() : f.bytes))
+
+                    for (const f of queued) if (f.after !== undefined) f.after()
+
                     // Once the GOAWAY that ends a connection has gone out, nothing more is read.
-                    if (this.terminated) this.ignoring = true
+                    if (this.terminated && out.length > 0) {
+                        this.ignoring = true
+                        this.termSent = true
+                    }
+
+                    if (this.goaways.length > 0) this.goawaySent = true
 
                     for (const last of this.goaways) this.closeBeyond(last)
 
@@ -802,10 +957,6 @@ js_runtime_h2() -> string = raw"""
                     return out
                 }
             }
-
-            return { Session, H2Error }
-        })()
-
 """
 
 #else

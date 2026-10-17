@@ -1,0 +1,840 @@
+module dev.slatelang.slate
+@tests
+
+// **THE WHOLE FILE IS BEHIND THE `http2` FEATURE**, which is `tests_http2.sysl`'s rule and its reason.
+#if feature_http2
+
+import sysl.fs.{read_bytes, remove_file, write_text}
+import sysl.process.capture
+import sysl.text.{from_utf8, split, str_builder}
+
+// `slate:nghttp2`'s client half and its stand-alone HPACK in the JavaScript back end, held to the
+// interpreter's nghttp2.
+//
+// **Each program here runs on both hosts and is held to ONE written answer, which was read off the
+// interpreter**, so what the JavaScript session is held to is nghttp2's: `tests_js_h2.sysl`'s
+// arrangement. The in-memory programs put a client and a server in one process with no socket, which
+// under node is a JavaScript client talking to a JavaScript server. The last test is the real-world
+// half: a JavaScript client over TLS against node's own `http2` server, which is as independent of
+// both back ends as a server can be.
+
+// A client and a server in memory, one write at a time. A client's frames are printed in full --
+// type, flags, stream, length, and what a SETTINGS, WINDOW_UPDATE, RST_STREAM or GOAWAY carries -- so
+// the HEADERS lengths are a check of the encoder too: the JavaScript client's is nghttp2's,
+// indexing and Huffman included. A server's are printed without lengths or SETTINGS entries, because
+// the JavaScript server's encoder never indexes and it advertises the two limits it holds a peer to,
+// and both of those are deliberate.
+private val ClientSource: string = raw"""
+import { h2Client, h2Server, h2Receive, h2Send, h2Next, h2Request, h2RequestStream, h2Respond, h2RespondStream, h2Push, h2Finish, h2Settings, h2Goaway, h2Reset, h2WindowUpdate, h2Ping, h2Wants, h2Close } from slate:nghttp2
+
+val names = ["DATA", "HEADERS", "PRIORITY", "RST", "SETTINGS", "PUSH", "PING", "GOAWAY", "WINDOW", "CONT"]
+
+u32(bs, at) = ((bs[at] * 256 + bs[at + 1]) * 256 + bs[at + 2]) * 256 + bs[at + 3]
+
+frames(bs, full = true)
+    var at = 0
+    var seen = []
+
+    if bs.length >= 24 && bs[0] == 80 && bs[1] == 82 && bs[2] == 73
+        seen.push("preface")
+        at = 24
+
+    while at + 9 <= bs.length
+        val n = bs[at] * 65536 + bs[at + 1] * 256 + bs[at + 2]
+        val t = bs[at + 3]
+        val p = at + 9
+        var more = ""
+
+        if t == 4 && full
+            var i = 0
+
+            while i < n
+                more = more + " " + string(bs[p + i] * 256 + bs[p + i + 1]) + "=" + string(u32(bs, p + i + 2))
+                i = i + 6
+        elif t == 8 || t == 3
+            more = " " + string(u32(bs, p))
+        elif t == 7
+            more = " " + string(u32(bs, p)) + "," + string(u32(bs, p + 4))
+
+        seen.push(names[t] + "/" + string(bs[at + 4]) + "/" + string(u32(bs, at + 5)) + (if full then "/" + string(n) else "") + more)
+        at = p + n
+
+    seen.join(" ")
+
+told(e)
+    var t = e.kind
+
+    if has(e, "stream") then t = t + " s" + string(e.stream)
+    if has(e, "of") then t = t + " " + e.of
+    if has(e, "headers") then t = t + " " + toJSON(e.headers)
+    if has(e, "bytes") then t = t + " " + string(e.bytes.length) + "b"
+    if has(e, "code") then t = t + " code " + string(e.code)
+    if has(e, "lastStream") then t = t + " last " + string(e.lastStream)
+    if has(e, "increment") then t = t + " +" + string(e.increment)
+    if has(e, "ack") then t = t + " ack " + string(e.ack)
+
+    t
+
+drain(name, sess)
+    var e = h2Next(sess)
+
+    while e != null
+        print("  " + name + ": " + told(e))
+        e = h2Next(sess)
+
+step(an, a, bn, b)
+    val bs = h2Send(a).toArray()
+
+    drain(an, a)
+
+    if bs.length == 0 then return false
+
+    print(an + " > " + frames(bs, an != "s"))
+
+    val said = h2Receive(b, bs)
+
+    if said != null then print("  " + bn + " answered " + toJSON(said))
+
+    drain(bn, b)
+
+    true
+
+talk(c, s)
+    var going = true
+
+    while going
+        val one = step("c", c, "s", s)
+        val two = step("s", s, "c", c)
+
+        going = one || two
+
+wants(name, sess)
+    val w = h2Wants(sess)
+
+    print(name + " wants read " + string(w.read) + " write " + string(w.write))
+
+tried(what, f)
+    try
+        print(what + ": " + toJSON(f()))
+    catch e
+        print(what + " faults: " + e.message)
+
+print("-- a session, before anything")
+val c = h2Client()
+val s = h2Server()
+
+wants("c", c)
+wants("s", s)
+
+print("-- GET, answered with a body")
+val one = h2Request(c, { ":method": "GET", ":scheme": "https", ":authority": "example.test", ":path": "/things" })
+
+print("stream " + string(one))
+wants("c", c)
+talk(c, s)
+h2Respond(s, one, { ":status": "200", "content-type": "text/plain" }, "hello from h2")
+talk(c, s)
+
+print("-- the same request again costs less, the table having it")
+val two = h2Request(c, { ":method": "GET", ":scheme": "https", ":authority": "example.test", ":path": "/things" })
+
+talk(c, s)
+h2Respond(s, two, [[":status", "204"]])
+talk(c, s)
+
+print("-- POST, a body past one frame")
+val three = h2Request(c, [[":method", "POST"], [":scheme", "https"], [":authority", "example.test"], [":path", "/up"], ["content-type", "text/plain"]], "z".repeat(40000))
+
+talk(c, s)
+h2Respond(s, three, { ":status": "201" }, "took it")
+talk(c, s)
+
+print("-- a response with trailers, and a request body written in pieces")
+val four = h2RequestStream(c, { ":method": "PUT", ":scheme": "https", ":authority": "example.test", ":path": "/stream" })
+
+talk(c, s)
+print(toJSON(h2Push(c, four, "first ")))
+talk(c, s)
+print(toJSON(h2Push(c, four, toBytes("second"))))
+print(toJSON(h2Finish(c, four)))
+talk(c, s)
+h2RespondStream(s, four, { ":status": "200" })
+h2Push(s, four, "part")
+h2Finish(s, four, [["grpc-status", "0"]])
+talk(c, s)
+
+print("-- settings")
+h2Settings(c, { initialWindowSize: 100000, maxConcurrentStreams: 50, headerTableSize: 8192, enablePush: 0 })
+wants("c", c)
+talk(c, s)
+h2Settings(s, { maxFrameSize: 32768 })
+talk(c, s)
+
+print("-- ping")
+h2Ping(c)
+talk(c, s)
+h2Ping(s)
+talk(c, s)
+
+print("-- window updates")
+h2WindowUpdate(c, 0, 1000)
+talk(c, s)
+val five = h2RequestStream(c, { ":method": "POST", ":scheme": "https", ":authority": "example.test", ":path": "/w" })
+
+talk(c, s)
+h2WindowUpdate(s, five, 5000)
+h2WindowUpdate(c, five, 7)
+h2WindowUpdate(c, 99, 7)
+talk(c, s)
+
+print("-- a reset")
+h2Reset(c, five, 8)
+talk(c, s)
+print(toJSON(h2Push(c, five, "late")))
+
+print("-- a stream the server resets")
+val six = h2Request(c, { ":method": "GET", ":scheme": "https", ":authority": "example.test", ":path": "/no" })
+
+talk(c, s)
+h2Reset(s, six, 2)
+talk(c, s)
+
+print("-- request and ping in one write")
+val seven = h2Request(c, { ":method": "GET", ":scheme": "https", ":authority": "example.test", ":path": "/both" }, "b")
+
+h2Ping(c)
+h2WindowUpdate(c, 0, 10)
+talk(c, s)
+h2Respond(s, seven, { ":status": "200" }, "ok")
+talk(c, s)
+
+print("-- goaway")
+val eight = h2Request(c, { ":method": "GET", ":scheme": "https", ":authority": "example.test", ":path": "/last" })
+
+talk(c, s)
+h2Goaway(s, 7, 0)
+wants("s", s)
+talk(c, s)
+wants("c", c)
+wants("s", s)
+tried("a request after goaway", () -> h2Request(c, { ":method": "GET", ":scheme": "https", ":authority": "example.test", ":path": "/after" }))
+talk(c, s)
+
+h2Close(c)
+h2Close(s)
+
+print("-- what a client refuses")
+val r = h2Client()
+
+tried("respond on a client", () -> h2Respond(r, 1, { ":status": "200" }))
+tried("push on a stream never opened", () -> h2Push(r, 9, "x"))
+tried("a bad setting", () -> h2Settings(r, { nope: 1 }))
+tried("enablePush 2", () -> h2Settings(r, { enablePush: 2 }))
+tried("a window past the limit", () -> h2Settings(r, { initialWindowSize: 2147483648 }))
+tried("a frame size too small", () -> h2Settings(r, { maxFrameSize: 100 }))
+tried("settings not an object", () -> h2Settings(r, 5))
+tried("a negative count", () -> h2Settings(r, { maxConcurrentStreams: -1 }))
+tried("a window update of nothing", () -> h2WindowUpdate(r, 0, 0))
+tried("a negative window update", () -> h2WindowUpdate(r, 0, -1))
+tried("a window update past the limit", () -> h2WindowUpdate(r, 0, 2147483647))
+tried("ping with an argument", () -> h2Ping(r, 1))
+tried("wants with nothing", () -> h2Wants())
+tried("request with no headers", () -> h2Request(r))
+tried("request a number", () -> h2Request(r, 5))
+tried("request a header number", () -> h2Request(r, { ":path": 12 }))
+tried("request a body number", () -> h2Request(r, { ":path": "/" }, 12))
+tried("request stream with a body", () -> h2RequestStream(r, { ":path": "/" }, "x"))
+tried("client options", () -> h2Client({ autoWindowUpdate: 3 }))
+tried("client two options", () -> h2Client({}, {}))
+print(toJSON(frames(h2Send(r).toArray())))
+tried("a server sends a request", () -> h2Request(h2Server(), { ":path": "/" }))
+
+print("-- a client that is not answered with SETTINGS first")
+val q = h2Client()
+
+h2Send(q)
+print(toJSON(h2Receive(q, [0, 0, 8, 6, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8])))
+print(frames(h2Send(q).toArray()))
+drain("q", q)
+wants("q", q)
+h2Close(q)
+"""
+
+// **Every line was first read off the interpreter.** What it showed that a JavaScript client has to
+// do the same way: frames go out SETTINGS and PING first, then frames about open streams, then the
+// HEADERS that open new ones, then DATA; a request with no body is half closed, and a reset stream
+// closed, when its frame GOES OUT rather than when it is asked for; the server's GOAWAY closes the
+// client's streams past its last stream as REFUSED_STREAM, and a request made after it is closed the
+// same way, unsent; a client's own WINDOW_UPDATE pays off uncredited bytes before it widens a window;
+// and a server whose first frame is not SETTINGS is hung up on with "SETTINGS expected".
+private val ClientAnswered: string = raw"""
+-- a session, before anything
+c wants read true write true
+s wants read true write true
+-- GET, answered with a body
+stream 1
+c wants read true write true
+c > preface SETTINGS/0/0/0 HEADERS/5/1/20
+  s: settings
+  s: beginHeaders s1 request
+  s: headers s1 request [[":method","GET"],[":scheme","https"],[":authority","example.test"],[":path","/things"]]
+  s: streamEnd s1
+s > SETTINGS/0/0 SETTINGS/1/0
+  c: settings
+c > SETTINGS/1/0/0
+  s: streamClose s1 code 0
+s > HEADERS/4/1 DATA/1/1
+  c: beginHeaders s1 response
+  c: headers s1 response [[":status","200"],["content-type","text/plain"]]
+  c: data s1 13b
+  c: streamEnd s1
+  c: streamClose s1 code 0
+-- the same request again costs less, the table having it
+c > HEADERS/5/3/10
+  s: beginHeaders s3 request
+  s: headers s3 request [[":method","GET"],[":scheme","https"],[":authority","example.test"],[":path","/things"]]
+  s: streamEnd s3
+  s: streamClose s3 code 0
+s > HEADERS/5/3
+  c: beginHeaders s3 response
+  c: headers s3 response [[":status","204"]]
+  c: streamEnd s3
+  c: streamClose s3 code 0
+-- POST, a body past one frame
+c > HEADERS/4/5/17 DATA/0/5/16384 DATA/0/5/16384 DATA/1/5/7232
+  s: beginHeaders s5 request
+  s: headers s5 request [[":method","POST"],[":scheme","https"],[":authority","example.test"],[":path","/up"],["content-type","text/plain"]]
+  s: data s5 16384b
+  s: data s5 16384b
+  s: data s5 7232b
+  s: streamEnd s5
+s > WINDOW/0/0 32768 WINDOW/0/5 32768
+  c: windowUpdate s0 +32768
+  c: windowUpdate s5 +32768
+  s: streamClose s5 code 0
+s > HEADERS/4/5 DATA/1/5
+  c: beginHeaders s5 response
+  c: headers s5 response [[":status","201"]]
+  c: data s5 7b
+  c: streamEnd s5
+  c: streamClose s5 code 0
+-- a response with trailers, and a request body written in pieces
+c > HEADERS/4/7/14
+  s: beginHeaders s7 request
+  s: headers s7 request [[":method","PUT"],[":scheme","https"],[":authority","example.test"],[":path","/stream"]]
+null
+c > DATA/0/7/6
+  s: data s7 6b
+null
+null
+c > DATA/1/7/6
+  s: data s7 6b
+  s: streamEnd s7
+  s: streamClose s7 code 0
+s > HEADERS/4/7 DATA/0/7 HEADERS/5/7
+  c: beginHeaders s7 response
+  c: headers s7 response [[":status","200"]]
+  c: data s7 4b
+  c: beginHeaders s7 trailer
+  c: headers s7 trailer [["grpc-status","0"]]
+  c: streamEnd s7
+  c: streamClose s7 code 0
+-- settings
+c wants read true write true
+c > SETTINGS/0/0/24 4=100000 3=50 1=8192 2=0
+  s: settings
+s > SETTINGS/1/0
+s > SETTINGS/0/0
+  c: settings
+c > SETTINGS/1/0/0
+-- ping
+c > PING/0/0/8
+  s: ping ack false
+s > PING/1/0
+  c: ping ack true
+s > PING/0/0
+  c: ping ack false
+c > PING/1/0/8
+  s: ping ack true
+-- window updates
+c > WINDOW/0/0/4 1000
+  s: windowUpdate s0 +1000
+c > HEADERS/4/9/7
+  s: beginHeaders s9 request
+  s: headers s9 request [[":method","POST"],[":scheme","https"],[":authority","example.test"],[":path","/w"]]
+c > WINDOW/0/9/4 7
+  s: windowUpdate s9 +7
+s > WINDOW/0/9 5000
+  c: windowUpdate s9 +5000
+-- a reset
+  c: streamClose s9 code 8
+c > RST/0/9/4 8
+  s: rstStream s9 code 8
+  s: streamClose s9 code 8
+{"error":"there is no body open on stream 9"}
+-- a stream the server resets
+c > HEADERS/5/11/8
+  s: beginHeaders s11 request
+  s: headers s11 request [[":method","GET"],[":scheme","https"],[":authority","example.test"],[":path","/no"]]
+  s: streamEnd s11
+  s: streamClose s11 code 2
+s > RST/0/11 2
+  c: rstStream s11 code 2
+  c: streamClose s11 code 2
+-- request and ping in one write
+c > PING/0/0/8 WINDOW/0/0/4 10 HEADERS/4/13/9 DATA/1/13/1
+  s: ping ack false
+  s: windowUpdate s0 +10
+  s: beginHeaders s13 request
+  s: headers s13 request [[":method","GET"],[":scheme","https"],[":authority","example.test"],[":path","/both"]]
+  s: data s13 1b
+  s: streamEnd s13
+s > PING/1/0
+  c: ping ack true
+  s: streamClose s13 code 0
+s > HEADERS/4/13 DATA/1/13
+  c: beginHeaders s13 response
+  c: headers s13 response [[":status","200"]]
+  c: data s13 2b
+  c: streamEnd s13
+  c: streamClose s13 code 0
+-- goaway
+c > HEADERS/5/15/9
+  s: beginHeaders s15 request
+  s: headers s15 request [[":method","GET"],[":scheme","https"],[":authority","example.test"],[":path","/last"]]
+  s: streamEnd s15
+s wants read true write true
+  s: streamClose s15 code 7
+s > GOAWAY/0/0 7,0
+  c: goaway code 0 last 7
+  c: streamClose s15 code 7
+c wants read false write false
+s wants read false write false
+a request after goaway: 17
+  c: streamClose s17 code 7
+-- what a client refuses
+respond on a client faults: `h2Respond` could not be sent: submitting a response: Protocol error
+push on a stream never opened: {"error":"there is no body open on stream 9"}
+a bad setting faults: `nope` is not one of HTTP/2's settings -- they are `headerTableSize`, `enablePush`, `maxConcurrentStreams`, `initialWindowSize`, `maxFrameSize` and `maxHeaderListSize`
+enablePush 2 faults: `h2Settings` could not be sent: submitting SETTINGS: Invalid argument
+a window past the limit faults: `h2Settings` could not be sent: submitting SETTINGS: Invalid argument
+a frame size too small faults: `h2Settings` could not be sent: submitting SETTINGS: Invalid argument
+settings not an object faults: `h2Settings` takes an object of settings, and this is an integer
+a negative count faults: `maxConcurrentStreams` is a count, and this is -1
+a window update of nothing: null
+a negative window update faults: `h2WindowUpdate` takes a stream number, and this is -1
+a window update past the limit faults: `h2WindowUpdate` could not be sent: submitting WINDOW_UPDATE: Flow control error
+ping with an argument faults: `h2Ping` takes a session, and was given 2 arguments
+wants with nothing faults: `h2Wants` takes a session, and was given 0 arguments
+request with no headers faults: `h2Request` takes a session, the headers and an optional body, and was given 1 argument
+request a number faults: `h2Request` takes the headers as an object or as pairs, and this is an integer
+request a header number faults: a header value is text, and this one is an integer -- `h2Request` writes what goes on the wire
+request a body number faults: `h2Request` takes a body as text or bytes, and this is an integer
+request stream with a body faults: `h2RequestStream` takes a session and the headers, and was given 3 arguments
+client options faults: `autoWindowUpdate` is true or false, and this is an integer
+client two options faults: `h2Client` takes an optional object of options, and was given 2 arguments
+"preface SETTINGS/0/0/0"
+a server sends a request faults: `h2Request` could not be sent: submitting a request: Protocol error
+-- a client that is not answered with SETTINGS first
+null
+GOAWAY/0/0/25 0,1
+q wants read false write false
+"""
+
+@test
+JS_H2_A_CLIENT_SESSION_SPEAKS_AS_NGHTTP2_DOES_ON_BOTH_HOSTS()
+    val want = ClientAnswered.trim()
+
+    assert_eq(out(ClientSource).trim(), want)
+    assert_eq(node_said(ClientSource).trim(), want)
+
+// HPACK on its own: what the encoder writes, byte for byte, and what the decoder refuses. The blocks
+// are nghttp2's encoder's decisions -- what it indexes (and the eight names it never does), what it
+// never indexes (`authorization`, a `cookie` under twenty bytes, a field marked so), what is too
+// large to index for the table, Huffman only where it is shorter, a static name preferred to a
+// dynamic one, and the size update a small table announces once -- and a decoder that has refused a
+// block refuses every block after it, its table being out of step.
+private val HpackSource: string = raw"""
+import { hpackDeflater, hpackInflater, hpackDeflate, hpackInflate, hpackClose, h2Client, h2Server, h2RequestStream, h2RespondStream, h2Request, h2Push, h2Finish, h2Consume } from slate:nghttp2
+
+val digits = "0123456789abcdef"
+
+hex(bs)
+    val all = bs.toArray().map(b -> digits[b >> 4] + digits[b & 15])
+
+    if all.length <= 64 then all.join("") else all.slice(0, 24).join("") + ".." + all.slice(all.length - 8).join("")
+
+short(hs) = toJSON(if hs is array then hs.map(p -> [p[0], if p[1].length > 40 then string(p[1].length) + " chars" else p[1]]) else hs)
+
+tried(what, f)
+    try
+        print(what + ": " + toJSON(f()))
+    catch e
+        print(what + " faults: " + e.message)
+
+val enc = hpackDeflater()
+val dec = hpackInflater()
+
+shown(hs)
+    val b = hpackDeflate(enc, hs)
+
+    print(string(b.length) + " " + hex(b) + " " + short(hpackInflate(dec, b)))
+
+shown({ ":method": "GET", ":scheme": "https", ":authority": "example.test", ":path": "/things" })
+shown({ ":method": "GET", ":scheme": "https", ":authority": "example.test", ":path": "/things" })
+shown({ ":status": "200", "content-type": "text/plain" })
+shown({ ":status": "200", "content-type": "text/plain" })
+shown([["authorization", "Bearer abc"], ["cookie", "a=1"], ["cookie", "a-much-longer-cookie-value=1"], ["set-cookie", "x=y"]])
+shown([["authorization", "Bearer abc"], ["cookie", "a=1"], ["cookie", "a-much-longer-cookie-value=1"], ["set-cookie", "x=y"]])
+shown([["x-secret", "hush", true], ["x-secret", "hush", true], ["x-open", "loud"], ["x-open", "loud"]])
+shown([[":path", "/a/very/long/path/that/is/not/indexed"], ["content-length", "123"], ["etag", "\"v1\""], ["location", "/x"], ["age", "5"], ["if-none-match", "q"], ["if-modified-since", "Tue"]])
+shown([["x-bytes", "ÿ wide é ü"], ["UPPER", "Case"], ["empty", ""], ["", "noname"]])
+shown([["x-long", "v".repeat(200)], ["x-raw", "~~~~~~~~"]])
+shown([["x-huge", "w".repeat(3500)], ["x-after", "1"]])
+shown([["x-huge", "w".repeat(3500)], ["x-after", "1"]])
+shown([[":method", "POST"], [":method", "PUT"], [":status", "404"], [":status", "999"], ["accept-encoding", "gzip, deflate"], ["accept-encoding", "br"]])
+
+print("-- a small table")
+val small = hpackDeflater(100)
+val sdec = hpackInflater()
+
+small_shown(hs)
+    val b = hpackDeflate(small, hs)
+
+    print(string(b.length) + " " + hex(b) + " " + short(hpackInflate(sdec, b)))
+
+small_shown([["x-a", "1"], ["x-b", "2"], ["x-c", "3"]])
+small_shown([["x-a", "1"], ["x-b", "2"], ["x-c", "3"]])
+small_shown([["x-d", "a".repeat(80)], ["x-a", "1"]])
+val zero = hpackDeflater(0)
+print(hex(hpackDeflate(zero, [["x-a", "1"]])) + " " + hex(hpackDeflate(zero, [["x-a", "1"]])))
+val huge = hpackDeflater(100000)
+print(hex(hpackDeflate(huge, [["x-a", "1"]])) + " " + hex(hpackDeflate(huge, [["x-a", "1"]])))
+
+print("-- what an inflater refuses")
+val bad = hpackInflater()
+
+tried("garbage", () -> hpackInflate(bad, [255, 255, 255, 255, 255, 255]))
+tried("then good", () -> hpackInflate(bad, [130]))
+tried("index zero", () -> hpackInflate(hpackInflater(), [128]))
+tried("index past the table", () -> hpackInflate(hpackInflater(), [190]))
+tried("cut short", () -> hpackInflate(hpackInflater(), [64, 3, 97]))
+tried("table resize past limit", () -> hpackInflate(hpackInflater(), [63, 226, 31]))
+tried("table resize within", () -> hpackInflate(hpackInflater(), [63, 225, 31, 130]))
+tried("empty", () -> hpackInflate(hpackInflater(), []))
+tried("text", () -> hpackInflate(hpackInflater(), "\u0082"))
+tried("bad huffman", () -> hpackInflate(hpackInflater(), [0, 129, 255, 1, 97]))
+tried("deflate a number", () -> hpackDeflate(enc, 5))
+tried("deflate a decoder", () -> hpackDeflate(99, {}))
+tried("inflate an encoder", () -> hpackInflate(99, []))
+tried("deflater a string", () -> hpackDeflater("x"))
+tried("deflater negative", () -> hpackDeflater(-1))
+tried("inflater an argument", () -> hpackInflater(1))
+tried("deflate arity", () -> hpackDeflate(enc))
+tried("inflate a number", () -> hpackInflate(dec, 5))
+tried("close nothing", () -> hpackClose())
+tried("close a number", () -> hpackClose(77))
+hpackClose(enc)
+tried("closed encoder", () -> hpackDeflate(enc, {}))
+tried("close again", () -> hpackClose(enc))
+hpackClose(dec)
+tried("closed decoder", () -> hpackInflate(dec, [130]))
+
+print("-- client oddities")
+val c = h2Client({ autoWindowUpdate: false })
+val s = h2Server()
+
+tried("respond stream on a client", () -> h2RespondStream(c, 1, { ":status": "200" }))
+tried("request stream on a server", () -> h2RequestStream(s, { ":path": "/" }))
+val st = h2RequestStream(c, { ":method": "POST", ":scheme": "https", ":authority": "t", ":path": "/" })
+tried("push", () -> h2Push(c, st, "a"))
+tried("finish with trailers", () -> h2Finish(c, st, [["x-t", "1"]]))
+tried("push after finish", () -> h2Push(c, st, "b"))
+tried("finish again", () -> h2Finish(c, st))
+tried("consume", () -> h2Consume(c, st, 10))
+tried("consume an unknown stream", () -> h2Consume(c, 77, 10))
+tried("request a number body", () -> h2Request(c, { ":path": "/" }, [1, 2, 300]))
+"""
+
+private val HpackAnswered: string = raw"""
+20 828741892f91d35d055d25427f048561339aa991 [[":method","GET"],[":scheme","https"],[":authority","example.test"],[":path","/things"]]
+10 8287be048561339aa991 [[":method","GET"],[":scheme","https"],[":authority","example.test"],[":path","/things"]]
+10 885f87497ca58ae819aa [[":status","200"],["content-type","text/plain"]]
+2 88be [[":status","200"],["content-type","text/plain"]]
+43 1f0887ba51d85b141c641f11821c0160941ad4da49d6a0f54c5b1621cfd4c55bb8e8b4b0070f2803783d79 [["authorization","Bearer abc"],["cookie","a=1"],["cookie","a-much-longer-cookie-value=1"],["set-cookie","x=y"]]
+22 1f0887ba51d85b141c641f11821c01be0f2803783d79 [["authorization","Bearer abc"],["cookie","a=1"],["cookie","a-much-longer-cookie-value=1"],["set-cookie","x=y"]]
+36 1086f2b20a4b0a9f839ed44f1086f2b20a4b0a9f839ed44f4085f2b1eb2d5f83a0f6c9be [["x-secret","hush"],["x-secret","hush"],["x-open","loud"],["x-open","loud"]]
+60 049b606c772d9e98a0f54cc5634cec2671a583218a8e960d5485f2593f0f0d8208990f1304227631220f1f022f780f0601350f1a01710f1903547565 [[":path","/a/very/long/path/that/is/not/indexed"],["content-length","123"],["etag","\"v1\""],["location","/x"],["age","5"],["if-none-match","q"],["if-modified-since","Tue"]]
+48 4086f2b47e92547f0dc3bf207769646520c3a920c3bc4005555050455283bc341740842d35a7d700400085a8f50e92ff [["x-bytes","ÿ wide é ü"],["UPPER","Case"],["empty",""],["","noname"]]
+199 4085f2b507aa6fff30efdfbf7efdfbf7efdfbf7efdfbf7ef..7e7e7e7e7e7e7e7e [["x-long","200 chars"],["x-raw","~~~~~~~~"]]
+3082 0085f2b4f6cc5ffff816f1e3c78f1e3c78f1e3c78f1e3c78..85f2b0e5496c0131 [["x-huge","3500 chars"],["x-after","1"]]
+3074 0085f2b4f6cc5ffff816f1e3c78f1e3c78f1e3c78f1e3c78..1e3c78f1e3c78fbe [["x-huge","3500 chars"],["x-after","1"]]
+17 8342035055548d48033939399050026272 [[":method","POST"],[":method","PUT"],[":status","404"],[":status","999"],["accept-encoding","gzip, deflate"],["accept-encoding","br"]]
+-- a small table
+23 3f454003782d6101314003782d6201324003782d630133 [["x-a","1"],["x-b","2"],["x-c","3"]]
+21 4003782d6101314003782d6201324003782d630133 [["x-a","1"],["x-b","2"],["x-c","3"]]
+63 0003782d64b218c6318c6318c6318c6318c6318c6318c6318c6318c6318c6318c6318c6318c6318c6318c6318c6318c6318c6318c6318c634003782d610131 [["x-d","80 chars"],["x-a","1"]]
+200003782d610131 0003782d610131
+4003782d610131 be
+-- what an inflater refuses
+garbage: {"error":"decoding a header block: Header compression/decompression error"}
+then good: {"error":"decoding a header block: Header compression/decompression error"}
+index zero: {"error":"decoding a header block: Header compression/decompression error"}
+index past the table: {"error":"decoding a header block: Header compression/decompression error"}
+cut short: {"error":"decoding a header block: Header compression/decompression error"}
+table resize past limit: {"error":"decoding a header block: Header compression/decompression error"}
+table resize within: [[":method","GET"]]
+empty: []
+text faults: `hpackInflate` takes bytes or an array of numbers, and this is a string
+bad huffman: {"error":"decoding a header block: Header compression/decompression error"}
+deflate a number faults: `hpackDeflate` takes the headers as an object or as pairs, and this is an integer
+deflate a decoder faults: `hpackDeflate` was given something that is not an encoder
+inflate an encoder faults: `hpackInflate` was given something that is not a decoder
+deflater a string faults: `hpackDeflater` takes a count of bytes, and this is a string
+deflater negative faults: `hpackDeflater` takes a count of bytes, and this is -1
+inflater an argument faults: `hpackInflater` takes nothing, and was given 1 argument
+deflate arity faults: `hpackDeflate` takes an encoder and the headers, and was given 1 argument
+inflate a number faults: `hpackInflate` takes bytes or an array of numbers, and this is an integer
+close nothing faults: `hpackClose` takes an encoder or a decoder, and was given 0 arguments
+close a number: null
+closed encoder faults: this encoder has been closed
+close again: null
+closed decoder faults: this decoder has been closed
+-- client oddities
+respond stream on a client faults: `h2RespondStream` could not be sent: submitting a response: Protocol error
+request stream on a server faults: `h2RequestStream` could not be sent: submitting a request: Protocol error
+push: null
+finish with trailers: null
+push after finish: {"error":"the body on stream 1 has been finished, so there is nothing to add to"}
+finish again: null
+consume: null
+consume an unknown stream: null
+request a number body faults: a byte is between 0 and 255, and this is 300
+"""
+
+@test
+JS_H2_HPACK_ENCODES_BYTE_FOR_BYTE_AS_NGHTTP2_AND_REFUSES_AS_IT_DOES_ON_BOTH_HOSTS()
+    val want = HpackAnswered.trim()
+
+    assert_eq(out(HpackSource).trim(), want)
+    assert_eq(node_said(HpackSource).trim(), want)
+
+// -- the page --------------------------------------------------------------------------------------
+
+// The fenced blocks of `docs/library/nghttp2.md`, inside and outside alternately.
+private page_parts() -> []string = split(from_utf8(read_bytes("docs/library/nghttp2.md").unwrap()).unwrap(), "```")
+
+// The page's `slate` block holding `marker` -- or, with `answer`, the `output` block under it.
+private page_block(marker: string, answer: bool) -> string
+    val parts = page_parts()
+    var found = false
+
+    for i in 0..<parts.len
+        val lines = split(parts[i], "\n")
+
+        if !found && lines[0] == "slate" && parts[i].contains(marker)
+            found = true
+
+            if !answer then return block_body(lines)
+        elif found && lines[0] == "output"
+            return block_body(lines)
+
+    ""
+end page_block
+
+private block_body(lines: []string) -> string
+    var b = str_builder()
+
+    for i in 1..<lines.len
+        b.push(lines[i])
+        b.push("\n")
+
+    b.finish().trim()
+end block_body
+
+// **The page's two runnable programs run under node too**, against the very `output` block the docs
+// suite holds the interpreter to: a client and a server talking in memory, and HPACK on its own.
+@test
+JS_H2_THE_nghttp2_PAGE_RUNS_UNDER_NODE_AS_IT_RUNS_IN_THE_INTERPRETER()
+    for marker in ["pump(from, to)", "hpackDeflater()"]
+        val program = page_block(marker, false)
+        val want = page_block(marker, true)
+
+        assert(program.contains("slate:nghttp2"))
+        assert(want != "")
+        assert_eq(out(program).trim(), want)
+        assert_eq(node_said(program).trim(), want)
+
+// -- over TLS, against node's own server -------------------------------------------------------------
+
+// A JavaScript client over a real TLS connection to node's `http2` server: six requests at once (a
+// body, a 100 KB upload that needs the server's credit, trailers, a 200 KB download that needs the
+// client's, a 404, and a body written in pieces), then SETTINGS, a WINDOW_UPDATE and a PING, then a
+// stream reset mid-body, then a GOAWAY. What each stream heard is printed in a fixed order once all
+// have closed, and the server prints what it was asked, sorted, so nothing depends on timing.
+private val TlsClientSource: string = raw"""
+import { connect, onBytes, send, close, startTls, alpnProtocol } from slate:net
+import { args, exit } from slate:process
+import { readFileSync } from slate:fs
+import { h2Client, h2Receive, h2Send, h2Next, h2Request, h2RequestStream, h2Push, h2Finish, h2Ping, h2Settings, h2WindowUpdate, h2Wants, h2Goaway, h2Reset, h2Close } from slate:nghttp2
+
+val theCert = readFileSync("tests/tls/cert.pem").value
+
+stalled()
+    print("watchdog: the client did not finish")
+    exit(3)
+
+val guard = setTimeout(stalled, 20000)
+
+async main()
+    val c = (await connect("localhost", number(args[0]))).value
+    val h = h2Client()
+    val order = ["hello", "echo", "trailers", "big", "missing", "upload"]
+    var names = {}
+    var heads = {}
+    var sizes = {}
+    var results = {}
+    var open = 0
+    var stage = 0
+
+    ask(name, method, path, body = null)
+        val stream = h2Request(h, [[":method", method], [":scheme", "https"], [":authority", "localhost"], [":path", path], ["x-custom", name]], body)
+
+        names[string(stream)] = name
+        open = open + 1
+
+        stream
+
+    heard(e)
+        val k = string(e.stream ?? 0)
+        val name = names[k] ?? null
+
+        if e.kind == "headers" && name != null
+            heads[k] = (heads[k] ?? "") + e.of + " " + e.headers.filter(p -> p[0] != "date").map(p -> p[0] + "=" + p[1]).join(" ") + "; "
+        elif e.kind == "data" && name != null
+            sizes[k] = (sizes[k] ?? 0) + e.bytes.length
+        elif e.kind == "ping"
+            print("ping ack " + string(e.ack))
+
+            if e.ack && stage == 1
+                stage = 2
+
+                val doomed = h2RequestStream(h, [[":method", "POST"], [":scheme", "https"], [":authority", "localhost"], [":path", "/reset"]])
+
+                names[string(doomed)] = "reset"
+                h2Push(h, doomed, "never finished")
+                h2Reset(h, doomed, 8)
+        elif e.kind == "streamClose" && name == "reset"
+            print("reset closed " + string(e.code))
+            h2Goaway(h, 0, 0)
+            stage = 3
+        elif e.kind == "streamClose" && name != null
+            results[name] = (heads[k] ?? "") + string(sizes[k] ?? 0) + " bytes, closed " + string(e.code)
+            open = open - 1
+
+            if open == 0 && stage == 0
+                for n in order
+                    print(n + ": " + results[n])
+
+                stage = 1
+                h2Settings(h, { initialWindowSize: 1000000 })
+                h2WindowUpdate(h, 0, 100000)
+                h2Ping(h)
+
+    turn()
+        loop
+            val e = h2Next(h)
+
+            if e != null
+                heard(e)
+            else
+                val out = h2Send(h)
+
+                if out.length == 0 then break
+
+                send(c, out)
+
+        if stage == 3
+            val w = h2Wants(h)
+
+            print("wants read " + string(w.read) + " write " + string(w.write))
+            h2Close(h)
+            close(c)
+            clearTimeout(guard)
+            stage = 4
+
+    arrived(chunk)
+        if chunk == null || stage == 4 then return
+
+        val said = h2Receive(h, chunk)
+
+        if said != null then print("refused " + said.error)
+
+        turn()
+
+    onBytes(c, arrived)
+
+    await startTls(c, { host: "localhost", trust: theCert, alpn: ["h2"] })
+
+    print("alpn " + alpnProtocol(c))
+
+    ask("hello", "GET", "/hello")
+    ask("echo", "POST", "/echo", "e".repeat(100000))
+    ask("trailers", "GET", "/trailers")
+    ask("big", "GET", "/big")
+    ask("missing", "GET", "/nowhere")
+
+    val up = h2RequestStream(h, [[":method", "PUT"], [":scheme", "https"], [":authority", "localhost"], [":path", "/echo"], ["x-custom", "upload"]])
+
+    names[string(up)] = "upload"
+    open = open + 1
+    h2Push(h, up, "piece one ")
+    h2Push(h, up, toBytes("two"))
+    h2Finish(h, up)
+    turn()
+
+main()
+"""
+
+// What the client printed, and what node's server was asked.
+private tls_client_said() -> string
+    val src = probe_path("js-h2-client")
+    val out_js = src + ".js"
+
+    write_text(src, TlsClientSource).unwrap()
+
+    if cli_status(["slate", "js", src, "-o", out_js]) != 0
+        remove_file(src)
+
+        return "the client would not compile"
+
+    val ran = capture("node", ["tests/tls/h2_probe.js", "--client", out_js], "", [], true, 120000)
+
+    remove_file(src)
+    remove_file(out_js)
+
+    ran match
+        Err(e) -> s"node could not be started: ${e}"
+        Ok(o) -> if o.status.ok() then o.text.trim() else o.err.unwrap_or("").trim()
+end tls_client_said
+
+@test
+JS_H2_A_SLATE_CLIENT_UNDER_NODE_TALKS_HTTP_2_TO_NODES_OWN_SERVER_OVER_TLS()
+    assert_eq(tls_client_said(), "alpn h2\n" +
+        "hello: response :status=200 content-type=text/plain; 15 bytes, closed 0\n" +
+        "echo: response :status=200 x-seen=100000; 100000 bytes, closed 0\n" +
+        "trailers: response :status=200; trailer x-done=yes; 13 bytes, closed 0\n" +
+        "big: response :status=200; 200000 bytes, closed 0\n" +
+        "missing: response :status=404; 0 bytes, closed 0\n" +
+        "upload: response :status=200 x-seen=13; 13 bytes, closed 0\n" +
+        "ping ack true\n" +
+        "reset closed 8\n" +
+        "wants read false write false\n" +
+        "asked GET /big 0 big\n" +
+        "asked GET /hello 0 hello\n" +
+        "asked GET /nowhere 0 missing\n" +
+        "asked GET /trailers 0 trailers\n" +
+        "asked POST /echo 100000 echo\n" +
+        "asked PUT /echo 13 upload")
+
+#endif
