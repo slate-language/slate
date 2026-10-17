@@ -71,9 +71,11 @@ Both are keys on the listening record, as in
 
 The two are apart because a large upload is slow and legitimate, and only its head is held to the
 short deadline. node's defaults are 60 seconds for the head and 5 minutes for the request; Go's
-`http.Server` has neither unless a program sets one. Over HTTP/2 a header block has `headMillis` to
-finish, and one that does not ends the connection with a GOAWAY, there being no stream yet to answer
-on.
+`http.Server` has neither unless a program sets one. Over HTTP/2 each header block has `headMillis`
+from the frame that begins it, and one that does not finish is reset with `CANCEL` — that stream
+alone, the others on the connection going on as they were. Bytes that arrive with no block begun, a
+preface or a frame that never finishes, have `headMillis` too, and missing it ends the connection with
+a GOAWAY.
 
 ## `adopt(handler)`
 
