@@ -50,8 +50,8 @@ async main()
     print(flat.ok, fromBytes(flat.value).value == text)
 
     // Bytes rather than text, which is the other thing either takes.
-    val bytes = [0, 1, 2, 255, 128, 0, 0, 0, 7]
-    val small = await gzip(bytes)
+    val raw = [0, 1, 2, 255, 128, 0, 0, 0, 7]
+    val small = await gzip(raw)
 
     print(toJSON((await gunzip(small, 4096)).value))
 
@@ -108,6 +108,57 @@ async main()
     // and too small is caught against what actually came out.
     print((await gunzip(patched(packed, packed.length - 1, 255), 4096)).error)
     print((await gunzip(patched(packed, packed.length - 4, 3), 4096)).error)
+
+    // -- more than one member ----------------------------------------------------------------------
+
+    // **`cat a.gz b.gz` is a gzip file and reads as the two outputs joined**, which is what node's
+    // `gunzipSync` does. An empty member in the middle contributes nothing and is not an end.
+    val ab = await gzip("ab")
+    val cd = await gzip("cd")
+    val none = await gzip("")
+    val two = bytes(0)
+
+    push(two, ab)
+    push(two, cd)
+
+    val joined = await gunzip(two, 64)
+
+    print(joined.ok, fromBytes(joined.value).value)
+
+    val three = bytes(0)
+
+    push(three, ab)
+    push(three, none)
+    push(three, cd)
+
+    print(fromBytes((await gunzip(three, 64)).value).value)
+
+    // The limit is the most the WHOLE may become, across members, and exactly it is allowed.
+    print((await gunzip(two, 4)).ok)
+    print((await gunzip(two, 3)).error)
+
+    // A second member that is long enough to be dynamic Huffman is read by the same walk.
+    val bigTwo = bytes(0)
+
+    push(bigTwo, await gzip(long))
+    push(bigTwo, await gzip(long))
+
+    print((await gunzip(bigTwo, 30000)).error)
+    print((await gunzip(bigTwo, 65536)).ok)
+
+    // What follows the last member is refused and is not read as part of it: junk, zero padding
+    // (which gzip(1) and node's `gunzipSync` allow, and a `DecompressionStream` refuses), and a
+    // `1f` that begins a header that is wrong.
+    print((await gunzip(concat(two.toArray(), [120, 121, 122]), 64)).error)
+    print((await gunzip(concat(two.toArray(), [0, 0, 0, 0]), 64)).error)
+    print((await gunzip(concat(two.toArray(), [31, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), 64)).error)
+
+    // A second member that stops in the middle, and one whose checksum is wrong. The first of the
+    // two is read whole before either is noticed.
+    print((await gunzip(two.toArray()[0..<(two.length - 3)], 64)).error)
+    print((await gunzip(patched(two.toArray(), two.length - 6, 0), 64)).error)
+    print((await gunzip(concat(ab.toArray(), [31]), 64)).error)
+    print((await gunzip(concat(ab.toArray(), [31, 139, 8]), 64)).error)
 
     // zlib's own header, whose four rules are read here rather than left to the host.
     print((await inflate([1, 2, 3, 4], 64)).error)

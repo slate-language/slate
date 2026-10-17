@@ -17,14 +17,28 @@ process per group, so a mode's "rss before" is the previous mode's "after".
    `GET / HTTP/1.1\r\nHost: x\r\nX-A: `, then one byte per second; never closed (sent nothing more:
    closed at 5000 ms). node and Go also failed at a 20 s wait (node's `headersTimeout` is 60 s; Go's
    `net/http` has none by default), so the reference servers are no better here.
-2. **soak: RSS still climbs under steady load.** A separate 90 s soak on a fresh slate server read
-   `ok=4500/4500`, with mean RSS 16 -> 24 MB from the first quarter to the last (before the
-   finalizer fix it was 16 -> 34 MB). fds were bounded: peak 63, back to 13. node and Go plateaued.
-   In the table, the 30 s soak's fds rose 45 -> 63 under load and fell back to 13 after settling, so
-   the fd half is the 5 s idle window lagging, not a leak.
-3. **A connection storm's memory is not given back**: 11 -> 124 MB across 1000 slowloris connections,
-   all fds returned. It is bounded now, since the next three modes add 1 MB between them (before the
-   fix, idleflood alone added 85 MB). node grew 44 -> 78 MB over the same mode, Go 11 -> 35 MB.
+2. **soak: RSS creeps, the memory the process OWNS does not (diagnosed, not a leak).** A 300 s soak
+   on a fresh server (`ok=15000/15000`) read RSS 21.7 -> 25.0 MB in the first minute and then
+   ~0.6 MB a minute to 27.6 MB. Over the same run `vmmap`'s **physical footprint** was 12.8 MB at
+   150 s and 12.5 MB at 300 s, `leaks <pid>` found **0 leaks** at start, middle, end and 10 s after,
+   and the `heap` census of live malloc blocks (the 256 MiB collector block aside) was 10.2 MB mid-run
+   and 11.4 MB at the end under load. The gap is `MALLOC_SMALL` pages that are resident but not dirty
+   (21.5 MB resident, 10.8 MB dirty at the end): freed blocks that macOS malloc marked reusable,
+   which RSS still counts and the footprint does not. `run.sh -d 300` over the same binary read
+   "plateau rss 125->130 MB, fds 61->62" after the storm. fds peak at ~63 under load and return to 13.
+3. **A connection storm's memory is not given back (diagnosed: allocator retention, no bug in
+   slate).** 11 -> 124 MB across 1000 slowloris connections, all fds returned. After the storm and
+   after settling, the live malloc blocks total **6.1 MB** (baseline 4.9 MB, 23,302 blocks), with
+   **0 leaks**. The footprint stays at 99.6 MB because 74.5 MB of `MALLOC_SMALL (empty)` regions
+   are still resident (65.2 MB of it dirty). That memory is freed and nothing references it; macOS
+   malloc keeps the empty regions. `malloc_zone_pressure_relief(NULL, 0)` does not help: a C probe
+   that frees 1000 80 KB blocks gets **0 bytes** back from it, with the footprint unchanged at 79.5 MB.
+   So no workaround was added. Most of the peak comes from **sh.sysl.libuv's per-stream read buffer**:
+   `read_start(cb, buffer_size = 65536)` in `stream.sysl` gives every connection its own 64 KiB,
+   held for as long as the connection is reading, so 1000 idle connections hold ~64 MB of buffers.
+   node shares one slab per read and Go's `bufio` starts at 4 KiB. Changing that belongs in the
+   binding (or in kairos's reads over it), not here. node grew 44 -> 78 MB over the same mode and
+   also kept it, Go 11 -> 35 MB.
 
 **The halfclose rows were re-taken after `slate:net` gained `shutdown(sock)`** (a real write-side
 half-close; the mode used to just drop the connection right after the request). Each of 300 rounds
@@ -40,6 +54,18 @@ closed, h2 rapid reset / stream flood / SETTINGS flood / zero window answered no
 afterwards. Go's `oversized-header` "2xx?!" is Go accepting a 128 KB header under its 1 MB limit,
 which is legal; "waiting" on a huge `Content-Length` means the server is still reading a body it was
 promised, which is legal while it serves everyone else.
+
+**Re-taken on dev `6019cb1`** with `run.sh --only slate --mode slowloris --mode soak -d 300`, one
+server process:
+
+| server | mode | verdict | rss before | rss peak | rss after | fd before | fd peak | fd after |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| slate | slowloris | FAIL | 10 | 124 | 124 | 13 | 1014 | 13 |
+| slate | soak (300 s) | PASS | 124 | 131 | 131 | 13 | 64 | 13 |
+
+The instruments are `leaks <pid>`, `heap -s <pid>` and `vmmap --summary <pid>` on the live server
+(physical footprint, and resident vs dirty per malloc region). Read the footprint, not RSS, on
+macOS: RSS counts pages malloc has marked reusable.
 
 ## Verdict, and server RSS (MB) / open fds, before / peak / after
 

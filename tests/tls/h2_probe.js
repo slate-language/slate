@@ -104,5 +104,145 @@ const run = async (port) => {
 
     console.log("after garbage " + (await request(again, "GET", "/hello")).text)
 
+    // The limits a server holds a peer to, each from a client written in raw frames, since node's own
+    // client keeps to them. After each the attacker's connection is over or its stream refused, and
+    // the well-behaved client above is answered as before.
+    const opened = await raw(port, Buffer.alloc(0), (fs) => fs.some((f) => f.type === SETTINGS))
+    const limits = opened.frames.find((f) => f.type === SETTINGS)
+
+    console.log("settings " + settingsOf(limits.payload))
+
+    // A hundred and one requests open at once, none of them ended: the last is refused.
+    const many101 = []
+
+    for (let i = 0; i < 101; i++) many101.push(frame(HEADERS, END_HEADERS, 1 + 2 * i, block("POST", "/echo")))
+
+    const crowded = await raw(port, Buffer.concat(many101), (fs) => fs.some((f) => f.type === RST_STREAM))
+
+    console.log("too many streams " + resets(crowded.frames))
+    console.log("after streams " + (await request(again, "GET", "/hello")).text)
+
+    // A header list that comes to more than 64 KiB once decoded, from a block of four kilobytes: one
+    // field added to the table and then named twenty times, a byte each.
+    const indexed = Buffer.concat([Buffer.from([0x40, 5]), Buffer.from("x-big"), Buffer.from([0x7f, 0xa1, 0x1e]), Buffer.alloc(4000, 0x61)])
+    const flood = Buffer.concat([block("GET", "/"), indexed, Buffer.alloc(20, 0xbe)])
+    const flooded = await raw(port, frame(HEADERS, END_HEADERS | END_STREAM, 1, flood), (fs) => fs.some((f) => f.type === HEADERS))
+    const answer = flooded.frames.find((f) => f.type === HEADERS)
+
+    console.log("header flood " + (answer !== undefined && answer.payload.includes("431") ? "431" : "no answer"))
+    console.log("after header flood " + (await request(again, "GET", "/hello")).text)
+
+    // The 2024 CONTINUATION flood: a header block that is never ended, in empty frames.
+    const continued = [frame(HEADERS, 0, 1, block("GET", "/"))]
+
+    for (let i = 0; i < 20; i++) continued.push(frame(CONTINUATION, 0, 1))
+
+    const conted = await raw(port, Buffer.concat(continued), () => false)
+
+    console.log("continuation flood " + goawayOf(conted.frames) + " " + conted.how)
+    console.log("after continuation flood " + (await request(again, "GET", "/hello")).text)
+
+    // The 2023 rapid reset: requests opened and cancelled at once, past nghttp2's bucket of a thousand.
+    const pairs = []
+
+    for (let i = 0; i < 1100; i++) {
+        pairs.push(frame(HEADERS, END_HEADERS, 1 + 2 * i, block("POST", "/echo")))
+        pairs.push(frame(RST_STREAM, 0, 1 + 2 * i, u32(8)))
+    }
+
+    const reset = await raw(port, Buffer.concat(pairs), () => false)
+
+    console.log("rapid reset " + goawayOf(reset.frames) + " " + reset.how)
+    console.log("after rapid reset " + (await request(again, "GET", "/hello")).text)
+
     again.close()
+}
+
+// -- raw frames ---------------------------------------------------------------------------------------
+
+const PREFACE = Buffer.from("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", "latin1")
+const HEADERS = 1, RST_STREAM = 3, SETTINGS = 4, GOAWAY = 7, CONTINUATION = 9
+const END_STREAM = 1, END_HEADERS = 4
+
+const u32 = (n) => {
+    const b = Buffer.alloc(4)
+
+    b.writeUInt32BE(n, 0)
+
+    return b
+}
+
+const frame = (type, flags, stream, payload) => {
+    const body = payload || Buffer.alloc(0)
+    const head = Buffer.alloc(9)
+
+    head.writeUIntBE(body.length, 0, 3)
+    head[3] = type
+    head[4] = flags
+    head.writeUInt32BE(stream, 5)
+
+    return Buffer.concat([head, body])
+}
+
+// A request's header block: the method, `https` and the path from the static table, and the authority
+// as a literal that is not indexed, so the block leaves the server's table as it found it.
+const block = (method, path) => Buffer.concat([
+    Buffer.from([method === "GET" ? 0x82 : 0x83, 0x87]),
+    path === "/" ? Buffer.from([0x84]) : Buffer.concat([Buffer.from([0x04, path.length]), Buffer.from(path, "latin1")]),
+    Buffer.from([0x01, 9]), Buffer.from("localhost", "latin1")
+])
+
+// A connection that sends the preface, an empty SETTINGS and `bytes`, and keeps every frame the server
+// sends until `enough` says so, the server hangs up, or three seconds pass.
+const raw = (port, bytes, enough) => new Promise((resolve) => {
+    const frames = []
+    let inbuf = Buffer.alloc(0)
+    let done = false
+
+    const finish = (how) => {
+        if (done) return
+
+        done = true
+        clearTimeout(timer)
+        sock.destroy()
+        resolve({ frames: frames, how: how })
+    }
+
+    const sock = tls.connect({ port: port, host: "localhost", ALPNProtocols: ["h2"], rejectUnauthorized: false }, () => {
+        sock.write(Buffer.concat([PREFACE, frame(SETTINGS, 0, 0), bytes]))
+    })
+
+    const timer = setTimeout(() => finish("still open"), 3000)
+
+    sock.on("data", (chunk) => {
+        inbuf = Buffer.concat([inbuf, chunk])
+
+        while (inbuf.length >= 9 && inbuf.length >= 9 + inbuf.readUIntBE(0, 3)) {
+            const len = inbuf.readUIntBE(0, 3)
+
+            frames.push({ type: inbuf[3], flags: inbuf[4], stream: inbuf.readUInt32BE(5) & 0x7fffffff, payload: inbuf.subarray(9, 9 + len) })
+            inbuf = inbuf.subarray(9 + len)
+        }
+
+        if (enough(frames)) finish("open")
+    })
+
+    sock.on("close", () => finish("closed"))
+    sock.on("error", () => finish("closed"))
+})
+
+const settingsOf = (payload) => {
+    const said = []
+
+    for (let at = 0; at + 6 <= payload.length; at += 6) said.push(payload.readUInt16BE(at) + "=" + payload.readUInt32BE(at + 2))
+
+    return said.join(" ")
+}
+
+const resets = (frames) => frames.filter((f) => f.type === RST_STREAM).map((f) => f.stream + ":" + f.payload.readUInt32BE(0)).join(" ")
+
+const goawayOf = (frames) => {
+    const g = frames.find((f) => f.type === GOAWAY)
+
+    return g === undefined ? "no goaway" : "goaway " + g.payload.readUInt32BE(4)
 }

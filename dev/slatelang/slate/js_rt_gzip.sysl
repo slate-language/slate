@@ -12,15 +12,18 @@ module dev.slatelang.slate
 // something a host allows. `gzip.sysl` answers a promise it has already settled for that reason,
 // rather than the language having two shapes for one thing.
 //
-// ## The gzip container is read HERE and not handed over, and that is what buys the sentences
+// ## `gunzip` asks the host, and reads the gzip stream HERE when the host refuses
 //
 // A host's decompressor answers one opaque `TypeError` for everything: a stream that is not gzip at
 // all, one that stops in the middle, one whose checksum is wrong. `gzip.sysl` says which, because
-// miniz tells it. So the header and the trailer are parsed in this file exactly as `unwrapped`
-// parses them, and the body alone goes to `deflate-raw` -- which makes every refusal about the
-// CONTAINER read the same sentence on both back ends, including the limit, which is the one that
-// matters. **What is left is a body that would not inflate**, and there a JavaScript host can only
-// say that it did not; `docs/reference/javascript.md` names that difference.
+// miniz's `Decoder` tells it. So a stream the host takes is answered at the host's speed, and one it
+// refuses is walked again by `gzMembers`, member by member, with an inflater written out below --
+// the host cannot say where a member ends, which is what finding the next one needs. That makes
+// every refusal the interpreter's sentence, including the limit, on both back ends.
+//
+// **`inflate` (zlib) is not the same case**: it has one stream, so nothing needs to find where it
+// ends, and a body that would not inflate is one a JavaScript host can only say did not.
+// `docs/reference/javascript.md` names that difference.
 //
 // Inside the `$b` block, after the host's WebSocket and before the DOM's names.
 js_runtime_gzip() -> string = raw"""
@@ -126,58 +129,6 @@ js_runtime_gzip() -> string = raw"""
         const gzLe32 = (bytes, at) =>
             bytes[at] + bytes[at + 1] * 256 + bytes[at + 2] * 65536 + bytes[at + 3] * 16777216
 
-        const gzPastNul = (bytes, from) => {
-            let i = from
-
-            for (;;) {
-                if (i >= bytes.length) return -1
-
-                const c = bytes[i]
-
-                i = i + 1
-
-                if (c === 0) return i
-            }
-        }
-
-        // Where the deflate body starts, or the sentence saying why there is not one.
-        const gzBodyAt = (bytes) => {
-            if (bytes.length < 18) return "this is too short to be a gzip stream"
-
-            if (bytes[0] !== 0x1f || bytes[1] !== 0x8b)
-                return "this does not begin with gzip's two magic bytes, so it is not a gzip stream"
-
-            if (bytes[2] !== 8)
-                return "this gzip stream says it uses compression method " + bytes[2] +
-                    ", and the only one there is is deflate"
-
-            const flags = bytes[3]
-            let at = 10
-
-            if ((flags & 0x04) !== 0) {
-                if (at + 2 > bytes.length) return "this gzip stream ends inside its header"
-
-                at = at + 2 + bytes[at] + bytes[at + 1] * 256
-            }
-
-            if ((flags & 0x08) !== 0) {
-                at = gzPastNul(bytes, at)
-
-                if (at < 0) return "this gzip stream ends inside its header"
-            }
-
-            if ((flags & 0x10) !== 0) {
-                at = gzPastNul(bytes, at)
-
-                if (at < 0) return "this gzip stream ends inside its header"
-            }
-
-            if ((flags & 0x02) !== 0) at = at + 2
-            if (at + 8 > bytes.length) return "this gzip stream ends inside its header"
-
-            return at
-        }
-
         // The CRC-32 gzip's trailer carries, which is the one thing miniz has and a host does not.
         //
         // **A table built once**, since the alternative is a bit loop over every byte of every
@@ -239,6 +190,360 @@ js_runtime_gzip() -> string = raw"""
             return null
         }
 
+        // -- every gzip member, read exactly -----------------------------------------------------
+
+        // **A host's decompressor cannot say where a member ends**, and without that the second
+        // member of `cat a.gz b.gz` cannot be found: `deflate-raw` stops quietly after the first
+        // stream and reports no count. So the container is walked here, member by member, and the
+        // deflate stream is read by `gzInflate` below -- which is what lets a refusal be the
+        // interpreter's own sentence, since it sees every way a stream can be wrong.
+        //
+        // **`gunzip` asks the host first and comes here only when the host refuses**, so a good
+        // stream is inflated at the host's speed and this runs for the sentence, or for a host that
+        // cannot read members after the first. What each failure is called is `miniz`'s `Decoder`'s
+        // account, one for one: "T" is `Truncated`, "C" is `Corrupt`, "H" is `BadHeader`, "R" is
+        // `Trailing` and "L" is the limit.
+        const GZ_CRC_SAID = "this gzip stream's checksum does not match its contents, so the bytes are damaged"
+        const GZ_LENGTH_SAID = "this gzip stream's stated length does not match its contents"
+
+        // Just past the next NUL at or after `from`, or -1 where there is none.
+        const gzPastNul = (bytes, from) => {
+            for (let i = from; i < bytes.length; i = i + 1)
+                if (bytes[i] === 0) return i + 1
+
+            return -1
+        }
+
+        const GZ_SAID = {
+            T: GZ_ENDS,
+            C: GZ_NOT_ONE,
+            H: "this is not a gzip stream",
+            R: "this compressed stream ends before the bytes do"
+        }
+
+        const GZ_LEN_BASE = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59,
+            67, 83, 99, 115, 131, 163, 195, 227, 258]
+        const GZ_LEN_EXTRA = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4,
+            5, 5, 5, 5, 0]
+        const GZ_DIST_BASE = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513,
+            769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577]
+        const GZ_DIST_EXTRA = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10,
+            10, 11, 11, 12, 12, 13, 13]
+        const GZ_CL_ORDER = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+
+        // A canonical Huffman code as the count of codes of each length and the symbols in order.
+        // An over-subscribed set of lengths is no code at all; an incomplete one is allowed, and
+        // reaching a code it does not have is what is refused.
+        const gzHuffman = (lengths, n) => {
+            const count = new Uint16Array(16)
+            const symbol = new Uint16Array(n)
+
+            for (let i = 0; i < n; i = i + 1) count[lengths[i]] = count[lengths[i]] + 1
+
+            let left = 1
+
+            for (let len = 1; len <= 15; len = len + 1) {
+                left = left * 2 - count[len]
+
+                if (left < 0) throw "C"
+            }
+
+            const offs = new Uint16Array(16)
+
+            for (let len = 1; len < 15; len = len + 1) offs[len + 1] = offs[len] + count[len]
+
+            for (let s = 0; s < n; s = s + 1)
+                if (lengths[s] !== 0) {
+                    symbol[offs[lengths[s]]] = s
+                    offs[lengths[s]] = offs[lengths[s]] + 1
+                }
+
+            return { count, symbol }
+        }
+
+        let gzFixed = null
+
+        // **Inflate one deflate stream starting at `at`, appending to `out`, and answer where it
+        // ended.** `out.len` is where this member's own output begins when it is called, which is
+        // what a back reference may reach and no further. Throws "T", "C" or "L".
+        const gzInflate = (bytes, at, out, cap) => {
+            const base = out.len
+            let pos = at
+            let buf = 0
+            let have = 0
+
+            const bit = () => {
+                if (have === 0) {
+                    if (pos >= bytes.length) throw "T"
+
+                    buf = bytes[pos]
+                    pos = pos + 1
+                    have = 8
+                }
+
+                const b = buf & 1
+
+                buf = buf >> 1
+                have = have - 1
+
+                return b
+            }
+
+            const bits = (n) => {
+                let v = 0
+
+                for (let i = 0; i < n; i = i + 1) v = v | (bit() << i)
+
+                return v
+            }
+
+            const decode = (h) => {
+                let code = 0
+                let first = 0
+                let index = 0
+
+                for (let len = 1; len <= 15; len = len + 1) {
+                    code = code | bit()
+
+                    const n = h.count[len]
+
+                    if (code - n < first) return h.symbol[index + (code - first)]
+
+                    index = index + n
+                    first = (first + n) * 2
+                    code = code * 2
+                }
+
+                throw "C"
+            }
+
+            // Room for `n` more bytes, which is also where the limit is enforced: the answer is
+            // never allowed to grow past `cap`, so a bomb is stopped where it is.
+            const room = (n) => {
+                if (out.len + n > cap) throw "L"
+
+                if (out.len + n > out.buf.length) {
+                    const bigger = new Uint8Array(Math.max(out.buf.length * 2, out.len + n))
+
+                    bigger.set(out.buf.subarray(0, out.len))
+                    out.buf = bigger
+                }
+            }
+
+            const codes = (lit, dist) => {
+                for (;;) {
+                    let sym = decode(lit)
+
+                    if (sym < 256) {
+                        room(1)
+                        out.buf[out.len] = sym
+                        out.len = out.len + 1
+                    } else if (sym === 256) {
+                        return
+                    } else {
+                        sym = sym - 257
+
+                        if (sym >= 29) throw "C"
+
+                        const len = GZ_LEN_BASE[sym] + bits(GZ_LEN_EXTRA[sym])
+                        const ds = decode(dist)
+
+                        if (ds >= 30) throw "C"
+
+                        const d = GZ_DIST_BASE[ds] + bits(GZ_DIST_EXTRA[ds])
+
+                        if (d > out.len - base) throw "C"
+
+                        room(len)
+
+                        for (let i = 0; i < len; i = i + 1) {
+                            out.buf[out.len] = out.buf[out.len - d]
+                            out.len = out.len + 1
+                        }
+                    }
+                }
+            }
+
+            let last = 0
+
+            do {
+                last = bit()
+
+                const type = bits(2)
+
+                if (type === 0) {
+                    have = 0
+
+                    if (pos + 4 > bytes.length) throw "T"
+
+                    const n = bytes[pos] | (bytes[pos + 1] << 8)
+                    const complement = bytes[pos + 2] | (bytes[pos + 3] << 8)
+
+                    if (n !== (~complement & 0xFFFF)) throw "C"
+
+                    pos = pos + 4
+
+                    if (pos + n > bytes.length) throw "T"
+
+                    room(n)
+                    out.buf.set(bytes.subarray(pos, pos + n), out.len)
+                    out.len = out.len + n
+                    pos = pos + n
+                } else if (type === 1) {
+                    if (gzFixed === null) {
+                        const lit = new Uint8Array(288)
+
+                        for (let i = 0; i < 288; i = i + 1) lit[i] = i < 144 ? 8 : i < 256 ? 9 : i < 280 ? 7 : 8
+
+                        gzFixed = { lit: gzHuffman(lit, 288), dist: gzHuffman(new Uint8Array(30).fill(5), 30) }
+                    }
+
+                    codes(gzFixed.lit, gzFixed.dist)
+                } else if (type === 2) {
+                    const nlen = bits(5) + 257
+                    const ndist = bits(5) + 1
+                    const ncode = bits(4) + 4
+
+                    if (nlen > 286 || ndist > 30) throw "C"
+
+                    const lengths = new Uint8Array(nlen + ndist > 19 ? nlen + ndist : 19)
+
+                    for (let i = 0; i < ncode; i = i + 1) lengths[GZ_CL_ORDER[i]] = bits(3)
+
+                    const lencode = gzHuffman(lengths, 19)
+
+                    lengths.fill(0)
+
+                    let idx = 0
+
+                    while (idx < nlen + ndist) {
+                        const sym = decode(lencode)
+
+                        if (sym < 16) {
+                            lengths[idx] = sym
+                            idx = idx + 1
+                        } else {
+                            let value = 0
+                            let rep = 0
+
+                            if (sym === 16) {
+                                if (idx === 0) throw "C"
+
+                                value = lengths[idx - 1]
+                                rep = 3 + bits(2)
+                            } else if (sym === 17) {
+                                rep = 3 + bits(3)
+                            } else {
+                                rep = 11 + bits(7)
+                            }
+
+                            if (idx + rep > nlen + ndist) throw "C"
+
+                            for (; rep > 0; rep = rep - 1) {
+                                lengths[idx] = value
+                                idx = idx + 1
+                            }
+                        }
+                    }
+
+                    if (lengths[256] === 0) throw "C"
+
+                    codes(gzHuffman(lengths.subarray(0, nlen), nlen),
+                        gzHuffman(lengths.subarray(nlen, nlen + ndist), ndist))
+                } else {
+                    throw "C"
+                }
+            } while (last === 0)
+
+            return pos
+        }
+
+        // The bytes of every member, read the way `miniz`'s gzip `Decoder` reads them, or the
+        // sentence saying why not. The faults are in the Decoder's order and so are its checks: the
+        // header a byte at a time, the deflate stream, then the trailer's checksum before its length.
+        const gzMembers = (bytes, cap) => {
+            const out = { buf: new Uint8Array(Math.min(Math.max(bytes.length * 4, 64), cap + 1)), len: 0 }
+            const tooMuch = "this expands past the " + cap + " bytes it was allowed"
+
+            try {
+                // The stream may stop after a member and not before the first one.
+                if (bytes.length === 0) throw "T"
+
+                let at = 0
+
+                while (at < bytes.length) {
+                    // **The first byte of a member after the first is `Trailing` when it is not
+                    // `1f`**, where the first member's is a header that is wrong.
+                    if (bytes[at] !== 0x1f) throw at === 0 ? "H" : "R"
+
+                    const from = at
+                    const need = (i) => { if (from + i >= bytes.length) throw "T" }
+
+                    need(1)
+                    if (bytes[from + 1] !== 0x8b) throw "H"
+                    need(2)
+                    if (bytes[from + 2] !== 8) throw "H"
+                    need(3)
+
+                    const flags = bytes[from + 3]
+
+                    if ((flags & 0xE0) !== 0) throw "H"
+
+                    need(9)
+                    at = from + 10
+
+                    if ((flags & 0x04) !== 0) {
+                        need(at - from + 1)
+
+                        const extra = bytes[at] + bytes[at + 1] * 256
+
+                        at = at + 2 + extra
+
+                        if (at > bytes.length) throw "T"
+                    }
+
+                    for (const flag of [0x08, 0x10]) {
+                        if ((flags & flag) !== 0) {
+                            at = gzPastNul(bytes, at)
+
+                            if (at < 0) throw "T"
+                        }
+                    }
+
+                    if ((flags & 0x02) !== 0) {
+                        if (at + 2 > bytes.length) throw "T"
+
+                        const stated = bytes[at] + bytes[at + 1] * 256
+
+                        if (stated !== (gzCrc32(bytes.subarray(from, at)) & 0xFFFF)) throw "H"
+
+                        at = at + 2
+                    }
+
+                    const start = out.len
+
+                    at = gzInflate(bytes, at, out, cap)
+
+                    if (at + 8 > bytes.length) throw "T"
+
+                    const made = out.buf.subarray(start, out.len)
+
+                    if (gzCrc32(made) !== gzLe32(bytes, at)) return gzBad(GZ_CRC_SAID)
+                    if (made.length >>> 0 !== gzLe32(bytes, at + 4)) return gzBad(GZ_LENGTH_SAID)
+
+                    at = at + 8
+                }
+            } catch (e) {
+                if (e === "L") return gzBad(tooMuch)
+
+                if (typeof e === "string" && GZ_SAID[e] !== undefined) return gzBad(GZ_SAID[e])
+
+                throw e
+            }
+
+            return gzOk(gzArray(out.buf.subarray(0, out.len)))
+        }
+
         // -- the four names ----------------------------------------------------------------------
 
         B.gzip = (...args) => {
@@ -270,40 +575,16 @@ js_runtime_gzip() -> string = raw"""
 
             gzHave("gunzip")
 
-            const at = gzBodyAt(bytes)
-
-            if (typeof at === "string") return Promise.resolve(gzBad(at))
-
-            // **The trailer is checked against the limit before a byte is asked for**, which is
-            // `unwrapped`'s own order and is what makes the refusal the same sentence here.
-            const size = gzLe32(bytes, bytes.length - 4)
-
-            if (size > cap)
-                return Promise.resolve(gzBad("this expands past the " + cap + " bytes it was allowed"))
-
-            return gzThrough("deflate-raw", bytes.subarray(at, bytes.length - 8), cap).then((out) => {
-                // **A trailer may lie**, so the cap is also counted as the chunks arrive; that is
-                // what `null` means here.
+            // **The host reads the whole stream first, every member of it**, and a stream it takes
+            // is a stream `gzMembers` would take. What it refuses is read again by `gzMembers`,
+            // which says why in the interpreter's words; the limit is the one thing answered here,
+            // the host having stopped counting at it.
+            return gzThrough("gzip", bytes, cap).then((out) => {
                 if (out === null)
                     return gzBad("this expands past the " + cap + " bytes it was allowed")
 
-                // **Two sentences for a trailer that lies, matching `unwrapped`'s two.** The
-                // interpreter sizes its destination from `ISIZE` and so has no count to report for a
-                // stream that held more; this one has inflated the whole thing and says the same
-                // words anyway, or the two back ends would disagree over a damaged file.
-                if (out.length > size)
-                    return gzBad("this gzip stream said it held " + size +
-                        " bytes and holds more than that")
-
-                if (out.length < size)
-                    return gzBad("this gzip stream said it held " + size + " bytes and produced " +
-                        out.length)
-
-                if (gzCrc32(out) !== gzLe32(bytes, bytes.length - 8))
-                    return gzBad("this gzip stream's checksum does not match its contents, so the bytes are damaged")
-
                 return gzOk(gzArray(out))
-            }, () => gzBad(GZ_UNREADABLE))
+            }, () => gzMembers(bytes, cap))
         }
 
         B.inflate = (...args) => {

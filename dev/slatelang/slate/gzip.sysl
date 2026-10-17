@@ -13,80 +13,73 @@ import sysl.buf.{Buf, buf}
 // `slate:gzip`, the module a program imports -- the same container written as well as read, plus the
 // zlib wrapper beside it, and every sentence written for somebody holding bytes rather than a file.
 //
-// **gzip is a small header, a raw deflate stream, and an eight-byte trailer.** `sh.sysl.miniz` does
-// the deflate; everything here is the wrapper around it, which zlib's own format does not have and
-// which miniz therefore does not read.
-//
-// **The trailer is the reason this is easy.** miniz's own comment says a compressed stream does not
-// say how large its output will be, so a caller has to know from somewhere else -- and gzip's
-// trailer carries exactly that, an `ISIZE` giving the uncompressed length. So the buffer is sized
-// from the file rather than guessed at or grown.
+// **gzip is a small header, a raw deflate stream, and an eight-byte trailer, repeated for every
+// member.** `sh.sysl.miniz`'s `Decoder` reads the whole of it, wrapper included, so the container
+// is miniz's and every member of a concatenated file is decoded; zlib's wrapper and a bare deflate
+// stream go through the whole-buffer `inflate`, which grows its destination by doubling.
 
 // The bytes a `.gz` holds.
 gunzip(bytes: []const u8) -> Result[[]u8, string]
-    // Ten bytes of header and eight of trailer is the smallest a gzip file can be.
-    if bytes.len < 18 then return Err("this is too short to be a gzip file")
-
-    if bytes[0] != u8(0x1f) || bytes[1] != u8(0x8b)
-        return Err("this does not begin with gzip's two magic bytes, so it is not a gzip file")
-
-    // **The only compression method gzip has ever had is deflate**, so anything else is a file from
-    // a future that does not exist rather than something to fall back over.
-    if bytes[2] != 8 then return Err(s"this gzip file says it uses compression method ${bytes[2]}, and the only one there is is deflate")
-
-    val flags = bytes[3]
-    var at: usize = 10
-
-    // FEXTRA: two bytes of length and that many bytes of vendor data.
-    if flags & 0x04 != 0
-        if at + 2 > bytes.len then return Err("this gzip file ends inside its header")
-
-        val extra = usize(bytes[at]) + usize(bytes[at + 1]) * 256
-
-        at += 2 + extra
-
-    // FNAME and FCOMMENT are each a NUL-terminated string. **Both are skipped rather than read**:
-    // the name inside an archive is the uploader's, and what a package is called is settled by the
-    // coordinate that fetched it.
-    if flags & 0x08 != 0 then at = past_nul(bytes, at)?
-    if flags & 0x10 != 0 then at = past_nul(bytes, at)?
-
-    // FHCRC: a checksum of the header alone.
-    if flags & 0x02 != 0 then at += 2
-
-    if at + 8 > bytes.len then return Err("this gzip file ends inside its header")
-
-    val body = bytes[at..<(bytes.len - 8)]
-    val size = le32(bytes, bytes.len - 4)
-
-    // **A ceiling, because `ISIZE` is the real length modulo 2^32 and a corrupt trailer is a number
-    // like any other.** Without it a damaged download asks for four gigabytes before failing.
-    if size > MaxUnpacked
-        return Err(s"this gzip file says it holds ${size} bytes, which is more than a package should be")
-
-    var storage = [u8(0); miniz.INFLATE_BYTES]
-    // **The annotation is what makes this storage rather than an array**: a repeat count worked out
-    // while running cannot be an array's bound, and `[]u8` is what says so.
-    var out: []u8 = [u8(0); size]
-
-    miniz.inflate(storage, body, out, miniz.Format.Raw) match
-        Err(e) -> return Err(why(e))
-        Ok(n) ->
-            if n != size
-                return Err(s"this gzip file said it held ${size} bytes and produced ${n}")
-
+    // **A `Decoder` reads the whole file, and every member of it**: `cat a.gz b.gz` is a valid gzip
+    // file and gzip(1) reads it as the two outputs joined, which a tarball built by concatenation is
+    // entitled to be. What a package is decides by hash, and `slate.sum` is that, so there is no
+    // reason to refuse a stream that is well formed.
+    //
     // **The checksum is worth the pass even though a `slate.sum` hash is coming.** They catch
-    // different things and at different moments: this one catches a download that arrived damaged,
-    // now, and says so in those words -- where the same corruption reaching the tar reader produces
-    // a complaint about an archive being malformed, which sends the reader to the wrong question.
-    val stated = le32(bytes, bytes.len - 8)
-    val actual = usize(miniz.crc32(out))
+    // different things and at different moments: the decoder's catches a download that arrived
+    // damaged, now, and `why` says so in those words -- where the same corruption reaching the tar
+    // reader produces a complaint about an archive being malformed, which sends the reader to the
+    // wrong question.
+    members(bytes, MaxUnpacked) match
+        Err(None) -> Err(s"this gzip file holds more than a package should, which is ${MaxUnpacked} bytes")
+        Err(Some(e)) -> Err(why(e))
+        Ok(made) ->
+            // **The annotation is what makes this an array rather than storage**: a repeat count
+            // worked out while running cannot be an array's bound, and `[]u8` is what says so.
+            var out: []u8 = [u8(0); made.len()]
 
-    if actual != stated
-        return Err("this gzip file's checksum does not match its contents, so the download is damaged")
+            for i in 0..<made.len()
+                out[i] = made.at(i)
+
+            Ok(out)
+end gunzip
+
+// Every member of a gzip file through one `Decoder`, or what stopped it. `None` is the limit, which
+// is not miniz's to report: it is a decision about how much a caller will hold.
+//
+// **The file is fed in pieces and the limit is read between them**, because a few hundred bytes of
+// deflate stand for megabytes and the point of a limit is never to hold the whole of what it
+// refuses. A piece may expand a thousandfold, so the overshoot is bounded by the piece and not by
+// the stream. **The limit is asked BEFORE the error**, the decoder having appended everything it
+// produced ahead of a fault: a stream that outgrew the limit and was then found damaged is, on both
+// hosts, one that outgrew the limit.
+private members(bytes: []const u8, limit: usize) -> Result[Buf[u8], Option[miniz.Error]]
+    val d = miniz.decoder(miniz.Wrapper.Gzip)
+    var out: Buf[u8] = buf()
+    var at: usize = 0
+
+    while at < bytes.len
+        val to = if bytes.len - at > FeedPiece then at + FeedPiece else bytes.len
+        val fed = d.feed(bytes[at..<to], out)
+
+        if out.len() > limit then return Err(None)
+
+        fed match
+            Err(e) -> return Err(Some(e))
+            Ok(_) -> ()
+
+        at = to
+
+    // A stream that stops short of its end is `Truncated`, an empty one included.
+    d.finish() match
+        Err(e) -> return Err(Some(e))
+        Ok(_) -> ()
 
     Ok(out)
-end gunzip
+end members
+
+// How much of a stream is handed to the decoder at once.
+private val FeedPiece: usize = 4096
 
 // What miniz objected to, said in the words of someone unpacking a package.
 //
@@ -100,34 +93,16 @@ private why(e: miniz.Error) -> string
         Full -> "the compressed data held more than its own trailer said it would"
         Short(_) -> "the compressed data held more than its own trailer said it would"
         NoRoom(needed) -> s"unpacking needed ${needed} bytes of working space"
-        // The stream ended before the bytes did. The body handed to miniz stops at the trailer, so
-        // what follows the end is most often a second gzip member, which a package never is.
+        // The last member ended and bytes followed that do not begin another: padding or junk.
         Trailing -> "the compressed data ends before the file does, so the download is damaged"
-        // The last three are a gzip `Decoder`'s, and `gunzip` reads the container itself above and
-        // hands miniz the bare stream; they are here because the match says every answer.
-        BadHeader -> "this gzip file's header is damaged"
+        // A gzip header that is not one, which is what text arrives as when it is not a gzip file.
+        BadHeader -> "this is not a gzip file, or its header is damaged"
         BadCrc -> "this gzip file's checksum does not match its contents, so the download is damaged"
         BadLength -> "this gzip file's stated length does not match its contents, so the download is damaged"
 end why
 
 // No package is this large, and a number bigger than this in a trailer is damage rather than a size.
 private val MaxUnpacked: usize = 512 * 1024 * 1024
-
-private le32(bytes: []const u8, at: usize) -> usize =
-    usize(bytes[at]) + usize(bytes[at + 1]) * 256 + usize(bytes[at + 2]) * 65536 + usize(bytes[at + 3]) * 16777216
-
-private past_nul(bytes: []const u8, from: usize) -> Result[usize, string]
-    var i = from
-
-    loop
-        if i >= bytes.len then return Err("this gzip file ends inside its header")
-
-        val c = bytes[i]
-
-        i += 1
-
-        if c == 0 then return Ok(i)
-end past_nul
 
 // -- `slate:gzip`, which is the compression every host has ---------------------------------------
 
@@ -289,88 +264,39 @@ private why_gz(e: miniz.Error) -> string
         Full -> "this expands past the room it was given"
         Short(_) -> "this expands past the room it was given"
         NoRoom(needed) -> s"decompressing needed ${needed} bytes of working space"
-        // **A stream says where it ends, so bytes after that are not part of it** -- and for a gzip
-        // member the commonest such bytes are a second member, which is not read.
+        // **A stream says where it ends, so bytes after that are not part of it**: after a zlib or
+        // raw stream anything is, and after the last gzip member whatever does not begin another.
         Trailing -> "this compressed stream ends before the bytes do"
-        // `gz_member` reads the container itself and hands miniz the bare stream, so these three are
-        // a `Decoder`'s; the sentences are `gz_member`'s own for the same faults.
+        // A gzip `Decoder`'s three, which `unwrapped` reaches through `gz_members`.
         BadHeader -> "this is not a gzip stream"
         BadCrc -> "this gzip stream's checksum does not match its contents, so the bytes are damaged"
         BadLength -> "this gzip stream's stated length does not match its contents"
 end why_gz
 
-// The bytes a gzip member holds, as a result.
+// The bytes a gzip stream holds, as a result.
 //
-// **The trailer is what makes this exact where `stretched` has to guess.** gzip's `ISIZE` gives the
-// uncompressed length, so the destination is sized from the file and the limit is checked before a
-// byte is allocated -- which is the whole of the bomb defence for this format.
+// **Every member is read and the answer is their outputs joined**, which is what node's `gunzipSync`
+// and gzip(1) do. The limit is checked as the output grows rather than against a stated length, a
+// member's trailer saying nothing about the ones after it.
 private unwrapped(bytes: []const u8, limit: usize) -> Value
-    gz_member(bytes, limit) match
-        Ok(out) -> ok_value(gz_bytes(out))
+    gz_members(bytes, limit) match
+        Ok(out) -> ok_value(gz_bytes(out.view()))
         Err(why) -> err_value(why)
 
-// The bytes inside a gzip member, or the sentence saying why there are none.
+// The bytes inside every member of a gzip stream, or the sentence saying why there are none.
+//
+// **Bytes after the last member are `Trailing`, zero padding included**, which gzip(1) and node's
+// `gunzipSync` tolerate for zero padding and a `DecompressionStream` refuses; the JavaScript host
+// refuses it too, so the two back ends agree.
 //
 // Not `private`: `client.sysl` decodes a `Content-Encoding: gzip` body with it, so a response and a
 // program's own `gunzip` cannot read the container two ways.
-gz_member(bytes: []const u8, limit: usize) -> Result[[]u8, string]
-    if bytes.len < 18 then return Err("this is too short to be a gzip stream")
-
-    if bytes[0] != u8(0x1f) || bytes[1] != u8(0x8b)
-        return Err("this does not begin with gzip's two magic bytes, so it is not a gzip stream")
-
-    if bytes[2] != 8
-        return Err(s"this gzip stream says it uses compression method ${bytes[2]}, and the only one there is is deflate")
-
-    val flags = bytes[3]
-    var at: usize = 10
-
-    if flags & 0x04 != 0
-        if at + 2 > bytes.len then return Err("this gzip stream ends inside its header")
-
-        at += 2 + usize(bytes[at]) + usize(bytes[at + 1]) * 256
-
-    if flags & 0x08 != 0
-        past_nul(bytes, at) match
-            // **`past_nul`'s own sentence is the package manager's and says "file"**, which is the
-            // right word for a download and the wrong one for bytes somebody sent.
-            Err(_) -> return Err("this gzip stream ends inside its header")
-            Ok(next) -> at = next
-
-    if flags & 0x10 != 0
-        past_nul(bytes, at) match
-            Err(_) -> return Err("this gzip stream ends inside its header")
-            Ok(next) -> at = next
-
-    if flags & 0x02 != 0 then at += 2
-    if at + 8 > bytes.len then return Err("this gzip stream ends inside its header")
-
-    val size = le32(bytes, bytes.len - 4)
-
-    if size > limit then return Err(s"this expands past the ${limit} bytes it was allowed")
-
-    var out: []u8 = [u8(0); size]
-
-    // **A trailer that lies is two different sentences and both are exact.** The destination is
-    // sized from `ISIZE`, so a stream holding MORE fills it and miniz answers `Full` -- there is no
-    // count to report, only that there was more -- while one holding less simply produces less and
-    // the count is worth saying. A JavaScript host reaches the same two sentences from the other
-    // side, having inflated the whole thing before comparing.
-    miniz.inflate(current().inflate_state.view(), bytes[at..<(bytes.len - 8)], out, miniz.Format.Raw) match
-        Err(Full) -> return Err(s"this gzip stream said it held ${size} bytes and holds more than that")
-        Err(e) -> return Err(why_gz(e))
-        Ok(n) ->
-            if n != size
-                return Err(s"this gzip stream said it held ${size} bytes and produced ${n}")
-
-    // **The checksum is the difference between damaged and merely wrong.** A stream that inflated to
-    // the right length and the wrong bytes is a download that arrived corrupt, and saying so sends
-    // the reader to the transport rather than to the compressor.
-    if usize(miniz.crc32(out)) != le32(bytes, bytes.len - 8)
-        return Err("this gzip stream's checksum does not match its contents, so the bytes are damaged")
-
-    Ok(out)
-end gz_member
+gz_members(bytes: []const u8, limit: usize) -> Result[Buf[u8], string]
+    members(bytes, limit) match
+        Ok(out) -> Ok(out)
+        Err(None) -> Err(s"this expands past the ${limit} bytes it was allowed")
+        Err(Some(e)) -> Err(why_gz(e))
+end gz_members
 
 // `gzip(data)` -- a promise of the compressed bytes, wrapped as a gzip member.
 //
