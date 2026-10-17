@@ -16,7 +16,8 @@ module dev.slatelang.slate
 // **The server's half, which is what `serve` needs**: `h2Server`, `h2Receive`, `h2Send`, `h2Next`,
 // `h2Respond`, `h2RespondStream`, `h2Push`, `h2Finish`, `h2Goaway`, `h2Consume` and `h2Close`. The
 // client's half, `h2Settings`, `h2Reset`, `h2WindowUpdate`, `h2Ping`, `h2Wants` and the stand-alone
-// HPACK calls stay on the `OWED` list and say so.
+// HPACK calls stay on the `OWED` list and say so. HPACK itself is `js_rt_h2_hpack.sysl`, whose block
+// opens the `h2` scope that this one closes.
 //
 // **The encoder never indexes.** Every field goes out as an indexed static entry or a literal
 // without indexing, so the peer's table is never touched and a `SETTINGS_HEADER_TABLE_SIZE` it
@@ -24,352 +25,15 @@ module dev.slatelang.slate
 // what it buys is that this side holds no table the peer could drive out of step. **The decoder is
 // complete**: it has to be, a client indexes whatever it likes.
 //
-// **Frames the peer sends over the size this side advertised, and windows it overruns, are not
-// policed beyond the frame size.** The session answers the first as a protocol error, which is
-// `{ error }` from `h2Receive` as it is in the interpreter.
+// **A peer is held to what nghttp2 holds it to**, since a session that buffers whatever arrives is
+// a memory-exhaustion risk for every `slate js` server: a frame over the size advertised, DATA past
+// a stream's window (RST_STREAM FLOW_CONTROL_ERROR) or the connection's (GOAWAY FLOW_CONTROL_ERROR),
+// more than a hundred streams open at once (REFUSED_STREAM), a header list past 64 KiB (`431`),
+// a header block past eight CONTINUATIONs or 64 KiB, and resets past nghttp2's rapid-reset bucket
+// (both GOAWAY ENHANCE_YOUR_CALM). A connection error is `{ error }` from `h2Receive`, as it is in
+// the interpreter, with the GOAWAY that says why already queued.
 
 js_runtime_h2() -> string = raw"""
-        // -- HTTP/2, the server's half ------------------------------------------------------------------
-
-        const h2 = (() => {
-            // RFC 7541 Appendix A, in order: an index of `n` names `STATIC[n - 1]`.
-            const STATIC = [
-                [":authority", ""], [":method", "GET"], [":method", "POST"], [":path", "/"],
-                [":path", "/index.html"], [":scheme", "http"], [":scheme", "https"], [":status", "200"],
-                [":status", "204"], [":status", "206"], [":status", "304"], [":status", "400"],
-                [":status", "404"], [":status", "500"], ["accept-charset", ""],
-                ["accept-encoding", "gzip, deflate"], ["accept-language", ""], ["accept-ranges", ""],
-                ["accept", ""], ["access-control-allow-origin", ""], ["age", ""], ["allow", ""],
-                ["authorization", ""], ["cache-control", ""], ["content-disposition", ""],
-                ["content-encoding", ""], ["content-language", ""], ["content-length", ""],
-                ["content-location", ""], ["content-range", ""], ["content-type", ""], ["cookie", ""],
-                ["date", ""], ["etag", ""], ["expect", ""], ["expires", ""], ["from", ""], ["host", ""],
-                ["if-match", ""], ["if-modified-since", ""], ["if-none-match", ""], ["if-range", ""],
-                ["if-unmodified-since", ""], ["last-modified", ""], ["link", ""], ["location", ""],
-                ["max-forwards", ""], ["proxy-authenticate", ""], ["proxy-authorization", ""],
-                ["range", ""], ["referer", ""], ["refresh", ""], ["retry-after", ""], ["server", ""],
-                ["set-cookie", ""], ["strict-transport-security", ""], ["transfer-encoding", ""],
-                ["user-agent", ""], ["vary", ""], ["via", ""], ["www-authenticate", ""]
-            ]
-
-            // The static entries by what a field says: the index of a name and value together, and of
-            // a name alone (the first entry that has it).
-            const staticFull = new Map()
-            const staticName = new Map()
-
-            STATIC.forEach((e, i) => {
-                if (e[1] !== "") staticFull.set(e[0] + "\u0000" + e[1], i + 1)
-                if (!staticName.has(e[0])) staticName.set(e[0], i + 1)
-            })
-
-            // RFC 7541 Appendix B: the code of each byte and how many bits it is. The end-of-string
-            // symbol is not here, so a stream that spells it falls off the tree and is refused.
-            const HUFF_CODES = [
-                0x1ff8, 0x7fffd8, 0xfffffe2, 0xfffffe3, 0xfffffe4, 0xfffffe5, 0xfffffe6, 0xfffffe7,
-                0xfffffe8, 0xffffea, 0x3ffffffc, 0xfffffe9, 0xfffffea, 0x3ffffffd, 0xfffffeb, 0xfffffec,
-                0xfffffed, 0xfffffee, 0xfffffef, 0xffffff0, 0xffffff1, 0xffffff2, 0x3ffffffe, 0xffffff3,
-                0xffffff4, 0xffffff5, 0xffffff6, 0xffffff7, 0xffffff8, 0xffffff9, 0xffffffa, 0xffffffb,
-                0x14, 0x3f8, 0x3f9, 0xffa, 0x1ff9, 0x15, 0xf8, 0x7fa,
-                0x3fa, 0x3fb, 0xf9, 0x7fb, 0xfa, 0x16, 0x17, 0x18,
-                0x0, 0x1, 0x2, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
-                0x1e, 0x1f, 0x5c, 0xfb, 0x7ffc, 0x20, 0xffb, 0x3fc,
-                0x1ffa, 0x21, 0x5d, 0x5e, 0x5f, 0x60, 0x61, 0x62,
-                0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a,
-                0x6b, 0x6c, 0x6d, 0x6e, 0x6f, 0x70, 0x71, 0x72,
-                0xfc, 0x73, 0xfd, 0x1ffb, 0x7fff0, 0x1ffc, 0x3ffc, 0x22,
-                0x7ffd, 0x3, 0x23, 0x4, 0x24, 0x5, 0x25, 0x26,
-                0x27, 0x6, 0x74, 0x75, 0x28, 0x29, 0x2a, 0x7,
-                0x2b, 0x76, 0x2c, 0x8, 0x9, 0x2d, 0x77, 0x78,
-                0x79, 0x7a, 0x7b, 0x7ffe, 0x7fc, 0x3ffd, 0x1ffd, 0xffffffc,
-                0xfffe6, 0x3fffd2, 0xfffe7, 0xfffe8, 0x3fffd3, 0x3fffd4, 0x3fffd5, 0x7fffd9,
-                0x3fffd6, 0x7fffda, 0x7fffdb, 0x7fffdc, 0x7fffdd, 0x7fffde, 0xffffeb, 0x7fffdf,
-                0xffffec, 0xffffed, 0x3fffd7, 0x7fffe0, 0xffffee, 0x7fffe1, 0x7fffe2, 0x7fffe3,
-                0x7fffe4, 0x1fffdc, 0x3fffd8, 0x7fffe5, 0x3fffd9, 0x7fffe6, 0x7fffe7, 0xffffef,
-                0x3fffda, 0x1fffdd, 0xfffe9, 0x3fffdb, 0x3fffdc, 0x7fffe8, 0x7fffe9, 0x1fffde,
-                0x7fffea, 0x3fffdd, 0x3fffde, 0xfffff0, 0x1fffdf, 0x3fffdf, 0x7fffeb, 0x7fffec,
-                0x1fffe0, 0x1fffe1, 0x3fffe0, 0x1fffe2, 0x7fffed, 0x3fffe1, 0x7fffee, 0x7fffef,
-                0xfffea, 0x3fffe2, 0x3fffe3, 0x3fffe4, 0x7ffff0, 0x3fffe5, 0x3fffe6, 0x7ffff1,
-                0x3ffffe0, 0x3ffffe1, 0xfffeb, 0x7fff1, 0x3fffe7, 0x7ffff2, 0x3fffe8, 0x1ffffec,
-                0x3ffffe2, 0x3ffffe3, 0x3ffffe4, 0x7ffffde, 0x7ffffdf, 0x3ffffe5, 0xfffff1, 0x1ffffed,
-                0x7fff2, 0x1fffe3, 0x3ffffe6, 0x7ffffe0, 0x7ffffe1, 0x3ffffe7, 0x7ffffe2, 0xfffff2,
-                0x1fffe4, 0x1fffe5, 0x3ffffe8, 0x3ffffe9, 0xffffffd, 0x7ffffe3, 0x7ffffe4, 0x7ffffe5,
-                0xfffec, 0xfffff3, 0xfffed, 0x1fffe6, 0x3fffe9, 0x1fffe7, 0x1fffe8, 0x7ffff3,
-                0x3fffea, 0x3fffeb, 0x1ffffee, 0x1ffffef, 0xfffff4, 0xfffff5, 0x3ffffea, 0x7ffff4,
-                0x3ffffeb, 0x7ffffe6, 0x3ffffec, 0x3ffffed, 0x7ffffe7, 0x7ffffe8, 0x7ffffe9, 0x7ffffea,
-                0x7ffffeb, 0xffffffe, 0x7ffffec, 0x7ffffed, 0x7ffffee, 0x7ffffef, 0x7fffff0, 0x3ffffee
-            ]
-
-            const HUFF_LENS = [
-                13, 23, 28, 28, 28, 28, 28, 28, 28, 24, 30, 28, 28, 30, 28, 28,
-                28, 28, 28, 28, 28, 28, 30, 28, 28, 28, 28, 28, 28, 28, 28, 28,
-                6, 10, 10, 12, 13, 6, 8, 11, 10, 10, 8, 11, 8, 6, 6, 6,
-                5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 7, 8, 15, 6, 12, 10,
-                13, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
-                7, 7, 7, 7, 7, 7, 7, 7, 8, 7, 8, 13, 19, 13, 14, 6,
-                15, 5, 6, 5, 6, 5, 6, 6, 6, 5, 7, 7, 6, 6, 6, 5,
-                6, 7, 6, 5, 5, 6, 7, 7, 7, 7, 7, 15, 11, 14, 13, 28,
-                20, 22, 20, 20, 22, 22, 22, 23, 22, 23, 23, 23, 23, 23, 24, 23,
-                24, 24, 22, 23, 24, 23, 23, 23, 23, 21, 22, 23, 22, 23, 23, 24,
-                22, 21, 20, 22, 22, 23, 23, 21, 23, 22, 22, 24, 21, 22, 23, 23,
-                21, 21, 22, 21, 23, 22, 23, 23, 20, 22, 22, 22, 23, 22, 22, 23,
-                26, 26, 20, 19, 22, 23, 22, 25, 26, 26, 26, 27, 27, 26, 24, 25,
-                19, 21, 26, 27, 27, 26, 27, 24, 21, 21, 26, 26, 28, 27, 27, 27,
-                20, 24, 20, 21, 22, 21, 21, 23, 22, 22, 25, 25, 24, 24, 26, 23,
-                26, 27, 26, 26, 27, 27, 27, 27, 27, 28, 27, 27, 27, 27, 27, 26
-            ]
-
-            // The code as a binary tree: an inner node is `[zero, one]` and a leaf is its byte.
-            const huffRoot = [undefined, undefined]
-
-            HUFF_CODES.forEach((code, sym) => {
-                let n = huffRoot
-
-                for (let b = HUFF_LENS[sym] - 1; b > 0; b--) {
-                    const bit = (code >>> b) & 1
-
-                    if (n[bit] === undefined) n[bit] = [undefined, undefined]
-
-                    n = n[bit]
-                }
-
-                n[code & 1] = sym
-            })
-
-            // What a peer got wrong, as the answer `h2Receive` gives.
-            class H2Error extends Error {}
-
-            const refuse = (message) => { throw new H2Error(message) }
-
-            const huffDecode = (buf) => {
-                const out = []
-                let node = huffRoot
-                let bits = 0
-                let ones = true
-
-                for (const byte of buf) {
-                    for (let i = 7; i >= 0; i--) {
-                        const bit = (byte >> i) & 1
-
-                        node = node[bit]
-
-                        if (node === undefined) refuse("a header block was not valid HPACK: bad Huffman code")
-
-                        bits++
-
-                        if (bit === 0) ones = false
-
-                        if (typeof node === "number") {
-                            out.push(node)
-
-                            node = huffRoot
-                            bits = 0
-                            ones = true
-                        }
-                    }
-                }
-
-                // What is left over is padding, which is the start of the end-of-string code: fewer than
-                // eight bits and every one of them set.
-                if (bits > 7 || !ones) refuse("a header block was not valid HPACK: bad Huffman padding")
-
-                return Buffer.from(out)
-            }
-
-            // An HPACK integer with a `prefix`-bit prefix, as `[value, next position]`.
-            const readInt = (buf, pos, prefix) => {
-                const max = (1 << prefix) - 1
-
-                if (pos >= buf.length) refuse("a header block was not valid HPACK: it ended early")
-
-                let value = buf[pos++] & max
-
-                if (value < max) return [value, pos]
-
-                let shift = 0
-
-                for (;;) {
-                    if (pos >= buf.length) refuse("a header block was not valid HPACK: it ended early")
-
-                    const b = buf[pos++]
-
-                    value += (b & 0x7f) * Math.pow(2, shift)
-                    shift += 7
-
-                    if (shift > 35) refuse("a header block was not valid HPACK: an integer is too large")
-
-                    if ((b & 0x80) === 0) return [value, pos]
-                }
-            }
-
-            // A string literal, as a latin1 string of its bytes and the next position.
-            const readString = (buf, pos) => {
-                const huffman = pos < buf.length && (buf[pos] & 0x80) !== 0
-                const [len, at] = readInt(buf, pos, 7)
-
-                if (at + len > buf.length) refuse("a header block was not valid HPACK: a string ran past its end")
-
-                const raw = buf.subarray(at, at + len)
-
-                return [(huffman ? huffDecode(raw) : raw).toString("latin1"), at + len]
-            }
-
-            // The peer's header table, with the size rule that evicts the oldest.
-            class Decoder {
-                constructor() {
-                    this.table = []
-                    this.size = 0
-                    this.max = 4096
-                    this.limit = 4096
-                }
-
-                evict(room) {
-                    while (this.size > room && this.table.length > 0) {
-                        const old = this.table.pop()
-
-                        this.size -= old[0].length + old[1].length + 32
-                    }
-                }
-
-                add(name, value) {
-                    const cost = name.length + value.length + 32
-
-                    if (cost > this.max) {
-                        this.table = []
-                        this.size = 0
-
-                        return
-                    }
-
-                    this.evict(this.max - cost)
-                    this.table.unshift([name, value])
-                    this.size += cost
-                }
-
-                lookup(i) {
-                    if (i === 0) refuse("a header block was not valid HPACK: index zero")
-                    if (i <= STATIC.length) return STATIC[i - 1]
-
-                    const e = this.table[i - STATIC.length - 1]
-
-                    if (e === undefined) refuse("a header block was not valid HPACK: index " + i + " is not in the table")
-
-                    return e
-                }
-
-                // A whole header block, as `[name, value]` pairs of text.
-                decode(buf) {
-                    const fields = []
-                    let pos = 0
-
-                    while (pos < buf.length) {
-                        const b = buf[pos]
-
-                        if ((b & 0x80) !== 0) {
-                            const [i, next] = readInt(buf, pos, 7)
-
-                            pos = next
-                            fields.push(this.lookup(i))
-                        } else if ((b & 0x20) !== 0 && (b & 0x40) === 0) {
-                            const [size, next] = readInt(buf, pos, 5)
-
-                            pos = next
-
-                            if (size > this.limit) refuse("a header block was not valid HPACK: the table was resized past its limit")
-
-                            this.max = size
-                            this.evict(size)
-                        } else {
-                            const indexed = (b & 0x40) !== 0
-                            const [i, next] = readInt(buf, pos, indexed ? 6 : 4)
-
-                            pos = next
-
-                            let name
-
-                            if (i > 0) {
-                                name = this.lookup(i)[0]
-                            } else {
-                                const [n, after] = readString(buf, pos)
-
-                                name = n
-                                pos = after
-                            }
-
-                            const [value, after] = readString(buf, pos)
-
-                            pos = after
-
-                            if (indexed) this.add(name, value)
-
-                            fields.push([name, value])
-                        }
-                    }
-
-                    return fields.map(([n, v]) => [n, Buffer.from(v, "latin1").toString("utf8")])
-                }
-            }
-
-            // An HPACK integer written with `prefix` bits under `flags`.
-            const putInt = (out, flags, prefix, value) => {
-                const max = (1 << prefix) - 1
-
-                if (value < max) {
-                    out.push(flags | value)
-
-                    return
-                }
-
-                out.push(flags | max)
-
-                value -= max
-
-                while (value >= 128) {
-                    out.push((value & 0x7f) | 0x80)
-
-                    value = Math.floor(value / 128)
-                }
-
-                out.push(value)
-            }
-
-            // A header block, with nothing indexed.
-            const encodeFields = (fields) => {
-                const out = []
-
-                for (const [name, value, sensitive] of fields) {
-                    const whole = staticFull.get(name + "\u0000" + value)
-
-                    if (whole !== undefined && !sensitive) {
-                        putInt(out, 0x80, 7, whole)
-
-                        continue
-                    }
-
-                    const flags = sensitive ? 0x10 : 0x00
-                    const named = staticName.get(name)
-
-                    if (named !== undefined) {
-                        putInt(out, flags, 4, named)
-                    } else {
-                        out.push(flags)
-
-                        const bytes = Buffer.from(name, "utf8")
-
-                        putInt(out, 0, 7, bytes.length)
-
-                        for (const byte of bytes) out.push(byte)
-                    }
-
-                    const bytes = Buffer.from(value, "utf8")
-
-                    putInt(out, 0, 7, bytes.length)
-
-                    for (const byte of bytes) out.push(byte)
-                }
-
-                return Buffer.from(out)
-            }
-
             // -- frames --------------------------------------------------------------------------------------
 
             const DATA = 0, HEADERS = 1, PRIORITY = 2, RST_STREAM = 3, SETTINGS = 4, PUSH_PROMISE = 5
@@ -383,6 +47,22 @@ js_runtime_h2() -> string = raw"""
 
             // Flow-control credit is given back in lumps of this size rather than frame by frame.
             const CREDIT_LUMP = 16384
+
+            // The window this side opens for every stream and for the connection: the protocol's
+            // default, which it never raises, so a peer may have this much unacknowledged at most.
+            const INITIAL_WINDOW = 65535
+
+            // **The limits a peer is held to, which are nghttp2's in substance.** The first two are
+            // advertised in this side's SETTINGS; the CONTINUATION cap is nghttp2's default since the
+            // 2024 CONTINUATION flood, and the reset bucket is the one it added for the 2023 rapid
+            // reset -- a burst of a thousand, refilled at thirty-three a second.
+            const MAX_STREAMS = 100
+            const MAX_HEADER_LIST = 65536
+            const MAX_CONTINUATIONS = 8
+            const RESET_BURST = 1000
+            const RESET_RATE = 33
+
+            const NO_ERROR = 0, FLOW_CONTROL_ERROR = 3, FRAME_SIZE_ERROR = 6, REFUSED_STREAM = 7, ENHANCE_YOUR_CALM = 11
 
             const frame = (type, flags, stream, payload) => {
                 const head = Buffer.alloc(9)
@@ -417,18 +97,50 @@ js_runtime_h2() -> string = raw"""
                     this.peerWin = 65535
                     this.peerFrame = 16384
                     this.connCredit = 0
+                    this.recvWin = INITIAL_WINDOW
                     this.continuing = null
                     this.lastStream = 0
                     this.closed = false
+                    this.failed = null
+                    this.resetTokens = RESET_BURST
+                    this.resetAt = Date.now()
 
-                    // The server's own SETTINGS go first, and an empty one is every default.
-                    this.out.push(frame(SETTINGS, 0, 0, Buffer.alloc(0)))
+                    // The server's own SETTINGS go first: every default but the two limits it holds
+                    // the peer to, so that a client which reads them never meets the refusal.
+                    const limits = Buffer.alloc(12)
+
+                    limits.writeUInt16BE(3, 0)
+                    limits.writeUInt32BE(MAX_STREAMS, 2)
+                    limits.writeUInt16BE(6, 6)
+                    limits.writeUInt32BE(MAX_HEADER_LIST, 8)
+                    this.out.push(frame(SETTINGS, 0, 0, limits))
+                }
+
+                // A connection error this side names: a GOAWAY carrying its code goes out ahead of the
+                // sentence `h2Receive` answers, and the session reads nothing more. The program's own
+                // `h2Goaway` after it is not sent, the peer having been told why already.
+                fatal(code, message) {
+                    this.goaway(this.lastStream, code)
+                    this.failed = message
+                    refuse(message)
+                }
+
+                // A stream error: RST_STREAM with its code, and the stream gone as though the peer had
+                // reset it, so the program is told `streamClose` and forgets what it held for it.
+                resetStream(stream, code) {
+                    this.out.push(frame(RST_STREAM, 0, stream, u32(code)))
+
+                    const s = this.streams.get(stream)
+
+                    if (s !== undefined) this.drop(s, code)
                 }
 
                 // -- reading -------------------------------------------------------------------------------
 
                 // Bytes in. Answers `null`, or the sentence for what the peer got wrong.
                 receive(chunk) {
+                    if (this.failed !== null) return this.failed
+
                     this.inbuf = this.inbuf.length === 0 ? Buffer.from(chunk) : Buffer.concat([this.inbuf, chunk])
 
                     try {
@@ -460,7 +172,7 @@ js_runtime_h2() -> string = raw"""
 
                         const len = this.inbuf.readUIntBE(0, 3)
 
-                        if (len > MAX_FRAME) refuse("a frame of " + len + " bytes is larger than the " + MAX_FRAME + " this side accepts")
+                        if (len > MAX_FRAME) this.fatal(FRAME_SIZE_ERROR, "a frame of " + len + " bytes is larger than the " + MAX_FRAME + " this side accepts")
 
                         if (this.inbuf.length < 9 + len) return
 
@@ -509,21 +221,41 @@ js_runtime_h2() -> string = raw"""
                 takeData(flags, stream, payload) {
                     if (stream === 0) refuse("DATA on stream zero")
 
+                    // **THE PEER IS HELD TO BOTH WINDOWS, or a body is buffered for as long as it is
+                    // sent.** Credit only goes back as the program consumes, so a client that ignores
+                    // the windows is the one thing that could make this session hold more than they
+                    // allow. Past the connection's it is a connection error; past a stream's, that
+                    // stream is reset and the bytes are credited to the connection, nobody reading them.
+                    // The whole payload counts, padding included, as RFC 9113 says.
+                    if (payload.length > this.recvWin)
+                        this.fatal(FLOW_CONTROL_ERROR, "the peer sent " + payload.length + " bytes of DATA past the connection's window of " + this.recvWin)
+
+                    this.recvWin -= payload.length
+
                     const [data, padding] = this.unpadded(flags, payload)
                     const s = this.streams.get(stream)
-
-                    // Padding is not something the program reads, so its credit goes straight back.
-                    this.credit(s, padding, true)
 
                     if (s === undefined) {
                         if (stream > this.lastStream) refuse("DATA on a stream that was never opened")
 
-                        this.credit(undefined, data.length, false)
+                        this.credit(undefined, payload.length, false)
 
                         return
                     }
 
                     if (s.recvEnded) refuse("DATA on a stream the peer had ended")
+
+                    if (payload.length > s.recvWin) {
+                        this.credit(undefined, payload.length, false)
+                        this.resetStream(stream, FLOW_CONTROL_ERROR)
+
+                        return
+                    }
+
+                    s.recvWin -= payload.length
+
+                    // Padding is not something the program reads, so its credit goes straight back.
+                    this.credit(s, padding, true)
 
                     if (data.length > 0) {
                         this.events.push({ kind: "data", stream: stream, bytes: new Uint8Array(data) })
@@ -546,7 +278,7 @@ js_runtime_h2() -> string = raw"""
                     }
 
                     if ((flags & END_HEADERS) === 0) {
-                        this.continuing = { stream: stream, flags: flags, parts: [block] }
+                        this.continuing = { stream: stream, flags: flags, parts: [block], size: block.length, count: 0 }
 
                         return
                     }
@@ -557,11 +289,24 @@ js_runtime_h2() -> string = raw"""
                 takeContinuation(flags, stream, payload) {
                     if (this.continuing === null) refuse("a CONTINUATION with no header block to continue")
 
-                    this.continuing.parts.push(payload)
+                    const held = this.continuing
+
+                    // **A header block is bounded in frames and in bytes.** Held until END_HEADERS, a
+                    // block nobody ends -- the 2024 CONTINUATION flood, often of empty frames -- would
+                    // grow for as long as the peer kept sending, so past either limit the connection
+                    // goes, as nghttp2's does.
+                    held.count += 1
+                    held.size += payload.length
+
+                    if (held.count > MAX_CONTINUATIONS)
+                        this.fatal(ENHANCE_YOUR_CALM, "a header block ran to more than " + MAX_CONTINUATIONS + " CONTINUATION frames")
+
+                    if (held.size > MAX_HEADER_LIST)
+                        this.fatal(ENHANCE_YOUR_CALM, "a header block ran past " + MAX_HEADER_LIST + " bytes")
+
+                    held.parts.push(payload)
 
                     if ((flags & END_HEADERS) === 0) return
-
-                    const held = this.continuing
 
                     this.continuing = null
                     this.headed(stream, held.flags, Buffer.concat(held.parts))
@@ -569,11 +314,13 @@ js_runtime_h2() -> string = raw"""
 
                 // A whole header block has arrived: a request, or the trailers of one.
                 headed(stream, flags, block) {
-                    const fields = this.dec.decode(block)
+                    const fields = this.dec.decode(block, MAX_HEADER_LIST)
                     const known = this.streams.get(stream)
 
                     if (known !== undefined) {
                         if (known.recvEnded) refuse("HEADERS on a stream the peer had ended")
+
+                        if (fields === null) return this.resetStream(stream, ENHANCE_YOUR_CALM)
 
                         this.events.push({ kind: "headers", stream: stream, headers: fields, of: "trailer" })
 
@@ -587,8 +334,30 @@ js_runtime_h2() -> string = raw"""
 
                     this.lastStream = stream
 
+                    // **A request past a limit never reaches the program**, and the stream number is
+                    // spent either way. Too many open at once is REFUSED_STREAM, which tells the client
+                    // it may try again; a header list past the size this side advertised is answered
+                    // `431` here, the program having nothing it could do with a request it was never
+                    // given -- and a reset after it where the client meant to send a body.
+                    if (this.streams.size >= MAX_STREAMS) {
+                        this.out.push(frame(RST_STREAM, 0, stream, u32(REFUSED_STREAM)))
+
+                        return
+                    }
+
+                    if (fields === null) {
+                        const ends = (flags & END_STREAM) !== 0
+
+                        this.headFrames(stream, encodeFields([[":status", "431", false]]), true)
+
+                        if (!ends) this.out.push(frame(RST_STREAM, 0, stream, u32(NO_ERROR)))
+
+                        return
+                    }
+
                     const s = {
                         id: stream,
+                        recvWin: INITIAL_WINDOW,
                         recvEnded: false,
                         sentEnded: false,
                         headSent: false,
@@ -638,6 +407,18 @@ js_runtime_h2() -> string = raw"""
 
                     if (s === undefined) return
 
+                    // **Rapid reset**, the 2023 pattern: a request opened and reset at once costs the
+                    // client two frames and the server a handler, so resets are drawn from nghttp2's
+                    // bucket, and a client that empties it is told to calm down and hung up on.
+                    const now = Date.now()
+
+                    this.resetTokens = Math.min(RESET_BURST, this.resetTokens + (now - this.resetAt) * RESET_RATE / 1000)
+                    this.resetAt = now
+
+                    if (this.resetTokens < 1)
+                        this.fatal(ENHANCE_YOUR_CALM, "the peer reset streams faster than " + RESET_RATE + " a second, after a burst of " + RESET_BURST)
+
+                    this.resetTokens -= 1
                     this.events.push({ kind: "rstStream", stream: stream, code: payload.readUInt32BE(0) })
                     this.drop(s, payload.readUInt32BE(0))
                 }
@@ -739,6 +520,7 @@ js_runtime_h2() -> string = raw"""
 
                     if (immediate || this.connCredit >= CREDIT_LUMP) {
                         this.out.push(frame(WINDOW_UPDATE, 0, 0, u32(this.connCredit)))
+                        this.recvWin += this.connCredit
                         this.connCredit = 0
                     }
 
@@ -748,6 +530,7 @@ js_runtime_h2() -> string = raw"""
 
                     if (immediate || s.credit >= CREDIT_LUMP) {
                         this.out.push(frame(WINDOW_UPDATE, 0, s.id, u32(s.credit)))
+                        s.recvWin += s.credit
                         s.credit = 0
                     }
                 }
@@ -839,6 +622,8 @@ js_runtime_h2() -> string = raw"""
                 }
 
                 goaway(last, code) {
+                    if (this.failed !== null) return
+
                     const body = Buffer.alloc(8)
 
                     body.writeUInt32BE(last, 0)

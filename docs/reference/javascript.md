@@ -77,6 +77,12 @@ out in the runtime rather than being node's `http2`**, because `slate:http`'s sp
 bytes and reads what they said at once, and node's HTTP/2 only answers later. `h2Client`, `h2Request`,
 `h2RequestStream`, `h2Settings`, `h2Reset`, `h2WindowUpdate`, `h2Ping`, `h2Wants` and the `hpack*`
 calls are still on the list. In a browser `listen` refuses, so nothing there reaches a session.
+The session holds a peer to nghttp2's limits — both flow-control windows, at most 100 streams open
+at once, a 64 KiB header list, eight CONTINUATION frames to a header block, and nghttp2's
+rapid-reset bucket — and advertises the stream and header-list limits in its SETTINGS, which an nghttp2
+session does not. **One difference is in the shape of the answer**: a connection error the peer
+caused, such as DATA past the connection's window, is `{ error }` from `h2Receive` here, with the
+GOAWAY already queued, where nghttp2 queues the GOAWAY and answers `null`.
 
 **`slate:net` and `slate:llhttp` came OFF that list in 0.0.31**, and they are what everything above
 a socket stands on — see the section below. **`startTls` is here at both ends, over node's `tls`**,
