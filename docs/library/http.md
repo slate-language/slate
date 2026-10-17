@@ -61,6 +61,20 @@ once, because a stream that never ends is not something a shutdown can wait for.
 version. A client may keep a connection and then simply go away, and without that clock the socket
 would be held for the life of the server.
 
+**A request is held to two deadlines that a trickle of bytes cannot move.** Its head — the request line
+and headers — has `headMillis` (default 10 seconds) from its first byte, and the whole request,
+body included, has `requestMillis` (default 5 minutes). A client that runs out of either is answered
+`408` and the connection ends; one whose answer has already begun is simply cut. The idle clock alone
+could not do this, because every byte resets it, so a head sent one byte a second was held for ever.
+Both are keys on the listening record, as in
+`serve({ port: 3000, headMillis: 5000, requestMillis: 60000 }, app)`.
+
+The two are apart because a large upload is slow and legitimate, and only its head is held to the
+short deadline. node's defaults are 60 seconds for the head and 5 minutes for the request; Go's
+`http.Server` has neither unless a program sets one. Over HTTP/2 a header block has `headMillis` to
+finish, and one that does not ends the connection with a GOAWAY, there being no stream yet to answer
+on.
+
 ## `adopt(handler)`
 
 **The same server with no port, answering connections somebody else accepted.** A supervisor accepts on

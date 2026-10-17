@@ -13,7 +13,7 @@
 // The servers and the three endpoints are `bench/serve/`'s: GET /plain -> "hello". A TLS server's
 // certificate is self-signed, so a TLS run is told the CA to trust through `STRESS_CA`.
 
-import { connect, send, close, onData, onBytes, onError, startTls, alpnProtocol, localPort } from slate:net
+import { connect, send, shutdown, close, onData, onBytes, onError, startTls, alpnProtocol, localPort } from slate:net
 import { serve, close as stopServer } from slate:http
 import { h2Client, h2Request, h2Reset, h2Settings, h2Send, h2Receive, h2Next, h2Close } from slate:nghttp2
 import { args, env, exit } from slate:process
@@ -201,11 +201,12 @@ async idleFlood(host, port, tls, base) =
     { pass: served >= 9, note: "idle=" + string(opened) + " served=" + string(served) + "/10" }
 
 // --- scenario 3: half-close and hang-ups --------------------------------------------------------
-// A client that drops right after the request, one that drops mid-request, and one that drops
-// mid-body. No crash, and nothing leaked (the harness checks fds).
+// A client that half-closes right after the request (and must still be answered), one that drops
+// mid-request, and one that drops mid-body. No crash, and nothing leaked (the harness checks fds).
 async halfClose(host, port, tls, base) =
     val rounds = if CHECK then 20 else num("STRESS_HALF_ROUNDS", 300)
     var i = 0
+    var answered = 0
 
     loop
         if i >= rounds then break
@@ -215,6 +216,18 @@ async halfClose(host, port, tls, base) =
 
         if c1 != null
             await send(c1, "GET /plain HTTP/1.1\r\nHost: x\r\n\r\n")
+
+            // A real half-close: the FIN goes out while this end still reads. A server that treats
+            // the end of the request stream as the end of the connection never answers.
+            await shutdown(c1)
+
+            var waited = 0
+
+            while !s1.heard.startsWith("HTTP/1.1 200") && !s1.closed && waited < 1000
+                await sleep(5)
+                waited += 5
+
+            if s1.heard.startsWith("HTTP/1.1 200") then answered += 1
 
             close(c1)
 
@@ -238,7 +251,7 @@ async halfClose(host, port, tls, base) =
 
     val served = await normalScore(base, 10)
 
-    { pass: served >= 10, note: "rounds=" + string(rounds) + " served=" + string(served) + "/10 (no crash)" }
+    { pass: served >= 10 && answered == rounds, note: "rounds=" + string(rounds) + " answeredAfterHalfClose=" + string(answered) + "/" + string(rounds) + " served=" + string(served) + "/10 (no crash)" }
 
 // --- scenario 4: malformed and oversized --------------------------------------------------------
 // A bad request line, oversized headers, too many headers, a bad chunked body, and a huge
