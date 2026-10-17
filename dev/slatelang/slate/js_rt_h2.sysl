@@ -29,9 +29,18 @@ module dev.slatelang.slate
 // a memory-exhaustion risk for every `slate js` server: a frame over the size advertised, DATA past
 // a stream's window (RST_STREAM FLOW_CONTROL_ERROR) or the connection's (GOAWAY FLOW_CONTROL_ERROR),
 // more than a hundred streams open at once (REFUSED_STREAM), a header list past 64 KiB (`431`),
-// a header block past eight CONTINUATIONs or 64 KiB, and resets past nghttp2's rapid-reset bucket
-// (both GOAWAY ENHANCE_YOUR_CALM). A connection error is `{ error }` from `h2Receive`, as it is in
-// the interpreter, with the GOAWAY that says why already queued.
+// a header block past eight CONTINUATIONs, and resets past nghttp2's rapid-reset bucket.
+//
+// **A CONNECTION ERROR ANSWERS EXACTLY WHAT nghttp2 ANSWERS**, which was measured rather than
+// assumed. `h2Receive` answers `null` and a GOAWAY with the error's code is queued (FLOW_CONTROL_ERROR,
+// FRAME_SIZE_ERROR, COMPRESSION_ERROR, PROTOCOL_ERROR, and INTERNAL_ERROR for the rapid-reset bucket);
+// nothing is delivered after the error, and no event says so. The rapid reset is the one exception to
+// "nothing after": it only queues, so the rest of the same bytes are still read, and input stops once
+// the GOAWAY has gone out through `h2Send`. Two things are not connection errors at all and answer
+// `{ error }` from this call and every one after it with no GOAWAY: bytes that do not begin with the
+// preface, and a header block past eight CONTINUATIONs. The program's own `h2Goaway` still goes out
+// after those, and any GOAWAY that goes out closes the peer's streams numbered past its last stream
+// as REFUSED_STREAM, which is what the interpreter's session reports.
 
 js_runtime_h2() -> string = raw"""
             // -- frames --------------------------------------------------------------------------------------
@@ -62,7 +71,14 @@ js_runtime_h2() -> string = raw"""
             const RESET_BURST = 1000
             const RESET_RATE = 33
 
-            const NO_ERROR = 0, FLOW_CONTROL_ERROR = 3, FRAME_SIZE_ERROR = 6, REFUSED_STREAM = 7, ENHANCE_YOUR_CALM = 11
+            const NO_ERROR = 0, PROTOCOL_ERROR = 1, INTERNAL_ERROR = 2, FLOW_CONTROL_ERROR = 3, FRAME_SIZE_ERROR = 6
+            const REFUSED_STREAM = 7, COMPRESSION_ERROR = 9, ENHANCE_YOUR_CALM = 11
+
+            // Ends the reading of what a peer sent, after a connection error has queued its GOAWAY.
+            class Halt extends Error {}
+
+            // What nghttp2 puts in front of a failure it reports, which is what `h2Receive` answers.
+            const PEER = "reading what the peer sent: "
 
             const frame = (type, flags, stream, payload) => {
                 const head = Buffer.alloc(9)
@@ -102,6 +118,9 @@ js_runtime_h2() -> string = raw"""
                     this.lastStream = 0
                     this.closed = false
                     this.failed = null
+                    this.terminated = false
+                    this.ignoring = false
+                    this.goaways = []
                     this.resetTokens = RESET_BURST
                     this.resetAt = Date.now()
 
@@ -116,13 +135,32 @@ js_runtime_h2() -> string = raw"""
                     this.out.push(frame(SETTINGS, 0, 0, limits))
                 }
 
-                // A connection error this side names: a GOAWAY carrying its code goes out ahead of the
-                // sentence `h2Receive` answers, and the session reads nothing more. The program's own
-                // `h2Goaway` after it is not sent, the peer having been told why already.
-                fatal(code, message) {
-                    this.goaway(this.lastStream, code)
-                    this.failed = message
-                    refuse(message)
+                // A connection error that is not worth reading past: its GOAWAY is queued, the session
+                // reads nothing more, and `h2Receive` answers `null`. The program's own `h2Goaway`
+                // after it is not sent, the peer having been told why already.
+                fatal(code) {
+                    this.terminate(code)
+                    this.ignoring = true
+
+                    throw new Halt()
+                }
+
+                // A connection error that only queues its GOAWAY, so the bytes already in hand are still
+                // read -- the rapid-reset bucket's, as nghttp2 does it. Said once however often it recurs.
+                terminate(code) {
+                    if (this.terminated) return
+
+                    this.terminated = true
+                    this.queueGoaway(this.lastStream, code)
+                }
+
+                queueGoaway(last, code) {
+                    const body = Buffer.alloc(8)
+
+                    body.writeUInt32BE(last, 0)
+                    body.writeUInt32BE(code, 4)
+                    this.out.push(frame(GOAWAY, 0, 0, body))
+                    this.goaways.push(last)
                 }
 
                 // A stream error: RST_STREAM with its code, and the stream gone as though the peer had
@@ -137,16 +175,24 @@ js_runtime_h2() -> string = raw"""
 
                 // -- reading -------------------------------------------------------------------------------
 
-                // Bytes in. Answers `null`, or the sentence for what the peer got wrong.
+                // Bytes in. Answers `null`, or the sentence for a failure the library itself reports.
                 receive(chunk) {
                     if (this.failed !== null) return this.failed
+
+                    if (this.ignoring) return null
 
                     this.inbuf = this.inbuf.length === 0 ? Buffer.from(chunk) : Buffer.concat([this.inbuf, chunk])
 
                     try {
                         this.pump()
                     } catch (e) {
-                        if (e instanceof H2Error) return e.message
+                        if (e instanceof Halt) return null
+
+                        if (e instanceof LibError) {
+                            this.failed = PEER + e.message
+
+                            return this.failed
+                        }
 
                         throw e
                     }
@@ -159,7 +205,7 @@ js_runtime_h2() -> string = raw"""
                         const n = Math.min(this.inbuf.length, PREFACE.length)
 
                         if (!this.inbuf.subarray(0, n).equals(PREFACE.subarray(0, n)))
-                            refuse("the connection did not begin with the HTTP/2 preface")
+                            throw new LibError("Received bad client magic byte string")
 
                         if (n < PREFACE.length) return
 
@@ -172,7 +218,7 @@ js_runtime_h2() -> string = raw"""
 
                         const len = this.inbuf.readUIntBE(0, 3)
 
-                        if (len > MAX_FRAME) this.fatal(FRAME_SIZE_ERROR, "a frame of " + len + " bytes is larger than the " + MAX_FRAME + " this side accepts")
+                        if (len > MAX_FRAME) this.fatal(FRAME_SIZE_ERROR)
 
                         if (this.inbuf.length < 9 + len) return
 
@@ -182,7 +228,16 @@ js_runtime_h2() -> string = raw"""
                         const payload = this.inbuf.subarray(9, 9 + len)
 
                         this.inbuf = this.inbuf.subarray(9 + len)
-                        this.take(type, flags, stream, payload)
+
+                        // What a frame got wrong is a connection error carrying the code it names, or
+                        // PROTOCOL_ERROR where it names none.
+                        try {
+                            this.take(type, flags, stream, payload)
+                        } catch (e) {
+                            if (e instanceof H2Error && !(e instanceof LibError)) this.fatal(e.code === undefined ? PROTOCOL_ERROR : e.code)
+
+                            throw e
+                        }
                     }
                 }
 
@@ -228,7 +283,7 @@ js_runtime_h2() -> string = raw"""
                     // stream is reset and the bytes are credited to the connection, nobody reading them.
                     // The whole payload counts, padding included, as RFC 9113 says.
                     if (payload.length > this.recvWin)
-                        this.fatal(FLOW_CONTROL_ERROR, "the peer sent " + payload.length + " bytes of DATA past the connection's window of " + this.recvWin)
+                        this.fatal(FLOW_CONTROL_ERROR)
 
                     this.recvWin -= payload.length
 
@@ -269,6 +324,16 @@ js_runtime_h2() -> string = raw"""
                 takeHeaders(flags, stream, payload) {
                     if (stream === 0) refuse("HEADERS on stream zero")
 
+                    // A request is the last stream this side has processed from the moment its first
+                    // frame arrives, a header block still being read included, which is what the
+                    // GOAWAY for a connection error afterwards names.
+                    if (!this.streams.has(stream)) {
+                        if (stream % 2 === 0 || stream <= this.lastStream)
+                            refuse("a request opened stream " + stream + ", which a client may not use")
+
+                        this.lastStream = stream
+                    }
+
                     let [block] = this.unpadded(flags, payload)
 
                     if ((flags & PRIORITY_FLAG) !== 0) {
@@ -278,7 +343,7 @@ js_runtime_h2() -> string = raw"""
                     }
 
                     if ((flags & END_HEADERS) === 0) {
-                        this.continuing = { stream: stream, flags: flags, parts: [block], size: block.length, count: 0 }
+                        this.continuing = { stream: stream, flags: flags, parts: [block], count: 0 }
 
                         return
                     }
@@ -291,18 +356,16 @@ js_runtime_h2() -> string = raw"""
 
                     const held = this.continuing
 
-                    // **A header block is bounded in frames and in bytes.** Held until END_HEADERS, a
-                    // block nobody ends -- the 2024 CONTINUATION flood, often of empty frames -- would
-                    // grow for as long as the peer kept sending, so past either limit the connection
-                    // goes, as nghttp2's does.
+                    // **A header block is bounded in frames.** Held until END_HEADERS, a block nobody
+                    // ends -- the 2024 CONTINUATION flood, often of empty frames -- would grow for as long
+                    // as the peer kept sending, so past eight the library gives up on the connection, as
+                    // nghttp2's does: an `{ error }` and no GOAWAY. Its size is not bounded here, because
+                    // nghttp2 does not bound it either: eight frames of 16 KiB are all it can come to,
+                    // and what the block says is held to the header list limit once it is decoded.
                     held.count += 1
-                    held.size += payload.length
 
                     if (held.count > MAX_CONTINUATIONS)
-                        this.fatal(ENHANCE_YOUR_CALM, "a header block ran to more than " + MAX_CONTINUATIONS + " CONTINUATION frames")
-
-                    if (held.size > MAX_HEADER_LIST)
-                        this.fatal(ENHANCE_YOUR_CALM, "a header block ran past " + MAX_HEADER_LIST + " bytes")
+                        throw new LibError("Too many CONTINUATION frames following a HEADER frame")
 
                     held.parts.push(payload)
 
@@ -314,7 +377,18 @@ js_runtime_h2() -> string = raw"""
 
                 // A whole header block has arrived: a request, or the trailers of one.
                 headed(stream, flags, block) {
-                    const fields = this.dec.decode(block, MAX_HEADER_LIST)
+                    let fields
+
+                    // A block that is not valid HPACK is a connection error: the table it would have
+                    // built is out of step with the peer's, so nothing after it could be read.
+                    try {
+                        fields = this.dec.decode(block, MAX_HEADER_LIST)
+                    } catch (e) {
+                        if (e instanceof H2Error) this.fatal(COMPRESSION_ERROR)
+
+                        throw e
+                    }
+
                     const known = this.streams.get(stream)
 
                     if (known !== undefined) {
@@ -328,11 +402,6 @@ js_runtime_h2() -> string = raw"""
 
                         return
                     }
-
-                    if (stream % 2 === 0 || stream <= this.lastStream)
-                        refuse("a request opened stream " + stream + ", which a client may not use")
-
-                    this.lastStream = stream
 
                     // **A request past a limit never reaches the program**, and the stream number is
                     // spent either way. Too many open at once is REFUSED_STREAM, which tells the client
@@ -401,7 +470,7 @@ js_runtime_h2() -> string = raw"""
 
                 takeReset(stream, payload) {
                     if (stream === 0) refuse("RST_STREAM on stream zero")
-                    if (payload.length !== 4) refuse("an RST_STREAM that is not four bytes")
+                    if (payload.length !== 4) coded(FRAME_SIZE_ERROR, "an RST_STREAM that is not four bytes")
 
                     const s = this.streams.get(stream)
 
@@ -409,16 +478,17 @@ js_runtime_h2() -> string = raw"""
 
                     // **Rapid reset**, the 2023 pattern: a request opened and reset at once costs the
                     // client two frames and the server a handler, so resets are drawn from nghttp2's
-                    // bucket, and a client that empties it is told to calm down and hung up on.
+                    // bucket, and a client that empties it is hung up on. **The code is INTERNAL_ERROR,
+                    // which is what nghttp2 sends for it** -- not ENHANCE_YOUR_CALM, though that is the
+                    // code RFC 9113 suggests -- and the reset that emptied it is still delivered.
                     const now = Date.now()
 
                     this.resetTokens = Math.min(RESET_BURST, this.resetTokens + (now - this.resetAt) * RESET_RATE / 1000)
                     this.resetAt = now
 
-                    if (this.resetTokens < 1)
-                        this.fatal(ENHANCE_YOUR_CALM, "the peer reset streams faster than " + RESET_RATE + " a second, after a burst of " + RESET_BURST)
+                    if (this.resetTokens < 1) this.terminate(INTERNAL_ERROR)
+                    else this.resetTokens -= 1
 
-                    this.resetTokens -= 1
                     this.events.push({ kind: "rstStream", stream: stream, code: payload.readUInt32BE(0) })
                     this.drop(s, payload.readUInt32BE(0))
                 }
@@ -427,19 +497,19 @@ js_runtime_h2() -> string = raw"""
                     if (stream !== 0) refuse("SETTINGS on a stream")
 
                     if ((flags & ACK) !== 0) {
-                        if (payload.length !== 0) refuse("a SETTINGS acknowledgement with a payload")
+                        if (payload.length !== 0) coded(FRAME_SIZE_ERROR, "a SETTINGS acknowledgement with a payload")
 
                         return
                     }
 
-                    if (payload.length % 6 !== 0) refuse("a SETTINGS frame that is not whole entries")
+                    if (payload.length % 6 !== 0) coded(FRAME_SIZE_ERROR, "a SETTINGS frame that is not whole entries")
 
                     for (let at = 0; at < payload.length; at += 6) {
                         const id = payload.readUInt16BE(at)
                         const value = payload.readUInt32BE(at + 2)
 
                         if (id === 4) {
-                            if (value > 0x7fffffff) refuse("an initial window larger than the protocol allows")
+                            if (value > 0x7fffffff) coded(FLOW_CONTROL_ERROR, "an initial window larger than the protocol allows")
 
                             const delta = value - this.peerWin
 
@@ -459,7 +529,7 @@ js_runtime_h2() -> string = raw"""
 
                 takePing(flags, stream, payload) {
                     if (stream !== 0) refuse("PING on a stream")
-                    if (payload.length !== 8) refuse("a PING that is not eight bytes")
+                    if (payload.length !== 8) coded(FRAME_SIZE_ERROR, "a PING that is not eight bytes")
 
                     const ack = (flags & ACK) !== 0
 
@@ -470,7 +540,7 @@ js_runtime_h2() -> string = raw"""
 
                 takeGoaway(stream, payload) {
                     if (stream !== 0) refuse("GOAWAY on a stream")
-                    if (payload.length < 8) refuse("a GOAWAY that is too short")
+                    if (payload.length < 8) coded(FRAME_SIZE_ERROR, "a GOAWAY that is too short")
 
                     this.events.push({
                         kind: "goaway",
@@ -480,7 +550,7 @@ js_runtime_h2() -> string = raw"""
                 }
 
                 takeWindow(stream, payload) {
-                    if (payload.length !== 4) refuse("a WINDOW_UPDATE that is not four bytes")
+                    if (payload.length !== 4) coded(FRAME_SIZE_ERROR, "a WINDOW_UPDATE that is not four bytes")
 
                     const by = payload.readUInt32BE(0) & 0x7fffffff
 
@@ -489,7 +559,7 @@ js_runtime_h2() -> string = raw"""
                     if (stream === 0) {
                         this.sendWin += by
 
-                        if (this.sendWin > 0x7fffffff) refuse("a connection window past the protocol's limit")
+                        if (this.sendWin > 0x7fffffff) coded(FLOW_CONTROL_ERROR, "a connection window past the protocol's limit")
                     } else {
                         const s = this.streams.get(stream)
 
@@ -621,14 +691,24 @@ js_runtime_h2() -> string = raw"""
                     return null
                 }
 
+                // The program's own GOAWAY. Not queued once a connection error has queued one.
                 goaway(last, code) {
-                    if (this.failed !== null) return
+                    if (this.terminated) return
 
-                    const body = Buffer.alloc(8)
+                    this.queueGoaway(last, code)
+                }
 
-                    body.writeUInt32BE(last, 0)
-                    body.writeUInt32BE(code, 4)
-                    this.out.push(frame(GOAWAY, 0, 0, body))
+                // A GOAWAY that has gone out closes every stream of the peer's numbered past its last
+                // stream, REFUSED_STREAM, the peer being told those were never processed. A header block
+                // still being read is such a stream: it has been counted since its first frame.
+                closeBeyond(last) {
+                    for (const s of [...this.streams.values()])
+                        if (s.id % 2 === 1 && s.id > last) this.drop(s, REFUSED_STREAM)
+
+                    if (this.continuing !== null && this.continuing.stream > last) {
+                        this.events.push({ kind: "streamClose", stream: this.continuing.stream, code: REFUSED_STREAM })
+                        this.continuing = null
+                    }
                 }
 
                 // Every queued body that the windows allow, as DATA frames.
@@ -676,6 +756,13 @@ js_runtime_h2() -> string = raw"""
                     const out = this.out.length === 0 ? Buffer.alloc(0) : Buffer.concat(this.out)
 
                     this.out = []
+
+                    // Once the GOAWAY that ends a connection has gone out, nothing more is read.
+                    if (this.terminated) this.ignoring = true
+
+                    for (const last of this.goaways) this.closeBeyond(last)
+
+                    this.goaways = []
 
                     return out
                 }

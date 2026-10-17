@@ -17,6 +17,11 @@ process per group, so a mode's "rss before" is the previous mode's "after".
    `GET / HTTP/1.1\r\nHost: x\r\nX-A: `, then one byte per second; never closed (sent nothing more:
    closed at 5000 ms). node and Go also failed at a 20 s wait (node's `headersTimeout` is 60 s; Go's
    `net/http` has none by default), so the reference servers are no better here.
+   **FIXED on `headdeadline`**: `serve` now gives a head `headMillis` (10 s) from its first byte and
+   the whole request `requestMillis` (5 min), answering `408`. Re-taken with
+   `bench/stress/run.sh --only slate --mode slowloris ./slate`: **PASS**, `opened=1000 served=10/10
+   cutOff=1000/1000 hasHeaderTimeout=true`, RSS 11 -> 133 MB, fds 13 -> 1014 -> 13. The slowloris
+   rows in the tables below are the run before the fix.
 2. **soak: RSS creeps, the memory the process OWNS does not (diagnosed, not a leak).** A 300 s soak
    on a fresh server (`ok=15000/15000`) read RSS 21.7 -> 25.0 MB in the first minute and then
    ~0.6 MB a minute to 27.6 MB. Over the same run `vmmap`'s **physical footprint** was 12.8 MB at
@@ -39,6 +44,15 @@ process per group, so a mode's "rss before" is the previous mode's "after".
    node shares one slab per read and Go's `bufio` starts at 4 KiB. Changing that belongs in the
    binding (or in kairos's reads over it), not here. node grew 44 -> 78 MB over the same mode and
    also kept it, Go 11 -> 35 MB.
+
+**The halfclose rows were re-taken after `slate:net` gained `shutdown(sock)`** (a real write-side
+half-close; the mode used to just drop the connection right after the request). Each of 300 rounds
+sends a request, half-closes, and requires the `200` to arrive anyway: slate, node and Go all
+answered 300/300. These three rows are a separate single-mode run on fresh server processes, so their
+rss "before" is not the previous mode's "after" as in the other rows. The slate server's fd peak read
+293 in that run (back to 13 after), against 13 in the earlier run; the mid-request and mid-body drops
+in the same mode are unchanged, so this is most likely the sampler catching the idle window, and it
+is not investigated further here.
 
 Everything else held on slate: idle flood, hang-ups (no fd left behind), all five malformed requests
 closed, h2 rapid reset / stream flood / SETTINGS flood / zero window answered normal requests
@@ -64,19 +78,19 @@ macOS: RSS counts pages malloc has marked reusable.
 |---|---|---|---:|---:|---:|---:|---:|---:|
 | slate | slowloris | FAIL | 11 | 124 | 124 | 13 | 1014 | 13 |
 | slate | idleflood | PASS | 124 | 125 | 125 | 13 | 13 | 13 |
-| slate | halfclose | PASS | 125 | 125 | 125 | 13 | 13 | 13 |
+| slate | halfclose | PASS | 11 | 46 | 46 | 13 | 293 | 13 |
 | slate | malformed | PASS | 125 | 125 | 125 | 13 | 14 | 13 |
 | slate | soak | FAIL | 125 | 127 | 127 | 13 | 63 | 13 |
 | slate | h2abuse | PASS | 13 | 23 | 23 | 13 | 13 | 13 |
 | node | slowloris | FAIL | 44 | 78 | 78 | 17 | 1018 | 17 |
 | node | idleflood | PASS | 78 | 81 | 81 | 17 | 17 | 17 |
-| node | halfclose | PASS | 81 | 84 | 84 | 17 | 17 | 17 |
+| node | halfclose | PASS | 44 | 57 | 57 | 17 | 17 | 17 |
 | node | malformed | PASS | 84 | 84 | 84 | 17 | 18 | 17 |
 | node | soak | PASS | 84 | 84 | 84 | 17 | 18 | 17 |
 | node | h2abuse | PASS | 51 | 70 | 70 | 17 | 17 | 17 |
 | go | slowloris | FAIL | 11 | 35 | 35 | 9 | 1010 | 9 |
 | go | idleflood | PASS | 35 | 40 | 40 | 9 | 9 | 9 |
-| go | halfclose | PASS | 40 | 40 | 40 | 9 | 9 | 9 |
+| go | halfclose | PASS | 11 | 16 | 16 | 9 | 9 | 9 |
 | go | malformed | FAIL | 40 | 41 | 41 | 9 | 12 | 9 |
 | go | soak | PASS | 41 | 45 | 45 | 9 | 10 | 9 |
 | go | h2abuse | PASS | 11 | 19 | 19 | 9 | 9 | 9 |
@@ -87,19 +101,19 @@ macOS: RSS counts pages malloc has marked reusable.
 |---|---|---|
 | slate | slowloris | opened=1000 served=10/10 cutOff=0/1000 hasHeaderTimeout=false |
 | slate | idleflood | idle=1000 served=10/10 |
-| slate | halfclose | rounds=300 served=10/10 (no crash) |
+| slate | halfclose | rounds=300 answeredAfterHalfClose=300/300 served=10/10 (no crash) |
 | slate | malformed | handled=5/5 served=10/10 [bad-request-line=closed oversized-header=closed too-many-headers=closed bad-chunked=closed huge-content-length=closed] |
 | slate | soak | secs=30 ok=1500/1500 [server CLIMBING fds 45->63] |
 | slate | h2abuse | resets=2000 streams=500 settings=1000 zeroWindow=1 served=10/10  |
 | node | slowloris | opened=1000 served=10/10 cutOff=0/1000 hasHeaderTimeout=false |
 | node | idleflood | idle=1000 served=10/10 |
-| node | halfclose | rounds=300 served=10/10 (no crash) |
+| node | halfclose | rounds=300 answeredAfterHalfClose=300/300 served=10/10 (no crash) |
 | node | malformed | handled=5/5 served=10/10 [bad-request-line=closed oversized-header=closed too-many-headers=closed bad-chunked=closed huge-content-length=waiting] |
 | node | soak | secs=30 ok=1500/1500 [server plateau rss 83->84 MB, fds 17->18] |
 | node | h2abuse | resets=2000 streams=500 settings=1000 zeroWindow=1 served=10/10  |
 | go | slowloris | opened=1000 served=10/10 cutOff=0/1000 hasHeaderTimeout=false |
 | go | idleflood | idle=1000 served=10/10 |
-| go | halfclose | rounds=300 served=10/10 (no crash) |
+| go | halfclose | rounds=300 answeredAfterHalfClose=300/300 served=10/10 (no crash) |
 | go | malformed | handled=4/5 served=10/10 [bad-request-line=closed oversized-header=2xx?! too-many-headers=closed bad-chunked=closed huge-content-length=waiting] |
 | go | soak | secs=30 ok=1500/1500 [server plateau rss 41->44 MB, fds 9->10] |
 | go | h2abuse | resets=2000 streams=500 settings=1000 zeroWindow=1 served=10/10  |
