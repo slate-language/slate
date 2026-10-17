@@ -54,12 +54,13 @@ js_runtime_h2() -> string = raw"""
             // The size of a frame this side accepts: the protocol's default, which it never raises.
             const MAX_FRAME = 16384
 
-            // Flow-control credit is given back in lumps of this size rather than frame by frame.
-            const CREDIT_LUMP = 16384
-
             // The window this side opens for every stream and for the connection: the protocol's
             // default, which it never raises, so a peer may have this much unacknowledged at most.
             const INITIAL_WINDOW = 65535
+
+            // Flow-control credit goes back as nghttp2 returns it: once HALF a window has been consumed,
+            // counted separately for the connection and for each stream.
+            const CREDIT_AT = INITIAL_WINDOW >> 1
 
             // **The limits a peer is held to, which are nghttp2's in substance.** The first two are
             // advertised in this side's SETTINGS; the CONTINUATION cap is nghttp2's default since the
@@ -279,8 +280,8 @@ js_runtime_h2() -> string = raw"""
                     // **THE PEER IS HELD TO BOTH WINDOWS, or a body is buffered for as long as it is
                     // sent.** Credit only goes back as the program consumes, so a client that ignores
                     // the windows is the one thing that could make this session hold more than they
-                    // allow. Past the connection's it is a connection error; past a stream's, that
-                    // stream is reset and the bytes are credited to the connection, nobody reading them.
+                    // allow. **Past either window is a connection error, a stream's included**, which is
+                    // what nghttp2 answers (GOAWAY FLOW_CONTROL_ERROR) rather than a reset of the stream.
                     // The whole payload counts, padding included, as RFC 9113 says.
                     if (payload.length > this.recvWin)
                         this.fatal(FLOW_CONTROL_ERROR)
@@ -293,30 +294,27 @@ js_runtime_h2() -> string = raw"""
                     if (s === undefined) {
                         if (stream > this.lastStream) refuse("DATA on a stream that was never opened")
 
-                        this.credit(undefined, payload.length, false)
+                        this.credit(undefined, payload.length)
 
                         return
                     }
 
                     if (s.recvEnded) refuse("DATA on a stream the peer had ended")
 
-                    if (payload.length > s.recvWin) {
-                        this.credit(undefined, payload.length, false)
-                        this.resetStream(stream, FLOW_CONTROL_ERROR)
-
-                        return
-                    }
+                    if (payload.length > s.recvWin)
+                        this.fatal(FLOW_CONTROL_ERROR)
 
                     s.recvWin -= payload.length
 
-                    // Padding is not something the program reads, so its credit goes straight back.
-                    this.credit(s, padding, true)
+                    // A session that extends its own windows counts the whole payload as consumed, but a
+                    // stream this frame ends is not credited (nghttp2 sends nothing for a stream whose
+                    // peer has finished). One that does not counts only the padding, which the program
+                    // never reads; the data is counted when it is consumed.
+                    if (this.auto) this.credit(s, payload.length, (flags & END_STREAM) === 0)
+                    else this.credit(s, padding, true)
 
-                    if (data.length > 0) {
+                    if (data.length > 0)
                         this.events.push({ kind: "data", stream: stream, bytes: new Uint8Array(data) })
-
-                        if (this.auto) this.consume(stream, data.length)
-                    }
 
                     if ((flags & END_STREAM) !== 0) this.ended(s)
                 }
@@ -580,33 +578,36 @@ js_runtime_h2() -> string = raw"""
 
                 // -- flow control received ----------------------------------------------------------------
 
-                // Credit `n` bytes back to the peer: the connection's, and the stream's where it is still
-                // sending. **Lumps, not frames**, so a body arriving in sixteen-kilobyte DATA frames is
-                // not answered by a WINDOW_UPDATE per frame.
-                credit(s, n, immediate) {
+                // `n` bytes have been consumed: count them against the connection and, where `s` is
+                // given and `viaStream` says so, against the stream. **nghttp2's rule: each counter is
+                // returned as one WINDOW_UPDATE once it has reached half a window**, so what the peer is
+                // told and when is the same here as under the interpreter.
+                credit(s, n, viaStream) {
                     if (n === 0) return
 
                     this.connCredit += n
 
-                    if (immediate || this.connCredit >= CREDIT_LUMP) {
+                    if (this.connCredit >= CREDIT_AT) {
                         this.out.push(frame(WINDOW_UPDATE, 0, 0, u32(this.connCredit)))
                         this.recvWin += this.connCredit
                         this.connCredit = 0
                     }
 
-                    if (s === undefined || s.recvEnded) return
+                    if (s === undefined || viaStream === false) return
 
                     s.credit += n
 
-                    if (immediate || s.credit >= CREDIT_LUMP) {
+                    if (s.credit >= CREDIT_AT) {
                         this.out.push(frame(WINDOW_UPDATE, 0, s.id, u32(s.credit)))
                         s.recvWin += s.credit
                         s.credit = 0
                     }
                 }
 
+                // The program says it has read `n` bytes: a stream that has ended is still credited,
+                // as nghttp2 does.
                 consume(stream, n) {
-                    this.credit(this.streams.get(stream), n, false)
+                    this.credit(this.streams.get(stream), n, true)
                 }
 
                 // -- writing -------------------------------------------------------------------------------
