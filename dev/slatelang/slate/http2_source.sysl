@@ -57,8 +57,13 @@ http2_source() -> string = raw"""
         // The clock that closes a connection nobody is using, or null while it is not running.
         var idle = null
 
-        // The deadline on a request's header block, or null while none is running.
+        // The deadline on bytes that arrived with no header block begun -- a preface or a frame the
+        // peer never finishes -- or null while none is running.
         var headClock = null
+
+        // The deadline on each header block that has begun and not ended, keyed by its stream number
+        // as text.
+        var heads = {}
 
         // How to cut each streamed response being written, keyed by its stream number as text. **A
         // TABLE where the 1.1 connection has one**, a connection here carrying many streams at once
@@ -111,20 +116,27 @@ http2_source() -> string = raw"""
 
             awake()
             headDone()
+
+            for key in keys(heads)
+                clearTimeout(heads[key])
+
+            heads = {}
+
             h2Close(session)
             slot.retire()
             shutSocket(conn)
 
-        // Stop the head's deadline, a request's header block having arrived whole.
+        // Stop the connection's deadline, a header block having begun or ended.
         headDone()
             if headClock != null
                 clearTimeout(headClock)
 
                 headClock = null
 
-        // The head's deadline expired with no header block finished. **There is no stream to
-        // answer `408` on**, nghttp2 not having opened one for a block it has not finished, so the
-        // peer is told with a GOAWAY and the connection ends.
+        // The connection's deadline expired with bytes arriving and no header block begun: a preface
+        // or a frame the peer never finished, or a block it went on dribbling after its own stream was
+        // reset. There is no stream to blame, so the peer is told with a GOAWAY and the connection
+        // ends.
         headLate()
             headClock = null
 
@@ -132,6 +144,42 @@ http2_source() -> string = raw"""
 
             h2Goaway(session, 0)
             goodbye()
+
+        // Start a header block's deadline, at the frame that begins it.
+        headBegun(stream)
+            headDone()
+            headEnded(stream)
+
+            heads[string(stream)] = setTimeout(() -> headStalled(stream), headMillis)
+
+        // Stop a header block's deadline: the block arrived whole, or its stream ended another way.
+        headEnded(stream)
+            val key = string(stream)
+
+            if has(heads, key)
+                clearTimeout(heads[key])
+
+                heads = forgotten(heads, key)
+
+        // A header block's deadline expired. **The stream is reset and the connection is left
+        // alone**, so a peer dribbling one request's CONTINUATIONs costs that request and not the
+        // others on the connection. The code is CANCEL, "the stream is no longer needed", rather
+        // than REFUSED_STREAM, which tells a client the request was not processed and may be retried
+        // automatically -- inviting it to send the same slow block again. nghttp2 still decodes
+        // the rest of the block if it comes, which is what keeps the compression table in step.
+        headStalled(stream)
+            heads = forgotten(heads, string(stream))
+
+            if shut || parting then return
+
+            // **A timer is no place to fault from**, nothing awaiting it, so a session that refuses
+            // the reset -- the stream gone a moment before -- leaves nothing to do.
+            try
+                h2Reset(session, stream, 8)
+            catch gone
+                return
+
+            flushed()
 
         // Stop the clock, a connection with something to do not being idle by definition.
         awake()
@@ -573,6 +621,13 @@ http2_source() -> string = raw"""
 
                 if e == null then break
 
+                if e.kind == "beginHeaders"
+                    headBegun(e.stream)
+
+                    continue
+
+                if e.kind == "headers" then headEnded(e.stream)
+
                 if e.kind == "headers" && e.of == "request"
                     headDone()
 
@@ -665,6 +720,8 @@ http2_source() -> string = raw"""
                 elif e.kind == "rstStream" || e.kind == "streamClose"
                     val key = string(e.stream)
 
+                    headEnded(e.stream)
+
                     // **A handler reading a body the peer abandoned has to be told it has ended**,
                     // or a `for await` over it waits for the rest of the run. What it sees is a
                     // truncated body, which is the only thing either version of HTTP can say once
@@ -687,13 +744,12 @@ http2_source() -> string = raw"""
 
             awake()
 
-            // **Bytes arriving with nothing in flight are a request's head beginning**, or nothing
-            // at all -- a ping, a window update -- and either way a request has `headMillis` to
-            // finish its HEADERS from here. A header block dribbled one CONTINUATION byte at a time
-            // resets the idle clock with every byte and never completes, which held a connection
-            // for ever. nghttp2 reports a header block only once it is whole, so the deadline is
-            // the connection's rather than a stream's, exactly as the 1.1 speaker's is.
-            if headClock == null && working == 0 && keys(pending).length == 0
+            // **Bytes arriving with nothing in flight and no header block begun are the
+            // connection's to account for**: a preface or a frame still arriving, or nothing at all
+            // -- a ping, a window update. Each byte resets the idle clock, so without this a peer
+            // dribbling them held a connection for ever. **Once a HEADERS frame arrives the deadline
+            // is that stream's** (`headBegun`), and a stalled block is reset on its own.
+            if headClock == null && working == 0 && keys(pending).length == 0 && keys(heads).length == 0
                 headClock = setTimeout(headLate, headMillis)
 
             // **Bytes the peer got wrong are an ANSWER and not a fault**, which is `slate:nghttp2`'s
