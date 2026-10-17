@@ -69,7 +69,7 @@ js_runtime_h2_write() -> string = raw"""
                         }
 
                         return Buffer.concat(parts)
-                    }, after, stream)
+                    }, after, stream, endStream)
                 }
 
                 // A header block this side sends, as `headFrames` takes it.
@@ -98,7 +98,19 @@ js_runtime_h2_write() -> string = raw"""
                         return
                     }
 
-                    if (s.headSent) fault("stream " + stream + " has already been answered")
+                    // A second response on a stream already answered is taken too: it sends another
+                    // HEADERS and nothing of its body, and sends nothing at all once the stream has
+                    // ended on this side, which `send` also sees to for a stream whose END_STREAM is in
+                    // the same batch.
+                    if (s.headSent) {
+                        if (!s.sentEnded)
+                            this.headFrames(stream, this.block(fields), bare, REGULAR, bare ? () => {
+                                s.sentEnded = true
+                                this.settle(s)
+                            } : undefined)
+
+                        return
+                    }
 
                     s.headSent = true
 
@@ -109,7 +121,12 @@ js_runtime_h2_write() -> string = raw"""
                         this.settle(s)
                     } : undefined)
 
-                    if (bare) return
+                    // A head that ended the stream leaves no body to add to, as nghttp2 says.
+                    if (bare) {
+                        s.finishing = true
+
+                        return
+                    }
 
                     if (whole) {
                         if (body.length > 0) s.queue.push(body)
@@ -225,7 +242,7 @@ js_runtime_h2_write() -> string = raw"""
 
                             const last = s.queue.length === 0 && s.finishing && s.trailers === null
 
-                            this.put(BODY, frame(DATA, last ? END_STREAM : 0, s.id, Buffer.from(piece)))
+                            this.put(BODY, frame(DATA, last ? END_STREAM : 0, s.id, Buffer.from(piece)), undefined, s.id, last)
 
                             if (last) {
                                 s.sentEnded = true
@@ -236,7 +253,7 @@ js_runtime_h2_write() -> string = raw"""
 
                         if (s.queue.length === 0 && s.finishing && !s.sentEnded) {
                             if (s.trailers !== null) this.headFrames(s.id, s.trailers, true, BODY)
-                            else this.put(BODY, frame(DATA, END_STREAM, s.id, Buffer.alloc(0)))
+                            else this.put(BODY, frame(DATA, END_STREAM, s.id, Buffer.alloc(0)), undefined, s.id, true)
 
                             s.sentEnded = true
                         }
@@ -256,9 +273,19 @@ js_runtime_h2_write() -> string = raw"""
                     queued.sort((a, b) => a.rank - b.rank)
                     this.out = []
 
-                    const out = Buffer.concat(queued.map((f) => typeof f.bytes === "function" ? f.bytes() : f.bytes))
+                    // Nothing goes out behind a frame that ended its stream, and a dropped header block
+                    // is never encoded, so the compression table stays as the peer has it.
+                    const ended = new Set()
+                    const going = queued.filter((f) => {
+                        if (f.stream !== undefined && ended.has(f.stream)) return false
+                        if (f.ends) ended.add(f.stream)
 
-                    for (const f of queued) if (f.after !== undefined) f.after()
+                        return true
+                    })
+
+                    const out = Buffer.concat(going.map((f) => typeof f.bytes === "function" ? f.bytes() : f.bytes))
+
+                    for (const f of going) if (f.after !== undefined) f.after()
 
                     // Once the GOAWAY that ends a connection has gone out, nothing more is read.
                     if (this.terminated && out.length > 0) {
