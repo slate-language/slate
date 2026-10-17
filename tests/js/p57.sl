@@ -11,7 +11,7 @@
 
 import { connect, onData, send, close, localPort } from slate:net
 import { serve, serveStream, close as shutServer } from slate:http
-import { httpParser, httpStream, httpFeed, httpHeading } from slate:llhttp
+import { httpParser, httpStream, httpFeed, httpHeading, httpReading } from slate:llhttp
 
 // -- the parser's half ---------------------------------------------------------------------------------
 
@@ -31,6 +31,35 @@ heading()
 
     httpFeed(p, toBytes("cdeGET /b"))
     print("a pipelined head", httpHeading(p))
+
+    // `httpReading` is true for the whole of a request: the same walk, asked the other question.
+    val r = httpParser(8192, 1048576)
+
+    print("reading before a byte", httpReading(r))
+
+    httpFeed(r, toBytes("GET / HTTP/1.1\r\nHo"))
+    print("reading in a head", httpReading(r))
+
+    httpFeed(r, toBytes("st: x\r\n\r\n"))
+    print("reading after a whole request", httpReading(r))
+
+    httpFeed(r, toBytes("POST /u HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nab"))
+    print("reading in a body", httpReading(r), httpHeading(r))
+
+    httpFeed(r, toBytes("cde"))
+    print("reading after a body", httpReading(r))
+
+    httpFeed(r, toBytes("GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\nPOST /c HTTP/1.1\r\nHost: x\r\nContent-Length: 9\r\n\r\nab"))
+    print("reading a pipelined body", httpReading(r), httpHeading(r))
+
+    val bad2 = httpParser(8192, 1048576)
+
+    httpFeed(bad2, toBytes("GET / HTTP/1.1\r\nBad Name: x\r\n\r\n"))
+    print("reading after a refusal", httpReading(bad2))
+    print("reading a parser that is not there", httpReading(9999))
+    print(httpReading(httpStream(8192)) catch e -> e.message)
+    print(httpReading("p") catch e -> e.message)
+    print(httpReading() catch e -> e.message)
 
     val bad = httpParser(8192, 1048576)
 
@@ -158,6 +187,24 @@ async heldTo(name, quick, slow)
     await until(s6, 1)
     print(name, "a slow body", codes(s6), "closed", s6.gone)
     close(s6.conn)
+
+    // Two whole requests in one read are both answered, and the connection is kept.
+    val s7 = await dial(localPort(slow))
+
+    await send(s7.conn, "GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n")
+    await until(s7, 2)
+    print(name, "two requests in one read", codes(s7), "closed", s7.gone)
+    close(s7.conn)
+
+    // One read holding a whole request, a whole second head and part of the second's body: the
+    // second looks like an idle connection once the first is answered, and still has the request's
+    // deadline. The head's is five seconds, so a cut here is the request's clock.
+    val s8 = await dial(localPort(slow))
+
+    await send(s8.conn, "GET /a HTTP/1.1\r\nHost: x\r\n\r\nPOST /up HTTP/1.1\r\nHost: x\r\nContent-Length: 40\r\n\r\nab")
+    await until(s8, 2)
+    print(name, "a pipelined slow body in one read", codes(s8), "closed", s8.gone)
+    close(s8.conn)
 
 // -- a deadline that is not a number -------------------------------------------------------------------
 

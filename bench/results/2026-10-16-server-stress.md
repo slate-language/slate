@@ -150,3 +150,19 @@ when it misses it, the connection-level deadline being kept only for bytes with 
 h2abuse is unchanged by the per-stream clock (rapid reset, stream flood, SETTINGS flood and zero
 window all still answered, normal requests still served), and its RSS stays within a megabyte of the
 earlier run.
+
+## Re-taken with the interpreter's h2 server announcing 100 streams and a 64 KiB header list (`h2limits`)
+
+`run.sh --only slate --mode h2abuse ./slate`, a plain `sysl build .` binary: `h2Server` now announces
+SETTINGS_MAX_CONCURRENT_STREAMS = 100 and SETTINGS_MAX_HEADER_LIST_SIZE = 65536, as the JavaScript
+session does, and `slate:http` answers `431` on both hosts to a header list past the second.
+
+| server | mode | verdict | rss before | rss peak | rss after | fd before | fd peak | fd after |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| slate | h2abuse | PASS | 14 | 18 | 18 | 13 | 13 | 13 |
+
+| server | mode | what the client saw |
+|---|---|---|
+| slate | h2abuse | resets=2000 streams=500 settings=1000 zeroWindow=1 served=10/10 |
+
+Unchanged in what the client saw, and peak RSS is 18 MB against 24 MB.
