@@ -404,7 +404,7 @@ A literate `.lsl` form, a raw string literal, a name resolver for `connect`, Uni
 standard library beyond the builtins. On the object side: `super`, and a check that a proto satisfies a
 `type` when it is attached to an object literal by hand.
 
-In the JavaScript back end: `run`, `slate:redis`, `slate:nghttp2`, and the
+In the JavaScript back end: `slate:redis`, `slate:nghttp2`, and the
 servers written over them — `slate:ws` has its **client** there, over the host's own `WebSocket`, and
 cannot have its server, a browser being unable to listen. Each one is a name that
 says *"not in the JavaScript back end yet"* rather than a name that is not there. `slate:time` is whole
