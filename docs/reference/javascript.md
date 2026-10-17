@@ -80,9 +80,11 @@ calls are still on the list. In a browser `listen` refuses, so nothing there rea
 The session holds a peer to nghttp2's limits — both flow-control windows, at most 100 streams open
 at once, a 64 KiB header list, eight CONTINUATION frames to a header block, and nghttp2's
 rapid-reset bucket — and advertises the stream and header-list limits in its SETTINGS, which an nghttp2
-session does not. **One difference is in the shape of the answer**: a connection error the peer
-caused, such as DATA past the connection's window, is `{ error }` from `h2Receive` here, with the
-GOAWAY already queued, where nghttp2 queues the GOAWAY and answers `null`.
+session does not. A connection error the peer causes is answered as nghttp2 answers it:
+`h2Receive` says `null`, the GOAWAY is queued for `h2Send`, and nothing more is read. **One
+difference is in when flow-control credit goes back**: with `autoWindowUpdate: false` this session
+returns it in lumps of 16 KiB as the program consumes, where nghttp2 waits until half a window has
+been consumed.
 
 **`slate:net` and `slate:llhttp` came OFF that list in 0.0.31**, and they are what everything above
 a socket stands on — see the section below. **`startTls` is here at both ends, over node's `tls`**,
