@@ -64,10 +64,19 @@ way.
 
 ## What is not there yet
 
-**`slate:process`'s `run`, `slate:redis` and `slate:nghttp2`.** Each is a
+**`slate:process`'s `run`, `slate:redis` and the client half of `slate:nghttp2`.** Each is a
 name that says *"not in the JavaScript back end yet"* when a program reaches it, rather than a name
 that is not there — so a program is told which half of the world it is in. **No global is on that
 list any more**; `fetch` was the last and has its own section below.
+
+**`slate:nghttp2`'s server half is here on node**, which is what lets `slate:http`'s `serve` answer
+HTTP/2 under `slate js` when `listen` was given a certificate, a key and `alpn: ["h2", "http/1.1"]`.
+`h2Server`, `h2Receive`, `h2Send`, `h2Next`, `h2Respond`, `h2RespondStream`, `h2Push`, `h2Finish`,
+`h2Goaway`, `h2Consume` and `h2Close` behave as they do in the interpreter. **The session is written
+out in the runtime rather than being node's `http2`**, because `slate:http`'s speaker hands a session
+bytes and reads what they said at once, and node's HTTP/2 only answers later. `h2Client`, `h2Request`,
+`h2RequestStream`, `h2Settings`, `h2Reset`, `h2WindowUpdate`, `h2Ping`, `h2Wants` and the `hpack*`
+calls are still on the list. In a browser `listen` refuses, so nothing there reaches a session.
 
 **`slate:net` and `slate:llhttp` came OFF that list in 0.0.31**, and they are what everything above
 a socket stands on — see the section below. **`startTls` is here at both ends, over node's `tls`**,
@@ -535,10 +544,12 @@ the interpreter and the text here. Everything else matches: the request asks for
 interpreter's sentence rather than the host's `TypeError`.
 
 **A streamed body (`stream: true`) is read through the host's own `response.body.getReader()`**, and
-the same line runs through it: a JavaScript host decodes a compressed body as it reads, where the
-interpreter asks for `identity` and refuses a server that compresses anyway, having no inflater that
-runs as the bytes arrive. A body that breaks off, a limit running out mid-body and `dispose` all
-answer the interpreter's sentences word for word; `dispose` cancels the reader and aborts the request.
+both back ends decode a compressed body as it arrives. A body that breaks off, a limit running out
+mid-body, a stream damaged in the middle and `dispose` all answer the interpreter's sentences word for
+word; `dispose` cancels the reader and aborts the request. **A compressed stream that stops short of
+its end** behind a connection that ended cleanly is the one difference: node's `fetch` answers what
+it decoded as the whole body, where the interpreter ends the body in *"…it could not be
+decompressed"*.
 
 **`trust` refuses**, and it is the shape case rather than a missing feature. It names a certificate to
 trust as well as the machine's own, and no JavaScript host lets a program add a trust anchor for one

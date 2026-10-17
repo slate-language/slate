@@ -1,5 +1,6 @@
 module dev.slatelang.slate
 
+import sh.sysl.miniz
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.text.{from_utf8_unchecked, split, Search}
@@ -223,8 +224,8 @@ broke_off(url: string) -> string = s"${url} stopped sending in the middle of the
 
 // -- the head, and the bytes after it ------------------------------------------------------------
 
-// A streamed fetch's head is in: follow it if it redirects, refuse it if it is compressed, and
-// otherwise answer the fetch with the head and a body to read the rest through.
+// A streamed fetch's head is in: follow it if it redirects, and otherwise answer the fetch with the
+// head and a body to read the rest through.
 //
 // Not `private`: `try_answer` in `client.sysl` hands a streamed fetch over here once its head is in.
 body_head(fi: usize, split_at: usize)
@@ -246,8 +247,9 @@ body_head(fi: usize, split_at: usize)
     stream_head(fi, h.status, h.lines, frame_for(h.status, h.lines, f.method))
 end body_head
 
-// A streamed head, however it arrived: follow it if it redirects, refuse it if it is compressed, and
-// otherwise answer the fetch and start the body flowing with whatever already came after the head.
+// A streamed head, however it arrived: follow it if it redirects, and otherwise answer the fetch and
+// start the body flowing with whatever already came after the head -- decoded as it arrives where
+// the head says it is compressed.
 //
 // Not `private`: `client_h2.sysl` answers an HTTP/2 head through it, with the end of the stream as
 // the framing -- `no_frame()`, which reads to the end, and the end there is the stream's.
@@ -255,13 +257,6 @@ stream_head(fi: usize, status: int, lines: []const string, framing: Result[BodyF
     val f = current().fetches.at(fi)
 
     if redirected(fi, status, lines) then return
-
-    if f.decode
-        val refused = streamed_compression(header_named(lines, "content-encoding"))
-
-        if refused != ""
-            fetch_failed(fi, refused)
-            return
 
     val fr = framing match
         Err(why) ->
@@ -273,6 +268,10 @@ stream_head(fi: usize, status: int, lines: []const string, framing: Result[BodyF
 
     g.frame = fr
     g.streaming = true
+    g.coding = if f.decode then streamed_coding(header_named(lines, "content-encoding")) else ""
+    g.inflating = None
+    g.early = buf()
+    g.wire = 0
     current().fetches.set(fi, g)
 
     val mark = root_mark()
@@ -299,24 +298,27 @@ body_feed(fi: usize)
     var i: usize = 0
     var bad = false
 
+    // The body's own bytes in this read, framing taken off and not yet decoded.
+    var framed: Buf[u8] = buf()
+
     while i < n && !f.frame.done && !bad
         if f.frame.framing == Framing.Counted
             val take = if f.frame.left < n - i then f.frame.left else n - i
 
-            f.held.extend(bytes[i..<(i + take)])
+            framed.extend(bytes[i..<(i + take)])
             i += take
             f.frame.left -= take
 
             if f.frame.left == 0 then f.frame.done = true
         elif f.frame.framing == Framing.ToClose
-            f.held.extend(bytes[i..])
+            framed.extend(bytes[i..])
             i = n
         elif f.frame.framing == Framing.Bodiless
             f.frame.done = true
         elif f.frame.at == ChunkAt.InChunk
             val take = if f.frame.left < n - i then f.frame.left else n - i
 
-            f.held.extend(bytes[i..<(i + take)])
+            framed.extend(bytes[i..<(i + take)])
             i += take
             f.frame.left -= take
 
@@ -358,14 +360,95 @@ body_feed(fi: usize)
     f.got = buf()
     current().fetches.set(fi, f)
 
+    // **What was framed is decoded before a broken frame is reported**, so the bytes that did arrive
+    // are handed over first, which is the mid-body rule.
+    val decoded = take_body(fi, framed.view())
+
     if bad
         body_failed(fi, broke_off(f.url))
+        return
+
+    if !decoded || (f.frame.done && !body_whole(fi))
+        body_failed(fi, undecodable(f.coding))
         return
 
     if f.frame.done then body_over(fi)
 
     body_deliver(fi)
 end body_feed
+
+// This read's body bytes into what is held: as they came, or decoded where the head said the server
+// compressed them. Answers false where they will not decode -- **an answer and not a fault**, so the
+// caller ends the body with `undecodable`'s sentence, the one a JavaScript host's read says too.
+//
+// **A `deflate` body waits for its second byte before a decoder is made.** The word means zlib, and
+// a server sending the bare stream anyway is common enough that every browser reads both
+// (`fetch_body_text`'s reason); zlib's two header bytes are a checksum of themselves, so it takes
+// both to tell.
+private take_body(fi: usize, framed: []const u8) -> bool
+    if framed.len == 0 then return true
+
+    var f = current().fetches.at(fi)
+
+    f.wire += framed.len
+
+    if f.coding == ""
+        f.held.extend(framed)
+        current().fetches.set(fi, f)
+        return true
+
+    val d = f.inflating match
+        Some(d) -> d
+        None ->
+            f.early.extend(framed)
+
+            if f.coding == "deflate" && f.early.len() < 2
+                current().fetches.set(fi, f)
+                return true
+
+            val made = miniz.decoder(wrapper_for(f.coding, f.early.view()))
+            val first = f.early
+
+            f.inflating = Some(made)
+            f.early = buf()
+
+            val ok = fed(made, first.view(), f.held)
+
+            current().fetches.set(fi, f)
+            return ok
+
+    val ok = fed(d, framed, f.held)
+
+    current().fetches.set(fi, f)
+    ok
+end take_body
+
+// What a streamed body's decoder reads: a gzip member, or for `deflate` zlib or the bare stream.
+private wrapper_for(coding: string, first: []const u8) -> miniz.Wrapper
+    if coding == "gzip" then return miniz.Wrapper.Gzip
+
+    if zlib_wrapped(first) then miniz.Wrapper.Zlib else miniz.Wrapper.Raw
+
+private fed(d: &miniz.Decoder, bytes: []const u8, out: Buf[u8]) -> bool
+    d.feed(bytes, out) match
+        Ok(_) -> true
+        Err(_) -> false
+
+// Whether a body that has ended is whole once decoded. **A compressed one has to have reached the end
+// of its stream**, and one that stops short is `Truncated` however cleanly its connection ended -- a
+// server that crashed mid-write and a proxy that cut it off both look like that. An empty body is
+// whole: nothing was sent to decode.
+private body_whole(fi: usize) -> bool
+    val f = current().fetches.at(fi)
+
+    if f.coding == "" then return true
+
+    f.inflating match
+        Some(d) ->
+            d.finish() match
+                Ok(_) -> true
+                Err(_) -> false
+        None -> f.early.len() == 0
 
 // The socket ended while a body was flowing: the end of an unframed body, and a break in any other.
 //
@@ -376,6 +459,10 @@ body_ended(fi: usize)
     if f.ended then return
 
     if f.frame.done || f.frame.framing == Framing.ToClose
+        if !body_whole(fi)
+            body_failed(fi, undecodable(f.coding))
+            return
+
         body_over(fi)
         body_deliver(fi)
         return
@@ -440,9 +527,12 @@ private take_step(fi: usize) -> Option[Value]
 
     if f.held.len() > 0
         val chunk = bytes_from(f.held.view())
-        val n = f.held.len()
+
+        // **Counted off the wire, not out of `held`**, which a compressed body makes larger.
+        val n = f.wire
 
         f.held = buf()
+        f.wire = 0
         current().fetches.set(fi, f)
 
         // Over HTTP/2 what was read is what the server may now send again.
