@@ -1,0 +1,559 @@
+module dev.slatelang.slate
+
+// `slate:redis` in the JavaScript back end -- the five natives under it, with RESP written out.
+//
+// **`slate:redis` is slate source, so nothing of the CLIENT is here.** The queue of waiting
+// commands, the push routing, the two failure channels and every sentence a program reads are
+// `redis_source.sysl`'s, shared by both hosts; its socket is `slate:net`, which `js_rt_net.sysl`
+// puts over node's `net`. What the interpreter binds and a JavaScript host lacks is hiredis's
+// reader, so this file is that reader, and the command writer beside it.
+//
+// **THE READER IS A PORT OF hiredis 1.4.1's `read.c`, NOT A FRESH READING OF RESP**, because the
+// two hosts have to agree about bytes that are wrong as well as bytes that are right. Each
+// protocol failure is hiredis's own sentence -- `Bad integer value`, `Protocol error, got "x" as
+// reply type byte` -- behind the binding's `this is not a redis stream: `, and the checks run in
+// hiredis's order so the first thing wrong is the thing named. It keeps hiredis's shape too: a task
+// stack that survives between calls, so a reply arriving in a hundred packets is read once rather
+// than re-read from its first byte every time one lands.
+//
+// **What a reply becomes is `redis_parse.sysl`'s `as_value`, line for line**: a bulk string is text
+// where it is UTF-8 and an array of byte values where it is not, a `-ERR` inside an aggregate is an
+// object with an `error`, a RESP3 map is an object whose keys are the keys written as text, and a
+// set, a push and an attribute are arrays.
+//
+// **A browser refuses every name**, in `slate:llhttp`'s sentence -- the reader is no use without
+// the socket `connect` already refuses there, and a page that reached one would have a parser for a
+// connection it cannot open.
+//
+// **BEHIND THE `redis` FEATURE**, with the natives it implements: `tests_owed.sysl` checks that
+// `$b`'s names and `builtin_names()` are one set, so a block left in for a build without them is a
+// name nothing can reach.
+
+#if feature_redis
+js_runtime_redis() -> string = raw"""
+        // -- redis: hiredis's reader, written out ----------------------------------------------------
+
+        // **One entry per reader and never reused**, the interpreter's `redis_slots`: an id is an
+        // index, and one that names nothing is fed nothing and answers nothing.
+        const respReaders = []
+
+        // hiredis's `REDIS_READER_MAX_REPLY_DEPTH` and `REDIS_READER_MAX_ARRAY_ELEMENTS`.
+        const RespMaxDepth = 1024
+        const RespMaxElements = 4294967295n
+
+        const respNeedsSockets = (name) => {
+            if (typeof Buffer === "undefined")
+                fault("`" + name + "` needs a host with sockets, and this JavaScript host has none")
+        }
+
+        const respWantCount = (args, want, name, takes) => {
+            if (args.length !== want)
+                fault("`" + name + "` takes " + takes + ", and was given " + args.length +
+                    (args.length === 1 ? " argument" : " arguments"))
+        }
+
+        const respReaderAt = (v, name) => {
+            if (!$.isInt(v)) fault("`" + name + "` takes a reader, and this is " + typeName(v))
+
+            const r = respReaders[Number(v)]
+
+            return r === undefined ? null : r
+        }
+
+        // hiredis's `chrtos`: the byte as C would quote it in its sentence.
+        const respByteText = (b) => {
+            if (b === 0x5c || b === 0x22) return "\"\\" + String.fromCharCode(b) + "\""
+            if (b === 0x0a) return "\"\\n\""
+            if (b === 0x0d) return "\"\\r\""
+            if (b === 0x09) return "\"\\t\""
+            if (b === 0x07) return "\"\\a\""
+            if (b === 0x08) return "\"\\b\""
+            if (b >= 0x20 && b <= 0x7e) return "\"" + String.fromCharCode(b) + "\""
+
+            return "\"\\x" + b.toString(16).padStart(2, "0") + "\""
+        }
+
+        // hiredis's `string2ll`: no sign but one leading minus, no leading zero, no spaces, and
+        // nothing outside 64 bits. Answers a BigInt, or null where the text is not one.
+        const respInteger = (u, at, n) => {
+            if (n === 0) return null
+
+            let i = at
+            let negative = false
+
+            if (n === 1 && u[i] === 0x30) return 0n
+
+            if (u[i] === 0x2d) {
+                negative = true
+                i++
+
+                if (i === at + n) return null
+            }
+
+            if (u[i] < 0x31 || u[i] > 0x39) return null
+
+            let v = 0n
+
+            for (; i < at + n; i++) {
+                if (u[i] < 0x30 || u[i] > 0x39) return null
+
+                v = v * 10n + BigInt(u[i] - 0x30)
+            }
+
+            if (negative) return v > 9223372036854775808n ? null : -v
+
+            return v > 9223372036854775807n ? null : v
+        }
+
+        const respLatin = (u, at, n) => {
+            let s = ""
+
+            for (let i = at; i < at + n; i++) s += String.fromCharCode(u[i])
+
+            return s
+        }
+
+        // `,` -- RESP3's `inf`, `-inf`, `nan` and `-nan` in any case, or a finite decimal written
+        // out whole. ffc with `NO_INFNAN` takes no leading `+` and no hexadecimal.
+        const respDouble = (text) => {
+            const low = text.toLowerCase()
+
+            if (low === "inf") return Infinity
+            if (low === "-inf") return -Infinity
+            if (low === "nan" || low === "-nan") return NaN
+
+            if (!/^-?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$/.test(text)) return null
+
+            const d = Number(text)
+
+            return Number.isFinite(d) ? d : null
+        }
+
+        class RespReader {
+            constructor() {
+                this.buf = new Uint8Array(256)
+                this.len = 0
+                this.pos = 0
+                this.tasks = []
+                this.reply = null
+                this.broken = ""
+                this.open = true
+            }
+
+            feed(u) {
+                if (this.broken !== "" || u.length === 0) return
+
+                if (this.len + u.length > this.buf.length) {
+                    const kept = this.len - this.pos
+                    const room = new Uint8Array(Math.max(this.buf.length * 2, kept + u.length))
+
+                    room.set(this.buf.subarray(this.pos, this.len))
+                    this.buf = room
+                    this.len = kept
+                    this.pos = 0
+                }
+
+                this.buf.set(u, this.len)
+                this.len += u.length
+            }
+
+            // `__redisReaderSetError`: the buffer and the stack go, and the sentence stays.
+            fail(why) {
+                this.broken = "this is not a redis stream: " + why.slice(0, 127)
+                this.buf = new Uint8Array(0)
+                this.len = 0
+                this.pos = 0
+                this.tasks = []
+                this.reply = null
+
+                return false
+            }
+
+            // Where the next `\r\n` begins, or -1.
+            newline() {
+                for (let i = this.pos; i + 1 < this.len; i++)
+                    if (this.buf[i] === 0x0d && this.buf[i + 1] === 0x0a) return i
+
+                return -1
+            }
+
+            // A finished node goes into its parent's reserved slot, or becomes the reply.
+            place(node) {
+                const cur = this.tasks[this.tasks.length - 1]
+
+                if (cur.parent !== null) cur.parent.node.kids[cur.idx] = node
+
+                if (this.tasks.length === 1) this.reply = node
+            }
+
+            // `moveToNextTask`.
+            next() {
+                while (this.tasks.length > 0) {
+                    if (this.tasks.length === 1) {
+                        this.tasks.pop()
+
+                        return
+                    }
+
+                    const cur = this.tasks[this.tasks.length - 1]
+                    const prv = this.tasks[this.tasks.length - 2]
+
+                    if (cur.idx === prv.elements - 1) this.tasks.pop()
+                    else {
+                        cur.type = ""
+                        cur.idx++
+
+                        return
+                    }
+                }
+            }
+
+            lineItem(cur) {
+                const end = this.newline()
+
+                if (end < 0) return false
+
+                const at = this.pos
+                const n = end - at
+                const u = this.buf
+
+                this.pos = end + 2
+
+                let node
+
+                if (cur.type === "integer") {
+                    const v = respInteger(u, at, n)
+
+                    if (v === null) return this.fail("Bad integer value")
+
+                    node = { kind: "integer", value: v }
+                } else if (cur.type === "double") {
+                    if (n >= 326) return this.fail("Double value is too large")
+
+                    const d = respDouble(respLatin(u, at, n))
+
+                    if (d === null) return this.fail("Bad double value")
+
+                    node = { kind: "double", value: d }
+                } else if (cur.type === "nil") {
+                    if (n !== 0) return this.fail("Bad nil value")
+
+                    node = { kind: "nil" }
+                } else if (cur.type === "boolean") {
+                    const c = u[at]
+
+                    if (n !== 1 || (c !== 0x74 && c !== 0x54 && c !== 0x66 && c !== 0x46))
+                        return this.fail("Bad bool value")
+
+                    node = { kind: "boolean", value: c === 0x74 || c === 0x54 }
+                } else if (cur.type === "bignum") {
+                    for (let i = 0; i < n; i++) {
+                        if (i === 0 && u[at] === 0x2d) continue
+
+                        if (u[at + i] < 0x30 || u[at + i] > 0x39) return this.fail("Bad bignum value")
+                    }
+
+                    node = { kind: "bignum", bytes: u.slice(at, end) }
+                } else {
+                    for (let i = at; i < end; i++)
+                        if (u[i] === 0x0d || u[i] === 0x0a) return this.fail("Bad simple string value")
+
+                    node = { kind: cur.type, bytes: u.slice(at, end) }
+                }
+
+                this.place(node)
+                this.next()
+
+                return true
+            }
+
+            bulkItem(cur) {
+                const end = this.newline()
+
+                if (end < 0) return false
+
+                const len = respInteger(this.buf, this.pos, end - this.pos)
+
+                if (len === null) return this.fail("Bad bulk string length")
+
+                if (len < -1n) return this.fail("Bulk string length out of range")
+
+                if (len === -1n) {
+                    this.pos = end + 2
+                    this.place({ kind: "nil" })
+                    this.next()
+
+                    return true
+                }
+
+                const n = Number(len)
+
+                if (end + 2 + n + 2 > this.len) return false
+
+                if (cur.type === "verbatim" && (n < 4 || this.buf[end + 5] !== 0x3a))
+                    return this.fail("Verbatim string 4 bytes of content type are missing or incorrectly encoded.")
+
+                const bytes = this.buf.slice(end + 2, end + 2 + n)
+
+                this.pos = end + 2 + n + 2
+                this.place({ kind: cur.type, bytes: bytes })
+                this.next()
+
+                return true
+            }
+
+            aggregateItem(cur) {
+                if (this.tasks.length - 1 >= RespMaxDepth) return this.fail("Max nesting depth exceeded")
+
+                const end = this.newline()
+
+                if (end < 0) return false
+
+                const count = respInteger(this.buf, this.pos, end - this.pos)
+
+                this.pos = end + 2
+
+                if (count === null) return this.fail("Bad multi-bulk length")
+
+                if (count < -1n || count > RespMaxElements) return this.fail("Multi-bulk length out of range")
+
+                if (count === -1n) {
+                    this.place({ kind: "nil" })
+                    this.next()
+
+                    return true
+                }
+
+                let elements = Number(count)
+
+                if (cur.type === "map" || cur.type === "attribute") elements *= 2
+
+                const node = { kind: cur.type, kids: new Array(elements).fill(null) }
+
+                this.place(node)
+
+                if (elements > 0) {
+                    cur.elements = elements
+                    cur.node = node
+                    this.tasks.push({ type: "", idx: 0, elements: -1, parent: cur, node: null })
+                } else this.next()
+
+                return true
+            }
+
+            // `processItem`: true where it made progress, false where it needs bytes or failed.
+            item() {
+                const cur = this.tasks[this.tasks.length - 1]
+
+                if (cur.type === "") {
+                    if (this.pos >= this.len) return false
+
+                    const b = this.buf[this.pos++]
+
+                    switch (b) {
+                        case 0x2d: cur.type = "failure"; break
+                        case 0x2b: cur.type = "status"; break
+                        case 0x3a: cur.type = "integer"; break
+                        case 0x2c: cur.type = "double"; break
+                        case 0x5f: cur.type = "nil"; break
+                        case 0x24: cur.type = "text"; break
+                        case 0x2a: cur.type = "array"; break
+                        case 0x25: cur.type = "map"; break
+                        case 0x7c: cur.type = "attribute"; break
+                        case 0x7e: cur.type = "set"; break
+                        case 0x23: cur.type = "boolean"; break
+                        case 0x3d: cur.type = "verbatim"; break
+                        case 0x3e: cur.type = "push"; break
+                        case 0x28: cur.type = "bignum"; break
+                        default: return this.fail("Protocol error, got " + respByteText(b) + " as reply type byte")
+                    }
+                }
+
+                switch (cur.type) {
+                    case "text": case "verbatim": return this.bulkItem(cur)
+                    case "array": case "map": case "attribute": case "set": case "push": return this.aggregateItem(cur)
+                    default: return this.lineItem(cur)
+                }
+            }
+
+            // `redisReaderGetReply`: the next whole reply as a node, or null.
+            take() {
+                if (this.broken !== "" || this.len === 0) return null
+
+                if (this.tasks.length === 0)
+                    this.tasks.push({ type: "", idx: -1, elements: -1, parent: null, node: null })
+
+                while (this.tasks.length > 0)
+                    if (!this.item()) break
+
+                if (this.broken !== "" || this.tasks.length > 0) return null
+
+                const got = this.reply
+
+                this.reply = null
+
+                return got
+            }
+        }
+
+        const respStrictText = new TextDecoder("utf-8", { fatal: true })
+        const respLooseText = new TextDecoder("utf-8")
+
+        // `as_value` in `redis_parse.sysl`.
+        const respValue = (node) => {
+            switch (node.kind) {
+                case "nil": return null
+                case "integer": case "double": case "boolean": return node.value
+                case "status": case "bignum": case "verbatim": return respLooseText.decode(node.bytes)
+                case "failure": return $.obj([["error", respLooseText.decode(node.bytes)]])
+
+                case "text":
+                    try {
+                        return respStrictText.decode(node.bytes)
+                    } catch (e) {
+                        return Array.from(node.bytes, (b) => BigInt(b))
+                    }
+
+                case "map": {
+                    // **A key said twice keeps its first place and its last value**, which is what
+                    // `obj_put_name` does to a table it is writing into.
+                    const pairs = []
+                    const seen = new Map()
+
+                    for (let i = 0; i + 1 < node.kids.length; i += 2) {
+                        const key = text(respValue(node.kids[i]))
+                        const v = respValue(node.kids[i + 1])
+
+                        if (seen.has(key)) pairs[seen.get(key)][1] = v
+                        else {
+                            seen.set(key, pairs.length)
+                            pairs.push([key, v])
+                        }
+                    }
+
+                    return $.obj(pairs)
+                }
+
+                default: return node.kids.map(respValue)
+            }
+        }
+
+        const respEnvelope = (kind, v) => $.obj([["kind", kind], ["value", v]])
+
+        // `redisReader()` -- a reader for one connection.
+        B.redisReader = (...args) => {
+            respNeedsSockets("redisReader")
+
+            if (args.length !== 0)
+                fault("`redisReader` takes no arguments and was given " + args.length +
+                    (args.length === 1 ? " argument" : " arguments"))
+
+            respReaders.push(new RespReader())
+
+            return BigInt(respReaders.length - 1)
+        }
+
+        // `redisFeed(r, bytes)` -- bytes off the wire, copied.
+        B.redisFeed = (...args) => {
+            respNeedsSockets("redisFeed")
+            respWantCount(args, 2, "redisFeed", "a reader and some bytes")
+
+            const r = respReaderAt(args[0], "redisFeed")
+            const u = $.bytesLike(args[1], "redisFeed")
+
+            if (r !== null && r.open) r.feed(u)
+
+            return null
+        }
+
+        // `redisTake(r)` -- the next whole reply, or null where more bytes are needed.
+        B.redisTake = (...args) => {
+            respNeedsSockets("redisTake")
+            respWantCount(args, 1, "redisTake", "a reader")
+
+            const r = respReaderAt(args[0], "redisTake")
+
+            if (r === null) return null
+
+            if (r.broken !== "") return respEnvelope("broken", r.broken)
+
+            if (!r.open) return null
+
+            const node = r.take()
+
+            if (r.broken !== "") return respEnvelope("broken", r.broken)
+
+            if (node === null) return null
+
+            const kind = node.kind === "failure" ? "error" : node.kind === "push" ? "push" : "reply"
+
+            return respEnvelope(kind, respValue(node))
+        }
+
+        // `redisCommand(parts)` -- an array of arguments, as the bytes to send.
+        //
+        // **Every argument crosses as a counted string**, which is the whole of RESP's answer to
+        // injection: `*<count>` and then `$<length>` before each piece, nothing escaped.
+        B.redisCommand = (...args) => {
+            respNeedsSockets("redisCommand")
+            respWantCount(args, 1, "redisCommand", "an array of arguments")
+
+            const parts = args[0]
+
+            if (!Array.isArray(parts))
+                fault("`redisCommand` takes the arguments as an array, and this is " + typeName(parts))
+
+            const pieces = []
+
+            for (const p of parts) {
+                if (typeof p === "string") pieces.push(new TextEncoder().encode(p))
+                else if (p instanceof $.SBytes) pieces.push(p.view().slice())
+                else if (Array.isArray(p)) {
+                    const out = new Uint8Array(p.length)
+
+                    for (let i = 0; i < p.length; i++) {
+                        if (!$.isInt(p[i]))
+                            fault("a byte is a whole number between 0 and 255, and this is " + typeName(p[i]))
+
+                        if (p[i] < 0n || p[i] > 255n) fault("a byte is between 0 and 255, and this is " + p[i])
+
+                        out[i] = Number(p[i])
+                    }
+
+                    pieces.push(out)
+                } else fault("a redis argument is text or bytes, and this one is " + typeName(p))
+            }
+
+            if (pieces.length === 0) fault("`redisCommand` needs at least the command's own name")
+
+            const wire = []
+            const ascii = (s) => { for (let i = 0; i < s.length; i++) wire.push(BigInt(s.charCodeAt(i))) }
+
+            ascii("*" + pieces.length + "\r\n")
+
+            for (const piece of pieces) {
+                ascii("$" + piece.length + "\r\n")
+
+                for (const b of piece) wire.push(BigInt(b))
+
+                ascii("\r\n")
+            }
+
+            return wire
+        }
+
+        // `redisClose(r)` -- the connection has gone and the reader with it.
+        B.redisClose = (...args) => {
+            respNeedsSockets("redisClose")
+            respWantCount(args, 1, "redisClose", "a reader")
+
+            const r = respReaderAt(args[0], "redisClose")
+
+            if (r !== null) r.open = false
+
+            return null
+        }
+    """
+#else
+js_runtime_redis() -> string = ""
+#endif
