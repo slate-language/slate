@@ -1,5 +1,6 @@
 #!/bin/sh
-# The server benchmark: the same three-endpoint HTTP server in slate, node, Bun and Go, loaded by
+# The server benchmark: the same three-endpoint HTTP server in slate (interpreted, and compiled by
+# `slate js` to run under node), node, Bun and Go, loaded by
 # existing generators (oha, wrk, h2load) and reported as one markdown results table.
 #
 #     bench/serve/run.sh [-d secs] [-c conns] [-w warmup-secs] [-q rate] [-o file] [--only name]
@@ -10,7 +11,7 @@
 #   -w  warm-up seconds per server, spread over endpoints (default 3)
 #   -q  requests per second for the fixed-rate latency run (default 5000)
 #   -o  also write the tables to this file
-#   --only  one of slate, node, bun, go (repeatable)
+#   --only  one of slate, slatejs (slate's `slate js` output under node), node, bun, go (repeatable)
 #   --check start each server, verify its answers, and stop: the quick smoke, no load is applied
 #
 # **Run it under `caffeinate -dimsu` on a quiet box**, as `bench/run.sh` is run -- the sleep that
@@ -79,6 +80,7 @@ start_server() {
   [ "$tls" = 1 ] && extra="$cert $key"
   case "$name" in
     slate) "$SLATE" "$here/server.sl" "$port" $extra > "$log" 2>&1 & ;;
+    slatejs) node "$tmp/server-slatejs.js" "$port" $extra > "$log" 2>&1 & ;;
     node) node "$here/server.js" "$port" $extra > "$log" 2>&1 & ;;
     bun) bun "$here/server.bun.js" "$port" $extra > "$log" 2>&1 & ;;
     go) "$tmp/server-go" "$port" $extra > "$log" 2>&1 & ;;
@@ -167,12 +169,17 @@ if selected go; then
   (cd "$here" && go build -o "$tmp/server-go" server.go) || { echo "go build failed" >&2; exit 1; }
 fi
 
+# The same server.sl, compiled once to JavaScript and run under node.
+if selected slatejs; then
+  "$SLATE" js "$here/server.sl" -o "$tmp/server-slatejs.js" || { echo "slate js failed" >&2; exit 1; }
+fi
+
 : > "$tmp/t1"; : > "$tmp/t2"; : > "$tmp/t3"; : > "$tmp/t4"
 status=0
 base_port=18100
 idx=0
 
-for name in slate node bun go; do
+for name in slate slatejs node bun go; do
   selected "$name" || continue
   idx=$((idx + 1))
   port=$((base_port + idx * 10))

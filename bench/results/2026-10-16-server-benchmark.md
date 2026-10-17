@@ -2,8 +2,9 @@
 
 Taken with `bench/serve/run.sh ./slate` under `caffeinate -dimsu`. slate is a plain `sysl build .`
 binary, not the PGO one (about 20% slower than a release build, `bench/README.md`), and each figure
-is ONE run, not a best-of. slate runs on its interpreter only: `listen` refuses under `slate js`, so
-node stands for that host. Bun 1.4.3 negotiates HTTP/1.1 on a TLS port (no h2), so it has no h2 row.
+is ONE run, not a best-of. The `slate js` rows are the same `server.sl` compiled by `slate js` and run
+under node, taken afterwards with `--only slatejs` on the same box (HTTP/2 there is the session in
+`js_rt_h2.sysl`, written for this; the interpreter's is nghttp2). Bun 1.4.3 negotiates HTTP/1.1 on a TLS port (no h2), so it has no h2 row.
 
 **Two things to read before the numbers.** slate's peak RSS is 2.6 GB on plain HTTP/1.1 against
 26-124 MB for the others, which says the collector's schedule or something the server retains is not
@@ -25,6 +26,9 @@ oha columns are req/s, then p50, p99 and p99.9 in ms; wrk columns are req/s, p50
 | slate | /plain | 39126 | 1.637 | 1.921 | 3.594 | 47027 | 1.320 | 2.340 |
 | slate | /json | 36190 | 1.744 | 2.158 | 3.117 | 46478 | 1.370 | 1.700 |
 | slate | /echo (POST) | 36846 | 1.695 | 2.782 | 3.631 | - | - | - |
+| slate js | /plain | 54447 | 1.101 | 2.378 | 3.333 | 70804 | 0.860 | 1.820 |
+| slate js | /json | 55021 | 1.088 | 2.334 | 3.481 | 60956 | 1.000 | 2.090 |
+| slate js | /echo (POST) | 50780 | 1.178 | 2.505 | 3.401 | - | - | - |
 | node | /plain | 121382 | 0.482 | 1.022 | 1.151 | 149125 | 0.410 | 0.829 |
 | node | /json | 114416 | 0.511 | 1.113 | 1.252 | 143289 | 0.427 | 0.870 |
 | node | /echo (POST) | 104071 | 0.564 | 1.195 | 1.532 | - | - | - |
@@ -41,6 +45,8 @@ oha columns are req/s, then p50, p99 and p99.9 in ms; wrk columns are req/s, p50
 |---|---|---:|---:|---:|---:|---:|
 | slate | /plain | 5000 | 4997 | 0.171 | 0.466 | 0.765 |
 | slate | /json | 5000 | 4998 | 0.174 | 0.475 | 4.836 |
+| slate js | /plain | 5000 | 4999 | 0.18 | 0.421 | 1.497 |
+| slate js | /json | 5000 | 4999 | 0.192 | 0.434 | 0.734 |
 | node | /plain | 5000 | 4998 | 0.107 | 0.29 | 0.411 |
 | node | /json | 5000 | 4999 | 0.109 | 0.235 | 0.535 |
 | bun | /plain | 5000 | 4998 | 0.08 | 76.327 | 257.874 |
@@ -54,6 +60,8 @@ oha columns are req/s, then p50, p99 and p99.9 in ms; wrk columns are req/s, p50
 |---|---|---:|---:|---:|---:|---:|
 | slate | /plain | 24430 | 2.584 | 3.612 | 3.996 | 11502 |
 | slate | /json | 24743 | 2.599 | 3.148 | 4.15 | 11308 |
+| slate js | /plain | 35863 | 1.733 | 2.71 | 4.062 | 76226 |
+| slate js | /json | 34224 | 1.794 | 3.062 | 4.307 | 62290 |
 | node | /plain | 53426 | 1.16 | 1.735 | 3.951 | 108395 |
 | node | /json | 51382 | 1.202 | 1.78 | 4.096 | 101276 |
 | bun | not measured: negotiated HTTP/1.1, no h2 | | | |
@@ -65,6 +73,7 @@ oha columns are req/s, then p50, p99 and p99.9 in ms; wrk columns are req/s, p50
 | server | plain HTTP/1.1 | HTTPS + h2 |
 |---|---:|---:|
 | slate | 2649 | 1945 |
+| slate js | 211 | 271 |
 | node | 124 | 267 |
 | bun | 39 | - |
 | go | 26 | 48 |
