@@ -142,6 +142,79 @@ whole_yet(raw: []const u8, split_at: usize, method: string) -> bool
 
     fr.framing != Framing.ToClose
 
+// Where a buffered reply ends in what has arrived, or zero where that cannot be known yet -- or ever,
+// for a body framed by the close. **A chunked body ends after its trailers and the blank line**, not
+// at the `0` chunk that `parse_response` stops at, and a connection handed on with those still on it
+// would answer the next request with them.
+//
+// Not `private`: `try_answer` in `client.sysl` keeps a connection only where this is all of it.
+reply_end(raw: []const u8, split_at: usize, method: string) -> usize
+    val h = parse_head(raw) match
+        Err(_) -> return 0
+        Ok(h) -> h
+
+    val fr = frame_for(h.status, h.lines, method) match
+        Err(_) -> return 0
+        Ok(fr) -> fr
+
+    if fr.framing == Framing.Bodiless then return split_at
+    if fr.framing == Framing.Counted then return if raw.len - split_at >= fr.left then split_at + fr.left else 0
+    if fr.framing == Framing.ToClose then return 0
+
+    var i = split_at
+
+    loop
+        val nl = newline_at(raw, i)
+
+        if nl == raw.len then return 0
+
+        var line = raw[i..<nl]
+
+        for j in 0..<line.len
+            if line[j] == u8(';') || line[j] == u8('\r')
+                line = line[0..<j]
+                break
+
+        val size = hex_of(line) match
+            Err(_) -> return 0
+            Ok(n) -> n
+
+        i = nl + 1
+
+        if size == 0
+            // The trailers, each a line, and the blank line that ends them.
+            loop
+                val t = newline_at(raw, i)
+
+                if t == raw.len then return 0
+
+                val blank = t == i || (t == i + 1 && raw[i] == u8('\r'))
+
+                i = t + 1
+
+                if blank then return i
+
+        if raw.len < i + size + 2 then return 0
+
+        i += size
+
+        if raw[i] != u8('\r') || raw[i + 1] != u8('\n') then return 0
+
+        i += 2
+end reply_end
+
+// Where the next `\n` at or after `from` is, or the end where there is none.
+private newline_at(raw: []const u8, from: usize) -> usize
+    for j in from..<raw.len
+        if raw[j] == u8('\n') then return j
+
+    raw.len
+
+// A reply's status line, which is where its HTTP version is.
+//
+// Not `private`: `try_answer` in `client.sysl` reads the version off it.
+first_line(raw: []const u8) -> string = from_utf8_unchecked(raw[0..<newline_at(raw, 0)])
+
 // The sentence a streamed body ends with when its connection goes before it is whole -- the same on
 // both hosts, which is why it names nothing but the URL the program asked for.
 //
@@ -167,6 +240,7 @@ body_head(fi: usize, split_at: usize)
     var rest: Buf[u8] = buf()
 
     rest.extend(g.got.view()[split_at..])
+    g.keeps = g.reuse && stays_open(first_line(g.got.view()), h.lines, g.extra.view())
     g.got = rest
     current().fetches.set(fi, g)
     stream_head(fi, h.status, h.lines, frame_for(h.status, h.lines, f.method))
@@ -278,6 +352,9 @@ body_feed(fi: usize)
 
                 f.frame.line = buf()
 
+    // **A body that ended exactly where the bytes did leaves its connection fit for the next
+    // request**, where the head did not say otherwise. One framed by the close never ends here.
+    f.keepable = f.keeps && f.frame.done && i == n && !bad
     f.got = buf()
     current().fetches.set(fi, f)
 
@@ -363,9 +440,13 @@ private take_step(fi: usize) -> Option[Value]
 
     if f.held.len() > 0
         val chunk = bytes_from(f.held.view())
+        val n = f.held.len()
 
         f.held = buf()
         current().fetches.set(fi, f)
+
+        // Over HTTP/2 what was read is what the server may now send again.
+        h2_taken(fi, n)
 
         return Some(step(false, chunk))
 

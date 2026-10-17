@@ -1,0 +1,433 @@
+module dev.slatelang.slate
+@tests
+
+import sh.sysl.libuv
+
+// `fetch`'s connection pool (`client_pool.sysl`), against servers in the same program that COUNT the
+// connections they accept -- which is the only thing that can tell a reused connection from a fresh
+// one, the answers being the same either way.
+//
+// **Every server closes what it accepted when the program finishes**, or its own reads would keep the
+// program running until the client's idle timer closed the other end.
+
+// An HTTP/1.1 server answering by path, and the counts. `/ka` keeps the connection open; `/close`
+// says `Connection: close` and closes; `/old` is HTTP/1.0; `/unframed` has no length and closes;
+// `/chunked` is chunked with a trailer; `/drop` answers and then closes the connection behind the
+// client's back; `/host` and `/conn` say what the request's `Host` and `Connection` were; `/held`
+// answers only after a while, so that requests overlap.
+private val H1Server: string = raw"""
+    import { listen, onData, send, close, localPort } from slate:net
+
+    var accepted = 0
+    val conns = []
+
+    header(req, name)
+        var v = ""
+        for line in req.split("\r\n")
+            val parts = line.split(": ")
+            if parts.length == 2 && parts[0].lower() == name then v = parts[1]
+        v
+
+    plain(body) = "HTTP/1.1 200 OK\r\nContent-Length: " + string(body.length) + "\r\n\r\n" + body
+
+    async reply(conn, req)
+        val path = req.split(" ")[1]
+        if req.startsWith("HEAD")
+            await send(conn, "HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\n")
+        elif path == "/close"
+            await send(conn, "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nclose")
+            close(conn)
+        elif path == "/old"
+            await send(conn, "HTTP/1.0 200 OK\r\nContent-Length: 3\r\n\r\nold")
+        elif path == "/unframed"
+            await send(conn, "HTTP/1.1 200 OK\r\n\r\nunframed")
+            close(conn)
+        elif path == "/chunked"
+            await send(conn, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\nX-Done: yes\r\n\r\n")
+        elif path == "/drop"
+            await send(conn, plain("dropping"))
+            await sleep(20)
+            close(conn)
+        elif path == "/host"
+            await send(conn, plain(header(req, "host")))
+        elif path == "/conn"
+            await send(conn, plain("[" + header(req, "connection") + "]"))
+        elif path == "/held"
+            await sleep(50)
+            await send(conn, plain("held"))
+        else
+            await send(conn, plain("count " + string(accepted)))
+
+    val server = listen(0, conn ->
+        accepted = accepted + 1
+        conns.push(conn)
+        onData(conn, chunk ->
+            if chunk == null then close(conn) else reply(conn, chunk)))
+
+    val port = string(localPort(server))
+    val base = "http://127.0.0.1:" + port
+    body(r) = if r.ok then r.value.body else "failed: " + r.error
+    get(p) = fetch(base + p)
+    finish()
+        close(server)
+        for c in conns
+            try
+                close(c)
+            catch e
+                e
+        done()
+    """
+
+private h1_out(probe: string) -> string = out(watched(H1Server + "\n" + probe))
+
+@test
+THE_POOL_SENDS_ONE_REQUEST_AFTER_ANOTHER_TO_AN_ORIGIN_OVER_ONE_CONNECTION()
+    // A counted body, a chunked one read through its trailers, and a `HEAD` -- each leaves the
+    // connection exactly at the end of its reply, so the next request finds it fit to use.
+    assert_eq(h1_out(raw"""
+        async main()
+            print(body(await get("/ka")))
+            print(body(await get("/chunked")))
+            print((await fetch(base + "/ka", { method: "HEAD" })).value.status)
+            print(body(await get("/ka")))
+            finish()
+
+        main()
+        """).trim(),
+        "count 1\nabcde\n200\ncount 1")
+end THE_POOL_SENDS_ONE_REQUEST_AFTER_ANOTHER_TO_AN_ORIGIN_OVER_ONE_CONNECTION
+
+@test
+THE_POOL_KEEPS_NO_CONNECTION_THAT_EITHER_SIDE_SAID_WOULD_CLOSE()
+    // `Connection: close`, an HTTP/1.0 reply, and a body that only the close could end: each request
+    // after one of them is a connection of its own.
+    assert_eq(h1_out(raw"""
+        async main()
+            print(body(await get("/close")), body(await get("/ka")))
+            print(body(await get("/old")), body(await get("/ka")))
+            print(body(await get("/unframed")), body(await get("/ka")))
+            print(body(await fetch(base + "/ka", { headers: { Connection: "close" } })), body(await get("/ka")))
+            finish()
+
+        main()
+        """).trim(),
+        "close count 2\nold count 3\nunframed count 4\ncount 4 count 5")
+end THE_POOL_KEEPS_NO_CONNECTION_THAT_EITHER_SIDE_SAID_WOULD_CLOSE
+
+@test
+THE_POOL_KEEPS_SIX_IDLE_CONNECTIONS_TO_AN_ORIGIN_AND_CLOSES_ONE_LEFT_IDLE()
+    // Eight at once open eight; six are kept, so eight more at once open two. Left idle past the
+    // limit -- a hundred and fifty milliseconds for this test -- a connection is closed, and the
+    // request after it opens another.
+    set_pool_limits(0, 150)
+
+    val said = h1_out(raw"""
+        async eight()
+            val all = []
+            for i in 0..<8
+                all.push(get("/held"))
+            for p in all
+                await p
+
+        async main()
+            await eight()
+            print(body(await get("/count")))
+            await eight()
+            print(body(await get("/count")))
+            await sleep(400)
+            print(body(await get("/count")))
+            finish()
+
+        main()
+        """).trim()
+
+    set_pool_limits(0, 0)
+    assert_eq(said, "count 8\ncount 10\ncount 11")
+end THE_POOL_KEEPS_SIX_IDLE_CONNECTIONS_TO_AN_ORIGIN_AND_CLOSES_ONE_LEFT_IDLE
+
+@test
+THE_POOL_SENDS_A_GET_AGAIN_WHEN_ITS_IDLE_CONNECTION_IS_DEAD_AND_TELLS_A_POST()
+    // `/drop` leaves its connection in the pool and then closes it, which the client cannot see
+    // while nothing reads it. A `GET` on it is sent again on a fresh connection; a `POST` may have
+    // been acted on, so it is told the connection went -- and nothing is dialled for it.
+    assert_eq(h1_out(raw"""
+        async main()
+            print(body(await get("/drop")))
+            await sleep(100)
+            print(body(await get("/count")))
+            print(body(await get("/drop")))
+            await sleep(100)
+            val p = await fetch(base + "/count", { method: "POST", body: "x" })
+            print(p.ok)
+            print(body(await get("/count")))
+            finish()
+
+        main()
+        """).trim(),
+        "dropping\ncount 2\ndropping\nfalse\ncount 3")
+end THE_POOL_SENDS_A_GET_AGAIN_WHEN_ITS_IDLE_CONNECTION_IS_DEAD_AND_TELLS_A_POST
+
+@test
+reuse_false_TAKES_NO_CONNECTION_FROM_THE_POOL_AND_LEAVES_NONE_IN_IT()
+    // It dials although one is idle, asks for `Connection: close`, and closes -- so the next request
+    // dials too. Anything but a yes-or-no is refused at the call.
+    assert_eq(h1_out(raw"""
+        async main()
+            print(body(await get("/conn")))
+            print(body(await fetch(base + "/conn", { reuse: false })))
+            print(body(await get("/count")))
+            print(body(await get("/count")))
+            print(fetch(base + "/", { reuse: "no" }) catch e -> e.message)
+            finish()
+
+        main()
+        """).trim(),
+        "[]\n[close]\ncount 2\ncount 2\n`reuse` is true or false, and this is string")
+end reuse_false_TAKES_NO_CONNECTION_FROM_THE_POOL_AND_LEAVES_NONE_IN_IT
+
+@test
+THE_POOL_SENDS_A_Host_HEADER_WITH_THE_PORT_WHERE_IT_IS_NOT_THE_SCHEMES_OWN()
+    assert_eq(h1_out(raw"""
+        async main()
+            print(body(await get("/host")) == "127.0.0.1:" + port)
+            finish()
+
+        main()
+        """).trim(),
+        "true")
+end THE_POOL_SENDS_A_Host_HEADER_WITH_THE_PORT_WHERE_IT_IS_NOT_THE_SCHEMES_OWN
+
+@test
+A_PROGRAM_ENDS_WITHOUT_WAITING_FOR_THE_POOL_TO_CLOSE_ITS_IDLE_CONNECTION()
+    // The server keeps its end open for a fifth of a second and then closes it, so the second fetch
+    // reuses the first one's connection. After that the client's connection sits in the pool with
+    // its four-second timer, and the program still ends as soon as the server has let go: neither
+    // the idle socket nor the timer holds the loop.
+    val started = libuv.hrtime()
+
+    val said = out(watched(raw"""
+        import { listen, onData, send, close, localPort } from slate:net
+
+        var accepted = 0
+
+        val server = listen(0, conn ->
+            accepted = accepted + 1
+            setTimeout(() -> close(conn), 200)
+            onData(conn, chunk ->
+                if chunk != null then send(conn, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")))
+
+        async main()
+            val base = "http://127.0.0.1:" + string(localPort(server))
+            print((await fetch(base + "/")).value.body, (await fetch(base + "/")).value.body, accepted)
+            close(server)
+            done()
+
+        main()
+        """)).trim()
+
+    val took_ms = (libuv.hrtime() - started) / 1000000
+
+    assert_eq(said, "ok ok 1")
+    assert(took_ms < 2500, s"the program took ${took_ms} ms, so something held it for the pool's four seconds")
+end A_PROGRAM_ENDS_WITHOUT_WAITING_FOR_THE_POOL_TO_CLOSE_ITS_IDLE_CONNECTION
+
+#if feature_http2
+
+// An HTTP/2 server that counts connections and the streams open on one at once. `/slow` answers late,
+// `/bye` sends a GOAWAY naming its own stream as the last and then answers, `/big` is a megabyte,
+// `/flood` is a megabyte sent as fast as the client's window allows, and `/count` and `/peak` say the
+// two numbers. `limit` is the MAX_CONCURRENT_STREAMS it announces, where it is not zero.
+private val H2Server: string = raw"""
+    import { listen, onBytes, send, close, localPort } from slate:net
+    import { h2Server, h2Receive, h2Send, h2Next, h2Respond, h2RespondStream, h2Push, h2Finish, h2Goaway, h2Settings } from slate:nghttp2
+    import { readFileSync } from slate:fs
+
+    val cert = readFileSync("tests/tls/cert.pem").value
+    val key = readFileSync("tests/tls/key.pem").value
+    val big = "0123456789".repeat(100000)
+    var accepted = 0
+    var open = 0
+    var peak = 0
+    var limit = 0
+    val conns = []
+
+    field(hs, name)
+        var v = ""
+        for p in hs
+            if p[0] == name then v = p[1]
+        v
+
+    speak(conn, first)
+        val s = h2Server()
+        val asked = {}
+        val c = { gone: false }
+
+        if limit > 0 then h2Settings(s, { maxConcurrentStreams: limit })
+
+        async flush()
+            if c.gone then return
+            val out = h2Send(s)
+            if out.length > 0
+                try
+                    await send(conn, out)
+                catch e
+                    c.gone = true
+
+        reply(stream, text)
+            open = open - 1
+            h2Respond(s, stream, { ":status": "200" }, text)
+
+        async answer(stream, p)
+            if p == "/count"
+                reply(stream, string(accepted))
+            elif p == "/peak"
+                reply(stream, string(peak))
+            elif p == "/slow"
+                await sleep(60)
+                reply(stream, "slow")
+            elif p == "/bye"
+                h2Goaway(s, stream, 0)
+                reply(stream, "bye")
+            elif p == "/big"
+                reply(stream, big)
+            elif p == "/flood"
+                open = open - 1
+                h2RespondStream(s, stream, { ":status": "200" })
+                h2Push(s, stream, big)
+                h2Finish(s, stream)
+            else
+                reply(stream, "hello")
+            await flush()
+
+        took(e)
+            val k = string(e.stream ?? 0)
+            if e.kind == "headers"
+                open = open + 1
+                if open > peak then peak = open
+                asked[k] = field(e.headers, ":path")
+            elif e.kind == "streamEnd"
+                answer(e.stream, asked[k])
+
+        heard(chunk)
+            if h2Receive(s, chunk) != null
+                close(conn)
+                return
+            var e = h2Next(s)
+            while e != null
+                took(e)
+                e = h2Next(s)
+            flush()
+
+        onBytes(conn, chunk ->
+            if chunk == null
+                c.gone = true
+                close(conn)
+            else
+                heard(chunk))
+        heard(first)
+
+    val server = listen({ port: 0, cert: cert, key: key, alpn: ["h2"] }, conn ->
+        accepted = accepted + 1
+        conns.push(conn)
+        onBytes(conn, first ->
+            if first == null then close(conn) else speak(conn, first)))
+
+    val base = "https://localhost:" + string(localPort(server))
+    get(p) = fetch(base + p, { trust: cert })
+    body(r) = if r.ok then r.value.body else "failed: " + r.error
+    finish()
+        close(server)
+        for c in conns
+            try
+                close(c)
+            catch e
+                e
+        done()
+    """
+
+private h2_pool_out(probe: string) -> string = out(watched(H2Server + "\n" + probe))
+
+@test
+CONCURRENT_FETCHES_TO_AN_HTTP2_ORIGIN_SHARE_THE_POOLS_ONE_CONNECTION()
+    // Three at once, before any connection exists: the first dials and the other two wait to hear
+    // whether it found `h2`, then join it as streams. `reuse: false` dials one of its own -- counted
+    // when it is accepted -- and the request after it is back on the shared one.
+    assert_eq(h2_pool_out(raw"""
+        async main()
+            val a = get("/hello")
+            val b = get("/hello")
+            val c = get("/hello")
+            print(body(await a), body(await b), body(await c))
+            print(body(await get("/count")))
+            print(body(await fetch(base + "/count", { trust: cert, reuse: false })))
+            print(body(await get("/count")))
+            finish()
+
+        main()
+        """).trim(),
+        "hello hello hello\n1\n2\n2")
+end CONCURRENT_FETCHES_TO_AN_HTTP2_ORIGIN_SHARE_THE_POOLS_ONE_CONNECTION
+
+@test
+THE_POOL_HOLDS_HTTP2_STREAMS_PAST_THE_SERVERS_MAX_CONCURRENT_STREAMS()
+    // The server allows one stream at a time. Once its SETTINGS are in, four slow requests at once
+    // go one after another on the one connection, and none is refused.
+    assert_eq(h2_pool_out(raw"""
+        limit = 1
+
+        async main()
+            print(body(await get("/hello")))
+            val all = [get("/slow"), get("/slow"), get("/slow"), get("/slow")]
+            val said = []
+            for p in all
+                said.push(body(await p))
+            print(said, body(await get("/peak")), body(await get("/count")))
+            finish()
+
+        main()
+        """).trim(),
+        "hello\n[\"slow\", \"slow\", \"slow\", \"slow\"] 1 1")
+end THE_POOL_HOLDS_HTTP2_STREAMS_PAST_THE_SERVERS_MAX_CONCURRENT_STREAMS
+
+@test
+A_GOAWAY_LETS_THE_POOLS_OPEN_STREAMS_FINISH_AND_THE_NEXT_FETCH_DIALS()
+    // A slow request is in flight when another one is answered with a GOAWAY naming it as the last
+    // stream: both are answered, and the request after them is on a new connection.
+    assert_eq(h2_pool_out(raw"""
+        async main()
+            print(body(await get("/hello")))
+            val slow = get("/slow")
+            await sleep(10)
+            val bye = get("/bye")
+            print(body(await bye), body(await slow))
+            print(body(await get("/count")))
+            finish()
+
+        main()
+        """).trim(),
+        "hello\nbye slow\n2")
+end A_GOAWAY_LETS_THE_POOLS_OPEN_STREAMS_FINISH_AND_THE_NEXT_FETCH_DIALS
+
+@test
+A_STREAMED_BODY_NOBODY_IS_READING_DOES_NOT_STALL_ANOTHER_STREAM_ON_THE_POOLS_CONNECTION()
+    // A megabyte streamed and left unread fills its own window and stops there; a megabyte asked for
+    // beside it on the same connection still arrives whole, and the first is whole when it is read.
+    assert_eq(h2_pool_out(raw"""
+        async main()
+            val flood = (await getWith()).value
+            val b = body(await get("/big"))
+            print(b.length, b == big)
+            var got = 0
+            for await piece in flood.body
+                got = got + piece.length
+            print(got, body(await get("/count")))
+            finish()
+
+        getWith() = fetch(base + "/flood", { trust: cert, stream: true })
+
+        main()
+        """).trim(),
+        "1000000 true\n1000000 1")
+end A_STREAMED_BODY_NOBODY_IS_READING_DOES_NOT_STALL_ANOTHER_STREAM_ON_THE_POOLS_CONNECTION
+
+#endif

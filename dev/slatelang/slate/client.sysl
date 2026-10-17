@@ -118,6 +118,16 @@ struct Fetch
     // settled on `h2`. `client_h2.sysl` owns everything about it.
     h2: Option[usize]
 
+    // The pool's part (`client_pool.sysl`): whether this request may share a connection at all;
+    // whether the one it is on may be kept once the answer is in; whether that one came out of the
+    // pool; whether the request has already been sent again once; and whether the reply's head left
+    // the connection open.
+    reuse: bool
+    keepable: bool
+    reused: bool
+    retried: bool
+    keeps: bool
+
 // The table is now `current().fetches` -- see `vm_state.sysl`.
 
 // Give every fetch back between runs. **Each connection is CLOSED and the slot is kept**: a read
@@ -129,6 +139,11 @@ struct Fetch
 forget_fetches()
     for i in 0..<current().fetches.len()
         if current().fetches.at(i).live then finish_fetch(i)
+
+    // **And every connection the pool kept**, idle ones and HTTP/2 ones alike: an idle socket holds
+    // nothing open, but it is a descriptor, and a server in the next program could be handed it.
+    forget_pool()
+    forget_h2_conns()
 
 // `fetch(url)` and `fetch(url, options)` -- a promise of what the server said.
 //
@@ -157,7 +172,8 @@ end do_fetch
 private claim_fetch(request: usize, at: Span, asked: FetchOptions) -> usize
     var f = Fetch(true, request, at, "", "", 80, "/", false, asked.method, asked.body, asked.extra,
                   None, 0, None, asked.trust, false, buf(), 0, asked.decode, None,
-                  asked.stream, false, no_frame(), buf(), None, false, false, "", 0, None)
+                  asked.stream, false, no_frame(), buf(), None, false, false, "", 0, None,
+                  asked.reuse, false, false, false, false)
 
     // A reused slot carries its epoch and its stamp on, so that a task of the fetch that had it last
     // still finds the number moved, and so does a body that fetch handed out.
@@ -224,9 +240,56 @@ private start_fetch(fi: usize, url: string)
             f.tls = None
             f.got = buf()
             f.reading = true
+            f.keepable = false
+            f.reused = false
             current().fetches.set(fi, f)
 
-    loop_events().spawn(dialled(fi, current().fetches.at(fi).epoch))
+    val g = current().fetches.at(fi)
+
+    // **A connection already open to the origin is taken before anything is dialled**: an idle
+    // HTTP/1.1 one, then a stream on the HTTP/2 one, then a place in the line behind a dial that is
+    // still finding out which of the two the server speaks. A request sent again because a pooled
+    // connection was dead dials, so it cannot be handed another dead one.
+    if g.reuse && !g.retried
+        val key = pool_key(g.secure, g.host, g.port, g.trust)
+
+        take_idle(key) match
+            Some(c) ->
+                var h = current().fetches.at(fi)
+
+                h.conn = Some(c.conn)
+                h.tls = c.tls
+                h.ready = true
+                h.reused = true
+                current().fetches.set(fi, h)
+                send_request(fi)
+                loop_events().spawn(read_on(fi, h.epoch))
+                return
+            None -> ()
+
+        if g.secure && fetch_speaks_h2()
+            if h2_attach(fi, key) then return
+            if wait_on_probe(key, fi, g.epoch) then return
+
+            start_probe(key, fi, g.epoch)
+
+    loop_events().spawn(dialled(fi, g.epoch))
+
+// A dial to an `https` origin has found out whether the server speaks HTTP/2, or never will, so the
+// fetches waiting on it go on: onto its HTTP/2 connection where there now is one, and each to a dial
+// of its own where there is not.
+//
+// Not `private`: `client_h2.sysl` ends the wait once its connection is up.
+probe_settled(fi: usize)
+    val p = end_probe(fi) match
+        Some(p) -> p
+        None -> return
+
+    for i in 0..<p.waiters.len()
+        val w = p.waiters.at(i)
+        val epoch = p.epochs.at(i)
+
+        if owns(w, epoch) && !h2_attach(w, p.key) then loop_events().spawn(dialled(w, epoch))
 
 // One dial of a fetch, from the name to the end of the answer: resolve, connect, send, then read
 // until the connection ends or the answer is whole. **Each step ends in the call its libuv callback
@@ -283,8 +346,8 @@ end dialled
 // bytes are held that nobody has asked for yet, when the task ends and `resume_reading` starts
 // another at the next `next()`.
 //
-// **The end of the socket is the end of the answer**, since this asks for `Connection: close` -- so
-// what has arrived is what there is, and it is parsed rather than complained about.
+// **The end of the socket is the end of an answer that has no framing of its own** -- so what has
+// arrived is what there is, and it is parsed rather than complained about.
 private async read_on(fi: usize, epoch: usize)
     loop
         if !owns(fi, epoch) then return
@@ -308,7 +371,7 @@ private async read_on(fi: usize, epoch: usize)
                 if owns(fi, epoch)
                     if current().fetches.at(fi).streaming
                         body_failed(fi, broke_off(current().fetches.at(fi).url))
-                    else
+                    elif !retry_dead(fi)
                         fetch_failed(fi, s"this connection failed: ${e}")
 
                 return
@@ -329,6 +392,11 @@ end read_on
 // Not `private`: `client_stream.sysl`'s `next` asks for more with it when nothing is held.
 resume_reading(fi: usize)
     var f = current().fetches.at(fi)
+
+    // An HTTP/2 stream's connection is read for every stream on it, and is told it may read again.
+    if on_h2(fi)
+        h2_resume(fi)
+        return
 
     if f.reading then return
 
@@ -411,18 +479,16 @@ private step_handshake(fi: usize)
                             g.ready = true
                             current().fetches.set(fi, g)
 
-                            // **Whatever came with the end of the handshake is read at once** on
-                            // HTTP/2, the server's SETTINGS being able to share its last flight.
-                            if h2_begin(fi)
-                                if on_h2(fi) then drain_tls(fi, stream)
-                            else
+                            // **Where the server chose `h2` the connection is the session's from
+                            // here**, and `h2_begin` takes it over; otherwise the fetches waiting to
+                            // hear go and dial their own.
+                            if !h2_begin(fi)
+                                probe_settled(fi)
                                 send_request(fi)
                         More -> ()
 
 // Everything OpenSSL wants sent, written to the socket.
-//
-// Not `private`: `client_h2.sysl` writes a session's frames through it.
-push_tls(fi: usize, stream: &openssl.Stream)
+private push_tls(fi: usize, stream: &openssl.Stream)
     val f = current().fetches.at(fi)
 
     loop
@@ -443,16 +509,20 @@ private send_request(fi: usize)
     var out = str_builder()
 
     out.push(s"${f.method} ${f.target} HTTP/1.1\r\n")
-    out.push(s"Host: ${f.host}\r\n")
+
+    // **The port is part of `Host` wherever it is not the scheme's own** (RFC 9110 7.2): a server
+    // behind one address on two ports, or a proxy, tells the two apart by nothing else.
+    out.push(if f.port == (if f.secure then 443 else 80) then s"Host: ${f.host}\r\n" else s"Host: ${f.host}:${f.port}\r\n")
 
     for i in 0..<f.extra.len()
         out.push(f.extra.at(i))
         out.push("\r\n")
 
-    // **`Connection: close` is what makes the end of the socket the end of the answer**, which is
-    // the whole of this client's framing. A keep-alive client has to know how long a body is before
-    // it has read it, and that is a second reader for no gain here.
-    out.push("Connection: close\r\n")
+    // **HTTP/1.1 keeps a connection open unless somebody says otherwise**, and the reply's framing is
+    // what says where it ends -- so the pool can hand it to the next request. A request that asked
+    // not to share one says so to the server too.
+    if !f.reuse then out.push("Connection: close\r\n")
+
     out.push("Accept: */*\r\n")
 
     // **A streamed body asks for none**, there being no inflater here that runs as the bytes arrive
@@ -487,7 +557,7 @@ private write_wire(fi: usize, bytes: []const u8)
 private async sent(fi: usize, epoch: usize, t: Task[Result[unit, libuv.Error]])
     (await t) match
         Ok(_) -> ()
-        Err(e) -> if owns(fi, epoch) then fetch_failed(fi, s"the request could not be sent: ${e}")
+        Err(e) -> if owns(fi, epoch) && !retry_dead(fi) then fetch_failed(fi, s"the request could not be sent: ${e}")
 
 // Bytes off the wire. **Plaintext goes straight into the answer and ciphertext goes through
 // OpenSSL**, which is the only place in this file that knows which kind of connection it is on.
@@ -518,13 +588,12 @@ private fetch_read(fi: usize, bytes: []const u8)
 
             drain_tls(fi, stream)
 
-            // An HTTP/2 answer is the session's to recognise, and `h2_incoming` has.
-            if fetch_live(fi) && on_h2(fi) then return
+            if !fetch_live(fi) then return
 
     try_answer(fi)
 
-// Everything OpenSSL has decrypted, into the answer -- or into the HTTP/2 session, which may answer,
-// fail or redirect the fetch, after which what is left belongs to a connection that has gone.
+// Everything OpenSSL has decrypted, into the answer. **An HTTP/2 connection is never read here**:
+// `h2_begin` takes the socket away from the fetch the moment ALPN says `h2`.
 private drain_tls(fi: usize, stream: &openssl.Stream)
     var plain: []u8 = [u8(0); 16384]
     val epoch = current().fetches.at(fi).epoch
@@ -538,15 +607,10 @@ private drain_tls(fi: usize, stream: &openssl.Stream)
                 return
             Ok(got) -> got match
                 Data(n) ->
-                    if on_h2(fi)
-                        h2_incoming(fi, plain[0..<n])
-                    else
-                        var f = current().fetches.at(fi)
+                    var f = current().fetches.at(fi)
 
-                        for i in 0..<n
-                            f.got.push(plain[i])
-
-                        current().fetches.set(fi, f)
+                    f.got.extend(plain[0..<n])
+                    current().fetches.set(fi, f)
                 Closed -> return
                 Wants -> return
 
@@ -577,7 +641,16 @@ private try_answer(fi: usize)
 
     parse_response(f.got.view()) match
         Err(_) -> ()
-        Ok(r) -> deliver_response(fi, r)
+        Ok(r) ->
+            // **Kept only where the reply ended exactly where the bytes did**, so that nothing of it
+            // is left on the connection for the next request to read as its own answer.
+            if f.reuse && reply_end(f.got.view(), split_at, f.method) == f.got.len()
+                var g = f
+
+                g.keepable = stays_open(first_line(f.got.view()), r.headers, f.extra.view())
+                current().fetches.set(fi, g)
+
+            deliver_response(fi, r)
 
 // The socket ended. Whatever arrived is the answer, and a response that will not parse says so here
 // rather than waiting for more that is not coming.
@@ -586,16 +659,12 @@ private fetch_ended(fi: usize)
 
     val f = current().fetches.at(fi)
 
-    if on_h2(fi)
-        h2_ended(fi)
-        return
-
     if f.streaming
         body_ended(fi)
         return
 
     if f.got.len() == 0
-        fetch_failed(fi, s"${f.host} closed the connection without answering")
+        if !retry_dead(fi) then fetch_failed(fi, s"${f.host} closed the connection without answering")
         return
 
     // A streamed fetch whose head never finished: `parse_head` has the sentence for what is wrong
@@ -757,17 +826,23 @@ private close_fetch_socket(fi: usize)
 
     f.h2 = None
 
-    // **`close` is immediate**, which is right here: the request has gone and the answer is in, or
-    // the fetch failed, or a redirect is about to dial somewhere else. A read still parked on it ends
-    // with `ECANCELED` and finds the epoch moved.
+    // **A connection whose answer was read to its last byte goes back to the pool**, and every other
+    // one is closed. **`close` is immediate**, which is right here: the request has gone and the
+    // answer is in, or the fetch failed, or a redirect is about to dial somewhere else. A read still
+    // parked on it ends with `ECANCELED` and finds the epoch moved.
     f.conn match
-        Some(c) -> c.close()
+        Some(c) -> if f.keepable then park_idle(pool_key(f.secure, f.host, f.port, f.trust), c, f.tls) else c.close()
         None -> ()
 
     f.conn = None
     f.epoch += 1
     f.tls = None
+    f.keepable = false
     current().fetches.set(fi, f)
+
+    // A dial others were waiting on that is given up before it could tell them anything sends them
+    // to dial for themselves.
+    probe_settled(fi)
 
 // Close the connection and cancel the limit, keeping the slot. **A streamed body hangs up the moment
 // it is over and gives the slot back only once the program has read what is held**, so the socket
@@ -818,6 +893,30 @@ fetch_failed(fi: usize, why: string)
 
     finish_fetch(fi)
     deny_request(request, at, why)
+
+// A connection out of the pool that turned out to be dead -- the write refused, or the socket ended
+// before a byte of the answer -- and the request sent again on a fresh one where that is safe,
+// answering whether it was. See `client_pool.sysl`.
+private retry_dead(fi: usize) -> bool
+    val f = current().fetches.at(fi)
+
+    f.reused && f.got.len() == 0 && retry_once(fi)
+
+// Send the request again, once, on a connection dialled for it, where the method is idempotent and
+// it has not been sent again already.
+//
+// Not `private`: `client_h2.sysl` sends a stream again this way when its pooled connection is dead.
+retry_once(fi: usize) -> bool
+    var f = current().fetches.at(fi)
+
+    if f.retried || f.streaming || !idempotent(f.method) then return false
+
+    f.keepable = false
+    f.retried = true
+    current().fetches.set(fi, f)
+    close_fetch_socket(fi)
+    start_fetch(fi, f.url)
+    true
 
 // Not `private`, and neither is `header_name_of`: `client_h2.sysl` reads a caller's header lines
 // into HTTP/2's lower-case names with them.
