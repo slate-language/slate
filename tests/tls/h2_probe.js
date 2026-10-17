@@ -107,8 +107,9 @@ const run = async (port) => {
     // The limits a server holds a peer to, each from a client written in raw frames, since node's own
     // client keeps to them. After each the attacker's connection is over or its stream refused, and
     // the well-behaved client above is answered as before.
-    const opened = await raw(port, Buffer.alloc(0), (fs) => fs.some((f) => f.type === SETTINGS))
-    const limits = opened.frames.find((f) => f.type === SETTINGS)
+    // The server opens with an empty SETTINGS and then the one that carries its two limits.
+    const opened = await raw(port, Buffer.alloc(0), (fs) => fs.some((f) => f.type === SETTINGS && f.payload.length > 0))
+    const limits = opened.frames.find((f) => f.type === SETTINGS && f.payload.length > 0)
 
     console.log("settings " + settingsOf(limits.payload))
 

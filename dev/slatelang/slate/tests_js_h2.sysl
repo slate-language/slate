@@ -405,7 +405,7 @@ private val ConnectionErrorsAnswered: string =
     "a thousand resets then ping: null | t6 | ping:-:- (1)\n" +
     "eleven hundred resets: null | goaway(2001,2) | beginHeaders:1:- headers:1:- streamEnd:1:- rstStream:1:8 streamClose:1:8 (5500)\n" +
     "eleven hundred resets then ping: null |  |  (0)\n" +
-    "garbage: {error: \"reading what the peer sent: Received bad client magic byte string\"} | t4\n" +
+    "garbage: {error: \"reading what the peer sent: Received bad client magic byte string\"} | t4 t4\n" +
     "garbage again: {error: \"reading what the peer sent: Received bad client magic byte string\"}\n" +
     "flood: {error: \"reading what the peer sent: Too many CONTINUATION frames following a HEADER frame\"}\n" +
     "then goaway: null | goaway(0,0) | beginHeaders:1:- streamClose:1:7 (2)\n" +
@@ -650,6 +650,127 @@ JS_H2_A_SESSION_UNDER_NODE_ANSWERS_NONSENSE_WITH_AN_ERROR_AND_REFUSES_A_CLOSED_O
         "h2Close(s)\n" +
         "print(h2Send(s) catch e -> e.message)\n")
 
-    assert_eq(said, "21\nnull\ntrue\n`h2Send` was given a session that is closed or was never opened")
+    assert_eq(said, "30\nnull\ntrue\n`h2Send` was given a session that is closed or was never opened")
+
+// **The two limits a server session announces and holds its peer to, from one program on both hosts**:
+// SETTINGS_MAX_CONCURRENT_STREAMS = 100 and SETTINGS_MAX_HEADER_LIST_SIZE = 64 KiB. The peer
+// acknowledges the server's SETTINGS (which is what puts them in force), opens a hundred streams that
+// stay open, and the 101st is refused; a stream that is closed gives its place back.
+//
+// **nghttp2 announces the header-list limit and does not enforce it on what it reads**: a list of
+// 80,000 bytes, of 130,000, and one that indexes a 4,000-byte field 20,000 times are all delivered
+// whole. The session on both hosts does the same, and the `431` is `slate:http`'s
+// (`HeaderListBytes`), so it is the same on both -- see `A_SERVER_ANSWERS_431_...` in
+// `tests_http2_streams.sysl`.
+//
+// **Every line was first read off the interpreter**, so it is nghttp2's answer.
+private val ServerLimitsSource: string = raw"""
+import { h2Server, h2Receive, h2Send, h2Next, h2Reset } from slate:nghttp2
+
+frame(t, f, s, p) = [p.length >> 16, (p.length >> 8) & 255, p.length & 255, t, f, (s >> 24) & 255, (s >> 16) & 255, (s >> 8) & 255, s & 255, ...p]
+
+val req = [131, 135, 132, 1, 9, ...toBytes("localhost").toArray()]
+
+sent(sess)
+    val bs = h2Send(sess).toArray()
+    var at = 0
+    var seen = []
+
+    while at + 9 <= bs.length
+        val t = bs[at + 3]
+        val s = bs[at + 7] * 256 + bs[at + 8]
+
+        if t == 3 then seen.push("rst(" + string(s) + "," + string(bs[at + 12]) + ")")
+        if t == 7 then seen.push("goaway(" + string(bs[at + 11] * 256 + bs[at + 12]) + "," + string(bs[at + 16]) + ")")
+
+        at = at + 9 + bs[at] * 65536 + bs[at + 1] * 256 + bs[at + 2]
+
+    seen.join(" ")
+
+told(sess)
+    var seen = []
+    var e = h2Next(sess)
+
+    while e != null
+        if e.kind == "headers" && e.headers.length > 5
+            seen.push("headers:" + string(e.stream) + ":" + string(e.headers.length) + " fields")
+        else if e.kind != "beginHeaders" && e.kind != "headers" && e.kind != "streamEnd"
+            seen.push(e.kind + ":" + string(e.stream ?? "-") + ":" + string(e.code ?? "-"))
+
+        e = h2Next(sess)
+
+    seen.join(" ")
+
+opened()
+    val sess = h2Server({ autoWindowUpdate: false })
+
+    h2Receive(sess, [...toBytes("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").toArray(), ...frame(4, 0, 0, []), ...frame(4, 1, 0, [])])
+    h2Send(sess)
+    h2Next(sess)
+
+    sess
+
+step(name, sess, bytes)
+    print(name + ": " + string(h2Receive(sess, bytes)) + " | " + sent(sess) + " | " + told(sess))
+
+val busy = opened()
+
+for i in 0..<100
+    h2Receive(busy, frame(1, 4, 2 * i + 1, req))
+
+print("a hundred open: " + sent(busy) + " | " + told(busy))
+step("the 101st stream", busy, frame(1, 4, 201, req))
+step("the 102nd stream", busy, frame(1, 4, 203, req))
+step("a stream closed", busy, frame(3, 0, 1, [0, 0, 0, 8]))
+step("then the next", busy, frame(1, 4, 205, req))
+
+// Eight fields of 10,000 bytes: 80,000 bytes of header list, no field longer than HPACK allows.
+field() = [0, 1, 120, 127, 145, 77, ...toBytes("v".repeat(10000)).toArray()]
+
+// One block in frames of 16 KiB, the HEADERS and then its CONTINUATIONs.
+framed(block)
+    var pieces = frame(1, 1, 1, block[0..<16384])
+    var from = 16384
+
+    while from < block.length
+        val to = if from + 16384 < block.length then from + 16384 else block.length
+
+        pieces = [...pieces, ...frame(9, if to == block.length then 4 else 0, 1, block[from..<to])]
+        from = to
+
+    pieces
+
+step("a header list of 80,000 bytes", opened(), framed([...req, ...field(), ...field(), ...field(), ...field(), ...field(), ...field(), ...field(), ...field()]))
+step("a header list of 40,000 bytes", opened(), framed([...req, ...field(), ...field(), ...field(), ...field()]))
+step("a header list of 130,000 bytes", opened(), framed([...req, ...field(), ...field(), ...field(), ...field(), ...field(), ...field(), ...field(), ...field(), ...field(), ...field(), ...field(), ...field(), ...field()]))
+
+// One entry of 4,000 bytes added to the table and then indexed 20,000 times: 20 KiB on the wire that
+// names 80 MB of header list.
+amplified()
+    var refs = []
+
+    for i in 0..<20000
+        refs.push(190)
+
+    [...req, 64, 1, 121, 127, 161, 30, ...toBytes("w".repeat(4000)).toArray(), ...refs]
+
+step("a block that indexes one field 20,000 times", opened(), framed(amplified()))
+"""
+
+private val ServerLimitsAnswered: string =
+    "a hundred open:  | \n" +
+    "the 101st stream: null | rst(201,7) | \n" +
+    "the 102nd stream: null | rst(203,7) | \n" +
+    "a stream closed: null |  | rstStream:1:8 streamClose:1:8\n" +
+    "then the next: null |  | \n" +
+    "a header list of 80,000 bytes: null |  | headers:1:12 fields\n" +
+    "a header list of 40,000 bytes: null |  | headers:1:8 fields\n" +
+    "a header list of 130,000 bytes: null |  | headers:1:17 fields\n" +
+    "a block that indexes one field 20,000 times: null |  | headers:1:20005 fields"
+
+@test
+JS_H2_A_SERVER_HOLDS_ITS_PEER_TO_100_STREAMS_AND_A_64_KIB_HEADER_LIST_ON_BOTH_HOSTS()
+    assert_eq(out(ServerLimitsSource), ServerLimitsAnswered)
+    assert_eq(node_said(ServerLimitsSource), ServerLimitsAnswered)
 
 #endif
