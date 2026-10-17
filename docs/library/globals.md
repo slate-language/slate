@@ -718,12 +718,13 @@ if r.ok
   open, as a socket does. `close` is
   the same call under the name `slate:http` asks a streamed response's source for, so a fetched body can
   be handed straight back out as one.
-- **A compressed body is not decoded as it arrives in the interpreter.** A streamed request asks for
-  `Accept-Encoding: identity`, and a server that compresses anyway is refused at the head — *"the server
-  compressed a streamed body with gzip although it was asked not to, and a streamed body is not
-  decompressed as it arrives"* — rather than buffered whole behind the program's back. A JavaScript host
-  decodes as it reads, so there the same body arrives decoded; that is the one difference between the
-  hosts here.
+- **A compressed body is decoded as it arrives**, on both back ends: a streamed request asks for
+  `gzip, deflate` as a buffered one does, and each chunk is the bytes it decoded to. A stream damaged
+  in the middle hands over what decoded before the damage and then ends in *"the server said the body
+  was compressed with gzip, and it could not be decompressed"*. One stream that **stops short of its
+  end** while its connection ends cleanly — the gzip trailer missing, say — is where the hosts part:
+  the interpreter ends it in that same sentence, and node's `fetch` answers what it decoded as though
+  it were whole.
 - **Leaving `stream` out, or `stream: false`, is the buffered fetch above, unchanged.** Anything but
   `true` or `false` is a mistake in the program and faults at the call.
 

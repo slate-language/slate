@@ -535,10 +535,12 @@ the interpreter and the text here. Everything else matches: the request asks for
 interpreter's sentence rather than the host's `TypeError`.
 
 **A streamed body (`stream: true`) is read through the host's own `response.body.getReader()`**, and
-the same line runs through it: a JavaScript host decodes a compressed body as it reads, where the
-interpreter asks for `identity` and refuses a server that compresses anyway, having no inflater that
-runs as the bytes arrive. A body that breaks off, a limit running out mid-body and `dispose` all
-answer the interpreter's sentences word for word; `dispose` cancels the reader and aborts the request.
+both back ends decode a compressed body as it arrives. A body that breaks off, a limit running out
+mid-body, a stream damaged in the middle and `dispose` all answer the interpreter's sentences word for
+word; `dispose` cancels the reader and aborts the request. **A compressed stream that stops short of
+its end** behind a connection that ended cleanly is the one difference: node's `fetch` answers what
+it decoded as the whole body, where the interpreter ends the body in *"…it could not be
+decompressed"*.
 
 **`trust` refuses**, and it is the shape case rather than a missing feature. It names a certificate to
 trust as well as the machine's own, and no JavaScript host lets a program add a trust anchor for one
