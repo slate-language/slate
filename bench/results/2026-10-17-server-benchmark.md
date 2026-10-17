@@ -115,3 +115,43 @@ the thread, so a quarter of the time is the kernel and cannot be bought back in 
 interpreter loop and the allocator around it are about 24%, and the collector is small.
 
 Investigation only: no fix is proposed or made here.
+
+## After write coalescing: there was nothing to coalesce
+
+The `write` share above was suspected of being a response going out in pieces. **It is not: a
+whole-body HTTP/1.1 response is already ONE write.** `reply` and `replyBytes` in
+`http_write_source.sysl` join the status line, headers and body into one value before a single
+`send`; `send_bytes` in `net.sysl` makes one kairos `write`, which is one `uv_write`, and libuv
+issues one `writev` at the call when its queue is empty (always so for a small response on a
+keep-alive connection, the previous write having completed synchronously). So the 12.6% is one
+loopback `write` per request (about 3.3 us of the 26 us each request costs), which node and Go pay
+too.
+
+Measured rather than read: `Vm.writes_issued` now counts every write on a connection and
+`tests_writes.sysl` pins five keep-alive `/plain` requests at exactly 10 writes (5 client, 5
+server), a byte body at one write, a refused request at one write, and a pipelined pair at one write
+per response. A control that split `reply` into a head `send` and a body `send` read 15, 5 and 3 and
+failed three of the four tests.
+
+- **Pipelined responses are NOT coalesced, and doing so is not cheap**: `answer` in
+  `http_source.sysl` awaits each response's write before it parses the next request, so two
+  responses are never in hand in one turn. Joining them needs the connection loop to answer ahead
+  of the write's completion. That is a change to the connection loop, not to the writer, and
+  `oha`/`wrk` without pipelining would not see it.
+- **HTTP/2 has the same shape.** `flushed` in `http2_source.sysl` drains everything nghttp2 has
+  queued (`h2Send`) into one `send`, so a response's HEADERS and DATA are one write. Each stream
+  answered still flushes on its own, so N multiplexed streams answered in one turn cost N writes.
+  The fix would be to defer the flush to the end of the turn, and that is out of scope here.
+- **The cheaper syscall to go after is `getpeername` (1.6%).** `answer` calls `remoteAddress(conn)`
+  for every REQUEST to fill `req.address`, not once per connection as the note above says.
+
+Same-session runs, `bench/serve/run.sh --only slate -n 3`, both PGO builds (the released 0.1.27 and
+this branch's `bench/pgo.sh`), h1 `/plain`:
+
+| build | req/s median | req/s min-max | p50 ms | p99 ms | p99.9 ms | peak RSS MB (h1 / h2) |
+|---|---:|---:|---:|---:|---:|---:|
+| released slate (before) | 36910 | 36308-37979 | 1.671 | 2.233 | 3.291 | 31 / 39 |
+| after write coalescing (counter only) | 38043 | 37236-38304 | 1.687 | 1.978 | 3.202 | 30 / 40 |
+
+The two are the same within run-to-run noise, which is what a change that adds one counter
+increment per write should read.
