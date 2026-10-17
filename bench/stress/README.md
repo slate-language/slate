@@ -47,8 +47,10 @@ server failed any mode.
 ## The quick check
 
 `stress.sl --check` runs every TCP mode (1–4 and 6) at tiny scale against a slate server it starts in
-its own process, over plain HTTP/1.1, in a few seconds — the smoke. `h2abuse` needs a TLS server and
-is left to the full run above.
+its own process, over plain HTTP/1.1, in about ten seconds (slowloris has to dribble past the 5 s idle
+clock to say anything) — the smoke. It exits 1 if any mode failed, and today it does: slowloris
+fails on slate (no header-read deadline, `bench/results/2026-10-16-server-stress.md`). `h2abuse`
+needs a TLS server and is left to the full run above.
 
 ```
 ./slate bench/stress/stress.sl --check

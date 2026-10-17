@@ -98,16 +98,32 @@ fds()    { lsof -p "$SPID" 2>/dev/null | wc -l | tr -d ' '; }
 
 # sample a server's peak RSS and peak fds into files while a command runs in the foreground.
 sample_start() {
-  echo 0 > "$tmp/peakrss"; echo 0 > "$tmp/peakfd"
+  : > "$tmp/samples"
   (
     while kill -0 "$SPID" 2>/dev/null; do
       r=$(rss_kb); f=$(fds)
-      [ -n "$r" ] && [ "$r" -gt "$(cat "$tmp/peakrss")" ] && echo "$r" > "$tmp/peakrss"
-      [ -n "$f" ] && [ "$f" -gt "$(cat "$tmp/peakfd")" ] && echo "$f" > "$tmp/peakfd"
-      sleep 0.3
+      [ -n "$r" ] && [ -n "$f" ] && echo "$r $f" >> "$tmp/samples"
+      sleep 0.5
     done
   ) &
   SAMPLER=$!
+}
+
+# max <a> <b>: the larger of two whole numbers.
+max() { [ "$1" -gt "$2" ] && echo "$1" || echo "$2"; }
+
+# slope: compares the mean RSS of the first and last quarter of the samples. "plateau" unless the
+# last quarter is more than 10% and 2 MB above the first, or fds climbed by more than 8.
+slope() {
+  awk '{ r[NR] = $1; f[NR] = $2 } END {
+    q = int(NR / 4); if (q < 1) { print "too-few-samples"; exit }
+    for (i = 1; i <= q; i++) { a += r[i]; fa += f[i] }
+    for (i = NR - q + 1; i <= NR; i++) { b += r[i]; fb += f[i] }
+    a /= q; b /= q; fa /= q; fb /= q
+    if (b > a * 1.10 && b - a > 2048) print "CLIMBING rss " int(a / 1024) "->" int(b / 1024) " MB"
+    else if (fb - fa > 8) print "CLIMBING fds " int(fa) "->" int(fb)
+    else print "plateau rss " int(a / 1024) "->" int(b / 1024) " MB, fds " int(fa) "->" int(fb)
+  }' "$tmp/samples"
 }
 sample_stop() { [ -n "${SAMPLER:-}" ] && kill "$SAMPLER" 2>/dev/null; SAMPLER=""; }
 
@@ -120,8 +136,20 @@ run_one() {
   sample_start
   line=$("$SLATE" "$here/stress.sl" "$mode" "$host" "$port" $tlsarg 2>>"$tmp/stress.err")
   sample_stop
+  if [ "$mode" = soak ]; then
+    shape=$(slope)
+    case "$shape" in CLIMBING*) line="$line [server $shape]"; line=$(echo "$line" | sed 's/: PASS/: FAIL/') ;; *) line="$line [server $shape]" ;; esac
+  fi
+  # Settle past every server's idle clock before reading "after", so a socket the server is still
+  # closing is not counted as a leak -- what remains after this IS one.
+  sleep "${STRESS_SETTLE:-7}"
   rss2=$(rss_kb); fd2=$(fds)
-  peakr=$(cat "$tmp/peakrss"); peakf=$(cat "$tmp/peakfd")
+  peakr=$(awk 'BEGIN { m = 0 } { if ($1 > m) m = $1 } END { print m }' "$tmp/samples")
+  peakf=$(awk 'BEGIN { m = 0 } { if ($2 > m) m = $2 } END { print m }' "$tmp/samples")
+  peakr=$(max "$(max "$peakr" "$rss0")" "$rss2"); peakf=$(max "$(max "$peakf" "$fd0")" "$fd2")
+  if [ "$fd2" -gt $((fd0 + 8)) ]; then
+    line="$line [server fds $fd0 -> $fd2 after settling: LEAK]"; line=$(echo "$line" | sed 's/: PASS/: FAIL/')
+  fi
   verdict=$(echo "$line" | sed -n 's/^[a-z0-9]*: \([A-Z]*\).*/\1/p')
   [ "$name" = slate ] && [ "$verdict" = FAIL ] && state=1
   echo "| $name | $mode | ${verdict:-?} | $(mb "$rss0") | $(mb "$peakr") | $(mb "$rss2") | $fd0 | $peakf | $fd2 |" >> "$tmp/t1"

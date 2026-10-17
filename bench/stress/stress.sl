@@ -16,7 +16,7 @@
 import { connect, send, close, onData, onBytes, onError, startTls, alpnProtocol, localPort } from slate:net
 import { serve, close as stopServer } from slate:http
 import { h2Client, h2Request, h2Reset, h2Settings, h2Send, h2Receive, h2Next, h2Close } from slate:nghttp2
-import { args, env } from slate:process
+import { args, env, exit } from slate:process
 import { readFileSync } from slate:fs
 import { handler } from "../serve/app.sl"
 
@@ -285,11 +285,14 @@ async malformed(host, port, tls, base) =
             await until(5000, () -> state.closed || state.heard.length > 0)
 
             val status4xx = state.heard.length >= 12 && (state.heard[9] == "4" || state.heard[9] == "5")
-            val ok = state.closed || status4xx
+            // A server still reading a body it was PROMISED is legal, provided it serves everyone
+            // else meanwhile (checked below); only that case may be silent.
+            val waiting = c.name == "huge-content-length" && !state.closed && state.heard.length == 0
+            val ok = state.closed || status4xx || waiting
 
             if ok then handled += 1
 
-            details.push(c.name + "=" + (if state.closed then "closed" elif status4xx then "4xx" elif state.heard.length > 0 then "2xx?!" else "hung"))
+            details.push(c.name + "=" + (if state.closed then "closed" elif status4xx then "4xx" elif waiting then "waiting" elif state.heard.length > 0 then "2xx?!" else "hung"))
 
             close(conn)
 
@@ -441,8 +444,13 @@ async soak(host, port, tls, base) =
 
     { pass: total > 0 && good >= total - (total / 100) - 1, note: "secs=" + string(secs) + " ok=" + string(good) + "/" + string(total) }
 
+// How many modes failed, so the program's exit status says so.
+var failures = 0
+
 report(mode, result) =
     val tag = if result.pass then "PASS" else "FAIL"
+
+    if !result.pass then failures += 1
 
     print(mode + ": " + tag + " -- " + result.note)
 
@@ -475,6 +483,8 @@ async main()
 
         await check()
 
+        if failures > 0 then exit(1)
+
         return
 
     if args.length < 3
@@ -491,5 +501,7 @@ async main()
     val base = scheme + host + ":" + string(port)
 
     await runMode(mode, host, port, tls, base)
+
+    if failures > 0 then exit(1)
 
 main()
