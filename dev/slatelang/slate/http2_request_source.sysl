@@ -1,0 +1,210 @@
+module dev.slatelang.slate
+
+// `slate:http`'s fifth piece: what an HTTP/2 request is made of, once the session has framed it.
+//
+// **Cut from `http2_source.sysl` at the end of `speakH2`**, which is the one seam that file had: above
+// it is the session -- streams, clocks, flow control, the order frames go out in -- and below it are
+// module-level helpers the session calls and that know nothing about a connection. A body joined, a
+// header block turned into a `Request`, a body still arriving, and the `next` written over it. The
+// blocks are joined with no newline between, so the lexer is given the same module either way.
+//
+// **BEHIND THE `http2` FEATURE**, for `http2_source.sysl`'s reason: nothing here is reached by the
+// HTTP/1.1 speaker.
+#if feature_http2
+http2_request_source() -> string = raw"""
+    // Every DATA frame of a body, as one buffer.
+    //
+    // **The frames are joined ONCE and each join is a copy of a run of memory**, which is what
+    // `push` of a whole buffer is. It was `flat` over an array of arrays of numbers, and that is the
+    // shape the note at the push site is about: a value per byte, undone one level at the end.
+    joined(parts: array) -> bytes
+        var out = bytes(0)
+
+        for p in parts
+            push(out, p)
+
+        out
+
+    // The request a handler is given, out of an HTTP/2 header block and the body that followed it.
+    //
+    // **A HEADER BLOCK ARRIVES AS PAIRS AND THE OBJECT KEEPS THE LAST OF A REPEATED NAME**, which is
+    // what `query` already does with a repeated field and is the same reasoning: an array where a
+    // name repeats makes the type of `req.headers.x` depend on what a peer sent. Folding on the way
+    // OUT is what request smuggling is made of; folding on the way in, having already framed the
+    // request, is not.
+    //
+    // **`:authority` becomes `host`.** It is the same fact under HTTP/2's name, and a handler that
+    // reads `req.headers.host` should not have to know which version it is being spoken to over.
+    //
+    // **A body that is not text is the empty string**, exactly as it is on the 1.1 path, where
+    // llhttp's bytes go through the same conversion and the same `unwrap_or("")`.
+    requestOfH2(pairs: array, bytes: bytes, streaming: boolean, live) -> object
+        var method = "GET"
+        var target = "/"
+        var headers = {}
+
+        for [name, value] in pairs
+            if name == ":method"
+                method = value
+            elif name == ":path"
+                target = value
+            elif name == ":authority"
+                headers["host"] = value
+            elif name == "cookie" && has(headers, "cookie")
+                // **RFC 9113 SS8.2.3: COOKIE FIELDS ARE JOINED WITH `"; "`.** HTTP/2 lets a client
+                // split its cookies one per field so that each compresses on its own, and browsers
+                // do -- so keeping the last of them, which is what every other repeated name gets
+                // here, silently dropped all but one cookie from every such request. Joined, the
+                // value is exactly what the same client sends over 1.1 and `parseCookies` reads it
+                // unchanged.
+                headers["cookie"] = headers["cookie"] + "; " + value
+            elif !startsWith(name, ":")
+                headers[name] = value
+
+        val q = indexOf(target, "?")
+        val path = if q == null then target else target[0..<q]
+        val search = if q == null then "" else target[(q + 1)..<target.length]
+
+        val req = { method: method,
+                    path: path,
+                    search: search,
+                    headers: headers,
+                    query: parseQuery(search),
+                    cookies: if has(headers, "cookie") then parseCookies(headers["cookie"]) else {},
+                    params: {},
+                    keepAlive: true,
+                    upgrade: false }
+
+        if streaming then return streamingRequest(req, live)
+
+        val text = fromBytes(bytes)
+
+        req with { body: if text.ok then text.value else "" }
+
+    // The size of a header list as RFC 9113 counts it: each field's name and value in bytes, plus 32.
+    headerListSize(headers)
+        var total = 0
+
+        for [name, value] in headers
+            total = total + toBytes(name).length + toBytes(value).length + 32
+
+        total
+
+    // A body that is still arriving: what DATA frames are delivered to, and what a handler reads.
+    //
+    // **Module level rather than inside `speakH2`, and the reason is one shadowed name.** The session
+    // loop keeps its streams in a `pending` object, which is the very name the promise builtin goes by --
+    // so a `pending()` written in there is a call of that object and is refused as one. Nothing here
+    // reaches into the connection anyway: what a body needs is a place to put chunks and somebody to
+    // give them to.
+    //
+    // **The push half only.** `next` is written over `each` in `streamingRequest`, exactly as the
+    // 1.1 server writes it over its own -- a second reader reaching into this state would be a
+    // second thing to keep in step with it.
+    //
+    // **Chunks that arrive before the handler asks are HELD rather than dropped**, because a
+    // handler is an ordinary function and its first `await` is later than the frame that woke
+    // it. What is not held is a body nobody ever asks for: `each` is what starts the delivery,
+    // and a handler that never calls it leaves its chunks here until the stream closes.
+    liveBody()
+        var sink = null
+        var held = []
+        var total = 0
+        var finished = false
+        val ending = pending()
+
+        val live = {}
+
+        live.deliver = (chunk) ->
+            total = total + chunk.length
+
+            if sink == null then push(held, chunk) else sink(chunk)
+
+        // **The end is idempotent**, a stream ending and then closing being two events about one
+        // body -- and a reset arrives instead of an end rather than after it.
+        live.close = () ->
+            if finished then return
+
+            finished = true
+
+            settle(ending, total)
+
+        // `each` answers a promise for the number of bytes the body turned out to be, which is
+        // the one number an upload handler usually wants.
+        live.each = (f) ->
+            sink = f
+
+            for c in held
+                f(c)
+
+            held = []
+
+            ending
+
+        live
+
+    // A streamed request over HTTP/2: the head, and the one way of asking for the rest.
+    //
+    // **The frames are handed over as they land**, which needed `sh.sysl.nghttp2`'s deferred/resume
+    // path to exist -- until 0.3.0 the binding held a body whole and this delivered it in one chunk,
+    // so a handler written to write a gigabyte to disk as it arrived got the gigabyte first.
+    //
+    // **`next` is written OVER `each` rather than beside it**, which is what the 1.1 server does and
+    // for the same reason: the push half already knows about held chunks, the sink and the ending
+    // promise, and a second reader reaching into that state would be a second thing to keep in step
+    // with it. So this is an ordinary queue and one pending promise.
+    streamingRequest(req: object, live: object) -> object
+        var queue = []
+        var waiting = null
+        var started = false
+        var finished = false
+
+        // A chunk goes to whoever is already asking for one, and to the queue otherwise.
+        deliver(c)
+            if waiting == null
+                push(queue, c)
+
+                return
+
+            val asked = waiting
+
+            waiting = null
+
+            settle(asked, { done: false, value: c })
+
+        // **The end has to wake a waiting `next` as well as be remembered**, or a handler that asked
+        // for one more chunk than the body had waits for the rest of the run.
+        async endedAt(whole)
+            await whole
+
+            finished = true
+
+            if waiting != null
+                val asked = waiting
+
+                waiting = null
+
+                settle(asked, { done: true, value: null })
+
+        val out = req with { each: live.each }
+
+        out.next = () ->
+            // **`each` drains what was held synchronously**, so the queue is checked after starting
+            // rather than before: frames that arrived before the handler asked are in `queue` by the
+            // time this line runs.
+            if !started
+                started = true
+
+                endedAt(out.each(deliver))
+
+            if queue.length > 0 then return { done: false, value: shift(queue) }
+            if finished then return { done: true, value: null }
+
+            waiting = pending()
+
+            waiting
+
+        out
+
+    """
+#endif
