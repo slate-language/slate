@@ -5,9 +5,9 @@ binary, not the PGO one (about 20% slower than a release build, `bench/README.md
 is ONE run, not a best-of. slate runs on its interpreter only: `listen` refuses under `slate js`, so
 node stands for that host. Bun 1.4.3 negotiates HTTP/1.1 on a TLS port (no h2), so it has no h2 row.
 
-**Two things to read before the numbers.** slate's peak RSS is 2.6 GB on plain HTTP/1.1 against
-26-124 MB for the others, which says the collector's schedule or something the server retains is not
-keeping up with 40k req/s; it is a finding to chase, not part of the harness. And Bun's `/plain`
+**Two things to read before the numbers.** slate's peak RSS was 2.6 GB on plain HTTP/1.1 against
+26-124 MB for the others. It was a leak, not the schedule, and it is fixed: see *The RSS finding*
+at the end, and the `slate (fixed)` row in the RSS table. And Bun's `/plain`
 fixed-rate p99 of 76 ms is one stall in a single run, since `/json` beside it is 0.19 ms.
 
 Machine: Apple M5 Pro, 18 cores, macOS 26.6.2, 2026-10-16.
@@ -65,6 +65,27 @@ oha columns are req/s, then p50, p99 and p99.9 in ms; wrk columns are req/s, p50
 | server | plain HTTP/1.1 | HTTPS + h2 |
 |---|---:|---:|
 | slate | 2649 | 1945 |
+| slate (fixed) | 40 | 73 |
 | node | 124 | 267 |
 | bun | 39 | - |
 | go | 26 | 48 |
+
+### The RSS finding, and the re-run
+
+**The collected heap was never the problem.** Under one 8 s `oha` run on `/plain` (~32k req/s),
+`SLATE_PROFILE` put the heap high water at 2.1 MB, while RSS climbed in a straight line at about
+50 MB a second, reached 397 MB, and stayed there once the load stopped. `leaks` on the live server
+found 1.66 million leaked 64-byte blocks after 4 s. Every one of them was allocated in a finalizer:
+`finalize_object`, `finalize_array`, `finalize_bytes` and `finalize_promise`.
+
+**The cause:** each finalizer let go of an object's `Buf` or `Map` by assigning `buf()` or `map()`
+over it. A `Buf` is a reference, so `buf()` allocates a fresh core. The next `gc.alloc` to reuse the
+cell then zeroed that core away without releasing it, which lost one core per object swept, on
+every request. The fix is `release()`, which sysl provides for exactly this case (`collector.sysl`).
+`tests_finalize.sysl` measures it with malloc's own block count: 359,893 blocks left behind by a
+program that keeps nothing before the fix, and under 20,000 after.
+
+**Re-run, slate only, same settings, same machine, after the fix.** Peak RSS was **40 MB** on plain
+HTTP/1.1 and **73 MB** on HTTPS + h2. Under one 8 s `oha` run, RSS sat flat at 30 MB on h1 and at
+64 MB on h2. Throughput did not move: oha 36,199 / 37,098 / 36,799 req/s on `/plain`, `/json` and
+`/echo`, wrk 46,137 / 46,065; h2 oha 23,639 / 22,714, h2load 10,756 / 10,977.
