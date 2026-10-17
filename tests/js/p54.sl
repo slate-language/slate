@@ -114,11 +114,56 @@ async serverReadsLate()
 
     print("server reads late", up.ok, heard)
 
+// **A secured connection nobody reads keeps its backpressure.** Its server stops reading once the
+// handshake is over, so a client flooding it is held back by the kernel -- its `send` does not settle
+// -- rather than the server holding the whole flood in memory; and once the server reads, every byte
+// arrives in order and the send settles.
+async floodedUntilRead()
+    var conn = null
+    val server = listen({ port: 0, cert: theCert, key: theKey }, accepted ->
+        conn = accepted)
+    val c = (await connect("127.0.0.1", localPort(server))).value
+    val up = await startTls(c, { host: "localhost", trust: theCert })
+    val big = "0123456789abcdef".repeat(1048576)
+    var sent = false
+
+    val flood = async () ->
+        await send(c, big)
+        sent = true
+
+    flood()
+
+    // Far longer than sixteen megabytes takes to cross a loopback that is being read.
+    await sleep(500)
+
+    print("a flood nobody reads is held back", up.ok, conn != null, sent)
+
+    var parts = []
+    var got = 0
+
+    onData(conn, chunk ->
+        if chunk != null
+            parts.push(chunk)
+            got = got + chunk.length)
+
+    var turns = 0
+
+    while (!sent || got < big.length) && turns < 2000
+        await sleep(10)
+        turns = turns + 1
+
+    print("and delivered in order once read", sent, got == big.length, parts.join("") == big)
+
+    close(c)
+    close(conn)
+    close(server)
+
 async main()
     await exchange(false)
     await exchange(true)
     await heldUntilRead()
     await refusedWithNoReader()
     await serverReadsLate()
+    await floodedUntilRead()
 
 main()
