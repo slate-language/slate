@@ -64,7 +64,9 @@ way.
 
 ## What is not there yet
 
-**`slate:process`'s `run`, `slate:redis` and the client half of `slate:nghttp2`.** Each is a
+**`slate:redis` and the client half of `slate:nghttp2`.** (`slate:process`'s `run` is built on node,
+answering the interpreter's shape word for word; a browser has no processes and refuses naming the
+host, as `spawn` does.) Each is a
 name that says *"not in the JavaScript back end yet"* when a program reaches it, rather than a name
 that is not there — so a program is told which half of the world it is in. **No global is on that
 list any more**; `fetch` was the last and has its own section below.

@@ -44,7 +44,7 @@ js_runtime_process() -> string = raw"""
 
             try {
                 return { children: load("node:child_process"), sockets: load("node:net"),
-                         system: load("node:os") }
+                         system: load("node:os"), util: load("node:util") }
             } catch (e) {
                 return null
             }
@@ -294,14 +294,16 @@ js_runtime_process() -> string = raw"""
             if (cwd !== undefined && !$.isStr(cwd))
                 fault("`cwd` is a string, and this is " + typeName(cwd))
 
-            if (ipc !== undefined && typeof ipc !== "boolean")
+            // **`run` has no `ipc` and ignores the key**, as the interpreter does.
+            if (name !== "run" && ipc !== undefined && typeof ipc !== "boolean")
                 fault("`ipc` is true or false, and this is " + typeName(ipc))
 
             // **The environment REPLACES the child's rather than adding to it**, which is what `run`
-            // does in the interpreter and what libuv does underneath it.
+            // does in the interpreter and what libuv does underneath it. A `null` is refused, not
+            // read as absent: the interpreter's reading of the option says so.
             let given = null
 
-            if (env !== undefined && env !== null) {
+            if (env !== undefined) {
                 if (!(env instanceof $.SObj))
                     fault("`env` is an object of names and values, and this is " + typeName(env))
 
@@ -321,7 +323,145 @@ js_runtime_process() -> string = raw"""
                 }
             }
 
-            return { cwd: $.isStr(cwd) ? cwd : "", env: given, ipc: ipc === true }
+            return { cwd: $.isStr(cwd) ? cwd : "", env: given, ipc: name !== "run" && ipc === true }
+        }
+
+        // libuv's own words for a failed start (`ENOENT: no such file or directory`), which is what
+        // the interpreter's sentence carries; node's `spawn x ENOENT` names the same error in its own.
+        const startFailure = (e) => {
+            try {
+                const map = procHost.util.getSystemErrorMap()
+                const found = typeof e.errno === "number" ? map.get(e.errno) : undefined
+
+                if (found !== undefined) return found[0] + ": " + found[1]
+            } catch (ignored) {}
+
+            return e && e.message ? e.message : String(e)
+        }
+
+        // `run(command, args, options)` -- a promise of what the program did, and the interpreter's
+        // answer word for word: `{ ok: true, value: { status, signal, out, err } }` where there was a
+        // child and `{ ok: false, error }` where there was none or it was stopped or its output is
+        // not text. The same three things have to have happened before it settles -- the exit and
+        // both pipes' ends -- and node's `close` is exactly that.
+        B.run = (...args) => {
+            if (args.length < 1 || args.length > 3)
+                fault("`run` takes a command, its arguments and optionally some options, and was given " +
+                    args.length + (args.length === 1 ? " argument" : " arguments"))
+
+            const command = args[0]
+
+            if (!$.isStr(command)) fault("`run` takes a command, and this is " + typeName(command))
+
+            const given = args.length > 1 ? args[1] : []
+
+            if (!Array.isArray(given))
+                fault("`run` takes the arguments as an array, and this is " + typeName(given))
+
+            const argv = []
+
+            for (const a of given) {
+                if (!$.isStr(a))
+                    fault("`run` takes its arguments as strings, and one of them is " + typeName(a))
+
+                argv.push(a)
+            }
+
+            const opts = args.length > 2 ? args[2] : null
+            const options = childOptions(opts, "run")
+
+            // A duration or a number of milliseconds, and none or a negative one is no limit.
+            let limit = 0n
+
+            if (opts !== null && opts !== undefined) {
+                const t = opts.getKey("timeout")
+
+                if (t !== undefined) {
+                    if ($.isInt(t)) limit = BigInt(t)
+                    else if (t instanceof SDuration) limit = BigInt(t.us) / 1000n
+                    else fault("`timeout` is a duration or a number of milliseconds, and this is " + typeName(t))
+                }
+            }
+
+            if (procHost === null) noChildren("run")
+
+            const refused = (why) => $.obj([["ok", false], ["error", why]])
+
+            return new Promise((resolve) => {
+                const settings = { stdio: ["ignore", "pipe", "pipe"],
+                    env: options.env === null ? { ...process.env } : { ...options.env } }
+
+                if (options.cwd !== "") settings.cwd = options.cwd
+
+                let handle = null
+
+                try {
+                    handle = procHost.children.spawn(command, argv, settings)
+                } catch (e) {
+                    resolve(refused("cannot run `" + command + "`: " + startFailure(e)))
+                    return
+                }
+
+                const out = []
+                const err = []
+                let timedOut = false
+                let finished = false
+                let timer = null
+
+                const finish = (answer) => {
+                    if (finished) return
+
+                    finished = true
+                    if (timer !== null) clearTimeout(timer)
+                    resolve(answer)
+                }
+
+                handle.on("error", (e) => {
+                    if (handle.pid === undefined) finish(refused("cannot run `" + command + "`: " + startFailure(e)))
+                })
+
+                if (handle.stdout) handle.stdout.on("data", (c) => out.push(c))
+                if (handle.stderr) handle.stderr.on("data", (c) => err.push(c))
+
+                // **SIGKILL and not SIGTERM**, the interpreter's reason: a timeout is the caller no
+                // longer being willing to wait, and a signal the child may ignore leaves the promise
+                // pending. A child already gone answers `false` and there is nothing to stop.
+                if (limit > 0n && handle.pid !== undefined)
+                    timer = setTimeout(() => {
+                        timedOut = true
+                        try { handle.kill("SIGKILL") } catch (ignored) {}
+                    }, Number(limit))
+
+                handle.on("close", (code, signal) => {
+                    if (finished) return
+
+                    if (timedOut) return finish(refused("`" + command + "` took too long and was stopped"))
+
+                    let said = ""
+                    let complained = ""
+
+                    try {
+                        said = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(out))
+                    } catch (e) {
+                        return finish(refused("what `" + command + "` printed is not text"))
+                    }
+
+                    try {
+                        complained = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(err))
+                    } catch (e) {
+                        return finish(refused("what `" + command + "` printed on its error output is not text"))
+                    }
+
+                    // **A signal is `null` and not zero**, zero being a status a program can exit with.
+                    const number = signal === null || signal === undefined ? undefined :
+                        procHost.system.constants.signals[signal]
+
+                    finish($.obj([["ok", true], ["value", $.obj([
+                        ["status", $.i64(BigInt(code === null || code === undefined ? 0 : code))],
+                        ["signal", number === undefined ? null : $.i64(BigInt(number))],
+                        ["out", said], ["err", complained]])]]))
+                })
+            })
         }
 
         B.spawn = (...args) => {
