@@ -64,12 +64,16 @@ way.
 
 ## What is not there yet
 
-**`slate:redis` and the client half of `slate:nghttp2`.** (`slate:process`'s `run` is built on node,
+**The client half of `slate:nghttp2`.** (`slate:process`'s `run` is built on node,
 answering the interpreter's shape word for word; a browser has no processes and refuses naming the
-host, as `spawn` does.) Each is a
+host, as `spawn` does.) Each of its names is a
 name that says *"not in the JavaScript back end yet"* when a program reaches it, rather than a name
 that is not there — so a program is told which half of the world it is in. **No global is on that
 list any more**; `fetch` was the last and has its own section below.
+
+**`slate:redis` is here on node**, over `slate:net`'s socket and a RESP reader written out in the
+runtime to read exactly what hiredis reads: every reply type, pipelining, `onPush`, and the same
+sentence for every stream that stops being RESP. A browser refuses it, having no socket to put it on.
 
 **`slate:nghttp2`'s server half is here on node**, which is what lets `slate:http`'s `serve` answer
 HTTP/2 under `slate js` when `listen` was given a certificate, a key and `alpn: ["h2", "http/1.1"]`.
