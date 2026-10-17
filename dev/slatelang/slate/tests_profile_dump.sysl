@@ -1,0 +1,142 @@
+module dev.slatelang.slate
+@tests
+
+import sh.sysl.libuv
+
+// `SIGUSR1` under `SLATE_PROFILE`: a running program writes its profile and starts the next interval.
+//
+// **THE RESET IS WHAT THESE ASSERT, because it is the one thing only a dump does.** The report goes
+// to the process's stderr, which a test in this process cannot read; `profile_dump` is the report
+// followed by `profile_start`, so a builtin counted BEFORE the signal and absent after it is the
+// dump having happened, and one counted after it is the next interval beginning. The report's own
+// text is `A_PROFILE_REPORT_NAMES_THE_INSTRUCTIONS_AND_THE_BUILTINS_IT_COUNTED`'s, and
+// `scripts/profile-signal-check.sh` is the other half: it starts the real binary, sends the signal
+// and reads stderr.
+
+// A child that sends its parent -- the program under test -- a `SIGUSR1`, and the moment the loop is
+// given to deliver it, which is how the signal's arrival is ordered before what follows.
+private val Poke: string =
+    "async poke()\n" +
+    "    await spawn(\"/bin/sh\", [\"-c\", \"kill -USR1 $PPID\"]).value.exited\n" +
+    "    await sleep(60)\n"
+
+// Run `text` under the profiler with a guard on `SIGUSR1`, so a build that misses the signal fails
+// the test instead of ending the runner with the signal's default.
+private dumped(text: string) -> string
+    val guard = libuv.signal().expect("a guard watcher")
+
+    guard.start(libuv.SIGUSR1, (n: i32) -> ()).expect("the guard watches")
+    guard.unref()
+
+    profile_start()
+
+    val said = out("import { spawn, onSignal, offSignal } from slate:process\n" + Poke + text)
+
+    profile_stop()
+    guard.close(() -> ())
+    libuv.default_loop().run(libuv.RUN_NOWAIT).expect("the close finishes")
+
+    said
+end dumped
+
+@test
+SIGUSR1_DUMPS_THE_PROFILE_OF_A_RUNNING_PROGRAM_AND_STARTS_THE_NEXT_INTERVAL()
+    val said = dumped(
+        "async main()\n" +
+        "    var a = 0\n    while a < 40\n        floor(1.5)\n        a = a + 1\n" +
+        "    await poke()\n" +
+        "    var b = 0\n    while b < 30\n        abs(-1)\n        b = b + 1\n" +
+        "    print(\"done\")\n" +
+        "main()\n")
+
+    assert_eq(said, "done")
+    assert_eq(profile_call_count("floor"), 0u64, "the interval before the signal was dumped and reset")
+    assert_eq(profile_call_count("abs"), 30u64, "and the interval after it is what is counted now")
+end SIGUSR1_DUMPS_THE_PROFILE_OF_A_RUNNING_PROGRAM_AND_STARTS_THE_NEXT_INTERVAL
+
+@test
+A_SECOND_SIGUSR1_DUMPS_A_SECOND_INTERVAL()
+    val said = dumped(
+        "async main()\n" +
+        "    var a = 0\n    while a < 40\n        floor(1.5)\n        a = a + 1\n" +
+        "    await poke()\n" +
+        "    var b = 0\n    while b < 30\n        abs(-1)\n        b = b + 1\n" +
+        "    await poke()\n" +
+        "    var c = 0\n    while c < 20\n        min(1, 2)\n        c = c + 1\n" +
+        "    print(\"done\")\n" +
+        "main()\n")
+
+    assert_eq(said, "done")
+    assert_eq(profile_call_count("floor"), 0u64)
+    assert_eq(profile_call_count("abs"), 0u64, "the second dump took the middle interval")
+    assert_eq(profile_call_count("min"), 20u64)
+end A_SECOND_SIGUSR1_DUMPS_A_SECOND_INTERVAL
+
+@test
+WITHOUT_A_SIGNAL_THE_INTERVALS_ACCUMULATE()
+    // The control: the same two loops with no signal between them are one interval, so the counts
+    // above are the dump's doing and not a property of the program.
+    val said = dumped(
+        "async main()\n" +
+        "    var a = 0\n    while a < 40\n        floor(1.5)\n        a = a + 1\n" +
+        "    await sleep(60)\n" +
+        "    var b = 0\n    while b < 30\n        abs(-1)\n        b = b + 1\n" +
+        "    print(\"done\")\n" +
+        "main()\n")
+
+    assert_eq(said, "done")
+    assert_eq(profile_call_count("floor"), 40u64)
+    assert_eq(profile_call_count("abs"), 30u64)
+end WITHOUT_A_SIGNAL_THE_INTERVALS_ACCUMULATE
+
+@test
+A_PROGRAMS_OWN_SIGUSR1_HANDLER_TAKES_THE_SIGNAL_AND_THE_PROFILE_IS_NOT_DUMPED()
+    val said = dumped(
+        "async main()\n" +
+        "    onSignal(\"SIGUSR1\", () -> print(\"mine\"))\n" +
+        "    var a = 0\n    while a < 40\n        floor(1.5)\n        a = a + 1\n" +
+        "    await poke()\n" +
+        "    print(\"done\")\n" +
+        "main()\n")
+
+    assert_eq(said, "mine\ndone")
+    assert_eq(profile_call_count("floor"), 40u64, "the program's handler answered, so nothing was reset")
+end A_PROGRAMS_OWN_SIGUSR1_HANDLER_TAKES_THE_SIGNAL_AND_THE_PROFILE_IS_NOT_DUMPED
+
+@test
+STOPPING_THE_PROGRAMS_OWN_SIGUSR1_HANDLER_GIVES_THE_SIGNAL_BACK_TO_THE_DUMP()
+    // The error path of the arrangement: the last handler leaving must not leave the signal at
+    // libuv's default, which ends the process.
+    val said = dumped(
+        "async main()\n" +
+        "    offSignal(onSignal(\"SIGUSR1\", () -> print(\"mine\")))\n" +
+        "    var a = 0\n    while a < 40\n        floor(1.5)\n        a = a + 1\n" +
+        "    await poke()\n" +
+        "    var b = 0\n    while b < 30\n        abs(-1)\n        b = b + 1\n" +
+        "    print(\"done\")\n" +
+        "main()\n")
+
+    assert_eq(said, "done")
+    assert_eq(profile_call_count("floor"), 0u64)
+    assert_eq(profile_call_count("abs"), 30u64)
+end STOPPING_THE_PROGRAMS_OWN_SIGUSR1_HANDLER_GIVES_THE_SIGNAL_BACK_TO_THE_DUMP
+
+@test
+A_REPORT_TAKEN_AFTER_A_DUMP_COUNTS_COLLECTIONS_FROM_THE_DUMP()
+    // The report's two running totals are read against what they were when the interval began, or
+    // the second dump of a server would repeat the first's collector figures.
+    profile_start()
+    out("print(1)")
+
+    val first = profile_report()
+
+    profile_start()
+
+    val second = profile_report()
+
+    profile_stop()
+
+    assert(first.contains("collections"), first)
+    assert(second.contains("collections      0\n"), second)
+    assert(second.contains("allocator steps  0\n"), second)
+end A_REPORT_TAKEN_AFTER_A_DUMP_COUNTS_COLLECTIONS_FROM_THE_DUMP
