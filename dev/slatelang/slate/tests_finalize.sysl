@@ -1,0 +1,53 @@
+module dev.slatelang.slate
+@tests
+
+// What a sweep gives back to `malloc`, measured by asking `malloc`.
+//
+// **A finalizer that writes an empty `Buf` or `Map` into a dying cell leaks one core per object**,
+// because `buf()` and `map()` allocate and the next `gc.alloc` to reuse the cell zeroes it over the
+// fresh core without releasing it (`collector.sysl` says so above `finalize_array`). Nothing inside
+// the collected heap can see that -- `live_size`, `payload` and `high_water` all read as healthy --
+// so the witness here is the allocator's own count of blocks in use, read on either side of a
+// program that makes and drops a great many values of every kind a finalizer serves.
+//
+// Found by the server benchmark: a plain HTTP/1.1 server climbed 50 MB a second under load while
+// its collected heap stayed at two megabytes.
+
+// `malloc_statistics_t` is `{ unsigned blocks_in_use; size_t size_in_use; size_t max_size_in_use;
+// size_t size_allocated; }` -- four words once the first is padded -- and a null zone sums them all.
+extern malloc_zone_statistics(zone: *u8, stats: *u8)
+
+private blocks_in_use() -> usize
+    var stats: [4]usize = [0, 0, 0, 0]
+
+    malloc_zone_statistics(null, ptr_cast(&stats))
+    stats[0] & 0xffffffff
+end blocks_in_use
+
+// Every kind whose finalizer gives a counted member back: an array, an object (its index), a byte
+// buffer, a closure (its parameter names), a promise (its waiters) and a scope a closure captured.
+private const Churn: string = "f(i) = () -> i\nasync g(i) = i\nvar n = 0\nfor i in 0..<40000\n    val a = [i, i]\n    val o = { a: i, b: i }\n    val b = toBytes(\"xy\")\n    val c = f(i)\n    val p = g(i)\n    n += a.length + b.length + o.a - i + c() - i\nprint(n)\n"
+
+@test
+A_SWEPT_CELL_GIVES_EVERY_BLOCK_IT_OWNED_BACK_TO_MALLOC()
+    // The first run takes whatever a first run takes once -- interned names, the loop, the heap's
+    // own tables -- so the measured run is the second.
+    assert_eq(out(Churn), "160000", "the program ran")
+
+    val before = blocks_in_use()
+
+    assert_eq(out(Churn), "160000", "and ran again")
+
+    val after = blocks_in_use()
+
+    // **The control: the program made the collector reuse cells**, which is the only path on which
+    // a lost core can happen. A run with no collection would pass the bound below for nothing.
+    // `run` rebuilds the heap on the way in, so the count is this run's alone.
+    assert(current().collections > 10, s"the run collected ${current().collections} times")
+
+    // Two hundred thousand objects went through the sweep; with a core lost per object the count
+    // grows by about that many. What is left is the run's own bookkeeping.
+    val grew = if after > before then after - before else 0
+
+    assert(grew < 20000, s"malloc holds ${grew} more blocks after a run that kept nothing")
+end A_SWEPT_CELL_GIVES_EVERY_BLOCK_IT_OWNED_BACK_TO_MALLOC

@@ -64,10 +64,19 @@ way.
 
 ## What is not there yet
 
-**`slate:process`'s `run`, `slate:redis` and `slate:nghttp2`.** Each is a
+**`slate:process`'s `run`, `slate:redis` and the client half of `slate:nghttp2`.** Each is a
 name that says *"not in the JavaScript back end yet"* when a program reaches it, rather than a name
 that is not there — so a program is told which half of the world it is in. **No global is on that
 list any more**; `fetch` was the last and has its own section below.
+
+**`slate:nghttp2`'s server half is here on node**, which is what lets `slate:http`'s `serve` answer
+HTTP/2 under `slate js` when `listen` was given a certificate, a key and `alpn: ["h2", "http/1.1"]`.
+`h2Server`, `h2Receive`, `h2Send`, `h2Next`, `h2Respond`, `h2RespondStream`, `h2Push`, `h2Finish`,
+`h2Goaway`, `h2Consume` and `h2Close` behave as they do in the interpreter. **The session is written
+out in the runtime rather than being node's `http2`**, because `slate:http`'s speaker hands a session
+bytes and reads what they said at once, and node's HTTP/2 only answers later. `h2Client`, `h2Request`,
+`h2RequestStream`, `h2Settings`, `h2Reset`, `h2WindowUpdate`, `h2Ping`, `h2Wants` and the `hpack*`
+calls are still on the list. In a browser `listen` refuses, so nothing there reaches a session.
 
 **`slate:net` and `slate:llhttp` came OFF that list in 0.0.31**, and they are what everything above
 a socket stands on — see the section below. **`startTls` is here at both ends, over node's `tls`**,

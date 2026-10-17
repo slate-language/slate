@@ -1,0 +1,109 @@
+module dev.slatelang.slate
+@tests
+
+// **THE WHOLE FILE IS BEHIND THE `http2` FEATURE**, which is `tests_http2.sysl`'s rule and its reason.
+#if feature_http2
+
+import sysl.fs.{remove_file, write_text}
+import sysl.process.capture
+
+// HTTP/2 served by a slate program that has been compiled to JavaScript and is running under node.
+//
+// **The interpreter's half is `tests_http2.sysl`, and this is the same server on the other host.**
+// What answers here is `js_rt_h2.sysl`'s session rather than nghttp2, so the client has to be
+// somebody else's: `tests/tls/h2_probe.js` is node's own `http2` module, which is as independent of
+// both back ends as a client can be. It starts the server this file compiles, makes its requests and
+// prints one line per fact.
+
+private val ServerSource: string = raw"""
+import { serve } from slate:http
+import { localPort } from slate:net
+import { readFileSync } from slate:fs
+
+val big = "y".repeat(1000000)
+
+async handler(req)
+    if req.path == "/slow"
+        await sleep(100)
+
+        { status: 200, body: "slow done" }
+    elif req.path == "/big"
+        { status: 200, headers: { "Content-Type": "text/plain" }, body: big }
+    elif req.path == "/echo"
+        { status: 200, headers: { "X-Seen": req.headers["x-custom"] ?? "none" }, body: req.body }
+    else
+        { status: 200, body: "hello" }
+
+val server = serve({ port: 0, cert: readFileSync("tests/tls/cert.pem").value, key: readFileSync("tests/tls/key.pem").value, alpn: ["h2", "http/1.1"] }, handler)
+
+print("listening " + string(localPort(server)))
+"""
+
+// What node's `http2` client saw of the server above.
+private h2_probe_said() -> string
+    val src = probe_path("js-h2-server")
+    val out_js = src + ".js"
+
+    write_text(src, ServerSource).unwrap()
+
+    if cli_status(["slate", "js", src, "-o", out_js]) != 0
+        remove_file(src)
+
+        return "the server would not compile"
+
+    val ran = capture("node", ["tests/tls/h2_probe.js", out_js], "", [], true, 120000)
+
+    remove_file(src)
+    remove_file(out_js)
+
+    ran match
+        Err(e) -> s"node could not be started: ${e}"
+        Ok(o) -> if o.status.ok() then o.text.trim() else o.err.unwrap_or("").trim()
+end h2_probe_said
+
+@test
+JS_H2_A_SLATE_SERVER_UNDER_NODE_ANSWERS_HTTP_2_NEGOTIATED_BY_ALPN()
+    // **Each line is a different part of the session.** `get` is the head and a whole body; `upload`
+    // is DATA frames arriving past the initial window, so it only completes if credit is given back,
+    // and a header outside ASCII; `download` is the other direction, a megabyte through a window
+    // that is a sixteenth of it; `concurrent` is forty streams interleaved on one connection; and
+    // the last four are what the server does about a stream abandoned mid-answer and about a peer
+    // that speaks nonsense, which is to stop talking to that peer and go on serving the others.
+    val said = h2_probe_said()
+
+    assert_eq(said, "alpn h2\n" +
+        "get 200 hello\n" +
+        "upload 200 300000 héllo wörld\n" +
+        "download 200 1000000\n" +
+        "concurrent true\n" +
+        "slow slow done\n" +
+        "after cancel hello\n" +
+        "garbage closed\n" +
+        "after garbage hello")
+
+// The half of `slate:nghttp2` that was not written out still says so, in the words every name that
+// is owed uses -- rather than being a JavaScript sentence about a name that is not defined.
+@test
+JS_H2_THE_CLIENT_HALF_OF_nghttp2_IS_STILL_OWED_UNDER_NODE()
+    val said = node_said(
+        "import { h2Client } from slate:nghttp2\n" +
+        "print(h2Client() catch e -> e.message)\n")
+
+    assert(said.contains("`h2Client` is not in the JavaScript back end yet"))
+
+// A session handed bytes that are not HTTP/2 answers `{ error }` rather than faulting, as the
+// interpreter's does, and a closed session is refused by name.
+@test
+JS_H2_A_SESSION_UNDER_NODE_ANSWERS_NONSENSE_WITH_AN_ERROR_AND_REFUSES_A_CLOSED_ONE()
+    val said = node_said(
+        "import { h2Server, h2Receive, h2Send, h2Next, h2Close } from slate:nghttp2\n" +
+        "val s = h2Server()\n" +
+        "print(h2Send(s).length)\n" +
+        "print(h2Next(s))\n" +
+        "print(h2Receive(s, toBytes(\"GET / HTTP/1.1\\r\\n\\r\\n\")).error != \"\")\n" +
+        "h2Close(s)\n" +
+        "print(h2Send(s) catch e -> e.message)\n")
+
+    assert_eq(said, "9\nnull\ntrue\n`h2Send` was given a session that is closed or was never opened")
+
+#endif
