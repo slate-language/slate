@@ -28,7 +28,7 @@ http2_source() -> string = raw"""
     // **There is no keep-alive question and no pipelining question.** A connection carries many
     // streams at once and each is answered on its own, so the ordering machinery the 1.1 speaker
     // needs -- `busy`, the parser's queue, the `Connection` header -- has nothing to do here.
-    speakH2(conn, called, streaming: boolean, first, slot)
+    speakH2(conn, called, streaming: boolean, first, slot, headMillis)
         // **`autoWindowUpdate: false` is not an option, it is the only working setting.** nghttp2
         // answers `INVALID_STATE` to `h2Consume` without it, and `h2Consume` is the call that returns
         // flow-control credit once the work is done rather than when the bytes land.
@@ -46,12 +46,19 @@ http2_source() -> string = raw"""
         // Whether the server has been closed and this connection is finishing what it was doing.
         var closing = false
 
+        // How many streams handed their cut over after the server was closed and have not yet
+        // ended, which `watched` counts and `lateEnded` counts down.
+        var lateCuts = 0
+
         // How many answers are being worked out or written. **A stream still receiving its body is
         // counted by `pending` instead**, so the two together are what this connection has in flight.
         var working = 0
 
         // The clock that closes a connection nobody is using, or null while it is not running.
         var idle = null
+
+        // The deadline on a request's header block, or null while none is running.
+        var headClock = null
 
         // How to cut each streamed response being written, keyed by its stream number as text. **A
         // TABLE where the 1.1 connection has one**, a connection here carrying many streams at once
@@ -103,9 +110,28 @@ http2_source() -> string = raw"""
             shut = true
 
             awake()
+            headDone()
             h2Close(session)
             slot.retire()
             shutSocket(conn)
+
+        // Stop the head's deadline, a request's header block having arrived whole.
+        headDone()
+            if headClock != null
+                clearTimeout(headClock)
+
+                headClock = null
+
+        // The head's deadline expired with no header block finished. **There is no stream to
+        // answer `408` on**, nghttp2 not having opened one for a block it has not finished, so the
+        // peer is told with a GOAWAY and the connection ends.
+        headLate()
+            headClock = null
+
+            if shut || parting then return
+
+            h2Goaway(session, 0)
+            goodbye()
 
         // Stop the clock, a connection with something to do not being idle by definition.
         awake()
@@ -184,10 +210,32 @@ http2_source() -> string = raw"""
             else
                 stop()
 
+        // The ending handed to a cut taken late: the session goes when the last of them has ended.
+        lateEnded()
+            lateCuts = lateCuts - 1
+
+            if lateCuts <= 0 then stop()
+
         // What the writer calls to hand a stream's cut over, and to take it back when the response
         // has ended. **A named function because an assignment is not an expression.**
+        //
+        // **A cut handed over after the server was closed is taken at once**, the 1.1 connection's
+        // rule: `finish` arriving while a handler is still running finds no cutter to call, marks
+        // the session closing and starts the clock, and a cutter filed after that was never called
+        // -- the source untold and the session held for `IdleMillis`. **Its ending stops the
+        // session once every late cut has ended**, as `finish`'s countdown does: a writer whose
+        // deadline fired is still parked in a source that is never going to answer, so it never
+        // returns to `served` and `settled` would never be asked. `cutters` is always empty once
+        // `closing` is set, `finish` having taken them all, so the late ones are counted apart.
         watched(stream: integer, f)
             val key = string(stream)
+
+            if f != null && closing
+                lateCuts = lateCuts + 1
+
+                f(lateEnded)
+
+                return
 
             if f == null then cutters = forgotten(cutters, key)
             else cutters[key] = f
@@ -526,6 +574,8 @@ http2_source() -> string = raw"""
                 if e == null then break
 
                 if e.kind == "headers" && e.of == "request"
+                    headDone()
+
                     // **A SERVER THAT HAS BEEN CLOSED SERVES NO NEW REQUEST.** The connection is
                     // finishing what it had in flight and will close after it, so a stream opened now
                     // would be answered on a connection about to go -- which is what "no keep-alive
@@ -636,6 +686,15 @@ http2_source() -> string = raw"""
                 return
 
             awake()
+
+            // **Bytes arriving with nothing in flight are a request's head beginning**, or nothing
+            // at all -- a ping, a window update -- and either way a request has `headMillis` to
+            // finish its HEADERS from here. A header block dribbled one CONTINUATION byte at a time
+            // resets the idle clock with every byte and never completes, which held a connection
+            // for ever. nghttp2 reports a header block only once it is whole, so the deadline is
+            // the connection's rather than a stream's, exactly as the 1.1 speaker's is.
+            if headClock == null && working == 0 && keys(pending).length == 0
+                headClock = setTimeout(headLate, headMillis)
 
             // **Bytes the peer got wrong are an ANSWER and not a fault**, which is `slate:nghttp2`'s
             // rule: a peer that speaks nonsense is a condition a server handles, and the handling is
