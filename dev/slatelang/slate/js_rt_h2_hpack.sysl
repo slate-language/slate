@@ -3,7 +3,7 @@ module dev.slatelang.slate
 #if feature_http2
 
 // HPACK for `js_rt_h2.sysl`'s HTTP/2 session: the static table, the Huffman code, the peer's header
-// table, and the encoder that indexes nothing.
+// table, and nghttp2's own indexing encoder, which both ends of a session write with.
 //
 // **Cut from that file at the line where the header compression ends and the framing begins.** It
 // opens the `h2` scope the session's file closes, so `js_runtime` puts this block directly in front
@@ -33,16 +33,6 @@ js_runtime_h2_hpack() -> string = raw"""
                 ["set-cookie", ""], ["strict-transport-security", ""], ["transfer-encoding", ""],
                 ["user-agent", ""], ["vary", ""], ["via", ""], ["www-authenticate", ""]
             ]
-
-            // The static entries by what a field says: the index of a name and value together, and of
-            // a name alone (the first entry that has it).
-            const staticFull = new Map()
-            const staticName = new Map()
-
-            STATIC.forEach((e, i) => {
-                if (e[1] !== "") staticFull.set(e[0] + "\u0000" + e[1], i + 1)
-                if (!staticName.has(e[0])) staticName.set(e[0], i + 1)
-            })
 
             // RFC 7541 Appendix B: the code of each byte and how many bits it is. The end-of-string
             // symbol is not here, so a stream that spells it falls off the tree and is refused.
@@ -348,45 +338,7 @@ js_runtime_h2_hpack() -> string = raw"""
                 out.push(value)
             }
 
-            // A header block, with nothing indexed.
-            const encodeFields = (fields) => {
-                const out = []
-
-                for (const [name, value, sensitive] of fields) {
-                    const whole = staticFull.get(name + "\u0000" + value)
-
-                    if (whole !== undefined && !sensitive) {
-                        putInt(out, 0x80, 7, whole)
-
-                        continue
-                    }
-
-                    const flags = sensitive ? 0x10 : 0x00
-                    const named = staticName.get(name)
-
-                    if (named !== undefined) {
-                        putInt(out, flags, 4, named)
-                    } else {
-                        out.push(flags)
-
-                        const bytes = Buffer.from(name, "utf8")
-
-                        putInt(out, 0, 7, bytes.length)
-
-                        for (const byte of bytes) out.push(byte)
-                    }
-
-                    const bytes = Buffer.from(value, "utf8")
-
-                    putInt(out, 0, 7, bytes.length)
-
-                    for (const byte of bytes) out.push(byte)
-                }
-
-                return Buffer.from(out)
-            }
-
-            // -- the encoder a client and `hpackDeflate` use, which is nghttp2's -----------------------
+            // -- the encoder a session and `hpackDeflate` use, which is nghttp2's ----------------------
 
             // A string as Huffman, the codes written most significant bit first and the last byte
             // padded with ones, which is the start of the end-of-string code.
@@ -463,7 +415,19 @@ js_runtime_h2_hpack() -> string = raw"""
                     this.table = []
                     this.size = 0
                     this.max = Math.min(limit, 4096)
+                    this.least = this.max
                     this.notify = limit < 4096
+                }
+
+                // The peer's SETTINGS_HEADER_TABLE_SIZE: the table shrinks to it (never past the 4096
+                // nghttp2 asks for), and the next block opens by announcing the smallest size passed
+                // through and then the one settled on.
+                change(limit) {
+                    this.max = Math.min(limit, 4096)
+                    this.least = Math.min(this.least, this.max)
+                    this.notify = true
+
+                    while (this.size > this.max && this.table.length > 0) this.size -= this.table.pop()[2]
                 }
 
                 // The newest entry naming `name` -- with `value` too where `exact` -- as its index.
@@ -495,7 +459,11 @@ js_runtime_h2_hpack() -> string = raw"""
 
                     if (this.notify) {
                         this.notify = false
+
+                        if (this.least < this.max) putInt(out, 0x20, 5, this.least)
+
                         putInt(out, 0x20, 5, this.max)
+                        this.least = this.max
                     }
 
                     for (const [name, value, sensitive] of fields) {

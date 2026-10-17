@@ -74,37 +74,46 @@ js_runtime_h2_write() -> string = raw"""
 
                 // A header block this side sends, as `headFrames` takes it.
                 block(fields) {
-                    return encodeFields(fields)
+                    return () => this.enc.deflate(fields)
                 }
 
-                open(stream, name) {
+                // A response, which nghttp2 accepts for a stream it no longer holds -- one that has
+                // closed, been reset, or was never opened -- and silently sends nothing for. Stream
+                // zero is the one number it refuses.
+                respond(stream, fields, body, whole, bare) {
+                    if (stream === 0)
+                        fault("`" + (whole ? "h2Respond" : "h2RespondStream") + "` could not be sent: submitting a response: Invalid argument")
+
                     const s = this.streams.get(stream)
 
-                    if (s === undefined || s.closed) fault("`" + name + "` was given stream " + stream + ", which is not open")
+                    if (s === undefined || s.closed) return
 
-                    return s
-                }
+                    // A stream whose RST_STREAM is waiting to go takes the answer and writes none of it,
+                    // but remembers that it was given, which is what a later `h2Push` is told.
+                    if (s.resetting) {
+                        s.headSent = true
 
-                respond(stream, fields, body, whole) {
-                    const s = this.open(stream, whole ? "h2Respond" : "h2RespondStream")
+                        if (whole) s.finishing = true
+
+                        return
+                    }
 
                     if (s.headSent) fault("stream " + stream + " has already been answered")
 
                     s.headSent = true
 
-                    const ends = whole && body.length === 0
-
-                    this.headFrames(stream, encodeFields(fields), ends, REGULAR)
-
-                    if (ends) {
+                    // A response given NO body is a head that ends the stream. One given an empty body
+                    // is a head and then an empty DATA frame, as nghttp2's is.
+                    this.headFrames(stream, this.block(fields), bare, REGULAR, bare ? () => {
                         s.sentEnded = true
                         this.settle(s)
+                    } : undefined)
 
-                        return
-                    }
+                    if (bare) return
 
                     if (whole) {
-                        s.queue.push(body)
+                        if (body.length > 0) s.queue.push(body)
+
                         s.finishing = true
                         this.pending.add(s)
                     }
@@ -114,6 +123,7 @@ js_runtime_h2_write() -> string = raw"""
                 push(stream, piece) {
                     const s = this.streams.get(stream)
 
+                    if (s !== undefined && s.resetting && s.headSent && !s.finishing) return null
                     if (s === undefined || s.closed || !s.headSent) return "there is no body open on stream " + stream
                     if (s.finishing) return "the body on stream " + stream + " has been finished, so there is nothing to add to"
 
@@ -127,6 +137,12 @@ js_runtime_h2_write() -> string = raw"""
 
                 finish(stream, trailers) {
                     const s = this.streams.get(stream)
+
+                    if (s !== undefined && s.resetting && s.headSent) {
+                        s.finishing = true
+
+                        return null
+                    }
 
                     if (s === undefined || s.closed || !s.headSent) return "there is no body open on stream " + stream
                     if (s.finishing) return null
@@ -142,18 +158,33 @@ js_runtime_h2_write() -> string = raw"""
                 // reset too**, which is what a header-read deadline asks for: the rest of its block is
                 // still decoded when it comes, keeping the compression table in step, and then
                 // dropped.
+                //
+                // **The stream closes once its RST_STREAM has gone out**, which is nghttp2's timing: the
+                // program is told `streamClose` by the `send` that writes it, and anything still queued
+                // for the stream is dropped. A second reset, or a response, on a stream already being
+                // reset says nothing.
                 reset(stream, code) {
+                    const rst = () => frame(RST_STREAM, 0, stream, u32(code))
+
                     if (this.continuing !== null && this.continuing.stream === stream) {
-                        this.put(REGULAR, frame(RST_STREAM, 0, stream, u32(code)))
+                        if (this.continuing.resetting) return
+
+                        this.continuing.resetting = true
                         this.continuing.dropped = true
-                        this.events.push({ kind: "streamClose", stream: stream, code: code })
+                        this.put(REGULAR, rst(), () => this.events.push({ kind: "streamClose", stream: stream, code: code }))
 
                         return
                     }
 
                     const s = this.streams.get(stream)
 
-                    if (s !== undefined && !s.closed) this.resetStream(stream, code)
+                    if (s === undefined || s.closed || s.resetting) return
+
+                    s.resetting = true
+                    s.queue = []
+                    this.pending.delete(s)
+                    this.out = this.out.filter((f) => f.stream !== stream)
+                    this.put(REGULAR, rst(), () => this.drop(s, code))
                 }
 
                 // The program's own GOAWAY. Not queued once a connection error has queued one.

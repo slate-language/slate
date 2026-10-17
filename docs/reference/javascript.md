@@ -83,13 +83,13 @@ out in the runtime rather than being node's `http2`**, because a program hands a
 reads what they said at once, and node's HTTP/2 only answers later. In a browser `listen` refuses
 and there are no sockets, so nothing there reaches a session; `hpack*` needs neither and works.
 
-**A client writes the bytes the interpreter's writes.** Its header blocks come from nghttp2's own
-encoder decisions — what is indexed, what is never indexed (`authorization`, a short `cookie`, a
-field marked so), Huffman only where it is shorter — so `hpackDeflate` answers the same bytes on
-both hosts, and frames go out in nghttp2's order: SETTINGS and PING first, then frames about open
-streams, then new requests, then DATA. **The server's encoder is the one difference left**: it
-never indexes, so a response's header block is a few bytes longer than nghttp2's and decodes to the
-same fields.
+**A session writes the bytes the interpreter's writes.** Its header blocks, a server's responses
+as much as a client's requests, come from nghttp2's own encoder decisions — what is indexed, what is
+never indexed (`authorization`, a short `cookie`, a field marked so), Huffman only where it is
+shorter — so `hpackDeflate` answers the same bytes on both hosts, and frames go out in nghttp2's
+order: SETTINGS and PING first, then frames about open streams, then new requests, then DATA. A
+stream closes, and `h2Next` says `streamClose`, when the `h2Send` that writes its last frame
+returns, as it does there.
 
 The session holds a peer to nghttp2's limits — both flow-control windows, at most 100 streams open
 at once, a 64 KiB header list, eight CONTINUATION frames to a header block, and nghttp2's
