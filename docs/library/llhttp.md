@@ -11,7 +11,14 @@ The HTTP parser itself — the state machine under [`slate:http`](http.md).
 import { httpParser, httpFeed, httpTake } from slate:llhttp
 ```
 
-`httpParser  httpStream  httpFeed  httpTake  httpTakePart  httpFinish  httpClose  httpUpgraded`
+`httpParser  httpStream  httpFeed  httpTake  httpTakePart  httpFinish  httpClose  httpUpgraded  httpHeading`
+
+**`httpHeading(p)` says whether a request's head is part way through arriving** — true from its first
+byte until the blank line that ends it, again for a pipelined request's next head, and false before,
+after, and once the parser has refused something. It is what a header-read deadline is built on: a
+deadline on the whole request cannot tell a client dribbling its headers from one sending a large body
+slowly. It asks a parser made by `httpParser`; a streaming parser hands its head over as a part, and
+asking one is refused.
 
 **This is the lowest module slate has, and it is public on purpose.** `slate:http` is the server a program
 wants; this is for the programs that want something else — a proxy, a client that keeps its connections, a

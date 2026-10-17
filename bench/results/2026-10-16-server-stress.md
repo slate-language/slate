@@ -17,6 +17,11 @@ process per group, so a mode's "rss before" is the previous mode's "after".
    `GET / HTTP/1.1\r\nHost: x\r\nX-A: `, then one byte per second; never closed (sent nothing more:
    closed at 5000 ms). node and Go also failed at a 20 s wait (node's `headersTimeout` is 60 s; Go's
    `net/http` has none by default), so the reference servers are no better here.
+   **FIXED on `headdeadline`**: `serve` now gives a head `headMillis` (10 s) from its first byte and
+   the whole request `requestMillis` (5 min), answering `408`. Re-taken with
+   `bench/stress/run.sh --only slate --mode slowloris ./slate`: **PASS**, `opened=1000 served=10/10
+   cutOff=1000/1000 hasHeaderTimeout=true`, RSS 11 -> 133 MB, fds 13 -> 1014 -> 13. The slowloris
+   rows in the tables below are the run before the fix.
 2. **soak: RSS still climbs under steady load.** A separate 90 s soak on a fresh slate server read
    `ok=4500/4500`, with mean RSS 16 -> 24 MB from the first quarter to the last (before the
    finalizer fix it was 16 -> 34 MB). fds were bounded: peak 63, back to 13. node and Go plateaued.
