@@ -134,6 +134,7 @@ event has a `kind`, and the rest of its fields depend on it:
 
 | `kind` | |
 |---|---|
+| `beginHeaders` | `stream`, and the `of` its `headers` will carry — a header block has begun and its fields have not arrived |
 | `headers` | `stream`, `headers`, and `of` — `"request"`, `"response"` or `"trailer"` |
 | `data` | `stream`, `bytes` — **one event per DATA frame**, not one per stream |
 | `streamEnd` | `stream` — the peer will send no more, and may still be reading |
@@ -148,6 +149,13 @@ event has a `kind`, and the rest of its fields depend on it:
 back from inside `receive`, which is a place your code has no business running — it cannot submit
 frames there without reentering the library, and a closure it registered would have to be kept alive
 by the session. What you write instead is a loop.
+
+**`beginHeaders` is for header-read deadlines.** It comes at the HEADERS frame that opens a block —
+trailers included, a PUSH_PROMISE not — and is always followed by that stream's `headers`, a reset of
+the stream, or the end of the session. A server starts a clock there and stops it at the `headers`, so
+a peer dribbling one block's CONTINUATION frames costs that stream (an `h2Reset`) rather than the
+connection; `slate:http` does exactly that with its `headMillis`. A request refused before it is read
+— past the hundred streams a session allows at once — gets no `beginHeaders`.
 
 ## Headers
 

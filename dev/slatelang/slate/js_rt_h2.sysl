@@ -14,8 +14,8 @@ module dev.slatelang.slate
 // ## What is here, and what is not
 //
 // **The server's half, which is what `serve` needs**: `h2Server`, `h2Receive`, `h2Send`, `h2Next`,
-// `h2Respond`, `h2RespondStream`, `h2Push`, `h2Finish`, `h2Goaway`, `h2Consume` and `h2Close`. The
-// client's half, `h2Settings`, `h2Reset`, `h2WindowUpdate`, `h2Ping`, `h2Wants` and the stand-alone
+// `h2Respond`, `h2RespondStream`, `h2Push`, `h2Finish`, `h2Goaway`, `h2Reset`, `h2Consume` and
+// `h2Close`. The client's half, `h2Settings`, `h2WindowUpdate`, `h2Ping`, `h2Wants` and the stand-alone
 // HPACK calls stay on the `OWED` list and say so. HPACK itself is `js_rt_h2_hpack.sysl`, whose block
 // opens the `h2` scope that this one closes.
 //
@@ -72,7 +72,7 @@ js_runtime_h2() -> string = raw"""
             const RESET_BURST = 1000
             const RESET_RATE = 33
 
-            const NO_ERROR = 0, PROTOCOL_ERROR = 1, INTERNAL_ERROR = 2, FLOW_CONTROL_ERROR = 3, FRAME_SIZE_ERROR = 6
+            const NO_ERROR = 0, PROTOCOL_ERROR = 1, INTERNAL_ERROR = 2, FLOW_CONTROL_ERROR = 3, STREAM_CLOSED = 5, FRAME_SIZE_ERROR = 6
             const REFUSED_STREAM = 7, COMPRESSION_ERROR = 9, ENHANCE_YOUR_CALM = 11
 
             // Ends the reading of what a peer sent, after a connection error has queued its GOAWAY.
@@ -340,6 +340,21 @@ js_runtime_h2() -> string = raw"""
                         block = block.subarray(5)
                     }
 
+                    // **The block is announced before its fields arrive**, which is nghttp2's
+                    // `BeginHeaders` and what a header-read deadline starts at. nghttp2 says it only
+                    // where the frame is going to be read as a block -- not for a request refused for
+                    // too many streams, nor for HEADERS on a stream the peer had ended -- so those two
+                    // are decided here, before it.
+                    const known = this.streams.get(stream)
+
+                    if (known !== undefined) {
+                        if (known.recvEnded) coded(STREAM_CLOSED, "HEADERS on a stream the peer had ended")
+
+                        this.events.push({ kind: "beginHeaders", stream: stream, of: "trailer" })
+                    } else if (this.streams.size < MAX_STREAMS) {
+                        this.events.push({ kind: "beginHeaders", stream: stream, of: "request" })
+                    }
+
                     if ((flags & END_HEADERS) === 0) {
                         this.continuing = { stream: stream, flags: flags, parts: [block], count: 0 }
 
@@ -370,11 +385,12 @@ js_runtime_h2() -> string = raw"""
                     if ((flags & END_HEADERS) === 0) return
 
                     this.continuing = null
-                    this.headed(stream, held.flags, Buffer.concat(held.parts))
+                    this.headed(stream, held.flags, Buffer.concat(held.parts), held.dropped === true)
                 }
 
-                // A whole header block has arrived: a request, or the trailers of one.
-                headed(stream, flags, block) {
+                // A whole header block has arrived: a request, or the trailers of one -- or the block
+                // of a stream the program reset while it was arriving, which is decoded and dropped.
+                headed(stream, flags, block, dropped) {
                     let fields
 
                     // A block that is not valid HPACK is a connection error: the table it would have
@@ -387,11 +403,11 @@ js_runtime_h2() -> string = raw"""
                         throw e
                     }
 
+                    if (dropped) return
+
                     const known = this.streams.get(stream)
 
                     if (known !== undefined) {
-                        if (known.recvEnded) refuse("HEADERS on a stream the peer had ended")
-
                         if (fields === null) return this.resetStream(stream, ENHANCE_YOUR_CALM)
 
                         this.events.push({ kind: "headers", stream: stream, headers: fields, of: "trailer" })
@@ -692,6 +708,24 @@ js_runtime_h2() -> string = raw"""
                     return null
                 }
 
+                // The program's own RST_STREAM. **A stream whose header block is still arriving is
+                // reset too**, which is what a header-read deadline asks for: the rest of its block is
+                // still decoded when it comes, keeping the compression table in step, and then
+                // dropped.
+                reset(stream, code) {
+                    if (this.continuing !== null && this.continuing.stream === stream) {
+                        this.out.push(frame(RST_STREAM, 0, stream, u32(code)))
+                        this.continuing.dropped = true
+                        this.events.push({ kind: "streamClose", stream: stream, code: code })
+
+                        return
+                    }
+
+                    const s = this.streams.get(stream)
+
+                    if (s !== undefined && !s.closed) this.resetStream(stream, code)
+                }
+
                 // The program's own GOAWAY. Not queued once a connection error has queued one.
                 goaway(last, code) {
                     if (this.terminated) return
@@ -706,7 +740,7 @@ js_runtime_h2() -> string = raw"""
                     for (const s of [...this.streams.values()])
                         if (s.id % 2 === 1 && s.id > last) this.drop(s, REFUSED_STREAM)
 
-                    if (this.continuing !== null && this.continuing.stream > last) {
+                    if (this.continuing !== null && this.continuing.stream > last && this.continuing.dropped !== true) {
                         this.events.push({ kind: "streamClose", stream: this.continuing.stream, code: REFUSED_STREAM })
                         this.continuing = null
                     }

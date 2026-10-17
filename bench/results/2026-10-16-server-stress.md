@@ -129,3 +129,24 @@ buffer, so the storm's footprint drops.
 
 Peak RSS 11 -> 50 MB, against 11 -> 124 MB before. The verdict is still FAIL for the unchanged
 reason (`cutOff=0/1000 hasHeaderTimeout=false`): the header-read deadline is a separate item.
+
+## Re-taken with per-stream h2 head deadlines (`h2deadline2`, sh.sysl.nghttp2 0.4.0)
+
+`run.sh --only slate --mode slowloris --mode h2abuse ./slate`, a plain `sysl build .` binary on
+`h2deadline2` (based on dev `a682002`) with the header-read deadline in place on both versions: an
+HTTP/2 header block now has `headMillis` from its `beginHeaders` and is reset with CANCEL on its own
+when it misses it, the connection-level deadline being kept only for bytes with no block begun.
+
+| server | mode | verdict | rss before | rss peak | rss after | fd before | fd peak | fd after |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| slate | slowloris | PASS | 11 | 51 | 51 | 13 | 1014 | 13 |
+| slate | h2abuse | PASS | 14 | 24 | 24 | 13 | 13 | 13 |
+
+| server | mode | what the client saw |
+|---|---|---|
+| slate | slowloris | opened=1000 served=10/10 cutOff=1000/1000 hasHeaderTimeout=true |
+| slate | h2abuse | resets=2000 streams=500 settings=1000 zeroWindow=1 served=10/10 |
+
+h2abuse is unchanged by the per-stream clock (rapid reset, stream flood, SETTINGS flood and zero
+window all still answered, normal requests still served), and its RSS stays within a megabyte of the
+earlier run.
