@@ -120,6 +120,20 @@ async until(s, n)
         await sleep(10)
         turns = turns + 1
 
+// Wait for the server to hang up, and say whether it did. **A cut is two events at the client, the
+// `408` and then the end of the stream, and no host promises nothing runs between them**: node can
+// fire a timer after the answer's bytes and before the end, so reading `gone` the moment the answer
+// is counted printed `closed false` about a connection that closed a moment later. A server that
+// keeps the connection is still caught -- it never hangs up and this answers false.
+async hungUp(s)
+    var turns = 0
+
+    while !s.gone && turns < 300
+        await sleep(10)
+        turns = turns + 1
+
+    s.gone
+
 // A first piece and then `n` single bytes.
 trickle(first, n)
     var out = [first]
@@ -140,7 +154,7 @@ async heldTo(name, quick, slow)
 
     await dribble(s1, trickle("GET / HTTP/1.1\r\nHost: x\r\nX-A: ", 15), 100)
     await until(s1, 1)
-    print(name, "a slow head", codes(s1), "closed", s1.gone)
+    print(name, "a slow head", codes(s1), "closed", await hungUp(s1))
     close(s1.conn)
 
     // A head that finishes inside the deadline is answered.
@@ -168,7 +182,7 @@ async heldTo(name, quick, slow)
 
     await dribble(s4, trickle("GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\nX-A: ", 15), 100)
     await until(s4, 2)
-    print(name, "a pipelined slow head", codes(s4), "closed", s4.gone)
+    print(name, "a pipelined slow head", codes(s4), "closed", await hungUp(s4))
     close(s4.conn)
 
     // An upload slower than the head's deadline and faster than the request's is answered: only the
@@ -185,7 +199,7 @@ async heldTo(name, quick, slow)
 
     await dribble(s6, trickle("POST /up HTTP/1.1\r\nHost: x\r\nContent-Length: 40\r\n\r\n", 20), 100)
     await until(s6, 1)
-    print(name, "a slow body", codes(s6), "closed", s6.gone)
+    print(name, "a slow body", codes(s6), "closed", await hungUp(s6))
     close(s6.conn)
 
     // Two whole requests in one read are both answered, and the connection is kept.
@@ -203,7 +217,7 @@ async heldTo(name, quick, slow)
 
     await send(s8.conn, "GET /a HTTP/1.1\r\nHost: x\r\n\r\nPOST /up HTTP/1.1\r\nHost: x\r\nContent-Length: 40\r\n\r\nab")
     await until(s8, 2)
-    print(name, "a pipelined slow body in one read", codes(s8), "closed", s8.gone)
+    print(name, "a pipelined slow body in one read", codes(s8), "closed", await hungUp(s8))
     close(s8.conn)
 
 // -- a deadline that is not a number -------------------------------------------------------------------

@@ -327,6 +327,33 @@ async A_MESSAGE_SENT_JUST_BEFORE_EXIT_IS_DELIVERED_BEFORE_exited_SETTLES()
         assertEq(got, "ping")
 
 @test
+async onExit_IS_CALLED_AFTER_THE_LAST_MESSAGE_TOO()
+    // The callback form of the rule above: the exit and the channel's end are two events, and the
+    // exit is told only once both have happened, whichever came first.
+    for i in 0..<20
+        val worker = spawn("/bin/sh", ["-c", "printf '\"ping\"\\n' >&3; exit 5"], { ipc: true }).value
+        var seen = []
+
+        worker.onMessage(m ->
+            seen.push(m))
+        worker.onExit(e ->
+            seen.push(e.status))
+
+        await worker.exited
+
+        assertEq(seen, ["ping", 5])
+
+@test
+async A_CHILD_THAT_CLOSES_ITS_CHANNEL_BEFORE_IT_EXITS_STILL_SETTLES_exited()
+    // The other order: the channel ends first, and the exit that comes after it is what settles the
+    // promise. A child that never says anything on its channel is the same case.
+    val early = spawn("/bin/sh", ["-c", "exec 3>&-; sleep 0.1; exit 2"], { ipc: true }).value
+    val quiet = spawn("/bin/sh", ["-c", "exit 3"], { ipc: true }).value
+
+    assertEq((await early.exited).value.status, 2)
+    assertEq((await quiet.exited).value.status, 3)
+
+@test
 async A_SIGPIPE_DOES_NOT_END_THE_PROGRAM()
     // **A write to a peer that has gone is an error the write answers**, which is node's rule and
     // slate's on both hosts. What finds it in the wild is a race -- a supervisor writing to a worker

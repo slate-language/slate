@@ -94,7 +94,15 @@ struct Child
     // supervisor that has started a worker and reached its last statement is not finished.
     exited_promise: Value
     request: usize
+
+    // Whether the child has exited, and how. **The exit and the channel's end are two events and
+    // either may come first**, so `settled` records the exit and `reported` says the promise has been
+    // answered -- which waits for the channel too, or a message written just before the exit is
+    // delivered after `exited` settles. node's `close` is the same rule.
     settled: bool
+    status: i64
+    signal: i32
+    reported: bool
 
     // Where the `spawn` was written, for the sentence a failure carries.
     at: Span
@@ -169,7 +177,7 @@ private claim_child(request: usize, promise: Value, at: Span) -> usize
     val gen = v.children.len() + 1
 
     v.children.push(Child(true, gen, 0, None, None, false, "", false, buf(), buf(), Null, Null,
-                        promise, request, false, at))
+                        promise, request, false, 0, 0, false, at))
     v.children.len() - 1
 
 // The child a builtin was handed, as the slot that names it -- or the complaint about what it was
@@ -324,7 +332,17 @@ private child_channel_end(slot: usize)
     c.socks = buf()
     v.children.set(slot, c)
 
+    // An exit that came first was waiting for this.
+    if c.settled then report_child_exit(slot)
+
 // The child has gone.
+//
+// **The process handle goes and the channel does NOT**, which is the same rule `run` keeps by
+// waiting for the pipes as well as for the exit: a message already on its way is a message the
+// program was sent, and the read that carries it may land after the exit. What the exit settles is
+// that nothing more can be *written* -- `channel_open` is false from here. **And `exited` is answered
+// only once the channel has ended too**, so every message the child wrote is delivered before a
+// program awaiting the exit goes on.
 private record_child_exit(slot: usize, status: i64, signal: i32)
     val v = current()
 
@@ -335,41 +353,50 @@ private record_child_exit(slot: usize, status: i64, signal: i32)
     if !c.live || c.settled then return
 
     c.settled = true
+    c.status = status
+    c.signal = signal
+    c.proc = None
+    c.channel_open = false
+    v.children.set(slot, c)
+
+    if c.channel.is_none() then report_child_exit(slot)
+
+// Answer `exited` and call `onExit`, once the exit has happened and the channel has ended.
+private report_child_exit(slot: usize)
+    val v = current()
+    var c = v.children.at(slot)
+
+    if c.reported then return
+
+    c.reported = true
     v.children.set(slot, c)
 
     val mark = root_mark()
     val o = new_object()
 
     hold(Object(o))
-    obj_put_name(o, "status", Int(long(status)))
+    obj_put_name(o, "status", Int(long(c.status)))
 
     // **A signal is `null` and not zero**, which is `run`'s decision and for its reason: zero is a
     // status a program can exit with, so a caller has to be able to tell "killed by signal 0" --
     // which is not a thing -- from "not killed".
-    obj_put_name(o, "signal", if signal == 0 then Null else Int(long(int(signal))))
+    obj_put_name(o, "signal", if c.signal == 0 then Null else Int(long(int(c.signal))))
 
     val answer = Object(o)
 
     answer_request(c.request, answer)
 
+    // **The pid and the promise stay.** A supervisor reads `child.pid` in the sentence it logs about
+    // a worker that died, and `await child.exited` may be written after the child has already gone.
     var after = v.children.at(slot)
     val told = after.on_exit
 
-    // **The process handle goes and the channel does NOT**, which is the same rule `run` keeps by
-    // waiting for the pipes as well as for the exit: a message already on its way is a message the
-    // program was sent, and the read that carries it may land after the exit. What the exit settles
-    // is that nothing more can be *written* -- `channel_open` is false from here.
-    //
-    // **The pid and the promise stay.** A supervisor reads `child.pid` in the sentence it logs about
-    // a worker that died, and `await child.exited` may be written after the child has already gone.
-    after.proc = None
-    after.channel_open = false
     after.on_exit = Null
     v.children.set(slot, after)
 
     call_with(told, answer, "onExit")
     release(mark)
-end record_child_exit
+end report_child_exit
 
 // Give up everything a slot holds, for a spawn that never started a child.
 private drop_child(slot: usize)
