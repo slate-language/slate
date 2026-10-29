@@ -4,7 +4,7 @@
 #
 # **This is one file so that the container and the runner cannot drift.** The GitHub workflow runs it
 # with `sudo`, `scripts/linux-shell.sh` bakes it into an image, and a person setting up their own box
-# runs it directly -- so a library added to `package.hocon` is added here once and all three follow.
+# runs it directly -- so a library added to `sysl.hocon` is added here once and all three follow.
 # Two lists that have to agree is how a Linux build breaks for the person who is not looking.
 #
 # Run as root, or under `sudo`.

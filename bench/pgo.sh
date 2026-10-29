@@ -3,7 +3,7 @@
 #
 #     bench/pgo.sh [out-dir]
 #
-# **This is how the release binary is built.** `package.hocon` already asks for `-O2` and thin LTO,
+# **This is how the release binary is built.** `sysl.hocon` already asks for `-O2` and thin LTO,
 # which every build gets; a profile is the third lever and is not a manifest key, because it is one
 # measurement taken on one machine and a path to it would be wrong for everybody else. So it is this
 # script, run from anywhere, and the binary it prints is the one to stage.

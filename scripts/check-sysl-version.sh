@@ -8,18 +8,18 @@
 # release procedure runs it before building the macOS tarball, and the Linux install runs it after
 # installing.
 #
-# `package.hocon`'s `sysl` key is a different number: the FLOOR, the oldest compiler slate builds
+# `sysl.hocon`'s `sysl` key is a different number: the FLOOR, the oldest compiler slate builds
 # with, which moves only when the language needs it. `sysl-version` may never sit behind it.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 want=$(tr -d '[:space:]' < "$repo_root/sysl-version")
-floor=$(grep -oE '^[[:space:]]*sysl[[:space:]]*=[[:space:]]*"[^"]+"' "$repo_root/package.hocon" \
+floor=$(grep -oE '^[[:space:]]*sysl[[:space:]]*=[[:space:]]*"[^"]+"' "$repo_root/sysl.hocon" \
         | head -1 | sed 's/.*"\(.*\)"/\1/')
 
 if [ "$(printf '%s\n%s\n' "$floor" "$want" | sort -V | head -1)" != "$floor" ]; then
-  echo "sysl-version says $want, which is behind package.hocon's floor of $floor" >&2
+  echo "sysl-version says $want, which is behind sysl.hocon's floor of $floor" >&2
   exit 1
 fi
 

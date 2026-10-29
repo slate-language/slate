@@ -37,7 +37,7 @@ RUN /tmp/linux-deps.sh && rm -rf /var/lib/apt/lists/* /tmp/linux-deps.sh
 ENV PATH=/usr/lib/llvm-20/bin:$PATH
 ENV HOME=/home/dev
 RUN mkdir -p /home/dev/.cache && chmod -R 777 /home/dev
-COPY scripts/linux-install-sysl.sh scripts/check-sysl-version.sh package.hocon sysl-version /tmp/sysl/
+COPY scripts/linux-install-sysl.sh scripts/check-sysl-version.sh sysl.hocon sysl-version /tmp/sysl/
 RUN cd /tmp/sysl && mkdir -p scripts && mv linux-install-sysl.sh check-sysl-version.sh scripts/ \
     && scripts/linux-install-sysl.sh /usr/local && rm -rf /tmp/sysl
 WORKDIR /src

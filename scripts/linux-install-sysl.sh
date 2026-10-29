@@ -5,7 +5,7 @@
 # slate is a sysl program, so a Linux machine needs the Linux sysl before it can build anything here.
 # The version is the repository's `sysl-version` file -- the one place that names the compiler a
 # release is built with, on every platform -- and nothing else: no environment variable overrides it,
-# so a workflow cannot carry a second copy that falls behind. (`package.hocon`'s `sysl` key is the
+# so a workflow cannot carry a second copy that falls behind. (`sysl.hocon`'s `sysl` key is the
 # FLOOR, the oldest compiler slate builds with; `scripts/check-sysl-version.sh` refuses a
 # `sysl-version` behind it, and runs at the end of this script against what was installed.)
 #

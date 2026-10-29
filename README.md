@@ -8,7 +8,7 @@
   <a href="https://github.com/slate-language/slate/actions/workflows/docs.yml"><img alt="Docs" src="https://github.com/slate-language/slate/actions/workflows/docs.yml/badge.svg?branch=stable"></a>
   <a href="https://github.com/slate-language/slate/commits/dev"><img alt="Last Commit" src="https://img.shields.io/github/last-commit/slate-language/slate/dev"></a>
   <img alt="License" src="https://img.shields.io/github/license/slate-language/slate">
-  <a href="https://sysl.sh"><img alt="sysl Version" src="https://img.shields.io/badge/dynamic/regex?url=https%3A%2F%2Fraw.githubusercontent.com%2Fslate-language%2Fslate%2Fstable%2Fpackage.hocon&search=sysl%20%3D%20%22(%5B%5E%22%5D%2B)%22&replace=%241&label=sysl&color=blue"></a>
+  <a href="https://sysl.sh"><img alt="sysl Version" src="https://img.shields.io/badge/dynamic/regex?url=https%3A%2F%2Fraw.githubusercontent.com%2Fslate-language%2Fslate%2Fstable%2Fsysl.hocon&search=sysl%20%3D%20%22(%5B%5E%22%5D%2B)%22&replace=%241&label=sysl&color=blue"></a>
 </p>
 
 A small indentation-structured, garbage-collected language, written in [sysl](https://sysl.sh).
@@ -121,7 +121,7 @@ brew install slate-language/tap/slate-desktop
 Its binary is still called `slate`, so scripts and `#!` lines never care which edition runs them, and
 the two formulas conflict rather than install side by side. On Linux the desktop edition links GTK and
 WebKitGTK from the system. Building it from source is one flag, which is the `desktop` feature list
-in `package.hocon` spelled as the one feature it adds:
+in `sysl.hocon` spelled as the one feature it adds:
 
 ```
 brew install sysl-lang/tap/webview

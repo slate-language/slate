@@ -222,39 +222,60 @@ private asked_for(args: Args, at: Span, name: string, from: usize) -> Result[Wan
 // allocates nothing and touches no string -- and keeps `parse` and `encode` where the loop is. What
 // the pool thread sees is a struct of fixed arrays and integers.
 //
-// **The job reaches it through a `*Argon2Job`, and the box it points into is rooted HERE.** The
+// **The job reaches it through a `*Derivation` into an `Argon2Job`, and the box it points into is rooted HERE.** The
 // pointer is on the crossable list because a raw pointer has no count; what it does not do is keep
 // the object alive, so `jobs` below holds the `&Argon2Job` for exactly as long as the pool may still
 // be reading it. That table is the same arrangement `event.sysl` keeps for a pending callback, and
 // it is kept for the same reason.
 
-// One derivation, and everything both threads touch.
+// One derivation: everything the pool thread touches, and nothing else.
 //
-// **Every field is a fixed array or a number** -- no string, no `Buf` whose storage could move, and
-// nothing reference counted. The work area is the one allocation, taken on the loop's thread before
-// the job is queued and read by nothing else while it runs.
-//
-// Not `private`: `vm_state.sysl` names it in `Vm`.
-struct Argon2Job
+// **Every field is a fixed array, a number or a raw address** -- no string, no `Buf`, and nothing
+// reference counted -- because the address of this part of a job is what crosses to the pool, and
+// the compiler asks everything it reaches whether its counts are atomic. The work area is held as
+// the address of the job's own `Buf`, which the job keeps on the loop's thread.
+struct Derivation
     password: [MaxPassword]u8
     password_len: usize
     salt: [32]u8
     salt_len: usize
     params: monocypher.Params
-    area: Buf[u8]
+    area: *u8
+    area_len: usize
     digest: [64]u8
     digest_len: usize
+
+    // Called on a POOL THREAD, and it is the only thing that is. It reads the inputs and writes the
+    // digest; nothing else in this file may be touched from here.
+    run(*self)
+        monocypher.argon2(self.digest[0..<self.digest_len], self.area[0..<self.area_len],
+            self.password[0..<self.password_len], self.salt[0..<self.salt_len], self.params, [], [])
+end Derivation
+
+// A derivation and what the loop's thread keeps beside it.
+//
+// **The work area is the one allocation**, taken on the loop's thread before the job is queued and
+// written by nothing but the derivation while it runs. Its storage never moves -- nothing pushes to
+// it -- so the address `work.area` holds stays good for as long as the job does.
+//
+// Not `private`: `vm_state.sysl` names it in `Vm`.
+struct Argon2Job
+    work: Derivation
+    area: Buf[u8]
 
     // What `argon2Verify` is deriving towards, copied out of the parsed record. Unused by `argon2`,
     // which has nothing to compare against -- the record it answers IS the digest.
     expected: [64]u8
 
-    // Called on a POOL THREAD, and it is the only thing that is. It reads the inputs and writes the
-    // digest; nothing else in this file may be touched from here.
-    run(*self)
-        monocypher.argon2(self.digest[0..<self.digest_len], self.area.elems,
-            self.password[0..<self.password_len], self.salt[0..<self.salt_len], self.params, [], [])
-end Argon2Job
+// A job over a fresh work area of `area_len` bytes, with its salt and password still to be filled.
+//
+// Not `private`: `tests_argon2.sysl` makes one by hand.
+new_job(salt_len: usize, params: monocypher.Params, area_len: usize, digest_len: usize) -> &Argon2Job
+    val area = work_area(area_len)
+    val at: *u8 = &area.elems[0]
+
+    Argon2Job(Derivation([0; MaxPassword], 0, [0; 32], salt_len, params, at, area_len, [0; 64], digest_len),
+        area, [0; 64])
 
 // The longest password this will derive from.
 //
@@ -268,7 +289,7 @@ private const MaxPassword: usize = 256
 // The jobs the pool may still be reading, indexed by the request id that will answer them.
 //
 // **This is `event.sysl`'s `pending` table for a different kind of pending thing**, and it exists for
-// that table's reason: the pool thread holds a `*Argon2Job` and a raw pointer keeps nothing alive, so
+// that table's reason: the pool thread holds a `*Derivation` and a raw pointer keeps nothing alive, so
 // the box has to be held somewhere the loop's thread owns until the completion callback has run.
 // The table is now `current().argon2_jobs` -- see `vm_state.sysl`.
 //
@@ -300,7 +321,7 @@ forget_argon2_jobs()
     current().argon2_jobs.clear()
 
 // Copy a password into the job's own storage, refusing one longer than the ceiling.
-private fill_password(j: *Argon2Job, password: string) -> bool
+private fill_password(j: *Derivation, password: string) -> bool
     val b = password.bytes
 
     if b.len > MaxPassword then return false
@@ -338,7 +359,7 @@ end on_the_pool
 // the box from being freed under the pool thread.
 private async deriving(id: usize, at: Span, what: string, job: &Argon2Job,
                        done: &Fn(usize, &Argon2Job) -> unit)
-    val p: *Argon2Job = &*job
+    val p: *Derivation = &job.work
     val r = await current().io.work(() -> p.run())
 
     pool_answered(id, at, what, job, r, done)
@@ -401,13 +422,12 @@ do_argon2(args: Args, at: Span) -> Step
         if !entropy_from_os(want.salt[0..<default_salt])
             return fault(at, "`argon2` could not get randomness from the kernel, and a password hashed with a salt this program made up would not be worth storing")
 
-    var job: &Argon2Job = Argon2Job([0; MaxPassword], 0, [0; 32], want.salt_len, want.params,
-        work_area(monocypher.work_area_size(want.params)), [0; 64], want.hash_len, [0; 64])
+    var job = new_job(want.salt_len, want.params, monocypher.work_area_size(want.params), want.hash_len)
 
     for i in 0..<want.salt_len
-        job.salt[i] = want.salt[i]
+        job.work.salt[i] = want.salt[i]
 
-    if !fill_password(&*job, password)
+    if !fill_password(&job.work, password)
         return fault(at, s"`argon2` was given a password of ${password.bytes.len} bytes, and ${MaxPassword} is the longest it will derive from")
 
     on_the_pool(begin_request(), at, "argon2", job, hash_answered)
@@ -416,8 +436,8 @@ end do_argon2
 // Back on the loop's thread, with the digest the pool wrote. **The PHC string is built here**, where
 // a string may be made at all.
 private hash_answered(id: usize, j: &Argon2Job) =
-    answer_plain_request(id, str_value(monocypher.encode(j.params, j.salt[0..<j.salt_len],
-        j.digest[0..<j.digest_len])))
+    answer_plain_request(id, str_value(monocypher.encode(j.work.params, j.work.salt[0..<j.work.salt_len],
+        j.work.digest[0..<j.work.digest_len])))
 
 // `argon2Verify(record, password)` -- a promise of whether that password is the one it was made from.
 //
@@ -450,16 +470,15 @@ do_argon2_verify(args: Args, at: Span) -> Step
     if needed > work_area_ceiling
         return fault(at, s"this record asks for ${needed / (1024 * 1024)} MiB of working memory, which is more than any real Argon2 parameter reaches -- it is not a record this program wrote")
 
-    var job: &Argon2Job = Argon2Job([0; MaxPassword], 0, [0; 32], record.salt().len, record.params,
-        work_area(needed), [0; 64], record.hash().len, [0; 64])
+    var job = new_job(record.salt().len, record.params, needed, record.hash().len)
 
     for i in 0..<record.salt().len
-        job.salt[i] = record.salt()[i]
+        job.work.salt[i] = record.salt()[i]
 
     for i in 0..<record.hash().len
         job.expected[i] = record.hash()[i]
 
-    if !fill_password(&*job, password)
+    if !fill_password(&job.work, password)
         return fault(at, s"`argon2Verify` was given a password of ${password.bytes.len} bytes, and ${MaxPassword} is the longest it will derive from")
 
     on_the_pool(begin_request(), at, "argon2Verify", job, check_answered)
@@ -468,7 +487,7 @@ end do_argon2_verify
 // Back on the loop's thread. **The comparison is constant time**, for the reason a MAC's is: how long
 // it took is a measurement, and one made a byte at a time over many attempts is a password.
 private check_answered(id: usize, j: &Argon2Job) =
-    answer_plain_request(id, Bool(same_tag(j.digest[0..<j.digest_len], j.expected[0..<j.digest_len])))
+    answer_plain_request(id, Bool(same_tag(j.work.digest[0..<j.work.digest_len], j.expected[0..<j.work.digest_len])))
 
 // `argon2NeedsRehash(record)` -- whether this record is weaker than what a call writes today.
 //
