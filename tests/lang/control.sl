@@ -681,7 +681,20 @@ async an_interval_repeats_until_it_is_cancelled() =
 
     id = setInterval(tick, 10)
 
-    await sleep(60)
+    // **Waited for by what it is waiting for, not by a sleep that is long enough when the machine is
+    // quiet.** The third tick is the event; the bound is only so that a broken interval fails rather
+    // than hangs, and is far above any delay a loaded machine adds.
+    var waited = 0
+
+    while n < 3 && waited < 10000
+        await sleep(5)
+
+        waited = waited + 5
+
+    assertEq(n, 3)
+
+    // And it stays cancelled: several periods more, with nothing further counted.
+    await sleep(50)
 
     assertEq(n, 3)
 

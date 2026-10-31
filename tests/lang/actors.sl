@@ -437,7 +437,13 @@ async a_later_ask_of_a_dead_actor_rejects_at_once() =
     catch e
         assertEq(e.message, "it broke")
 
-    await sleep(80)
+    // **Waits for the death itself, not for a sleep long enough for it to have been announced.** An
+    // ask sent while the announcement is still on its way is rejected with the fault, which is right
+    // and is not what this test is about; `done` rejects once the actor is known to be dead.
+    try
+        await done(b)
+    catch e
+        assertEq(e.message, "it broke")
 
     var said = ""
 
