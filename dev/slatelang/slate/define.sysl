@@ -339,8 +339,45 @@ rest_parameter(p: *Parser, params: *Buf[string], defaults: *Buf[Expr], checks: *
     params.push(marked_rest(name))
 end rest_parameter
 
+// Everything a definition says before its body: the name, the parameters and what each costs at the
+// top of the body, and the result.
+//
+// **A head is a struct because two things end in one.** A definition has its body under it; a
+// function defined by clauses may have a typed signature line instead -- the same head with no body
+// -- and its clauses become the body (`clause_def.sysl`). Both are finished by `finish_def`.
+//
+// Not `private`: `clause_def.sysl` builds one and reads one.
+struct DefHead
+    start: Span
+    is_async: bool
+    name: string
+    params: Buf[string]
+    declares: Buf[bool]
+    checks: Buf[Stmt]
+    defaults: Buf[Expr]
+    result: Option[(string, Pattern, Option[Claim])]
+end DefHead
+
 // `name(a, b)` with a body.
 parse_def(p: *Parser) -> Stmt
+    val head = parse_def_head(p)
+
+    // Two body forms, and the `=` is what tells them apart: `double(x) = x * 2` puts the result on
+    // the line, and an indented block puts it in a run of statements. sysl has both for the same
+    // reason -- a body should not have to change shape when it outgrows a line -- and `=` may open
+    // an indented block too, which needs nothing here because `parse_body` looks for the `Indent`.
+    p.accept(Assign)
+
+    finish_def(p, head, None)
+end parse_def
+
+// The head of a definition, read up to where its body begins.
+//
+// **Its type parameters are left OPEN**, so `T` is a type in the body that follows; `finish_def` is
+// what closes them.
+//
+// Not `private`: `clause_def.sysl` reads a signature line with it.
+parse_def_head(p: *Parser) -> DefHead
     val start = p.here()
     val is_async = p.accept(Async)
 
@@ -468,11 +505,22 @@ parse_def(p: *Parser) -> Stmt
     else
         None
 
-    // Two body forms, and the `=` is what tells them apart: `double(x) = x * 2` puts the result on
-    // the line, and an indented block puts it in a run of statements. sysl has both for the same
-    // reason -- a body should not have to change shape when it outgrows a line -- and `=` may open
-    // an indented block too, which needs nothing here because `parse_body` looks for the `Indent`.
-    p.accept(Assign)
+    DefHead(start, is_async, name, params, declares, checks, defaults, result)
+end parse_def_head
+
+// A definition's body, read and wrapped in what its head asked for, and the `Def` the two make.
+//
+// **`run` is the clauses that stand where the body would**, and `None` for an ordinary body. A run
+// of clauses is read by `clause_arms` into the one `match` that is the body, and everything
+// around it -- the counts, the contract state, the checks, the result -- is the same for both, which
+// is why the two share this rather than each keeping a copy.
+//
+// Not `private`: `clause_def.sysl` finishes a run of clauses with it.
+finish_def(p: *Parser, head: DefHead, run: Option[ClauseRun]) -> Stmt
+    var h = head
+    val start = h.start
+    val name = h.name
+    val result = h.result
 
     // **The count is put back to zero for this body and restored after it**, which is what makes the
     // question "did *this* body yield" rather than "has anything yielded yet".
@@ -502,19 +550,23 @@ parse_def(p: *Parser) -> Stmt
     p.olds = buf()
     p.clauses_ok = true
     p.contract_owner = name
-    snapshot_claimed(p, result, params)
+    snapshot_claimed(p, result, h.params)
 
-    val read = parse_body(p)
+    // **A run of clauses may fill in the parameters**: with no signature line above them, how many
+    // there are is what the first clause says, and they are the hidden names a pattern parameter has.
+    val read = run match
+        Some(r) -> clause_arms(p, &h, r)
+        None -> parse_body(p)
     val snapped = snapshotting(read, p.olds)
     val ensured = if p.clauses.len() == 0 then snapped else answering(snapped, p.clauses, start)
 
-    if p.ensures > 0 then checks.push(stmt(start, Var(ResultName, expr(start, NullLit))))
+    if p.ensures > 0 then h.checks.push(stmt(start, Var(ResultName, expr(start, NullLit))))
 
     // **A snapshot's slot is declared out here beside `result` and for its reason**: the
     // postconditions are written in the block that wraps the body, so a name bound inside the body
     // would not be in scope where the clause reads it.
     for i in 0..<p.olds.len()
-        checks.push(stmt(start, Var(old_slot(i), expr(start, NullLit))))
+        h.checks.push(stmt(start, Var(old_slot(i), expr(start, NullLit))))
 
     p.ensures = outer_ensures
     p.clauses = outer_clauses
@@ -522,7 +574,7 @@ parse_def(p: *Parser) -> Stmt
     p.clauses_ok = outer_ok
     p.contract_owner = outer_owner
 
-    val checked = with_checks(checks, ensured)
+    val checked = with_checks(h.checks, ensured)
 
     val body = result match
         Some(r) -> expr(checked.span, Ensures(checked, r.0, r.1, r.2))
@@ -536,12 +588,12 @@ parse_def(p: *Parser) -> Stmt
     p.yields = outer_yields
     p.awaits = outer_awaits
     p.binders = outer_binders
-    current().param_declares = declares
+    current().param_declares = h.declares
 
     pop_type_params()
 
-    stmt(start.to(p.just_taken()), Def(name, params, defaults, intern_body(body, yielded), is_async))
-end parse_def
+    stmt(start.to(p.just_taken()), Def(name, h.params, h.defaults, intern_body(body, yielded), h.is_async))
+end finish_def
 
 // `= expr` after a parameter, or a bare `?` marking it optional with no value of its own, if either
 // is there -- and the refusal that keeps `defaults` trailing.

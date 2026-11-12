@@ -472,6 +472,172 @@ print(f({ n: 21 }), g({ n: 1 }))
 
 The pattern is any [pattern](patterns.md) that binds.
 
+## Clauses
+
+A function may be defined by **clauses**: the same name written on consecutive lines, each with a
+[pattern](patterns.md) in every parameter's place. A call tries the clauses in order and runs the
+first whose patterns match its arguments:
+
+```slate
+fact(0) = 1
+fact(n) = n * fact(n - 1)
+
+area({ kind: "circle", r }) = 3 * r * r
+area({ kind: "rect", w, h }) = w * h
+
+print(fact(5), area({ kind: "circle", r: 2 }), area({ kind: "rect", w: 2, h: 3 }))
+```
+
+```output
+120 12 6
+```
+
+Every pattern a `match` arm takes works here — literals, kind words, object and array patterns, `@`,
+`|`, ranges, classes and variants, `_` — and the names a clause's patterns bind are its own. Several
+parameters are matched together, left to right:
+
+```slate
+where(0, 0) = "the origin"
+where(0, y) = s"on the y axis at ${y}"
+where(x, 0) = s"on the x axis at ${x}"
+where(x, y) = s"at ${x}, ${y}"
+
+print(where(0, 0))
+print(where(0, 4))
+print(where(3, 4))
+```
+
+```output
+the origin
+on the y axis at 4
+at 3, 4
+```
+
+Every clause takes the same number of arguments, and the clauses of one function are written together
+— a clause separated from the others by another statement is refused, since it would be a second
+function of the same name. A body may be an indented block, as any definition's may.
+
+One line on its own is a clause only where it could not be an ordinary definition — `fact(0) = 1`, or
+a line with a [guard](#guards). Otherwise it is the definition it always was, and a
+[destructuring parameter](#destructuring-parameters) in it takes its argument apart rather than testing
+it.
+
+### Guards
+
+`|` after the arguments and a condition takes the clause only when the condition holds; when it does
+not, the next clause is tried. Several guards go in an indented block under the arguments, one to a
+line, and are tried in order — `| _` always holds:
+
+```slate
+classify(0) = "zero"
+classify(n)
+    | n < 0 = "negative"
+    | n < 10 = "small"
+classify(_) = "large"
+
+fib(n) | n < 2 = n
+fib(n) = fib(n - 1) + fib(n - 2)
+
+print(classify(0), classify(-3), classify(4), classify(40), fib(10))
+```
+
+```output
+zero negative small large 55
+```
+
+A `|` inside the brackets is still a pattern's alternative; the guard is the one after the `)`. A guard
+after `| _` could never be tried, and is refused:
+
+```slate
+sign(n)
+    | _ = 1
+    | n < 0 = -1
+
+print(sign(1))
+```
+
+```error
+this guard of `sign` is never tried -- `| _` above it always holds, so it ends the block
+```
+
+A second guard written under a clause whose guard is on the same line is not one — the guards of a
+clause either sit on its line, one of them, or go in a block under it:
+
+```slate
+size(n) | n < 0 = "negative"
+    | n < 10 = "small"
+size(_) = "large"
+
+print(size(1))
+```
+
+```error
+a second guard cannot follow a one-line guarded clause
+```
+
+### A signature
+
+A line with the function's name, its parameters' annotations and its result type, and no body, may
+stand above the clauses. It is what the annotations are written on — a clause's parameters are
+patterns, and carry none — and its names are the ones a call may [name](#named-arguments) and a
+default may fill:
+
+```slate
+grow(n: integer, by = 10) -> integer
+grow(0, by) = by
+grow(n, by) = n + by
+
+print(grow(0), grow(3), grow(3, 1), grow(by = 5, n = 0))
+```
+
+```output
+10 13 4 5
+```
+
+The annotation is what tells a signature from a call: an untyped `grow(n)` on a line of its own is a
+call. Every clause takes as many arguments as the signature has parameters, a `...` parameter being
+one no clause could match.
+
+A signature over a [`data`](data-types.md) type is checked for covering it, as a `match` over one is:
+
+```slate
+data Shape
+    Circle(r)
+    Rect(w, h)
+    Empty
+
+perimeter(s: Shape) -> number
+perimeter(Circle(r)) = 6 * r
+perimeter(Rect(w, h)) = 2 * (w + h)
+
+print(perimeter(Empty))
+```
+
+```error
+the clauses of `perimeter` do not cover every Shape -- `Empty` is unmatched
+```
+
+### When no clause matches
+
+A call no clause takes is a fault naming the function and the arguments — one as itself, several as an
+array of them:
+
+```slate
+area({ kind: "circle", r }) = 3 * r * r
+area({ kind: "rect", w, h }) = w * h
+
+print(area({ kind: "square", side: 2 }))
+```
+
+```error
+no clause of `area` applies to {kind: "square", side: 2}
+```
+
+`async` is written once, on the first line of a run, and a run with a `yield` in any clause is a
+generator. A `require` or an `ensure` is a whole function's [contract](#contracts), and a run of clauses
+has no one body for it to head, so one in a clause is refused — a guard is where a clause tests its
+arguments.
+
 ## Annotations
 
 Per parameter, and per result:

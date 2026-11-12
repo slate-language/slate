@@ -5,8 +5,10 @@ weight: 50
 
 # Patterns
 
-One grammar, used in four places: a `match` arm, an `is` test, a binding (`val { a } = o`), and a
-[parameter](functions.md) that takes its argument apart.
+One grammar, used in five places: a `match` arm, an `is` test, a binding (`val { a } = o`), a
+[parameter](functions.md) that takes its argument apart, and a [clause](functions.md#clauses) of a
+function defined by clauses, whose parameters take every pattern an arm does and are tried in order as
+arms are.
 
 ## `match`
 

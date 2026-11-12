@@ -1,0 +1,602 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// A function defined by clauses: `fact(0) = 1` and `fact(n) = n * fact(n - 1)`, one after another,
+// with an optional typed signature line above them.
+//
+// **The clauses become ONE ordinary `Def` whose body is a `match`**, so the checker, the machine and
+// the JavaScript back end learn nothing new. Without a signature the parameters are the hidden names a
+// pattern parameter already has -- `(0)`, `(1)`, ... -- and with one they are the signature's own, so
+// a call may name them. One parameter is matched as itself; several are matched as an array of them,
+// each clause's patterns becoming one array pattern. The `match` carries the function's name
+// (`MatchExpr.owner`) for the sentences alone.
+//
+// **What makes a run is decided by looking ahead, before anything is read**, because the first line
+// of a run may be an ordinary definition: `fact(n) = ...` followed by `fact(0) = 1` is two clauses
+// and not a function and a mistake. `clause_run_at` counts the lines; `parse_clause_def` reads them.
+//
+// Not `private`: `parse_stmt.sysl` and `declare.sysl` ask both questions, and `define.sysl`'s
+// `finish_def` calls `clause_arms` where an ordinary body would be read.
+
+// What `clause_run_at` found: whether a signature line heads the run, and how many clauses follow.
+struct ClauseRun
+    signed: bool
+    count: usize
+end ClauseRun
+
+// Whether the cursor is on a function defined by clauses, and if so its shape.
+//
+// **A run is a signature followed by at least one clause, or two or more clauses, or one line that
+// is a clause and could not be an ordinary definition** -- `fact(0) = 1` alone, or a line with a
+// guard. A single ordinary definition stays exactly what it was.
+clause_run_at(p: *Parser) -> Option[ClauseRun]
+    val s: usize = if p.at(Async) then 1 else 0
+
+    if p.peek_kind_at(s) != Ident then return None
+
+    val name = p.text_at(s)
+    var k = s
+    var signed = false
+
+    if at_signature(p, s)
+        next_statement(p, s, name) match
+            Some(n) ->
+                k = n
+                signed = true
+            None -> return None
+    elif p.peek_kind_at(s + 1) != LParen
+        return None
+
+    var count: usize = 0
+
+    loop
+        // **A `|` line under a one-line guarded clause belongs to the run**, misplaced as it is, so
+        // that it is refused there rather than splitting the run in two around it.
+        if k != s && p.peek_kind_at(k) == Pipe
+            next_statement(p, k, name) match
+                Some(n) ->
+                    k = n
+                    continue
+                None -> break
+
+        // **A later clause written `async` is counted, so that it can be refused by name** rather
+        // than splitting the run in two around it.
+        val at_name = if k != s && p.peek_kind_at(k) == Async then k + 1 else k
+
+        if p.peek_kind_at(at_name) != Ident || p.text_at(at_name) != name then break
+        if !at_clause_head(p, at_name) && !at_definition_from(p, at_name) then break
+
+        count += 1
+
+        next_statement(p, at_name, name) match
+            Some(n) -> k = n
+            None -> break
+    end loop
+
+    if count == 0 then return None
+    if signed || count > 1 then return Some(ClauseRun(signed, count))
+
+    if at_definition_from(p, s) && !guarded_at(p, s) then None else Some(ClauseRun(false, 1))
+end clause_run_at
+
+// A run of clauses, and the signature above it if there is one, as the one `Def` they make.
+parse_clause_def(p: *Parser, run: ClauseRun) -> Stmt
+    if !run.signed
+        val start = p.here()
+        val is_async = p.accept(Async)
+
+        // `finish_def` closes a definition's type parameters, and a run with no signature has none.
+        push_type_params(buf())
+
+        return finish_def(p, DefHead(start, is_async, p.text_at(0), buf(), buf(), buf(), buf(), None), Some(run))
+    end if
+
+    val head = parse_def_head(p)
+
+    for i in 0..<head.params.len()
+        if head.params[i].starts_with(RestMark)
+            p.fault(head.start, s"`${head.name}` is defined by clauses, and a clause matches a fixed number of arguments -- a `...` parameter gathering however many were given has nothing for a clause to match against")
+
+    // **An absence cannot be matched**, the clauses taking every argument together as one value and
+    // slate refusing to put an `undefined` in one.
+    for i in 0..<head.defaults.len()
+        *head.defaults[i].kind match
+            UndefinedLit -> p.fault(head.defaults[i].span, s"a parameter of `${head.name}` may not be left without a value, because its clauses match every argument -- give it a default they can match, such as `= null`")
+            _ -> ()
+
+    if !p.end_of_statement()
+        p.fault(p.here(), s"a signature line ends after its result type -- the clauses of `${head.name}` under it are its body")
+
+    finish_def(p, head, Some(run))
+end parse_clause_def
+
+// The clauses of a run, read into the `match` that is the function's body.
+//
+// **`h.params` is filled in here where no signature gave them**, the first clause saying how many
+// there are. Every clause is checked against that count, and against the signature's where there is
+// one.
+clause_arms(p: *Parser, h: *DefHead, run: ClauseRun) -> Expr
+    val name = h.name
+    val first = if run.signed then "the signature" else "the first clause"
+    var arity = h.params.len()
+    var arms: Buf[Arm] = buf()
+
+    for c in 0..<run.count
+        // The line before this one has ended -- a signature's was ended by `parse_clause_def`.
+        if c > 0 && !p.end_of_statement()
+            p.fault(p.here(), "this is where the clause should have ended")
+
+        p.skip_newlines()
+
+        val at = p.here()
+
+        if p.at(Async)
+            p.fault(at, s"`async` is written once, on the first line of `${name}` -- its clauses are one function, and that line says what kind it is")
+            p.bump()
+
+        p.bump()
+        p.expect(LParen, "`(`")
+
+        var pats: Buf[Pattern] = buf()
+
+        if !p.at(RParen)
+            loop
+                pats.push(clause_param(p, name))
+
+                if !p.accept(Comma) then break
+                if p.at(RParen) then break
+
+        p.expect(RParen, "`)`")
+
+        val head_at = at.to(p.just_taken())
+
+        if c == 0 && !run.signed
+            arity = pats.len()
+
+            for i in 0..<arity
+                h.params.push(s"(${i})")
+                h.declares.push(false)
+        elif pats.len() != arity
+            p.fault(head_at, s"this clause of `${name}` takes ${counted(pats.len())} and ${first} takes ${counted(arity)} -- every clause of one function takes the same number")
+
+        val pat = clause_pattern(pats, head_at)
+
+        // **A guard is a `match` arm's guard written after a `|`**: read after the patterns, so it can
+        // use what they bound, and one that answers false sends the call on. A clause with a block of
+        // them is one arm per guard over the same pattern, which is exactly "try each in order, and
+        // the next clause where none holds".
+        if p.accept(Pipe)
+            // `| _` holds always, here as in a block, and is not a lambda with its parameter left out.
+            val always = p.at(Ident) && p.text_at(0) == "_" && (p.peek_kind_at(1) == Assign || p.peek_kind_at(1) == Indent)
+            var guard: Option[Expr] = None
+
+            if always
+                p.bump()
+            else
+                guard = Some(parse_expr(p))
+
+            arms.push(Arm(pat, guard, clause_body(p, name)))
+            misplaced_guards(p, name, pat, &arms)
+        elif p.at(Indent) && p.peek_kind_at(1) == Pipe
+            p.bump()
+            guard_lines(p, name, pat, &arms)
+        else
+            arms.push(Arm(pat, None, clause_body(p, name)))
+
+        accept_end_named(p, name)
+    end for
+
+    val subject = if arity == 0
+        expr(h.start, NullLit)
+    elif arity == 1
+        expr(h.start, Name(h.params[0]))
+    else
+        var items: Buf[Expr] = buf()
+
+        for i in 0..<arity
+            items.push(expr(h.start, Name(h.params[i])))
+
+        expr(h.start, ArrayLit(items))
+
+    expr(h.start, MatchExpr(subject, arms, name))
+end clause_arms
+
+// What a clause or one of its guards answers: an `=` and an expression, or an indented block.
+private clause_body(p: *Parser, name: string) -> Expr
+    p.accept(Assign)
+    refuse_clause_contract(p, name)
+
+    // **A contract clause has already been refused above, so it is read as one and dropped**:
+    // recorded, it would wrap the whole function in a promise one clause made.
+    val outer_clauses = p.clauses
+    val outer_ensures = p.ensures
+    val outer_olds = p.olds
+
+    p.clauses_ok = true
+
+    val body = parse_body(p)
+
+    p.clauses = outer_clauses
+    p.ensures = outer_ensures
+    p.olds = outer_olds
+
+    // **An arm's body is always a block**, which is where the JavaScript back end starts a fresh set of
+    // declarations: two clauses binding one name each write their own `let`. A one-line body is an
+    // expression, so it is put in one.
+    *body.kind match
+        Block(_) -> body
+        _ ->
+            var one: Buf[Stmt] = buf()
+
+            one.push(stmt(body.span, Eval(body)))
+            expr(body.span, Block(one))
+end clause_body
+
+// The indented block of `| condition = body` lines under a clause, the `Indent` already taken.
+//
+// **`| _` always holds, so it ends the block** -- a line after it is never tried, and is refused.
+private guard_lines(p: *Parser, name: string, pat: Pattern, arms: *Buf[Arm])
+    var reachable = true
+
+    loop
+        p.skip_newlines()
+
+        if p.at(Dedent) || p.at(Eof) then break
+
+        val at = p.here()
+
+        if !p.accept(Pipe)
+            p.fault(at, s"a guard of `${name}` is written `| condition = body`, one to a line")
+            break
+        end if
+
+        val always = p.at(Ident) && p.text_at(0) == "_" && (p.peek_kind_at(1) == Assign || p.peek_kind_at(1) == Indent)
+        var guard: Option[Expr] = None
+
+        if always
+            p.bump()
+        else
+            guard = Some(parse_expr(p))
+
+        if !reachable
+            p.fault(at.to(p.just_taken()), s"this guard of `${name}` is never tried -- `| _` above it always holds, so it ends the block")
+
+        arms.push(Arm(pat, guard, clause_body(p, name)))
+
+        if always then reachable = false
+
+        if !p.end_of_statement()
+            p.fault(p.here(), "this is where the guard should have ended")
+            p.bump()
+        end if
+    end loop
+
+    p.expect(Dedent, "the end of the guards")
+end guard_lines
+
+// A second guard written under a one-line guarded clause, which is not one: refused, saying where the
+// guards go, and read as one so the rest of the run is still understood.
+//
+// **A line beginning with `|` does not continue the line above it** -- only a TRAILING operator
+// does -- so it arrives either as a deeper block or as a line of its own, and both are caught.
+private misplaced_guards(p: *Parser, name: string, pat: Pattern, arms: *Buf[Arm])
+    val deeper = p.at(Indent) && p.peek_kind_at(1) == Pipe
+    val beside = p.at(Newline) && p.peek_kind_at(1) == Pipe
+
+    if !deeper && !beside then return
+
+    p.fault(p.span_at(1), s"a second guard cannot follow a one-line guarded clause -- write the clause's patterns on a line of their own, `${name}(...)`, and every guard under it in an indented block, `| condition = body`")
+    p.bump()
+
+    if deeper
+        guard_lines(p, name, pat, arms)
+        return
+    end if
+
+    loop
+        if !p.accept(Pipe) then break
+
+        val guard = parse_expr(p)
+
+        arms.push(Arm(pat, Some(guard), clause_body(p, name)))
+
+        if !(p.at(Newline) && p.peek_kind_at(1) == Pipe) then break
+
+        p.bump()
+    end loop
+end misplaced_guards
+
+// A definition and a run of clauses of one name in one block, with something else between them --
+// refused at both, and answering whether it was.
+//
+// **It is the redefinition `check.sysl` refuses, told in the words that send the reader to the fix**:
+// a clause written apart from the others is not a clause of the same function but a second function
+// of the same name, so "declared twice" is true and says nothing about moving the line up.
+//
+// Not `private`: `check_stmts` asks it before `refuse_redefinitions`.
+refuse_scattered_clauses(stmts: Buf[Stmt]) -> bool
+    for i in 0..<stmts.len()
+        val first = def_named(stmts[i])
+
+        if first.0 == "" then continue
+
+        for j in (i + 1)..<stmts.len()
+            val later = def_named(stmts[j])
+
+            if later.0 == first.0 && (first.1 || later.1)
+                complain_here(stmts[j].span, s"this clause of `${later.0}` is separated from the ones above it by other statements -- the clauses of one function are written one after another, so this would be a second function of the same name. Move it up beside the others")
+                complain_here(stmts[i].span, s"the clauses of `${first.0}` begin here")
+
+                return true
+            end if
+        end for
+    end for
+
+    false
+end refuse_scattered_clauses
+
+// A definition's name and whether it was made by clauses -- `""` for a statement that is not one.
+private def_named(s: Stmt) -> (string, bool) = *s.kind match
+    Def(name, _, _, body, _) -> (name, made_by_clauses(body_at(body), name))
+    _ -> ("", false)
+
+// Whether a definition's body is the `match` a run of clauses becomes, under whatever its signature
+// wrapped around it.
+private made_by_clauses(body: Expr, name: string) -> bool = *body.kind match
+    MatchExpr(_, _, owner) -> owner == name
+    Ensures(inner, _, _, _) -> made_by_clauses(inner, name)
+    Block(stmts) ->
+        if stmts.is_empty() then return false
+
+        *stmts[stmts.len() - 1].kind match
+            Eval(tail) -> made_by_clauses(tail, name)
+            _ -> false
+    _ -> false
+
+// One parameter of a clause, which is a pattern -- and the two things a definition's parameter may
+// carry and a clause's may not, refused with the place each belongs.
+private clause_param(p: *Parser, name: string) -> Pattern
+    val pat = parse_pattern(p)
+
+    if p.at(Colon)
+        val at = p.here()
+
+        p.bump()
+        parse_type(p)
+        p.fault(at.to(p.just_taken()), s"a parameter of a clause is a pattern and carries no annotation -- the types of `${name}` go on a signature line above its clauses, such as `${name}(n: integer) -> integer`, or a pattern tests one where it stands, `n @ integer`")
+
+    if p.at(Assign) || p.at(Question)
+        val at = p.here()
+
+        if p.accept(Assign)
+            parse_expr(p)
+        else
+            p.bump()
+
+        p.fault(at.to(p.just_taken()), s"a default belongs to a binding and not to a clause of `${name}` -- a clause's parameter is a test, so a default would let it take an argument nobody gave. A default goes on a signature line above the clauses")
+
+    pat
+end clause_param
+
+// The one pattern a clause's patterns make: itself where there is one, an array of them where there
+// are several -- the subject being an array of the arguments then -- and `_` where there are none.
+private clause_pattern(pats: Buf[Pattern], at: Span) -> Pattern
+    if pats.len() == 1 then return pats[0]
+    if pats.is_empty() then return pattern(at, Wild)
+
+    var defaults: Buf[Option[Expr]] = buf()
+
+    for _ in 0..<pats.len()
+        defaults.push(None)
+
+    pattern(at, ArrayPat(pats, false, None, defaults))
+end clause_pattern
+
+// `require` or `ensure` at the head of a clause's body, refused.
+//
+// **A contract is the whole function's, and a run of clauses has no one body to head.** A
+// precondition one clause carried would bind only the calls that clause took, which reads as a
+// contract and is not one.
+private refuse_clause_contract(p: *Parser, name: string)
+    val k: usize = if p.at(Indent) then 1 else 0
+
+    if p.peek_kind_at(k) != Ident then return
+
+    val word = p.text_at(k)
+
+    if (word == "require" || word == "ensure") && starts_expr(p.peek_kind_at(k + 1))
+        p.fault(p.span_at(k), s"`${word}` is a whole function's contract, and `${name}` is defined by clauses with no one body for it to head -- test the arguments in a guard, `if ...`, or define `${name}` once and `match` inside it")
+end refuse_clause_contract
+
+private counted(n: usize) -> string = if n == 1 then "1 argument" else s"${n} arguments"
+
+// Whether `i` begins a clause: a name, a bracketed list, and then a guard, an `=`, or an indented
+// body or block of guards.
+//
+// **`fact(0) = 1` used to be an assignment to a call, and `f(n) | n < 0 = x` an assignment to an
+// `|`**, both refused as such, so the shapes were free. A guard counts only where a body follows it
+// on its line, so `f(x) | g(y)` written as a statement stays the expression it was.
+private at_clause_head(p: *Parser, i: usize) -> bool
+    if p.peek_kind_at(i) != Ident || p.peek_kind_at(i + 1) != LParen then return false
+
+    val close = closing(p, i + 1) match
+        Some(at) -> at
+        None -> return false
+
+    val k = p.peek_kind_at(close + 1)
+
+    if k == Assign || k == Indent then return true
+    if k != Pipe then return false
+
+    var at = close + 2
+    var depth: usize = 0
+
+    loop
+        val t = p.peek_kind_at(at)
+
+        if t == Eof || t == Newline || t == Dedent then return false
+
+        if t == LParen || t == LBracket || t == LBrace
+            depth += 1
+        elif t == RParen || t == RBracket || t == RBrace
+            if depth == 0 then return false
+
+            depth -= 1
+        elif depth == 0 && (t == Assign || t == Indent)
+            return true
+
+        at += 1
+end at_clause_head
+
+// Whether the head beginning at `i` has guards after it, inline or as an indented block -- which
+// makes a line shaped like an ordinary definition a clause.
+private guarded_at(p: *Parser, i: usize) -> bool
+    if p.peek_kind_at(i + 1) != LParen then return false
+
+    closing(p, i + 1) match
+        Some(at) -> p.peek_kind_at(at + 1) == Pipe || p.peek_kind_at(at + 1) == Indent && p.peek_kind_at(at + 2) == Pipe
+        None -> false
+end guarded_at
+
+// Whether `i` begins a signature line: a head with no body, carrying an annotation or a result type.
+//
+// **What tells it from a call is the annotation**, so an untyped `f(n)` above the clauses stays the
+// call it always was. `f[T](...)`'s type parameters are stepped over as a definition's are.
+private at_signature(p: *Parser, i: usize) -> bool
+    var head = i + 1
+
+    if p.peek_kind_at(head) == LBracket
+        names_end(p.toks, p.toks.position + head, LBracket, RBracket, Comma, Ident) match
+            Some(past) -> head = past - p.toks.position
+            None -> return false
+
+    if p.peek_kind_at(head) != LParen then return false
+
+    val close = closing(p, head) match
+        Some(at) -> at
+        None -> return false
+
+    var typed = false
+    var depth: usize = 0
+
+    for j in (head + 1)..<close
+        val k = p.peek_kind_at(j)
+
+        if k == LParen || k == LBracket || k == LBrace
+            depth += 1
+        elif k == RParen || k == RBracket || k == RBrace
+            depth -= 1
+        elif k == Colon && depth == 0
+            typed = true
+
+    var at = close + 1
+
+    if p.peek_kind_at(at) == Arrow
+        typed = true
+        depth = 0
+
+        loop
+            val k = p.peek_kind_at(at)
+
+            if k == Eof then break
+
+            if k == LParen || k == LBracket || k == LBrace
+                depth += 1
+            elif k == RParen || k == RBracket || k == RBrace
+                if depth == 0 then return false
+
+                depth -= 1
+            elif depth == 0
+                // A body under the result type makes it an ordinary definition.
+                if k == Assign || k == Indent then return false
+                if k == Newline || k == Dedent then break
+
+            at += 1
+        end loop
+
+        return typed
+    end if
+
+    val k = p.peek_kind_at(at)
+
+    typed && (k == Newline || k == Dedent || k == Eof)
+end at_signature
+
+// The `)` closing the bracket at `open`, counting every kind of bracket between.
+private closing(p: *Parser, open: usize) -> Option[usize]
+    var depth: usize = 0
+    var i = open
+
+    loop
+        val k = p.peek_kind_at(i)
+
+        if k == Eof then return None
+
+        if k == LParen || k == LBracket || k == LBrace
+            depth += 1
+        elif k == RParen || k == RBracket || k == RBrace
+            if depth == 0 then return None
+
+            depth -= 1
+
+            if depth == 0 then return if k == RParen then Some(i) else None
+
+        i += 1
+end closing
+
+// Where the statement after the one beginning at `from` begins, in the same block -- `None` where the
+// block or the file ends first.
+//
+// **A block body ends with a `Dedent` and no `Newline` after it**, the lexer spending the newline
+// inside the block, so both are where a statement can end; brackets are counted because a lambda's
+// block inside an argument list opens and closes inside them.
+private next_statement(p: *Parser, from: usize, name: string) -> Option[usize]
+    var i = from
+    var depth: usize = 0
+    var nest: usize = 0
+
+    loop
+        val k = p.peek_kind_at(i)
+
+        if k == Eof then return None
+
+        if k == LParen || k == LBracket || k == LBrace
+            nest += 1
+        elif k == RParen || k == RBracket || k == RBrace
+            if nest == 0 then return None
+
+            nest -= 1
+        elif k == Indent
+            depth += 1
+        elif k == Dedent
+            if depth == 0 then return None
+
+            depth -= 1
+
+            if depth == 0 && nest == 0 then return statement_after(p, i + 1, name)
+        elif k == Newline && depth == 0 && nest == 0
+            return statement_after(p, i + 1, name)
+
+        i += 1
+end next_statement
+
+// The first token of a statement at or after `i`, past blank lines and an `end` marker naming the
+// function.
+private statement_after(p: *Parser, i: usize, name: string) -> Option[usize]
+    var j = i
+
+    while p.peek_kind_at(j) == Newline
+        j += 1
+
+    if p.peek_kind_at(j) == Ident && p.text_at(j) == "end" && p.peek_kind_at(j + 1) == Ident && p.text_at(j + 1) == name
+        j += 2
+
+        while p.peek_kind_at(j) == Newline
+            j += 1
+
+    val k = p.peek_kind_at(j)
+
+    if k == Dedent || k == Eof then None else Some(j)
+end statement_after
