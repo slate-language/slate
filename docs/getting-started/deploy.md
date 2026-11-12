@@ -13,40 +13,10 @@ Linux box.
 
 ## Installing
 
-**Homebrew, exactly as on macOS, once Homebrew itself is on the machine:**
-
-```
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
-brew tap slate-language/tap
-brew install slate
-slate --version
-```
-
-`brew upgrade slate` is how a later version arrives — the same command as on macOS, because it is the
-same formula. Keep Homebrew for the taps that are actually yours (this one and sysl's); apt is what
-installs everything else on the box.
-
-**The tarball is the fallback where brew is not wanted**, straight off the [release
-page](https://github.com/slate-language/slate/releases/latest):
-
-```
-tag=$(curl -fsSLo /dev/null -w '%{url_effective}' https://github.com/slate-language/slate/releases/latest | sed 's#.*/##')
-curl -LO "https://github.com/slate-language/slate/releases/download/$tag/slate-${tag#v}-linux-arm64.tar.gz"
-sudo tar -xzf slate-*-linux-arm64.tar.gz -C /usr/local
-sudo apt-get install -y libssl3 libsqlite3-0 libbrotli1 libwebp7
-slate --version
-```
-
-Swap `-linux-arm64` for `-linux-x86_64` on an x86_64 box. **Those four packages are the whole of what
-the binary needs at run time** — Redis, libuv, LMDB, HTTP/2, Zstandard, regular expressions and the
-collector are
-linked in, so nothing has to match a version. A bare container image also wants `tzdata`, which
-`zone(...)` reads from and any real installation already has.
-
-The desktop edition, which adds [`slate:window`](../library/window.md), is the same shape beside it —
-`slate-desktop-<version>-linux-x86_64.tar.gz`, or `-linux-arm64` — and needs `libgtk-3-0` and
-`libwebkit2gtk-4.1-0` on top of those four, the web view being the system's own.
+**There is no prebuilt Linux binary and no Linux formula as of 0.2.0.** The releases carry macOS binaries only, and Linux
+builds return once sysl publishes Linux builds. Until then, build slate from source on the box, which is a
+clone and one command given [sysl](https://sysl.sh) installed (see the README's *Installing*). A bare
+container image also wants `tzdata`, which `zone(...)` reads from and any real installation already has.
 
 ## A program that uses every core
 
@@ -107,8 +77,7 @@ ExecReload=/bin/kill -HUP $MAINPID
 WantedBy=multi-user.target
 ```
 
-`ExecStart` is `/usr/local/bin/slate` for the tarball install above; a brew install on Linux puts the
-binary at `/home/linuxbrew/.linuxbrew/bin/slate` instead. **`TimeoutStopSec` should be a little longer
+`ExecStart` is the path of the `slate` binary you built, `/usr/local/bin/slate` here. **`TimeoutStopSec` should be a little longer
 than `cluster`'s own `drainMillis`** (ten seconds by default) — systemd sends `SIGKILL` at the timeout
 whether or not the drain finished, so a shorter one can cut off a worker that was still finishing a
 slow request.
