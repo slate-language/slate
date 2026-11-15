@@ -1,0 +1,107 @@
+module dev.slatelang.slate
+@tests
+
+import sysl.fs.{remove_file, write_text}
+import sysl.process.capture
+
+// `listen(0)` under `slate js`, on a machine where somebody else holds a port on `127.0.0.1` alone.
+//
+// **On macOS the dual-stack bind of `::` succeeds on such a port**, so a server that kept the kernel's
+// choice would be reached by its own clients dialling `127.0.0.1` only some of the time -- the rest
+// went to the other process. The interpreter's guard is `loopback_free`, pinned in `tests_io.sysl`;
+// this is the JavaScript runtime's, asked end to end.
+//
+// **The kernel's choice cannot be steered from a test**, so the driver stands a squatter on an IPv4
+// port first and hands that port to the runtime as its first choice through
+// `globalThis.$slateListenChoices`, the one seam the runtime keeps for this. The program reads the
+// same port from `HELD`, and the squatter says so out loud if a client ever reaches it.
+
+private val AnyPort: string = raw"""
+import { listen, connect, localPort, close } from slate:net
+import { env } from slate:process
+
+val held = number(env("HELD") ?? "0")
+
+accepted(conn)
+    print("reached this server")
+    close(conn)
+    close(server)
+
+val server = listen(0, accepted)
+
+print(if localPort(server) == held then "kept the squatter's port" else "chose another port")
+
+val client = (await connect("127.0.0.1", localPort(server))).value
+
+close(client)
+"""
+
+// The control a guard limited to port `0` owes: a port the PROGRAM names is bound as asked, squatter
+// or no squatter. Nothing dials it, the squatter being what would answer.
+private val NamedPort: string = raw"""
+import { listen, localPort, close } from slate:net
+import { env } from slate:process
+
+val held = number(env("HELD") ?? "0")
+
+val server = listen(held, conn -> close(conn))
+
+print(if localPort(server) == held then "bound the named port" else "moved off the named port")
+
+close(server)
+"""
+
+// The squatter, the seam and the program, in that order. **The squatter is `unref`'d**, so a run in
+// which nobody reached it ends when the program does; one in which somebody did ends there.
+private squatting_driver(program_js: string) -> string =
+    "const net = require(\"node:net\")\n" +
+    "const squatter = net.createServer((c) => { console.log(\"reached the squatter\"); process.exit(0) })\n" +
+    "squatter.listen({ port: 0, host: \"127.0.0.1\" }, () => {\n" +
+    "    const held = squatter.address().port\n" +
+    "    squatter.unref()\n" +
+    "    globalThis.$slateListenChoices = [held]\n" +
+    "    process.env.HELD = String(held)\n" +
+    // The name is the driver's own neighbour: `require` resolves against the requiring file.
+    s"    require(\"./${program_js}\")\n" +
+    "})\n"
+
+// What the program said, run behind a squatter.
+private squatted_said(program: string) -> string
+    val name = probe_name("js-listen")
+    val src = "tests/" + name
+    val out_js = src + ".js"
+    val driver = s"tests/${name}-driver.tmp.js"
+
+    write_text(src, program).unwrap()
+
+    val wrote = cli_status(["slate", "js", src, "-o", out_js])
+
+    if wrote != 0
+        // Best-effort cleanup: a temp file left behind is not a test failure.
+        _ = remove_file(src)
+
+        return s"`slate js` exited ${wrote}"
+
+    write_text(driver, squatting_driver(name + ".js")).unwrap()
+
+    val ran = capture("node", [driver], "", [], true, 120000)
+
+    // Best-effort cleanup: a temp file left behind is not a test failure.
+    _ = remove_file(src)
+    _ = remove_file(out_js)
+    _ = remove_file(driver)
+
+    ran match
+        Err(e) -> s"node could not be started: ${e}"
+        Ok(o) -> if o.status.ok() then o.text.trim() else o.err.unwrap_or("").trim()
+end squatted_said
+
+@test
+JS_LISTEN_0_HANDS_BACK_A_PORT_SOMEBODY_HOLDS_ON_THE_IPV4_LOOPBACK()
+    // Without the guard this reads `kept the squatter's port` and then `reached the squatter`: the
+    // bind succeeds and the client's bytes go to the other process.
+    assert_eq(squatted_said(AnyPort), "chose another port\nreached this server")
+
+@test
+JS_LISTEN_ON_A_NAMED_PORT_IS_BOUND_AS_ASKED_EVEN_BESIDE_A_SQUATTER()
+    assert_eq(squatted_said(NamedPort), "bound the named port")
