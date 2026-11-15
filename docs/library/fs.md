@@ -110,6 +110,8 @@ save()
 val saving = setInterval(save, 20)
 
 changed(e)
+    if e.path != "notes.txt" then return
+
     print(e.path)
     unwatch(w)
     clearInterval(saving)
@@ -133,7 +135,10 @@ notes.txt
 convention: `unwatch` takes it, nothing else reads it, and one that has been stopped names nothing. A
 wrong argument — `watch(42, fn)`, a handler that is not a function — still faults.
 
-**`path` is `null` where the platform did not say which entry it was.** `kind` is `"rename"` for a name
+**`path` is `null` where the platform did not say which entry it was, and a change to the watched
+directory ITSELF is named by the directory's own last component** — the example above, which made
+`watched-tree` a moment before watching it, may be told `watched-tree` first, which is why it waits for
+the name it wants. `kind` is `"rename"` for a name
 appearing or going (a new file, a removed one, both ends of a rename) and `"change"` for new contents,
 which are node's two words and libuv's.
 
