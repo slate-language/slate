@@ -5,5 +5,6 @@
 
     modules: {
         extra: "extra.sl",
+        sheet: "sheet.sl",
     },
 }

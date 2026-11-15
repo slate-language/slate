@@ -86,6 +86,28 @@ is not slate source, so there are no names in it to take
 and a bare name asked of slate source says the same thing the other way round — **slate has no
 default export**, and a file that does have names in it is imported by naming them.
 
+**A stylesheet may also be imported bare, with no name at all**, which is how a file says it needs a
+sheet rather than that it holds one:
+
+```slate
+import "./button.css"
+```
+
+The sheet is read like any other asset and joins the program's stylesheets, which
+[`sheets()` from `slate:style`](../library/style.md) answers as an array of their texts — in the order
+the files were met, each once. A file imported both bare and by name is one file, read once; only the
+bare import puts it in `sheets()`. **A bare import is for a stylesheet and nothing else**, since a file
+that binds no name has to do something by being there, and anything else is refused in one sentence
+naming the form it wanted:
+
+```slate
+import "./util.sl"
+```
+
+```error
+a bare `import` is for a stylesheet, as in `import "./app.css"`
+```
+
 **A package's assets are the package's own.** A `.css` shipped beside a `.slx` is imported by that
 file, relatively, and handed on as an ordinary exported value — so nothing about the
 [package](packages.md) system had to learn what an asset is.
