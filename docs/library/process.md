@@ -118,7 +118,7 @@ true
 val r = await run(cmd, args, options)       // { status, signal, out, err } or an error
 ```
 
-Options are `{ cwd, env, timeout }`.
+Options are `{ cwd, env, timeout }`, and a key that is not one of them is refused at the call, naming it, as `spawn`'s is.
 
 - **A child that ran and failed is a success with a non-zero status; an error means there was no child.**
   That is what lets a caller tell "the program said no" from "there is no such program".

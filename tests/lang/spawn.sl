@@ -11,7 +11,7 @@
 // supervisor waits for the child and the child waits for the supervisor, which is a suite that hangs
 // with nothing printed rather than a test that fails.
 
-import { spawn, channel } from slate:process
+import { spawn, channel, run } from slate:process
 import { listen, close } from slate:net
 
 // A value whose type the checker cannot see, so that a refusal is the MACHINE's rather than the
@@ -534,3 +534,21 @@ async EVERY_OPTION_spawn_TAKES_IS_STILL_TAKEN_TOGETHER()
     assert(all.ok)
     assertEq((await all.value.stdout.text()).value, "/\n1")
     await all.value.exited
+
+@test
+WHAT_run_SAYS_ABOUT_AN_OPTION_IT_DOES_NOT_TAKE()
+    // **Refused rather than ignored**, as `spawn` does -- a misspelt `timeout` that was quietly
+    // dropped would leave a call with no limit.
+    assertFaults(() -> run("/bin/sh", [], anything({ timeot: 5 })), "`timeot` is not one of `run`'s options -- there are `cwd`, `env` and `timeout`")
+    assertFaults(() -> run("/bin/sh", [], anything({ cwd: "/", stdout: "pipe" })), "`stdout` is not one of `run`'s options")
+    assertFaults(() -> run("/bin/sh", [], anything({ ipc: true })), "`ipc` is not one of `run`'s options")
+    assertFaults(() -> run("/bin/sh", [], anything({ cwd: 5 })), "`cwd` is a string, and this is")
+    assertFaults(() -> run("/bin/sh", [], anything({ env: 5 })), "`env` is an object of names and values")
+    assertFaults(() -> run("/bin/sh", [], anything({ timeout: "x" })), "`timeout` is a duration or a number of milliseconds")
+
+@test
+async EVERY_OPTION_run_TAKES_IS_STILL_TAKEN_TOGETHER()
+    val all = await run("/bin/sh", ["-c", "pwd; printf '%s' \"$A\""], { cwd: "/", env: { A: "1" }, timeout: 30000 })
+
+    assert(all.ok)
+    assertEq(all.value.out, "/\n1")
