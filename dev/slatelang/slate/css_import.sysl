@@ -1,0 +1,454 @@
+module dev.slatelang.slate
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{StrBuilder, from_utf8, from_utf8_unchecked, str_builder}
+
+// A stylesheet's relative `@import`, resolved and inlined when the program is loaded.
+//
+// **A browser resolves an `@import` against the SHEET's address, and a sheet a program carries as a
+// string has none** -- it is put into the page as text, so `@import "./base.css"` would be fetched
+// relative to the page, which is somewhere else, and fail with nothing said. So the loader does what
+// a bundler does: the file the import names is read beside the importing file and its text stands
+// where the statement stood. Everything that is not relative -- `https:`, `//`, `/x.css` -- means
+// the same thing from a page as from a sheet and is left exactly as written.
+//
+// **The text is scanned as CSS tokens, not searched**, so an `@import` inside a comment or a string
+// is the comment or the string, and a `;` inside `url(...)` or `supports(...)` does not end a
+// statement.
+//
+// **Everything that would change what the sheet means is refused rather than done**, one sentence
+// each, drawn against the `@import` in the CSS file that wrote it:
+//
+// - an `@import` after a rule, which a browser ignores, so inlining it would apply rules that never
+//   applied;
+// - one naming a layer AND a condition, whose layer would be declared even where the condition
+//   is false once written as nested blocks;
+// - one an inlined file keeps (absolute) that would land after rules or inside a block, where a
+//   browser ignores it;
+// - a cycle, a file that is not there, a file that is not UTF-8, and a target that is not `.css`.
+//
+// **A file imported twice in one tree under the same condition is inlined once, where it is first
+// met.** A browser fetches it once and applies it at EVERY place it is imported, so the two differ in
+// one case only: a rule between the two imports that the second copy would override again.
+// `docs/library/style.md` says so.
+//
+// Its own file because none of it is the loader's business: `take_asset` in `module.sysl` asks
+// `inline_css` and turns a `CssFault` into a diagnostic, and nothing else crosses.
+
+// Why a stylesheet could not be inlined, against the file and the statement that asked.
+//
+// **The file's text travels with the fault** so the loader can render the complaint against the CSS
+// file's own line and column -- the stylesheet is not one of the program's sources until then.
+struct CssFault
+    file: string
+    text: string
+    at: Span
+    message: string
+
+// One inlining, from the stylesheet a program imported down through everything it imports.
+private struct CssInlining
+    out: StrBuilder
+
+    // The files being read, outermost first -- what a cycle is checked against and named from.
+    stack: Buf[string]
+
+    // Every file already inlined in this tree, keyed with the blocks it was wrapped in.
+    seen: Buf[string]
+
+    // Whether anything has been written that an `@import` may not follow.
+    rules_out: bool
+
+// The stylesheet at `file`, with every relative `@import` in it replaced by the text it names.
+//
+// Not `private`: `take_asset` in `module.sysl` asks it of every `.css` asset it reads.
+inline_css(file: string, text: string) -> Result[string, CssFault]
+    var st = CssInlining(str_builder(), buf(), buf(), false)
+
+    css_inline_into(&st, file, text, "", 0) match
+        Some(f) -> Err(f)
+        None -> Ok(st.out.finish())
+end inline_css
+
+// One file's text into the output, its relative imports followed as they are met.
+//
+// **`from` is how far the text has been copied**: everything is copied as it stands except an
+// `@import` statement that was inlined, so the scan only decides where those are.
+private css_inline_into(st: *CssInlining, file: string, text: string, chain: string, depth: usize) -> Option[CssFault]
+    st.stack.push(file)
+
+    val b = text.bytes
+    var i: usize = 0
+    var from: usize = 0
+    var nest: usize = 0
+    var past = false
+
+    while i < b.len
+        val c = b[i]
+
+        if c == u8('/') && i + 1 < b.len && b[i + 1] == u8('*')
+            i = css_comment_end(b, i)
+            continue
+
+        if css_space(c)
+            i += 1
+            continue
+
+        if c == u8('@') && nest == 0
+            val name_end = css_ident_end(b, i + 1)
+            val name = css_lower(b[i + 1..<name_end])
+            val stop = css_statement_end(b, name_end)
+            val statement = stop < b.len && b[stop] == u8(';')
+
+            if name == "import" && statement
+                st.out.push(from_utf8_unchecked(b[from..<i]))
+                from = i
+
+                css_take_import(st, file, text, i, name_end, stop, chain, depth, past) match
+                    Err(f) -> return Some(f)
+                    Ok(replaced) -> if replaced then from = stop + 1
+
+                i = stop + 1
+                continue
+
+            // **`@charset` and a `@layer` statement may come before an `@import`**, so they are
+            // not the rule that ends the run of imports.
+            if (name == "charset" || name == "layer") && statement
+                i = stop + 1
+                continue
+
+        if c == u8('"') || c == u8('\'')
+            i = css_string_end(b, i)
+        elif c == u8('\\')
+            i = if i + 2 <= b.len then i + 2 else b.len
+        else
+            if c == u8('{') then nest += 1
+            if c == u8('}') && nest > 0 then nest -= 1
+            i += 1
+
+        past = true
+        st.rules_out = true
+
+    st.out.push(from_utf8_unchecked(b[from..<b.len]))
+    st.stack.truncate(st.stack.len() - 1)
+    None
+end css_inline_into
+
+// One `@import`, from its `@` at `at` to its `;` at `stop`: answers whether it was replaced, which
+// it is where it is relative -- inlined, or inlined already and dropped.
+private css_take_import(st: *CssInlining, file: string, text: string, at: usize, name_end: usize, stop: usize, chain: string, depth: usize, past: bool) -> Result[bool, CssFault]
+    val b = text.bytes
+    val here = Span(at, stop + 1)
+    var k = css_skip_blank(b, name_end, stop)
+    var raw = ""
+
+    if k < stop && (b[k] == u8('"') || b[k] == u8('\''))
+        val close = css_string_end(b, k)
+
+        raw = css_string_text(b, k, close)
+        k = close
+    elif css_word_at(b, k, stop, "url") && k + 3 < stop && b[k + 3] == u8('(')
+        var j = css_skip_blank(b, k + 4, stop)
+
+        if j < stop && (b[j] == u8('"') || b[j] == u8('\''))
+            val close = css_string_end(b, j)
+
+            raw = css_string_text(b, j, close)
+            j = css_skip_blank(b, close, stop)
+        else
+            val start = j
+
+            while j < stop && b[j] != u8(')') && !css_space(b[j])
+                j += 1
+
+            raw = css_unescape(b[start..<j])
+            j = css_skip_blank(b, j, stop)
+
+        if j >= stop || b[j] != u8(')') then return Ok(false)
+
+        k = j + 1
+    else
+        return Ok(false)
+
+    if !(raw.starts_with("./") || raw.starts_with("../"))
+        if depth > 0 && (chain != "" || st.rules_out)
+            return css_fault(file, text, here,s"`@import` of `${raw}` cannot be kept once `${file}` is inlined into `${st.stack[0]}`: it would land after rules or inside a block, where a browser ignores it")
+
+        return Ok(false)
+
+    if !raw.ends_with(".css")
+        return css_fault(file, text, here,s"`${raw}` is not a stylesheet, and an `@import` is inlined only where it names a `.css` file beside this one")
+
+    if past
+        return css_fault(file, text, here,s"an `@import` after a rule is ignored by a browser, so `${raw}` is not inlined -- move it above the first rule in `${file}`")
+
+    // -- the condition: `layer`, `layer(name)`, `supports(...)`, and a media query list ----------
+
+    k = css_skip_blank(b, k, stop)
+
+    var layer = ""
+    var layered = false
+
+    if css_word_at(b, k, stop, "layer")
+        val after = k + 5
+
+        if after < stop && b[after] == u8('(')
+            val close = css_paren_end(b, after, stop)
+
+            layer = s" ${css_trim(b[after + 1..<close])}"
+            layered = true
+            k = if close < stop then close + 1 else stop
+        else
+            layered = true
+            k = after
+
+    k = css_skip_blank(b, k, stop)
+
+    var supports = ""
+
+    if css_word_at(b, k, stop, "supports") && k + 8 < stop && b[k + 8] == u8('(')
+        val close = css_paren_end(b, k + 8, stop)
+
+        supports = css_trim(b[k + 9..<close])
+        k = if close < stop then close + 1 else stop
+
+    k = css_skip_blank(b, k, stop)
+
+    val media = css_trim(b[k..<stop])
+
+    if layered && (supports != "" || media != "")
+        return css_fault(file, text, here,s"`@import` of `${raw}` names a layer and a condition, which cannot be inlined without declaring the layer where the condition is false -- write the `@layer` block inside `${raw}` and import it with the condition alone")
+
+    // **At most two blocks, `@supports` outside `@media`**: an import's conditions must all hold, and
+    // two nested blocks are that. A layer is the third case and stands alone.
+    var open = ""
+    var blocks = 0
+
+    if layered
+        open = s"@layer${layer} {\n"
+        blocks = 1
+
+    if supports != ""
+        open = s"@supports (${supports}) {\n"
+        blocks = 1
+
+    if media != ""
+        open = s"${open}@media ${media} {\n"
+        blocks += 1
+
+    // -- the file it names ------------------------------------------------------------------------
+
+    val target = normalize_path(s"${dir_of(file)}${raw}")
+
+    for i in 0..<st.stack.len()
+        if st.stack[i] == target
+            var circle = str_builder()
+
+            for n in i..<st.stack.len()
+                circle.push(s"`${st.stack[n]}` imports ")
+
+            circle.push(s"`${target}`")
+            return css_fault(file, text, here,s"this `@import` closes a circle: ${circle.finish()}")
+
+    val inner = s"${chain}${open}"
+    val key = s"${target}\n${inner}"
+
+    for i in 0..<st.seen.len()
+        if st.seen[i] == key then return Ok(true)
+
+    val got = source_bytes(target) match
+        Err(e) -> return css_fault(file, text, here,s"cannot read `${target}`, which `${file}` imports: ${e}")
+        Ok(bytes) -> bytes
+
+    val child = from_utf8(got) match
+        Err(_) -> return css_fault(file, text, here,s"`${target}` is not UTF-8 text, so `${file}` cannot import it")
+        Ok(t) -> t
+
+    st.seen.push(key)
+
+    if open != ""
+        st.out.push(open)
+        st.rules_out = true
+
+    css_inline_into(st, target, child, inner, depth + 1) match
+        Some(f) -> return Err(f)
+        None -> ()
+
+    if blocks > 0
+        if !child.ends_with("\n") then st.out.push("\n")
+
+        st.out.push("}")
+
+        if blocks > 1 then st.out.push("\n}")
+
+    Ok(true)
+end css_take_import
+
+private css_fault(file: string, text: string, at: Span, message: string) -> Result[bool, CssFault] = Err(CssFault(file, text, at, message))
+
+// -- tokens ---------------------------------------------------------------------------------------
+
+// What a quoted string from `open` to `close` (as `css_string_end` answered it) says, the quotes
+// left out -- and a string a newline or the end cut short has no closing one to leave out.
+private css_string_text(b: []const u8, open: usize, close: usize) -> string
+    val shut = close > open + 1 && b[close - 1] == b[open]
+
+    css_unescape(b[open + 1..<(if shut then close - 1 else close)])
+
+private css_space(c: u8) -> bool = c == u8(' ') || c == u8('\t') || c == u8('\n') || c == u8('\r') || c == 12
+
+private css_ident(c: u8) -> bool
+    (c >= u8('a') && c <= u8('z')) || (c >= u8('A') && c <= u8('Z')) || (c >= u8('0') && c <= u8('9')) ||
+        c == u8('-') || c == u8('_') || c >= 128
+
+private css_ident_end(b: []const u8, from: usize) -> usize
+    var i = from
+
+    while i < b.len && css_ident(b[i])
+        i += 1
+
+    i
+
+private css_lower(b: []const u8) -> string
+    var out: Buf[u8] = buf()
+
+    for i in 0..<b.len
+        out.push(if b[i] >= u8('A') && b[i] <= u8('Z') then b[i] + 32 else b[i])
+
+    from_utf8_unchecked(out.view())
+
+// Whether the identifier at `k` is `word`, in any case, and ends there.
+private css_word_at(b: []const u8, k: usize, stop: usize, word: string) -> bool
+    val n = word.bytes.len
+
+    if k + n > stop then return false
+    if css_lower(b[k..<k + n]) != word then return false
+
+    k + n == stop || !css_ident(b[k + n])
+
+// Past a `/* ... */` starting at `i`, or to the end where it is never closed.
+private css_comment_end(b: []const u8, i: usize) -> usize
+    var j = i + 2
+
+    while j + 1 < b.len
+        if b[j] == u8('*') && b[j + 1] == u8('/') then return j + 2
+        j += 1
+
+    b.len
+
+// Past a quoted string starting at `i`: a backslash takes the byte after it, and an unescaped newline
+// ends a string a browser would call bad.
+private css_string_end(b: []const u8, i: usize) -> usize
+    val q = b[i]
+    var j = i + 1
+
+    while j < b.len
+        if b[j] == u8('\\')
+            j += 2
+            continue
+
+        if b[j] == q then return j + 1
+        if b[j] == u8('\n') then return j
+
+        j += 1
+
+    b.len
+end css_string_end
+
+// Past whitespace and comments.
+private css_skip_blank(b: []const u8, from: usize, stop: usize) -> usize
+    var k = from
+
+    while k < stop
+        if css_space(b[k])
+            k += 1
+        elif b[k] == u8('/') && k + 1 < stop && b[k + 1] == u8('*')
+            k = css_comment_end(b, k)
+        else
+            return k
+
+    stop
+
+// The `)` matching the `(` at `open`, or `stop` where there is none before it.
+private css_paren_end(b: []const u8, open: usize, stop: usize) -> usize
+    var depth: usize = 0
+    var j = open
+
+    while j < stop
+        val c = b[j]
+
+        if c == u8('"') || c == u8('\'')
+            j = css_string_end(b, j)
+            continue
+
+        if c == u8('/') && j + 1 < stop && b[j + 1] == u8('*')
+            j = css_comment_end(b, j)
+            continue
+
+        if c == u8('(') then depth += 1
+
+        if c == u8(')')
+            depth -= 1
+            if depth == 0 then return j
+
+        j += 1
+
+    stop
+end css_paren_end
+
+// Where an at-rule's prelude ends: its `;` or its `{`, outside any string, comment or parentheses --
+// or the end of the text.
+private css_statement_end(b: []const u8, from: usize) -> usize
+    var depth: usize = 0
+    var j = from
+
+    while j < b.len
+        val c = b[j]
+
+        if c == u8('"') || c == u8('\'')
+            j = css_string_end(b, j)
+            continue
+
+        if c == u8('/') && j + 1 < b.len && b[j + 1] == u8('*')
+            j = css_comment_end(b, j)
+            continue
+
+        if c == u8('\\')
+            j += 2
+            continue
+
+        if c == u8('(') then depth += 1
+        if c == u8(')') && depth > 0 then depth -= 1
+        if depth == 0 && (c == u8(';') || c == u8('{') || c == u8('}')) then return j
+
+        j += 1
+
+    b.len
+end css_statement_end
+
+// The text of a string or an unquoted url with its backslash escapes taken out.
+private css_unescape(b: []const u8) -> string
+    var out: Buf[u8] = buf()
+    var i: usize = 0
+
+    while i < b.len
+        if b[i] == u8('\\') && i + 1 < b.len
+            out.push(b[i + 1])
+            i += 2
+        else
+            out.push(b[i])
+            i += 1
+
+    from_utf8_unchecked(out.view())
+
+private css_trim(b: []const u8) -> string
+    var s: usize = 0
+    var e = b.len
+
+    while s < e && css_space(b[s])
+        s += 1
+
+    while e > s && css_space(b[e - 1])
+        e -= 1
+
+    from_utf8_unchecked(b[s..<e])

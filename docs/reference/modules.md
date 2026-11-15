@@ -108,6 +108,36 @@ import "./util.sl"
 a bare `import` is for a stylesheet, as in `import "./app.css"`
 ```
 
+**A stylesheet's relative `@import` is inlined.** A browser resolves an `@import` against the
+sheet's own address, and a sheet a program carries as text has none — so `@import "./tokens.css"`
+would be fetched relative to the page and fail without a word. The loader reads the file beside the
+stylesheet instead and puts its text where the statement stood, following its imports in turn:
+
+```slate
+import panel from "./panel.css"
+
+print(panel.trim())
+```
+
+```output
+:root { --ink: #222; }
+
+.panel { color: var(--ink); }
+```
+
+Only a path starting `./` or `../` is inlined; `https:`, `//` and `/` mean the same from a page as
+from a sheet and are left as written, and so is an `@import` inside a comment or a string. The rest —
+conditions, a file imported twice, what is refused — is in [`slate:style`](../library/style.md). A
+stylesheet that imports a file that is not there is refused at its `@import`, naming both:
+
+```slate
+import broken from "./broken.css"
+```
+
+```error
+cannot read `docs/reference/nowhere.css`, which `docs/reference/broken.css` imports
+```
+
 **A package's assets are the package's own.** A `.css` shipped beside a `.slx` is imported by that
 file, relatively, and handed on as an ordinary exported value — so nothing about the
 [package](packages.md) system had to learn what an asset is.
