@@ -1,0 +1,173 @@
+module dev.slatelang.slate
+
+import sh.sysl.kairos.uv
+import sh.sysl.libuv
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.{os, MacOS}
+
+// `watch(dir, fn)` and `unwatch(id)` in `slate:fs` -- be told when something under a directory changes.
+//
+//     val w = watch("src", e -> print(e.kind, e.path))
+//
+// **The operating system says what changed; nothing is polled.** kairos's `io.watch` is FSEvents on
+// macOS, recursive over the whole tree, and every change arrives as a turn of the loop on which a
+// kairos task wakes and calls the program's function with `{ path, kind }`: the path relative to the
+// directory, and `"rename"` or `"change"` -- the two words libuv has, and node's two words too.
+//
+// **One save is several events, and nothing here merges them.** An editor writes a temporary file and
+// renames it over the old one, a formatter touches three files, and FSEvents carries a file's recent
+// history in the flags of a later event, so a file made a moment ago is still reported as a rename
+// when it is written to. A caller that rebuilds debounces and looks at the disk again; `slate run
+// --watch` (`watch.sysl`) is that caller, and it is why the burst is not this file's to settle.
+//
+// ## A watcher KEEPS the program alive, which is the opposite of a signal watcher
+//
+// `onSignal` registers something that may happen while the program does whatever it is for, so it is
+// put in kairos's background (`signals.sysl`). A file watcher is usually what the program is FOR --
+// a development server, a rebuild loop -- and a program that watched a directory and then ended at
+// once would have done nothing at all. That is node's rule as well: `fs.watch` is `persistent` unless
+// asked otherwise. So the watcher takes a slot in `event.sysl`'s table the way a socket does, the slot
+// holds the program's function where the mark phase reaches it, and `unwatch` is what gives it back.
+// A test that watches must unwatch, and one that forgets is told so by name (`leaked_since`).
+//
+// ## Linux, honestly
+//
+// **inotify watches one directory at a time and libuv does not walk the tree**, so a recursive watch
+// there would silently miss every edit below the top level. `watch` answers an error result off macOS
+// instead, which is `slate run --watch`'s rule for the same reason, and the JavaScript back end says
+// the same sentence so that one program behaves one way on either host.
+
+// The sentence a platform without a recursive watcher is answered with. Not `private`: the
+// JavaScript back end's twin in `js_rt_host_io.sysl` is checked against it.
+val TreeWatchUnavailable: string =
+    "watching a directory tree needs macOS's FSEvents, and inotify on this platform watches one directory at a time"
+
+// `watch(dir, fn)` -- call `fn(event)` for every change under `dir`, until `unwatch(id)`.
+//
+// **The answer is a result** -- `{ ok: true, value: id }` or `{ ok: false, error }` -- for `slate:fs`'s
+// reason: a directory that is not there is news about the disk, not a defect in the program. The id is
+// `setTimeout`'s and `onSignal`'s convention, a generation, so a stale one names nothing.
+do_watch(args: Args, at: Span) -> Step
+    wants(args, 2, at, "watch", "a directory and a function")?
+
+    val dir = text_argument(args.at(0), at, "watch", "a directory")?
+    val cb = args.at(1)
+
+    cb match
+        Fn(_) -> ()
+        Native(_) -> ()
+        HostFn(_) -> ()
+        other -> return fault(at, s"`watch` needs a function to call, and this is ${other.type_name()}")
+
+    // **The directory is asked about first**, so a path that is not there is the same answer on every
+    // platform, and a file is refused rather than watched as a directory with nothing in it.
+    libuv.stat_sync(dir) match
+        Err(e) -> return Ok(err_value(s"cannot watch ${dir}: ${e}"))
+        Ok(st) -> if !st.is_dir() then return Ok(err_value(s"cannot watch ${dir}: it is not a directory"))
+
+    if os() != MacOS then return Ok(err_value(s"cannot watch ${dir}: ${TreeWatchUnavailable}"))
+
+    current().io.watch(dir, true) match
+        Err(e) -> Ok(err_value(s"cannot watch ${dir}: ${e}"))
+        Ok(w) ->
+            val id = claim(Pending(cb, Null, null, None, None, Some(w), true, true, 0, 0))
+            val gen = gen_at(id)
+
+            // **The task carries the slot and its generation, not the function**: the collector
+            // cannot see through a task, and the slot is where the mark phase finds the callback.
+            loop_events().spawn(file_changes(w, id, gen, run_stamp()))
+
+            Ok(ok_value(Int(long(gen))))
+end do_watch
+
+// Every change the watcher reports, until its slot is given back.
+//
+// **It ends three ways and each is a `return`**: the slot given back (`unwatch`, a test's leak
+// check, a reset), which closes the watcher and wakes this with `ECANCELED`; the program that
+// started it having ended, which the stamp says; and a failure the backend reports, after which the
+// watcher is given back too -- a watcher that can say nothing more is no reason to keep running.
+private async file_changes(w: &uv.Watch, id: usize, gen: usize, stamp: usize)
+    loop
+        val got = await w.next()
+
+        if !same_run(stamp) || !holds(id, gen) then return
+
+        got match
+            Err(_) ->
+                surrender(id)
+                return
+            Ok(change) -> heard_change(id, change)
+end file_changes
+
+// Call the program's function with one change.
+//
+// **A fault inside it stops the program**, as one inside a timer callback or a signal handler does.
+// Nothing here is a root but what is held: the function is held before the event is built, and the
+// event before it is handed over.
+private heard_change(id: usize, change: uv.FsChange)
+    val cb = current().pending[id].callback
+    val mark = root_mark()
+
+    hold(cb)
+
+    val o = new_object()
+
+    hold(Object(o))
+
+    // **`null` where the platform did not say which entry it was**, which libuv allows.
+    val named = change.filename match
+        Some(n) -> str_value(n)
+        None -> Null
+
+    obj_put_name(o, "path", named)
+    obj_put_name(o, "kind", str_value(if change.renamed() then "rename" else "change"))
+
+    var given: Buf[Value] = buf()
+
+    given.push(Object(o))
+
+    apply_callback(cb, given, point(0), "watch") match
+        Ok(_) -> ()
+        Err(s) -> current().loop_fault = Some(s)
+
+    release(mark)
+end heard_change
+
+// `unwatch(id)` -- stop the watcher that id names.
+//
+// **An id that names nothing is not an error**, which is `clearTimeout`'s and `offSignal`'s rule. An
+// id that names a timer or a socket is nothing here either: only a slot holding a watcher is stopped.
+do_unwatch(args: Args, at: Span) -> Step
+    wants(args, 1, at, "unwatch", "the id `watch` answered")?
+
+    args.at(0) match
+        Int(n) ->
+            if n >= 0
+                slot_of_gen(usize(n)) match
+                    Some(i) -> if current().pending[i].watcher.is_some() then surrender(i)
+                    None -> ()
+
+            Ok(Null)
+        other -> fault(at, s"a watcher is stopped by the id `watch` answered, and this is ${other.type_name()}")
+end do_unwatch
+
+// What a watcher left open is called in a test's leak report.
+//
+// Not `private`: `leak_description` in `event.sysl` names it.
+watcher_description(w: &uv.Watch) -> string
+    w.path() match
+        Ok(p) -> s"a file watcher on ${p}"
+        Err(_) -> "a file watcher"
+
+var n_watch: NativeFn = 0
+var n_unwatch: NativeFn = 0
+
+install_fs_watch(env: *EnvObj, everything: bool)
+    n_watch = register("watch", do_watch)
+    n_unwatch = register("unwatch", do_unwatch)
+
+    if everything
+        declare(env, "watch", Native(n_watch), false)
+        declare(env, "unwatch", Native(n_unwatch), false)
+end install_fs_watch
