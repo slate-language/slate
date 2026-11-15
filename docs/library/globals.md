@@ -628,7 +628,8 @@ yet"* any more.
 Two things differ there and [JavaScript](../reference/javascript.md) says why: **`trust` refuses**,
 no JavaScript host letting a program add a certificate authority for one request, and **the redirect
 rule is the host's** — the interpreter follows at most five and refuses one that leaves `https` for
-`http`, where a browser follows them itself and gives a page no way in.
+`http`, where a browser follows them itself and gives a page no way in, which is also why
+`redirect: "manual"` refuses there.
 
 **An `https` fetch speaks HTTP/2 where the server offers it**, the client offering `h2` and
 `http/1.1` in the TLS handshake and the server choosing; a server that chooses `http/1.1`, or names
@@ -653,8 +654,39 @@ forbidden response-header name, so a page never reads one. The browser still app
 **A body that is not UTF-8 is `""`** rather than a string of replacement characters, which is the same
 answer `run` gives and for the same reason: slate has no byte value for it to be.
 
-**The options** are `method`, `body`, `headers`, `trust`, `timeout`, `stream` and `reuse`, all
-optional.
+**The options** are `method`, `body`, `headers`, `trust`, `timeout`, `stream`, `reuse` and
+`redirect`, all optional. **Any other key is refused**, naming it — a misspelt `timout` quietly
+ignored would be a fetch with no limit in a program that believes it has one:
+
+```slate
+print(fetch("http://127.0.0.1:1/", { timout: 100 }))
+```
+
+```error
+`fetch` has no option `timout` -- it takes `method`, `body`, `headers`, `timeout`, `stream`, `reuse`, `redirect` and `trust`
+```
+
+**`redirect` says what a redirect does, in the browser's spelling.** `"follow"` is the default: a
+3xx carrying a `Location` is followed, at most five times, and one that leaves `https` for `http` is
+refused. `"manual"` answers the 3xx itself — its status, every header as the server sent it
+(`set-cookie` still a list of every line), `location` exactly as written and never resolved against
+the URL, and the body as usual, streamed too under `stream: true`. That is what a reverse proxy
+needs: a 303 it followed would swallow the `Set-Cookie` the client behind it was meant to get.
+`"error"` fails the fetch instead, as `{ ok: false, error }`. A response that is not a redirect is
+answered the same under all three. Any other value is refused:
+
+```slate
+print(fetch("http://127.0.0.1:1/", { redirect: "stop" }))
+```
+
+```error
+`redirect` is "follow", "manual" or "error", and this is "stop"
+```
+
+**Under `slate js`, `redirect: "manual"` refuses**, the way `trust` does: a browser answers a manual
+redirect with an opaque response — no status, no headers, no location — so the one thing the option
+asks for is the thing a page cannot be handed. `"follow"` and `"error"` go to the host's `fetch` as
+they are.
 
 **Connections are pooled and reused, per origin.** Over HTTP/1.1 a connection whose answer was read
 to its last byte — a `Content-Length` met, a chunked body read through its trailers, or a reply with

@@ -585,6 +585,11 @@ to read — so a page cannot implement that rule at all, and doing it on node al
 JavaScript hosts disagree with each other. This is `ping`'s case in `slate:ws`: the host does the
 thing and gives the program no way in.
 
+**So a program's own `redirect: "manual"` refuses here**, the way `trust` does, since the 3xx it asks
+for is exactly what a browser withholds. `"follow"` and `"error"` are handed to the host's `fetch`;
+under `"error"`, node says the failure was a redirect and the answer is the interpreter's sentence,
+where a browser's one `TypeError` cannot be told from any other failure and is quoted as any other is.
+
 **A body that is not UTF-8 is `""` on both**, which took a decision here: a host's `text()` replaces
 every bad byte with U+FFFD, so the response would come back as replacement characters here and as
 `""` there. The bytes are decoded strictly instead and the failure is caught.
