@@ -26,6 +26,7 @@ What a program has without writing it.
 | [`slate:crypto`](crypto.md) | digests, HMAC, Argon2id, key derivation, randomness |
 | [`slate:jwt`](jwt.md) | JSON Web Tokens |
 | [`slate:ws`](ws.md) | WebSockets |
+| [`slate:style`](style.md) | the stylesheets a program brings in with a bare `import "./app.css"` |
 | [`slate:redis`](redis.md) | a Redis client |
 | [`slate:sqlite`](sqlite.md) | SQLite — the database that needs no server |
 | [`slate:gzip`](gzip.md) | gzip and zlib — the compression every host has |
