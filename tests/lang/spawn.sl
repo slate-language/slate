@@ -362,3 +362,175 @@ async A_SIGPIPE_DOES_NOT_END_THE_PROGRAM()
     await spawn("/bin/sh", ["-c", "kill -PIPE $PPID"]).value.exited
 
     assert(true)
+
+// -- a child's output, piped to the program ---------------------------------------------------------
+
+@test
+async A_PIPED_STDOUT_IS_READ_WHOLE_BY_text()
+    val child = spawn("/bin/sh", ["-c", "printf 'hello\\nworld\\n'"], { stdout: "pipe" }).value
+    val said = await child.stdout.text()
+
+    assert(said.ok)
+    assertEq(said.value, "hello\nworld\n")
+    assertEq((await child.exited).value.status, 0)
+
+@test
+async A_PIPED_STREAM_HANDS_OVER_EACH_CHUNK_AS_IT_ARRIVES()
+    // **The first line is handed over while the child is still running**, which `onExit` not having
+    // been called yet says -- a stream that handed nothing over until the child ended would see it
+    // called by then.
+    val child = spawn("/bin/sh", ["-c", "echo first; sleep 0.2; echo second"], { stdout: "pipe" }).value
+    var gone = false
+
+    child.onExit(_ ->
+        gone = true)
+
+    val first = await child.stdout.next()
+
+    assert(!first.done)
+    assertEq(fromBytes(first.value).value, "first\n")
+
+    // The exit waits for the stream, so a child still writing has not been reported gone.
+    assert(!gone)
+
+    var rest = ""
+
+    for await chunk in child.stdout
+        rest = rest + fromBytes(chunk).value
+
+    assertEq(rest, "second\n")
+    assertEq((await child.exited).value.status, 0)
+    assert(gone)
+
+@test
+async A_CHILD_WRITING_A_MEGABYTE_IS_NOT_BLOCKED_BY_A_PROGRAM_THAT_WAITS_FOR_ITS_EXIT_FIRST()
+    // **More than any pipe buffer holds, and the exit awaited before a byte is read.** A stream that
+    // only read when asked would leave the child blocked on a full pipe and the program waiting on
+    // an exit that never comes.
+    val child = spawn("/bin/sh", ["-c", "head -c 1048576 /dev/zero | tr '\\0' x"], { stdout: "pipe" }).value
+
+    assertEq((await child.exited).value.status, 0)
+
+    val said = await child.stdout.text()
+
+    assertEq(said.value.length, 1048576)
+    assert(said.value.startsWith("xxxx"))
+
+@test
+async A_MEGABYTE_READ_CHUNK_BY_CHUNK_ARRIVES_WHOLE()
+    val child = spawn("/bin/sh", ["-c", "head -c 1048576 /dev/zero"], { stdout: "pipe" }).value
+    var total = 0
+
+    for await chunk in child.stdout
+        total = total + chunk.length
+
+    assertEq(total, 1048576)
+    assertEq((await child.exited).value.status, 0)
+
+@test
+async STDOUT_AND_STDERR_ARE_PIPED_APART()
+    val child = spawn("/bin/sh", ["-c", "printf out; printf err >&2; printf more; exit 4"],
+        { stdout: "pipe", stderr: "pipe" }).value
+
+    val out = await child.stdout.text()
+    val err = await child.stderr.text()
+    val gone = await child.exited
+
+    assertEq(out.value, "outmore")
+    assertEq(err.value, "err")
+    assertEq(gone.value.status, 4)
+
+@test
+async EVERYTHING_A_CHILD_WROTE_BEFORE_IT_EXITED_IS_THERE_AFTER_exited_SETTLES()
+    // **`exited` waits for the piped streams to end**, as it waits for the channel, so a program that
+    // learns of the exit first reads everything afterwards -- stderr written as the last act included.
+    val child = spawn("/bin/sh", ["-c", "echo one; echo two >&2; echo three; exit 1"],
+        { stdout: "pipe", stderr: "pipe" }).value
+    val gone = await child.exited
+
+    assertEq(gone.value.status, 1)
+    assertEq((await child.stdout.text()).value, "one\nthree\n")
+    assertEq((await child.stderr.text()).value, "two\n")
+
+@test
+async A_CHILD_THAT_EXITS_AT_ONCE_HAS_AN_EMPTY_STREAM()
+    val quiet = spawn("/bin/sh", ["-c", "exit 0"], { stdout: "pipe" }).value
+    val step = await quiet.stdout.next()
+
+    assert(step.done)
+    assertEq((await quiet.stdout.next()).done, true)
+
+    val also = spawn("/bin/sh", ["-c", "exit 0"], { stderr: "pipe" }).value
+
+    assertEq((await also.stderr.text()).value, "")
+    assertEq((await quiet.exited).value.status, 0)
+    assertEq((await also.exited).value.status, 0)
+
+@test
+async OUTPUT_THAT_IS_NOT_TEXT_IS_AN_ANSWER_FROM_text()
+    val child = spawn("/bin/sh", ["-c", "printf '\\377'"], { stdout: "pipe" }).value
+    val said = await child.stdout.text()
+
+    assert(!said.ok)
+    assert(said.error.contains("not text"))
+    await child.exited
+
+@test
+async A_STREAM_LEFT_EARLY_IS_STILL_DRAINED_SO_THE_CHILD_ENDS()
+    // **Leaving the loop lets go of the stream and does not close the pipe under the child**, which
+    // goes on writing a megabyte nobody reads -- and still exits, because the rest is thrown away.
+    val child = spawn("/bin/sh", ["-c", "head -c 1048576 /dev/zero"], { stdout: "pipe" }).value
+
+    for await chunk in child.stdout
+        assert(chunk.length > 0)
+        break
+
+    assertEq((await child.exited).value.status, 0)
+    assertEq((await child.stdout.next()).done, true)
+    assert(!(await child.stdout.text()).ok)
+
+@test
+async A_STREAM_IS_ONE_VALUE_AND_HAS_ONE_READER_AT_A_TIME()
+    val child = spawn("/bin/sh", ["-c", "sleep 0.1; echo late"], { stdout: "pipe" }).value
+
+    assert(child.stdout == child.stdout)
+
+    val pending = child.stdout.next()
+
+    assertFaults(() -> child.stdout.next(), "already working on a `next`")
+    assertFaults(() -> child.stdout.text(), "already being read")
+
+    assertEq(fromBytes((await pending).value).value, "late\n")
+    await child.exited
+
+@test
+async AN_OUTPUT_THAT_IS_NOT_PIPED_IS_null()
+    // **Inherited is still the default**, so a child started as before has nothing to read.
+    val plain = spawn("/bin/sh", ["-c", "exit 0"]).value
+    val ignored = spawn("/bin/sh", ["-c", "echo nobody hears this"], { stdout: "ignore", stderr: "inherit" }).value
+
+    assertEq(plain.stdout, null)
+    assertEq(plain.stderr, null)
+    assertEq(ignored.stdout, null)
+    assertEq(ignored.stderr, null)
+    await plain.exited
+    await ignored.exited
+
+@test
+WHAT_spawn_SAYS_ABOUT_AN_OPTION_IT_DOES_NOT_TAKE()
+    // **Refused rather than ignored**, naming the key -- a misspelt `stdout` that was quietly dropped
+    // would leave a program waiting on a stream it never asked for.
+    assertFaults(() -> spawn("/bin/sh", [], anything({ stdot: "pipe" })), "`stdot` is not one of `spawn`'s options")
+    assertFaults(() -> spawn("/bin/sh", [], anything({ cwd: "/", timeout: 5 })), "`timeout` is not one of")
+    assertFaults(() -> spawn("/bin/sh", [], { stdout: "piped" }), "`stdout` is \"inherit\", \"pipe\" or \"ignore\", and this is \"piped\"")
+    assertFaults(() -> spawn("/bin/sh", [], { stderr: true }), "`stderr` is \"inherit\", \"pipe\" or \"ignore\", and this is")
+    assertFaults(() -> spawn("/bin/sh", [], { stdout: null }), "`stdout` is \"inherit\", \"pipe\" or \"ignore\", and this is")
+
+@test
+async EVERY_OPTION_spawn_TAKES_IS_STILL_TAKEN_TOGETHER()
+    val all = spawn("/bin/sh", ["-c", "pwd; printf '%s' \"$A\""],
+        { cwd: "/", env: { A: "1" }, ipc: false, stdout: "pipe", stderr: "ignore" })
+
+    assert(all.ok)
+    assertEq((await all.value.stdout.text()).value, "/\n1")
+    await all.value.exited

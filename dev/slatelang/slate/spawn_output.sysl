@@ -1,0 +1,355 @@
+module dev.slatelang.slate
+
+import sh.sysl.kairos.uv.{Pipe, Stdio}
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{from_utf8, Utf8Error}
+
+// A child's standard output and error, where `spawn`'s options piped them to this program.
+//
+// **`spawn.sysl` is the other half**: the child, its channel and its exit. What is here is the two
+// streams -- reading the pipes, holding what arrived, and the asynchronous source `child.stdout` and
+// `child.stderr` answer. It is cut from `spawn.sysl` at the stream because nothing below reads the
+// channel and nothing in the channel's half reads a stream; what crosses is the start of the reads
+// (`piped_as`, `child_reads`), the question the exit asks (`child_quiet`), and the two things a stream
+// asks of a child (`child_of`, `report_child_exit`).
+//
+// **A stream is the shape a streamed fetch body has**, `client_stream.sysl`'s: an object answering
+// `next()` with a promise of `{ value, done }`, each value a `bytes`, so `for await chunk in
+// child.stdout` reads it -- and `text()` beside it for a program that wants the whole of it.
+
+// The stream a piped option asks for, holding the parent's end; anything else is nothing to read.
+//
+// Not `private`: `start_child` in `spawn.sysl` makes both of a child's streams with it.
+piped_as(mode: Stdio, pipe: Option[&Pipe]) -> Piped
+    if mode != Stdio.Piped then return unpiped(mode)
+
+    Piped(mode, pipe, buf(), pipe.is_none(), false, None, None, Null)
+
+private piped(slot: usize, is_out: bool) -> Piped =
+    if is_out then current().children[slot].out else current().children[slot].err
+
+private put_piped(slot: usize, is_out: bool, p: Piped)
+    var c = current().children[slot]
+
+    if is_out
+        c.out = p
+    else
+        c.err = p
+
+    current().children[slot] = c
+
+// Whether everything the child can still say has arrived: its channel and both its piped streams.
+//
+// Not `private`: `spawn.sysl` asks it at the exit and at the channel's end, either of which may be
+// the last thing the exit was waiting for.
+child_quiet(c: Child) -> bool = c.channel.is_none() && c.out.ended && c.err.ended
+
+// Read one of the child's pipes until it ends. **A read that fails is an end and not a fault**, which
+// is `run`'s rule: a child that died mid-sentence has still said everything it managed to.
+//
+// Not `private`: `start_child` in `spawn.sysl` starts one for each piped stream.
+async child_reads(slot: usize, stamp: usize, p: &Pipe, is_out: bool)
+    loop
+        val got = (await p.read()) match
+            Ok(bytes) -> bytes
+            Err(_) -> break
+
+        if !same_run(stamp) then return
+        if got.len == 0 then break
+
+        child_output(slot, got, is_out)
+
+    // A reset has closed the pipe already, and the slot is another program's.
+    if !same_run(stamp) then return
+
+    p.close()
+    child_output_end(slot, is_out)
+end child_reads
+
+// Bytes the child wrote to one of its piped streams.
+private child_output(slot: usize, bytes: []const u8, is_out: bool)
+    if slot >= current().children.len() || !current().children[slot].live then return
+
+    var p = piped(slot, is_out)
+
+    if p.released then return
+
+    for b in bytes do p.held.push(b)
+
+    put_piped(slot, is_out, p)
+    deliver_output(slot, is_out)
+
+// One of the child's piped streams has ended. **The exit waits for it**, as it waits for the channel:
+// `exited` settles once everything the child wrote has arrived.
+private child_output_end(slot: usize, is_out: bool)
+    if slot >= current().children.len() || !current().children[slot].live then return
+
+    var p = piped(slot, is_out)
+
+    p.ended = true
+    p.pipe = None
+    put_piped(slot, is_out, p)
+    deliver_output(slot, is_out)
+    finish_whole(slot, is_out)
+
+    val c = current().children[slot]
+
+    if c.settled && child_quiet(c) then report_child_exit(slot)
+
+// Answer the `next()` waiting on a stream, where there is now something to answer it with.
+private deliver_output(slot: usize, is_out: bool)
+    var p = piped(slot, is_out)
+
+    val id = p.waiting match
+        Some(id) -> id
+        None -> return
+
+    if p.held.len() > 0
+        val mark = root_mark()
+        val chunk = bytes_from(p.held.view())
+
+        hold(chunk)
+        p.held = buf()
+        p.waiting = None
+        put_piped(slot, is_out, p)
+        answer_plain_request(id, output_step(false, chunk))
+        release(mark)
+    else if p.ended
+        p.waiting = None
+        put_piped(slot, is_out, p)
+        answer_plain_request(id, output_step(true, Null))
+
+// Answer the `text()` waiting on a stream, once the stream has ended.
+private finish_whole(slot: usize, is_out: bool)
+    var p = piped(slot, is_out)
+
+    if !p.ended then return
+
+    val id = p.whole match
+        Some(id) -> id
+        None -> return
+
+    val said = from_utf8(p.held.view())
+
+    p.held = buf()
+    p.whole = None
+    put_piped(slot, is_out, p)
+
+    val mark = root_mark()
+    val answer = whole_answer(said, is_out)
+
+    hold(answer)
+    answer_plain_request(id, answer)
+    release(mark)
+
+// What a `text()` answers: the text, or the sentence for output that is not text -- **an answer and
+// not a fault**, the bytes having come from outside the program.
+private whole_answer(said: Result[string, Utf8Error], is_out: bool) -> Value = said match
+    Ok(t) -> ok_value(str_value(t))
+    Err(_) -> err_value(if is_out then "what the child printed is not text" else "what the child printed on its error output is not text")
+
+// `{ done, value }`, which is what a source's `next()` answers.
+private output_step(done: bool, v: Value) -> Value
+    val mark = root_mark()
+
+    hold(v)
+
+    val o = new_object()
+
+    hold(Object(o))
+    obj_put_name(o, "done", Bool(done))
+    obj_put_name(o, "value", v)
+    release(mark)
+    Object(o)
+
+// -- the stream a program holds -----------------------------------------------------------------
+
+// How a slot, which of the two streams, and the slot's generation share one integer.
+private val OutputScale: long = 4294967296
+
+// `child.stdout` and `child.stderr` -- the stream where the options piped it, and `null` where not.
+do_child_stdout(args: Args, at: Span) -> Step = output_source(args, at, true, "stdout")
+
+do_child_stderr(args: Args, at: Span) -> Step = output_source(args, at, false, "stderr")
+
+// **Its methods are on a proto, which is what hands them the stream**, exactly as a streamed fetch
+// body's are. It is made the first time it is asked for and kept, so that it is one value.
+private output_source(args: Args, at: Span, is_out: bool, name: string) -> Step
+    val slot = child_of(args.at(0), at, name)?
+    var p = piped(slot, is_out)
+
+    if p.mode != Stdio.Piped then return Ok(Null)
+
+    p.source match
+        Value.Null -> ()
+        made -> return Ok(made)
+
+    val mark = root_mark()
+    val proto = new_object()
+
+    hold(Object(proto))
+    obj_put_name(proto, "next", Native(n_output_next))
+    obj_put_name(proto, "text", Native(n_output_text))
+    obj_put_name(proto, "dispose", Native(n_output_dispose))
+    obj_put_name(proto, "close", Native(n_output_close))
+    obj_put_name(proto, "return", Native(n_output_return))
+
+    val o = new_object()
+
+    hold(Object(o))
+    obj_put_name(o, "proto", Object(proto))
+
+    val which = long(slot) * 2 + (if is_out then 0 else 1)
+
+    obj_put_name(o, StreamTag, Int(which * OutputScale + long(current().children[slot].gen)))
+    p.source = Object(o)
+    put_piped(slot, is_out, p)
+    release(mark)
+    Ok(Object(o))
+end output_source
+
+// The stream a method was called on, as its slot and which of the two it is.
+private output_of(args: Args, at: Span, name: string) -> Result[(usize, bool), Signal]
+    if args.len() != 1
+        return Err(failure(at, s"`${name}` is a child's output stream's own and takes nothing -- it is called as `child.stdout.${name}()`"))
+
+    val packed = args.at(0) match
+        Object(o) -> obj_get_name(o, StreamTag) match
+            Some(Int(k)) -> k
+            _ -> return Err(failure(at, s"`${name}` is a child's output stream's own, and this is not one"))
+        other -> return Err(failure(at, s"`${name}` is a child's output stream's own, and this is ${other.type_name()}"))
+
+    val which = usize(packed / OutputScale)
+    val gen = usize(packed % OutputScale)
+    val slot = which / 2
+
+    if slot >= current().children.len() || current().children[slot].gen != gen
+        return Err(failure(at, s"this stream belongs to a child of another program, and `${name}` needs one of this program's"))
+
+    Ok((slot, which % 2 == 0))
+end output_of
+
+// `child.stdout.next()` -- a promise of the next chunk the child wrote, as bytes, or of `done`.
+//
+// **One reader at a time, refused rather than queued**, which is a streamed body's rule: `for await`
+// never asks twice, and a program that does has two readers of one stream.
+private do_output_next(args: Args, at: Span) -> Step
+    val (slot, is_out) = output_of(args, at, "next")?
+    var p = piped(slot, is_out)
+
+    if p.whole.is_some()
+        return fault(at, "this stream is already being read whole by `text` -- await that promise instead")
+
+    if p.waiting.is_some()
+        return fault(at, "this stream is already working on a `next` -- await that promise before asking it for another value")
+
+    if p.released then return gz_settled(output_step(true, Null))
+
+    if p.held.len() > 0
+        val mark = root_mark()
+        val chunk = bytes_from(p.held.view())
+
+        hold(chunk)
+        p.held = buf()
+        put_piped(slot, is_out, p)
+
+        val answer = gz_settled(output_step(false, chunk))
+
+        release(mark)
+
+        return answer
+
+    if p.ended then return gz_settled(output_step(true, Null))
+
+    val id = begin_request()
+
+    p.waiting = Some(id)
+    put_piped(slot, is_out, p)
+    Ok(awaited_request(id))
+end do_output_next
+
+// `child.stdout.text()` -- a promise of everything the stream has still to hand over, as one string,
+// once the child has closed it: `{ ok: true, value }`, or `{ ok: false, error }` where it is not text.
+private do_output_text(args: Args, at: Span) -> Step
+    val (slot, is_out) = output_of(args, at, "text")?
+    var p = piped(slot, is_out)
+
+    if p.whole.is_some() || p.waiting.is_some()
+        return fault(at, "this stream is already being read -- await that promise before asking it for the rest")
+
+    if p.released
+        return gz_settled(err_value("this stream was closed before it was read"))
+
+    if p.ended
+        val said = from_utf8(p.held.view())
+
+        p.held = buf()
+        put_piped(slot, is_out, p)
+
+        return gz_settled(whole_answer(said, is_out))
+
+    val id = begin_request()
+
+    p.whole = Some(id)
+    put_piped(slot, is_out, p)
+    Ok(awaited_request(id))
+end do_output_text
+
+// `child.stdout.dispose()` and `close()` -- stop handing the stream over. **The pipe is still read to
+// its end and what arrives is thrown away**, so a child that goes on writing is not left blocked on a
+// pipe nobody drains. A `next()` waiting is told `done`.
+private do_output_dispose(args: Args, at: Span) -> Step = let_output_go(args, at, "dispose")
+
+private do_output_close(args: Args, at: Span) -> Step = let_output_go(args, at, "close")
+
+// `return()` -- the same, under the name a `for await` left early calls.
+private do_output_return(args: Args, at: Span) -> Step
+    let_output_go(args, at, "return")?
+
+    Ok(output_step(true, Null))
+
+private let_output_go(args: Args, at: Span, name: string) -> Step
+    val (slot, is_out) = output_of(args, at, name)?
+    var p = piped(slot, is_out)
+    val waiting = p.waiting
+    val whole = p.whole
+
+    p.released = true
+    p.held = buf()
+    p.waiting = None
+    p.whole = None
+    put_piped(slot, is_out, p)
+
+    waiting match
+        Some(id) -> answer_plain_request(id, output_step(true, Null))
+        None -> ()
+
+    whole match
+        Some(id) -> answer_plain_request(id, err_value("this stream was closed before it was read"))
+        None -> ()
+
+    Ok(Null)
+end let_output_go
+
+// -- what this file registers -----------------------------------------------------------------------
+
+// **Registered and not declared**, as a streamed fetch body's are: a program reaches the five a
+// stream answers only through its proto, and the two properties only off a child.
+var n_child_stdout: NativeFn = 0
+var n_child_stderr: NativeFn = 0
+var n_output_next: NativeFn = 0
+var n_output_text: NativeFn = 0
+var n_output_dispose: NativeFn = 0
+var n_output_close: NativeFn = 0
+var n_output_return: NativeFn = 0
+
+// Not `private`: `install_spawn` in `spawn.sysl` calls it.
+install_child_output()
+    n_child_stdout = register("Child.stdout", do_child_stdout)
+    n_child_stderr = register("Child.stderr", do_child_stderr)
+    n_output_next = register("childOutputNext", do_output_next)
+    n_output_text = register("childOutputText", do_output_text)
+    n_output_dispose = register("childOutputDispose", do_output_dispose)
+    n_output_close = register("childOutputClose", do_output_close)
+    n_output_return = register("childOutputReturn", do_output_return)

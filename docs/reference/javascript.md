@@ -665,7 +665,9 @@ directory tree asked a file for its modification time and reached a field that w
 ### `spawn` is node's `child_process`, and the channel is slate's own framing
 
 `slate:process`'s `spawn` and `channel` are whole here on node. The child is `child_process.spawn`
-with stdin ignored and stdout and stderr inherited, and the message channel is a fourth descriptor
+with stdin ignored and stdout and stderr inherited, ignored or piped as the options say — a piped
+stream is node's own, read from the moment the child starts and handed over as the same source of
+bytes the interpreter's is — and the message channel is a fourth descriptor
 carrying one JSON value per line, with `SLATE_CHANNEL_FD` naming it in the child's environment — the
 same wire as the interpreter's, so a supervisor under either back end drives a child under either back
 end.

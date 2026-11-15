@@ -169,11 +169,15 @@ it left with 0
 - **`spawn(command, args)` and `spawn(command, args, options)` answer `{ ok: true, value: child }` or
   `{ ok: false, error }`, and they answer it AT ONCE.** The child has already been started by the time
   the call comes back, so "there is no such program" is known there rather than one turn later.
-- **The options are `cwd`, `env` and `ipc`.** `env` replaces the child's environment exactly as `run`'s
-  does; `ipc: true` opens the message channel.
-- **stdin is closed and stdout and stderr are INHERITED**, which is the pair a worker wants: a child
-  waiting on input nobody will type is a hang with nothing on screen, and a worker's own log lines
-  belong wherever its supervisor's do. A program that wants the output captured instead wants `run`.
+- **The options are `cwd`, `env`, `ipc`, `stdout` and `stderr`.** `env` replaces the child's
+  environment exactly as `run`'s does; `ipc: true` opens the message channel; `stdout` and `stderr`
+  are each `"inherit"`, `"pipe"` or `"ignore"`. **Any other key, or a value of the wrong kind, faults
+  at the call**, naming the option — a misspelt `stdot: "pipe"` is a mistake in the program, not
+  something to pass over.
+- **stdin is closed, and stdout and stderr are INHERITED unless the options say otherwise**, which is
+  the pair a worker wants: a child waiting on input nobody will type is a hang with nothing on screen,
+  and a worker's own log lines belong wherever its supervisor's do. `"ignore"` sends a stream nowhere;
+  `"pipe"` hands it to the program, below.
 - **A live child keeps the program alive**, exactly as a socket does. A supervisor that has started a
   worker and reached its last statement is not finished.
 
@@ -183,6 +187,7 @@ it left with 0
 |---|---|
 | `child.pid` | the number the operating system knows it by, readable after it has died |
 | `child.exited` | a promise of `{ status, signal }`, settled once — `await` it to learn a worker died |
+| `child.stdout`, `child.stderr` | the stream where the options piped it, and `null` where they did not |
 | `child.onExit(fn)` | the callback form of the same answer |
 | `child.send(value)` | one message, as JSON and a newline — `{ ok, error }` |
 | `child.send(value, socket)` | the same message with a connection travelling beside it |
@@ -201,6 +206,59 @@ it left with 0
   `toJSON`'s own words. That is slate's two-channel rule read twice in one call.
 - **A child started without `ipc` is refused a message** rather than answering a failure: the program
   asked for a child with no channel and then wrote to the channel.
+
+### Reading what a child prints
+
+**`stdout: "pipe"` and `stderr: "pipe"` hand a stream to the program**, as `child.stdout` and
+`child.stderr`. A stream is an asynchronous source of [`bytes`](bytes.md) — the same kind a
+[streamed `fetch`](globals.md) body is — so `for await` reads it chunk by chunk as the child writes,
+and `text()` waits for the whole of it:
+
+```slate
+import { spawn } from slate:process
+
+async main()
+    val child = spawn("/bin/sh", ["-c", "printf 'one\\nthree'; printf two >&2; head -c 100000 /dev/zero"],
+        { stdout: "pipe", stderr: "pipe" }).value
+
+    var total = 0
+
+    for await chunk in child.stdout
+        total = total + chunk.length
+
+    print(total, "bytes on stdout")
+    print("and on stderr:", (await child.stderr.text()).value)
+    print("it left with", (await child.exited).value.status)
+
+main()
+```
+
+```output
+100009 bytes on stdout
+and on stderr: two
+it left with 0
+```
+
+| | |
+|---|---|
+| `stream.next()` | a promise of `{ value, done }`: the next chunk, as bytes, or `done` once the child has closed it |
+| `stream.text()` | a promise of everything still to come as one string — `{ ok: true, value }`, or `{ ok: false, error }` where it is not UTF-8 |
+| `stream.close()`, `stream.dispose()` | stop reading it; what the child writes after that is thrown away |
+
+- **A chunk is whatever has arrived** since the last one was asked for. `text()` hands over everything
+  not yet taken, so it can follow a few `next()`s.
+- **A piped stream is read from the moment the child starts, whether the program asks or not.** What
+  arrives waits for the program, so a child writing more than a pipe holds is never left blocked on a
+  supervisor that has not got round to reading — `await child.exited` first and `text()` afterwards
+  is fine. The price is that a stream nobody reads is held in memory until the child ends.
+- **`exited` waits for the piped streams to end**, as it waits for the channel: by the time it settles,
+  everything the child wrote has arrived, and a stream read afterwards hands all of it over.
+- **Leaving a `for await` early lets go of the stream**, as [a loop left early](../reference/statements.md#leaving-early-closes-what-the-loop-walked)
+  lets go of whatever it walked, and so does `using`. The pipe is not closed under the child: it is
+  still read to its end and what arrives is dropped, so a child that goes on writing still exits.
+- **One reader at a time.** A second `next()` while one is waiting, or a `text()` beside it, faults.
+- **Output that is not text is an answer**, `{ ok: false, error }` from `text()`, the bytes having come
+  from outside the program; a chunk from `next()` is bytes and has no such question.
 
 ### Passing a connection to a worker
 

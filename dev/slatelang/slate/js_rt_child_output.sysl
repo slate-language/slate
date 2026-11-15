@@ -1,0 +1,127 @@
+module dev.slatelang.slate
+
+// A child's piped output in the JavaScript back end -- `spawn_output.sysl`'s source over node's
+// streams. `js_rt_process.sysl`'s `spawn` makes one for each stream its options piped, so this block
+// comes directly before that one in `js_runtime`; it closes nothing and opens nothing.
+
+js_runtime_child_output() -> string = raw"""
+        // One of a child's output streams where `spawn` piped it, and `null` where it was inherited or
+        // ignored. **It is read from the moment the child starts**, whether or not the program has
+        // asked for anything, so a child writing more than a pipe holds is never left blocked on a
+        // supervisor that has not got round to reading; and node's `close`, which settles `exited`,
+        // waits for the stream to end, as the interpreter's exit does.
+        const childOutput = (stream, isOut) => {
+            if (stream === null || stream === undefined) return null
+
+            const st = { held: [], ended: false, released: false, waiting: null, whole: null }
+            const step = (done, value) => $.obj([["done", done], ["value", value]])
+            const closedEarly = () => $.obj([["ok", false], ["error", "this stream was closed before it was read"]])
+
+            const take = () => {
+                const chunk = $.bytesOf(Buffer.concat(st.held))
+
+                st.held = []
+                return chunk
+            }
+
+            const whole = () => {
+                let said = ""
+
+                try {
+                    said = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(st.held))
+                } catch (e) {
+                    st.held = []
+                    return $.obj([["ok", false], ["error", isOut ? "what the child printed is not text" :
+                        "what the child printed on its error output is not text"]])
+                }
+
+                st.held = []
+                return $.obj([["ok", true], ["value", said]])
+            }
+
+            const deliver = () => {
+                if (st.waiting !== null && (st.held.length > 0 || st.ended)) {
+                    const resolve = st.waiting
+
+                    st.waiting = null
+                    resolve(st.held.length > 0 ? step(false, take()) : step(true, null))
+                }
+
+                if (st.whole !== null && st.ended) {
+                    const resolve = st.whole
+
+                    st.whole = null
+                    resolve(whole())
+                }
+            }
+
+            const ended = () => {
+                if (st.ended) return
+
+                st.ended = true
+                deliver()
+            }
+
+            stream.on("data", (chunk) => {
+                if (st.released || chunk.length === 0) return
+
+                st.held.push(chunk)
+                deliver()
+            })
+
+            // **A read that fails is an end and not a fault**, which is `run`'s rule.
+            stream.on("end", ended)
+            stream.on("error", ended)
+            stream.on("close", ended)
+
+            const next = () => {
+                if (st.whole !== null)
+                    fault("this stream is already being read whole by `text` -- await that promise instead")
+
+                if (st.waiting !== null)
+                    fault("this stream is already working on a `next` -- await that promise before asking it " +
+                        "for another value")
+
+                if (st.released) return Promise.resolve(step(true, null))
+                if (st.held.length > 0) return Promise.resolve(step(false, take()))
+                if (st.ended) return Promise.resolve(step(true, null))
+
+                return new Promise((resolve) => { st.waiting = resolve })
+            }
+
+            const text = () => {
+                if (st.whole !== null || st.waiting !== null)
+                    fault("this stream is already being read -- await that promise before asking it for the rest")
+
+                if (st.released) return Promise.resolve(closedEarly())
+                if (st.ended) return Promise.resolve(whole())
+
+                return new Promise((resolve) => { st.whole = resolve })
+            }
+
+            // **The pipe is still read to its end and what arrives is thrown away**, as it is in the
+            // interpreter: a child that goes on writing is not left blocked on a pipe nobody drains.
+            const dispose = () => {
+                const waiting = st.waiting
+                const told = st.whole
+
+                st.released = true
+                st.held = []
+                st.waiting = null
+                st.whole = null
+
+                if (waiting !== null) waiting(step(true, null))
+                if (told !== null) told(closedEarly())
+
+                return null
+            }
+
+            const finish = () => {
+                dispose()
+                return step(true, null)
+            }
+
+            return $.obj([["proto", $.obj([["next", next], ["text", text], ["dispose", dispose],
+                ["close", dispose], ["return", finish]])]])
+        }
+    """
