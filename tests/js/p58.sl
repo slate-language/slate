@@ -82,8 +82,8 @@ async main()
     val rawErr = await run("/bin/sh", ["-c", "printf '\\377' >&2"])
     print("not text on stderr", rawErr.ok, rawErr.error)
 
-    val ignored = await run("/bin/sh", ["-c", "echo ok"], { ipc: 5, unknown: true })
-    print("unknown options are ignored", ignored.value.out.trim())
+    print((await run("/bin/sh", ["-c", "echo ok"], { ipc: 5, unknown: true })) catch e -> e.message)
+    print((await run("/bin/sh", ["-c", "echo ok"], { cwd: "/", timeot: 5 })) catch e -> e.message)
 
     // Two children read at once never see each other's bytes.
     val a = run("/bin/sh", ["-c", printing("A", 60)])
