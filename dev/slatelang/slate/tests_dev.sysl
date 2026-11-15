@@ -1,0 +1,554 @@
+module dev.slatelang.slate
+@tests
+
+import sh.sysl.libuv
+import sysl.buf.{Buf, buf}
+import sysl.fs.{read_bytes, write_text}
+import sysl.text.{split, str_builder}
+import sysl.{os, MacOS}
+
+// `slate dev` -- the loop driven end to end, in-process, against a real server.
+//
+// **The server is `/usr/bin/perl`**, for `tests_watch.sysl`'s reason: a test binary is not a slate
+// executable, so the loop cannot start `slate server.sl` here, and `startDev` takes the server's
+// command line as `command`. `DevServer` below is a few lines of HTTP over a socket that does what a
+// test needs a server to do -- answer a page, echo a body as hex, set two cookies on a 303, hold an
+// event stream open between two events, take an upgrade -- and reads `main.sl` once at start, so an
+// edit to it is a restart the test can see. A `main.sl` holding `BROKEN` is a server that says so on
+// stdout -- where slate itself reports a compile error -- and a line more on stderr, and exits 1.
+//
+// **The probe is slate, run after `dev_source()` under `slate:dev`** -- the same text the command
+// line runs, with the test's lines where `DevEntry`'s would be. It talks to the proxy with `fetch`,
+// reads the loop's own event stream, edits the scene with `writeFileSync`, and prints lines starting
+// `> `; the server's own stdout is passed through by the loop as well, so the test reads its `> `
+// lines alone. macOS only, `watch` being macOS's.
+
+private val DevServer: string = raw"""
+    use strict;
+    use IO::Socket::INET;
+    my $dir = $ARGV[0];
+    open(my $fh, '<', "$dir/main.sl") or die "no main.sl";
+    my $main = do { local $/; <$fh> };
+    close $fh;
+    if ($main =~ /BROKEN/) { $| = 1; print "main.sl:1: <oops> & broken\n"; print STDERR "and stderr says so too\n"; exit 1; }
+    $| = 1;
+    print "serving $main\n";
+    $SIG{CHLD} = 'IGNORE';
+    my $l = IO::Socket::INET->new(LocalAddr => '127.0.0.1', LocalPort => $ENV{PORT}, Listen => 16, ReuseAddr => 1) or die "listen: $!";
+    while (my $c = $l->accept) {
+        if (fork) { close $c; next; }
+        open(STDOUT, '>', '/dev/null'); open(STDERR, '>', '/dev/null'); close $l;
+        $c->autoflush(1);
+        while (1) {
+            my $head = '';
+            while ($head !~ /\r\n\r\n/) { my $n = sysread($c, my $b, 1); exit 0 unless $n; $head .= $b; }
+            my ($line) = split /\r\n/, $head;
+            my ($m, $p) = split / /, $line;
+            my $len = $head =~ /\r\ncontent-length: *(\d+)/i ? $1 : 0;
+            my $body = '';
+            while (length($body) < $len) { sysread($c, my $b, $len - length($body)); $body .= $b; }
+            my $send = sub { my ($st, $type, $text, @extra) = @_;
+                my $typed = $type eq '' ? '' : "Content-Type: $type\r\n";
+                print $c "HTTP/1.1 $st\r\n${typed}Content-Length: " . length($text) . "\r\n" . join('', map { "$_\r\n" } @extra) . "\r\n$text"; };
+            if ($p eq '/') { $send->('200 OK', 'text/html', "<html><head><style>p{color:red}</style></head><body><p>version $main</p></body></html>"); }
+            elsif ($p eq '/plain') { $send->('200 OK', 'text/plain', "plain $main"); }
+            elsif ($p eq '/echo') { $send->('200 OK', 'text/plain', "$m " . length($body) . " " . unpack('H*', $body)); }
+            elsif ($p =~ m{^/head}) { $send->('200 OK', 'text/plain', $head); }
+            elsif ($p eq '/login') { $send->('303 See Other', '', '', 'Location: /', 'Set-Cookie: a=1; Path=/', 'Set-Cookie: b=2; Expires=Wed, 21 Oct 2026 07:28:00 GMT'); }
+            elsif ($p eq '/events') {
+                print $c "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\ndata: one\n\n";
+                sleep 2;
+                print $c "data: two\n\n";
+                exit 0;
+            }
+            elsif ($p eq '/ws') {
+                print $c "HTTP/1.1 101 Switching Protocols\r\nUpgrade: echo\r\nConnection: Upgrade\r\n\r\n";
+                while (sysread($c, my $b, 4096)) { print $c "echo:$b"; }
+                exit 0;
+            }
+            else { $send->('404 Not Found', 'text/plain', 'no'); }
+        }
+    }
+    """
+
+// The probe's helpers: the loop started on the scene, a watchdog, and the loop's own event stream
+// read one event at a time.
+private val DevKit: string = raw"""
+    val dir = args[0]
+
+    async events(url)
+        val r = await fetch(url, { stream: true })
+        val body = r.value.body
+        var held = ""
+
+        async take()
+            loop
+                val at = held.indexOf("\n\n")
+
+                if at != null
+                    val block = held[0..<at]
+
+                    held = held[at + 2..]
+
+                    var event = "message"
+                    var data = []
+
+                    for line in block.split("\n")
+                        if line.startsWith("event: ") then event = line[7..]
+                        elif line.startsWith("data: ") then data.push(line[6..])
+
+                    // **An event whose data is empty is not dispatched**, which is what a browser's
+                    // `EventSource` does -- so a `reload` sent with no data is one this never sees.
+                    if data.length > 0 && data.join("\n") != "" then return { event: event, data: data.join("\n") }
+                else
+                    val step = await body.next()
+
+                    if step.done then return { event: "end", data: "" }
+
+                    held = held + (fromBytes(step.value).value ?? "")
+
+        { next: take, close: () -> body.close() }
+
+    fired()
+        print("> WATCHDOG")
+        exit(3)
+
+    val watchdog = setTimeout(fired, 30000)
+    val notes = []
+
+    say(...xs) = print("> " + xs.map(x -> string(x)).join(" "))
+
+    started(extra = {}) = startDev({ root: dir, command: ["/usr/bin/perl", dir + "/server.pl", dir], port: 0,
+                                     builds: [], buildCommand: [], tell: line -> notes.push(line), ...extra })
+    """
+
+// A scene: the server, a `main.sl` it reads, and a stylesheet.
+private dev_scene() -> string
+    val dir = libuv.mkdtemp_sync("/tmp/slate-dev-XXXXXX").unwrap()
+
+    write_text(s"${dir}/server.pl", DevServer).unwrap()
+    write_text(s"${dir}/main.sl", "v1").unwrap()
+    write_text(s"${dir}/app.css", "p{color:red}").unwrap()
+
+    dir
+end dev_scene
+
+// The probe's `> ` lines, and everything else it said after them.
+private struct DevRun
+    said: string
+    rest: string
+
+    // Both halves, for a failure's message: the `> ` lines and whatever the loop or a fault said.
+    told(self) -> string = s"${self.said}--- the rest ---\n${self.rest}"
+
+private dev_probe(dir: string, probe: string) -> DevRun
+    var lines: Buf[string] = buf()
+    val sink = lines
+    var argv: Buf[string] = buf()
+
+    argv.push(dir)
+
+    val text = s"${dev_source()}\n${DevKit}\n${probe}"
+
+    ran_bytes("slate", DevProgram, text.bytes, argv, (l: string) -> sink.push(l), (l: string) -> sink.push(l), src -> run(src))
+
+    var said = str_builder()
+    var rest = str_builder()
+
+    for i in 0..<lines.len()
+        val parts = split(lines[i], "\n")
+
+        for j in 0..<parts.len
+            if parts[j].starts_with("> ")
+                said.push(parts[j])
+                said.push("\n")
+            else
+                rest.push(parts[j])
+                rest.push("\n")
+
+    DevRun(said.finish(), rest.finish())
+end dev_probe
+
+// -- the proxy -------------------------------------------------------------------------------------
+
+private val ProxyProbe: string = raw"""
+    async main()
+        val d = await started()
+        val base = "http://127.0.0.1:" + string(d.port)
+        val ev = await events(base + "/__slate/dev")
+
+        say("hello", (await ev.next()).event)
+
+        val home = (await fetch(base + "/")).value
+
+        say("page", home.status, home.body.contains("version v1"), home.body.indexOf("/__slate/dev") < home.body.indexOf("</body>"),
+            home.headers["content-length"] == string(toBytes(home.body).length))
+
+        val plain = (await fetch(base + "/plain")).value
+
+        say("plain", plain.body, plain.headers["content-length"] ?? null)
+
+        val echoed = (await fetch(base + "/echo", { method: "POST", body: bytes([0, 255, 104, 105]) })).value
+
+        say("echo", echoed.body)
+
+        val login = (await fetch(base + "/login", { method: "POST", body: "user=a", redirect: "manual" })).value
+
+        say("login", login.status, login.headers["location"], login.headers["set-cookie"])
+
+        val head = (await fetch(base + "/head?x=1&y=2", { headers: { "x-mine": "kept", connection: "keep-alive" } })).value.body
+
+        say("head", head.startsWith("GET /head?x=1&y=2 HTTP/1.1"), head.contains("x-mine: kept"),
+            head.contains("accept-encoding: identity"), head.contains("x-forwarded-host: 127.0.0.1:" + string(d.port)))
+
+        val streamed = (await fetch(base + "/events", { stream: true })).value
+        val first = fromBytes((await streamed.body.next()).value).value
+
+        say("events", streamed.headers["content-type"], first.contains("one"), first.contains("two"))
+        streamed.body.close()
+
+        val got = pending()
+        var heard = ""
+        val sock = (await connect("127.0.0.1", d.port)).value
+
+        onBytes(sock, b ->
+            if b == null
+                settle(got, heard)
+            else
+                heard = heard + (fromBytes(b).value ?? "")
+
+                if heard.contains("echo:hi") then settle(got, heard))
+
+        await send(sock, "GET /ws HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\r\nhi")
+
+        val answered = await got
+
+        closeSocket(sock)
+        say("upgrade", answered.startsWith("HTTP/1.1 101"), answered.contains("echo:hi"))
+
+        ev.close()
+        await d.stop()
+        clearTimeout(watchdog)
+        say("notes", notes.length)
+
+    main()
+    """
+
+private val ProxyExpected: string =
+    "> hello hello\n" +
+    "> page 200 true true true\n" +
+    "> plain plain v1 null\n" +
+    "> echo POST 4 00ff6869\n" +
+    "> login 303 / [\"a=1; Path=/\", \"b=2; Expires=Wed, 21 Oct 2026 07:28:00 GMT\"]\n" +
+    "> head true true true true\n" +
+    "> events text/event-stream true false\n" +
+    "> upgrade true true\n" +
+    "> notes 0\n"
+
+// **What a browser asks of a server reaches it, and what the server answers reaches the browser**:
+// a page with the script put in and its length made right, a body that is not a page handed on as
+// it arrives (so with no length of its own), a binary POST byte for byte, a 303 with both cookies and the location as written, the
+// query and the request's own headers, an event stream handed on before the server has finished it,
+// and an upgrade piped both ways with the bytes the client sent behind the handshake. **The 303
+// carries no `Content-Type`**, as a redirect from a real server usually does not -- the shape that
+// once faulted the proxy and ended the loop with the server still running.
+@test
+slate_dev_PASSES_A_REQUEST_THROUGH_AND_PUTS_THE_SCRIPT_IN_A_PAGE_ONLY()
+    if os() != MacOS then return
+
+    val dir = dev_scene()
+    val r = dev_probe(dir, ProxyProbe)
+
+    scrub(dir)
+    assert(r.said == ProxyExpected, r.told())
+    assert(r.rest.contains("serving v1"), r.rest)
+
+// -- the loop --------------------------------------------------------------------------------------
+
+private val LoopProbe: string = raw"""
+    async main()
+        val d = await started()
+        val base = "http://127.0.0.1:" + string(d.port)
+        val ev = await events(base + "/__slate/dev")
+
+        say("hello", (await ev.next()).event)
+
+        // **FSEvents takes a moment to start reporting**, so an edit in the same instant the watch
+        // began can go unheard -- `tests_watch.sysl` waits the same way before its first.
+        await sleep(600)
+        writeFileSync(dir + "/main.sl", "v2")
+        say("edited", (await ev.next()).event, (await fetch(base + "/plain")).value.body)
+
+        writeFileSync(dir + "/main.sl", "BROKEN")
+
+        val fault = await ev.next()
+
+        say("broken", fault.event, fault.data.contains("exited with status 1"), fault.data.contains("main.sl:1: <oops> & broken"),
+            fault.data.contains("and stderr says so too"))
+
+        val page = (await fetch(base + "/", { headers: { accept: "text/html" } })).value
+
+        say("page", page.status, page.body.contains("&lt;oops&gt; &amp; broken"), page.body.contains("/__slate/dev"))
+
+        val text = (await fetch(base + "/plain", { headers: { accept: "*/*" } })).value
+
+        say("text", text.status, text.headers["content-type"], text.body.contains("<oops> & broken"))
+
+        val late = await events(base + "/__slate/dev")
+
+        say("late", (await late.next()).event, (await late.next()).event)
+        late.close()
+
+        writeFileSync(dir + "/main.sl", "v3")
+        say("fixed", (await ev.next()).event, (await fetch(base + "/plain")).value.body)
+
+        writeFileSync(dir + "/app.css", "p{color:blue}")
+        say("css", (await ev.next()).event)
+
+        writeFileSync(dir + "/notes.log", "a log line")
+        writeFileSync(dir + "/main.sl~", "a backup")
+        writeFileSync(dir + "/app.css", "p{color:green}")
+        say("only the css", (await ev.next()).event)
+
+        ev.close()
+        await d.stop()
+        clearTimeout(watchdog)
+        say("notes", notes.filter(n -> n.startsWith("slate dev: restarted")).length)
+
+    main()
+    """
+
+private val LoopExpected: string =
+    "> hello hello\n" +
+    "> edited reload plain v2\n" +
+    "> broken fault true true true\n" +
+    "> page 502 true true\n" +
+    "> text 502 text/plain; charset=utf-8 true\n" +
+    "> late hello fault\n" +
+    "> fixed reload plain v3\n" +
+    "> css css\n" +
+    "> only the css css\n" +
+    "> notes 4\n"
+
+// **A save restarts the server and reloads the page; a server that dies is an overlay with what it
+// said, escaped, on a page that comes back by itself; a page opened while it is down is told at
+// once; the next good save clears it with a reload; and a stylesheet alone is swapped, not
+// reloaded** -- with a file the watcher does not count changing beside it, which must not turn the
+// swap into a reload.
+@test
+slate_dev_RESTARTS_ON_A_SAVE_SHOWS_A_CRASH_AND_SWAPS_A_STYLESHEET()
+    if os() != MacOS then return
+
+    val dir = dev_scene()
+    val r = dev_probe(dir, LoopProbe)
+
+    scrub(dir)
+    assert(r.said == LoopExpected, r.told())
+    assert(r.rest.contains("serving v3"), r.rest)
+
+// -- the bundles -----------------------------------------------------------------------------------
+
+// `slate js <src> -o <out>` stood in for by a shell line taking the same three words: it copies the
+// source to the output, and refuses a source holding `BROKEN` on stderr.
+private val BuildProbe: string = raw"""
+    async main()
+        val build = "if grep -q BROKEN \"$0\"; then echo \"client.slx:3: the client is broken\" >&2; exit 1; fi; cp \"$0\" \"$2\""
+        val d = await started({ builds: [{ src: dir + "/client.slx", out: dir + "/public/app.js", rel: "public/app.js" }],
+                                buildCommand: ["/bin/sh", "-c", build] })
+        val base = "http://127.0.0.1:" + string(d.port)
+        val ev = await events(base + "/__slate/dev")
+
+        say("hello", (await ev.next()).event, readFileSync(dir + "/public/app.js").value)
+
+        await sleep(600)
+        writeFileSync(dir + "/client.slx", "two")
+        say("edited", (await ev.next()).event, readFileSync(dir + "/public/app.js").value)
+
+        writeFileSync(dir + "/client.slx", "BROKEN")
+
+        val fault = await ev.next()
+
+        say("broken", fault.event, fault.data.contains("did not build"), fault.data.contains("client.slx:3: the client is broken"))
+        say("still serving", (await fetch(base + "/plain")).value.body)
+
+        writeFileSync(dir + "/client.slx", "three")
+        say("fixed", (await ev.next()).event, readFileSync(dir + "/public/app.js").value)
+
+        await sleep(400)
+        ev.close()
+        await d.stop()
+        clearTimeout(watchdog)
+        say("notes", notes.filter(n -> n.startsWith("slate dev: restarted")).length)
+
+    main()
+    """
+
+private val BuildExpected: string =
+    "> hello hello one\n" +
+    "> edited reload two\n" +
+    "> broken fault true true\n" +
+    "> still serving plain v1\n" +
+    "> fixed reload three\n" +
+    "> notes 2\n"
+
+// **Every `--js` bundle is built before the server starts and again on every save; a build that
+// fails is the overlay and leaves the last good server answering; and the bundle the loop writes
+// does not start the loop again** -- the count of restarts at the end, after a pause long enough
+// for one to have happened, is what says so.
+@test
+slate_dev_BUILDS_EACH_BUNDLE_AND_SHOWS_A_BUILD_THAT_FAILED()
+    if os() != MacOS then return
+
+    val dir = dev_scene()
+
+    write_text(s"${dir}/client.slx", "one").unwrap()
+
+    val r = dev_probe(dir, BuildProbe)
+
+    scrub(dir)
+    assert(r.said == BuildExpected, r.told())
+
+// -- a server that does not start ------------------------------------------------------------------
+
+private val SilentProbe: string = raw"""
+    async main()
+        val d = await started({ command: ["/bin/sh", "-c", "echo starting >&2; exec sleep 30"], readyMillis: 300 })
+        val base = "http://127.0.0.1:" + string(d.port)
+        val ev = await events(base + "/__slate/dev")
+
+        say("hello", (await ev.next()).event)
+
+        val fault = await ev.next()
+
+        say("silent", fault.event, fault.data.contains("did not take connections"), fault.data.contains("PORT"))
+
+        val page = (await fetch(base + "/", { headers: { accept: "text/html" } })).value
+
+        say("page", page.status)
+        ev.close()
+        await d.stop()
+
+        val missing = await startDev({ root: dir, command: [dir + "/no-such-server"], port: 0, builds: [],
+                                       buildCommand: [], tell: line -> notes.push(line) })
+
+        say("missing", notes.at(-1).startsWith("slate dev: could not start " + dir + "/no-such-server"))
+        await missing.stop()
+        clearTimeout(watchdog)
+
+    main()
+    """
+
+// **A server that never listens on `PORT` is reported as exactly that** rather than waited on for
+// ever, and one that cannot be started at all says so -- both with the proxy still answering, so
+// the page shows why.
+@test
+slate_dev_SAYS_WHEN_THE_SERVER_NEVER_LISTENS_OR_CANNOT_START()
+    if os() != MacOS then return
+
+    val dir = dev_scene()
+    val r = dev_probe(dir, SilentProbe)
+
+    scrub(dir)
+    assert(r.said == "> hello hello\n> silent fault true true\n> page 502\n> missing true\n", r.told())
+
+// -- the command line ------------------------------------------------------------------------------
+
+@test
+slate_dev_REFUSES_A_COMMAND_LINE_IT_CANNOT_READ()
+    if os() != MacOS then return
+
+    assert_eq(cli_status(["slate", "dev"]), Misused)
+    assert(cli_said(["slate", "dev"]).contains("usage: slate dev <server.sl>"))
+    assert_eq(cli_status(["slate", "dev", "a.sl", "b.sl"]), Misused)
+    assert_eq(cli_said(["slate", "dev", "a.sl", "b.sl"]), "slate: `dev` runs one server, and was given a.sl and b.sl")
+    assert_eq(cli_said(["slate", "dev", "a.sl", "--port"]), "slate: `--port` takes a port number")
+    assert_eq(cli_said(["slate", "dev", "a.sl", "--port", "http"]), "slate: `--port` takes a port number, and http is not one")
+    assert_eq(cli_said(["slate", "dev", "a.sl", "--port", "70000"]), "slate: `--port` takes a port number, and 70000 is not one")
+    assert_eq(cli_said(["slate", "dev", "a.sl", "--js"]), "slate: `--js` takes <client.slx>=<out.js>")
+    assert_eq(cli_said(["slate", "dev", "a.sl", "--js", "client.slx"]), "slate: `--js` takes <client.slx>=<out.js>, and client.slx is not that")
+    assert_eq(cli_said(["slate", "dev", "a.sl", "--js", "=out.js"]), "slate: `--js` takes <client.slx>=<out.js>, and =out.js is not that")
+    assert_eq(cli_said(["slate", "dev", "a.sl", "--js", "client.slx="]), "slate: `--js` takes <client.slx>=<out.js>, and client.slx= is not that")
+    assert_eq(cli_status(["slate", "dev", "--watch", "a.sl"]), Misused)
+    assert(cli_said(["slate", "dev", "--watch", "a.sl"]).starts_with("slate: `dev` has no option `--watch` -- it takes `--js` and `--port`"))
+    assert_eq(cli_status(["slate", "dev", "/no/such/server.sl"]), Failed)
+    assert_eq(cli_said(["slate", "dev", "/no/such/server.sl"]), "slate: cannot read /no/such/server.sl")
+
+// **A bundle whose source is not there is refused before anything starts**, rather than as an
+// overlay on a page nobody has opened yet.
+@test
+slate_dev_REFUSES_A_BUNDLE_SOURCE_THAT_IS_NOT_THERE()
+    if os() != MacOS then return
+
+    val dir = dev_scene()
+    val said = cli_said(["slate", "dev", s"${dir}/main.sl", "--js", "/no/client.slx=out.js"])
+    val status = cli_status(["slate", "dev", s"${dir}/main.sl", "--js", "/no/client.slx=out.js"])
+
+    scrub(dir)
+    assert_eq(status, Failed)
+    assert_eq(said, "slate: cannot read /no/client.slx, which `--js` was asked to build")
+
+// **Off macOS it refuses in `--watch`'s words**, there being no recursive watcher to run it on.
+@test
+slate_dev_REFUSES_OFF_MACOS()
+    if os() == MacOS then return
+
+    assert_eq(cli_status(["slate", "dev", "server.sl"]), Failed)
+    assert(cli_said(["slate", "dev", "server.sl"]).contains("`dev` needs recursive file watching"))
+
+// The command line's own lines, run as `dev.sysl` runs them.
+private dev_entry(argv: []const string, tail: string) -> string
+    var lines: Buf[string] = buf()
+    val sink = lines
+    var given: Buf[string] = buf()
+
+    for i in 0..<argv.len
+        given.push(argv[i])
+
+    val text = s"${dev_source()}\n${tail}"
+
+    ran_bytes("slate", DevProgram, text.bytes, given, (l: string) -> sink.push(l), (l: string) -> sink.push(l), src -> run(src))
+
+    var out = str_builder()
+
+    for i in 0..<lines.len()
+        out.push(lines[i])
+        out.push("\n")
+
+    out.finish()
+end dev_entry
+
+// **What `dev.sysl` hands over is what `startDev` is given**: the server's command is this executable
+// and the file, each bundle is a triple, and a bundle is built by the same executable's `js`.
+@test
+slate_dev_READS_WHAT_THE_COMMAND_LINE_HANDED_IT()
+    val said = dev_entry(["/p", "/bin/slate", "server.sl", "8080", "client.slx", "public/app.js", "public/app.js",
+                          "admin.slx", "/abs/admin.js", ""], "print(toJSON(configured(args)))\n")
+
+    assert_eq(said.trim(), "{\"root\":\"/p\",\"command\":[\"/bin/slate\",\"server.sl\"],\"port\":8080,\"builds\":[{\"src\":\"client.slx\",\"out\":\"public/app.js\",\"rel\":\"public/app.js\"},{\"src\":\"admin.slx\",\"out\":\"/abs/admin.js\",\"rel\":\"\"}],\"buildCommand\":[\"/bin/slate\",\"js\"]}")
+
+// **The entry itself runs**: started on a directory that cannot be watched, it says so as the
+// program's fault, having stopped the server it started first.
+@test
+slate_dev_FROM_THE_COMMAND_LINE_FAULTS_ON_A_DIRECTORY_IT_CANNOT_WATCH()
+    if os() != MacOS then return
+
+    val said = dev_entry(["/no/such/dir", "/usr/bin/true", "server.sl", "0"], DevEntry)
+
+    assert(said.contains("cannot watch /no/such/dir"), said)
+
+// -- the rule it restarts by -----------------------------------------------------------------------
+
+// **`watchCounts` is `watch_counts` and nothing else**, so the loop and `slate run --watch` cannot
+// disagree about what an edit is -- and it is the loop's, not a program's.
+@test
+watchCounts_IS_THE_WATCH_RULE_AND_ONLY_A_BUILT_IN_SCOPE_HAS_IT()
+    var lines: Buf[string] = buf()
+    val sink = lines
+    var none: Buf[string] = buf()
+    val text = "print(watchCounts(\"main.sl\", \"/p\"), watchCounts(\"styles/a.css\", \"/p\"), watchCounts(\".git/index\", \"/p\"), watchCounts(\"vendor/k/a.sl\", \"/p\"), watchCounts(\"data.db\", \"/p\"), watchCounts(\"main.sl~\", \"/p\"))\n"
+
+    ran_bytes("slate", DevProgram, text.bytes, none, (l: string) -> sink.push(l), (l: string) -> sink.push(l), src -> run(src))
+
+    assert_eq(lines.len(), 1)
+    assert_eq(lines[0], "true true false false false false")
+    assert(fails("watchCounts(\"main.sl\", \"/p\")\n").contains("`watchCounts` is not defined"))
