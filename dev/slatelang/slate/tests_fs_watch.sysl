@@ -1,0 +1,99 @@
+module dev.slatelang.slate
+@tests
+
+import sh.sysl.libuv
+import sysl.fs.{remove_file, write_text}
+import sysl.text.{Search, replace_all}
+import sysl.{os, MacOS}
+
+// `watch` and `unwatch` in `slate:fs`, where only the interpreter can be asked.
+//
+// **What a running program sees is `tests/lang/watch.sl`'s**, which both back ends run. What is here
+// is what that file cannot reach: a fault inside a handler ending the program, a forgotten watcher
+// named in a test's leak report, and the two hosts agreeing on the sentence a platform without a
+// recursive watcher is answered with.
+
+private val WatchImport: string = "import { watch, unwatch, writeFileSync } from slate:fs\n"
+
+// Run `text` with `<dir>` standing for a directory of its own, and give the directory back.
+private watched(text: string) -> string
+    val dir = libuv.mkdtemp_sync("/tmp/slate-watch-XXXXXX").unwrap()
+    val said = out(WatchImport + replace_all(text, "<dir>", dir))
+
+    scrub(dir)
+    said
+end watched
+
+// A program that writes a probe every 25 ms for five seconds, so that a watcher in it has something
+// to hear however long its stream takes to start -- and so that it ends on its own if nothing does.
+private val Prober: string =
+    "var n = 0\n" +
+    "var t = null\n" +
+    "tick()\n" +
+    "    n = n + 1\n" +
+    "    writeFileSync(\"<dir>/probe\" + string(n), \"x\")\n" +
+    "    if n > 200 then clearInterval(t)\n" +
+    "t = setInterval(tick, 25)\n"
+
+@test
+a_fault_inside_a_watch_handler_stops_the_program()
+    if os() != MacOS then return
+
+    // As one inside a timer callback does. **The interval is what proves it**: it would otherwise
+    // run for five seconds and the program would end with nothing said.
+    val said = watched(Prober + "boom(e)\n    throw \"the handler threw\"\nwatch(\"<dir>\", boom)\n")
+
+    assert(said.contains("the handler threw"), said)
+
+@test
+a_handler_is_given_the_path_and_the_kind()
+    if os() != MacOS then return
+
+    // The interpreter's half of `tests/lang/watch.sl`'s shape check, through the in-process runner
+    // rather than `slate test`: the first probe heard ends the program.
+    val said = watched(Prober +
+        "var w = null\n" +
+        "heard(e)\n" +
+        "    print(e.path.contains(\"probe\"), e.kind)\n" +
+        "    unwatch(w)\n" +
+        "    clearInterval(t)\n" +
+        "w = watch(\"<dir>\", heard).value\n")
+
+    // **One line, so one event**: `unwatch` inside the handler stops the next one already queued.
+    assert_eq(said, "true rename")
+
+@test
+off_macos_watch_answers_an_error_naming_why()
+    // **The refusal is checked where it happens**: on macOS the same program is answered a watcher,
+    // which it gives straight back.
+    val said = watched("val r = watch(\"<dir>\", e -> e)\nif r.ok\n    unwatch(r.value)\n    print(\"watching\")\nelse\n    print(r.error)\n")
+
+    if os() == MacOS
+        assert_eq(said, "watching")
+    else
+        assert(said.contains(TreeWatchUnavailable), said)
+
+@test
+both_hosts_say_the_same_thing_off_macos()
+    // The JavaScript back end writes the sentence out rather than being handed it, being a raw
+    // string of JavaScript, so this is what keeps the two from drifting.
+    assert(js_runtime_host_io().contains(TreeWatchUnavailable))
+
+@test
+a_watcher_a_test_forgets_is_named_in_its_leak_report()
+    if os() != MacOS then return
+
+    // **A watcher keeps the program alive**, so one a test never stops would hold that test's drain
+    // open; the bounded drain gives up, and the report says what was left rather than only that
+    // something was.
+    val dir = libuv.mkdtemp_sync("/tmp/slate-watch-XXXXXX").unwrap()
+    val probe = probe_path("watch")
+
+    write_text(probe, "import { watch } from slate:fs\n\n@test\nforgets()\n    watch(\"" + dir + "\", e -> e)\n").unwrap()
+
+    val said = cli_said(["slate", "test", probe])
+
+    remove_file(probe).unwrap()
+    scrub(dir)
+
+    assert(said.contains("left 1 handle open: a file watcher on " + dir), said)
