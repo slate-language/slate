@@ -1,0 +1,614 @@
+module dev.slatelang.slate
+
+// `slate dev`'s loop, written in slate and carried in the binary.
+//
+// **A program rather than a module**: `dev.sysl` runs this text under the name `slate:dev`, which is
+// what makes it compile against every builtin as a built-in module does -- so `watchCounts`, the rule
+// `slate run --watch` restarts by, is a name it can call and a program cannot. `DevEntry` below is the
+// command line's few lines; a test runs `dev_source()` with lines of its own after it instead, which
+// is how the whole loop is driven in-process against a real server and a real browser's requests.
+//
+// **A RAW TEXT BLOCK, SO WHAT IS WRITTEN HERE IS WHAT SLATE READS** -- `cluster_source.sysl`'s
+// arrangement and for its reason: a `\r\n` or a quote below means itself to slate's lexer.
+//
+// What the loop is, in one paragraph: a proxy on the port the person asked for, the server as a child
+// on a free port it is told as `PORT`, a watch on the project, and an event stream at `/__slate/dev`
+// that every HTML page is given a script to listen to. A save settles for 100 ms, rebuilds every
+// `--js` bundle, stops the server, starts it again, waits for it to take a connection, and only then
+// tells the browsers -- `reload`, or `css` where only stylesheets changed, or `fault` with what the
+// server or the build said where something went wrong.
+
+// The loop's source, as slate will read it.
+dev_source() -> string = raw"""
+    import { serve, close as closeServer, sse } from slate:http
+    import { connect, listen, localPort, close as closeSocket, onBytes, send } from slate:net
+    import { spawn, run, environment, stderr } from slate:process
+    import { watch, unwatch, mkdir } from slate:fs
+
+    // Where a page listens for what happened.
+    val DevPath = "/__slate/dev"
+
+    // **One save is several events**, so a burst settles before anything is done: `slate run
+    // --watch`'s figure.
+    val SettleMillis = 100
+
+    // How long a server asked to stop has before it is made to.
+    val GraceMillis = 2000
+
+    // How long a server has to start taking connections before it is reported as not listening.
+    val ReadyMillis = 30000
+
+    // How much of what a server last wrote to stderr the overlay shows.
+    val TailChars = 20000
+
+    // The script every HTML page is given.
+    //
+    // **Single quotes throughout**, so the JavaScript sits in a slate string with nothing escaped.
+    // `fault` is the event's name because an `EventSource` already has an `error` of its own. A
+    // stylesheet swap re-fetches the page and puts its `<style>` and `<link rel=stylesheet>` text into
+    // the page's own, one for one and IN PLACE -- `lath` writes its sheets inside the app's root
+    // rather than the head -- which keeps the scroll position and everything the page was holding.
+    // Where the two pages do not have the same sheets, the old ones go and the new ones go in the head.
+    val ClientScript = [
+        "<script>(() => {",
+        "const es = new EventSource('" + DevPath + "');",
+        "const sel = 'style, link[rel=stylesheet]';",
+        "const box = () => {",
+        "  let d = document.getElementById('__slate_dev_overlay');",
+        "  if (!d) {",
+        "    d = document.createElement('pre');",
+        "    d.id = '__slate_dev_overlay';",
+        "    d.style.cssText = 'position:fixed;inset:0;margin:0;z-index:2147483647;overflow:auto;padding:24px;' +",
+        "      'background:rgba(24,24,27,.96);color:#fca5a5;font:13px/1.5 ui-monospace,Menlo,monospace;white-space:pre-wrap';",
+        "    document.documentElement.appendChild(d);",
+        "  }",
+        "  return d;",
+        "};",
+        "const hide = () => { const d = document.getElementById('__slate_dev_overlay'); if (d) d.remove(); };",
+        "es.addEventListener('reload', () => location.reload());",
+        "es.addEventListener('fault', e => { box().textContent = e.data; });",
+        "const busted = n => { const u = new URL(n.getAttribute('href'), location.href); u.searchParams.set('__slate', Date.now()); return u.href; };",
+        "es.addEventListener('css', async () => {",
+        "  const r = await fetch(location.href, { headers: { accept: 'text/html' } });",
+        "  const doc = new DOMParser().parseFromString(await r.text(), 'text/html');",
+        "  const now = Array.from(document.querySelectorAll(sel));",
+        "  const fresh = Array.from(doc.querySelectorAll(sel));",
+        "  if (now.length === fresh.length && now.every((n, i) => n.tagName === fresh[i].tagName)) {",
+        "    now.forEach((n, i) => { if (n.tagName === 'LINK') n.href = busted(fresh[i]); else n.textContent = fresh[i].textContent; });",
+        "  } else {",
+        "    now.forEach(n => n.remove());",
+        "    fresh.forEach(n => { const c = document.importNode(n, true); if (c.tagName === 'LINK') c.href = busted(n); document.head.appendChild(c); });",
+        "  }",
+        "  hide();",
+        "});",
+        "})();</script>"].join("\n")
+
+    // The request headers that describe one hop rather than the request, and the one the proxy
+    // decides: `accept-encoding` is `identity` upstream, so an HTML body can be read and added to.
+    val HopHeaders = ["connection", "keep-alive", "proxy-connection", "transfer-encoding", "te", "trailer",
+        "upgrade", "host", "content-length", "accept-encoding"]
+
+    // The response headers the proxy's own server works out for what it sends.
+    val OwnHeaders = ["connection", "keep-alive", "transfer-encoding", "content-length"]
+
+    escaped(s) = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;")
+
+    // The page, with the script before its last `</body>`, or at the end where it has none.
+    injected(html)
+        val a = html.lastIndexOf("</body>")
+        val b = html.lastIndexOf("</BODY>")
+        val at = if a == null then b elif b == null then a elif a > b then a else b
+
+        if at == null then html + ClientScript else html[0..<at] + ClientScript + html[at..]
+
+    // Whether a response's `content-type` says a page -- `null` where the server sent none, a `303` or
+    // a `204` usually having no body to name.
+    htmlType(t) = t is string && lower(t).startsWith("text/html")
+
+    // Start the loop, and answer `{ port, stop }` once the proxy is listening.
+    //
+    // `cfg` is `{ root, command, port, builds, buildCommand, settleMillis?, readyMillis?, tell? }`: the directory
+    // watched, the server's command line, the proxy's port (0 for any), each bundle as
+    // `{ src, out, rel }` -- `rel` being `out` as the watcher names it, so the loop's own writes do
+    // not start it again -- the command a bundle is built with, and where a note goes.
+    async startDev(cfg)
+        val root = cfg.root
+        val command = cfg.command
+        val builds = cfg.builds ?? []
+        val buildCommand = cfg.buildCommand ?? []
+        val settleMillis = cfg.settleMillis ?? SettleMillis
+        val readyMillis = cfg.readyMillis ?? ReadyMillis
+        val tell = cfg.tell ?? (line -> stderr(line + "\n"))
+
+        // The server now running, as `{ proc, port, said, out, over, retired }`.
+        var child = null
+
+        // What the overlay says, or null when all is well.
+        var failure = null
+
+        // Settled whenever no restart is under way; a request arriving during one waits on it.
+        var ready = resolve(null)
+
+        var clients = []
+        var nextClient = 0
+        var changed = []
+        var settleTimer = null
+        var cycling = false
+        var again = false
+        var stopping = false
+        var watcher = null
+        var server = null
+
+        // -- the browsers --------------------------------------------------------------------------
+
+        delivered(c, item)
+            if c.waiting != null
+                val w = c.waiting
+
+                c.waiting = null
+                settle(w, item)
+            else
+                c.items.push(item)
+
+        broadcast(event, data)
+            for c in clients
+                delivered(c, { done: false, value: { event: event, data: data } })
+
+        // One page's event stream: a `hello` at once, and a `fault` straight after it where something
+        // is already wrong.
+        subscriber()
+            nextClient = nextClient + 1
+
+            val me = { id: nextClient, items: [{ done: false, value: { event: "hello", data: "slate dev" } }],
+                       waiting: null }
+
+            if failure != null then me.items.push({ done: false, value: { event: "fault", data: failure } })
+
+            clients.push(me)
+
+            pull()
+                if me.items.length > 0 then return resolve(me.items.shift())
+
+                me.waiting = pending()
+                me.waiting
+
+            gone()
+                clients = clients.filter(c -> c.id != me.id)
+                delivered(me, { done: true, value: null })
+
+            { next: pull, close: gone }
+
+        failed(text)
+            failure = text
+            tell(text)
+            broadcast("fault", text)
+
+        // -- the server ----------------------------------------------------------------------------
+
+        // A port nothing holds, for the server: asked of the kernel and given straight back.
+        freePort()
+            val l = listen(0, c -> closeSocket(c))
+            val p = localPort(l)
+
+            closeSocket(l)
+            p
+
+        // What a child writes, passed on as it arrives, with the end of BOTH streams kept for the
+        // overlay in the order they arrived. stdout goes out a whole line at a time, `print` adding
+        // the newline.
+        //
+        // **Both, because slate itself reports a compile error on STDOUT** -- the driver says what it
+        // was asked to say to the terminal -- so an overlay of stderr alone was a page saying the
+        // server exited and nothing about why.
+        async echo(c, stream, isErr)
+            for await chunk in stream
+                val text = fromBytes(chunk).value ?? ""
+
+                c.said = c.said + text
+
+                if c.said.length > TailChars then c.said = c.said[c.said.length - TailChars..]
+
+                if isErr
+                    stderr(text)
+                else
+                    c.out = c.out + text
+
+                    val end = c.out.lastIndexOf("\n")
+
+                    if end != null
+                        print(c.out[0..<end])
+                        c.out = c.out[end + 1..]
+
+            if !isErr && c.out != ""
+                print(c.out)
+                c.out = ""
+
+        // **A server that ends without being asked to is a fault the page shows**, with the last of
+        // what it said -- a compile error, an exception, a port already taken -- and it is left ended,
+        // `slate run --watch`'s rule: the next save is what starts it again.
+        async ended(c)
+            val gone = (await c.proc.exited).value
+
+            c.over = true
+
+            if c.retired || stopping then return
+
+            val how = if gone.signal != null then "was stopped by signal " + string(gone.signal) else "exited with status " + string(gone.status)
+            val said = c.said.trim()
+
+            failed("slate dev: the server " + how + (if said == "" then "" else ":\n\n" + said))
+
+        // Start the server on a port of its own, and wait until it takes a connection. Answers
+        // whether it did.
+        async startChild()
+            val port = freePort()
+            val env = environment()
+
+            env.PORT = string(port)
+
+            val started = spawn(command[0], command.slice(1), { env: env, stdout: "pipe", stderr: "pipe" })
+
+            if !started.ok
+                failed("slate dev: could not start " + command[0] + ": " + started.error)
+                return false
+
+            val c = { proc: started.value, port: port, said: "", out: "", over: false, retired: false }
+
+            child = c
+            echo(c, c.proc.stdout, false)
+            echo(c, c.proc.stderr, true)
+            ended(c)
+
+            var waited = 0
+
+            while !c.over
+                val r = await connect("127.0.0.1", port)
+
+                if r.ok
+                    closeSocket(r.value)
+                    return true
+
+                if waited >= readyMillis
+                    failed("slate dev: the server did not take connections on port " + string(port) + " within " +
+                        string(readyMillis) + " ms -- it is told its port as PORT, and has to listen on it")
+                    return false
+
+                await sleep(25)
+                waited = waited + 25
+
+            false
+
+        // SIGTERM, and SIGKILL once the grace period is up.
+        async stopChild()
+            val c = child
+
+            if c == null || c.over then return
+
+            c.retired = true
+            c.proc.kill()
+
+            val late = setTimeout(() -> if !c.over then c.proc.kill("SIGKILL"), GraceMillis)
+
+            await c.proc.exited
+            clearTimeout(late)
+
+        // -- building ------------------------------------------------------------------------------
+
+        // Every bundle, built; the first failure's report, or null.
+        async built()
+            for b in builds
+                val dir = b.out.lastIndexOf("/")
+
+                if dir != null && dir > 0 then await mkdir(b.out[0..<dir])
+
+                val r = await run(buildCommand[0], buildCommand.slice(1).concat([b.src, "-o", b.out]))
+
+                if !r.ok then return "slate dev: could not build " + b.src + ": " + r.error
+
+                if r.value.status != 0
+                    return "slate dev: " + b.src + " did not build:\n\n" + (r.value.err + r.value.out).trim()
+
+            null
+
+        // One rebuild and restart, and what the browsers are told of it.
+        //
+        // **A failed build leaves the running server alone** -- the overlay covers the page, and the
+        // server answering underneath it is the last one that worked.
+        async cycle(cssOnly)
+            cycling = true
+
+            val gate = pending()
+
+            ready = gate
+
+            val was = failure
+            val problem = await built()
+
+            if problem != null
+                failed(problem)
+            else
+                await stopChild()
+
+                if await startChild()
+                    failure = null
+
+                    // **Every event carries data**: an `EventSource` does not dispatch one whose data
+                    // is empty, so a bare `reload` would reach the page and never be heard.
+                    if cssOnly && was == null
+                        tell("slate dev: restarted, stylesheets swapped")
+                        broadcast("css", "stylesheets")
+                    else
+                        tell("slate dev: restarted")
+                        broadcast("reload", "page")
+
+            settle(gate, null)
+            cycling = false
+
+            if again
+                again = false
+                settledDown()
+
+        settledDown()
+            settleTimer = null
+
+            if stopping then return
+
+            if cycling
+                again = true
+                return
+
+            val names = changed
+
+            changed = []
+
+            if names.length > 0 then cycle(names.every(n -> n.endsWith(".css")))
+
+        heard(e)
+            if stopping || !watchCounts(e.path, root) then return
+
+            for b in builds
+                if e.path == b.rel then return
+
+            changed.push(e.path)
+
+            if settleTimer != null then clearTimeout(settleTimer)
+
+            settleTimer = setTimeout(settledDown, settleMillis)
+
+        // -- the proxy -----------------------------------------------------------------------------
+
+        target(req) = req.path + (if req.search != null && req.search != "" then "?" + req.search else "")
+
+        // What a request is answered with while there is no server: the overlay, as a page with the
+        // script on it so that it reloads once the server is back, or the text alone where the request
+        // did not ask for a page.
+        faultPage(req, text)
+            val accept = req.headers["accept"] ?? ""
+
+            if req.method == "GET" && (accept == "" || accept.contains("text/html"))
+                return { status: 502, headers: { "content-type": "text/html; charset=utf-8" },
+                         body: "<!doctype html><title>slate dev</title><body><pre>" + escaped(text) + "</pre>" +
+                               ClientScript + "</body>" }
+
+            { status: 502, headers: { "content-type": "text/plain; charset=utf-8" }, body: text }
+
+        // A fetched body handed on as it arrives, ending where it breaks off. **Its `close` closes the
+        // upstream body**, so a page leaving an event stream lets go of the server's too.
+        relayed(body)
+            async pull()
+                val step = await body.next()
+
+                if step.done || step.value is bytes then step else { done: true, value: null }
+
+            { next: pull, close: () -> body.close() }
+
+        async whole(body)
+            var all = bytes(0)
+
+            for await chunk in body
+                if chunk is bytes then push(all, chunk)
+
+            all
+
+        // **A request that raced a restart is sent again once**, to the server that replaced the one
+        // it found: a save while a page is loading is the ordinary case, not a failure to show.
+        async forwarded(req, options)
+            val port = child.port
+            val r = await fetch("http://127.0.0.1:" + string(port) + target(req), options)
+
+            if r.ok then return r
+
+            await ready
+
+            if child == null || child.over || child.port == port then return r
+
+            await fetch("http://127.0.0.1:" + string(child.port) + target(req), options)
+
+        async proxy(req)
+            if req.path == DevPath then return sse(subscriber())
+
+            await ready
+
+            if failure != null && (child == null || child.over) then return faultPage(req, failure)
+            if child == null then return faultPage(req, "slate dev: the server is not running")
+
+            val headers = {}
+
+            for [k, v] in entries(req.headers)
+                if !HopHeaders.contains(k) then headers[k] = v
+
+            headers["accept-encoding"] = "identity"
+            headers["x-forwarded-proto"] = "http"
+
+            val host = req.headers["host"] ?? null
+
+            if host != null then headers["x-forwarded-host"] = host
+
+            val options = { method: req.method, headers: headers, redirect: "manual", stream: true }
+
+            if req.bytes.length > 0 then options.body = req.bytes
+
+            val r = await forwarded(req, options)
+
+            if !r.ok then return faultPage(req, "slate dev: the server did not answer: " + r.error)
+
+            val res = r.value
+            val out = {}
+
+            for [k, v] in entries(res.headers)
+                if !OwnHeaders.contains(k) then out[k] = v
+
+            if req.method == "HEAD" || res.status == 204 || res.status == 304
+                res.body.close()
+                return { status: res.status, headers: out, body: "" }
+
+            // **A page is read whole, to put the script in it**; everything else -- an event stream
+            // above all -- goes on as it arrives.
+            if htmlType(res.headers["content-type"] ?? null) &&(res.headers["content-encoding"] ?? "identity") == "identity"
+                val raw = await whole(res.body)
+                val text = fromBytes(raw)
+
+                if text.ok then return { status: res.status, headers: out, body: injected(text.value) }
+
+                return { status: res.status, headers: out, body: raw }
+
+            { status: res.status, headers: out, body: relayed(res.body) }
+
+        // A protocol upgrade -- a WebSocket -- passed through as bytes both ways: the request's head
+        // written again to the server, what the client already sent after it, and then a pipe.
+        async upgrade(req, conn, leftover)
+            var up = null
+            var early = []
+            var downDone = false
+
+            onBytes(conn, b ->
+                if b == null
+                    downDone = true
+                    if up != null then closeSocket(up)
+                elif up == null
+                    early.push(b)
+                else
+                    send(up, b))
+
+            await ready
+
+            if child == null || child.over
+                closeSocket(conn)
+                return
+
+            val r = await connect("127.0.0.1", child.port)
+
+            if !r.ok
+                closeSocket(conn)
+                return
+
+            val sock = r.value
+            var head = req.method + " " + target(req) + " HTTP/1.1\r\n"
+
+            for [k, v] in entries(req.headers)
+                head = head + k + ": " + v + "\r\n"
+
+            onBytes(sock, b -> if b == null then closeSocket(conn) else send(conn, b))
+
+            await send(sock, head + "\r\n")
+
+            if leftover.length > 0 then await send(sock, leftover)
+
+            for b in early
+                await send(sock, b)
+
+            up = sock
+
+            if downDone then closeSocket(sock)
+
+        // -- the whole -----------------------------------------------------------------------------
+
+        async stop()
+            if stopping then return
+
+            stopping = true
+
+            if settleTimer != null then clearTimeout(settleTimer)
+            if watcher != null then unwatch(watcher)
+
+            await stopChild()
+
+            for c in clients
+                delivered(c, { done: true, value: null })
+
+            clients = []
+
+            if server != null then closeServer(server)
+
+        val first = await built()
+
+        if first != null then failed(first) else await startChild()
+
+        // **A defect in the proxy is the page's to show and not the loop's to die of**: a loop that
+        // ended on one would leave the server it started running, with nothing left to stop it.
+        async guarded(req)
+            try
+                return await proxy(req)
+            catch e
+                val said = "slate dev: answering " + req.method + " " + req.path + " failed: " + e.message
+
+                tell(said)
+                return faultPage(req, said)
+
+        async upgraded(req, conn, leftover)
+            try
+                await upgrade(req, conn, leftover)
+            catch e
+                tell("slate dev: passing on an upgrade of " + req.path + " failed: " + e.message)
+                closeSocket(conn)
+
+        server = serve(cfg.port, guarded, upgraded)
+
+        val w = watch(root, heard)
+
+        if !w.ok
+            await stop()
+            throw w.error
+
+        watcher = w.value
+
+        { port: localPort(server), stop: stop }
+
+    // What the command line asked for, as `startDev` takes it: `dev.sysl` hands the program `root`,
+    // the executable, the server's file, the port, and a `src`, `out`, `rel` triple for each `--js`.
+    // **The executable builds the bundles too**, as `slate js <src> -o <out>`.
+    configured(argv)
+        val builds = []
+        var i = 4
+
+        while i + 2 < argv.length
+            builds.push({ src: argv[i], out: argv[i + 1], rel: argv[i + 2] })
+            i = i + 3
+
+        { root: argv[0], command: [argv[1], argv[2]], port: number(argv[3]), builds: builds,
+          buildCommand: [argv[1], "js"] }
+    """
+
+// The command line's own lines, `configured` reading what `dev.sysl` handed over.
+//
+// **Ctrl-C stops the server before the proxy**, so the terminal is handed back with nothing left
+// running -- which is what a person pressing it expects and what a child left behind would not be.
+val DevEntry: string = raw"""
+    async devFromCommandLine()
+        val d = await startDev(configured(args))
+
+        stderr("slate dev: http://localhost:" + string(d.port) + "/ -- " + args[2] + " is started again on every save\n")
+
+        var ids = []
+
+        quit()
+            for id in ids
+                offSignal(id)
+
+            d.stop()
+
+        ids.push(onSignal("SIGINT", quit))
+        ids.push(onSignal("SIGTERM", quit))
+
+    devFromCommandLine()
+    """

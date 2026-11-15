@@ -1,0 +1,153 @@
+module dev.slatelang.slate
+
+import sh.sysl.libuv
+import sysl.buf.{Buf, buf}
+import sysl.fs.read_bytes
+import sysl.{os, MacOS}
+import sysl.text.{from_utf8_unchecked, parse_long}
+
+// `slate dev <server.sl> [--js <client.slx>=<out.js>]... [--port <n>]` -- a server, behind a proxy
+// that starts it again on every save and tells the browser.
+//
+// **The command line is read here and the dev loop is slate** (`dev_source.sysl`). Everything the loop
+// does is a slate surface already -- `serve`, `fetch` with `redirect: "manual"` and `stream: true`,
+// `spawn` with piped output, `watch`, the upgrade hook -- so the loop is a program like any other, run
+// as `slate:dev` so that it compiles against every builtin the way a built-in module does. That is
+// what reaches `watchCounts`, the one rule `slate run --watch` restarts by, rather than a copy of it.
+//
+// **The server learns its port from `PORT`**, the variable every host a server is deployed to sets,
+// and the one a slate server reads already (`serve(integer(env("PORT") ?? "3000"), app)`). The proxy
+// takes the port the person asked for and hands the server a free one of its own.
+
+// The port the proxy listens on where `--port` does not say.
+val DevPort: i64 = 3000
+
+private const DevUsage: string = "usage: slate dev <server.sl> [--js <client.slx>=<out.js>]... [--port <n>]"
+
+// The name the dev loop runs under: a built-in module's, so it compiles against every builtin.
+val DevProgram: string = "slate:dev"
+
+dev_command(args: []string, say: string -> unit) -> int
+    if os() != MacOS
+        say("slate: `dev` needs recursive file watching, which slate has on macOS only so far -- on this system it is not built yet")
+
+        return Failed
+    end if
+
+    var file = ""
+    var port = DevPort
+    var srcs: Buf[string] = buf()
+    var outs: Buf[string] = buf()
+    var i: usize = 2
+
+    while i < args.len
+        val a = args[i]
+
+        if a == "--port" || a == "--js"
+            if i + 1 >= args.len
+                say(if a == "--port" then "slate: `--port` takes a port number" else "slate: `--js` takes <client.slx>=<out.js>")
+
+                return Misused
+            end if
+
+            val v = args[i + 1]
+
+            if a == "--port"
+                val n = parse_long(v).unwrap_or(-1)
+
+                if n < 0 || n > 65535
+                    say(s"slate: `--port` takes a port number, and ${v} is not one")
+
+                    return Misused
+                end if
+
+                port = n
+            else
+                val eq = equals_at(v)
+
+                if eq == 0 || eq + 1 >= v.len
+                    say(s"slate: `--js` takes <client.slx>=<out.js>, and ${v} is not that")
+
+                    return Misused
+                end if
+
+                srcs.push(from_utf8_unchecked(v.bytes[0..<eq]))
+                outs.push(from_utf8_unchecked(v.bytes[eq + 1..<v.len]))
+
+            i += 2
+        elif a.starts_with("-")
+            say(s"slate: `dev` has no option `${a}` -- it takes `--js` and `--port`")
+            say(DevUsage)
+
+            return Misused
+        elif file != ""
+            say(s"slate: `dev` runs one server, and was given ${file} and ${a}")
+
+            return Misused
+        else
+            file = a
+            i += 1
+
+    if file == ""
+        say(DevUsage)
+
+        return Misused
+    end if
+
+    if read_bytes(file).is_err()
+        say(s"slate: cannot read ${file}")
+
+        return Failed
+    end if
+
+    for j in 0..<srcs.len()
+        if read_bytes(srcs[j]).is_err()
+            say(s"slate: cannot read ${srcs[j]}, which `--js` was asked to build")
+
+            return Failed
+        end if
+
+    val exec = libuv.exepath() match
+        Ok(p) -> p
+        Err(_) -> args[0]
+
+    val root = watched_root(file)
+    var argv: Buf[string] = buf()
+
+    argv.push(root)
+    argv.push(exec)
+    argv.push(file)
+    argv.push(s"${port}")
+
+    for j in 0..<srcs.len()
+        argv.push(srcs[j])
+        argv.push(outs[j])
+        argv.push(under_root(outs[j], root))
+
+    val text = s"${dev_source()}\n${DevEntry}"
+
+    ran_bytes(exec, DevProgram, text.bytes, argv, say, say, src -> run(src))
+end dev_command
+
+// Where the first `=` is, or zero where there is none -- a bundle with no source being refused too.
+private equals_at(v: string) -> usize
+    for k in 0..<v.len
+        if v.bytes[k] == u8('=') then return k
+
+    0
+
+// A path as the watcher reports it -- relative to the watched root -- or "" where it is outside it.
+//
+// **A bundle the loop writes must not start the loop again**, and the watcher hears its own writes
+// like anybody else's: `public/app.js` is a `.js`, which `watch_counts` counts. So each output is
+// named to the loop in the watcher's own terms and ignored by name.
+under_root(path: string, root: string) -> string
+    val whole = if path.starts_with("/")
+        normalize_path(path)
+    else
+        libuv.cwd() match
+            Ok(here) -> normalize_path(s"${here}/${path}")
+            Err(_) -> path
+
+    if whole.starts_with(s"${root}/") then from_utf8_unchecked(whole.bytes[root.len + 1..<whole.len]) else ""
+end under_root

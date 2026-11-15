@@ -655,7 +655,9 @@ forbidden response-header name, so a page never reads one. The browser still app
 answer `run` gives and for the same reason: slate has no byte value for it to be.
 
 **The options** are `method`, `body`, `headers`, `trust`, `timeout`, `stream`, `reuse` and
-`redirect`, all optional. **Any other key is refused**, naming it — a misspelt `timout` quietly
+`redirect`, all optional. **`body` is text or [`bytes`](bytes.md)**: text goes as UTF-8 and bytes go
+exactly as they are, which is what an upload — or a proxy passing on a request's `bytes` — needs; an
+empty one sends no body. **Any other key is refused**, naming it — a misspelt `timout` quietly
 ignored would be a fetch with no limit in a program that believes it has one:
 
 ```slate

@@ -195,6 +195,50 @@ the edit that fixes it rather than starting the same crash again in a loop. **Ct
 
 Recursive watching is macOS's for now; on another system `--watch` says so and runs nothing.
 
+## Developing a web app
+
+`slate dev` is `--watch` with a browser in the loop: a proxy in front of the server that rebuilds the
+client, restarts the server, and then tells every open page.
+
+```
+slate dev server.sl
+slate dev server.sl --js client.slx=public/app.js --port 8080
+```
+
+**The server is told its port as `PORT`**, and `slate dev` listens on the one you open in the browser
+— `--port`, or 3000. So a server written the way it is deployed works unchanged:
+
+```
+val server = serve(integer(env("PORT") ?? "3000"), app)
+```
+
+**A save is one cycle.** The watch is `--watch`'s — the same files count, the same 100 ms settle —
+then every `--js` bundle is built with `slate js <client> -o <out>`, the server is sent `SIGTERM`
+(`SIGKILL` two seconds later), started again, and waited for until it takes a connection. Only then
+is the page told, so a reload never lands on a server that is still starting. A request that arrives
+during a restart waits for it rather than failing.
+
+**What the page is told:**
+
+- **`reload`** after an ordinary save.
+- **A stylesheet swap** where only `.css` files changed: the page fetches itself again and replaces the
+  `<style>` and `<link rel="stylesheet">` elements in its head, keeping its scroll position and
+  everything it was holding.
+- **An overlay** where a bundle did not build or the server exited — a compile error, an exception at
+  start, a port it could not take — showing what the build or the server wrote to stderr. The terminal
+  shows the same. A page opened while the server is down is that overlay too. The next good save
+  reloads it and the overlay is gone. A failed build leaves the last good server running underneath.
+
+**The proxy passes a request on as it came** — the method, the headers, the body (bytes and all), and
+the query — and the answer back the same way: a redirect is not followed, so a `303` with two
+`Set-Cookie` lines reaches the browser as a `303` with two `Set-Cookie` lines; an event stream is handed
+on as it arrives; and a WebSocket upgrade is piped through. **An HTML page is the one thing it changes**,
+adding a small script before `</body>` that listens on `/__slate/dev`; its length is worked out again.
+The server's own output is printed as it arrives.
+
+**Ctrl-C stops the server and then the proxy.** Like `--watch`, it is macOS's for now; on another
+system `slate dev` says so and runs nothing.
+
 ## Starting a project
 
 `slate new --template <template> <directory>` writes a project to start from:
