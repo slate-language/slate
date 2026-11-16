@@ -20,6 +20,7 @@ import { args, exit, run, spawn } from slate:process
 import { readDirSync, readFileSync, removeSync, writeFileSync } from slate:fs
 
 val TableRows = 12
+val Attempts = 5
 val Marker = "Sort by top of stack, same collapsed"
 
 // -- the command line ----------------------------------------------------------------------------
@@ -104,7 +105,25 @@ section(program, rows)
 
 // -- driving `sample` ----------------------------------------------------------------------------
 
+// One run of `sample` against `pid`, answering the collapsed rows it wrote -- `[]` where it wrote
+// none, which is what it leaves when it could not attach in time.
+async sampleOnce(pid, duration, interval, scratch)
+    val limit = (number(duration) + 30) * 1000
+
+    await run("/usr/bin/sample", [string(pid), duration, interval, "-mayDie", "-file", scratch], { timeout: limit })
+
+    val text = readFileSync(scratch) match
+        { ok: true, value: t } -> t
+        _ -> ""
+
+    removeSync(scratch)
+    collapsed(text)
+
 // Start `program` under `binary`, sample it, kill it, and answer its section of the report.
+//
+// A sample that comes back empty while the program is still running is `sample` failing to attach
+// inside its window -- a loaded machine does that -- so it is asked again, up to `Attempts` times.
+// Only a program that has really gone is reported as having ended before `sample` could attach.
 async profiled(binary, program, duration, interval, scratch)
     print("sampling", program)
 
@@ -114,19 +133,26 @@ async profiled(binary, program, duration, interval, scratch)
         return "## " + program + "\n\n`" + binary + "` could not be started: " + string(started.error) + "\n"
 
     val child = started.value
-    val limit = (number(duration) + 30) * 1000
-    val sampled = await run("/usr/bin/sample", [string(child.pid), duration, interval, "-mayDie", "-file", scratch],
-        { timeout: limit })
+    var gone = false
+    child.onExit(_ ->
+        gone = true)
 
+    var rows = []
+    var tries = 0
+
+    while rows.length == 0 && !gone && tries < Attempts
+        rows = await sampleOnce(child.pid, duration, interval, scratch)
+        tries += 1
+
+    val ended = gone
     child.kill()
     await child.exited
 
-    val text = readFileSync(scratch) match
-        { ok: true, value: t } -> t
-        _ -> ""
+    if rows.length == 0 && !ended
+        return "## " + program + "\n\nNo samples: `sample` recorded nothing in " + string(tries) +
+            " tries, though the program was still running.\n"
 
-    removeSync(scratch)
-    section(program, collapsed(text))
+    section(program, rows)
 
 async main()
     val out = flag("out", "")
